@@ -15,7 +15,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
     python_dev_version, spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle,
-    EngineStatus, LateDataPolicy, Publisher as CorePublisher, ZippyError,
+    EngineMetricsSnapshot, EngineStatus, LateDataPolicy, OverflowPolicy,
+    Publisher as CorePublisher, ZippyError,
 };
 use zippy_engines::{
     ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
@@ -45,12 +46,21 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
 
 type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
 type SharedArchive = Arc<Mutex<Option<ArchiveHandle>>>;
+type SharedStatus = Arc<Mutex<EngineStatus>>;
+type SharedMetrics = Arc<Mutex<EngineMetricsSnapshot>>;
 
 #[derive(Clone)]
 struct DownstreamLink {
     handle: SharedHandle,
     archive: SharedArchive,
     write_input: bool,
+}
+
+#[derive(Clone)]
+struct RuntimeOptions {
+    buffer_capacity: usize,
+    overflow_policy: OverflowPolicy,
+    archive_buffer_capacity: usize,
 }
 
 #[derive(Clone)]
@@ -95,6 +105,13 @@ impl ParquetRotation {
             _ => Err(py_value_error("rotation must be 'none' or '1h'")),
         }
     }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Hourly => "1h",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -136,8 +153,8 @@ struct ArchiveHandle {
 }
 
 impl ArchiveHandle {
-    fn spawn(config: ParquetSinkConfig) -> Self {
-        let (tx, rx) = mpsc::sync_channel(1024);
+    fn spawn(config: ParquetSinkConfig, buffer_capacity: usize) -> Self {
+        let (tx, rx) = mpsc::sync_channel(buffer_capacity);
         let join_handle = thread::spawn(move || parquet_archive_worker(config, rx));
         Self {
             tx,
@@ -196,8 +213,8 @@ impl ArchiveHandle {
             .unwrap_or(Ok(()));
 
         match (close_result, join_result) {
-            (Err(error), _) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
+            (_, Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
         }
     }
@@ -720,10 +737,14 @@ impl ZmqSubscriber {
 #[pyclass]
 struct ReactiveStateEngine {
     name: String,
+    id_column: String,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
     parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
@@ -734,10 +755,17 @@ struct ReactiveStateEngine {
 #[pyclass]
 struct TimeSeriesEngine {
     name: String,
+    id_column: String,
+    dt_column: String,
+    window_ns: i64,
+    late_data_policy: String,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
     parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
@@ -749,7 +777,7 @@ struct TimeSeriesEngine {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, source=None, parquet_sink=None))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy="block", archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -759,6 +787,9 @@ impl ReactiveStateEngine {
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: &str,
+        archive_buffer_capacity: usize,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -770,8 +801,12 @@ impl ReactiveStateEngine {
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
+        let runtime_options =
+            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
         let handle = Arc::new(Mutex::new(None));
         let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
         let source_owner = register_source(
             source,
             DownstreamLink {
@@ -787,10 +822,14 @@ impl ReactiveStateEngine {
 
         Ok(Self {
             name,
+            id_column,
             input_schema: schema,
             output_schema,
             target,
             parquet_sink,
+            runtime_options,
+            status,
+            metrics,
             archive,
             handle,
             engine: Some(engine),
@@ -802,6 +841,7 @@ impl ReactiveStateEngine {
     fn start(&mut self) -> PyResult<()> {
         let (handle, archive) = start_runtime_engine(
             &self.name,
+            &self.runtime_options,
             &self.target,
             self.parquet_sink.as_ref(),
             &self.downstreams,
@@ -809,19 +849,22 @@ impl ReactiveStateEngine {
         )?;
         *self.handle.lock().unwrap() = Some(handle);
         *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         ensure_downstreams_running(&self.downstreams)?;
-        write_runtime_input(
+        let result = write_runtime_input(
             py,
             &self.handle,
             &self.archive,
             self.parquet_sink.as_ref(),
             value,
             &self.input_schema,
-        )
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
     }
 
     fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -831,13 +874,39 @@ impl ReactiveStateEngine {
             .map_err(|error| py_value_error(error.to_string()))
     }
 
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "reactive",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            self._source_owner.is_some(),
+        )?;
+        dict.set_item("id_column", &self.id_column)?;
+        Ok(dict.into_any().unbind())
+    }
+
     fn flush(&self) -> PyResult<()> {
-        flush_runtime_engine(&self.handle, &self.archive)
+        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, &self.archive)
+        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
     }
 }
 
@@ -845,7 +914,7 @@ impl ReactiveStateEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type="tumbling", window_ns=None, source=None, parquet_sink=None))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type="tumbling", window_ns=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy="block", archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -860,13 +929,16 @@ impl TimeSeriesEngine {
         window_ns: Option<i64>,
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: &str,
+        archive_buffer_capacity: usize,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let factor_specs = build_aggregation_specs(py, factors)?;
-        let late_data_policy = parse_late_data_policy(&late_data_policy)?;
+        let late_data_policy_enum = parse_late_data_policy(&late_data_policy)?;
         let window_ns = parse_window_ns(window, window_type, window_ns)?;
         let engine = RustTimeSeriesEngine::new(
             &name,
@@ -874,15 +946,19 @@ impl TimeSeriesEngine {
             &id_column,
             &dt_column,
             window_ns,
-            late_data_policy,
+            late_data_policy_enum,
             factor_specs,
         )
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
+        let runtime_options =
+            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
         let handle = Arc::new(Mutex::new(None));
         let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
         let source_owner = register_source(
             source,
             DownstreamLink {
@@ -898,10 +974,17 @@ impl TimeSeriesEngine {
 
         Ok(Self {
             name,
+            id_column,
+            dt_column,
+            window_ns,
+            late_data_policy,
             input_schema: schema,
             output_schema,
             target,
             parquet_sink,
+            runtime_options,
+            status,
+            metrics,
             archive,
             handle,
             engine: Some(engine),
@@ -913,6 +996,7 @@ impl TimeSeriesEngine {
     fn start(&mut self) -> PyResult<()> {
         let (handle, archive) = start_runtime_engine(
             &self.name,
+            &self.runtime_options,
             &self.target,
             self.parquet_sink.as_ref(),
             &self.downstreams,
@@ -920,19 +1004,22 @@ impl TimeSeriesEngine {
         )?;
         *self.handle.lock().unwrap() = Some(handle);
         *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         ensure_downstreams_running(&self.downstreams)?;
-        write_runtime_input(
+        let result = write_runtime_input(
             py,
             &self.handle,
             &self.archive,
             self.parquet_sink.as_ref(),
             value,
             &self.input_schema,
-        )
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
     }
 
     fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -942,13 +1029,42 @@ impl TimeSeriesEngine {
             .map_err(|error| py_value_error(error.to_string()))
     }
 
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "timeseries",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            self._source_owner.is_some(),
+        )?;
+        dict.set_item("id_column", &self.id_column)?;
+        dict.set_item("dt_column", &self.dt_column)?;
+        dict.set_item("window_ns", self.window_ns)?;
+        dict.set_item("late_data_policy", &self.late_data_policy)?;
+        Ok(dict.into_any().unbind())
+    }
+
     fn flush(&self) -> PyResult<()> {
-        flush_runtime_engine(&self.handle, &self.archive)
+        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, &self.archive)
+        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
     }
 }
 
@@ -1172,6 +1288,7 @@ fn ensure_runtime_is_not_running(handle: &SharedHandle) -> PyResult<()> {
 
 fn start_runtime_engine<E: Engine>(
     name: &str,
+    runtime_options: &RuntimeOptions,
     targets: &[TargetConfig],
     parquet_sink: Option<&ParquetSinkConfig>,
     downstreams: &[DownstreamLink],
@@ -1181,15 +1298,17 @@ fn start_runtime_engine<E: Engine>(
         Some(engine) => engine,
         None => return Err(py_runtime_error("engine already started")),
     };
-    let archive = parquet_sink.cloned().map(ArchiveHandle::spawn);
+    let archive = parquet_sink
+        .cloned()
+        .map(|config| ArchiveHandle::spawn(config, runtime_options.archive_buffer_capacity));
     let publisher = build_publisher(targets, parquet_sink, archive.clone(), downstreams)?;
 
     let handle = spawn_engine_with_publisher(
         engine,
         EngineConfig {
             name: name.to_string(),
-            buffer_capacity: 1024,
-            overflow_policy: Default::default(),
+            buffer_capacity: runtime_options.buffer_capacity,
+            overflow_policy: runtime_options.overflow_policy,
             late_data_policy: Default::default(),
         },
         publisher,
@@ -1230,7 +1349,12 @@ fn write_runtime_input(
     Ok(())
 }
 
-fn flush_runtime_engine(handle: &SharedHandle, archive: &SharedArchive) -> PyResult<()> {
+fn flush_runtime_engine(
+    handle: &SharedHandle,
+    archive: &SharedArchive,
+    status: &SharedStatus,
+    metrics: &SharedMetrics,
+) -> PyResult<()> {
     with_handle(handle, |runtime| {
         runtime
             .flush()
@@ -1242,10 +1366,16 @@ fn flush_runtime_engine(handle: &SharedHandle, archive: &SharedArchive) -> PyRes
             .flush()
             .map_err(|error| py_runtime_error(error.to_string()))?;
     }
+    sync_runtime_state(handle, status, metrics);
     Ok(())
 }
 
-fn stop_runtime_engine(handle: &SharedHandle, archive: &SharedArchive) -> PyResult<()> {
+fn stop_runtime_engine(
+    handle: &SharedHandle,
+    archive: &SharedArchive,
+    status: &SharedStatus,
+    metrics: &SharedMetrics,
+) -> PyResult<()> {
     let mut guard = handle.lock().unwrap();
     let mut runtime = match guard.take() {
         Some(handle) => handle,
@@ -1255,12 +1385,24 @@ fn stop_runtime_engine(handle: &SharedHandle, archive: &SharedArchive) -> PyResu
     let stop_result = runtime
         .stop()
         .map_err(|error| py_runtime_error(error.to_string()));
-    if let Some(archive) = archive.lock().unwrap().take() {
+    let archive_result = if let Some(archive) = archive.lock().unwrap().take() {
         archive
             .close()
-            .map_err(|error| py_runtime_error(error.to_string()))?;
+            .map_err(|error| py_runtime_error(error.to_string()))
+    } else {
+        Ok(())
+    };
+    let mut final_status = runtime.status();
+    if archive_result.is_err() {
+        final_status = EngineStatus::Failed;
     }
-    stop_result
+    set_cached_runtime_state(status, metrics, final_status, runtime.metrics());
+
+    match (stop_result, archive_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn with_handle<T>(
@@ -1274,6 +1416,27 @@ fn with_handle<T>(
     callback(runtime)
 }
 
+fn sync_runtime_state(
+    handle: &SharedHandle,
+    status: &SharedStatus,
+    metrics: &SharedMetrics,
+) {
+    let guard = handle.lock().unwrap();
+    if let Some(runtime) = guard.as_ref() {
+        set_cached_runtime_state(status, metrics, runtime.status(), runtime.metrics());
+    }
+}
+
+fn set_cached_runtime_state(
+    status: &SharedStatus,
+    metrics: &SharedMetrics,
+    engine_status: EngineStatus,
+    snapshot: EngineMetricsSnapshot,
+) {
+    *status.lock().unwrap() = engine_status;
+    *metrics.lock().unwrap() = snapshot;
+}
+
 fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
     match value {
         "reject" => Ok(LateDataPolicy::Reject),
@@ -1282,6 +1445,123 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
             "late_data_policy must be 'reject' or 'drop_with_metric'",
         )),
     }
+}
+
+fn parse_runtime_options(
+    buffer_capacity: usize,
+    overflow_policy: &str,
+    archive_buffer_capacity: usize,
+) -> PyResult<RuntimeOptions> {
+    if buffer_capacity == 0 {
+        return Err(py_value_error("buffer_capacity must be greater than zero"));
+    }
+
+    if archive_buffer_capacity == 0 {
+        return Err(py_value_error(
+            "archive_buffer_capacity must be greater than zero",
+        ));
+    }
+
+    Ok(RuntimeOptions {
+        buffer_capacity,
+        overflow_policy: parse_overflow_policy(overflow_policy)?,
+        archive_buffer_capacity,
+    })
+}
+
+fn parse_overflow_policy(value: &str) -> PyResult<OverflowPolicy> {
+    match value {
+        "block" => Ok(OverflowPolicy::Block),
+        "reject" => Ok(OverflowPolicy::Reject),
+        "drop_oldest" => Ok(OverflowPolicy::DropOldest),
+        _ => Err(py_value_error(
+            "overflow_policy must be 'block', 'reject', or 'drop_oldest'",
+        )),
+    }
+}
+
+fn overflow_policy_as_str(value: OverflowPolicy) -> &'static str {
+    match value {
+        OverflowPolicy::Block => "block",
+        OverflowPolicy::Reject => "reject",
+        OverflowPolicy::DropOldest => "drop_oldest",
+    }
+}
+
+fn metrics_snapshot_to_pydict(
+    py: Python<'_>,
+    snapshot: EngineMetricsSnapshot,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("processed_batches_total", snapshot.processed_batches_total)?;
+    dict.set_item("processed_rows_total", snapshot.processed_rows_total)?;
+    dict.set_item("output_batches_total", snapshot.output_batches_total)?;
+    dict.set_item("dropped_batches_total", snapshot.dropped_batches_total)?;
+    dict.set_item("late_rows_total", snapshot.late_rows_total)?;
+    dict.set_item("publish_errors_total", snapshot.publish_errors_total)?;
+    dict.set_item("queue_depth", snapshot.queue_depth)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn engine_base_config_dict<'py>(
+    py: Python<'py>,
+    engine_type: &str,
+    name: &str,
+    targets: &[TargetConfig],
+    parquet_sink: &Option<ParquetSinkConfig>,
+    runtime_options: &RuntimeOptions,
+    source_linked: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("engine_type", engine_type)?;
+    dict.set_item("name", name)?;
+    dict.set_item("buffer_capacity", runtime_options.buffer_capacity)?;
+    dict.set_item(
+        "overflow_policy",
+        overflow_policy_as_str(runtime_options.overflow_policy),
+    )?;
+    dict.set_item(
+        "archive_buffer_capacity",
+        runtime_options.archive_buffer_capacity,
+    )?;
+    dict.set_item("source_linked", source_linked)?;
+    dict.set_item("targets", target_configs_to_pylist(py, targets)?)?;
+    dict.set_item("parquet_sink", parquet_sink_to_pyobject(py, parquet_sink)?)?;
+    Ok(dict)
+}
+
+fn target_configs_to_pylist(py: Python<'_>, targets: &[TargetConfig]) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for target in targets {
+        let item = PyDict::new_bound(py);
+        match target {
+            TargetConfig::Null => {
+                item.set_item("type", "null")?;
+            }
+            TargetConfig::Zmq { endpoint } => {
+                item.set_item("type", "zmq")?;
+                item.set_item("endpoint", endpoint)?;
+            }
+        }
+        list.append(item)?;
+    }
+    Ok(list.into_any().unbind())
+}
+
+fn parquet_sink_to_pyobject(
+    py: Python<'_>,
+    parquet_sink: &Option<ParquetSinkConfig>,
+) -> PyResult<PyObject> {
+    let Some(parquet_sink) = parquet_sink else {
+        return Ok(py.None());
+    };
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("path", parquet_sink.path.to_string_lossy().into_owned())?;
+    dict.set_item("rotation", parquet_sink.rotation.as_str())?;
+    dict.set_item("write_input", parquet_sink.write_input)?;
+    dict.set_item("write_output", parquet_sink.write_output)?;
+    Ok(dict.into_any().unbind())
 }
 
 fn parse_window_ns(

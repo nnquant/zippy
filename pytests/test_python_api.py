@@ -907,3 +907,257 @@ def test_source_pipeline_archives_downstream_input_via_parquet_sink(
 
     assert input_files
     assert pq.read_schema(input_files[0]).names == ["symbol", "dt", "price", "ema_2"]
+
+
+def test_engine_rejects_invalid_runtime_config_keywords(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="buffer_capacity"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=schema,
+            id_column="symbol",
+            factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+            target=zippy.NullPublisher(),
+            buffer_capacity=0,
+        )
+
+    with pytest.raises(ValueError, match="overflow_policy"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=schema,
+            id_column="symbol",
+            factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+            target=zippy.NullPublisher(),
+            overflow_policy="invalid",
+        )
+
+    with pytest.raises(ValueError, match="archive_buffer_capacity"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=schema,
+            id_column="symbol",
+            factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+            target=zippy.NullPublisher(),
+            parquet_sink=zippy.ParquetSink(
+                path=str(tmp_path),
+                rotation="none",
+                write_input=True,
+                write_output=False,
+            ),
+            archive_buffer_capacity=0,
+        )
+
+
+def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=True,
+            write_output=False,
+        ),
+        buffer_capacity=32,
+        overflow_policy="reject",
+        archive_buffer_capacity=8,
+    )
+
+    assert engine.status() == "created"
+    assert engine.metrics() == {
+        "processed_batches_total": 0,
+        "processed_rows_total": 0,
+        "output_batches_total": 0,
+        "dropped_batches_total": 0,
+        "late_rows_total": 0,
+        "publish_errors_total": 0,
+        "queue_depth": 0,
+    }
+
+    config = engine.config()
+    assert config["engine_type"] == "reactive"
+    assert config["buffer_capacity"] == 32
+    assert config["overflow_policy"] == "reject"
+    assert config["archive_buffer_capacity"] == 8
+    assert config["targets"] == [{"type": "null"}]
+    assert config["source_linked"] is False
+    assert config["parquet_sink"] == {
+        "path": str(tmp_path),
+        "rotation": "none",
+        "write_input": True,
+        "write_output": False,
+    }
+
+    engine.start()
+    assert engine.status() == "running"
+
+    engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
+    engine.flush()
+
+    metrics = engine.metrics()
+    assert metrics["processed_batches_total"] == 1
+    assert metrics["processed_rows_total"] == 1
+    assert metrics["output_batches_total"] == 1
+    assert metrics["queue_depth"] == 0
+
+    engine.stop()
+    assert engine.status() == "stopped"
+    assert engine.metrics()["processed_batches_total"] == 1
+
+
+def test_timeseries_engine_config_and_output_archive_roundtrip(
+    tmp_path: Path,
+) -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
+        late_data_policy="reject",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=False,
+            write_output=True,
+        ),
+        buffer_capacity=17,
+        overflow_policy="drop_oldest",
+        archive_buffer_capacity=9,
+    )
+
+    config = engine.config()
+    assert config["engine_type"] == "timeseries"
+    assert config["window_ns"] == 60_000_000_000
+    assert config["late_data_policy"] == "reject"
+    assert config["buffer_capacity"] == 17
+    assert config["overflow_policy"] == "drop_oldest"
+    assert config["archive_buffer_capacity"] == 9
+    assert config["parquet_sink"]["write_output"] is True
+
+    engine.start()
+    engine.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)],
+            "price": [10.0],
+        }
+    )
+    engine.stop()
+
+    output_files = list((tmp_path / "output").rglob("*.parquet"))
+
+    assert output_files
+    assert pq.read_schema(output_files[0]).names == [
+        "symbol",
+        "window_start",
+        "window_end",
+        "open",
+    ]
+
+
+def test_timeseries_engine_metrics_report_late_rows() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
+        late_data_policy="drop_with_metric",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+    )
+
+    engine.start()
+    engine.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc)],
+            "price": [11.0],
+        }
+    )
+    engine.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)],
+            "price": [10.0],
+        }
+    )
+    engine.flush()
+
+    assert engine.status() == "running"
+    assert engine.metrics()["late_rows_total"] == 1
+
+    engine.stop()
+    assert engine.status() == "stopped"
+
+
+def test_parquet_sink_failure_marks_engine_failed_status(tmp_path: Path) -> None:
+    blocked_root = tmp_path / "blocked"
+    blocked_root.write_text("not-a-directory", encoding="utf-8")
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(blocked_root),
+            rotation="none",
+            write_input=True,
+            write_output=False,
+        ),
+    )
+
+    engine.start()
+    engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
+
+    with pytest.raises(RuntimeError, match="failed to create parquet directory"):
+        engine.stop()
+
+    assert engine.status() == "failed"

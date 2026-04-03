@@ -33,7 +33,13 @@ def main() -> None:
             write_input=True,
             write_output=True,
         ),
+        buffer_capacity=64,
+        overflow_policy="block",
+        archive_buffer_capacity=16,
     )
+
+    print("config:", engine.config())
+    print("status before start:", engine.status())
 
     engine.start()
     engine.write(
@@ -48,7 +54,11 @@ def main() -> None:
             }
         )
     )
+    engine.flush()
+    print("status after flush:", engine.status())
+    print("metrics:", engine.metrics())
     engine.stop()
+    print("status after stop:", engine.status())
 
     print("archived input/output parquet files under", ARCHIVE_ROOT)
     for path in sorted(ARCHIVE_ROOT.rglob("*.parquet")):
