@@ -4,6 +4,7 @@
 
 - `publish_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布
 - `subscribe_bars.py`：使用 `ZmqSubscriber` 订阅并读取一个 `RecordBatch`
+- `archive_reactive.py`：使用 `ParquetSink` 归档 `ReactiveStateEngine` 的输入和输出
 
 运行顺序：
 
@@ -19,7 +20,14 @@ uv run python examples/python/subscribe_bars.py
 uv run python examples/python/publish_pipeline.py
 ```
 
+3. 如果要看本地 Parquet 归档示例，单独运行：
+
+```bash
+uv run python examples/python/archive_reactive.py
+```
+
 注意事项：
 
 - 示例默认使用 `tcp://127.0.0.1:5555` 发布 reactive 输出，`tcp://127.0.0.1:5556` 发布 bars 输出
 - 发布侧遵守当前 source 生命周期约束：先启动 downstream，再写 source；停止时先停 source，再停 downstream
+- `archive_reactive.py` 默认把文件写到 `/tmp/zippy-parquet-demo/input/` 和 `/tmp/zippy-parquet-demo/output/`
