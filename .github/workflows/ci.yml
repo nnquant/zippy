@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: setup uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: sync python dependencies
+        run: uv sync --extra dev
+
+      - name: run rust tests
+        run: cargo test --workspace
+
+      - name: run zmq feature tests
+        run: cargo test -p zippy-io --features zmq-publisher
+
+      - name: run rust clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: compile benches
+        run: cargo bench -p zippy-engines --no-run
+
+      - name: install python extension
+        run: uv run maturin develop --manifest-path crates/zippy-python/Cargo.toml
+
+      - name: run python tests
+        run: uv run --extra dev pytest pytests -v

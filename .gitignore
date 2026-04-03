@@ -1,0 +1,8 @@
+target/
+.venv/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+.codex
+python/zippy/*.so

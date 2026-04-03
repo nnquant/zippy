@@ -1,0 +1,21 @@
+[package]
+name = "zippy-engines"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+md5 = "0.7"
+zippy-core = { path = "../zippy-core" }
+zippy-operators = { path = "../zippy-operators" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "reactive_pipeline"
+harness = false
+
+[[bench]]
+name = "timeseries_pipeline"
+harness = false

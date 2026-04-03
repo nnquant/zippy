@@ -1,0 +1,8 @@
+[package]
+name = "zippy-operators"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+zippy-core = { path = "../zippy-core" }

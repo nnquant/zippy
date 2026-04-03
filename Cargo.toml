@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/zippy-core",
+    "crates/zippy-operators",
+    "crates/zippy-engines",
+    "crates/zippy-io",
+    "crates/zippy-python",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+arrow = "53.3.0"
+crossbeam-channel = "0.5.15"
+parquet = "53.3.0"
+thiserror = "2.0.12"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

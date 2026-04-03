@@ -1,0 +1,16 @@
+[package]
+name = "zippy-python"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "zippy_internal"
+crate-type = ["cdylib"]
+
+[dependencies]
+arrow = { workspace = true, features = ["pyarrow"] }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+zippy-core = { path = "../zippy-core" }
+zippy-engines = { path = "../zippy-engines" }
+zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
+zippy-operators = { path = "../zippy-operators" }

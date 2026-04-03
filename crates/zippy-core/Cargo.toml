@@ -1,0 +1,9 @@
+[package]
+name = "zippy-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
