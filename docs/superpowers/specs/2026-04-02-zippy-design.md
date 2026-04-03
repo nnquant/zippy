@@ -693,8 +693,8 @@ bars = zippy.TimeSeriesEngine(
     target=[zippy.ZmqPublisher(endpoint="tcp://*:5556")],
 )
 
-reactive.start()
 bars.start()
+reactive.start()
 
 df = pl.DataFrame(
     {
