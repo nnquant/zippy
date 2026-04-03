@@ -9,14 +9,22 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
-    spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle, Publisher as CorePublisher,
+    python_dev_version, spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle,
+    LateDataPolicy, Publisher as CorePublisher,
 };
-use zippy_engines::ReactiveStateEngine as RustReactiveStateEngine;
+use zippy_engines::{
+    ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
+};
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
     ZmqPublisher as RustZmqPublisher,
 };
-use zippy_operators::TsEmaSpec as RustTsEmaSpec;
+use zippy_operators::{
+    AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
+    AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
+    AggSumSpec as RustAggSumSpec, AggVwapSpec as RustAggVwapSpec,
+    AggregationSpec as RustAggregationSpec, TsEmaSpec as RustTsEmaSpec,
+};
 
 fn py_value_error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
@@ -49,6 +57,116 @@ impl TsEmaSpec {
             id_column,
             value_column,
             span,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct AggFirstSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggFirstSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct AggLastSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggLastSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct AggSumSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggSumSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct AggMaxSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggMaxSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct AggMinSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggMinSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct AggCountSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggCountSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct AggVwapSpec {
+    price_column: String,
+    volume_column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AggVwapSpec {
+    #[new]
+    #[pyo3(signature = (price_column, volume_column, output))]
+    fn new(price_column: String, volume_column: String, output: String) -> Self {
+        Self {
+            price_column,
+            volume_column,
             output,
         }
     }
@@ -88,6 +206,16 @@ struct ReactiveStateEngine {
     target: Vec<TargetConfig>,
     handle: Option<EngineHandle>,
     engine: Option<RustReactiveStateEngine>,
+}
+
+#[pyclass]
+struct TimeSeriesEngine {
+    name: String,
+    input_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    target: Vec<TargetConfig>,
+    handle: Option<EngineHandle>,
+    engine: Option<RustTimeSeriesEngine>,
 }
 
 #[pymethods]
@@ -138,40 +266,16 @@ impl ReactiveStateEngine {
     }
 
     fn start(&mut self) -> PyResult<()> {
-        let engine = match self.engine.take() {
-            Some(engine) => engine,
-            None => return Err(py_runtime_error("engine already started")),
-        };
-        let publisher = build_publisher(&self.target)?;
-        let handle = spawn_engine_with_publisher(
-            engine,
-            EngineConfig {
-                name: self.name.clone(),
-                buffer_capacity: 1024,
-                overflow_policy: Default::default(),
-                late_data_policy: Default::default(),
-            },
-            publisher,
-        )
-        .map_err(|error| py_runtime_error(error.to_string()))?;
-        self.handle = Some(handle);
+        self.handle = Some(start_runtime_engine(
+            &self.name,
+            &self.target,
+            &mut self.engine,
+        )?);
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let handle = match self.handle.as_ref() {
-            Some(handle) => handle,
-            None => return Err(py_runtime_error("engine not started")),
-        };
-        let batches = value_to_record_batches(py, value, &self.input_schema)?;
-
-        for batch in batches {
-            handle
-                .write(batch)
-                .map_err(|error| py_runtime_error(error.to_string()))?;
-        }
-
-        Ok(())
+        write_runtime_input(py, &self.handle, value, &self.input_schema)
     }
 
     fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -182,35 +286,110 @@ impl ReactiveStateEngine {
     }
 
     fn flush(&self) -> PyResult<()> {
-        let handle = match self.handle.as_ref() {
-            Some(handle) => handle,
-            None => return Err(py_runtime_error("engine not started")),
-        };
-
-        handle
-            .flush()
-            .map(|_| ())
-            .map_err(|error| py_runtime_error(error.to_string()))
+        flush_runtime_engine(&self.handle)
     }
 
     fn stop(&mut self) -> PyResult<()> {
-        let mut handle = match self.handle.take() {
-            Some(handle) => handle,
-            None => return Err(py_runtime_error("engine not started")),
-        };
-        handle
-            .stop()
-            .map_err(|error| py_runtime_error(error.to_string()))
+        stop_runtime_engine(&mut self.handle)
+    }
+}
+
+#[pymethods]
+impl TimeSeriesEngine {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, window_ns, late_data_policy, factors, target))]
+    fn new(
+        py: Python<'_>,
+        name: String,
+        input_schema: &Bound<'_, PyAny>,
+        id_column: String,
+        dt_column: String,
+        window_ns: i64,
+        late_data_policy: String,
+        factors: Vec<Py<PyAny>>,
+        target: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(input_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let factor_specs = build_aggregation_specs(py, factors)?;
+        let late_data_policy = parse_late_data_policy(&late_data_policy)?;
+        let engine = RustTimeSeriesEngine::new(
+            &name,
+            Arc::clone(&schema),
+            &id_column,
+            &dt_column,
+            window_ns,
+            late_data_policy,
+            factor_specs,
+        )
+        .map_err(|error| py_value_error(error.to_string()))?;
+        let output_schema = engine.output_schema();
+        let target = parse_targets(target)?;
+
+        Ok(Self {
+            name,
+            input_schema: schema,
+            output_schema,
+            target,
+            handle: None,
+            engine: Some(engine),
+        })
+    }
+
+    fn start(&mut self) -> PyResult<()> {
+        self.handle = Some(start_runtime_engine(
+            &self.name,
+            &self.target,
+            &mut self.engine,
+        )?);
+        Ok(())
+    }
+
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        write_runtime_input(py, &self.handle, value, &self.input_schema)
+    }
+
+    fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.output_schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn flush(&self) -> PyResult<()> {
+        flush_runtime_engine(&self.handle)
+    }
+
+    fn stop(&mut self) -> PyResult<()> {
+        stop_runtime_engine(&mut self.handle)
     }
 }
 
 #[pymodule]
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add("__version__", python_dev_version())?;
+    module.add_function(wrap_pyfunction!(version, module)?)?;
     module.add_class::<TsEmaSpec>()?;
+    module.add_class::<AggFirstSpec>()?;
+    module.add_class::<AggLastSpec>()?;
+    module.add_class::<AggSumSpec>()?;
+    module.add_class::<AggMaxSpec>()?;
+    module.add_class::<AggMinSpec>()?;
+    module.add_class::<AggCountSpec>()?;
+    module.add_class::<AggVwapSpec>()?;
     module.add_class::<NullPublisher>()?;
     module.add_class::<ZmqPublisher>()?;
     module.add_class::<ReactiveStateEngine>()?;
+    module.add_class::<TimeSeriesEngine>()?;
     Ok(())
+}
+
+#[pyfunction]
+fn version() -> String {
+    python_dev_version()
 }
 
 fn parse_targets(target: &Bound<'_, PyAny>) -> PyResult<Vec<TargetConfig>> {
@@ -260,6 +439,145 @@ fn build_publisher(targets: &[TargetConfig]) -> PyResult<Box<dyn CorePublisher>>
     }
 
     Ok(Box::new(RustFanoutPublisher::new(publishers)))
+}
+
+fn start_runtime_engine<E: Engine>(
+    name: &str,
+    targets: &[TargetConfig],
+    engine: &mut Option<E>,
+) -> PyResult<EngineHandle> {
+    let engine = match engine.take() {
+        Some(engine) => engine,
+        None => return Err(py_runtime_error("engine already started")),
+    };
+    let publisher = build_publisher(targets)?;
+
+    spawn_engine_with_publisher(
+        engine,
+        EngineConfig {
+            name: name.to_string(),
+            buffer_capacity: 1024,
+            overflow_policy: Default::default(),
+            late_data_policy: Default::default(),
+        },
+        publisher,
+    )
+    .map_err(|error| py_runtime_error(error.to_string()))
+}
+
+fn write_runtime_input(
+    py: Python<'_>,
+    handle: &Option<EngineHandle>,
+    value: &Bound<'_, PyAny>,
+    input_schema: &Schema,
+) -> PyResult<()> {
+    let handle = runtime_handle(handle)?;
+    let batches = value_to_record_batches(py, value, input_schema)?;
+
+    for batch in batches {
+        handle
+            .write(batch)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn flush_runtime_engine(handle: &Option<EngineHandle>) -> PyResult<()> {
+    runtime_handle(handle)?
+        .flush()
+        .map(|_| ())
+        .map_err(|error| py_runtime_error(error.to_string()))
+}
+
+fn stop_runtime_engine(handle: &mut Option<EngineHandle>) -> PyResult<()> {
+    let mut handle = match handle.take() {
+        Some(handle) => handle,
+        None => return Err(py_runtime_error("engine not started")),
+    };
+
+    handle
+        .stop()
+        .map_err(|error| py_runtime_error(error.to_string()))
+}
+
+fn runtime_handle(handle: &Option<EngineHandle>) -> PyResult<&EngineHandle> {
+    handle
+        .as_ref()
+        .ok_or_else(|| py_runtime_error("engine not started"))
+}
+
+fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
+    match value {
+        "reject" => Ok(LateDataPolicy::Reject),
+        "drop_with_metric" => Ok(LateDataPolicy::DropWithMetric),
+        _ => Err(py_value_error(
+            "late_data_policy must be 'reject' or 'drop_with_metric'",
+        )),
+    }
+}
+
+fn build_aggregation_specs(
+    py: Python<'_>,
+    factors: Vec<Py<PyAny>>,
+) -> PyResult<Vec<Box<dyn RustAggregationSpec>>> {
+    factors
+        .into_iter()
+        .map(|factor| build_aggregation_spec(py, factor.bind(py)))
+        .collect()
+}
+
+fn build_aggregation_spec(
+    py: Python<'_>,
+    factor: &Bound<'_, PyAny>,
+) -> PyResult<Box<dyn RustAggregationSpec>> {
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggFirstSpec>>() {
+        return RustAggFirstSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggLastSpec>>() {
+        return RustAggLastSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggSumSpec>>() {
+        return RustAggSumSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggMaxSpec>>() {
+        return RustAggMaxSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggMinSpec>>() {
+        return RustAggMinSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggCountSpec>>() {
+        return RustAggCountSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AggVwapSpec>>() {
+        return RustAggVwapSpec::new(&spec.price_column, &spec.volume_column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    let _ = py;
+
+    Err(PyTypeError::new_err(
+        "factors must contain AggFirstSpec, AggLastSpec, AggSumSpec, AggMaxSpec, AggMinSpec, AggCountSpec, or AggVwapSpec",
+    ))
 }
 
 fn value_to_record_batches(
