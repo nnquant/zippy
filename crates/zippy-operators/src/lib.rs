@@ -1,4 +1,5 @@
 pub mod aggregation;
+pub mod expression;
 pub mod reactive;
 
 pub use aggregation::{
@@ -9,6 +10,7 @@ pub use reactive::{
     AbsSpec, CastSpec, ClipSpec, LogSpec, ReactiveFactor, TsDelaySpec, TsDiffSpec, TsEmaSpec,
     TsMeanSpec, TsReturnSpec, TsStdSpec,
 };
+pub use expression::ExpressionSpec;
 
 pub fn crate_name() -> &'static str {
     "zippy-operators"

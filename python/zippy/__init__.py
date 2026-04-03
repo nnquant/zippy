@@ -8,6 +8,7 @@ from ._internal import AggSumSpec
 from ._internal import AggVwapSpec
 from ._internal import CastSpec
 from ._internal import ClipSpec
+from ._internal import ExpressionFactor
 from ._internal import LogSpec
 from ._internal import NullPublisher
 from ._internal import ParquetSink
@@ -121,6 +122,11 @@ def CAST(*, column: str, dtype: str, output: str) -> CastSpec:
     return CastSpec(id_column="", value_column=column, dtype=dtype, output=output)
 
 
+def EXPR(*, expression: str, output: str) -> ExpressionFactor:
+    """Create a reactive expression factor spec."""
+    return ExpressionFactor(expression=expression, output=output)
+
+
 def AGG_FIRST(*, column: str, output: str) -> AggFirstSpec:
     """Create a first-value aggregation spec."""
     return AggFirstSpec(column=column, output=output)
@@ -172,6 +178,7 @@ __all__ = [
     "CastSpec",
     "ClipSpec",
     "Duration",
+    "ExpressionFactor",
     "LogSpec",
     "NullPublisher",
     "ParquetSink",
@@ -193,6 +200,7 @@ __all__ = [
     "AGG_VWAP",
     "CAST",
     "CLIP",
+    "EXPR",
     "LOG",
     "TS_DELAY",
     "TS_DIFF",

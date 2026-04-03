@@ -6,6 +6,29 @@
 - `subscribe_bars.py`：使用 `ZmqSubscriber` 订阅并读取一个 `RecordBatch`
 - `archive_reactive.py`：使用 `ParquetSink` 归档 `ReactiveStateEngine` 的输入和输出
 
+表达式因子：
+
+- 当前 Python API 额外支持 `zippy.EXPR(expression="price + ema_2", output="price_plus_ema")`
+- 表达式运行在 `ReactiveStateEngine` 内，支持引用输入列和前序 reactive factor 输出
+- 当前支持的语法边界是：`+` / `-` / `*` / `/`、括号、数值字面量，以及 `abs(...)`、`log(...)`、`clip(...)`、`cast(...)`
+- 未知标识符和不支持函数会在 `ReactiveStateEngine(...)` 构造阶段直接报错，而不是等到 `start()` 或 `write()` 才失败
+
+最小示例：
+
+```python
+engine = zippy.ReactiveStateEngine(
+    name="tick_expr",
+    input_schema=schema,
+    id_column="symbol",
+    factors=[
+        zippy.TS_EMA(column="price", span=2, output="ema_2"),
+        zippy.EXPR(expression="price + ema_2", output="price_plus_ema"),
+        zippy.EXPR(expression="clip(price_plus_ema, 20.0, 30.0)", output="clipped_total"),
+    ],
+    target=zippy.NullPublisher(),
+)
+```
+
 运行顺序：
 
 1. 在一个终端启动订阅侧：

@@ -471,6 +471,88 @@ def test_reactive_engine_accepts_all_v1_operators_via_design_helpers() -> None:
     engine.stop()
 
 
+def test_reactive_engine_accepts_expression_factor_helper() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+    expected_output_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+            pa.field("ema_2", pa.float64(), nullable=False),
+            pa.field("price_plus_ema", pa.float64(), nullable=True),
+        ]
+    )
+
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=input_schema,
+        id_column="symbol",
+        factors=[
+            zippy.TS_EMA(column="price", span=2, output="ema_2"),
+            zippy.EXPR(expression="price + ema_2", output="price_plus_ema"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    assert engine.output_schema() == expected_output_schema
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+    engine.write({"symbol": ["A", "A"], "price": [10.0, 16.0]})
+    engine.flush()
+
+    received = subscriber.recv()
+
+    assert received.column(2).to_pylist() == [10.0, 14.0]
+    assert received.column(3).to_pylist() == [20.0, 30.0]
+
+    engine.stop()
+    subscriber.close()
+
+
+def test_expression_factor_rejects_unknown_identifier() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unknown expression identifier"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=input_schema,
+            id_column="symbol",
+            factors=[zippy.EXPR(expression="missing + 1.0", output="score")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_expression_factor_rejects_unsupported_function() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unsupported expression function"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=input_schema,
+            id_column="symbol",
+            factors=[zippy.EXPR(expression="sqrt(price)", output="score")],
+            target=zippy.NullPublisher(),
+        )
+
+
 def test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpers() -> None:
     input_schema = pa.schema(
         [

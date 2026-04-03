@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, ZippyError};
 use zippy_engines::ReactiveStateEngine;
-use zippy_operators::{CastSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
+use zippy_operators::{CastSpec, ExpressionSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
 
 fn input_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -221,5 +221,39 @@ fn reactive_engine_supports_mixed_output_dtypes() {
             DataType::Float64,
             DataType::Int64,
         ]
+    );
+}
+
+#[test]
+fn reactive_engine_expression_factor_can_reference_previous_factor_output() {
+    let expr_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("ema_2", DataType::Float64, false),
+    ]));
+    let factors = vec![
+        TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap(),
+        ExpressionSpec::new("value + ema_2", "value_plus_ema")
+            .build(expr_schema.as_ref())
+            .unwrap(),
+    ];
+    let mut engine =
+        ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["a", "a"], vec![10.0, 16.0]))
+        .unwrap();
+    let output = &outputs[0];
+
+    assert_eq!(
+        column_names(output),
+        vec!["id", "value", "ema_2", "value_plus_ema"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_float_options_eq(
+        &float64_values(output.column(3)),
+        &[Some(20.0), Some(30.0)],
     );
 }

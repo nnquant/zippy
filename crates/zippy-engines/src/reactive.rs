@@ -22,7 +22,7 @@ impl ReactiveStateEngine {
     /// :type name: impl Into<String>
     /// :param input_schema: Input schema consumed by the engine.
     /// :type input_schema: SchemaRef
-    /// :param factors: Stateful factors evaluated against the original input batch.
+    /// :param factors: Stateful factors evaluated in declaration order against the current batch.
     /// :type factors: Vec<Box<dyn ReactiveFactor>>
     /// :returns: Initialized engine with stable output schema ordering.
     /// :rtype: Result<ReactiveStateEngine>
@@ -87,10 +87,23 @@ impl Engine for ReactiveStateEngine {
         }
 
         let mut columns = batch.columns().to_vec();
+        let mut current_schema = Arc::clone(&self.input_schema);
 
         for factor in &mut self.factors {
-            let output_column: ArrayRef = factor.evaluate(&batch)?;
+            let current_batch = RecordBatch::try_new(Arc::clone(&current_schema), columns.clone())
+                .map_err(|error| ZippyError::Io {
+                    reason: format!(
+                        "failed to build reactive intermediate batch error=[{}]",
+                        error
+                    ),
+                })?;
+            let output_field = factor.output_field();
+            let output_column: ArrayRef = factor.evaluate(&current_batch)?;
             columns.push(output_column);
+
+            let mut fields = current_schema.fields().iter().cloned().collect::<Vec<_>>();
+            fields.push(Arc::new(output_field));
+            current_schema = Arc::new(Schema::new(fields));
         }
 
         let output =

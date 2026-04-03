@@ -31,7 +31,8 @@ use zippy_operators::{
     AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
     AggSumSpec as RustAggSumSpec, AggVwapSpec as RustAggVwapSpec,
     AggregationSpec as RustAggregationSpec, CastSpec as RustCastSpec, ClipSpec as RustClipSpec,
-    LogSpec as RustLogSpec, TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec,
+    ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec,
+    TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec,
     TsEmaSpec as RustTsEmaSpec, TsMeanSpec as RustTsMeanSpec,
     TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
 };
@@ -526,6 +527,21 @@ impl CastSpec {
 }
 
 #[pyclass]
+struct ExpressionFactor {
+    expression: String,
+    output: String,
+}
+
+#[pymethods]
+impl ExpressionFactor {
+    #[new]
+    #[pyo3(signature = (expression, output))]
+    fn new(expression: String, output: String) -> Self {
+        Self { expression, output }
+    }
+}
+
+#[pyclass]
 struct AggFirstSpec {
     column: String,
     output: String,
@@ -795,7 +811,7 @@ impl ReactiveStateEngine {
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        let factor_specs = build_reactive_specs(py, &id_column, factors)?;
+        let factor_specs = build_reactive_specs(py, &schema, &id_column, factors)?;
         let engine = RustReactiveStateEngine::new(&name, Arc::clone(&schema), factor_specs)
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
@@ -1082,6 +1098,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<LogSpec>()?;
     module.add_class::<ClipSpec>()?;
     module.add_class::<CastSpec>()?;
+    module.add_class::<ExpressionFactor>()?;
     module.add_class::<AggFirstSpec>()?;
     module.add_class::<AggLastSpec>()?;
     module.add_class::<AggSumSpec>()?;
@@ -1601,18 +1618,37 @@ fn parse_window_ns(
 
 fn build_reactive_specs(
     py: Python<'_>,
+    input_schema: &Arc<Schema>,
     id_column: &str,
     factors: Vec<Py<PyAny>>,
 ) -> PyResult<Vec<Box<dyn zippy_operators::ReactiveFactor>>> {
-    factors
-        .into_iter()
-        .map(|factor| build_reactive_spec(py, id_column, factor.bind(py)))
-        .collect()
+    let mut current_schema = Arc::clone(input_schema);
+    let mut built_factors = Vec::with_capacity(factors.len());
+
+    for factor in factors {
+        let built = build_reactive_spec(py, id_column, current_schema.as_ref(), factor.bind(py))?;
+        let output_field = built.output_field();
+
+        if current_schema.index_of(output_field.name()).is_ok() {
+            return Err(py_value_error(format!(
+                "duplicate reactive output field field=[{}]",
+                output_field.name()
+            )));
+        }
+
+        let mut fields = current_schema.fields().iter().cloned().collect::<Vec<_>>();
+        fields.push(Arc::new(output_field));
+        current_schema = Arc::new(Schema::new(fields));
+        built_factors.push(built);
+    }
+
+    Ok(built_factors)
 }
 
 fn build_reactive_spec(
     py: Python<'_>,
     id_column: &str,
+    current_schema: &Schema,
     factor: &Bound<'_, PyAny>,
 ) -> PyResult<Box<dyn zippy_operators::ReactiveFactor>> {
     if let Ok(spec) = factor.extract::<PyRef<'_, TsEmaSpec>>() {
@@ -1681,10 +1717,16 @@ fn build_reactive_spec(
             .map_err(|error| py_value_error(error.to_string()));
     }
 
+    if let Ok(spec) = factor.extract::<PyRef<'_, ExpressionFactor>>() {
+        return RustExpressionSpec::new(&spec.expression, &spec.output)
+            .build(current_schema)
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
     let _ = py;
 
     Err(PyTypeError::new_err(
-        "factors must contain TsEmaSpec, TsReturnSpec, TsMeanSpec, TsStdSpec, TsDelaySpec, TsDiffSpec, AbsSpec, LogSpec, ClipSpec, or CastSpec",
+        "factors must contain TsEmaSpec, TsReturnSpec, TsMeanSpec, TsStdSpec, TsDelaySpec, TsDiffSpec, AbsSpec, LogSpec, ClipSpec, CastSpec, or ExpressionFactor",
     ))
 }
 

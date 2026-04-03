@@ -113,6 +113,10 @@ class CastSpec:
     ) -> None: ...
 
 
+class ExpressionFactor:
+    def __init__(self, expression: str, output: str) -> None: ...
+
+
 class AggFirstSpec:
     def __init__(self, column: str, output: str) -> None: ...
 
@@ -186,6 +190,7 @@ ReactiveFactor = (
     | LogSpec
     | ClipSpec
     | CastSpec
+    | ExpressionFactor
 )
 AggregationFactor = (
     AggFirstSpec

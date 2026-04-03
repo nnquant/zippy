@@ -5,8 +5,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::ZippyError;
 use zippy_operators::{
-    AbsSpec, CastSpec, ClipSpec, LogSpec, TsDelaySpec, TsDiffSpec, TsEmaSpec, TsMeanSpec,
-    TsReturnSpec, TsStdSpec,
+    AbsSpec, CastSpec, ClipSpec, ExpressionSpec, LogSpec, TsDelaySpec, TsDiffSpec, TsEmaSpec,
+    TsMeanSpec, TsReturnSpec, TsStdSpec,
 };
 
 fn input_schema() -> Arc<Schema> {
@@ -275,6 +275,65 @@ fn v1_reactive_factors_cover_windowed_pointwise_and_cast_outputs() {
         int64_values(&cast.evaluate(&output).unwrap()),
         vec![Some(10), Some(16), Some(19), Some(25)],
     );
+}
+
+#[test]
+fn expression_factor_supports_arithmetic_and_builtin_functions() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "a"])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![-10.0, 25.0])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut factor = ExpressionSpec::new("clip(abs(value) + 1.0, 0.0, 20.0)", "score")
+        .build(schema.as_ref())
+        .unwrap();
+
+    assert_eq!(factor.output_field(), Field::new("score", DataType::Float64, false));
+    assert_float_options_eq(
+        &float64_values(&factor.evaluate(&batch).unwrap()),
+        &[Some(11.0), Some(20.0)],
+    );
+}
+
+#[test]
+fn expression_factor_rejects_unknown_identifier() {
+    let error = match ExpressionSpec::new("missing + 1.0", "score").build(input_schema().as_ref())
+    {
+        Ok(_) => panic!("expected unknown identifier to be rejected"),
+        Err(error) => error,
+    };
+
+    match error {
+        ZippyError::InvalidConfig { reason } => {
+            assert!(reason.contains("unknown expression identifier"));
+            assert!(reason.contains("missing"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn expression_factor_rejects_unsupported_function() {
+    let error = match ExpressionSpec::new("sqrt(value)", "score").build(input_schema().as_ref())
+    {
+        Ok(_) => panic!("expected unsupported function to be rejected"),
+        Err(error) => error,
+    };
+
+    match error {
+        ZippyError::InvalidConfig { reason } => {
+            assert!(reason.contains("unsupported expression function"));
+            assert!(reason.contains("sqrt"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
