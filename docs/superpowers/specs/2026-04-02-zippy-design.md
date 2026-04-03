@@ -557,6 +557,9 @@ bars = zippy.TimeSeriesEngine(
 - 级联传输对象为 `RecordBatch`
 - 不经过 Python 层
 - 不触发 GIL
+- `source.output_schema()` 必须与 downstream `input_schema` 完全一致
+- downstream 必须在 source 首次 `write()` 前完成 `start()`
+- source 必须先 `stop()`，downstream 再 `stop()`
 
 ### 7.2 target：结果发布
 
@@ -710,8 +713,8 @@ reactive.write(df)
 reactive.flush()
 bars.flush()
 
-bars.stop()
 reactive.stop()
+bars.stop()
 ```
 
 ---

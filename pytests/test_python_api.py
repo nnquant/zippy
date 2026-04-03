@@ -465,6 +465,174 @@ def test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpe
     engine.stop()
 
 
+def test_timeseries_engine_accepts_reactive_source_pipeline() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+
+    bars = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        source=reactive,
+        input_schema=reactive.output_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window_ns=60_000_000_000,
+        late_data_policy="reject",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+    )
+
+    reactive.start()
+    bars.start()
+    reactive.write(
+        {
+            "symbol": ["A", "A"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 11.0],
+        }
+    )
+    reactive.flush()
+    bars.flush()
+    reactive.stop()
+    bars.stop()
+
+
+def test_timeseries_engine_rejects_source_schema_mismatch_at_construction() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+    mismatched_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("extra", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+
+    with pytest.raises(ValueError, match="source output schema"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            source=reactive,
+            input_schema=mismatched_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window_ns=60_000_000_000,
+            late_data_policy="reject",
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_source_write_requires_downstream_started() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+    bars = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        source=reactive,
+        input_schema=reactive.output_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window_ns=60_000_000_000,
+        late_data_policy="reject",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+    )
+
+    reactive.start()
+
+    with pytest.raises(RuntimeError, match="downstream engine must be started"):
+        reactive.write(
+            {
+                "symbol": ["A"],
+                "dt": [datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)],
+                "price": [10.0],
+            }
+        )
+
+    reactive.stop()
+    bars.start()
+    bars.stop()
+
+
+def test_downstream_stop_requires_source_stopped() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+    bars = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        source=reactive,
+        input_schema=reactive.output_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window_ns=60_000_000_000,
+        late_data_policy="reject",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+    )
+
+    reactive.start()
+    bars.start()
+
+    with pytest.raises(RuntimeError, match="source engine must be stopped"):
+        bars.stop()
+
+    reactive.stop()
+    bars.stop()
+
+
 def test_reactive_engine_accepts_target_list() -> None:
     schema = pa.schema(
         [

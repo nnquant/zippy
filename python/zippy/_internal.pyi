@@ -168,6 +168,7 @@ class ReactiveStateEngine:
         id_column: str,
         factors: list[ReactiveFactor],
         target: PublisherTarget,
+        source: ReactiveStateEngine | TimeSeriesEngine | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -192,6 +193,7 @@ class TimeSeriesEngine:
         late_data_policy: str,
         factors: list[AggregationFactor],
         target: PublisherTarget,
+        source: ReactiveStateEngine | TimeSeriesEngine | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...

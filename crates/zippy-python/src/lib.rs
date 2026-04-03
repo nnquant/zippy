@@ -1,6 +1,6 @@
 #![allow(clippy::useless_conversion)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
     python_dev_version, spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle,
-    LateDataPolicy, Publisher as CorePublisher,
+    EngineStatus, LateDataPolicy, Publisher as CorePublisher,
 };
 use zippy_engines::{
     ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
@@ -37,10 +37,27 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
     PyRuntimeError::new_err(message.into())
 }
 
+type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
+type DownstreamLink = SharedHandle;
+
 #[derive(Clone)]
 enum TargetConfig {
     Null,
     Zmq { endpoint: String },
+}
+
+struct InProcessPublisher {
+    downstream: DownstreamLink,
+}
+
+impl CorePublisher for InProcessPublisher {
+    fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
+        let guard = self.downstream.lock().unwrap();
+        let handle = guard.as_ref().ok_or(zippy_core::ZippyError::InvalidState {
+            status: "engine not started",
+        })?;
+        handle.write(batch.clone())
+    }
 }
 
 #[pyclass]
@@ -409,8 +426,10 @@ struct ReactiveStateEngine {
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
-    handle: Option<EngineHandle>,
+    handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
 }
 
 #[pyclass]
@@ -419,14 +438,16 @@ struct TimeSeriesEngine {
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
-    handle: Option<EngineHandle>,
+    handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
 }
 
 #[pymethods]
 impl ReactiveStateEngine {
     #[new]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, source=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -434,6 +455,7 @@ impl ReactiveStateEngine {
         id_column: String,
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
+        source: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -444,27 +466,34 @@ impl ReactiveStateEngine {
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
+        let handle = Arc::new(Mutex::new(None));
+        let source_owner = register_source(source, Arc::clone(&handle), schema.as_ref())?;
 
         Ok(Self {
             name,
             input_schema: schema,
             output_schema,
             target,
-            handle: None,
+            handle,
             engine: Some(engine),
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
         })
     }
 
     fn start(&mut self) -> PyResult<()> {
-        self.handle = Some(start_runtime_engine(
+        let handle = start_runtime_engine(
             &self.name,
             &self.target,
+            &self.downstreams,
             &mut self.engine,
-        )?);
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
         write_runtime_input(py, &self.handle, value, &self.input_schema)
     }
 
@@ -479,8 +508,9 @@ impl ReactiveStateEngine {
         flush_runtime_engine(&self.handle)
     }
 
-    fn stop(&mut self) -> PyResult<()> {
-        stop_runtime_engine(&mut self.handle)
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(&self.handle)
     }
 }
 
@@ -488,7 +518,7 @@ impl ReactiveStateEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, window_ns, late_data_policy, factors, target))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, window_ns, late_data_policy, factors, target, source=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -499,6 +529,7 @@ impl TimeSeriesEngine {
         late_data_policy: String,
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
+        source: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -518,27 +549,34 @@ impl TimeSeriesEngine {
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
+        let handle = Arc::new(Mutex::new(None));
+        let source_owner = register_source(source, Arc::clone(&handle), schema.as_ref())?;
 
         Ok(Self {
             name,
             input_schema: schema,
             output_schema,
             target,
-            handle: None,
+            handle,
             engine: Some(engine),
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
         })
     }
 
     fn start(&mut self) -> PyResult<()> {
-        self.handle = Some(start_runtime_engine(
+        let handle = start_runtime_engine(
             &self.name,
             &self.target,
+            &self.downstreams,
             &mut self.engine,
-        )?);
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
         write_runtime_input(py, &self.handle, value, &self.input_schema)
     }
 
@@ -553,8 +591,9 @@ impl TimeSeriesEngine {
         flush_runtime_engine(&self.handle)
     }
 
-    fn stop(&mut self) -> PyResult<()> {
-        stop_runtime_engine(&mut self.handle)
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(&self.handle)
     }
 }
 
@@ -619,8 +658,56 @@ fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
     ))
 }
 
-fn build_publisher(targets: &[TargetConfig]) -> PyResult<Box<dyn CorePublisher>> {
-    let mut publishers = Vec::<Box<dyn CorePublisher>>::with_capacity(targets.len());
+fn register_source(
+    source: Option<&Bound<'_, PyAny>>,
+    downstream: DownstreamLink,
+    input_schema: &Schema,
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream);
+        return Ok(Some(source.clone().unbind()));
+    }
+
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream);
+        return Ok(Some(source.clone().unbind()));
+    }
+
+    Err(PyTypeError::new_err(
+        "source must be ReactiveStateEngine or TimeSeriesEngine",
+    ))
+}
+
+fn build_publisher(
+    targets: &[TargetConfig],
+    downstreams: &[DownstreamLink],
+) -> PyResult<Box<dyn CorePublisher>> {
+    let mut publishers =
+        Vec::<Box<dyn CorePublisher>>::with_capacity(targets.len() + downstreams.len());
 
     for target in targets {
         match target {
@@ -633,6 +720,12 @@ fn build_publisher(targets: &[TargetConfig]) -> PyResult<Box<dyn CorePublisher>>
         }
     }
 
+    for downstream in downstreams {
+        publishers.push(Box::new(InProcessPublisher {
+            downstream: Arc::clone(downstream),
+        }));
+    }
+
     if publishers.len() == 1 {
         return Ok(publishers.pop().expect("single publisher checked above"));
     }
@@ -640,16 +733,65 @@ fn build_publisher(targets: &[TargetConfig]) -> PyResult<Box<dyn CorePublisher>>
     Ok(Box::new(RustFanoutPublisher::new(publishers)))
 }
 
+fn ensure_downstreams_running(downstreams: &[DownstreamLink]) -> PyResult<()> {
+    for downstream in downstreams {
+        let guard = downstream.lock().unwrap();
+        let runtime = guard.as_ref().ok_or_else(|| {
+            py_runtime_error("downstream engine must be started before source engine writes")
+        })?;
+
+        if runtime.status() != EngineStatus::Running {
+            return Err(py_runtime_error(
+                "downstream engine must be started before source engine writes",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_source_stopped(py: Python<'_>, source_owner: &Option<Py<PyAny>>) -> PyResult<()> {
+    let Some(source_owner) = source_owner else {
+        return Ok(());
+    };
+    let source = source_owner.bind(py);
+
+    if let Ok(engine) = source.extract::<PyRef<'_, ReactiveStateEngine>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
+    if let Ok(engine) = source.extract::<PyRef<'_, TimeSeriesEngine>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
+    Ok(())
+}
+
+fn ensure_runtime_is_not_running(handle: &SharedHandle) -> PyResult<()> {
+    let guard = handle.lock().unwrap();
+
+    if let Some(runtime) = guard.as_ref() {
+        if runtime.status() == EngineStatus::Running {
+            return Err(py_runtime_error(
+                "source engine must be stopped before downstream engine stops",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn start_runtime_engine<E: Engine>(
     name: &str,
     targets: &[TargetConfig],
+    downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
 ) -> PyResult<EngineHandle> {
     let engine = match engine.take() {
         Some(engine) => engine,
         None => return Err(py_runtime_error("engine already started")),
     };
-    let publisher = build_publisher(targets)?;
+    let publisher = build_publisher(targets, downstreams)?;
 
     spawn_engine_with_publisher(
         engine,
@@ -666,44 +808,53 @@ fn start_runtime_engine<E: Engine>(
 
 fn write_runtime_input(
     py: Python<'_>,
-    handle: &Option<EngineHandle>,
+    handle: &SharedHandle,
     value: &Bound<'_, PyAny>,
     input_schema: &Schema,
 ) -> PyResult<()> {
-    let handle = runtime_handle(handle)?;
     let batches = value_to_record_batches(py, value, input_schema)?;
 
     for batch in batches {
-        handle
-            .write(batch)
-            .map_err(|error| py_runtime_error(error.to_string()))?;
+        with_handle(handle, |runtime| {
+            runtime
+                .write(batch)
+                .map_err(|error| py_runtime_error(error.to_string()))
+        })?;
     }
 
     Ok(())
 }
 
-fn flush_runtime_engine(handle: &Option<EngineHandle>) -> PyResult<()> {
-    runtime_handle(handle)?
-        .flush()
-        .map(|_| ())
-        .map_err(|error| py_runtime_error(error.to_string()))
+fn flush_runtime_engine(handle: &SharedHandle) -> PyResult<()> {
+    with_handle(handle, |runtime| {
+        runtime
+            .flush()
+            .map(|_| ())
+            .map_err(|error| py_runtime_error(error.to_string()))
+    })
 }
 
-fn stop_runtime_engine(handle: &mut Option<EngineHandle>) -> PyResult<()> {
-    let mut handle = match handle.take() {
+fn stop_runtime_engine(handle: &SharedHandle) -> PyResult<()> {
+    let mut guard = handle.lock().unwrap();
+    let mut runtime = match guard.take() {
         Some(handle) => handle,
         None => return Err(py_runtime_error("engine not started")),
     };
 
-    handle
+    runtime
         .stop()
         .map_err(|error| py_runtime_error(error.to_string()))
 }
 
-fn runtime_handle(handle: &Option<EngineHandle>) -> PyResult<&EngineHandle> {
-    handle
+fn with_handle<T>(
+    handle: &SharedHandle,
+    callback: impl FnOnce(&EngineHandle) -> PyResult<T>,
+) -> PyResult<T> {
+    let guard = handle.lock().unwrap();
+    let runtime = guard
         .as_ref()
-        .ok_or_else(|| py_runtime_error("engine not started"))
+        .ok_or_else(|| py_runtime_error("engine not started"))?;
+    callback(runtime)
 }
 
 fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
@@ -992,4 +1143,132 @@ fn py_table_to_record_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBa
         .call_method0("to_batches")
         .map_err(|error| py_value_error(error.to_string()))?;
     py_batches_to_record_batches(&batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use zippy_engines::{
+        ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
+    };
+    use zippy_operators::{AggFirstSpec as RustAggFirstSpec, TsEmaSpec as RustTsEmaSpec};
+
+    const MINUTE_NS: i64 = 60_000_000_000;
+
+    fn tick_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new(
+                "dt",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("price", DataType::Float64, false),
+        ]))
+    }
+
+    fn tick_batch(symbols: Vec<&str>, dts: Vec<i64>, prices: Vec<f64>) -> RecordBatch {
+        RecordBatch::try_new(
+            tick_schema(),
+            vec![
+                Arc::new(StringArray::from(symbols)) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
+                Arc::new(Float64Array::from(prices)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn string_values(array: &ArrayRef) -> Vec<String> {
+        let values = array.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..values.len())
+            .map(|index| values.value(index).to_string())
+            .collect()
+    }
+
+    fn timestamp_values(array: &ArrayRef) -> Vec<i64> {
+        let values = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        (0..values.len()).map(|index| values.value(index)).collect()
+    }
+
+    fn float_values(array: &ArrayRef) -> Vec<f64> {
+        let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
+        (0..values.len()).map(|index| values.value(index)).collect()
+    }
+
+    #[test]
+    fn in_process_publisher_routes_source_batches_to_downstream_engine() {
+        let downstream_handle: SharedHandle = Arc::new(Mutex::new(None));
+        let upstream_engine = RustReactiveStateEngine::new(
+            "tick_factors",
+            tick_schema(),
+            vec![RustTsEmaSpec::new("symbol", "price", 2, "ema_2")
+                .build()
+                .unwrap()],
+        )
+        .unwrap();
+        let downstream_engine = RustTimeSeriesEngine::new(
+            "bars",
+            upstream_engine.output_schema(),
+            "symbol",
+            "dt",
+            MINUTE_NS,
+            LateDataPolicy::Reject,
+            vec![RustAggFirstSpec::new("price", "open").build().unwrap()],
+        )
+        .unwrap();
+
+        let downstream_runtime = spawn_engine_with_publisher(
+            downstream_engine,
+            EngineConfig {
+                name: "bars".to_string(),
+                buffer_capacity: 1024,
+                overflow_policy: Default::default(),
+                late_data_policy: Default::default(),
+            },
+            Box::new(RustNullPublisher::default()),
+        )
+        .unwrap();
+        *downstream_handle.lock().unwrap() = Some(downstream_runtime);
+
+        let mut upstream_handle = spawn_engine_with_publisher(
+            upstream_engine,
+            EngineConfig {
+                name: "tick_factors".to_string(),
+                buffer_capacity: 1024,
+                overflow_policy: Default::default(),
+                late_data_policy: Default::default(),
+            },
+            InProcessPublisher {
+                downstream: Arc::clone(&downstream_handle),
+            },
+        )
+        .unwrap();
+
+        upstream_handle
+            .write(tick_batch(vec!["A"], vec![1_000_000_000], vec![10.0]))
+            .unwrap();
+        upstream_handle.flush().unwrap();
+
+        let flushed = {
+            let guard = downstream_handle.lock().unwrap();
+            guard.as_ref().unwrap().flush().unwrap()
+        };
+
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(string_values(flushed[0].column(0)), vec!["A".to_string()]);
+        assert_eq!(timestamp_values(flushed[0].column(1)), vec![0]);
+        assert_eq!(timestamp_values(flushed[0].column(2)), vec![MINUTE_NS]);
+        assert_eq!(float_values(flushed[0].column(3)), vec![10.0]);
+
+        upstream_handle.stop().unwrap();
+        let mut guard = downstream_handle.lock().unwrap();
+        guard.as_mut().unwrap().stop().unwrap();
+    }
 }
