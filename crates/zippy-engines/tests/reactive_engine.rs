@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, ZippyError};
 use zippy_engines::ReactiveStateEngine;
-use zippy_operators::{TsEmaSpec, TsReturnSpec};
+use zippy_operators::{CastSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
 
 fn input_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -190,4 +190,36 @@ fn reactive_engine_rejects_input_schema_mismatch() {
         .unwrap_err();
 
     assert!(matches!(error, ZippyError::SchemaMismatch { .. }));
+}
+
+#[test]
+fn reactive_engine_supports_mixed_output_dtypes() {
+    let factors = vec![
+        TsDiffSpec::new("id", "value", 1, "diff_1").build().unwrap(),
+        CastSpec::new("id", "value", "int64", "value_i64")
+            .build()
+            .unwrap(),
+    ];
+    let mut engine =
+        ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["a", "a"], vec![10.0, 16.0]))
+        .unwrap();
+    let output = &outputs[0];
+
+    assert_eq!(
+        output
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Utf8,
+            DataType::Float64,
+            DataType::Float64,
+            DataType::Int64,
+        ]
+    );
 }

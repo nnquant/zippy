@@ -14,6 +14,85 @@ class TsEmaSpec:
     ) -> None: ...
 
 
+class TsReturnSpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        period: int,
+        output: str,
+    ) -> None: ...
+
+
+class TsMeanSpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        window: int,
+        output: str,
+    ) -> None: ...
+
+
+class TsStdSpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        window: int,
+        output: str,
+    ) -> None: ...
+
+
+class TsDelaySpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        period: int,
+        output: str,
+    ) -> None: ...
+
+
+class TsDiffSpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        period: int,
+        output: str,
+    ) -> None: ...
+
+
+class AbsSpec:
+    def __init__(self, id_column: str, value_column: str, output: str) -> None: ...
+
+
+class LogSpec:
+    def __init__(self, id_column: str, value_column: str, output: str) -> None: ...
+
+
+class ClipSpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        min: float,
+        max: float,
+        output: str,
+    ) -> None: ...
+
+
+class CastSpec:
+    def __init__(
+        self,
+        id_column: str,
+        value_column: str,
+        dtype: str,
+        output: str,
+    ) -> None: ...
+
+
 class AggFirstSpec:
     def __init__(self, column: str, output: str) -> None: ...
 
@@ -58,6 +137,18 @@ WriteValue = (
     | list[dict[str, object]]
 )
 PublisherTarget = NullPublisher | ZmqPublisher | list[NullPublisher | ZmqPublisher]
+ReactiveFactor = (
+    TsEmaSpec
+    | TsReturnSpec
+    | TsMeanSpec
+    | TsStdSpec
+    | TsDelaySpec
+    | TsDiffSpec
+    | AbsSpec
+    | LogSpec
+    | ClipSpec
+    | CastSpec
+)
 AggregationFactor = (
     AggFirstSpec
     | AggLastSpec
@@ -75,7 +166,7 @@ class ReactiveStateEngine:
         name: str,
         input_schema: pa.Schema,
         id_column: str,
-        factors: list[TsEmaSpec],
+        factors: list[ReactiveFactor],
         target: PublisherTarget,
     ) -> None: ...
 

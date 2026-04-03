@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::ZippyError;
-use zippy_operators::{TsEmaSpec, TsReturnSpec};
+use zippy_operators::{
+    AbsSpec, CastSpec, ClipSpec, LogSpec, TsDelaySpec, TsDiffSpec, TsEmaSpec, TsMeanSpec,
+    TsReturnSpec, TsStdSpec,
+};
 
 fn input_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -42,6 +45,13 @@ fn nullable_batch(ids: Vec<Option<&str>>, values: Vec<Option<f64>>) -> RecordBat
 
 fn float64_values(array: &ArrayRef) -> Vec<Option<f64>> {
     let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
+    (0..values.len())
+        .map(|index| (!values.is_null(index)).then(|| values.value(index)))
+        .collect()
+}
+
+fn int64_values(array: &ArrayRef) -> Vec<Option<i64>> {
+    let values = array.as_any().downcast_ref::<Int64Array>().unwrap();
     (0..values.len())
         .map(|index| (!values.is_null(index)).then(|| values.value(index)))
         .collect()
@@ -169,4 +179,117 @@ fn evaluate_returns_schema_mismatch_for_null_value() {
     let error = ema.evaluate(&batch).unwrap_err();
 
     assert!(matches!(error, ZippyError::SchemaMismatch { .. }));
+}
+
+#[test]
+fn v1_reactive_factors_cover_windowed_pointwise_and_cast_outputs() {
+    let mean_spec = TsMeanSpec::new("id", "value", 3, "mean_3");
+    let std_spec = TsStdSpec::new("id", "value", 3, "std_3");
+    let delay_spec = TsDelaySpec::new("id", "value", 2, "delay_2");
+    let diff_spec = TsDiffSpec::new("id", "value", 2, "diff_2");
+    let abs_spec = AbsSpec::new("id", "value", "abs_value");
+    let log_spec = LogSpec::new("id", "value", "log_value");
+    let clip_spec = ClipSpec::new("id", "value", 12.0, 20.0, "clipped");
+    let cast_spec = CastSpec::new("id", "value", "int64", "value_i64");
+
+    let mut mean = mean_spec.build().unwrap();
+    let mut std = std_spec.build().unwrap();
+    let mut delay = delay_spec.build().unwrap();
+    let mut diff = diff_spec.build().unwrap();
+    let mut abs = abs_spec.build().unwrap();
+    let mut log = log_spec.build().unwrap();
+    let mut clip = clip_spec.build().unwrap();
+    let mut cast = cast_spec.build().unwrap();
+
+    let output = batch(vec!["a", "a", "a", "a"], vec![10.0, 16.0, 19.0, 25.0]);
+
+    assert_eq!(
+        mean.output_field(),
+        Field::new("mean_3", DataType::Float64, true)
+    );
+    assert_eq!(std.output_field(), Field::new("std_3", DataType::Float64, true));
+    assert_eq!(
+        delay.output_field(),
+        Field::new("delay_2", DataType::Float64, true)
+    );
+    assert_eq!(
+        diff.output_field(),
+        Field::new("diff_2", DataType::Float64, true)
+    );
+    assert_eq!(
+        abs.output_field(),
+        Field::new("abs_value", DataType::Float64, false)
+    );
+    assert_eq!(
+        log.output_field(),
+        Field::new("log_value", DataType::Float64, false)
+    );
+    assert_eq!(
+        clip.output_field(),
+        Field::new("clipped", DataType::Float64, false)
+    );
+    assert_eq!(
+        cast.output_field(),
+        Field::new("value_i64", DataType::Int64, false)
+    );
+
+    assert_float_options_eq(
+        &float64_values(&mean.evaluate(&output).unwrap()),
+        &[None, None, Some(15.0), Some(20.0)],
+    );
+    assert_float_options_eq(
+        &float64_values(&std.evaluate(&output).unwrap()),
+        &[
+            None,
+            None,
+            Some(3.7416573867739413),
+            Some(3.7416573867739413),
+        ],
+    );
+    assert_float_options_eq(
+        &float64_values(&delay.evaluate(&output).unwrap()),
+        &[None, None, Some(10.0), Some(16.0)],
+    );
+    assert_float_options_eq(
+        &float64_values(&diff.evaluate(&output).unwrap()),
+        &[None, None, Some(9.0), Some(9.0)],
+    );
+    assert_float_options_eq(
+        &float64_values(&abs.evaluate(&output).unwrap()),
+        &[Some(10.0), Some(16.0), Some(19.0), Some(25.0)],
+    );
+    assert_float_options_eq(
+        &float64_values(&log.evaluate(&output).unwrap()),
+        &[
+            Some(10.0_f64.ln()),
+            Some(16.0_f64.ln()),
+            Some(19.0_f64.ln()),
+            Some(25.0_f64.ln()),
+        ],
+    );
+    assert_float_options_eq(
+        &float64_values(&clip.evaluate(&output).unwrap()),
+        &[Some(12.0), Some(16.0), Some(19.0), Some(20.0)],
+    );
+    assert_eq!(
+        int64_values(&cast.evaluate(&output).unwrap()),
+        vec![Some(10), Some(16), Some(19), Some(25)],
+    );
+}
+
+#[test]
+fn log_factor_rejects_non_positive_input() {
+    let spec = LogSpec::new("id", "value", "log_value");
+    let mut factor = spec.build().unwrap();
+
+    let error = factor
+        .evaluate(&batch(vec!["a"], vec![0.0]))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ZippyError::InvalidState {
+            status: "log input must be positive",
+        }
+    ));
 }

@@ -20,10 +20,13 @@ use zippy_io::{
     ZmqPublisher as RustZmqPublisher,
 };
 use zippy_operators::{
-    AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
+    AbsSpec as RustAbsSpec, AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
     AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
     AggSumSpec as RustAggSumSpec, AggVwapSpec as RustAggVwapSpec,
-    AggregationSpec as RustAggregationSpec, TsEmaSpec as RustTsEmaSpec,
+    AggregationSpec as RustAggregationSpec, CastSpec as RustCastSpec, ClipSpec as RustClipSpec,
+    LogSpec as RustLogSpec, TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec,
+    TsEmaSpec as RustTsEmaSpec, TsMeanSpec as RustTsMeanSpec,
+    TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
 };
 
 fn py_value_error(message: impl Into<String>) -> PyErr {
@@ -42,7 +45,7 @@ enum TargetConfig {
 
 #[pyclass]
 struct TsEmaSpec {
-    id_column: String,
+    _id_column: String,
     value_column: String,
     span: usize,
     output: String,
@@ -54,9 +57,211 @@ impl TsEmaSpec {
     #[pyo3(signature = (id_column, value_column, span, output))]
     fn new(id_column: String, value_column: String, span: usize, output: String) -> Self {
         Self {
-            id_column,
+            _id_column: id_column,
             value_column,
             span,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct TsReturnSpec {
+    _id_column: String,
+    value_column: String,
+    period: usize,
+    output: String,
+}
+
+#[pymethods]
+impl TsReturnSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, period, output))]
+    fn new(id_column: String, value_column: String, period: usize, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            period,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct TsMeanSpec {
+    _id_column: String,
+    value_column: String,
+    window: usize,
+    output: String,
+}
+
+#[pymethods]
+impl TsMeanSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, window, output))]
+    fn new(id_column: String, value_column: String, window: usize, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            window,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct TsStdSpec {
+    _id_column: String,
+    value_column: String,
+    window: usize,
+    output: String,
+}
+
+#[pymethods]
+impl TsStdSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, window, output))]
+    fn new(id_column: String, value_column: String, window: usize, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            window,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct TsDelaySpec {
+    _id_column: String,
+    value_column: String,
+    period: usize,
+    output: String,
+}
+
+#[pymethods]
+impl TsDelaySpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, period, output))]
+    fn new(id_column: String, value_column: String, period: usize, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            period,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct TsDiffSpec {
+    _id_column: String,
+    value_column: String,
+    period: usize,
+    output: String,
+}
+
+#[pymethods]
+impl TsDiffSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, period, output))]
+    fn new(id_column: String, value_column: String, period: usize, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            period,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct AbsSpec {
+    _id_column: String,
+    value_column: String,
+    output: String,
+}
+
+#[pymethods]
+impl AbsSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, output))]
+    fn new(id_column: String, value_column: String, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct LogSpec {
+    _id_column: String,
+    value_column: String,
+    output: String,
+}
+
+#[pymethods]
+impl LogSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, output))]
+    fn new(id_column: String, value_column: String, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct ClipSpec {
+    _id_column: String,
+    value_column: String,
+    min: f64,
+    max: f64,
+    output: String,
+}
+
+#[pymethods]
+impl ClipSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, min, max, output))]
+    fn new(
+        id_column: String,
+        value_column: String,
+        min: f64,
+        max: f64,
+        output: String,
+    ) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            min,
+            max,
+            output,
+        }
+    }
+}
+
+#[pyclass]
+struct CastSpec {
+    _id_column: String,
+    value_column: String,
+    dtype: String,
+    output: String,
+}
+
+#[pymethods]
+impl CastSpec {
+    #[new]
+    #[pyo3(signature = (id_column, value_column, dtype, output))]
+    fn new(id_column: String, value_column: String, dtype: String, output: String) -> Self {
+        Self {
+            _id_column: id_column,
+            value_column,
+            dtype,
             output,
         }
     }
@@ -227,33 +432,18 @@ impl ReactiveStateEngine {
         name: String,
         input_schema: &Bound<'_, PyAny>,
         id_column: String,
-        factors: Vec<Py<TsEmaSpec>>,
+        factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        let factor_specs = factors
-            .into_iter()
-            .map(|factor| {
-                let factor_ref = factor.borrow(py);
-                RustTsEmaSpec::new(
-                    &factor_ref.id_column,
-                    &factor_ref.value_column,
-                    factor_ref.span,
-                    &factor_ref.output,
-                )
-                .build()
-                .map_err(|error| py_value_error(error.to_string()))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let factor_specs = build_reactive_specs(py, &id_column, factors)?;
         let engine = RustReactiveStateEngine::new(&name, Arc::clone(&schema), factor_specs)
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-
-        let _ = id_column;
 
         Ok(Self {
             name,
@@ -373,6 +563,15 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", python_dev_version())?;
     module.add_function(wrap_pyfunction!(version, module)?)?;
     module.add_class::<TsEmaSpec>()?;
+    module.add_class::<TsReturnSpec>()?;
+    module.add_class::<TsMeanSpec>()?;
+    module.add_class::<TsStdSpec>()?;
+    module.add_class::<TsDelaySpec>()?;
+    module.add_class::<TsDiffSpec>()?;
+    module.add_class::<AbsSpec>()?;
+    module.add_class::<LogSpec>()?;
+    module.add_class::<ClipSpec>()?;
+    module.add_class::<CastSpec>()?;
     module.add_class::<AggFirstSpec>()?;
     module.add_class::<AggLastSpec>()?;
     module.add_class::<AggSumSpec>()?;
@@ -515,6 +714,95 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
             "late_data_policy must be 'reject' or 'drop_with_metric'",
         )),
     }
+}
+
+fn build_reactive_specs(
+    py: Python<'_>,
+    id_column: &str,
+    factors: Vec<Py<PyAny>>,
+) -> PyResult<Vec<Box<dyn zippy_operators::ReactiveFactor>>> {
+    factors
+        .into_iter()
+        .map(|factor| build_reactive_spec(py, id_column, factor.bind(py)))
+        .collect()
+}
+
+fn build_reactive_spec(
+    py: Python<'_>,
+    id_column: &str,
+    factor: &Bound<'_, PyAny>,
+) -> PyResult<Box<dyn zippy_operators::ReactiveFactor>> {
+    if let Ok(spec) = factor.extract::<PyRef<'_, TsEmaSpec>>() {
+        return RustTsEmaSpec::new(id_column, &spec.value_column, spec.span, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, TsReturnSpec>>() {
+        return RustTsReturnSpec::new(id_column, &spec.value_column, spec.period, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, TsMeanSpec>>() {
+        return RustTsMeanSpec::new(id_column, &spec.value_column, spec.window, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, TsStdSpec>>() {
+        return RustTsStdSpec::new(id_column, &spec.value_column, spec.window, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, TsDelaySpec>>() {
+        return RustTsDelaySpec::new(id_column, &spec.value_column, spec.period, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, TsDiffSpec>>() {
+        return RustTsDiffSpec::new(id_column, &spec.value_column, spec.period, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, AbsSpec>>() {
+        return RustAbsSpec::new(id_column, &spec.value_column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, LogSpec>>() {
+        return RustLogSpec::new(id_column, &spec.value_column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, ClipSpec>>() {
+        return RustClipSpec::new(
+            id_column,
+            &spec.value_column,
+            spec.min,
+            spec.max,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, CastSpec>>() {
+        return RustCastSpec::new(id_column, &spec.value_column, &spec.dtype, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    let _ = py;
+
+    Err(PyTypeError::new_err(
+        "factors must contain TsEmaSpec, TsReturnSpec, TsMeanSpec, TsStdSpec, TsDelaySpec, TsDiffSpec, AbsSpec, LogSpec, ClipSpec, or CastSpec",
+    ))
 }
 
 fn build_aggregation_specs(
