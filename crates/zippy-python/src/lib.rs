@@ -1,6 +1,11 @@
 #![allow(clippy::useless_conversion)]
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver as StdReceiver, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::Schema;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -10,13 +15,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
     python_dev_version, spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle,
-    EngineStatus, LateDataPolicy, Publisher as CorePublisher,
+    EngineStatus, LateDataPolicy, Publisher as CorePublisher, ZippyError,
 };
 use zippy_engines::{
     ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
 };
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
+    ParquetSink as RustParquetSink,
     ZmqPublisher as RustZmqPublisher, ZmqSubscriber as RustZmqSubscriber,
 };
 use zippy_operators::{
@@ -58,6 +64,209 @@ impl CorePublisher for InProcessPublisher {
         })?;
         handle.write(batch.clone())
     }
+}
+
+#[derive(Clone)]
+enum ParquetRotation {
+    None,
+    Hourly,
+}
+
+impl ParquetRotation {
+    fn parse(value: &str) -> PyResult<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "1h" => Ok(Self::Hourly),
+            _ => Err(py_value_error("rotation must be 'none' or '1h'")),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ParquetSinkConfig {
+    path: PathBuf,
+    rotation: ParquetRotation,
+    write_input: bool,
+    write_output: bool,
+}
+
+enum ArchiveKind {
+    Input,
+    Output,
+}
+
+impl ArchiveKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
+enum ArchiveCommand {
+    Write {
+        kind: ArchiveKind,
+        batch: RecordBatch,
+    },
+    Flush(mpsc::Sender<zippy_core::Result<()>>),
+    Close(mpsc::Sender<zippy_core::Result<()>>),
+}
+
+#[derive(Clone)]
+struct ArchiveHandle {
+    tx: SyncSender<ArchiveCommand>,
+    join_handle: Arc<Mutex<Option<JoinHandle<zippy_core::Result<()>>>>>,
+    closed: Arc<AtomicBool>,
+}
+
+impl ArchiveHandle {
+    fn spawn(config: ParquetSinkConfig) -> Self {
+        let (tx, rx) = mpsc::sync_channel(1024);
+        let join_handle = thread::spawn(move || parquet_archive_worker(config, rx));
+        Self {
+            tx,
+            join_handle: Arc::new(Mutex::new(Some(join_handle))),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn write(&self, kind: ArchiveKind, batch: RecordBatch) -> zippy_core::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ZippyError::InvalidState {
+                status: "parquet sink closed",
+            });
+        }
+
+        self.tx
+            .send(ArchiveCommand::Write { kind, batch })
+            .map_err(|_| ZippyError::ChannelSend)
+    }
+
+    fn flush(&self) -> zippy_core::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(ArchiveCommand::Flush(reply_tx))
+            .map_err(|_| ZippyError::ChannelSend)?;
+        reply_rx.recv().map_err(|_| ZippyError::ChannelReceive)?
+    }
+
+    fn close(&self) -> zippy_core::Result<()> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let send_result = self
+            .tx
+            .send(ArchiveCommand::Close(reply_tx))
+            .map_err(|_| ZippyError::ChannelSend);
+        let close_result = send_result.and_then(|_| {
+            reply_rx.recv().map_err(|_| ZippyError::ChannelReceive)?
+        });
+        let join_result = self
+            .join_handle
+            .lock()
+            .unwrap()
+            .take()
+            .map(|join_handle| {
+                join_handle.join().map_err(|_| ZippyError::Io {
+                    reason: "parquet sink worker panicked".to_string(),
+                })?
+            })
+            .unwrap_or(Ok(()));
+
+        match (close_result, join_result) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+}
+
+struct ParquetOutputPublisher {
+    archive: ArchiveHandle,
+}
+
+impl CorePublisher for ParquetOutputPublisher {
+    fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
+        self.archive.write(ArchiveKind::Output, batch.clone())
+    }
+
+    fn flush(&mut self) -> zippy_core::Result<()> {
+        self.archive.flush()
+    }
+
+    fn close(&mut self) -> zippy_core::Result<()> {
+        self.archive.close()
+    }
+}
+
+fn parquet_archive_worker(
+    config: ParquetSinkConfig,
+    rx: StdReceiver<ArchiveCommand>,
+) -> zippy_core::Result<()> {
+    let mut input_index = 0_u64;
+    let mut output_index = 0_u64;
+
+    while let Ok(command) = rx.recv() {
+        match command {
+            ArchiveCommand::Write { kind, batch } => match kind {
+                ArchiveKind::Input => {
+                    input_index += 1;
+                    write_archive_batch(&config, &kind, input_index, &batch)?;
+                }
+                ArchiveKind::Output => {
+                    output_index += 1;
+                    write_archive_batch(&config, &kind, output_index, &batch)?;
+                }
+            },
+            ArchiveCommand::Flush(reply_tx) => {
+                let _ = reply_tx.send(Ok(()));
+            }
+            ArchiveCommand::Close(reply_tx) => {
+                let _ = reply_tx.send(Ok(()));
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_archive_batch(
+    config: &ParquetSinkConfig,
+    kind: &ArchiveKind,
+    index: u64,
+    batch: &RecordBatch,
+) -> zippy_core::Result<()> {
+    let root = archive_root(config, kind)?;
+    let sink = RustParquetSink::new(root);
+    sink.write_batch(&format!("{index:06}.parquet"), batch)
+}
+
+fn archive_root(
+    config: &ParquetSinkConfig,
+    kind: &ArchiveKind,
+) -> zippy_core::Result<PathBuf> {
+    let mut root = config.path.join(kind.as_str());
+    if let ParquetRotation::Hourly = config.rotation {
+        root = root.join(format!("hour_{}", current_epoch_hour()?));
+    }
+    Ok(root)
+}
+
+fn current_epoch_hour() -> zippy_core::Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ZippyError::Io {
+            reason: format!("failed to compute archive hour error=[{}]", error),
+        })?;
+    Ok(duration.as_secs() / 3_600)
 }
 
 #[pyclass]
@@ -407,6 +616,40 @@ impl NullPublisher {
 }
 
 #[pyclass]
+struct ParquetSink {
+    path: String,
+    rotation: String,
+    write_input: bool,
+    write_output: bool,
+}
+
+#[pymethods]
+impl ParquetSink {
+    #[new]
+    #[pyo3(signature = (path, rotation="none", write_input=false, write_output=true))]
+    fn new(
+        path: String,
+        rotation: &str,
+        write_input: bool,
+        write_output: bool,
+    ) -> PyResult<Self> {
+        ParquetRotation::parse(rotation)?;
+        if !write_input && !write_output {
+            return Err(py_value_error(
+                "parquet_sink must enable write_input or write_output",
+            ));
+        }
+
+        Ok(Self {
+            path,
+            rotation: rotation.to_string(),
+            write_input,
+            write_output,
+        })
+    }
+}
+
+#[pyclass]
 struct ZmqPublisher {
     endpoint: String,
 }
@@ -465,6 +708,8 @@ struct ReactiveStateEngine {
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    archive: Option<ArchiveHandle>,
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
     downstreams: Vec<DownstreamLink>,
@@ -477,6 +722,8 @@ struct TimeSeriesEngine {
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    archive: Option<ArchiveHandle>,
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
     downstreams: Vec<DownstreamLink>,
@@ -486,7 +733,8 @@ struct TimeSeriesEngine {
 #[pymethods]
 impl ReactiveStateEngine {
     #[new]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, source=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, source=None, parquet_sink=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -495,6 +743,7 @@ impl ReactiveStateEngine {
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
+        parquet_sink: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -505,6 +754,7 @@ impl ReactiveStateEngine {
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(parquet_sink)?;
         let handle = Arc::new(Mutex::new(None));
         let source_owner = register_source(source, Arc::clone(&handle), schema.as_ref())?;
 
@@ -513,6 +763,8 @@ impl ReactiveStateEngine {
             input_schema: schema,
             output_schema,
             target,
+            parquet_sink,
+            archive: None,
             handle,
             engine: Some(engine),
             downstreams: Vec::new(),
@@ -521,19 +773,28 @@ impl ReactiveStateEngine {
     }
 
     fn start(&mut self) -> PyResult<()> {
-        let handle = start_runtime_engine(
+        let (handle, archive) = start_runtime_engine(
             &self.name,
             &self.target,
+            self.parquet_sink.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
         *self.handle.lock().unwrap() = Some(handle);
+        self.archive = archive;
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         ensure_downstreams_running(&self.downstreams)?;
-        write_runtime_input(py, &self.handle, value, &self.input_schema)
+        write_runtime_input(
+            py,
+            &self.handle,
+            self.archive.as_ref(),
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        )
     }
 
     fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -544,12 +805,12 @@ impl ReactiveStateEngine {
     }
 
     fn flush(&self) -> PyResult<()> {
-        flush_runtime_engine(&self.handle)
+        flush_runtime_engine(&self.handle, self.archive.as_ref())
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle)
+        stop_runtime_engine(&self.handle, self.archive.as_ref())
     }
 }
 
@@ -557,7 +818,7 @@ impl ReactiveStateEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type="tumbling", window_ns=None, source=None))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type="tumbling", window_ns=None, source=None, parquet_sink=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -571,6 +832,7 @@ impl TimeSeriesEngine {
         window_type: &str,
         window_ns: Option<i64>,
         source: Option<&Bound<'_, PyAny>>,
+        parquet_sink: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -591,6 +853,7 @@ impl TimeSeriesEngine {
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(parquet_sink)?;
         let handle = Arc::new(Mutex::new(None));
         let source_owner = register_source(source, Arc::clone(&handle), schema.as_ref())?;
 
@@ -599,6 +862,8 @@ impl TimeSeriesEngine {
             input_schema: schema,
             output_schema,
             target,
+            parquet_sink,
+            archive: None,
             handle,
             engine: Some(engine),
             downstreams: Vec::new(),
@@ -607,19 +872,28 @@ impl TimeSeriesEngine {
     }
 
     fn start(&mut self) -> PyResult<()> {
-        let handle = start_runtime_engine(
+        let (handle, archive) = start_runtime_engine(
             &self.name,
             &self.target,
+            self.parquet_sink.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
         *self.handle.lock().unwrap() = Some(handle);
+        self.archive = archive;
         Ok(())
     }
 
     fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         ensure_downstreams_running(&self.downstreams)?;
-        write_runtime_input(py, &self.handle, value, &self.input_schema)
+        write_runtime_input(
+            py,
+            &self.handle,
+            self.archive.as_ref(),
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        )
     }
 
     fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -630,12 +904,12 @@ impl TimeSeriesEngine {
     }
 
     fn flush(&self) -> PyResult<()> {
-        flush_runtime_engine(&self.handle)
+        flush_runtime_engine(&self.handle, self.archive.as_ref())
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle)
+        stop_runtime_engine(&self.handle, self.archive.as_ref())
     }
 }
 
@@ -661,6 +935,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AggCountSpec>()?;
     module.add_class::<AggVwapSpec>()?;
     module.add_class::<NullPublisher>()?;
+    module.add_class::<ParquetSink>()?;
     module.add_class::<ZmqPublisher>()?;
     module.add_class::<ZmqSubscriber>()?;
     module.add_class::<ReactiveStateEngine>()?;
@@ -699,6 +974,26 @@ fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
     Err(PyTypeError::new_err(
         "target must be NullPublisher, ZmqPublisher, or a non-empty list of them",
     ))
+}
+
+fn parse_parquet_sink(
+    parquet_sink: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<ParquetSinkConfig>> {
+    let Some(parquet_sink) = parquet_sink else {
+        return Ok(None);
+    };
+
+    let sink = parquet_sink
+        .extract::<PyRef<'_, ParquetSink>>()
+        .map_err(|_| PyTypeError::new_err("parquet_sink must be zippy.ParquetSink"))?;
+    let rotation = ParquetRotation::parse(&sink.rotation)?;
+
+    Ok(Some(ParquetSinkConfig {
+        path: PathBuf::from(&sink.path),
+        rotation,
+        write_input: sink.write_input,
+        write_output: sink.write_output,
+    }))
 }
 
 fn register_source(
@@ -747,10 +1042,12 @@ fn register_source(
 
 fn build_publisher(
     targets: &[TargetConfig],
+    parquet_sink: Option<&ParquetSinkConfig>,
+    archive: Option<ArchiveHandle>,
     downstreams: &[DownstreamLink],
 ) -> PyResult<Box<dyn CorePublisher>> {
     let mut publishers =
-        Vec::<Box<dyn CorePublisher>>::with_capacity(targets.len() + downstreams.len());
+        Vec::<Box<dyn CorePublisher>>::with_capacity(targets.len() + downstreams.len() + 1);
 
     for target in targets {
         match target {
@@ -761,6 +1058,16 @@ fn build_publisher(
                 publishers.push(Box::new(publisher));
             }
         }
+    }
+
+    if parquet_sink
+        .map(|config| config.write_output)
+        .unwrap_or(false)
+    {
+        let archive = archive.ok_or_else(|| {
+            py_runtime_error("parquet sink archive must be started before publisher setup")
+        })?;
+        publishers.push(Box::new(ParquetOutputPublisher { archive }));
     }
 
     for downstream in downstreams {
@@ -827,16 +1134,18 @@ fn ensure_runtime_is_not_running(handle: &SharedHandle) -> PyResult<()> {
 fn start_runtime_engine<E: Engine>(
     name: &str,
     targets: &[TargetConfig],
+    parquet_sink: Option<&ParquetSinkConfig>,
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
-) -> PyResult<EngineHandle> {
+) -> PyResult<(EngineHandle, Option<ArchiveHandle>)> {
     let engine = match engine.take() {
         Some(engine) => engine,
         None => return Err(py_runtime_error("engine already started")),
     };
-    let publisher = build_publisher(targets, downstreams)?;
+    let archive = parquet_sink.cloned().map(ArchiveHandle::spawn);
+    let publisher = build_publisher(targets, parquet_sink, archive.clone(), downstreams)?;
 
-    spawn_engine_with_publisher(
+    let handle = spawn_engine_with_publisher(
         engine,
         EngineConfig {
             name: name.to_string(),
@@ -846,18 +1155,28 @@ fn start_runtime_engine<E: Engine>(
         },
         publisher,
     )
-    .map_err(|error| py_runtime_error(error.to_string()))
+    .map_err(|error| py_runtime_error(error.to_string()))?;
+
+    Ok((handle, archive))
 }
 
 fn write_runtime_input(
     py: Python<'_>,
     handle: &SharedHandle,
+    archive: Option<&ArchiveHandle>,
+    parquet_sink: Option<&ParquetSinkConfig>,
     value: &Bound<'_, PyAny>,
     input_schema: &Schema,
 ) -> PyResult<()> {
     let batches = value_to_record_batches(py, value, input_schema)?;
 
     for batch in batches {
+        if parquet_sink.map(|config| config.write_input).unwrap_or(false) {
+            archive
+                .ok_or_else(|| py_runtime_error("parquet sink archive is not available"))?
+                .write(ArchiveKind::Input, batch.clone())
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+        }
         with_handle(handle, |runtime| {
             runtime
                 .write(batch)
@@ -868,25 +1187,37 @@ fn write_runtime_input(
     Ok(())
 }
 
-fn flush_runtime_engine(handle: &SharedHandle) -> PyResult<()> {
+fn flush_runtime_engine(handle: &SharedHandle, archive: Option<&ArchiveHandle>) -> PyResult<()> {
     with_handle(handle, |runtime| {
         runtime
             .flush()
             .map(|_| ())
             .map_err(|error| py_runtime_error(error.to_string()))
-    })
+    })?;
+    if let Some(archive) = archive {
+        archive
+            .flush()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+    }
+    Ok(())
 }
 
-fn stop_runtime_engine(handle: &SharedHandle) -> PyResult<()> {
+fn stop_runtime_engine(handle: &SharedHandle, archive: Option<&ArchiveHandle>) -> PyResult<()> {
     let mut guard = handle.lock().unwrap();
     let mut runtime = match guard.take() {
         Some(handle) => handle,
         None => return Err(py_runtime_error("engine not started")),
     };
 
-    runtime
+    let stop_result = runtime
         .stop()
-        .map_err(|error| py_runtime_error(error.to_string()))
+        .map_err(|error| py_runtime_error(error.to_string()));
+    if let Some(archive) = archive {
+        archive
+            .close()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+    }
+    stop_result
 }
 
 fn with_handle<T>(

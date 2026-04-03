@@ -6,6 +6,7 @@ import time
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import zippy
@@ -499,7 +500,8 @@ def test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpe
         input_schema=input_schema,
         id_column="symbol",
         dt_column="dt",
-        window_ns=60_000_000_000,
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
         late_data_policy="reject",
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
@@ -554,7 +556,8 @@ def test_timeseries_engine_accepts_reactive_source_pipeline() -> None:
         input_schema=reactive.output_schema(),
         id_column="symbol",
         dt_column="dt",
-        window_ns=60_000_000_000,
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
         late_data_policy="reject",
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
@@ -610,7 +613,8 @@ def test_timeseries_engine_rejects_source_schema_mismatch_at_construction() -> N
             input_schema=mismatched_schema,
             id_column="symbol",
             dt_column="dt",
-            window_ns=60_000_000_000,
+            window=zippy.Duration.minutes(1),
+            window_type="tumbling",
             late_data_policy="reject",
             factors=[zippy.AGG_FIRST(column="price", output="open")],
             target=zippy.NullPublisher(),
@@ -639,7 +643,8 @@ def test_source_write_requires_downstream_started() -> None:
         input_schema=reactive.output_schema(),
         id_column="symbol",
         dt_column="dt",
-        window_ns=60_000_000_000,
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
         late_data_policy="reject",
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
@@ -683,7 +688,8 @@ def test_downstream_stop_requires_source_stopped() -> None:
         input_schema=reactive.output_schema(),
         id_column="symbol",
         dt_column="dt",
-        window_ns=60_000_000_000,
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
         late_data_policy="reject",
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
@@ -801,3 +807,48 @@ def test_zmq_subscriber_receives_record_batch_from_engine() -> None:
 
     engine.stop()
     subscriber.close()
+
+
+def test_reactive_engine_accepts_parquet_sink_and_archives_input_and_output(
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[
+            zippy.TsEmaSpec(
+                id_column="symbol",
+                value_column="price",
+                span=2,
+                output="ema_2",
+            )
+        ],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="1h",
+            write_input=True,
+            write_output=True,
+        ),
+    )
+
+    engine.start()
+    engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
+    engine.stop()
+
+    parquet_files = list(tmp_path.rglob("*.parquet"))
+    input_files = [path for path in parquet_files if "input" in path.parts]
+    output_files = [path for path in parquet_files if "output" in path.parts]
+
+    assert input_files
+    assert output_files
+    assert pq.read_schema(input_files[0]).names == ["symbol", "price"]
+    assert pq.read_schema(output_files[0]).names == ["symbol", "price", "ema_2"]

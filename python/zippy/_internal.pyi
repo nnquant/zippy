@@ -145,6 +145,16 @@ class NullPublisher:
     def __init__(self) -> None: ...
 
 
+class ParquetSink:
+    def __init__(
+        self,
+        path: str,
+        rotation: str = "none",
+        write_input: bool = False,
+        write_output: bool = True,
+    ) -> None: ...
+
+
 class ZmqPublisher:
     def __init__(self, endpoint: str) -> None: ...
 
@@ -196,7 +206,9 @@ class ReactiveStateEngine:
         id_column: str,
         factors: list[ReactiveFactor],
         target: PublisherTarget,
+        *,
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
+        parquet_sink: ParquetSink | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -225,6 +237,7 @@ class TimeSeriesEngine:
         window_type: str = "tumbling",
         window_ns: int | None = None,
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
+        parquet_sink: ParquetSink | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...

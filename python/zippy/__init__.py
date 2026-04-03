@@ -10,6 +10,7 @@ from ._internal import CastSpec
 from ._internal import ClipSpec
 from ._internal import LogSpec
 from ._internal import NullPublisher
+from ._internal import ParquetSink
 from ._internal import ReactiveStateEngine
 from ._internal import TimeSeriesEngine
 from ._internal import TsDelaySpec
@@ -173,6 +174,7 @@ __all__ = [
     "Duration",
     "LogSpec",
     "NullPublisher",
+    "ParquetSink",
     "ReactiveStateEngine",
     "TimeSeriesEngine",
     "TsDelaySpec",
