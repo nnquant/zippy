@@ -361,6 +361,64 @@ def test_timeseries_engine_accepts_polars_and_exposes_output_schema() -> None:
     engine.stop()
 
 
+def test_timeseries_engine_accepts_duration_window_api() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
+        late_data_policy="reject",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+    )
+
+    engine.start()
+    engine.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)],
+            "price": [10.0],
+            "volume": [100.0],
+        }
+    )
+    engine.flush()
+    engine.stop()
+
+
+def test_timeseries_engine_rejects_non_tumbling_window_type() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="window_type"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type="sliding",
+            late_data_policy="reject",
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            target=zippy.NullPublisher(),
+        )
+
+
 def test_reactive_engine_accepts_all_v1_operators_via_design_helpers() -> None:
     input_schema = pa.schema(
         [

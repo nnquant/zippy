@@ -24,6 +24,52 @@ from ._internal import __version__
 from ._internal import version
 
 
+class Duration:
+    """Represent a positive time duration in nanoseconds for Python APIs."""
+
+    __slots__ = ("total_nanoseconds",)
+
+    def __init__(self, total_nanoseconds: int) -> None:
+        """
+        Create a duration value.
+
+        :param total_nanoseconds: Duration size in nanoseconds.
+        :type total_nanoseconds: int
+        :raises ValueError: If ``total_nanoseconds`` is not positive.
+        """
+        total_nanoseconds = int(total_nanoseconds)
+        if total_nanoseconds <= 0:
+            raise ValueError("duration must be positive")
+        self.total_nanoseconds = total_nanoseconds
+
+    @classmethod
+    def nanoseconds(cls, value: int) -> "Duration":
+        """Create a duration from nanoseconds."""
+        return cls(value)
+
+    @classmethod
+    def seconds(cls, value: int) -> "Duration":
+        """Create a duration from seconds."""
+        return cls(value * 1_000_000_000)
+
+    @classmethod
+    def minutes(cls, value: int) -> "Duration":
+        """Create a duration from minutes."""
+        return cls.seconds(value * 60)
+
+    @classmethod
+    def hours(cls, value: int) -> "Duration":
+        """Create a duration from hours."""
+        return cls.minutes(value * 60)
+
+    def __int__(self) -> int:
+        """Return the duration in nanoseconds."""
+        return self.total_nanoseconds
+
+    def __repr__(self) -> str:
+        return f"Duration(total_nanoseconds={self.total_nanoseconds})"
+
+
 def TS_EMA(*, column: str, span: int, output: str) -> TsEmaSpec:
     """Create a reactive EMA factor spec."""
     return TsEmaSpec(id_column="", value_column=column, span=span, output=output)
@@ -124,6 +170,7 @@ __all__ = [
     "AggVwapSpec",
     "CastSpec",
     "ClipSpec",
+    "Duration",
     "LogSpec",
     "NullPublisher",
     "ReactiveStateEngine",

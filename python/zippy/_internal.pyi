@@ -4,6 +4,26 @@ import pyarrow as pa
 __version__: str
 
 
+class Duration:
+    total_nanoseconds: int
+
+    def __init__(self, total_nanoseconds: int) -> None: ...
+
+    @classmethod
+    def nanoseconds(cls, value: int) -> Duration: ...
+
+    @classmethod
+    def seconds(cls, value: int) -> Duration: ...
+
+    @classmethod
+    def minutes(cls, value: int) -> Duration: ...
+
+    @classmethod
+    def hours(cls, value: int) -> Duration: ...
+
+    def __int__(self) -> int: ...
+
+
 class TsEmaSpec:
     def __init__(
         self,
@@ -197,10 +217,13 @@ class TimeSeriesEngine:
         input_schema: pa.Schema,
         id_column: str,
         dt_column: str,
-        window_ns: int,
         late_data_policy: str,
         factors: list[AggregationFactor],
         target: PublisherTarget,
+        *,
+        window: Duration | int | None = None,
+        window_type: str = "tumbling",
+        window_ns: int | None = None,
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
     ) -> None: ...
 

@@ -557,17 +557,19 @@ impl ReactiveStateEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, window_ns, late_data_policy, factors, target, source=None))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type="tumbling", window_ns=None, source=None))]
     fn new(
         py: Python<'_>,
         name: String,
         input_schema: &Bound<'_, PyAny>,
         id_column: String,
         dt_column: String,
-        window_ns: i64,
         late_data_policy: String,
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
+        window: Option<&Bound<'_, PyAny>>,
+        window_type: &str,
+        window_ns: Option<i64>,
         source: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -576,6 +578,7 @@ impl TimeSeriesEngine {
         );
         let factor_specs = build_aggregation_specs(py, factors)?;
         let late_data_policy = parse_late_data_policy(&late_data_policy)?;
+        let window_ns = parse_window_ns(window, window_type, window_ns)?;
         let engine = RustTimeSeriesEngine::new(
             &name,
             Arc::clone(&schema),
@@ -905,6 +908,41 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
             "late_data_policy must be 'reject' or 'drop_with_metric'",
         )),
     }
+}
+
+fn parse_window_ns(
+    window: Option<&Bound<'_, PyAny>>,
+    window_type: &str,
+    window_ns: Option<i64>,
+) -> PyResult<i64> {
+    if window_type != "tumbling" {
+        return Err(py_value_error("window_type must be 'tumbling' in v1"));
+    }
+
+    if window.is_some() && window_ns.is_some() {
+        return Err(py_value_error(
+            "window and window_ns are mutually exclusive",
+        ));
+    }
+
+    if let Some(window_ns) = window_ns {
+        return Ok(window_ns);
+    }
+
+    let window = window.ok_or_else(|| {
+        py_value_error("window is required when window_ns is not provided")
+    })?;
+
+    if let Ok(window_ns) = window.extract::<i64>() {
+        return Ok(window_ns);
+    }
+
+    let duration_attr = window
+        .getattr("total_nanoseconds")
+        .map_err(|_| py_value_error("window must be an integer nanosecond value or zippy.Duration"))?;
+    duration_attr
+        .extract::<i64>()
+        .map_err(|_| py_value_error("window must be an integer nanosecond value or zippy.Duration"))
 }
 
 fn build_reactive_specs(

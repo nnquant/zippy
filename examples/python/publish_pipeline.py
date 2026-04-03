@@ -8,7 +8,6 @@ import zippy
 
 TICK_ENDPOINT = "tcp://127.0.0.1:5555"
 BAR_ENDPOINT = "tcp://127.0.0.1:5556"
-MINUTE_NS = 60_000_000_000
 
 
 def main() -> None:
@@ -38,7 +37,8 @@ def main() -> None:
         input_schema=reactive.output_schema(),
         id_column="symbol",
         dt_column="dt",
-        window_ns=MINUTE_NS,
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
         late_data_policy="reject",
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
