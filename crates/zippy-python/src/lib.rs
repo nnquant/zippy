@@ -17,7 +17,7 @@ use zippy_engines::{
 };
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
-    ZmqPublisher as RustZmqPublisher,
+    ZmqPublisher as RustZmqPublisher, ZmqSubscriber as RustZmqSubscriber,
 };
 use zippy_operators::{
     AbsSpec as RustAbsSpec, AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
@@ -421,6 +421,45 @@ impl ZmqPublisher {
 }
 
 #[pyclass]
+struct ZmqSubscriber {
+    subscriber: Option<RustZmqSubscriber>,
+}
+
+#[pymethods]
+impl ZmqSubscriber {
+    #[new]
+    #[pyo3(signature = (endpoint, timeout_ms=1000))]
+    fn new(endpoint: String, timeout_ms: i32) -> PyResult<Self> {
+        let subscriber =
+            RustZmqSubscriber::connect(&endpoint, timeout_ms).map_err(|error| {
+                py_runtime_error(error.to_string())
+            })?;
+
+        Ok(Self {
+            subscriber: Some(subscriber),
+        })
+    }
+
+    fn recv(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        let subscriber = self
+            .subscriber
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("subscriber is closed"))?;
+        let batch = subscriber
+            .recv()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+
+        batch
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn close(&mut self) {
+        self.subscriber = None;
+    }
+}
+
+#[pyclass]
 struct ReactiveStateEngine {
     name: String,
     input_schema: Arc<Schema>,
@@ -620,6 +659,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AggVwapSpec>()?;
     module.add_class::<NullPublisher>()?;
     module.add_class::<ZmqPublisher>()?;
+    module.add_class::<ZmqSubscriber>()?;
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
     Ok(())

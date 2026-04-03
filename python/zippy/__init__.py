@@ -19,6 +19,7 @@ from ._internal import TsMeanSpec
 from ._internal import TsReturnSpec
 from ._internal import TsStdSpec
 from ._internal import ZmqPublisher
+from ._internal import ZmqSubscriber
 from ._internal import __version__
 from ._internal import version
 
@@ -151,6 +152,7 @@ __all__ = [
     "TS_RETURN",
     "TS_STD",
     "ZmqPublisher",
+    "ZmqSubscriber",
     "__version__",
     "version",
 ]

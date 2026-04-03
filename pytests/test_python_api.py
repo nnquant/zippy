@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import socket
 import subprocess
+import time
 
 import polars as pl
 import pyarrow as pa
@@ -19,6 +21,12 @@ def git_output(*args: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def reserve_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 def test_reactive_engine_accepts_polars_and_flushes() -> None:
@@ -687,3 +695,51 @@ def test_reactive_engine_accepts_zmq_target() -> None:
     engine.start()
     engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
     engine.stop()
+
+
+def test_zmq_subscriber_receives_record_batch_from_engine() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[
+            zippy.TsEmaSpec(
+                id_column="symbol",
+                value_column="price",
+                span=2,
+                output="ema_2",
+            )
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+    engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
+    engine.flush()
+
+    received = subscriber.recv()
+
+    assert isinstance(received, pa.RecordBatch)
+    assert received.schema == pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+            pa.field("ema_2", pa.float64(), nullable=False),
+        ]
+    )
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(1).to_pylist() == [10.0]
+    assert received.column(2).to_pylist() == [10.0]
+
+    engine.stop()
+    subscriber.close()

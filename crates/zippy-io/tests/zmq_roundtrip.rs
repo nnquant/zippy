@@ -13,7 +13,7 @@ use zippy_io::{NullPublisher, Publisher};
 #[cfg(not(feature = "zmq-publisher"))]
 use zippy_io::ZmqPublisher;
 #[cfg(feature = "zmq-publisher")]
-use zippy_io::ZmqPublisher;
+use zippy_io::{ZmqPublisher, ZmqSubscriber};
 
 #[test]
 fn null_publisher_accepts_arrow_batches() {
@@ -83,6 +83,28 @@ fn zmq_publisher_roundtrips_arrow_batches_to_subscriber() {
     let payload = subscriber.recv_bytes(0).unwrap();
     let mut reader = StreamReader::try_new(Cursor::new(payload), None).unwrap();
     let received = reader.next().unwrap().unwrap();
+
+    assert_eq!(received, batch);
+}
+
+#[cfg(feature = "zmq-publisher")]
+#[test]
+fn zmq_subscriber_receives_arrow_batches_from_publisher() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "price",
+        DataType::Float64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![2.0]))])
+        .unwrap();
+    let mut publisher = ZmqPublisher::bind("tcp://127.0.0.1:*").unwrap();
+    let endpoint = publisher.last_endpoint().unwrap();
+    let mut subscriber = ZmqSubscriber::connect(&endpoint, 1_000).unwrap();
+
+    thread::sleep(Duration::from_millis(100));
+    publisher.publish(&batch).unwrap();
+
+    let received = subscriber.recv().unwrap();
 
     assert_eq!(received, batch);
 }

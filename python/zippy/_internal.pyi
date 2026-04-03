@@ -129,6 +129,14 @@ class ZmqPublisher:
     def __init__(self, endpoint: str) -> None: ...
 
 
+class ZmqSubscriber:
+    def __init__(self, endpoint: str, timeout_ms: int = 1000) -> None: ...
+
+    def recv(self) -> pa.RecordBatch: ...
+
+    def close(self) -> None: ...
+
+
 WriteValue = (
     pl.DataFrame
     | pa.RecordBatch

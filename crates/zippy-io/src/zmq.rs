@@ -1,5 +1,8 @@
 #[cfg(feature = "zmq-publisher")]
 mod implementation {
+    use std::io::Cursor;
+
+    use arrow::ipc::reader::StreamReader;
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use zippy_core::{Result, ZippyError};
@@ -7,6 +10,11 @@ mod implementation {
     use crate::Publisher;
 
     pub struct ZmqPublisher {
+        _context: zmq::Context,
+        socket: zmq::Socket,
+    }
+
+    pub struct ZmqSubscriber {
         _context: zmq::Context,
         socket: zmq::Socket,
     }
@@ -45,6 +53,57 @@ mod implementation {
         }
     }
 
+    impl ZmqSubscriber {
+        pub fn connect(endpoint: &str, timeout_ms: i32) -> Result<Self> {
+            let context = zmq::Context::new();
+            let socket = context.socket(zmq::SUB).map_err(|error| ZippyError::Io {
+                reason: format!("failed to create zmq sub socket error=[{}]", error),
+            })?;
+            socket.set_subscribe(b"").map_err(|error| ZippyError::Io {
+                reason: format!("failed to subscribe zmq endpoint error=[{}]", error),
+            })?;
+            socket.set_rcvtimeo(timeout_ms).map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to set zmq receive timeout timeout_ms=[{}] error=[{}]",
+                    timeout_ms, error
+                ),
+            })?;
+            socket.connect(endpoint).map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to connect zmq endpoint endpoint=[{}] error=[{}]",
+                    endpoint, error
+                ),
+            })?;
+
+            Ok(Self {
+                _context: context,
+                socket,
+            })
+        }
+
+        pub fn recv(&mut self) -> Result<RecordBatch> {
+            let payload = self.socket.recv_bytes(0).map_err(|error| ZippyError::Io {
+                reason: format!("failed to receive zmq payload error=[{}]", error),
+            })?;
+            let mut reader =
+                StreamReader::try_new(Cursor::new(payload), None).map_err(|error| ZippyError::Io {
+                    reason: format!("failed to decode arrow ipc payload error=[{}]", error),
+                })?;
+
+            let batch = reader
+                .next()
+                .transpose()
+                .map_err(|error| ZippyError::Io {
+                    reason: format!("failed to read arrow ipc batch error=[{}]", error),
+                })?
+                .ok_or_else(|| ZippyError::Io {
+                    reason: "received empty arrow ipc payload".to_string(),
+                })?;
+
+            Ok(batch)
+        }
+    }
+
     impl Publisher for ZmqPublisher {
         fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
             let mut payload = Vec::new();
@@ -79,6 +138,7 @@ mod implementation {
     use crate::Publisher;
 
     pub struct ZmqPublisher;
+    pub struct ZmqSubscriber;
 
     impl ZmqPublisher {
         pub fn bind(endpoint: &str) -> Result<Self> {
@@ -97,6 +157,23 @@ mod implementation {
         }
     }
 
+    impl ZmqSubscriber {
+        pub fn connect(endpoint: &str, _timeout_ms: i32) -> Result<Self> {
+            Err(ZippyError::Io {
+                reason: format!(
+                    "failed to connect zmq endpoint because feature is disabled endpoint=[{}]",
+                    endpoint
+                ),
+            })
+        }
+
+        pub fn recv(&mut self) -> Result<RecordBatch> {
+            Err(ZippyError::Io {
+                reason: "failed to receive zmq payload because feature is disabled".to_string(),
+            })
+        }
+    }
+
     impl Publisher for ZmqPublisher {
         fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
             Err(ZippyError::Io {
@@ -106,4 +183,4 @@ mod implementation {
     }
 }
 
-pub use implementation::ZmqPublisher;
+pub use implementation::{ZmqPublisher, ZmqSubscriber};
