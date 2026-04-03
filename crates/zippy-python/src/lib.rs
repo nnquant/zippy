@@ -44,7 +44,14 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
 }
 
 type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
-type DownstreamLink = SharedHandle;
+type SharedArchive = Arc<Mutex<Option<ArchiveHandle>>>;
+
+#[derive(Clone)]
+struct DownstreamLink {
+    handle: SharedHandle,
+    archive: SharedArchive,
+    write_input: bool,
+}
 
 #[derive(Clone)]
 enum TargetConfig {
@@ -58,7 +65,15 @@ struct InProcessPublisher {
 
 impl CorePublisher for InProcessPublisher {
     fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
-        let guard = self.downstream.lock().unwrap();
+        if self.downstream.write_input {
+            let archive = self.downstream.archive.lock().unwrap();
+            let archive = archive.as_ref().ok_or(zippy_core::ZippyError::InvalidState {
+                status: "parquet sink not started",
+            })?;
+            archive.write(ArchiveKind::Input, batch.clone())?;
+        }
+
+        let guard = self.downstream.handle.lock().unwrap();
         let handle = guard.as_ref().ok_or(zippy_core::ZippyError::InvalidState {
             status: "engine not started",
         })?;
@@ -709,7 +724,7 @@ struct ReactiveStateEngine {
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
     parquet_sink: Option<ParquetSinkConfig>,
-    archive: Option<ArchiveHandle>,
+    archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
     downstreams: Vec<DownstreamLink>,
@@ -723,7 +738,7 @@ struct TimeSeriesEngine {
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
     parquet_sink: Option<ParquetSinkConfig>,
-    archive: Option<ArchiveHandle>,
+    archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
     downstreams: Vec<DownstreamLink>,
@@ -756,7 +771,19 @@ impl ReactiveStateEngine {
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
         let handle = Arc::new(Mutex::new(None));
-        let source_owner = register_source(source, Arc::clone(&handle), schema.as_ref())?;
+        let archive = Arc::new(Mutex::new(None));
+        let source_owner = register_source(
+            source,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+        )?;
 
         Ok(Self {
             name,
@@ -764,7 +791,7 @@ impl ReactiveStateEngine {
             output_schema,
             target,
             parquet_sink,
-            archive: None,
+            archive,
             handle,
             engine: Some(engine),
             downstreams: Vec::new(),
@@ -781,7 +808,7 @@ impl ReactiveStateEngine {
             &mut self.engine,
         )?;
         *self.handle.lock().unwrap() = Some(handle);
-        self.archive = archive;
+        *self.archive.lock().unwrap() = archive;
         Ok(())
     }
 
@@ -790,7 +817,7 @@ impl ReactiveStateEngine {
         write_runtime_input(
             py,
             &self.handle,
-            self.archive.as_ref(),
+            &self.archive,
             self.parquet_sink.as_ref(),
             value,
             &self.input_schema,
@@ -805,12 +832,12 @@ impl ReactiveStateEngine {
     }
 
     fn flush(&self) -> PyResult<()> {
-        flush_runtime_engine(&self.handle, self.archive.as_ref())
+        flush_runtime_engine(&self.handle, &self.archive)
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, self.archive.as_ref())
+        stop_runtime_engine(&self.handle, &self.archive)
     }
 }
 
@@ -855,7 +882,19 @@ impl TimeSeriesEngine {
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
         let handle = Arc::new(Mutex::new(None));
-        let source_owner = register_source(source, Arc::clone(&handle), schema.as_ref())?;
+        let archive = Arc::new(Mutex::new(None));
+        let source_owner = register_source(
+            source,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+        )?;
 
         Ok(Self {
             name,
@@ -863,7 +902,7 @@ impl TimeSeriesEngine {
             output_schema,
             target,
             parquet_sink,
-            archive: None,
+            archive,
             handle,
             engine: Some(engine),
             downstreams: Vec::new(),
@@ -880,7 +919,7 @@ impl TimeSeriesEngine {
             &mut self.engine,
         )?;
         *self.handle.lock().unwrap() = Some(handle);
-        self.archive = archive;
+        *self.archive.lock().unwrap() = archive;
         Ok(())
     }
 
@@ -889,7 +928,7 @@ impl TimeSeriesEngine {
         write_runtime_input(
             py,
             &self.handle,
-            self.archive.as_ref(),
+            &self.archive,
             self.parquet_sink.as_ref(),
             value,
             &self.input_schema,
@@ -904,12 +943,12 @@ impl TimeSeriesEngine {
     }
 
     fn flush(&self) -> PyResult<()> {
-        flush_runtime_engine(&self.handle, self.archive.as_ref())
+        flush_runtime_engine(&self.handle, &self.archive)
     }
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, self.archive.as_ref())
+        stop_runtime_engine(&self.handle, &self.archive)
     }
 }
 
@@ -1016,7 +1055,7 @@ fn register_source(
                 "source output schema must match downstream input_schema",
             ));
         }
-        engine.downstreams.push(downstream);
+        engine.downstreams.push(downstream.clone());
         return Ok(Some(source.clone().unbind()));
     }
 
@@ -1072,7 +1111,7 @@ fn build_publisher(
 
     for downstream in downstreams {
         publishers.push(Box::new(InProcessPublisher {
-            downstream: Arc::clone(downstream),
+            downstream: downstream.clone(),
         }));
     }
 
@@ -1085,7 +1124,7 @@ fn build_publisher(
 
 fn ensure_downstreams_running(downstreams: &[DownstreamLink]) -> PyResult<()> {
     for downstream in downstreams {
-        let guard = downstream.lock().unwrap();
+        let guard = downstream.handle.lock().unwrap();
         let runtime = guard.as_ref().ok_or_else(|| {
             py_runtime_error("downstream engine must be started before source engine writes")
         })?;
@@ -1163,7 +1202,7 @@ fn start_runtime_engine<E: Engine>(
 fn write_runtime_input(
     py: Python<'_>,
     handle: &SharedHandle,
-    archive: Option<&ArchiveHandle>,
+    archive: &SharedArchive,
     parquet_sink: Option<&ParquetSinkConfig>,
     value: &Bound<'_, PyAny>,
     input_schema: &Schema,
@@ -1173,6 +1212,10 @@ fn write_runtime_input(
     for batch in batches {
         if parquet_sink.map(|config| config.write_input).unwrap_or(false) {
             archive
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
                 .ok_or_else(|| py_runtime_error("parquet sink archive is not available"))?
                 .write(ArchiveKind::Input, batch.clone())
                 .map_err(|error| py_runtime_error(error.to_string()))?;
@@ -1187,14 +1230,14 @@ fn write_runtime_input(
     Ok(())
 }
 
-fn flush_runtime_engine(handle: &SharedHandle, archive: Option<&ArchiveHandle>) -> PyResult<()> {
+fn flush_runtime_engine(handle: &SharedHandle, archive: &SharedArchive) -> PyResult<()> {
     with_handle(handle, |runtime| {
         runtime
             .flush()
             .map(|_| ())
             .map_err(|error| py_runtime_error(error.to_string()))
     })?;
-    if let Some(archive) = archive {
+    if let Some(archive) = archive.lock().unwrap().as_ref().cloned() {
         archive
             .flush()
             .map_err(|error| py_runtime_error(error.to_string()))?;
@@ -1202,7 +1245,7 @@ fn flush_runtime_engine(handle: &SharedHandle, archive: Option<&ArchiveHandle>) 
     Ok(())
 }
 
-fn stop_runtime_engine(handle: &SharedHandle, archive: Option<&ArchiveHandle>) -> PyResult<()> {
+fn stop_runtime_engine(handle: &SharedHandle, archive: &SharedArchive) -> PyResult<()> {
     let mut guard = handle.lock().unwrap();
     let mut runtime = match guard.take() {
         Some(handle) => handle,
@@ -1212,7 +1255,7 @@ fn stop_runtime_engine(handle: &SharedHandle, archive: Option<&ArchiveHandle>) -
     let stop_result = runtime
         .stop()
         .map_err(|error| py_runtime_error(error.to_string()));
-    if let Some(archive) = archive {
+    if let Some(archive) = archive.lock().unwrap().take() {
         archive
             .close()
             .map_err(|error| py_runtime_error(error.to_string()))?;
@@ -1614,6 +1657,7 @@ mod tests {
     #[test]
     fn in_process_publisher_routes_source_batches_to_downstream_engine() {
         let downstream_handle: SharedHandle = Arc::new(Mutex::new(None));
+        let downstream_archive: SharedArchive = Arc::new(Mutex::new(None));
         let upstream_engine = RustReactiveStateEngine::new(
             "tick_factors",
             tick_schema(),
@@ -1655,7 +1699,11 @@ mod tests {
                 late_data_policy: Default::default(),
             },
             InProcessPublisher {
-                downstream: Arc::clone(&downstream_handle),
+                downstream: DownstreamLink {
+                    handle: Arc::clone(&downstream_handle),
+                    archive: Arc::clone(&downstream_archive),
+                    write_input: false,
+                },
             },
         )
         .unwrap();

@@ -852,3 +852,58 @@ def test_reactive_engine_accepts_parquet_sink_and_archives_input_and_output(
     assert output_files
     assert pq.read_schema(input_files[0]).names == ["symbol", "price"]
     assert pq.read_schema(output_files[0]).names == ["symbol", "price", "ema_2"]
+
+
+def test_source_pipeline_archives_downstream_input_via_parquet_sink(
+    tmp_path: Path,
+) -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+    bars = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        source=reactive,
+        input_schema=reactive.output_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type="tumbling",
+        late_data_policy="reject",
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=True,
+            write_output=False,
+        ),
+    )
+
+    reactive.start()
+    bars.start()
+    reactive.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)],
+            "price": [10.0],
+        }
+    )
+    reactive.stop()
+    bars.stop()
+
+    input_files = list((tmp_path / "input").rglob("*.parquet"))
+
+    assert input_files
+    assert pq.read_schema(input_files[0]).names == ["symbol", "dt", "price", "ema_2"]
