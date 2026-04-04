@@ -109,9 +109,10 @@ bucket_start = dt.div_euclid(trigger_interval) * trigger_interval
 `on_data(batch)` 固定执行如下：
 
 1. 校验输入 schema
-2. 逐行读取 `id` 和 `dt`
-3. 将 `dt` 对齐到 `bucket_start`
-4. 根据 `bucket_start` 与 `current_bucket_start` 比较，执行以下分支：
+2. 先将 batch 内行按 `bucket_start` 升序稳定整理；同一个 `bucket_start` 内保持原始到达顺序
+3. 逐行读取整理后的 `id` 和 `dt`
+4. 将 `dt` 对齐到 `bucket_start`
+5. 根据 `bucket_start` 与 `current_bucket_start` 比较，执行以下分支：
 
 #### Case 1: 当前桶为空
 
@@ -332,7 +333,8 @@ zippy.CS_ZSCORE(column="ret_1m", output="ret_z")
 
 首版可复现性依赖以下硬规则：
 
-- 输入按批次内顺序读取
+- 输入先按 batch 内 `bucket_start` 升序稳定整理，再推进状态机
+- 同一个 `bucket_start` 内保持原始到达顺序
 - 同桶内同 `id` 仅保留最后一条
 - 输出行按 `id` 稳定排序
 - 输出列按 factor 声明顺序稳定追加
