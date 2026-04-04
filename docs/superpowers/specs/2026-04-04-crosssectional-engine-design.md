@@ -221,6 +221,7 @@ zippy.CS_RANK(column="ret_1m", output="ret_rank")
 规则：
 
 - 只对非 null 样本排名
+- 非有限数值（`NaN`、`inf`、`-inf`）按缺失样本处理
 - ties 使用 average rank
 - 输出 dtype 为 `float64`
 - 不做归一化到 `[0, 1]`
@@ -235,6 +236,7 @@ zippy.CS_DEMEAN(column="ret_1m", output="ret_dm")
 规则：
 
 - 只对非 null 样本求均值
+- 非有限数值（`NaN`、`inf`、`-inf`）按缺失样本处理
 - 输出为 `value - mean`
 - 输出 dtype 为 `float64`
 - null 行输出 null
@@ -248,6 +250,7 @@ zippy.CS_ZSCORE(column="ret_1m", output="ret_z")
 规则：
 
 - 只对非 null 样本求均值和标准差
+- 非有限数值（`NaN`、`inf`、`-inf`）按缺失样本处理
 - 使用总体标准差
 - 输出 dtype 为 `float64`
 - 样本数为 0 时整列输出 null
@@ -260,6 +263,7 @@ zippy.CS_ZSCORE(column="ret_1m", output="ret_z")
 
 - 没有这个 `id`：不属于该截面
 - 存在这个 `id`，但算子输入列为 null：该行属于输出 batch，但该算子结果为 null
+- 存在这个 `id`，但算子输入列为非有限数值：按缺失样本处理，该算子结果为 null
 
 不同 `CS_*` 算子各自根据自己的输入列决定有效样本集合。
 
@@ -298,6 +302,7 @@ zippy.CS_ZSCORE(column="ret_1m", output="ret_z")
 因此：
 
 - null 值通过“该算子输出 null”处理
+- 非有限数值按缺失样本处理，不传播为整列 `NaN`
 - 零方差 `zscore` 输出 `0.0`
 
 理论上首版这 3 个 `CS_*` 不应有常规数值错误把整桶打死。
