@@ -34,7 +34,7 @@ def main() -> None:
             write_output=True,
         ),
         buffer_capacity=64,
-        overflow_policy="block",
+        overflow_policy=zippy.OverflowPolicy.BLOCK,
         archive_buffer_capacity=16,
     )
 

@@ -793,7 +793,7 @@ struct TimeSeriesEngine {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy="block", archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -804,7 +804,7 @@ impl ReactiveStateEngine {
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
-        overflow_policy: &str,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -930,23 +930,23 @@ impl ReactiveStateEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type="tumbling", window_ns=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy="block", archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
         input_schema: &Bound<'_, PyAny>,
         id_column: String,
         dt_column: String,
-        late_data_policy: String,
+        late_data_policy: &Bound<'_, PyAny>,
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
         window: Option<&Bound<'_, PyAny>>,
-        window_type: &str,
+        window_type: Option<&Bound<'_, PyAny>>,
         window_ns: Option<i64>,
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
-        overflow_policy: &str,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -954,7 +954,13 @@ impl TimeSeriesEngine {
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let factor_specs = build_aggregation_specs(py, factors)?;
-        let late_data_policy_enum = parse_late_data_policy(&late_data_policy)?;
+        let late_data_policy_value = parse_required_policy_value(
+            late_data_policy,
+            "late_data_policy",
+            "late_data_policy",
+            "LateDataPolicy",
+        )?;
+        let late_data_policy_enum = parse_late_data_policy(&late_data_policy_value)?;
         let window_ns = parse_window_ns(window, window_type, window_ns)?;
         let engine = RustTimeSeriesEngine::new(
             &name,
@@ -993,7 +999,7 @@ impl TimeSeriesEngine {
             id_column,
             dt_column,
             window_ns,
-            late_data_policy,
+            late_data_policy: late_data_policy_value,
             input_schema: schema,
             output_schema,
             target,
@@ -1466,7 +1472,7 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
 
 fn parse_runtime_options(
     buffer_capacity: usize,
-    overflow_policy: &str,
+    overflow_policy: Option<&Bound<'_, PyAny>>,
     archive_buffer_capacity: usize,
 ) -> PyResult<RuntimeOptions> {
     if buffer_capacity == 0 {
@@ -1486,13 +1492,20 @@ fn parse_runtime_options(
     })
 }
 
-fn parse_overflow_policy(value: &str) -> PyResult<OverflowPolicy> {
-    match value {
+fn parse_overflow_policy(value: Option<&Bound<'_, PyAny>>) -> PyResult<OverflowPolicy> {
+    let value = parse_optional_policy_value(
+        value,
+        "overflow_policy",
+        "overflow_policy",
+        "OverflowPolicy",
+        "block",
+    )?;
+    match value.as_str() {
         "block" => Ok(OverflowPolicy::Block),
         "reject" => Ok(OverflowPolicy::Reject),
         "drop_oldest" => Ok(OverflowPolicy::DropOldest),
         _ => Err(py_value_error(
-            "overflow_policy must be 'block', 'reject', or 'drop_oldest'",
+            "overflow_policy must be zippy.OverflowPolicy",
         )),
     }
 }
@@ -1583,11 +1596,18 @@ fn parquet_sink_to_pyobject(
 
 fn parse_window_ns(
     window: Option<&Bound<'_, PyAny>>,
-    window_type: &str,
+    window_type: Option<&Bound<'_, PyAny>>,
     window_ns: Option<i64>,
 ) -> PyResult<i64> {
+    let window_type = parse_optional_policy_value(
+        window_type,
+        "window_type",
+        "window_type",
+        "WindowType",
+        "tumbling",
+    )?;
     if window_type != "tumbling" {
-        return Err(py_value_error("window_type must be 'tumbling' in v1"));
+        return Err(py_value_error("window_type must be zippy.WindowType.TUMBLING in v1"));
     }
 
     if window.is_some() && window_ns.is_some() {
@@ -1614,6 +1634,55 @@ fn parse_window_ns(
     duration_attr
         .extract::<i64>()
         .map_err(|_| py_value_error("window must be an integer nanosecond value or zippy.Duration"))
+}
+
+fn parse_required_policy_value(
+    value: &Bound<'_, PyAny>,
+    parameter_name: &str,
+    expected_kind: &str,
+    expected_namespace: &str,
+) -> PyResult<String> {
+    parse_policy_value(value, parameter_name, expected_kind, expected_namespace)
+}
+
+fn parse_optional_policy_value(
+    value: Option<&Bound<'_, PyAny>>,
+    parameter_name: &str,
+    expected_kind: &str,
+    expected_namespace: &str,
+    default_value: &str,
+) -> PyResult<String> {
+    let Some(value) = value else {
+        return Ok(default_value.to_string());
+    };
+
+    parse_policy_value(value, parameter_name, expected_kind, expected_namespace)
+}
+
+fn parse_policy_value(
+    value: &Bound<'_, PyAny>,
+    parameter_name: &str,
+    expected_kind: &str,
+    expected_namespace: &str,
+) -> PyResult<String> {
+    let constant_kind = value
+        .getattr("_zippy_constant_kind")
+        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))?;
+    let constant_kind = constant_kind
+        .extract::<String>()
+        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))?;
+
+    if constant_kind != expected_kind {
+        return Err(py_value_error(format!(
+            "{parameter_name} must be zippy.{expected_namespace}"
+        )));
+    }
+
+    value
+        .getattr("_zippy_constant_value")
+        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))?
+        .extract::<String>()
+        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))
 }
 
 fn build_reactive_specs(

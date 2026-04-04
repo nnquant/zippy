@@ -54,4 +54,5 @@ uv run python examples/python/archive_reactive.py
 - 示例默认使用 `tcp://127.0.0.1:5555` 发布 reactive 输出，`tcp://127.0.0.1:5556` 发布 bars 输出
 - 发布侧遵守当前 source 生命周期约束：先启动 downstream，再写 source；停止时先停 source，再停 downstream
 - `archive_reactive.py` 默认把文件写到 `/tmp/zippy-parquet-demo/input/` 和 `/tmp/zippy-parquet-demo/output/`
+- 当前 Python API 使用预定义常量传递策略参数，例如 `zippy.WindowType.TUMBLING`、`zippy.LateDataPolicy.REJECT`、`zippy.OverflowPolicy.BLOCK`
 - 当前 Python API 还支持 `engine.status()`、`engine.metrics()`、`engine.config()`，以及 `buffer_capacity` / `overflow_policy` / `archive_buffer_capacity` 这组运行时配置参数，`archive_reactive.py` 里有最小示例

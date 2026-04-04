@@ -4,6 +4,30 @@ import pyarrow as pa
 __version__: str
 
 
+class _WindowTypeValue: ...
+
+
+class WindowType:
+    TUMBLING: _WindowTypeValue
+
+
+class _LateDataPolicyValue: ...
+
+
+class LateDataPolicy:
+    REJECT: _LateDataPolicyValue
+    DROP_WITH_METRIC: _LateDataPolicyValue
+
+
+class _OverflowPolicyValue: ...
+
+
+class OverflowPolicy:
+    BLOCK: _OverflowPolicyValue
+    REJECT: _OverflowPolicyValue
+    DROP_OLDEST: _OverflowPolicyValue
+
+
 class Duration:
     total_nanoseconds: int
 
@@ -215,7 +239,7 @@ class ReactiveStateEngine:
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
-        overflow_policy: str = "block",
+        overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
     ) -> None: ...
 
@@ -243,17 +267,17 @@ class TimeSeriesEngine:
         input_schema: pa.Schema,
         id_column: str,
         dt_column: str,
-        late_data_policy: str,
+        late_data_policy: _LateDataPolicyValue,
         factors: list[AggregationFactor],
         target: PublisherTarget,
         *,
         window: Duration | int | None = None,
-        window_type: str = "tumbling",
+        window_type: _WindowTypeValue | None = None,
         window_ns: int | None = None,
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
-        overflow_policy: str = "block",
+        overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
     ) -> None: ...
 

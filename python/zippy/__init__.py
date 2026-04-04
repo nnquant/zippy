@@ -26,6 +26,74 @@ from ._internal import __version__
 from ._internal import version
 
 
+class _PolicyConstant:
+    """Represent a predefined policy constant understood by the Rust bindings."""
+
+    __slots__ = ("_zippy_constant_kind", "_zippy_constant_value", "_zippy_constant_name")
+
+    def __init__(self, *, kind: str, value: str, name: str) -> None:
+        self._zippy_constant_kind = kind
+        self._zippy_constant_value = value
+        self._zippy_constant_name = name
+
+    def __repr__(self) -> str:
+        return self._zippy_constant_name
+
+
+class WindowType:
+    """Namespace for predefined window-type constants."""
+
+    TUMBLING = _PolicyConstant(
+        kind="window_type",
+        value="tumbling",
+        name="WindowType.TUMBLING",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> "WindowType":
+        raise TypeError("WindowType cannot be instantiated")
+
+
+class LateDataPolicy:
+    """Namespace for predefined late-data-policy constants."""
+
+    REJECT = _PolicyConstant(
+        kind="late_data_policy",
+        value="reject",
+        name="LateDataPolicy.REJECT",
+    )
+    DROP_WITH_METRIC = _PolicyConstant(
+        kind="late_data_policy",
+        value="drop_with_metric",
+        name="LateDataPolicy.DROP_WITH_METRIC",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> "LateDataPolicy":
+        raise TypeError("LateDataPolicy cannot be instantiated")
+
+
+class OverflowPolicy:
+    """Namespace for predefined overflow-policy constants."""
+
+    BLOCK = _PolicyConstant(
+        kind="overflow_policy",
+        value="block",
+        name="OverflowPolicy.BLOCK",
+    )
+    REJECT = _PolicyConstant(
+        kind="overflow_policy",
+        value="reject",
+        name="OverflowPolicy.REJECT",
+    )
+    DROP_OLDEST = _PolicyConstant(
+        kind="overflow_policy",
+        value="drop_oldest",
+        name="OverflowPolicy.DROP_OLDEST",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> "OverflowPolicy":
+        raise TypeError("OverflowPolicy cannot be instantiated")
+
+
 class Duration:
     """Represent a positive time duration in nanoseconds for Python APIs."""
 
@@ -179,8 +247,10 @@ __all__ = [
     "ClipSpec",
     "Duration",
     "ExpressionFactor",
+    "LateDataPolicy",
     "LogSpec",
     "NullPublisher",
+    "OverflowPolicy",
     "ParquetSink",
     "ReactiveStateEngine",
     "TimeSeriesEngine",
@@ -190,6 +260,7 @@ __all__ = [
     "TsMeanSpec",
     "TsReturnSpec",
     "TsStdSpec",
+    "WindowType",
     "ABS",
     "AGG_COUNT",
     "AGG_FIRST",

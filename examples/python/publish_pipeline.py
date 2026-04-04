@@ -38,8 +38,8 @@ def main() -> None:
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
             zippy.AGG_MAX(column="price", output="high"),

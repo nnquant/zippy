@@ -330,7 +330,7 @@ def test_timeseries_engine_accepts_polars_and_exposes_output_schema() -> None:
         id_column="symbol",
         dt_column="dt",
         window_ns=60_000_000_000,
-        late_data_policy="reject",
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[
             zippy.AggFirstSpec(column="price", output="open"),
             zippy.AggLastSpec(column="price", output="close"),
@@ -378,8 +378,8 @@ def test_timeseries_engine_accepts_duration_window_api() -> None:
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
     )
@@ -397,7 +397,7 @@ def test_timeseries_engine_accepts_duration_window_api() -> None:
     engine.stop()
 
 
-def test_timeseries_engine_rejects_non_tumbling_window_type() -> None:
+def test_timeseries_engine_rejects_string_policy_arguments() -> None:
     input_schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -414,9 +414,84 @@ def test_timeseries_engine_rejects_non_tumbling_window_type() -> None:
             dt_column="dt",
             window=zippy.Duration.minutes(1),
             window_type="sliding",
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            target=zippy.NullPublisher(),
+        )
+
+    with pytest.raises(ValueError, match="late_data_policy"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
             late_data_policy="reject",
             factors=[zippy.AGG_FIRST(column="price", output="open")],
             target=zippy.NullPublisher(),
+        )
+
+    with pytest.raises(ValueError, match="overflow_policy"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=pa.schema([("symbol", pa.string()), ("price", pa.float64())]),
+            id_column="symbol",
+            factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+            target=zippy.NullPublisher(),
+            overflow_policy="block",
+        )
+
+
+def test_engines_reject_wrong_policy_constant_categories() -> None:
+    timeseries_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+    reactive_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="window_type"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=timeseries_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.OverflowPolicy.BLOCK,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            target=zippy.NullPublisher(),
+        )
+
+    with pytest.raises(ValueError, match="late_data_policy"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=timeseries_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.WindowType.TUMBLING,
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            target=zippy.NullPublisher(),
+        )
+
+    with pytest.raises(ValueError, match="overflow_policy"):
+        zippy.ReactiveStateEngine(
+            name="tick_factors",
+            input_schema=reactive_schema,
+            id_column="symbol",
+            factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+            target=zippy.NullPublisher(),
+            overflow_policy=zippy.LateDataPolicy.REJECT,
         )
 
 
@@ -583,8 +658,8 @@ def test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpe
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
             zippy.AGG_MAX(column="price", output="high"),
@@ -639,8 +714,8 @@ def test_timeseries_engine_accepts_reactive_source_pipeline() -> None:
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
     )
@@ -696,8 +771,8 @@ def test_timeseries_engine_rejects_source_schema_mismatch_at_construction() -> N
             id_column="symbol",
             dt_column="dt",
             window=zippy.Duration.minutes(1),
-            window_type="tumbling",
-            late_data_policy="reject",
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
             factors=[zippy.AGG_FIRST(column="price", output="open")],
             target=zippy.NullPublisher(),
         )
@@ -726,8 +801,8 @@ def test_source_write_requires_downstream_started() -> None:
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
     )
@@ -771,8 +846,8 @@ def test_downstream_stop_requires_source_stopped() -> None:
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
     )
@@ -961,8 +1036,8 @@ def test_source_pipeline_archives_downstream_input_via_parquet_sink(
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
         parquet_sink=zippy.ParquetSink(
@@ -1016,7 +1091,7 @@ def test_engine_rejects_invalid_runtime_config_keywords(tmp_path: Path) -> None:
             id_column="symbol",
             factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
             target=zippy.NullPublisher(),
-            overflow_policy="invalid",
+            overflow_policy="block",
         )
 
     with pytest.raises(ValueError, match="archive_buffer_capacity"):
@@ -1059,7 +1134,7 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
             write_output=False,
         ),
         buffer_capacity=32,
-        overflow_policy="reject",
+        overflow_policy=zippy.OverflowPolicy.REJECT,
         archive_buffer_capacity=8,
     )
 
@@ -1122,8 +1197,8 @@ def test_timeseries_engine_config_and_output_archive_roundtrip(
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="reject",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
         parquet_sink=zippy.ParquetSink(
@@ -1133,7 +1208,7 @@ def test_timeseries_engine_config_and_output_archive_roundtrip(
             write_output=True,
         ),
         buffer_capacity=17,
-        overflow_policy="drop_oldest",
+        overflow_policy=zippy.OverflowPolicy.DROP_OLDEST,
         archive_buffer_capacity=9,
     )
 
@@ -1182,8 +1257,8 @@ def test_timeseries_engine_metrics_report_late_rows() -> None:
         id_column="symbol",
         dt_column="dt",
         window=zippy.Duration.minutes(1),
-        window_type="tumbling",
-        late_data_policy="drop_with_metric",
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.DROP_WITH_METRIC,
         factors=[zippy.AGG_FIRST(column="price", output="open")],
         target=zippy.NullPublisher(),
     )
