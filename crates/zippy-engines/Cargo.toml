@@ -19,3 +19,7 @@ harness = false
 [[bench]]
 name = "timeseries_pipeline"
 harness = false
+
+[[bench]]
+name = "crosssectional_pipeline"
+harness = false
