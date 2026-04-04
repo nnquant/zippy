@@ -7,6 +7,7 @@ use zippy_core::{spawn_engine, Engine, EngineConfig, LateDataPolicy, ZippyError}
 use zippy_engines::TimeSeriesEngine;
 use zippy_operators::{
     AggCountSpec, AggFirstSpec, AggLastSpec, AggMaxSpec, AggMinSpec, AggSumSpec, AggVwapSpec,
+    ExpressionSpec,
 };
 
 const MINUTE_NS: i64 = 60_000_000_000;
@@ -88,6 +89,22 @@ fn full_v1_specs() -> Vec<Box<dyn zippy_operators::AggregationSpec>> {
     ]
 }
 
+fn pre_turnover_exprs() -> Vec<ExpressionSpec> {
+    vec![ExpressionSpec::new("value * weight", "turnover")]
+}
+
+fn post_return_exprs() -> Vec<ExpressionSpec> {
+    vec![ExpressionSpec::new("close / open - 1.0", "ret_1m")]
+}
+
+fn post_invalid_input_exprs() -> Vec<ExpressionSpec> {
+    vec![ExpressionSpec::new("value * 2.0", "bad")]
+}
+
+fn post_invalid_runtime_exprs() -> Vec<ExpressionSpec> {
+    vec![ExpressionSpec::new("log(close - open)", "bad_log")]
+}
+
 #[test]
 fn timeseries_engine_flushes_open_windows() {
     let mut engine = TimeSeriesEngine::new(
@@ -98,6 +115,8 @@ fn timeseries_engine_flushes_open_windows() {
         MINUTE_NS,
         LateDataPolicy::Reject,
         specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
 
@@ -150,6 +169,8 @@ fn timeseries_engine_emits_completed_window_on_window_transition() {
         MINUTE_NS,
         LateDataPolicy::Reject,
         specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
 
@@ -193,6 +214,8 @@ fn timeseries_engine_rejects_late_data_for_same_id() {
         MINUTE_NS,
         LateDataPolicy::Reject,
         specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
 
@@ -242,6 +265,8 @@ fn timeseries_engine_rejects_late_rows_and_supports_full_v1_aggregations() {
         MINUTE_NS,
         LateDataPolicy::Reject,
         full_v1_specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
 
@@ -328,6 +353,8 @@ fn timeseries_engine_errors_on_zero_weight_vwap_window() {
         MINUTE_NS,
         LateDataPolicy::Reject,
         full_v1_specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
 
@@ -355,6 +382,8 @@ fn timeseries_engine_drop_with_metric_skips_late_rows_and_keeps_valid_rows() {
         MINUTE_NS,
         LateDataPolicy::DropWithMetric,
         specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
 
@@ -410,6 +439,8 @@ fn timeseries_runtime_records_late_rows_metric_for_drop_with_metric() {
         MINUTE_NS,
         LateDataPolicy::DropWithMetric,
         specs(),
+        vec![],
+        vec![],
     )
     .unwrap();
     let mut handle = spawn_engine(
@@ -435,4 +466,240 @@ fn timeseries_runtime_records_late_rows_metric_for_drop_with_metric() {
     handle.stop().unwrap();
 
     assert_eq!(handle.metrics().late_rows_total, 1);
+}
+
+#[test]
+fn timeseries_engine_pre_factors_can_generate_columns_for_agg_sum_inputs() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![
+            AggSumSpec::new("turnover", "turnover").build().unwrap(),
+            AggSumSpec::new("weight", "volume").build().unwrap(),
+        ],
+        pre_turnover_exprs(),
+        vec![],
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["a", "a"],
+            vec![1_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 12.0],
+            vec![2.0, 3.0],
+        ))
+        .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        column_names(&outputs[0]),
+        vec!["id", "window_start", "window_end", "turnover", "volume"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(float_values(outputs[0].column(3)), vec![20.0]);
+    assert_eq!(float_values(outputs[0].column(4)), vec![2.0]);
+}
+
+#[test]
+fn timeseries_engine_post_factors_can_extend_aggregate_outputs() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![
+            AggFirstSpec::new("value", "open").build().unwrap(),
+            AggLastSpec::new("value", "close").build().unwrap(),
+        ],
+        vec![],
+        post_return_exprs(),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["a", "a"],
+            vec![1_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 12.0],
+            vec![1.0, 1.0],
+        ))
+        .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        column_names(&outputs[0]),
+        vec![
+            "id",
+            "window_start",
+            "window_end",
+            "open",
+            "close",
+            "ret_1m"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(float_values(outputs[0].column(3)), vec![10.0]);
+    assert_eq!(float_values(outputs[0].column(4)), vec![10.0]);
+    assert_eq!(float_values(outputs[0].column(5)), vec![0.0]);
+}
+
+#[test]
+fn timeseries_engine_post_factors_reject_raw_input_column_references() {
+    let result = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![AggSumSpec::new("value", "sum_value").build().unwrap()],
+        vec![],
+        post_invalid_input_exprs(),
+    );
+
+    match result {
+        Err(ZippyError::InvalidConfig { reason }) => {
+            assert!(reason.contains("unknown expression identifier"));
+            assert!(reason.contains("value"));
+        }
+        Ok(_) => panic!("expected post factor with raw input reference to be rejected"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn timeseries_engine_flush_runs_post_factors() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![
+            AggFirstSpec::new("value", "open").build().unwrap(),
+            AggLastSpec::new("value", "close").build().unwrap(),
+        ],
+        vec![],
+        post_return_exprs(),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["a", "a"],
+            vec![1_000_000_000, 30_000_000_000],
+            vec![10.0, 12.0],
+            vec![1.0, 1.0],
+        ))
+        .unwrap();
+
+    assert!(outputs.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(
+        column_names(&flushed[0]),
+        vec![
+            "id",
+            "window_start",
+            "window_end",
+            "open",
+            "close",
+            "ret_1m"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(float_values(flushed[0].column(3)), vec![10.0]);
+    assert_eq!(float_values(flushed[0].column(4)), vec![12.0]);
+    assert!((float_values(flushed[0].column(5))[0] - 0.2).abs() < 1e-12);
+}
+
+#[test]
+fn timeseries_engine_post_factor_flush_failure_preserves_pending_windows() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![
+            AggFirstSpec::new("value", "open").build().unwrap(),
+            AggLastSpec::new("value", "close").build().unwrap(),
+        ],
+        vec![],
+        post_invalid_runtime_exprs(),
+    )
+    .unwrap();
+
+    engine
+        .on_data(batch(vec!["a"], vec![1_000_000_000], vec![10.0], vec![1.0]))
+        .unwrap();
+
+    let first_error = engine.on_flush().unwrap_err();
+    let second_error = engine.on_flush().unwrap_err();
+
+    assert!(matches!(
+        first_error,
+        ZippyError::InvalidState {
+            status: "expression log input must be positive",
+        }
+    ));
+    assert!(matches!(
+        second_error,
+        ZippyError::InvalidState {
+            status: "expression log input must be positive",
+        }
+    ));
+}
+
+#[test]
+fn timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::DropWithMetric,
+        vec![AggSumSpec::new("log_value", "sum_log_value")
+            .build()
+            .unwrap()],
+        vec![ExpressionSpec::new("log(value)", "log_value")],
+        vec![],
+    )
+    .unwrap();
+
+    engine
+        .on_data(batch(
+            vec!["a"],
+            vec![MINUTE_NS + 1_000_000_000],
+            vec![10.0],
+            vec![1.0],
+        ))
+        .unwrap();
+    engine
+        .on_data(batch(vec!["a"], vec![30_000_000_000], vec![0.0], vec![1.0]))
+        .unwrap();
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(float_values(flushed[0].column(3)), vec![10.0_f64.ln()]);
+    assert_eq!(engine.drain_metrics().late_rows_total, 1);
 }

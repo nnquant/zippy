@@ -690,6 +690,244 @@ def test_timeseries_engine_accepts_all_v1_aggregation_operators_via_design_helpe
     engine.stop()
 
 
+def test_timeseries_engine_accepts_pre_and_post_expression_factors() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+    expected_output_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            pa.field("window_start", pa.timestamp("ns", tz="UTC"), nullable=False),
+            pa.field("window_end", pa.timestamp("ns", tz="UTC"), nullable=False),
+            pa.field("open", pa.float64(), nullable=False),
+            pa.field("close", pa.float64(), nullable=False),
+            pa.field("volume", pa.float64(), nullable=False),
+            pa.field("turnover", pa.float64(), nullable=False),
+            pa.field("ret_1m", pa.float64(), nullable=False),
+            pa.field("vwap_1m", pa.float64(), nullable=False),
+        ]
+    )
+
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        pre_factors=[
+            zippy.EXPR(expression="price * volume", output="turnover_input"),
+        ],
+        factors=[
+            zippy.AGG_FIRST(column="price", output="open"),
+            zippy.AGG_LAST(column="price", output="close"),
+            zippy.AGG_SUM(column="volume", output="volume"),
+            zippy.AGG_SUM(column="turnover_input", output="turnover"),
+        ],
+        post_factors=[
+            zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
+            zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
+        ],
+        target=zippy.NullPublisher(),
+    )
+
+    assert engine.output_schema() == expected_output_schema
+
+
+def test_timeseries_engine_rejects_non_expression_phase_factors() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(TypeError, match="pre_factors"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            pre_factors=[zippy.AGG_SUM(column="price", output="sum_price")],
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            target=zippy.NullPublisher(),
+        )
+
+    with pytest.raises(TypeError, match="post_factors"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_FIRST(column="price", output="open")],
+            post_factors=[zippy.AGG_SUM(column="price", output="sum_price")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_timeseries_engine_rejects_post_factors_referencing_raw_input_columns() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="unknown expression identifier"):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[
+                zippy.AGG_FIRST(column="price", output="open"),
+                zippy.AGG_LAST(column="price", output="close"),
+            ],
+            post_factors=[
+                zippy.EXPR(expression="price * 2.0", output="bad"),
+            ],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.DROP_WITH_METRIC,
+        pre_factors=[
+            zippy.EXPR(expression="log(price)", output="log_price"),
+        ],
+        factors=[zippy.AGG_SUM(column="log_price", output="sum_log_price")],
+        target=zippy.NullPublisher(),
+    )
+
+    engine.start()
+    engine.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc)],
+            "price": [10.0],
+        }
+    )
+    engine.write(
+        {
+            "symbol": ["A"],
+            "dt": [datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)],
+            "price": [0.0],
+        }
+    )
+    engine.flush()
+
+    assert engine.metrics()["late_rows_total"] == 1
+
+    engine.stop()
+
+
+def test_timeseries_engine_flush_runs_post_factors() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        pre_factors=[
+            zippy.EXPR(expression="price * volume", output="turnover_input"),
+        ],
+        factors=[
+            zippy.AGG_FIRST(column="price", output="open"),
+            zippy.AGG_LAST(column="price", output="close"),
+            zippy.AGG_SUM(column="volume", output="volume"),
+            zippy.AGG_SUM(column="turnover_input", output="turnover"),
+        ],
+        post_factors=[
+            zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
+            zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+    engine.write(
+        {
+            "symbol": ["A", "A"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 11.0],
+            "volume": [100.0, 120.0],
+        }
+    )
+    engine.flush()
+
+    received = subscriber.recv()
+
+    assert received.column_names == [
+        "symbol",
+        "window_start",
+        "window_end",
+        "open",
+        "close",
+        "volume",
+        "turnover",
+        "ret_1m",
+        "vwap_1m",
+    ]
+    assert received.column(6).to_pylist() == [2320.0]
+    assert received.column(7).to_pylist() == pytest.approx([0.1])
+    assert received.column(8).to_pylist() == pytest.approx([2320.0 / 220.0])
+
+    engine.stop()
+    subscriber.close()
+
+
 def test_timeseries_engine_accepts_reactive_source_pipeline() -> None:
     tick_schema = pa.schema(
         [

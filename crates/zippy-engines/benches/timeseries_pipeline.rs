@@ -51,6 +51,8 @@ fn bench_timeseries_pipeline(c: &mut Criterion) {
                     AggLastSpec::new("price", "close").build().unwrap(),
                     AggSumSpec::new("volume", "volume").build().unwrap(),
                 ],
+                vec![],
+                vec![],
             )
             .unwrap();
             let _ = engine.on_data(batch.clone()).unwrap();

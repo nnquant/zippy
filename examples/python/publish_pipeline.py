@@ -40,12 +40,20 @@ def main() -> None:
         window=zippy.Duration.minutes(1),
         window_type=zippy.WindowType.TUMBLING,
         late_data_policy=zippy.LateDataPolicy.REJECT,
+        pre_factors=[
+            zippy.EXPR(expression="price * volume", output="turnover_input"),
+        ],
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
             zippy.AGG_MAX(column="price", output="high"),
             zippy.AGG_MIN(column="price", output="low"),
             zippy.AGG_LAST(column="price", output="close"),
             zippy.AGG_SUM(column="volume", output="volume"),
+            zippy.AGG_SUM(column="turnover_input", output="turnover"),
+        ],
+        post_factors=[
+            zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
+            zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
         ],
         target=zippy.ZmqPublisher(endpoint=BAR_ENDPOINT),
     )

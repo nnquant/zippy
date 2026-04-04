@@ -10,6 +10,9 @@
 
 - 当前 Python API 额外支持 `zippy.EXPR(expression="price + ema_2", output="price_plus_ema")`
 - 表达式运行在 `ReactiveStateEngine` 内，支持引用输入列和前序 reactive factor 输出
+- `TimeSeriesEngine` 额外支持 `pre_factors=[...]` 和 `post_factors=[...]`
+- `pre_factors` 在晚到数据过滤之后、窗口聚合之前执行
+- `post_factors` 在 `AGG_*` 输出之后执行，`flush()` 也会触发这一阶段
 - 当前支持的语法边界是：`+` / `-` / `*` / `/`、括号、数值字面量，以及 `abs(...)`、`log(...)`、`clip(...)`、`cast(...)`
 - 未知标识符和不支持函数会在 `ReactiveStateEngine(...)` 构造阶段直接报错，而不是等到 `start()` 或 `write()` 才失败
 
@@ -24,6 +27,34 @@ engine = zippy.ReactiveStateEngine(
         zippy.TS_EMA(column="price", span=2, output="ema_2"),
         zippy.EXPR(expression="price + ema_2", output="price_plus_ema"),
         zippy.EXPR(expression="clip(price_plus_ema, 20.0, 30.0)", output="clipped_total"),
+    ],
+    target=zippy.NullPublisher(),
+)
+```
+
+时序表达式示例：
+
+```python
+bars = zippy.TimeSeriesEngine(
+    name="bar_1m",
+    input_schema=tick_schema,
+    id_column="symbol",
+    dt_column="dt",
+    window=zippy.Duration.minutes(1),
+    window_type=zippy.WindowType.TUMBLING,
+    late_data_policy=zippy.LateDataPolicy.REJECT,
+    pre_factors=[
+        zippy.EXPR(expression="price * volume", output="turnover_input"),
+    ],
+    factors=[
+        zippy.AGG_FIRST(column="price", output="open"),
+        zippy.AGG_LAST(column="price", output="close"),
+        zippy.AGG_SUM(column="volume", output="volume"),
+        zippy.AGG_SUM(column="turnover_input", output="turnover"),
+    ],
+    post_factors=[
+        zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
+        zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
     ],
     target=zippy.NullPublisher(),
 )

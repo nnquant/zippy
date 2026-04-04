@@ -23,17 +23,16 @@ use zippy_engines::{
 };
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
-    ParquetSink as RustParquetSink,
-    ZmqPublisher as RustZmqPublisher, ZmqSubscriber as RustZmqSubscriber,
+    ParquetSink as RustParquetSink, ZmqPublisher as RustZmqPublisher,
+    ZmqSubscriber as RustZmqSubscriber,
 };
 use zippy_operators::{
     AbsSpec as RustAbsSpec, AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
     AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
     AggSumSpec as RustAggSumSpec, AggVwapSpec as RustAggVwapSpec,
     AggregationSpec as RustAggregationSpec, CastSpec as RustCastSpec, ClipSpec as RustClipSpec,
-    ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec,
-    TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec,
-    TsEmaSpec as RustTsEmaSpec, TsMeanSpec as RustTsMeanSpec,
+    ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec, TsDelaySpec as RustTsDelaySpec,
+    TsDiffSpec as RustTsDiffSpec, TsEmaSpec as RustTsEmaSpec, TsMeanSpec as RustTsMeanSpec,
     TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
 };
 
@@ -78,9 +77,11 @@ impl CorePublisher for InProcessPublisher {
     fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
         if self.downstream.write_input {
             let archive = self.downstream.archive.lock().unwrap();
-            let archive = archive.as_ref().ok_or(zippy_core::ZippyError::InvalidState {
-                status: "parquet sink not started",
-            })?;
+            let archive = archive
+                .as_ref()
+                .ok_or(zippy_core::ZippyError::InvalidState {
+                    status: "parquet sink not started",
+                })?;
             archive.write(ArchiveKind::Input, batch.clone())?;
         }
 
@@ -198,9 +199,8 @@ impl ArchiveHandle {
             .tx
             .send(ArchiveCommand::Close(reply_tx))
             .map_err(|_| ZippyError::ChannelSend);
-        let close_result = send_result.and_then(|_| {
-            reply_rx.recv().map_err(|_| ZippyError::ChannelReceive)?
-        });
+        let close_result =
+            send_result.and_then(|_| reply_rx.recv().map_err(|_| ZippyError::ChannelReceive)?);
         let join_result = self
             .join_handle
             .lock()
@@ -282,10 +282,7 @@ fn write_archive_batch(
     sink.write_batch(&format!("{index:06}.parquet"), batch)
 }
 
-fn archive_root(
-    config: &ParquetSinkConfig,
-    kind: &ArchiveKind,
-) -> zippy_core::Result<PathBuf> {
+fn archive_root(config: &ParquetSinkConfig, kind: &ArchiveKind) -> zippy_core::Result<PathBuf> {
     let mut root = config.path.join(kind.as_str());
     if let ParquetRotation::Hourly = config.rotation {
         root = root.join(format!("hour_{}", current_epoch_hour()?));
@@ -487,13 +484,7 @@ struct ClipSpec {
 impl ClipSpec {
     #[new]
     #[pyo3(signature = (id_column, value_column, min, max, output))]
-    fn new(
-        id_column: String,
-        value_column: String,
-        min: f64,
-        max: f64,
-        output: String,
-    ) -> Self {
+    fn new(id_column: String, value_column: String, min: f64, max: f64, output: String) -> Self {
         Self {
             _id_column: id_column,
             value_column,
@@ -675,12 +666,7 @@ struct ParquetSink {
 impl ParquetSink {
     #[new]
     #[pyo3(signature = (path, rotation="none", write_input=false, write_output=true))]
-    fn new(
-        path: String,
-        rotation: &str,
-        write_input: bool,
-        write_output: bool,
-    ) -> PyResult<Self> {
+    fn new(path: String, rotation: &str, write_input: bool, write_output: bool) -> PyResult<Self> {
         ParquetRotation::parse(rotation)?;
         if !write_input && !write_output {
             return Err(py_value_error(
@@ -721,10 +707,8 @@ impl ZmqSubscriber {
     #[new]
     #[pyo3(signature = (endpoint, timeout_ms=1000))]
     fn new(endpoint: String, timeout_ms: i32) -> PyResult<Self> {
-        let subscriber =
-            RustZmqSubscriber::connect(&endpoint, timeout_ms).map_err(|error| {
-                py_runtime_error(error.to_string())
-            })?;
+        let subscriber = RustZmqSubscriber::connect(&endpoint, timeout_ms)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
 
         Ok(Self {
             subscriber: Some(subscriber),
@@ -930,7 +914,7 @@ impl ReactiveStateEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -943,6 +927,8 @@ impl TimeSeriesEngine {
         window: Option<&Bound<'_, PyAny>>,
         window_type: Option<&Bound<'_, PyAny>>,
         window_ns: Option<i64>,
+        pre_factors: Option<Vec<Py<PyAny>>>,
+        post_factors: Option<Vec<Py<PyAny>>>,
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
@@ -954,6 +940,10 @@ impl TimeSeriesEngine {
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let factor_specs = build_aggregation_specs(py, factors)?;
+        let pre_factor_specs =
+            build_expression_specs(py, pre_factors.unwrap_or_default(), "pre_factors")?;
+        let post_factor_specs =
+            build_expression_specs(py, post_factors.unwrap_or_default(), "post_factors")?;
         let late_data_policy_value = parse_required_policy_value(
             late_data_policy,
             "late_data_policy",
@@ -970,6 +960,8 @@ impl TimeSeriesEngine {
             window_ns,
             late_data_policy_enum,
             factor_specs,
+            pre_factor_specs,
+            post_factor_specs,
         )
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
@@ -1132,7 +1124,10 @@ fn parse_targets(target: &Bound<'_, PyAny>) -> PyResult<Vec<TargetConfig>> {
             return Err(PyTypeError::new_err("target list must not be empty"));
         }
 
-        return targets.iter().map(|item| parse_single_target(&item)).collect();
+        return targets
+            .iter()
+            .map(|item| parse_single_target(&item))
+            .collect();
     }
 
     Ok(vec![parse_single_target(target)?])
@@ -1352,7 +1347,10 @@ fn write_runtime_input(
     let batches = value_to_record_batches(py, value, input_schema)?;
 
     for batch in batches {
-        if parquet_sink.map(|config| config.write_input).unwrap_or(false) {
+        if parquet_sink
+            .map(|config| config.write_input)
+            .unwrap_or(false)
+        {
             archive
                 .lock()
                 .unwrap()
@@ -1439,11 +1437,7 @@ fn with_handle<T>(
     callback(runtime)
 }
 
-fn sync_runtime_state(
-    handle: &SharedHandle,
-    status: &SharedStatus,
-    metrics: &SharedMetrics,
-) {
+fn sync_runtime_state(handle: &SharedHandle, status: &SharedStatus, metrics: &SharedMetrics) {
     let guard = handle.lock().unwrap();
     if let Some(runtime) = guard.as_ref() {
         set_cached_runtime_state(status, metrics, runtime.status(), runtime.metrics());
@@ -1607,7 +1601,9 @@ fn parse_window_ns(
         "tumbling",
     )?;
     if window_type != "tumbling" {
-        return Err(py_value_error("window_type must be zippy.WindowType.TUMBLING in v1"));
+        return Err(py_value_error(
+            "window_type must be zippy.WindowType.TUMBLING in v1",
+        ));
     }
 
     if window.is_some() && window_ns.is_some() {
@@ -1620,17 +1616,16 @@ fn parse_window_ns(
         return Ok(window_ns);
     }
 
-    let window = window.ok_or_else(|| {
-        py_value_error("window is required when window_ns is not provided")
-    })?;
+    let window = window
+        .ok_or_else(|| py_value_error("window is required when window_ns is not provided"))?;
 
     if let Ok(window_ns) = window.extract::<i64>() {
         return Ok(window_ns);
     }
 
-    let duration_attr = window
-        .getattr("total_nanoseconds")
-        .map_err(|_| py_value_error("window must be an integer nanosecond value or zippy.Duration"))?;
+    let duration_attr = window.getattr("total_nanoseconds").map_err(|_| {
+        py_value_error("window must be an integer nanosecond value or zippy.Duration")
+    })?;
     duration_attr
         .extract::<i64>()
         .map_err(|_| py_value_error("window must be an integer nanosecond value or zippy.Duration"))
@@ -1665,12 +1660,16 @@ fn parse_policy_value(
     expected_kind: &str,
     expected_namespace: &str,
 ) -> PyResult<String> {
-    let constant_kind = value
-        .getattr("_zippy_constant_kind")
-        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))?;
-    let constant_kind = constant_kind
-        .extract::<String>()
-        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))?;
+    let constant_kind = value.getattr("_zippy_constant_kind").map_err(|_| {
+        py_value_error(format!(
+            "{parameter_name} must be zippy.{expected_namespace}"
+        ))
+    })?;
+    let constant_kind = constant_kind.extract::<String>().map_err(|_| {
+        py_value_error(format!(
+            "{parameter_name} must be zippy.{expected_namespace}"
+        ))
+    })?;
 
     if constant_kind != expected_kind {
         return Err(py_value_error(format!(
@@ -1680,9 +1679,17 @@ fn parse_policy_value(
 
     value
         .getattr("_zippy_constant_value")
-        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))?
+        .map_err(|_| {
+            py_value_error(format!(
+                "{parameter_name} must be zippy.{expected_namespace}"
+            ))
+        })?
         .extract::<String>()
-        .map_err(|_| py_value_error(format!("{parameter_name} must be zippy.{expected_namespace}")))
+        .map_err(|_| {
+            py_value_error(format!(
+                "{parameter_name} must be zippy.{expected_namespace}"
+            ))
+        })
 }
 
 fn build_reactive_specs(
@@ -1862,6 +1869,33 @@ fn build_aggregation_spec(
     ))
 }
 
+fn build_expression_specs(
+    py: Python<'_>,
+    factors: Vec<Py<PyAny>>,
+    parameter_name: &str,
+) -> PyResult<Vec<RustExpressionSpec>> {
+    factors
+        .into_iter()
+        .map(|factor| build_expression_spec(py, factor.bind(py), parameter_name))
+        .collect()
+}
+
+fn build_expression_spec(
+    py: Python<'_>,
+    factor: &Bound<'_, PyAny>,
+    parameter_name: &str,
+) -> PyResult<RustExpressionSpec> {
+    if let Ok(spec) = factor.extract::<PyRef<'_, ExpressionFactor>>() {
+        return Ok(RustExpressionSpec::new(&spec.expression, &spec.output));
+    }
+
+    let _ = py;
+
+    Err(PyTypeError::new_err(format!(
+        "{parameter_name} must contain ExpressionFactor"
+    )))
+}
+
 fn value_to_record_batches(
     py: Python<'_>,
     value: &Bound<'_, PyAny>,
@@ -1938,7 +1972,8 @@ fn py_batches_to_record_batches(batches: &Bound<'_, PyAny>) -> PyResult<Vec<Reco
     batches
         .iter()
         .map(|batch| {
-            RecordBatch::from_pyarrow_bound(&batch).map_err(|error| py_value_error(error.to_string()))
+            RecordBatch::from_pyarrow_bound(&batch)
+                .map_err(|error| py_value_error(error.to_string()))
         })
         .collect()
 }
@@ -2065,6 +2100,8 @@ mod tests {
             MINUTE_NS,
             LateDataPolicy::Reject,
             vec![RustAggFirstSpec::new("price", "open").build().unwrap()],
+            vec![],
+            vec![],
         )
         .unwrap();
 

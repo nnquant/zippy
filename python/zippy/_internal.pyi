@@ -274,6 +274,8 @@ class TimeSeriesEngine:
         window: Duration | int | None = None,
         window_type: _WindowTypeValue | None = None,
         window_ns: int | None = None,
+        pre_factors: list[ExpressionFactor] | None = None,
+        post_factors: list[ExpressionFactor] | None = None,
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
