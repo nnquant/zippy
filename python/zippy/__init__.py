@@ -8,6 +8,10 @@ from ._internal import AggSumSpec
 from ._internal import AggVwapSpec
 from ._internal import CastSpec
 from ._internal import ClipSpec
+from ._internal import CSDemeanSpec
+from ._internal import CSRankSpec
+from ._internal import CSZscoreSpec
+from ._internal import CrossSectionalEngine
 from ._internal import ExpressionFactor
 from ._internal import LogSpec
 from ._internal import NullPublisher
@@ -234,6 +238,21 @@ def AGG_VWAP(*, price_column: str, volume_column: str, output: str) -> AggVwapSp
     )
 
 
+def CS_RANK(*, column: str, output: str) -> CSRankSpec:
+    """Create a cross-sectional rank factor spec."""
+    return CSRankSpec(column=column, output=output)
+
+
+def CS_ZSCORE(*, column: str, output: str) -> CSZscoreSpec:
+    """Create a cross-sectional z-score factor spec."""
+    return CSZscoreSpec(column=column, output=output)
+
+
+def CS_DEMEAN(*, column: str, output: str) -> CSDemeanSpec:
+    """Create a cross-sectional demean factor spec."""
+    return CSDemeanSpec(column=column, output=output)
+
+
 __all__ = [
     "AbsSpec",
     "AggCountSpec",
@@ -245,6 +264,10 @@ __all__ = [
     "AggVwapSpec",
     "CastSpec",
     "ClipSpec",
+    "CSDemeanSpec",
+    "CSRankSpec",
+    "CSZscoreSpec",
+    "CrossSectionalEngine",
     "Duration",
     "ExpressionFactor",
     "LateDataPolicy",
@@ -271,6 +294,9 @@ __all__ = [
     "AGG_VWAP",
     "CAST",
     "CLIP",
+    "CS_DEMEAN",
+    "CS_RANK",
+    "CS_ZSCORE",
     "EXPR",
     "LOG",
     "TS_DELAY",

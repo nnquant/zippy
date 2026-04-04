@@ -19,6 +19,7 @@ use zippy_core::{
     Publisher as CorePublisher, ZippyError,
 };
 use zippy_engines::{
+    CrossSectionalEngine as RustCrossSectionalEngine,
     ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
 };
 use zippy_io::{
@@ -31,6 +32,8 @@ use zippy_operators::{
     AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
     AggSumSpec as RustAggSumSpec, AggVwapSpec as RustAggVwapSpec,
     AggregationSpec as RustAggregationSpec, CastSpec as RustCastSpec, ClipSpec as RustClipSpec,
+    CSDemeanSpec as RustCSDemeanSpec, CSRankSpec as RustCSRankSpec,
+    CSZscoreSpec as RustCSZscoreSpec,
     ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec, TsDelaySpec as RustTsDelaySpec,
     TsDiffSpec as RustTsDiffSpec, TsEmaSpec as RustTsEmaSpec, TsMeanSpec as RustTsMeanSpec,
     TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
@@ -643,6 +646,51 @@ impl AggVwapSpec {
 }
 
 #[pyclass]
+struct CSRankSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl CSRankSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct CSZscoreSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl CSZscoreSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
+struct CSDemeanSpec {
+    column: String,
+    output: String,
+}
+
+#[pymethods]
+impl CSDemeanSpec {
+    #[new]
+    #[pyo3(signature = (column, output))]
+    fn new(column: String, output: String) -> Self {
+        Self { column, output }
+    }
+}
+
+#[pyclass]
 #[derive(Default)]
 struct NullPublisher;
 
@@ -769,6 +817,27 @@ struct TimeSeriesEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
+}
+
+#[pyclass]
+struct CrossSectionalEngine {
+    name: String,
+    id_column: String,
+    dt_column: String,
+    trigger_interval_ns: i64,
+    late_data_policy: String,
+    input_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
+    archive: SharedArchive,
+    handle: SharedHandle,
+    engine: Option<RustCrossSectionalEngine>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -1082,6 +1151,173 @@ impl TimeSeriesEngine {
     }
 }
 
+#[pymethods]
+impl CrossSectionalEngine {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    fn new(
+        py: Python<'_>,
+        name: String,
+        input_schema: &Bound<'_, PyAny>,
+        id_column: String,
+        dt_column: String,
+        trigger_interval: &Bound<'_, PyAny>,
+        late_data_policy: &Bound<'_, PyAny>,
+        factors: Vec<Py<PyAny>>,
+        target: &Bound<'_, PyAny>,
+        source: Option<&Bound<'_, PyAny>>,
+        parquet_sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
+        archive_buffer_capacity: usize,
+    ) -> PyResult<Self> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(input_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let factor_specs = build_cross_sectional_specs(py, factors)?;
+        let late_data_policy_value = parse_required_policy_value(
+            late_data_policy,
+            "late_data_policy",
+            "late_data_policy",
+            "LateDataPolicy",
+        )?;
+        if late_data_policy_value != "reject" {
+            return Err(py_value_error(
+                "cross-sectional engine only supports late_data_policy=zippy.LateDataPolicy.REJECT",
+            ));
+        }
+        let late_data_policy_enum = parse_late_data_policy(&late_data_policy_value)?;
+        let trigger_interval_ns = parse_duration_ns(trigger_interval, "trigger_interval")?;
+        let engine = RustCrossSectionalEngine::new(
+            &name,
+            Arc::clone(&schema),
+            &id_column,
+            &dt_column,
+            trigger_interval_ns,
+            late_data_policy_enum,
+            factor_specs,
+        )
+        .map_err(|error| py_value_error(error.to_string()))?;
+        let output_schema = engine.output_schema();
+        let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(parquet_sink)?;
+        let runtime_options =
+            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
+        let handle = Arc::new(Mutex::new(None));
+        let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
+        let source_owner = register_timeseries_source(
+            source,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+        )?;
+
+        Ok(Self {
+            name,
+            id_column,
+            dt_column,
+            trigger_interval_ns,
+            late_data_policy: late_data_policy_value,
+            input_schema: schema,
+            output_schema,
+            target,
+            parquet_sink,
+            runtime_options,
+            status,
+            metrics,
+            archive,
+            handle,
+            engine: Some(engine),
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
+        })
+    }
+
+    fn start(&mut self) -> PyResult<()> {
+        let (handle, archive) = start_runtime_engine(
+            &self.name,
+            &self.runtime_options,
+            &self.target,
+            self.parquet_sink.as_ref(),
+            &self.downstreams,
+            &mut self.engine,
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
+        *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        Ok(())
+    }
+
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
+        let result = write_runtime_input(
+            py,
+            &self.handle,
+            &self.archive,
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.output_schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "cross_sectional",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            self._source_owner.is_some(),
+        )?;
+        dict.set_item("id_column", &self.id_column)?;
+        dict.set_item("dt_column", &self.dt_column)?;
+        dict.set_item("trigger_interval_ns", self.trigger_interval_ns)?;
+        dict.set_item("late_data_policy", &self.late_data_policy)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    fn flush(&self) -> PyResult<()> {
+        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
+    }
+}
+
 #[pymodule]
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", python_dev_version())?;
@@ -1104,12 +1340,16 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<AggMinSpec>()?;
     module.add_class::<AggCountSpec>()?;
     module.add_class::<AggVwapSpec>()?;
+    module.add_class::<CSRankSpec>()?;
+    module.add_class::<CSZscoreSpec>()?;
+    module.add_class::<CSDemeanSpec>()?;
     module.add_class::<NullPublisher>()?;
     module.add_class::<ParquetSink>()?;
     module.add_class::<ZmqPublisher>()?;
     module.add_class::<ZmqSubscriber>()?;
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
+    module.add_class::<CrossSectionalEngine>()?;
     Ok(())
 }
 
@@ -1213,6 +1453,35 @@ fn register_source(
     ))
 }
 
+fn register_timeseries_source(
+    source: Option<&Bound<'_, PyAny>>,
+    downstream: DownstreamLink,
+    input_schema: &Schema,
+) -> PyResult<Option<Py<PyAny>>> {
+    let Some(source) = source else {
+        return Ok(None);
+    };
+
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream);
+        return Ok(Some(source.clone().unbind()));
+    }
+
+    Err(PyTypeError::new_err(
+        "source must be TimeSeriesEngine for CrossSectionalEngine",
+    ))
+}
+
 fn build_publisher(
     targets: &[TargetConfig],
     parquet_sink: Option<&ParquetSinkConfig>,
@@ -1312,23 +1581,35 @@ fn start_runtime_engine<E: Engine>(
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
 ) -> PyResult<(EngineHandle, Option<ArchiveHandle>)> {
+    let archive = parquet_sink
+        .cloned()
+        .map(|config| ArchiveHandle::spawn(config, runtime_options.archive_buffer_capacity));
+    let publisher = match build_publisher(targets, parquet_sink, archive.clone(), downstreams) {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            if let Some(archive) = archive {
+                let _ = archive.close();
+            }
+            return Err(error);
+        }
+    };
+    let config = EngineConfig {
+        name: name.to_string(),
+        buffer_capacity: runtime_options.buffer_capacity,
+        overflow_policy: runtime_options.overflow_policy,
+        late_data_policy: Default::default(),
+    };
+    config
+        .validate()
+        .map_err(|error| py_runtime_error(error.to_string()))?;
     let engine = match engine.take() {
         Some(engine) => engine,
         None => return Err(py_runtime_error("engine already started")),
     };
-    let archive = parquet_sink
-        .cloned()
-        .map(|config| ArchiveHandle::spawn(config, runtime_options.archive_buffer_capacity));
-    let publisher = build_publisher(targets, parquet_sink, archive.clone(), downstreams)?;
 
     let handle = spawn_engine_with_publisher(
         engine,
-        EngineConfig {
-            name: name.to_string(),
-            buffer_capacity: runtime_options.buffer_capacity,
-            overflow_policy: runtime_options.overflow_policy,
-            late_data_policy: Default::default(),
-        },
+        config,
         publisher,
     )
     .map_err(|error| py_runtime_error(error.to_string()))?;
@@ -1631,6 +1912,23 @@ fn parse_window_ns(
         .map_err(|_| py_value_error("window must be an integer nanosecond value or zippy.Duration"))
 }
 
+fn parse_duration_ns(value: &Bound<'_, PyAny>, parameter_name: &str) -> PyResult<i64> {
+    if let Ok(value) = value.extract::<i64>() {
+        return Ok(value);
+    }
+
+    let duration_attr = value.getattr("total_nanoseconds").map_err(|_| {
+        py_value_error(format!(
+            "{parameter_name} must be an integer nanosecond value or zippy.Duration"
+        ))
+    })?;
+    duration_attr.extract::<i64>().map_err(|_| {
+        py_value_error(format!(
+            "{parameter_name} must be an integer nanosecond value or zippy.Duration"
+        ))
+    })
+}
+
 fn parse_required_policy_value(
     value: &Bound<'_, PyAny>,
     parameter_name: &str,
@@ -1866,6 +2164,45 @@ fn build_aggregation_spec(
 
     Err(PyTypeError::new_err(
         "factors must contain AggFirstSpec, AggLastSpec, AggSumSpec, AggMaxSpec, AggMinSpec, AggCountSpec, or AggVwapSpec",
+    ))
+}
+
+fn build_cross_sectional_specs(
+    py: Python<'_>,
+    factors: Vec<Py<PyAny>>,
+) -> PyResult<Vec<Box<dyn zippy_operators::CrossSectionalFactor>>> {
+    factors
+        .into_iter()
+        .map(|factor| build_cross_sectional_spec(py, factor.bind(py)))
+        .collect()
+}
+
+fn build_cross_sectional_spec(
+    py: Python<'_>,
+    factor: &Bound<'_, PyAny>,
+) -> PyResult<Box<dyn zippy_operators::CrossSectionalFactor>> {
+    if let Ok(spec) = factor.extract::<PyRef<'_, CSRankSpec>>() {
+        return RustCSRankSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, CSZscoreSpec>>() {
+        return RustCSZscoreSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    if let Ok(spec) = factor.extract::<PyRef<'_, CSDemeanSpec>>() {
+        return RustCSDemeanSpec::new(&spec.column, &spec.output)
+            .build()
+            .map_err(|error| py_value_error(error.to_string()));
+    }
+
+    let _ = py;
+
+    Err(PyTypeError::new_err(
+        "factors must contain CSRankSpec, CSZscoreSpec, or CSDemeanSpec",
     ))
 }
 

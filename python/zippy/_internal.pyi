@@ -169,6 +169,18 @@ class AggVwapSpec:
     def __init__(self, price_column: str, volume_column: str, output: str) -> None: ...
 
 
+class CSRankSpec:
+    def __init__(self, column: str, output: str) -> None: ...
+
+
+class CSZscoreSpec:
+    def __init__(self, column: str, output: str) -> None: ...
+
+
+class CSDemeanSpec:
+    def __init__(self, column: str, output: str) -> None: ...
+
+
 class NullPublisher:
     def __init__(self) -> None: ...
 
@@ -225,6 +237,7 @@ AggregationFactor = (
     | AggCountSpec
     | AggVwapSpec
 )
+CrossSectionalFactor = CSRankSpec | CSZscoreSpec | CSDemeanSpec
 
 
 class ReactiveStateEngine:
@@ -277,6 +290,42 @@ class TimeSeriesEngine:
         pre_factors: list[ExpressionFactor] | None = None,
         post_factors: list[ExpressionFactor] | None = None,
         source: ReactiveStateEngine | TimeSeriesEngine | None = None,
+        parquet_sink: ParquetSink | None = None,
+        buffer_capacity: int = 1024,
+        overflow_policy: _OverflowPolicyValue | None = None,
+        archive_buffer_capacity: int = 1024,
+    ) -> None: ...
+
+    def start(self) -> None: ...
+
+    def write(self, value: WriteValue) -> None: ...
+
+    def output_schema(self) -> pa.Schema: ...
+
+    def status(self) -> str: ...
+
+    def metrics(self) -> dict[str, int]: ...
+
+    def config(self) -> dict[str, object]: ...
+
+    def flush(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class CrossSectionalEngine:
+    def __init__(
+        self,
+        name: str,
+        input_schema: pa.Schema,
+        id_column: str,
+        dt_column: str,
+        trigger_interval: Duration | int,
+        late_data_policy: _LateDataPolicyValue,
+        factors: list[CrossSectionalFactor],
+        target: PublisherTarget,
+        *,
+        source: TimeSeriesEngine | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,

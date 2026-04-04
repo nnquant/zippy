@@ -15,12 +15,19 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 
 
 def git_output(*args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(WORKSPACE_ROOT), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    if not (WORKSPACE_ROOT / ".git").exists():
+        pytest.skip("git metadata is unavailable in this workspace")
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(WORKSPACE_ROOT), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        pytest.skip(f"git metadata is unavailable: {error}")
+
     return result.stdout.strip()
 
 
@@ -1556,3 +1563,350 @@ def test_parquet_sink_failure_marks_engine_failed_status(tmp_path: Path) -> None
         engine.stop()
 
     assert engine.status() == "failed"
+
+
+def test_cross_sectional_engine_accepts_duration_trigger_interval_and_exposes_output_schema() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+    expected_output_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            pa.field("ret_rank", pa.float64(), nullable=True),
+            pa.field("ret_z", pa.float64(), nullable=True),
+            pa.field("ret_dm", pa.float64(), nullable=True),
+        ]
+    )
+
+    rank = zippy.CS_RANK(column="ret_1m", output="ret_rank")
+    zscore = zippy.CS_ZSCORE(column="ret_1m", output="ret_z")
+    demean = zippy.CS_DEMEAN(column="ret_1m", output="ret_dm")
+
+    assert isinstance(rank, zippy.CSRankSpec)
+    assert isinstance(zscore, zippy.CSZscoreSpec)
+    assert isinstance(demean, zippy.CSDemeanSpec)
+
+    engine = zippy.CrossSectionalEngine(
+        name="cs_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[rank, zscore, demean],
+        target=zippy.NullPublisher(),
+    )
+
+    assert engine.output_schema() == expected_output_schema
+
+    engine.start()
+
+    assert engine.output_schema() == expected_output_schema
+
+    engine.stop()
+
+
+def test_cross_sectional_engine_emits_bucketed_output_over_zmq() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+    bucket_start = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+
+    engine = zippy.CrossSectionalEngine(
+        name="cs_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[
+            zippy.CS_RANK(column="ret_1m", output="ret_rank"),
+            zippy.CS_ZSCORE(column="ret_1m", output="ret_z"),
+            zippy.CS_DEMEAN(column="ret_1m", output="ret_dm"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+    engine.write(
+        {
+            "symbol": ["B", "A", "C"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 2, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 3, tzinfo=timezone.utc),
+            ],
+            "ret_1m": [2.0, 1.0, 3.0],
+        }
+    )
+    engine.flush()
+
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "dt", "ret_rank", "ret_z", "ret_dm"]
+    assert received.column(0).to_pylist() == ["A", "B", "C"]
+    assert received.column(1).to_pylist() == [bucket_start, bucket_start, bucket_start]
+    assert received.column(2).to_pylist() == pytest.approx([1.0, 2.0, 3.0])
+    assert received.column(3).to_pylist() == pytest.approx(
+        [-1.224744871391589, 0.0, 1.224744871391589]
+    )
+    assert received.column(4).to_pylist() == pytest.approx([-1.0, 0.0, 1.0])
+
+    engine.stop()
+    subscriber.close()
+
+
+def test_cross_sectional_engine_rejects_unsupported_late_data_policy() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="late_data_policy"):
+        zippy.CrossSectionalEngine(
+            name="cs_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            trigger_interval=zippy.Duration.minutes(1),
+            late_data_policy=zippy.LateDataPolicy.DROP_WITH_METRIC,
+            factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_cross_sectional_engine_rejects_non_cross_sectional_factor_specs() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(TypeError, match="CSRankSpec|CSZscoreSpec|CSDemeanSpec"):
+        zippy.CrossSectionalEngine(
+            name="cs_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            trigger_interval=zippy.Duration.minutes(1),
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_FIRST(column="ret_1m", output="bad")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_cross_sectional_engine_rejects_reactive_source() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+
+    with pytest.raises(TypeError, match="source must be TimeSeriesEngine"):
+        zippy.CrossSectionalEngine(
+            name="cs_1m",
+            source=reactive,
+            input_schema=reactive.output_schema(),
+            id_column="symbol",
+            dt_column="dt",
+            trigger_interval=zippy.Duration.minutes(1),
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.CS_RANK(column="price", output="price_rank")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_cross_sectional_engine_accepts_timeseries_source_pipeline() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    reactive = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=tick_schema,
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.NullPublisher(),
+    )
+    bars = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        source=reactive,
+        input_schema=reactive.output_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    bucket_start = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+
+    cs = zippy.CrossSectionalEngine(
+        name="cs_1m",
+        source=bars,
+        input_schema=bars.output_schema(),
+        id_column="symbol",
+        dt_column="window_start",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="open", output="open_rank")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    reactive.start()
+    bars.start()
+    cs.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    reactive.write(
+        {
+            "symbol": ["A", "A", "B", "B"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 11.0, 20.0, 21.0],
+        }
+    )
+    reactive.flush()
+    bars.flush()
+    cs.flush()
+
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "window_start", "open_rank"]
+    assert received.column(0).to_pylist() == ["A", "B"]
+    assert received.column(1).to_pylist() == [bucket_start, bucket_start]
+    assert received.column(2).to_pylist() == pytest.approx([1.0, 2.0])
+
+    reactive.stop()
+    bars.stop()
+    cs.stop()
+    subscriber.close()
+
+
+def test_cross_sectional_engine_archives_output_parquet(tmp_path: Path) -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+    bucket_start = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+
+    engine = zippy.CrossSectionalEngine(
+        name="cs_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=False,
+            write_output=True,
+        ),
+    )
+
+    engine.start()
+    engine.write(
+        {
+            "symbol": ["B", "A"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 2, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "ret_1m": [2.0, 1.0],
+        }
+    )
+    engine.stop()
+
+    output_files = list((tmp_path / "output").rglob("*.parquet"))
+
+    assert output_files
+    output_table = pq.read_table(output_files[0])
+    assert output_table.column_names == ["symbol", "dt", "ret_rank"]
+    assert output_table.column("symbol").to_pylist() == ["A", "B"]
+    assert output_table.column("dt").to_pylist() == [bucket_start, bucket_start]
+    assert output_table.column("ret_rank").to_pylist() == pytest.approx([1.0, 2.0])
+
+
+def test_cross_sectional_engine_start_can_retry_after_publisher_failure() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+
+    blocker = zippy.ReactiveStateEngine(
+        name="blocker",
+        input_schema=pa.schema([("symbol", pa.string()), ("price", pa.float64())]),
+        id_column="symbol",
+        factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+    engine = zippy.CrossSectionalEngine(
+        name="cs_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    blocker.start()
+
+    with pytest.raises(RuntimeError):
+        engine.start()
+
+    blocker.stop()
+    engine.start()
+    engine.stop()
