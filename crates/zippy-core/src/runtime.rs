@@ -1,14 +1,14 @@
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
-use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, Sender};
 
 use crate::{
     queue::{QueueSendError, QueueSender},
     Engine, EngineConfig, EngineMetrics, EngineMetricsSnapshot, EngineStatus, OverflowPolicy,
-    Publisher, Result, ZippyError,
+    Publisher, Result, Source, SourceEvent, SourceHandle as RuntimeSourceHandle, SourceMode,
+    SourceSink, ZippyError,
 };
 
 #[derive(Default)]
@@ -23,7 +23,9 @@ impl Publisher for NoopPublisher {
 enum Command {
     Data(RecordBatch),
     Flush(Sender<Result<Vec<RecordBatch>>>),
-    Stop(Sender<Result<Vec<RecordBatch>>>),
+    Stop,
+    SourceEvent(SourceEvent),
+    SourceTerminated(Result<()>),
 }
 
 pub struct EngineHandle {
@@ -31,6 +33,15 @@ pub struct EngineHandle {
     overflow_policy: OverflowPolicy,
     tx: QueueSender<Command>,
     join_handle: Option<JoinHandle<Result<()>>>,
+    source_handle: Option<RuntimeSourceHandle>,
+    source_monitor_handle: Option<JoinHandle<()>>,
+    metrics: Arc<EngineMetrics>,
+}
+
+struct SourceRuntimeSink {
+    status: Arc<Mutex<EngineStatus>>,
+    overflow_policy: OverflowPolicy,
+    tx: QueueSender<Command>,
     metrics: Arc<EngineMetrics>,
 }
 
@@ -48,17 +59,30 @@ impl EngineHandle {
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        let (reply_tx, reply_rx) = bounded(1);
-        let command_result = self.enqueue_command(Command::Stop(reply_tx)).and_then(|_| {
-            self.recv_stop_response(reply_rx)
-                .and_then(|result| result.map(|_| ()))
-        });
-        let join_result = self.join_worker();
+        if self.status() == EngineStatus::Stopped {
+            let join_result = self.join_worker();
+            let source_result = self.join_source();
 
-        match (command_result, join_result) {
-            (_, Err(err)) => Err(err),
-            (Err(err), Ok(())) => Err(err),
-            (Ok(()), Ok(())) => Ok(()),
+            return match (join_result, source_result) {
+                (Err(err), _) => Err(err),
+                (Ok(()), Err(err)) => Err(err),
+                (Ok(()), Ok(())) => Ok(()),
+            };
+        }
+
+        match self.source_handle.as_ref() {
+            Some(source_handle) => source_handle.stop(),
+            None => Ok(()),
+        }?;
+        let command_result = self.enqueue_command(Command::Stop);
+        let join_result = self.join_worker();
+        let source_result = self.join_source();
+
+        match (command_result, join_result, source_result) {
+            (_, Err(err), _) => Err(err),
+            (_, Ok(()), Err(err)) => Err(err),
+            (Err(err), Ok(()), Ok(())) => Err(err),
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
         }
     }
 
@@ -70,30 +94,6 @@ impl EngineHandle {
         self.metrics.snapshot(self.tx.len())
     }
 
-    fn recv_stop_response(
-        &mut self,
-        reply_rx: crossbeam_channel::Receiver<Result<Vec<RecordBatch>>>,
-    ) -> Result<Result<Vec<RecordBatch>>> {
-        loop {
-            match reply_rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(result) => return Ok(result),
-                Err(RecvTimeoutError::Timeout) => {
-                    if self
-                        .join_handle
-                        .as_ref()
-                        .map(JoinHandle::is_finished)
-                        .unwrap_or(true)
-                    {
-                        return Err(ZippyError::ChannelReceive);
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(ZippyError::ChannelReceive);
-                }
-            }
-        }
-    }
-
     fn join_worker(&mut self) -> Result<()> {
         if let Some(join_handle) = self.join_handle.take() {
             return join_handle.join().map_err(|_| ZippyError::Io {
@@ -101,6 +101,19 @@ impl EngineHandle {
             })?;
         }
 
+        Ok(())
+    }
+
+    fn join_source(&mut self) -> Result<()> {
+        if let Some(source_handle) = self.source_handle.as_ref() {
+            source_handle.join()?;
+        }
+        self.source_handle = None;
+        if let Some(source_monitor_handle) = self.source_monitor_handle.take() {
+            source_monitor_handle.join().map_err(|_| ZippyError::Io {
+                reason: "source monitor thread panicked".to_string(),
+            })?;
+        }
         Ok(())
     }
 
@@ -116,32 +129,25 @@ impl EngineHandle {
     }
 
     fn enqueue_command(&self, command: Command) -> Result<()> {
-        let is_data = matches!(&command, Command::Data(_));
-        let send_result = match (is_data, self.overflow_policy) {
-            (false, _) | (true, OverflowPolicy::Block) => self.tx.send(command).map(|_| None),
-            (true, OverflowPolicy::Reject) => self.tx.try_send(command).map(|_| None),
-            (true, OverflowPolicy::DropOldest) => self
-                .tx
-                .send_drop_oldest(command, |queued| matches!(queued, Command::Data(_))),
-        };
+        enqueue_runtime_command(
+            &self.status,
+            self.overflow_policy,
+            &self.tx,
+            &self.metrics,
+            command,
+        )
+    }
+}
 
-        match send_result {
-            Ok(Some(_)) => {
-                self.metrics.inc_dropped_batches(1);
-                Ok(())
-            }
-            Ok(None) => Ok(()),
-            Err(QueueSendError::Full(_)) => Err(ZippyError::ChannelSend),
-            Err(QueueSendError::Disconnected(_)) => {
-                let status = self.status();
-                if status != EngineStatus::Running {
-                    return Err(ZippyError::InvalidState {
-                        status: status.as_str(),
-                    });
-                }
-                Err(ZippyError::ChannelSend)
-            }
-        }
+impl SourceSink for SourceRuntimeSink {
+    fn emit(&self, event: SourceEvent) -> Result<()> {
+        enqueue_runtime_command(
+            &self.status,
+            self.overflow_policy,
+            &self.tx,
+            &self.metrics,
+            Command::SourceEvent(event),
+        )
     }
 }
 
@@ -193,8 +199,9 @@ where
                         Ok(outputs) => {
                             metrics_clone.apply_delta(engine.drain_metrics());
                             metrics_clone.inc_output_batches(outputs.len());
-                            if let Err(err) = publish_batches(&mut publisher, &metrics_clone, &outputs)
-                                .and_then(|()| flush_publisher(&mut publisher, &metrics_clone))
+                            if let Err(err) =
+                                publish_batches(&mut publisher, &metrics_clone, &outputs)
+                                    .and_then(|()| flush_publisher(&mut publisher, &metrics_clone))
                             {
                                 *status_clone.lock().unwrap() = EngineStatus::Failed;
                                 let _ = reply_tx.send(Err(err.clone()));
@@ -209,31 +216,39 @@ where
                             return Err(err);
                         }
                     },
-                    Command::Stop(reply_tx) => {
+                    Command::Stop => {
                         *status_clone.lock().unwrap() = EngineStatus::Stopping;
                         match engine.on_stop() {
                             Ok(outputs) => {
                                 metrics_clone.apply_delta(engine.drain_metrics());
                                 metrics_clone.inc_output_batches(outputs.len());
-                                if let Err(err) = publish_batches(&mut publisher, &metrics_clone, &outputs)
-                                    .and_then(|()| flush_publisher(&mut publisher, &metrics_clone))
-                                    .and_then(|()| close_publisher(&mut publisher, &metrics_clone))
+                                if let Err(err) =
+                                    publish_batches(&mut publisher, &metrics_clone, &outputs)
+                                        .and_then(|()| {
+                                            flush_publisher(&mut publisher, &metrics_clone)
+                                        })
+                                        .and_then(|()| {
+                                            close_publisher(&mut publisher, &metrics_clone)
+                                        })
                                 {
                                     *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                    let _ = reply_tx.send(Err(err.clone()));
                                     return Err(err);
                                 }
-                                let _ = reply_tx.send(Ok(outputs));
                                 *status_clone.lock().unwrap() = EngineStatus::Stopped;
                                 return Ok(());
                             }
                             Err(err) => {
                                 metrics_clone.apply_delta(engine.drain_metrics());
                                 *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                let _ = reply_tx.send(Err(err.clone()));
                                 return Err(err);
                             }
                         }
+                    }
+                    Command::SourceEvent(_) => {
+                        unreachable!("source events are not dispatched into spawn_engine worker");
+                    }
+                    Command::SourceTerminated(_) => {
+                        unreachable!("source termination is not dispatched into spawn_engine worker");
                     }
                 }
             }
@@ -252,11 +267,360 @@ where
         overflow_policy: config.overflow_policy,
         tx,
         join_handle: Some(join_handle),
+        source_handle: None,
+        source_monitor_handle: None,
         metrics,
     })
 }
 
-fn publish_batches<P>(publisher: &mut P, metrics: &EngineMetrics, outputs: &[RecordBatch]) -> Result<()>
+pub fn spawn_source_engine_with_publisher<S, E, P>(
+    source: Box<S>,
+    mut engine: E,
+    config: EngineConfig,
+    mut publisher: P,
+) -> Result<EngineHandle>
+where
+    S: Source + ?Sized,
+    E: Engine,
+    P: Publisher,
+{
+    config.validate()?;
+    let queue = crate::queue::BoundedQueue::new(config.buffer_capacity);
+    let status = Arc::new(Mutex::new(EngineStatus::Running));
+    let metrics = Arc::new(EngineMetrics::default());
+    let status_clone = status.clone();
+    let metrics_clone = metrics.clone();
+    let rx = queue.receiver();
+    let tx = queue.sender();
+    let source_mode = source.mode();
+    let source_schema = source.output_schema();
+    let engine_schema = engine.input_schema();
+    let sink = Arc::new(SourceRuntimeSink {
+        status: status.clone(),
+        overflow_policy: config.overflow_policy,
+        tx: tx.clone(),
+        metrics: metrics.clone(),
+    });
+    let source_handle = source.start(sink)?;
+    let monitor_source_handle = source_handle.clone();
+    let monitor_status = status.clone();
+    let monitor_tx = tx.clone();
+    let monitor_metrics = metrics.clone();
+    let source_monitor_handle = thread::spawn(move || {
+        let source_result = monitor_source_handle.join();
+        if monitor_source_handle.stop_requested() && source_result.is_ok() {
+            return;
+        }
+
+        let current_status = *monitor_status.lock().unwrap();
+        if current_status != EngineStatus::Running {
+            return;
+        }
+
+        let _ = enqueue_runtime_command(
+            &monitor_status,
+            OverflowPolicy::Block,
+            &monitor_tx,
+            &monitor_metrics,
+            Command::SourceTerminated(source_result),
+        );
+    });
+
+    let join_handle = thread::spawn(move || -> Result<()> {
+        let worker_result = (|| -> Result<()> {
+            let mut hello_seen = false;
+
+            while let Ok(command) = rx.recv() {
+                match command {
+                    Command::Data(batch) => {
+                        process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)?;
+                    }
+                    Command::Flush(reply_tx) => {
+                        process_flush_event(&mut engine, &mut publisher, &metrics_clone, true)
+                            .map(|outputs| {
+                                let _ = reply_tx.send(Ok(outputs));
+                            })
+                            .inspect_err(|err| {
+                                *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                let _ = reply_tx.send(Err(err.clone()));
+                            })?;
+                    }
+                    Command::Stop => {
+                        *status_clone.lock().unwrap() = EngineStatus::Stopping;
+                        process_stop_event(&mut engine, &mut publisher, &metrics_clone)
+                            .map(|_outputs| {
+                                *status_clone.lock().unwrap() = EngineStatus::Stopped;
+                            })
+                            .inspect_err(|_err| {
+                                *status_clone.lock().unwrap() = EngineStatus::Failed;
+                            })?;
+                        return Ok(());
+                    }
+                    Command::SourceTerminated(source_result) => match source_result {
+                        Ok(()) => {
+                            return fail_worker(
+                                &mut engine,
+                                &status_clone,
+                                ZippyError::Io {
+                                    reason: "source terminated without stop event".to_string(),
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            return fail_worker(&mut engine, &status_clone, err);
+                        }
+                    },
+                    Command::SourceEvent(event) => match event {
+                        SourceEvent::Hello(hello) => {
+                            if hello_seen {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::InvalidConfig {
+                                        reason: "source hello already received".to_string(),
+                                    },
+                                );
+                            }
+                            if hello.schema != source_schema {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::SchemaMismatch {
+                                        reason: "source hello schema does not match source output schema"
+                                            .to_string(),
+                                    },
+                                );
+                            }
+                            if hello.schema != engine_schema {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::SchemaMismatch {
+                                        reason: "source hello schema does not match engine input schema"
+                                            .to_string(),
+                                    },
+                                );
+                            }
+                            hello_seen = true;
+                        }
+                        SourceEvent::Data(batch) => {
+                            if !hello_seen {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::InvalidConfig {
+                                        reason: "source hello must arrive before data".to_string(),
+                                    },
+                                );
+                            }
+                            process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)
+                                .inspect_err(|_| {
+                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                })?;
+                        }
+                        SourceEvent::Flush => {
+                            if !hello_seen {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::InvalidConfig {
+                                        reason: "source hello must arrive before flush".to_string(),
+                                    },
+                                );
+                            }
+                            if source_mode == SourceMode::Pipeline {
+                                process_flush_event(
+                                    &mut engine,
+                                    &mut publisher,
+                                    &metrics_clone,
+                                    true,
+                                )
+                                .inspect_err(|_| {
+                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                })?;
+                            }
+                        }
+                        SourceEvent::Stop => {
+                            if !hello_seen {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::InvalidConfig {
+                                        reason: "source hello must arrive before stop".to_string(),
+                                    },
+                                );
+                            }
+                            if source_mode == SourceMode::Pipeline {
+                                *status_clone.lock().unwrap() = EngineStatus::Stopping;
+                                process_stop_event(&mut engine, &mut publisher, &metrics_clone)
+                                    .inspect_err(|_| {
+                                        *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                    })?;
+                                *status_clone.lock().unwrap() = EngineStatus::Stopped;
+                                return Ok(());
+                            }
+                            *status_clone.lock().unwrap() = EngineStatus::Stopped;
+                            shutdown_source_pipeline(&mut publisher, &metrics_clone)?;
+                            return Ok(());
+                        }
+                        SourceEvent::Error(reason) => {
+                            return fail_worker(
+                                &mut engine,
+                                &status_clone,
+                                ZippyError::Io { reason },
+                            );
+                        }
+                    },
+                }
+            }
+            Ok(())
+        })();
+
+        if worker_result.is_err() {
+            *status_clone.lock().unwrap() = EngineStatus::Failed;
+        }
+
+        worker_result
+    });
+
+    Ok(EngineHandle {
+        status,
+        overflow_policy: config.overflow_policy,
+        tx,
+        join_handle: Some(join_handle),
+        source_handle: Some(source_handle),
+        source_monitor_handle: Some(source_monitor_handle),
+        metrics,
+    })
+}
+
+fn enqueue_runtime_command(
+    status: &Arc<Mutex<EngineStatus>>,
+    overflow_policy: OverflowPolicy,
+    tx: &QueueSender<Command>,
+    metrics: &Arc<EngineMetrics>,
+    command: Command,
+) -> Result<()> {
+    let is_data = command_is_data(&command);
+    let send_result = match (is_data, overflow_policy) {
+        (false, _) | (true, OverflowPolicy::Block) => tx.send(command).map(|_| None),
+        (true, OverflowPolicy::Reject) => tx.try_send(command).map(|_| None),
+        (true, OverflowPolicy::DropOldest) => tx.send_drop_oldest(command, command_is_data),
+    };
+
+    match send_result {
+        Ok(Some(_)) => {
+            metrics.inc_dropped_batches(1);
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(QueueSendError::Full(_)) => Err(ZippyError::ChannelSend),
+        Err(QueueSendError::Disconnected(_)) => {
+            let current_status = *status.lock().unwrap();
+            if current_status != EngineStatus::Running {
+                return Err(ZippyError::InvalidState {
+                    status: current_status.as_str(),
+                });
+            }
+            Err(ZippyError::ChannelSend)
+        }
+    }
+}
+
+fn command_is_data(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Data(_) | Command::SourceEvent(SourceEvent::Data(_))
+    )
+}
+
+fn process_data_event<E, P>(
+    engine: &mut E,
+    publisher: &mut P,
+    metrics: &Arc<EngineMetrics>,
+    batch: RecordBatch,
+) -> Result<()>
+where
+    E: Engine,
+    P: Publisher,
+{
+    metrics.inc_processed_batch(batch.num_rows());
+    let outputs = engine.on_data(batch).inspect_err(|_| {
+        metrics.apply_delta(engine.drain_metrics());
+    })?;
+    metrics.apply_delta(engine.drain_metrics());
+    metrics.inc_output_batches(outputs.len());
+    publish_batches(publisher, metrics, &outputs)
+}
+
+fn process_flush_event<E, P>(
+    engine: &mut E,
+    publisher: &mut P,
+    metrics: &Arc<EngineMetrics>,
+    flush_publisher_after: bool,
+) -> Result<Vec<RecordBatch>>
+where
+    E: Engine,
+    P: Publisher,
+{
+    let outputs = engine.on_flush().inspect_err(|_| {
+        metrics.apply_delta(engine.drain_metrics());
+    })?;
+    metrics.apply_delta(engine.drain_metrics());
+    metrics.inc_output_batches(outputs.len());
+    publish_batches(publisher, metrics, &outputs)?;
+    if flush_publisher_after {
+        flush_publisher(publisher, metrics)?;
+    }
+    Ok(outputs)
+}
+
+fn process_stop_event<E, P>(
+    engine: &mut E,
+    publisher: &mut P,
+    metrics: &Arc<EngineMetrics>,
+) -> Result<Vec<RecordBatch>>
+where
+    E: Engine,
+    P: Publisher,
+{
+    let outputs = engine.on_stop().inspect_err(|_| {
+        metrics.apply_delta(engine.drain_metrics());
+    })?;
+    metrics.apply_delta(engine.drain_metrics());
+    metrics.inc_output_batches(outputs.len());
+    publish_batches(publisher, metrics, &outputs)?;
+    flush_publisher(publisher, metrics)?;
+    close_publisher(publisher, metrics)?;
+    Ok(outputs)
+}
+
+fn shutdown_source_pipeline<P>(publisher: &mut P, metrics: &Arc<EngineMetrics>) -> Result<()>
+where
+    P: Publisher,
+{
+    flush_publisher(publisher, metrics)?;
+    close_publisher(publisher, metrics)
+}
+
+fn fail_worker<E>(
+    engine: &mut E,
+    status: &Arc<Mutex<EngineStatus>>,
+    err: ZippyError,
+) -> Result<()>
+where
+    E: Engine,
+{
+    let _ = engine.drain_metrics();
+    *status.lock().unwrap() = EngineStatus::Failed;
+    Err(err)
+}
+
+fn publish_batches<P>(
+    publisher: &mut P,
+    metrics: &EngineMetrics,
+    outputs: &[RecordBatch],
+) -> Result<()>
 where
     P: Publisher,
 {
