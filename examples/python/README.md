@@ -4,6 +4,7 @@
 
 - `publish_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布
 - `cross_sectional_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine -> CrossSectionalEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布截面因子
+- `remote_pipeline.py`：使用 `ZmqStreamPublisher` 发送远程 stream 协议，再由 `ZmqSource -> CrossSectionalEngine` 在另一个进程里继续处理
 - `subscribe_bars.py`：使用 `ZmqSubscriber` 订阅并读取一个 `RecordBatch`
 - `archive_reactive.py`：使用 `ParquetSink` 归档 `ReactiveStateEngine` 的输入和输出
 
@@ -107,6 +108,14 @@ uv run python examples/python/archive_reactive.py
 uv run python examples/python/cross_sectional_pipeline.py
 ```
 
+5. 如果要看跨进程 remote source 示例，先启动 downstream，再启动 upstream：
+
+```bash
+uv run python examples/python/remote_pipeline.py downstream
+uv run python examples/python/remote_pipeline.py upstream
+```
+`remote_pipeline.py` 的 downstream 进程会直接打印最终状态和 metrics。
+
 如果要订阅 `cross_sectional_pipeline.py` 的输出，请使用 `tcp://127.0.0.1:5557`。
 仓库里现成的 `subscribe_bars.py` 默认监听 `tcp://127.0.0.1:5556`，适用于
 `publish_pipeline.py`，不直接复用到截面示例。
@@ -119,7 +128,15 @@ uv run python examples/python/cross_sectional_pipeline.py
 
 - 示例默认使用 `tcp://127.0.0.1:5555` 发布 reactive 输出，`tcp://127.0.0.1:5556` 发布 bars 输出
 - `cross_sectional_pipeline.py` 默认使用 `tcp://127.0.0.1:5557` 发布 `CrossSectionalEngine` 输出
+- `remote_pipeline.py` 默认使用 `tcp://127.0.0.1:5560` 作为远程 source 输入流，`tcp://127.0.0.1:5561` 发布 downstream 输出
 - 发布侧遵守当前 source 生命周期约束：先启动 downstream，再写 source；停止时先停 source，再停 downstream
 - `archive_reactive.py` 默认把文件写到 `/tmp/zippy-parquet-demo/input/` 和 `/tmp/zippy-parquet-demo/output/`
 - 当前 Python API 使用预定义常量传递策略参数，例如 `zippy.WindowType.TUMBLING`、`zippy.LateDataPolicy.REJECT`、`zippy.OverflowPolicy.BLOCK`
+- 远程 source 相关常量同样使用预定义值：`zippy.SourceMode.PIPELINE`、`zippy.SourceMode.CONSUMER`
 - 当前 Python API 还支持 `engine.status()`、`engine.metrics()`、`engine.config()`，以及 `buffer_capacity` / `overflow_policy` / `archive_buffer_capacity` 这组运行时配置参数，`archive_reactive.py` 里有最小示例
+
+远程 source 选择建议：
+
+- `pipeline`：下游跟随上游 `Flush/Stop` 边界，适合正式处理链
+- `consumer`：下游只消费 `Data`，忽略上游 `Flush`；如果需要结算，要由本地下游显式 `flush()`
+- `remote_pipeline.py --mode consumer` 会在本地等待一段时间后手动 `flush()` 和 `stop()`，目的是把这种差异跑出来
