@@ -248,7 +248,12 @@ WriteValue = (
     | dict[str, object]
     | list[dict[str, object]]
 )
-PublisherTarget = NullPublisher | ZmqPublisher | list[NullPublisher | ZmqPublisher]
+PublisherTarget = (
+    NullPublisher
+    | ZmqPublisher
+    | ZmqStreamPublisher
+    | list[NullPublisher | ZmqPublisher | ZmqStreamPublisher]
+)
 ReactiveFactor = (
     TsEmaSpec
     | TsReturnSpec

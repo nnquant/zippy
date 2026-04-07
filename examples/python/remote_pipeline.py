@@ -12,54 +12,81 @@ DEFAULT_SOURCE_ENDPOINT = "tcp://127.0.0.1:5560"
 DEFAULT_OUTPUT_ENDPOINT = "tcp://127.0.0.1:5561"
 
 
-def bar_schema() -> pa.Schema:
+def tick_schema() -> pa.Schema:
     return pa.schema(
         [
             ("symbol", pa.string()),
-            ("window_start", pa.timestamp("ns", tz="UTC")),
-            ("ret_1m", pa.float64()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
         ]
     )
 
 
+def bar_schema() -> pa.Schema:
+    schema_probe = zippy.TimeSeriesEngine(
+        name="bars_probe",
+        input_schema=tick_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_LAST(column="price", output="close")],
+        target=zippy.NullPublisher(),
+    )
+    return schema_probe.output_schema()
+
+
 def run_upstream(endpoint: str) -> None:
-    publisher = zippy.ZmqStreamPublisher(
+    stream_target = zippy.ZmqStreamPublisher(
         endpoint=endpoint,
         stream_name="bars",
         schema=bar_schema(),
     )
-    actual_endpoint = publisher.last_endpoint()
-    print(f"upstream publishing stream frames to {actual_endpoint}")
+    engine = zippy.TimeSeriesEngine(
+        name="bars_upstream",
+        input_schema=tick_schema(),
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_LAST(column="price", output="close")],
+        target=stream_target,
+    )
+    actual_endpoint = stream_target.last_endpoint()
+    print(f"upstream engine publishing stream frames to {actual_endpoint}")
+    engine.start()
     time.sleep(0.5)
 
     first_bucket = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
     second_bucket = datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc)
 
-    publisher.publish(
+    engine.write(
         {
             "symbol": ["A", "B"],
-            "window_start": [first_bucket, first_bucket],
-            "ret_1m": [0.10, 0.20],
+            "dt": [first_bucket, first_bucket],
+            "price": [10.0, 20.0],
         }
     )
-    publisher.flush()
+    engine.flush()
     print("upstream flushed first bucket")
 
     time.sleep(0.5)
 
-    publisher.publish(
+    engine.write(
         {
             "symbol": ["A", "B"],
-            "window_start": [second_bucket, second_bucket],
-            "ret_1m": [0.05, -0.02],
+            "dt": [second_bucket, second_bucket],
+            "price": [11.0, 19.0],
         }
     )
-    publisher.flush()
+    engine.flush()
     print("upstream flushed second bucket")
 
     time.sleep(0.2)
-    publisher.stop()
-    print("upstream stopped stream publisher")
+    engine.stop()
+    print("upstream stopped timeseries engine")
 
 
 def run_downstream(source_endpoint: str, output_endpoint: str, mode: object) -> None:
@@ -76,7 +103,7 @@ def run_downstream(source_endpoint: str, output_endpoint: str, mode: object) -> 
         dt_column="window_start",
         trigger_interval=zippy.Duration.minutes(1),
         late_data_policy=zippy.LateDataPolicy.REJECT,
-        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        factors=[zippy.CS_RANK(column="close", output="close_rank")],
         target=zippy.ZmqPublisher(endpoint=output_endpoint),
     )
 

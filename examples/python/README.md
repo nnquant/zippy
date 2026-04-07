@@ -4,7 +4,7 @@
 
 - `publish_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布
 - `cross_sectional_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine -> CrossSectionalEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布截面因子
-- `remote_pipeline.py`：使用 `ZmqStreamPublisher` 发送远程 stream 协议，再由 `ZmqSource -> CrossSectionalEngine` 在另一个进程里继续处理
+- `remote_pipeline.py`：`TimeSeriesEngine -> ZmqStreamPublisher -> ZmqSource -> CrossSectionalEngine` 的跨进程处理链
 - `subscribe_bars.py`：使用 `ZmqSubscriber` 订阅并读取一个 `RecordBatch`
 - `archive_reactive.py`：使用 `ParquetSink` 归档 `ReactiveStateEngine` 的输入和输出
 

@@ -78,6 +78,11 @@ struct RemoteSourceConfig {
 enum TargetConfig {
     Null,
     Zmq { endpoint: String },
+    ZmqStream {
+        endpoint: String,
+        stream_name: String,
+        publisher: Arc<Mutex<Option<RustZmqStreamPublisher>>>,
+    },
 }
 
 struct InProcessPublisher {
@@ -755,8 +760,10 @@ impl ZmqPublisher {
 
 #[pyclass]
 struct ZmqStreamPublisher {
+    stream_name: String,
+    last_endpoint: String,
     schema: Arc<Schema>,
-    publisher: Option<RustZmqStreamPublisher>,
+    publisher: Arc<Mutex<Option<RustZmqStreamPublisher>>>,
 }
 
 #[pymethods]
@@ -773,25 +780,26 @@ impl ZmqStreamPublisher {
         );
         let publisher = RustZmqStreamPublisher::bind(&endpoint, &stream_name, schema.clone())
             .map_err(|error| py_runtime_error(error.to_string()))?;
+        let last_endpoint = publisher
+            .last_endpoint()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
 
         Ok(Self {
+            stream_name,
+            last_endpoint,
             schema,
-            publisher: Some(publisher),
+            publisher: Arc::new(Mutex::new(Some(publisher))),
         })
     }
 
     fn last_endpoint(&self) -> PyResult<String> {
-        self.publisher
-            .as_ref()
-            .ok_or_else(|| py_runtime_error("stream publisher is closed"))?
-            .last_endpoint()
-            .map_err(|error| py_runtime_error(error.to_string()))
+        Ok(self.last_endpoint.clone())
     }
 
     fn publish(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let batches = value_to_record_batches(py, value, self.schema.as_ref())?;
-        let publisher = self
-            .publisher
+        let mut publisher = self.publisher.lock().unwrap();
+        let publisher = publisher
             .as_mut()
             .ok_or_else(|| py_runtime_error("stream publisher is closed"))?;
 
@@ -806,6 +814,8 @@ impl ZmqStreamPublisher {
 
     fn publish_hello(&mut self) -> PyResult<()> {
         self.publisher
+            .lock()
+            .unwrap()
             .as_mut()
             .ok_or_else(|| py_runtime_error("stream publisher is closed"))?
             .publish_hello()
@@ -814,6 +824,8 @@ impl ZmqStreamPublisher {
 
     fn flush(&mut self) -> PyResult<()> {
         self.publisher
+            .lock()
+            .unwrap()
             .as_mut()
             .ok_or_else(|| py_runtime_error("stream publisher is closed"))?
             .publish_flush()
@@ -823,6 +835,8 @@ impl ZmqStreamPublisher {
     fn stop(&mut self) -> PyResult<()> {
         let mut publisher = self
             .publisher
+            .lock()
+            .unwrap()
             .take()
             .ok_or_else(|| py_runtime_error("stream publisher is closed"))?;
         publisher
@@ -1509,8 +1523,16 @@ fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
         });
     }
 
+    if let Ok(publisher) = target.extract::<PyRef<'_, ZmqStreamPublisher>>() {
+        return Ok(TargetConfig::ZmqStream {
+            endpoint: publisher.last_endpoint.clone(),
+            stream_name: publisher.stream_name.clone(),
+            publisher: publisher.publisher.clone(),
+        });
+    }
+
     Err(PyTypeError::new_err(
-        "target must be NullPublisher, ZmqPublisher, or a non-empty list of them",
+        "target must be NullPublisher, ZmqPublisher, ZmqStreamPublisher, or a non-empty list of them",
     ))
 }
 
@@ -1656,6 +1678,14 @@ fn build_publisher(
             TargetConfig::Zmq { endpoint } => {
                 let publisher = RustZmqPublisher::bind(endpoint)
                     .map_err(|error| py_runtime_error(error.to_string()))?;
+                publishers.push(Box::new(publisher));
+            }
+            TargetConfig::ZmqStream { publisher, .. } => {
+                let publisher = publisher.lock().unwrap().take().ok_or_else(|| {
+                    py_runtime_error(
+                        "zmq stream publisher target is closed or already owned by an engine",
+                    )
+                })?;
                 publishers.push(Box::new(publisher));
             }
         }
@@ -2032,6 +2062,15 @@ fn target_configs_to_pylist(py: Python<'_>, targets: &[TargetConfig]) -> PyResul
             TargetConfig::Zmq { endpoint } => {
                 item.set_item("type", "zmq")?;
                 item.set_item("endpoint", endpoint)?;
+            }
+            TargetConfig::ZmqStream {
+                endpoint,
+                stream_name,
+                ..
+            } => {
+                item.set_item("type", "zmq_stream")?;
+                item.set_item("endpoint", endpoint)?;
+                item.set_item("stream_name", stream_name)?;
             }
         }
         list.append(item)?;
