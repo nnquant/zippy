@@ -509,20 +509,22 @@ zippy.SourceMode.CONSUMER
 - `expected_schema` 必须显式提供
 - `source=` 将从“只接受本地 engine”扩展为“接受本地 source 或远端 source”
 - 首版重点支持 `TimeSeriesEngine` / `CrossSectionalEngine` 作为 `ZmqSource` 的下游
+- `ReactiveStateEngine` 在这一轮仍只接受本地 source，不接受 `ZmqSource`
+- Python 额外暴露一个 standalone `ZmqStreamPublisher`，用于测试、示例和远端发布入口
 
 ## Example Topologies
 
-### Example 1: Upstream TimeSeries with Multiple Subscribers
+### Example 1: Upstream Stream Publisher with Multiple Subscribers
 
 ```text
 进程 A:
-  CTPSource -> TimeSeriesEngine -> [ParquetSink, ZmqPublisher]
+  local producer / adapter -> ZmqStreamPublisher
 
 进程 B:
   ZmqSource(pipeline) -> CrossSectionalEngine -> ZmqPublisher
 
 进程 C:
-  ZmqSource(consumer) -> ReactiveStateEngine -> ParquetSink
+  ZmqSource(consumer) -> TimeSeriesEngine -> ParquetSink
 ```
 
 ### Example 2: Cross-Process Fan-Out
