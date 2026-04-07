@@ -14,9 +14,9 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
-    python_dev_version, spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle,
-    EngineMetricsSnapshot, EngineStatus, LateDataPolicy, OverflowPolicy,
-    Publisher as CorePublisher, ZippyError,
+    python_dev_version, spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine,
+    EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy,
+    OverflowPolicy, Publisher as CorePublisher, SourceMode as RustSourceMode, ZippyError,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
@@ -25,6 +25,7 @@ use zippy_engines::{
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
     ParquetSink as RustParquetSink, ZmqPublisher as RustZmqPublisher,
+    ZmqSource as RustZmqSource, ZmqStreamPublisher as RustZmqStreamPublisher,
     ZmqSubscriber as RustZmqSubscriber,
 };
 use zippy_operators::{
@@ -64,6 +65,13 @@ struct RuntimeOptions {
     buffer_capacity: usize,
     overflow_policy: OverflowPolicy,
     archive_buffer_capacity: usize,
+}
+
+#[derive(Clone)]
+struct RemoteSourceConfig {
+    endpoint: String,
+    expected_schema: Arc<Schema>,
+    mode: RustSourceMode,
 }
 
 #[derive(Clone)]
@@ -746,6 +754,84 @@ impl ZmqPublisher {
 }
 
 #[pyclass]
+struct ZmqStreamPublisher {
+    schema: Arc<Schema>,
+    publisher: Option<RustZmqStreamPublisher>,
+}
+
+#[pymethods]
+impl ZmqStreamPublisher {
+    #[new]
+    #[pyo3(signature = (endpoint, stream_name, schema))]
+    fn new(
+        endpoint: String,
+        stream_name: String,
+        schema: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(schema).map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let publisher = RustZmqStreamPublisher::bind(&endpoint, &stream_name, schema.clone())
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+
+        Ok(Self {
+            schema,
+            publisher: Some(publisher),
+        })
+    }
+
+    fn last_endpoint(&self) -> PyResult<String> {
+        self.publisher
+            .as_ref()
+            .ok_or_else(|| py_runtime_error("stream publisher is closed"))?
+            .last_endpoint()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn publish(&mut self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = value_to_record_batches(py, value, self.schema.as_ref())?;
+        let publisher = self
+            .publisher
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("stream publisher is closed"))?;
+
+        for batch in batches {
+            publisher
+                .publish_data(&batch)
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    fn publish_hello(&mut self) -> PyResult<()> {
+        self.publisher
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("stream publisher is closed"))?
+            .publish_hello()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        self.publisher
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("stream publisher is closed"))?
+            .publish_flush()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn stop(&mut self) -> PyResult<()> {
+        let mut publisher = self
+            .publisher
+            .take()
+            .ok_or_else(|| py_runtime_error("stream publisher is closed"))?;
+        publisher
+            .publish_stop()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+}
+
+#[pyclass]
 struct ZmqSubscriber {
     subscriber: Option<RustZmqSubscriber>,
 }
@@ -779,6 +865,36 @@ impl ZmqSubscriber {
 
     fn close(&mut self) {
         self.subscriber = None;
+    }
+}
+
+#[pyclass]
+struct ZmqSource {
+    endpoint: String,
+    expected_schema: Arc<Schema>,
+    mode: RustSourceMode,
+}
+
+#[pymethods]
+impl ZmqSource {
+    #[new]
+    #[pyo3(signature = (endpoint, expected_schema, mode))]
+    fn new(
+        endpoint: String,
+        expected_schema: &Bound<'_, PyAny>,
+        mode: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let expected_schema = Arc::new(
+            Schema::from_pyarrow_bound(expected_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let mode = parse_source_mode(mode)?;
+
+        Ok(Self {
+            endpoint,
+            expected_schema,
+            mode,
+        })
     }
 }
 
@@ -817,6 +933,7 @@ struct TimeSeriesEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
+    remote_source: Option<RemoteSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -838,6 +955,7 @@ struct CrossSectionalEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustCrossSectionalEngine>,
+    remote_source: Option<RemoteSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -876,7 +994,7 @@ impl ReactiveStateEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let source_owner = register_source(
+        let (source_owner, _) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -913,6 +1031,7 @@ impl ReactiveStateEngine {
             &self.runtime_options,
             &self.target,
             self.parquet_sink.as_ref(),
+            None,
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1042,7 +1161,7 @@ impl TimeSeriesEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let source_owner = register_source(
+        let (source_owner, remote_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1071,6 +1190,7 @@ impl TimeSeriesEngine {
             archive,
             handle,
             engine: Some(engine),
+            remote_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
         })
@@ -1082,6 +1202,7 @@ impl TimeSeriesEngine {
             &self.runtime_options,
             &self.target,
             self.parquet_sink.as_ref(),
+            self.remote_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1209,7 +1330,7 @@ impl CrossSectionalEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let source_owner = register_timeseries_source(
+        let (source_owner, remote_source) = register_timeseries_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1238,6 +1359,7 @@ impl CrossSectionalEngine {
             archive,
             handle,
             engine: Some(engine),
+            remote_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
         })
@@ -1249,6 +1371,7 @@ impl CrossSectionalEngine {
             &self.runtime_options,
             &self.target,
             self.parquet_sink.as_ref(),
+            self.remote_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1346,7 +1469,9 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NullPublisher>()?;
     module.add_class::<ParquetSink>()?;
     module.add_class::<ZmqPublisher>()?;
+    module.add_class::<ZmqStreamPublisher>()?;
     module.add_class::<ZmqSubscriber>()?;
+    module.add_class::<ZmqSource>()?;
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
@@ -1413,9 +1538,9 @@ fn register_source(
     source: Option<&Bound<'_, PyAny>>,
     downstream: DownstreamLink,
     input_schema: &Schema,
-) -> PyResult<Option<Py<PyAny>>> {
+) -> PyResult<(Option<Py<PyAny>>, Option<RemoteSourceConfig>)> {
     let Some(source) = source else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
@@ -1430,7 +1555,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok(Some(source.clone().unbind()));
+        return Ok((Some(source.clone().unbind()), None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
@@ -1445,11 +1570,28 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok(Some(source.clone().unbind()));
+        return Ok((Some(source.clone().unbind()), None));
+    }
+
+    if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
+        if remote_source.expected_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+
+        return Ok((
+            Some(source.clone().unbind()),
+            Some(RemoteSourceConfig {
+                endpoint: remote_source.endpoint.clone(),
+                expected_schema: remote_source.expected_schema.clone(),
+                mode: remote_source.mode,
+            }),
+        ));
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine or TimeSeriesEngine",
+        "source must be ReactiveStateEngine, TimeSeriesEngine, or ZmqSource",
     ))
 }
 
@@ -1457,9 +1599,9 @@ fn register_timeseries_source(
     source: Option<&Bound<'_, PyAny>>,
     downstream: DownstreamLink,
     input_schema: &Schema,
-) -> PyResult<Option<Py<PyAny>>> {
+) -> PyResult<(Option<Py<PyAny>>, Option<RemoteSourceConfig>)> {
     let Some(source) = source else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
@@ -1474,11 +1616,28 @@ fn register_timeseries_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok(Some(source.clone().unbind()));
+        return Ok((Some(source.clone().unbind()), None));
+    }
+
+    if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
+        if remote_source.expected_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+
+        return Ok((
+            Some(source.clone().unbind()),
+            Some(RemoteSourceConfig {
+                endpoint: remote_source.endpoint.clone(),
+                expected_schema: remote_source.expected_schema.clone(),
+                mode: remote_source.mode,
+            }),
+        ));
     }
 
     Err(PyTypeError::new_err(
-        "source must be TimeSeriesEngine for CrossSectionalEngine",
+        "source must be TimeSeriesEngine or ZmqSource for CrossSectionalEngine",
     ))
 }
 
@@ -1578,6 +1737,7 @@ fn start_runtime_engine<E: Engine>(
     runtime_options: &RuntimeOptions,
     targets: &[TargetConfig],
     parquet_sink: Option<&ParquetSinkConfig>,
+    remote_source: Option<&RemoteSourceConfig>,
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
 ) -> PyResult<(EngineHandle, Option<ArchiveHandle>)> {
@@ -1607,11 +1767,21 @@ fn start_runtime_engine<E: Engine>(
         None => return Err(py_runtime_error("engine already started")),
     };
 
-    let handle = spawn_engine_with_publisher(
-        engine,
-        config,
-        publisher,
-    )
+    let handle = match remote_source {
+        Some(remote_source) => {
+            let source = Box::new(
+                RustZmqSource::connect(
+                    &format!("{name}_source"),
+                    &remote_source.endpoint,
+                    remote_source.expected_schema.clone(),
+                    remote_source.mode,
+                )
+                .map_err(|error| py_runtime_error(error.to_string()))?,
+            );
+            spawn_source_engine_with_publisher(source, engine, config, publisher)
+        }
+        None => spawn_engine_with_publisher(engine, config, publisher),
+    }
     .map_err(|error| py_runtime_error(error.to_string()))?;
 
     Ok((handle, archive))
@@ -1684,9 +1854,11 @@ fn stop_runtime_engine(
         None => return Err(py_runtime_error("engine not started")),
     };
 
-    let stop_result = runtime
-        .stop()
-        .map_err(|error| py_runtime_error(error.to_string()));
+    let stop_result = match runtime.stop() {
+        Ok(()) => Ok(()),
+        Err(_error) if runtime.status() == EngineStatus::Stopped => Ok(()),
+        Err(error) => Err(py_runtime_error(error.to_string())),
+    };
     let archive_result = if let Some(archive) = archive.lock().unwrap().take() {
         archive
             .close()
@@ -1742,6 +1914,20 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
         _ => Err(py_value_error(
             "late_data_policy must be 'reject' or 'drop_with_metric'",
         )),
+    }
+}
+
+fn parse_source_mode(value: &Bound<'_, PyAny>) -> PyResult<RustSourceMode> {
+    let value = parse_required_policy_value(
+        value,
+        "mode",
+        "source_mode",
+        "SourceMode",
+    )?;
+    match value.as_str() {
+        "pipeline" => Ok(RustSourceMode::Pipeline),
+        "consumer" => Ok(RustSourceMode::Consumer),
+        _ => Err(py_value_error("mode must be zippy.SourceMode")),
     }
 }
 

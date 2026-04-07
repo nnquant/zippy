@@ -1823,6 +1823,188 @@ def test_cross_sectional_engine_accepts_timeseries_source_pipeline() -> None:
     subscriber.close()
 
 
+def test_source_mode_constants_and_zmq_source_are_exposed() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("window_start", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+
+    assert repr(zippy.SourceMode.PIPELINE) == "SourceMode.PIPELINE"
+    assert repr(zippy.SourceMode.CONSUMER) == "SourceMode.CONSUMER"
+
+    source = zippy.ZmqSource(
+        endpoint="tcp://127.0.0.1:7101",
+        expected_schema=schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+
+    assert isinstance(source, zippy.ZmqSource)
+
+
+def test_zmq_source_pipeline_can_drive_cross_sectional_engine() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("window_start", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+
+    upstream = zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:*",
+        stream_name="bars",
+        schema=input_schema,
+    )
+    source = zippy.ZmqSource(
+        endpoint=upstream.last_endpoint(),
+        expected_schema=input_schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.CrossSectionalEngine(
+        name="cs_remote",
+        source=source,
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="window_start",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+    bucket_start = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+
+    upstream.publish(
+        {
+            "symbol": ["A", "B"],
+            "window_start": [bucket_start, bucket_start],
+            "ret_1m": [0.1, 0.2],
+        }
+    )
+    upstream.flush()
+
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "window_start", "ret_rank"]
+    assert received.column(0).to_pylist() == ["A", "B"]
+    assert received.column(1).to_pylist() == [bucket_start, bucket_start]
+    assert received.column(2).to_pylist() == pytest.approx([1.0, 2.0])
+
+    engine.stop()
+    upstream.stop()
+    subscriber.close()
+
+
+def test_zmq_source_consumer_mode_ignores_upstream_flush_until_local_flush() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    upstream = zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:*",
+        stream_name="ticks",
+        schema=input_schema,
+    )
+    source = zippy.ZmqSource(
+        endpoint=upstream.last_endpoint(),
+        expected_schema=input_schema,
+        mode=zippy.SourceMode.CONSUMER,
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.TimeSeriesEngine(
+        name="bar_remote",
+        source=source,
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_LAST(column="price", output="close")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=200)
+    time.sleep(0.1)
+
+    upstream.publish(
+        {
+            "symbol": ["A", "A"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 11.0],
+        }
+    )
+    upstream.flush()
+
+    with pytest.raises(RuntimeError):
+        subscriber.recv()
+
+    engine.flush()
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "window_start", "window_end", "close"]
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(3).to_pylist() == [11.0]
+
+    engine.stop()
+    upstream.stop()
+    subscriber.close()
+
+
+def test_timeseries_engine_rejects_remote_source_schema_mismatch() -> None:
+    source_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("close", pa.float64()),
+        ]
+    )
+
+    source = zippy.ZmqSource(
+        endpoint="tcp://127.0.0.1:7102",
+        expected_schema=source_schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+
+    with pytest.raises(ValueError, match="source output schema must match downstream input_schema"):
+        zippy.TimeSeriesEngine(
+            name="bar_remote",
+            source=source,
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_LAST(column="close", output="last_close")],
+            target=zippy.NullPublisher(),
+        )
+
+
 def test_cross_sectional_engine_archives_output_parquet(tmp_path: Path) -> None:
     input_schema = pa.schema(
         [

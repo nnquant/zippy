@@ -28,6 +28,14 @@ class OverflowPolicy:
     DROP_OLDEST: _OverflowPolicyValue
 
 
+class _SourceModeValue: ...
+
+
+class SourceMode:
+    PIPELINE: _SourceModeValue
+    CONSUMER: _SourceModeValue
+
+
 class Duration:
     total_nanoseconds: int
 
@@ -199,12 +207,38 @@ class ZmqPublisher:
     def __init__(self, endpoint: str) -> None: ...
 
 
+class ZmqStreamPublisher:
+    def __init__(self, endpoint: str, stream_name: str, schema: pa.Schema) -> None: ...
+
+    def last_endpoint(self) -> str: ...
+
+    def publish(
+        self,
+        value: pl.DataFrame | pa.RecordBatch | pa.Table | dict[str, object] | list[dict[str, object]],
+    ) -> None: ...
+
+    def publish_hello(self) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
 class ZmqSubscriber:
     def __init__(self, endpoint: str, timeout_ms: int = 1000) -> None: ...
 
     def recv(self) -> pa.RecordBatch: ...
 
     def close(self) -> None: ...
+
+
+class ZmqSource:
+    def __init__(
+        self,
+        endpoint: str,
+        expected_schema: pa.Schema,
+        mode: _SourceModeValue,
+    ) -> None: ...
 
 
 WriteValue = (
@@ -249,7 +283,7 @@ class ReactiveStateEngine:
         factors: list[ReactiveFactor],
         target: PublisherTarget,
         *,
-        source: ReactiveStateEngine | TimeSeriesEngine | None = None,
+        source: ReactiveStateEngine | TimeSeriesEngine | ZmqSource | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -325,7 +359,7 @@ class CrossSectionalEngine:
         factors: list[CrossSectionalFactor],
         target: PublisherTarget,
         *,
-        source: TimeSeriesEngine | None = None,
+        source: TimeSeriesEngine | ZmqSource | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,

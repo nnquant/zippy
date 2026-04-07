@@ -25,6 +25,8 @@ from ._internal import TsMeanSpec
 from ._internal import TsReturnSpec
 from ._internal import TsStdSpec
 from ._internal import ZmqPublisher
+from ._internal import ZmqSource
+from ._internal import ZmqStreamPublisher
 from ._internal import ZmqSubscriber
 from ._internal import __version__
 from ._internal import version
@@ -96,6 +98,24 @@ class OverflowPolicy:
 
     def __new__(cls, *args: object, **kwargs: object) -> "OverflowPolicy":
         raise TypeError("OverflowPolicy cannot be instantiated")
+
+
+class SourceMode:
+    """Namespace for predefined source-mode constants."""
+
+    PIPELINE = _PolicyConstant(
+        kind="source_mode",
+        value="pipeline",
+        name="SourceMode.PIPELINE",
+    )
+    CONSUMER = _PolicyConstant(
+        kind="source_mode",
+        value="consumer",
+        name="SourceMode.CONSUMER",
+    )
+
+    def __new__(cls, *args: object, **kwargs: object) -> "SourceMode":
+        raise TypeError("SourceMode cannot be instantiated")
 
 
 class Duration:
