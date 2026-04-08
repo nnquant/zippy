@@ -5,6 +5,7 @@ members = [
     "crates/zippy-engines",
     "crates/zippy-io",
     "crates/zippy-python",
+    "crates/zippy-perf",
 ]
 resolver = "2"
 

@@ -1,0 +1,17 @@
+[package]
+name = "zippy-perf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+clap = { version = "4.5.38", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+zippy-core = { path = "../zippy-core" }
+zippy-engines = { path = "../zippy-engines" }
+zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
+zippy-operators = { path = "../zippy-operators" }
+
+[lints]
+workspace = true
