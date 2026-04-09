@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod error;
+pub mod logging;
 pub mod metrics;
 pub mod publisher;
 pub mod queue;
@@ -10,6 +11,7 @@ pub mod version;
 
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};
+pub use logging::{setup_log, LogConfig, LogSnapshot};
 pub use metrics::{EngineMetrics, EngineMetricsDelta, EngineMetricsSnapshot};
 pub use publisher::Publisher;
 pub use queue::BoundedQueue;

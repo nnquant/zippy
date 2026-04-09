@@ -6,4 +6,10 @@ edition.workspace = true
 [dependencies]
 arrow.workspace = true
 crossbeam-channel.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

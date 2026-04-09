@@ -17,7 +17,10 @@ version = "0.1.0"
 arrow = "53.3.0"
 crossbeam-channel = "0.5.15"
 parquet = "53.3.0"
+serde_json = "1.0.140"
 thiserror = "2.0.12"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "json", "env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
