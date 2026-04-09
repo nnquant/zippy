@@ -7,3 +7,5 @@ __pycache__/
 .codex
 python/zippy/*.so
 /plugins/zippy-openctp/
+
+docs/superpowers
