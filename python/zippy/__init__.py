@@ -30,6 +30,7 @@ from ._internal import ZmqSource
 from ._internal import ZmqStreamPublisher
 from ._internal import ZmqSubscriber
 from ._internal import __version__
+from ._internal import setup_log
 from ._internal import version
 
 

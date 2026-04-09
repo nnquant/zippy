@@ -4,6 +4,15 @@ import pyarrow as pa
 __version__: str
 
 
+def setup_log(
+    app: str,
+    level: str = "info",
+    log_dir: str = "logs",
+    to_console: bool = True,
+    to_file: bool = True,
+) -> dict[str, str | None]: ...
+
+
 class _WindowTypeValue: ...
 
 

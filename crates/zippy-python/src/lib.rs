@@ -17,33 +17,32 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
-    python_dev_version, spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine,
-    EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy,
-    OverflowPolicy, Publisher as CorePublisher, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode,
+    current_log_snapshot, python_dev_version, setup_log as setup_core_log, spawn_engine_with_publisher,
+    spawn_source_engine_with_publisher, Engine, EngineConfig, EngineHandle,
+    EngineMetricsSnapshot, EngineStatus, LateDataPolicy, LogConfig, OverflowPolicy,
+    Publisher as CorePublisher, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode,
     SourceSink, StreamHello, ZippyError,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
-    ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
-    StreamTableEngine as RustStreamTableEngine,
+    ReactiveStateEngine as RustReactiveStateEngine, StreamTableEngine as RustStreamTableEngine,
+    TimeSeriesEngine as RustTimeSeriesEngine,
 };
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
     ParquetSink as RustParquetSink, ParquetSinkWriter as RustParquetSinkWriter,
-    ZmqPublisher as RustZmqPublisher,
-    ZmqSource as RustZmqSource, ZmqStreamPublisher as RustZmqStreamPublisher,
-    ZmqSubscriber as RustZmqSubscriber,
+    ZmqPublisher as RustZmqPublisher, ZmqSource as RustZmqSource,
+    ZmqStreamPublisher as RustZmqStreamPublisher, ZmqSubscriber as RustZmqSubscriber,
 };
 use zippy_operators::{
     AbsSpec as RustAbsSpec, AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
     AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
     AggSumSpec as RustAggSumSpec, AggVwapSpec as RustAggVwapSpec,
-    AggregationSpec as RustAggregationSpec, CastSpec as RustCastSpec, ClipSpec as RustClipSpec,
-    CSDemeanSpec as RustCSDemeanSpec, CSRankSpec as RustCSRankSpec,
-    CSZscoreSpec as RustCSZscoreSpec,
-    ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec, TsDelaySpec as RustTsDelaySpec,
-    TsDiffSpec as RustTsDiffSpec, TsEmaSpec as RustTsEmaSpec, TsMeanSpec as RustTsMeanSpec,
-    TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
+    AggregationSpec as RustAggregationSpec, CSDemeanSpec as RustCSDemeanSpec,
+    CSRankSpec as RustCSRankSpec, CSZscoreSpec as RustCSZscoreSpec, CastSpec as RustCastSpec,
+    ClipSpec as RustClipSpec, ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec,
+    TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec, TsEmaSpec as RustTsEmaSpec,
+    TsMeanSpec as RustTsMeanSpec, TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
@@ -98,7 +97,9 @@ struct PythonSourceConfig {
 #[derive(Clone)]
 enum TargetConfig {
     Null,
-    Zmq { endpoint: String },
+    Zmq {
+        endpoint: String,
+    },
     ZmqStream {
         endpoint: String,
         stream_name: String,
@@ -139,7 +140,12 @@ struct SourceSinkProxy {
 #[pymethods]
 impl SourceSinkProxy {
     #[pyo3(signature = (stream_name, protocol_version=1))]
-    fn emit_hello(&self, py: Python<'_>, stream_name: String, protocol_version: u16) -> PyResult<()> {
+    fn emit_hello(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        protocol_version: u16,
+    ) -> PyResult<()> {
         let hello = StreamHello::new(&stream_name, Arc::clone(&self.schema), protocol_version)
             .map_err(|error| py_runtime_error(error.to_string()))?;
         py.allow_threads(|| self.sink.emit(SourceEvent::Hello(hello)))
@@ -203,13 +209,7 @@ impl Source for PythonSourceBridge {
                     .call_method1("_zippy_start_native", (capsule,))
                     .map(|value| value.unbind())
             } else {
-                let sink_proxy = Py::new(
-                    py,
-                    SourceSinkProxy {
-                        sink,
-                        schema,
-                    },
-                )?;
+                let sink_proxy = Py::new(py, SourceSinkProxy { sink, schema })?;
                 owner_bound
                     .call_method1("_zippy_start", (sink_proxy,))
                     .map(|value| value.unbind())
@@ -219,26 +219,15 @@ impl Source for PythonSourceBridge {
 
         let join_handle_object = Python::with_gil(|py| runtime_handle.clone_ref(py));
         let join_handle = thread::spawn(move || -> zippy_core::Result<()> {
-            Python::with_gil(|py| {
-                join_handle_object
-                    .bind(py)
-                    .call_method0("join")
-                    .map(|_| ())
-            })
-            .map_err(map_python_source_error)
+            Python::with_gil(|py| join_handle_object.bind(py).call_method0("join").map(|_| ()))
+                .map_err(map_python_source_error)
         });
 
         let stop_handle_object = Python::with_gil(|py| runtime_handle.clone_ref(py));
-        let stop_fn: Box<dyn FnMut() -> zippy_core::Result<()> + Send> =
-            Box::new(move || {
-                Python::with_gil(|py| {
-                    stop_handle_object
-                        .bind(py)
-                        .call_method0("stop")
-                        .map(|_| ())
-                })
+        let stop_fn: Box<dyn FnMut() -> zippy_core::Result<()> + Send> = Box::new(move || {
+            Python::with_gil(|py| stop_handle_object.bind(py).call_method0("stop").map(|_| ()))
                 .map_err(map_python_source_error)
-            });
+        });
 
         Ok(SourceHandle::new_with_stop(join_handle, stop_fn))
     }
@@ -1067,13 +1056,10 @@ struct ZmqStreamPublisher {
 impl ZmqStreamPublisher {
     #[new]
     #[pyo3(signature = (endpoint, stream_name, schema))]
-    fn new(
-        endpoint: String,
-        stream_name: String,
-        schema: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
+    fn new(endpoint: String, stream_name: String, schema: &Bound<'_, PyAny>) -> PyResult<Self> {
         let schema = Arc::new(
-            Schema::from_pyarrow_bound(schema).map_err(|error| py_value_error(error.to_string()))?,
+            Schema::from_pyarrow_bound(schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
         );
         let publisher = RustZmqStreamPublisher::bind(&endpoint, &stream_name, schema.clone())
             .map_err(|error| py_runtime_error(error.to_string()))?;
@@ -1926,6 +1912,7 @@ impl CrossSectionalEngine {
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", python_dev_version())?;
     module.add_function(wrap_pyfunction!(version, module)?)?;
+    module.add_function(wrap_pyfunction!(setup_log, module)?)?;
     module.add_class::<TsEmaSpec>()?;
     module.add_class::<TsReturnSpec>()?;
     module.add_class::<TsMeanSpec>()?;
@@ -1963,6 +1950,41 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 fn version() -> String {
     python_dev_version()
+}
+
+#[pyfunction]
+#[pyo3(signature = (app, level="info", log_dir="logs", to_console=true, to_file=true))]
+fn setup_log(
+    py: Python<'_>,
+    app: String,
+    level: &str,
+    log_dir: &str,
+    to_console: bool,
+    to_file: bool,
+) -> PyResult<PyObject> {
+    let snapshot = setup_core_log(LogConfig::new(
+        app,
+        level,
+        PathBuf::from(log_dir),
+        to_console,
+        to_file,
+    ))
+    .map_err(|error| py_runtime_error(error.to_string()))?;
+
+    let active_snapshot = current_log_snapshot()
+        .ok_or_else(|| py_runtime_error("logging setup completed without active snapshot"))?;
+
+    let dict = PyDict::new_bound(py);
+    dict.set_item("app", active_snapshot.app)?;
+    dict.set_item("level", active_snapshot.level)?;
+    dict.set_item("run_id", active_snapshot.run_id)?;
+    dict.set_item(
+        "file_path",
+        snapshot
+            .file_path
+            .map(|path| path.to_string_lossy().to_string()),
+    )?;
+    Ok(dict.into_any().unbind())
 }
 
 fn parse_targets(target: &Bound<'_, PyAny>) -> PyResult<Vec<TargetConfig>> {
@@ -2115,7 +2137,9 @@ fn register_source(
             RustSourceMode::Pipeline
         };
         let name = if source.hasattr("_zippy_source_name")? {
-            source.call_method0("_zippy_source_name")?.extract::<String>()?
+            source
+                .call_method0("_zippy_source_name")?
+                .extract::<String>()?
         } else {
             "python-source".to_string()
         };
@@ -2488,12 +2512,7 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
 }
 
 fn parse_source_mode(value: &Bound<'_, PyAny>) -> PyResult<RustSourceMode> {
-    let value = parse_required_policy_value(
-        value,
-        "mode",
-        "source_mode",
-        "SourceMode",
-    )?;
+    let value = parse_required_policy_value(value, "mode", "source_mode", "SourceMode")?;
     match value.as_str() {
         "pipeline" => Ok(RustSourceMode::Pipeline),
         "consumer" => Ok(RustSourceMode::Consumer),

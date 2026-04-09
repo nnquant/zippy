@@ -1,7 +1,9 @@
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import time
 
 import polars as pl
@@ -309,6 +311,39 @@ def test_python_package_exposes_git_derived_version() -> None:
 
     assert zippy.__version__ == expected
     assert zippy.version() == expected
+
+
+def test_setup_log_returns_snapshot_and_log_path(tmp_path: Path) -> None:
+    script = """
+import json
+import zippy
+
+result = zippy.setup_log(
+    app="py_test",
+    level="info",
+    log_dir=r\"\"\"%s\"\"\",
+    to_console=False,
+    to_file=True,
+)
+print(json.dumps(result))
+""" % str(tmp_path)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout.strip())
+
+    assert result["app"] == "py_test"
+    assert result["level"] == "info"
+    assert result["run_id"]
+    assert result["file_path"] is not None
+    file_path = Path(result["file_path"])
+    assert file_path.parent == tmp_path / "py_test"
+    assert file_path.name.endswith(".jsonl")
+    assert "_" in file_path.stem
 
 
 def test_timeseries_engine_accepts_polars_and_exposes_output_schema() -> None:
