@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -34,11 +35,27 @@ impl ExpressionSpec {
         let mut parser = Parser::new(&self.expression, input_schema)?;
         let ast = parser.parse_expression()?;
         parser.expect_end()?;
+        ensure_row_evaluable(&ast)?;
 
         Ok(Box::new(ExpressionFactor {
             ast: ast.clone(),
             output_field: Field::new(&self.output_field, ast.data_type.clone(), ast.nullable),
         }))
+    }
+
+    /// Build a typed reactive expression plan against the current schema.
+    pub fn build_reactive_plan(
+        &self,
+        input_schema: &Schema,
+        id_field: &str,
+    ) -> Result<ReactiveExpressionPlan> {
+        ensure_reactive_id_field(input_schema, id_field)?;
+
+        let mut parser = Parser::new(&self.expression, input_schema)?;
+        let ast = parser.parse_expression()?;
+        parser.expect_end()?;
+
+        ReactiveExpressionPlan::build(ast, id_field, &self.output_field)
     }
 }
 
@@ -60,6 +77,230 @@ impl ReactiveFactor for ExpressionFactor {
         }
 
         build_output_array(self.output_field.data_type(), values)
+    }
+}
+
+/// Typed DAG plan for a reactive expression.
+pub struct ReactiveExpressionPlan {
+    id_field: String,
+    output_field: Field,
+    output_node: PlanNodeId,
+    nodes: Vec<ReactivePlanNode>,
+}
+
+impl ReactiveExpressionPlan {
+    fn build(ast: TypedExpr, id_field: &str, output_field: &str) -> Result<Self> {
+        let mut planner = Planner::default();
+        let output_node = planner.lower_expr(&ast)?;
+
+        Ok(Self {
+            id_field: id_field.to_string(),
+            output_field: Field::new(output_field, ast.data_type.clone(), ast.nullable),
+            output_node,
+            nodes: planner.nodes,
+        })
+    }
+
+    /// Return the grouping field used by reactive planner nodes.
+    pub fn id_field(&self) -> &str {
+        &self.id_field
+    }
+
+    /// Return the output field for the planned expression.
+    pub fn output_field(&self) -> Field {
+        self.output_field.clone()
+    }
+
+    /// Return the planned output node identifier.
+    pub fn output_node_id(&self) -> usize {
+        self.output_node.as_usize()
+    }
+
+    /// Count stateful nodes whose operator name matches `operator_name`.
+    pub fn stateful_node_count(&self, operator_name: &str) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| match &node.kind {
+                ReactivePlanNodeKind::TsOp { op, .. } => op.canonical_name() == operator_name,
+                _ => false,
+            })
+            .count()
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct ReactivePlanNode {
+    id: PlanNodeId,
+    kind: ReactivePlanNodeKind,
+    data_type: DataType,
+    nullable: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum ReactivePlanNodeKind {
+    Input {
+        field: String,
+    },
+    Literal(PlanLiteral),
+    ColumnOp {
+        op: PlannedColumnOp,
+        inputs: Vec<PlanNodeId>,
+    },
+    TsOp {
+        op: PlannedTsOp,
+        inputs: Vec<PlanNodeId>,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+enum PlanLiteral {
+    Number(f64),
+    String(String),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum PlannedColumnOp {
+    UnaryNeg,
+    Binary(BinaryOp),
+    Function(PlannedFunctionOp),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum PlannedFunctionOp {
+    Abs,
+    Log,
+    Clip,
+    Cast(CastKind),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum PlannedTsOp {
+    Ema { span: usize },
+    Mean { window: usize },
+    Std { window: usize },
+    Delay { period: usize },
+    Diff { period: usize },
+    Return { period: usize },
+}
+
+impl PlannedTsOp {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Ema { .. } => "TS_EMA",
+            Self::Mean { .. } => "TS_MEAN",
+            Self::Std { .. } => "TS_STD",
+            Self::Delay { .. } => "TS_DELAY",
+            Self::Diff { .. } => "TS_DIFF",
+            Self::Return { .. } => "TS_RETURN",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanNodeId(usize);
+
+impl PlanNodeId {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Default)]
+struct Planner {
+    nodes: Vec<ReactivePlanNode>,
+    memo: HashMap<String, PlanNodeId>,
+}
+
+impl Planner {
+    fn lower_expr(&mut self, expr: &TypedExpr) -> Result<PlanNodeId> {
+        let key = expr_signature(expr);
+        if let Some(node_id) = self.memo.get(&key).copied() {
+            return Ok(node_id);
+        }
+
+        let kind = match &expr.kind {
+            TypedExprKind::Number(value) => {
+                ReactivePlanNodeKind::Literal(PlanLiteral::Number(*value))
+            }
+            TypedExprKind::String(value) => {
+                ReactivePlanNodeKind::Literal(PlanLiteral::String(value.clone()))
+            }
+            TypedExprKind::Identifier(name) => ReactivePlanNodeKind::Input {
+                field: name.clone(),
+            },
+            TypedExprKind::UnaryNeg(inner) => ReactivePlanNodeKind::ColumnOp {
+                op: PlannedColumnOp::UnaryNeg,
+                inputs: vec![self.lower_expr(inner)?],
+            },
+            TypedExprKind::Binary { op, left, right } => ReactivePlanNodeKind::ColumnOp {
+                op: PlannedColumnOp::Binary(*op),
+                inputs: vec![self.lower_expr(left)?, self.lower_expr(right)?],
+            },
+            TypedExprKind::Function { kind, args } => {
+                let inputs = args
+                    .iter()
+                    .map(|arg| self.lower_expr(arg))
+                    .collect::<Result<Vec<_>>>()?;
+                match kind {
+                    FunctionKind::Abs => ReactivePlanNodeKind::ColumnOp {
+                        op: PlannedColumnOp::Function(PlannedFunctionOp::Abs),
+                        inputs,
+                    },
+                    FunctionKind::Log => ReactivePlanNodeKind::ColumnOp {
+                        op: PlannedColumnOp::Function(PlannedFunctionOp::Log),
+                        inputs,
+                    },
+                    FunctionKind::Clip => ReactivePlanNodeKind::ColumnOp {
+                        op: PlannedColumnOp::Function(PlannedFunctionOp::Clip),
+                        inputs,
+                    },
+                    FunctionKind::Cast(kind) => ReactivePlanNodeKind::ColumnOp {
+                        op: PlannedColumnOp::Function(PlannedFunctionOp::Cast(*kind)),
+                        inputs,
+                    },
+                    FunctionKind::TsEma { span } => ReactivePlanNodeKind::TsOp {
+                        op: PlannedTsOp::Ema { span: *span },
+                        inputs,
+                    },
+                    FunctionKind::TsMean { window } => ReactivePlanNodeKind::TsOp {
+                        op: PlannedTsOp::Mean { window: *window },
+                        inputs,
+                    },
+                    FunctionKind::TsStd { window } => ReactivePlanNodeKind::TsOp {
+                        op: PlannedTsOp::Std { window: *window },
+                        inputs,
+                    },
+                    FunctionKind::TsDelay { period } => ReactivePlanNodeKind::TsOp {
+                        op: PlannedTsOp::Delay { period: *period },
+                        inputs,
+                    },
+                    FunctionKind::TsDiff { period } => ReactivePlanNodeKind::TsOp {
+                        op: PlannedTsOp::Diff { period: *period },
+                        inputs,
+                    },
+                    FunctionKind::TsReturn { period } => ReactivePlanNodeKind::TsOp {
+                        op: PlannedTsOp::Return { period: *period },
+                        inputs,
+                    },
+                }
+            }
+        };
+
+        let node_id = PlanNodeId(self.nodes.len());
+        self.nodes.push(ReactivePlanNode {
+            id: node_id,
+            kind,
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        });
+        self.memo.insert(key, node_id);
+        Ok(node_id)
     }
 }
 
@@ -87,7 +328,7 @@ enum TypedExprKind {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum BinaryOp {
     Add,
     Sub,
@@ -101,6 +342,41 @@ enum FunctionKind {
     Log,
     Clip,
     Cast(CastKind),
+    TsEma { span: usize },
+    TsMean { window: usize },
+    TsStd { window: usize },
+    TsDelay { period: usize },
+    TsDiff { period: usize },
+    TsReturn { period: usize },
+}
+
+impl FunctionKind {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Abs => "ABS",
+            Self::Log => "LOG",
+            Self::Clip => "CLIP",
+            Self::Cast(_) => "CAST",
+            Self::TsEma { .. } => "TS_EMA",
+            Self::TsMean { .. } => "TS_MEAN",
+            Self::TsStd { .. } => "TS_STD",
+            Self::TsDelay { .. } => "TS_DELAY",
+            Self::TsDiff { .. } => "TS_DIFF",
+            Self::TsReturn { .. } => "TS_RETURN",
+        }
+    }
+
+    fn is_stateful(self) -> bool {
+        matches!(
+            self,
+            Self::TsEma { .. }
+                | Self::TsMean { .. }
+                | Self::TsStd { .. }
+                | Self::TsDelay { .. }
+                | Self::TsDiff { .. }
+                | Self::TsReturn { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +385,12 @@ enum BuiltinFunction {
     Log,
     Clip,
     Cast,
+    TsEma,
+    TsMean,
+    TsStd,
+    TsDelay,
+    TsDiff,
+    TsReturn,
 }
 
 impl BuiltinFunction {
@@ -118,6 +400,12 @@ impl BuiltinFunction {
             Self::Log => "LOG",
             Self::Clip => "CLIP",
             Self::Cast => "CAST",
+            Self::TsEma => "TS_EMA",
+            Self::TsMean => "TS_MEAN",
+            Self::TsStd => "TS_STD",
+            Self::TsDelay => "TS_DELAY",
+            Self::TsDiff => "TS_DIFF",
+            Self::TsReturn => "TS_RETURN",
         }
     }
 
@@ -127,13 +415,19 @@ impl BuiltinFunction {
             Self::Log,
             Self::Clip,
             Self::Cast,
+            Self::TsEma,
+            Self::TsMean,
+            Self::TsStd,
+            Self::TsDelay,
+            Self::TsDiff,
+            Self::TsReturn,
         ]
         .into_iter()
         .find(|builtin| name.eq_ignore_ascii_case(builtin.canonical_name()))
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum CastKind {
     Float64,
     Float32,
@@ -516,12 +810,128 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
                     nullable: args[0].nullable,
                 })
             }
+            BuiltinFunction::TsEma => build_ts_function_expr(
+                FunctionKind::TsEma {
+                    span: parse_positive_integer_literal(name, "span", args.get(1))?,
+                },
+                args,
+                2,
+                false,
+            ),
+            BuiltinFunction::TsMean => build_ts_function_expr(
+                FunctionKind::TsMean {
+                    window: parse_positive_integer_literal(name, "window", args.get(1))?,
+                },
+                args,
+                2,
+                true,
+            ),
+            BuiltinFunction::TsStd => build_ts_function_expr(
+                FunctionKind::TsStd {
+                    window: parse_positive_integer_literal(name, "window", args.get(1))?,
+                },
+                args,
+                2,
+                true,
+            ),
+            BuiltinFunction::TsDelay => build_ts_function_expr(
+                FunctionKind::TsDelay {
+                    period: parse_positive_integer_literal(name, "period", args.get(1))?,
+                },
+                args,
+                2,
+                true,
+            ),
+            BuiltinFunction::TsDiff => build_ts_function_expr(
+                FunctionKind::TsDiff {
+                    period: parse_positive_integer_literal(name, "period", args.get(1))?,
+                },
+                args,
+                2,
+                true,
+            ),
+            BuiltinFunction::TsReturn => build_ts_function_expr(
+                FunctionKind::TsReturn {
+                    period: parse_positive_integer_literal(name, "period", args.get(1))?,
+                },
+                args,
+                2,
+                true,
+            ),
         };
     }
 
     Err(ZippyError::InvalidConfig {
         reason: format!("unsupported expression function function=[{}]", name),
     })
+}
+
+fn build_ts_function_expr(
+    kind: FunctionKind,
+    args: Vec<TypedExpr>,
+    expected_args: usize,
+    force_nullable: bool,
+) -> Result<TypedExpr> {
+    if args.len() != expected_args {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "expression function {} expects {} arguments args=[{}]",
+                kind.canonical_name().to_lowercase(),
+                expected_args,
+                args.len()
+            ),
+        });
+    }
+
+    ensure_numeric_type(&args[0].data_type, kind.canonical_name())?;
+
+    Ok(TypedExpr {
+        kind: TypedExprKind::Function {
+            kind,
+            args: vec![args[0].clone()],
+        },
+        data_type: DataType::Float64,
+        nullable: force_nullable || args[0].nullable,
+    })
+}
+
+fn parse_positive_integer_literal(
+    function_name: &str,
+    parameter_name: &str,
+    argument: Option<&TypedExpr>,
+) -> Result<usize> {
+    let Some(argument) = argument else {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "expression function {} requires {} literal",
+                function_name.to_lowercase(),
+                parameter_name
+            ),
+        });
+    };
+
+    let TypedExprKind::Number(value) = &argument.kind else {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "expression function {} expects {} to be an integer literal",
+                function_name.to_lowercase(),
+                parameter_name
+            ),
+        });
+    };
+
+    if !value.is_finite() || *value <= 0.0 || value.fract() != 0.0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "expression function {} expects positive integer {} value=[{}]",
+                function_name.to_lowercase(),
+                parameter_name,
+                value
+            ),
+        });
+    }
+
+    Ok(*value as usize)
 }
 
 fn ensure_supported_scalar_type(data_type: &DataType, name: &str) -> Result<()> {
@@ -549,6 +959,91 @@ fn ensure_numeric_type(data_type: &DataType, context: &str) -> Result<()> {
                 context, data_type
             ),
         }),
+    }
+}
+
+fn ensure_row_evaluable(expr: &TypedExpr) -> Result<()> {
+    match &expr.kind {
+        TypedExprKind::Number(_) | TypedExprKind::String(_) | TypedExprKind::Identifier(_) => {
+            Ok(())
+        }
+        TypedExprKind::UnaryNeg(inner) => ensure_row_evaluable(inner),
+        TypedExprKind::Binary { left, right, .. } => {
+            ensure_row_evaluable(left)?;
+            ensure_row_evaluable(right)
+        }
+        TypedExprKind::Function { kind, args } => {
+            if kind.is_stateful() {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "stateful expression function requires build_reactive_plan function=[{}]",
+                        kind.canonical_name()
+                    ),
+                });
+            }
+
+            for arg in args {
+                ensure_row_evaluable(arg)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_reactive_id_field(schema: &Schema, id_field: &str) -> Result<()> {
+    let index = schema
+        .index_of(id_field)
+        .map_err(|_| ZippyError::InvalidConfig {
+            reason: format!("unknown reactive id field field=[{}]", id_field),
+        })?;
+    let field = schema.field(index);
+
+    if field.data_type() != &DataType::Utf8 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "reactive id field must be utf8 field=[{}] dtype=[{:?}]",
+                id_field,
+                field.data_type()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn expr_signature(expr: &TypedExpr) -> String {
+    match &expr.kind {
+        TypedExprKind::Number(value) => format!("num:{:016x}", value.to_bits()),
+        TypedExprKind::String(value) => format!("str:{value:?}"),
+        TypedExprKind::Identifier(name) => format!("id:{name}"),
+        TypedExprKind::UnaryNeg(inner) => format!("neg({})", expr_signature(inner)),
+        TypedExprKind::Binary { op, left, right } => format!(
+            "bin:{:?}({},{})",
+            op,
+            expr_signature(left),
+            expr_signature(right)
+        ),
+        TypedExprKind::Function { kind, args } => {
+            let args = args
+                .iter()
+                .map(expr_signature)
+                .collect::<Vec<_>>()
+                .join(",");
+            match kind {
+                FunctionKind::Abs | FunctionKind::Log | FunctionKind::Clip => {
+                    format!("fn:{}({args})", kind.canonical_name())
+                }
+                FunctionKind::Cast(cast_kind) => {
+                    format!("fn:CAST:{cast_kind:?}({args})")
+                }
+                FunctionKind::TsEma { span } => format!("fn:TS_EMA:{span}({args})"),
+                FunctionKind::TsMean { window } => format!("fn:TS_MEAN:{window}({args})"),
+                FunctionKind::TsStd { window } => format!("fn:TS_STD:{window}({args})"),
+                FunctionKind::TsDelay { period } => format!("fn:TS_DELAY:{period}({args})"),
+                FunctionKind::TsDiff { period } => format!("fn:TS_DIFF:{period}({args})"),
+                FunctionKind::TsReturn { period } => format!("fn:TS_RETURN:{period}({args})"),
+            }
+        }
     }
 }
 
@@ -638,6 +1133,17 @@ fn evaluate_expr(expr: &TypedExpr, batch: &RecordBatch, row: usize) -> Result<Ev
                 let value = evaluate_expr(&args[0], batch, row)?;
                 cast_value(*kind, value)
             }
+            FunctionKind::TsEma { .. }
+            | FunctionKind::TsMean { .. }
+            | FunctionKind::TsStd { .. }
+            | FunctionKind::TsDelay { .. }
+            | FunctionKind::TsDiff { .. }
+            | FunctionKind::TsReturn { .. } => Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "stateful expression function requires build_reactive_plan function=[{}]",
+                    kind.canonical_name()
+                ),
+            }),
         },
     }
 }

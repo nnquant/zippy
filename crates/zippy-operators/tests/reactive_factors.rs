@@ -326,6 +326,15 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
 }
 
 #[test]
+fn expression_planner_deduplicates_repeated_ts_diff_subexpressions() {
+    let plan = ExpressionSpec::new("TS_DIFF(value, 2) / TS_STD(TS_DIFF(value, 2), 3)", "score")
+        .build_reactive_plan(input_schema().as_ref(), "id")
+        .unwrap();
+
+    assert_eq!(plan.stateful_node_count("TS_DIFF"), 1);
+}
+
+#[test]
 fn expression_rejects_lowercase_function_names() {
     for (expression, expected) in [
         ("abs(value)", "ABS"),
@@ -348,7 +357,9 @@ fn expression_rejects_lowercase_function_names() {
 fn expression_rejects_mixed_case_function_names() {
     for (expression, expected) in [("AbS(value)", "ABS"), ("LoG(value)", "LOG")] {
         let error = match ExpressionSpec::new(expression, "score").build(input_schema().as_ref()) {
-            Ok(_) => panic!("expected mixed-case function to be rejected expression=[{expression}]"),
+            Ok(_) => {
+                panic!("expected mixed-case function to be rejected expression=[{expression}]")
+            }
             Err(error) => error,
         };
 
