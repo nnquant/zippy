@@ -104,6 +104,36 @@ enum FunctionKind {
 }
 
 #[derive(Clone, Copy)]
+enum BuiltinFunction {
+    Abs,
+    Log,
+    Clip,
+    Cast,
+}
+
+impl BuiltinFunction {
+    fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Abs => "ABS",
+            Self::Log => "LOG",
+            Self::Clip => "CLIP",
+            Self::Cast => "CAST",
+        }
+    }
+
+    fn resolve(name: &str) -> Option<Self> {
+        [
+            Self::Abs,
+            Self::Log,
+            Self::Clip,
+            Self::Cast,
+        ]
+        .into_iter()
+        .find(|builtin| name.eq_ignore_ascii_case(builtin.canonical_name()))
+    }
+}
+
+#[derive(Clone, Copy)]
 enum CastKind {
     Float64,
     Float32,
@@ -385,17 +415,8 @@ fn build_identifier_expr(schema: &Schema, name: &str) -> Result<TypedExpr> {
 }
 
 fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
-    let builtin = match name {
-        "ABS" => Some("ABS"),
-        "LOG" => Some("LOG"),
-        "CLIP" => Some("CLIP"),
-        "CAST" => Some("CAST"),
-        _ => ["ABS", "LOG", "CLIP", "CAST"]
-            .into_iter()
-            .find(|expected| name.eq_ignore_ascii_case(expected)),
-    };
-
-    if let Some(expected) = builtin {
+    if let Some(builtin) = BuiltinFunction::resolve(name) {
+        let expected = builtin.canonical_name();
         if name != expected {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
@@ -404,103 +425,103 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
                 ),
             });
         }
-    }
-
-    match name {
-        "ABS" => {
-            if args.len() != 1 {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "expression function abs expects 1 argument args=[{}]",
-                        args.len()
-                    ),
-                });
-            }
-            let nullable = args[0].nullable;
-            ensure_numeric_type(&args[0].data_type, "abs")?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::Function {
-                    kind: FunctionKind::Abs,
-                    args,
-                },
-                data_type: DataType::Float64,
-                nullable,
-            })
-        }
-        "LOG" => {
-            if args.len() != 1 {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "expression function log expects 1 argument args=[{}]",
-                        args.len()
-                    ),
-                });
-            }
-            let nullable = args[0].nullable;
-            ensure_numeric_type(&args[0].data_type, "log")?;
-            Ok(TypedExpr {
-                kind: TypedExprKind::Function {
-                    kind: FunctionKind::Log,
-                    args,
-                },
-                data_type: DataType::Float64,
-                nullable,
-            })
-        }
-        "CLIP" => {
-            if args.len() != 3 {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "expression function clip expects 3 arguments args=[{}]",
-                        args.len()
-                    ),
-                });
-            }
-            for arg in &args {
-                ensure_numeric_type(&arg.data_type, "clip")?;
-            }
-            Ok(TypedExpr {
-                kind: TypedExprKind::Function {
-                    kind: FunctionKind::Clip,
-                    args: args.clone(),
-                },
-                data_type: DataType::Float64,
-                nullable: args.iter().any(|arg| arg.nullable),
-            })
-        }
-        "CAST" => {
-            if args.len() != 2 {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "expression function cast expects 2 arguments args=[{}]",
-                        args.len()
-                    ),
-                });
-            }
-            let dtype = match &args[1].kind {
-                TypedExprKind::String(value) => value.clone(),
-                _ => {
+        return match builtin {
+            BuiltinFunction::Abs => {
+                if args.len() != 1 {
                     return Err(ZippyError::InvalidConfig {
-                        reason: "expression function cast expects a string dtype literal"
-                            .to_string(),
-                    })
+                        reason: format!(
+                            "expression function abs expects 1 argument args=[{}]",
+                            args.len()
+                        ),
+                    });
                 }
-            };
-            let cast_kind = CastKind::parse(&dtype)?;
+                let nullable = args[0].nullable;
+                ensure_numeric_type(&args[0].data_type, "abs")?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::Function {
+                        kind: FunctionKind::Abs,
+                        args,
+                    },
+                    data_type: DataType::Float64,
+                    nullable,
+                })
+            }
+            BuiltinFunction::Log => {
+                if args.len() != 1 {
+                    return Err(ZippyError::InvalidConfig {
+                        reason: format!(
+                            "expression function log expects 1 argument args=[{}]",
+                            args.len()
+                        ),
+                    });
+                }
+                let nullable = args[0].nullable;
+                ensure_numeric_type(&args[0].data_type, "log")?;
+                Ok(TypedExpr {
+                    kind: TypedExprKind::Function {
+                        kind: FunctionKind::Log,
+                        args,
+                    },
+                    data_type: DataType::Float64,
+                    nullable,
+                })
+            }
+            BuiltinFunction::Clip => {
+                if args.len() != 3 {
+                    return Err(ZippyError::InvalidConfig {
+                        reason: format!(
+                            "expression function clip expects 3 arguments args=[{}]",
+                            args.len()
+                        ),
+                    });
+                }
+                for arg in &args {
+                    ensure_numeric_type(&arg.data_type, "clip")?;
+                }
+                Ok(TypedExpr {
+                    kind: TypedExprKind::Function {
+                        kind: FunctionKind::Clip,
+                        args: args.clone(),
+                    },
+                    data_type: DataType::Float64,
+                    nullable: args.iter().any(|arg| arg.nullable),
+                })
+            }
+            BuiltinFunction::Cast => {
+                if args.len() != 2 {
+                    return Err(ZippyError::InvalidConfig {
+                        reason: format!(
+                            "expression function cast expects 2 arguments args=[{}]",
+                            args.len()
+                        ),
+                    });
+                }
+                let dtype = match &args[1].kind {
+                    TypedExprKind::String(value) => value.clone(),
+                    _ => {
+                        return Err(ZippyError::InvalidConfig {
+                            reason: "expression function cast expects a string dtype literal"
+                                .to_string(),
+                        })
+                    }
+                };
+                let cast_kind = CastKind::parse(&dtype)?;
 
-            Ok(TypedExpr {
-                kind: TypedExprKind::Function {
-                    kind: FunctionKind::Cast(cast_kind),
-                    args: vec![args[0].clone()],
-                },
-                data_type: cast_kind.data_type(),
-                nullable: args[0].nullable,
-            })
-        }
-        _ => Err(ZippyError::InvalidConfig {
-            reason: format!("unsupported expression function function=[{}]", name),
-        }),
+                Ok(TypedExpr {
+                    kind: TypedExprKind::Function {
+                        kind: FunctionKind::Cast(cast_kind),
+                        args: vec![args[0].clone()],
+                    },
+                    data_type: cast_kind.data_type(),
+                    nullable: args[0].nullable,
+                })
+            }
+        };
     }
+
+    Err(ZippyError::InvalidConfig {
+        reason: format!("unsupported expression function function=[{}]", name),
+    })
 }
 
 fn ensure_supported_scalar_type(data_type: &DataType, name: &str) -> Result<()> {

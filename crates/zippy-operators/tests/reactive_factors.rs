@@ -345,6 +345,20 @@ fn expression_rejects_lowercase_function_names() {
 }
 
 #[test]
+fn expression_rejects_mixed_case_function_names() {
+    for (expression, expected) in [("AbS(value)", "ABS"), ("LoG(value)", "LOG")] {
+        let error = match ExpressionSpec::new(expression, "score").build(input_schema().as_ref()) {
+            Ok(_) => panic!("expected mixed-case function to be rejected expression=[{expression}]"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("function names must be uppercase"));
+        assert!(message.contains(expected));
+    }
+}
+
+#[test]
 fn expression_accepts_uppercase_functions() {
     for (expression, batch) in [
         ("ABS(value)", input_batch()),
