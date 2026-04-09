@@ -244,7 +244,7 @@ pub fn setup_log(config: LogConfig) -> Result<LogSnapshot> {
 
     let run_id = generate_run_id()?;
     let file_path = if config.to_file {
-        Some(prepare_file_path(&config.log_dir, &config.app, &run_id))
+        Some(prepare_file_path(&config.log_dir, &config.app, &run_id)?)
     } else {
         None
     };
@@ -329,8 +329,9 @@ fn validate_config(config: &LogConfig) -> Result<()> {
     Ok(())
 }
 
-fn prepare_file_path(log_dir: &Path, app: &str, run_id: &str) -> PathBuf {
-    log_dir.join(app).join(format!("{run_id}.jsonl"))
+fn prepare_file_path(log_dir: &Path, app: &str, run_id: &str) -> Result<PathBuf> {
+    let date = utc_date_string()?;
+    Ok(log_dir.join(app).join(format!("{date}_{run_id}.jsonl")))
 }
 
 fn generate_run_id() -> Result<String> {
@@ -341,4 +342,30 @@ fn generate_run_id() -> Result<String> {
         })?;
 
     Ok(format!("{:x}", duration.as_nanos()))
+}
+
+fn utc_date_string() -> Result<String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ZippyError::Io {
+            reason: format!("failed to compute utc date error=[{}]", error),
+        })?;
+    let days_since_epoch = (duration.as_secs() / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as u32, day as u32)
 }

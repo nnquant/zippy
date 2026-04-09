@@ -76,6 +76,14 @@ fn create_snapshot_case(temp_dir: &Path) {
 
     assert!(file_path.exists());
     assert!(file_path.starts_with(temp_dir.join("runtime_test")));
+    let file_name = file_path.file_name().unwrap().to_string_lossy();
+    assert!(file_name.ends_with(".jsonl"));
+    assert!(file_name.contains('_'));
+    let (date_part, run_part) = file_name.trim_end_matches(".jsonl").split_once('_').unwrap();
+    assert_eq!(date_part.len(), 10);
+    assert_eq!(&date_part[4..5], "-");
+    assert_eq!(&date_part[7..8], "-");
+    assert_eq!(run_part, snapshot.run_id);
 
     let active_snapshot = zippy_core::current_log_snapshot().expect("missing active snapshot");
     assert_eq!(active_snapshot.app, snapshot.app);
