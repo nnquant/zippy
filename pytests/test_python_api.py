@@ -47,6 +47,13 @@ def test_expr_factory_replaces_expr() -> None:
     assert not hasattr(zippy, "EXPR")
 
 
+def test_expression_factor_exposes_native_attributes() -> None:
+    factor = zippy.ExpressionFactor(expression="ABS(price)", output="score")
+
+    assert factor.expression == "ABS(price)"
+    assert factor.output == "score"
+
+
 def test_reactive_engine_accepts_polars_and_flushes() -> None:
     schema = pa.schema(
         [

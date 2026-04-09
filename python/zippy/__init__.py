@@ -33,8 +33,6 @@ from ._internal import __version__
 from ._internal import setup_log
 from ._internal import version
 
-_EXPRESSION_FACTOR_METADATA: dict[int, tuple[str, str]] = {}
-
 
 class _PolicyConstant:
     """Represent a predefined policy constant understood by the Rust bindings."""
@@ -218,26 +216,9 @@ def CAST(*, column: str, dtype: str, output: str) -> CastSpec:
     return CastSpec(id_column="", value_column=column, dtype=dtype, output=output)
 
 
-def _get_expression_factor_expression(factor: ExpressionFactor) -> str:
-    return _EXPRESSION_FACTOR_METADATA[id(factor)][0]
-
-
-def _get_expression_factor_output(factor: ExpressionFactor) -> str:
-    return _EXPRESSION_FACTOR_METADATA[id(factor)][1]
-
-
-if not hasattr(ExpressionFactor, "expression"):
-    ExpressionFactor.expression = property(_get_expression_factor_expression)
-
-if not hasattr(ExpressionFactor, "output"):
-    ExpressionFactor.output = property(_get_expression_factor_output)
-
-
 def Expr(*, expression: str, output: str) -> ExpressionFactor:
     """Create a planner-backed expression factor spec."""
-    factor = ExpressionFactor(expression=expression, output=output)
-    _EXPRESSION_FACTOR_METADATA[id(factor)] = (expression, output)
-    return factor
+    return ExpressionFactor(expression=expression, output=output)
 
 
 def AGG_FIRST(*, column: str, output: str) -> AggFirstSpec:

@@ -806,7 +806,9 @@ impl CastSpec {
 
 #[pyclass]
 struct ExpressionFactor {
+    #[pyo3(get)]
     expression: String,
+    #[pyo3(get)]
     output: String,
 }
 
