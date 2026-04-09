@@ -39,6 +39,14 @@ def reserve_tcp_port() -> int:
         return probe.getsockname()[1]
 
 
+def test_expr_factory_replaces_expr() -> None:
+    factor = zippy.Expr(expression="ABS(price)", output="score")
+
+    assert factor.expression == "ABS(price)"
+    assert factor.output == "score"
+    assert not hasattr(zippy, "EXPR")
+
+
 def test_reactive_engine_accepts_polars_and_flushes() -> None:
     schema = pa.schema(
         [
@@ -662,7 +670,7 @@ def test_reactive_engine_accepts_expression_factor_helper() -> None:
         id_column="symbol",
         factors=[
             zippy.TS_EMA(column="price", span=2, output="ema_2"),
-            zippy.EXPR(expression="price + ema_2", output="price_plus_ema"),
+            zippy.Expr(expression="price + ema_2", output="price_plus_ema"),
         ],
         target=zippy.ZmqPublisher(endpoint=endpoint),
     )
@@ -697,7 +705,7 @@ def test_expression_factor_rejects_unknown_identifier() -> None:
             name="tick_factors",
             input_schema=input_schema,
             id_column="symbol",
-            factors=[zippy.EXPR(expression="missing + 1.0", output="score")],
+            factors=[zippy.Expr(expression="missing + 1.0", output="score")],
             target=zippy.NullPublisher(),
         )
 
@@ -715,7 +723,7 @@ def test_expression_factor_rejects_unsupported_function() -> None:
             name="tick_factors",
             input_schema=input_schema,
             id_column="symbol",
-            factors=[zippy.EXPR(expression="sqrt(price)", output="score")],
+            factors=[zippy.Expr(expression="sqrt(price)", output="score")],
             target=zippy.NullPublisher(),
         )
 
@@ -814,7 +822,7 @@ def test_timeseries_engine_accepts_pre_and_post_expression_factors() -> None:
         window_type=zippy.WindowType.TUMBLING,
         late_data_policy=zippy.LateDataPolicy.REJECT,
         pre_factors=[
-            zippy.EXPR(expression="price * volume", output="turnover_input"),
+            zippy.Expr(expression="price * volume", output="turnover_input"),
         ],
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
@@ -823,8 +831,8 @@ def test_timeseries_engine_accepts_pre_and_post_expression_factors() -> None:
             zippy.AGG_SUM(column="turnover_input", output="turnover"),
         ],
         post_factors=[
-            zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
-            zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
+            zippy.Expr(expression="close / open - 1.0", output="ret_1m"),
+            zippy.Expr(expression="turnover / volume", output="vwap_1m"),
         ],
         target=zippy.NullPublisher(),
     )
@@ -895,7 +903,7 @@ def test_timeseries_engine_rejects_post_factors_referencing_raw_input_columns() 
                 zippy.AGG_LAST(column="price", output="close"),
             ],
             post_factors=[
-                zippy.EXPR(expression="price * 2.0", output="bad"),
+                zippy.Expr(expression="price * 2.0", output="bad"),
             ],
             target=zippy.NullPublisher(),
         )
@@ -919,7 +927,7 @@ def test_timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors
         window_type=zippy.WindowType.TUMBLING,
         late_data_policy=zippy.LateDataPolicy.DROP_WITH_METRIC,
         pre_factors=[
-            zippy.EXPR(expression="log(price)", output="log_price"),
+            zippy.Expr(expression="log(price)", output="log_price"),
         ],
         factors=[zippy.AGG_SUM(column="log_price", output="sum_log_price")],
         target=zippy.NullPublisher(),
@@ -968,7 +976,7 @@ def test_timeseries_engine_flush_runs_post_factors() -> None:
         window_type=zippy.WindowType.TUMBLING,
         late_data_policy=zippy.LateDataPolicy.REJECT,
         pre_factors=[
-            zippy.EXPR(expression="price * volume", output="turnover_input"),
+            zippy.Expr(expression="price * volume", output="turnover_input"),
         ],
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
@@ -977,8 +985,8 @@ def test_timeseries_engine_flush_runs_post_factors() -> None:
             zippy.AGG_SUM(column="turnover_input", output="turnover"),
         ],
         post_factors=[
-            zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
-            zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
+            zippy.Expr(expression="close / open - 1.0", output="ret_1m"),
+            zippy.Expr(expression="turnover / volume", output="vwap_1m"),
         ],
         target=zippy.ZmqPublisher(endpoint=endpoint),
     )

@@ -13,6 +13,14 @@ def setup_log(
 ) -> dict[str, str | None]: ...
 
 
+def log_info(
+    component: str,
+    event: str,
+    message: str,
+    status: str | None = None,
+) -> None: ...
+
+
 class _WindowTypeValue: ...
 
 
@@ -155,6 +163,9 @@ class CastSpec:
 
 
 class ExpressionFactor:
+    expression: str
+    output: str
+
     def __init__(self, expression: str, output: str) -> None: ...
 
 

@@ -40,7 +40,7 @@ def main() -> None:
         window_type=zippy.WindowType.TUMBLING,
         late_data_policy=zippy.LateDataPolicy.REJECT,
         pre_factors=[
-            zippy.EXPR(expression="price * volume", output="turnover_input"),
+            zippy.Expr(expression="price * volume", output="turnover_input"),
         ],
         factors=[
             zippy.AGG_FIRST(column="price", output="open"),
@@ -49,8 +49,8 @@ def main() -> None:
             zippy.AGG_SUM(column="turnover_input", output="turnover"),
         ],
         post_factors=[
-            zippy.EXPR(expression="close / open - 1.0", output="ret_1m"),
-            zippy.EXPR(expression="turnover / volume", output="vwap_1m"),
+            zippy.Expr(expression="close / open - 1.0", output="ret_1m"),
+            zippy.Expr(expression="turnover / volume", output="vwap_1m"),
         ],
         target=zippy.NullPublisher(),
     )
