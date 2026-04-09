@@ -102,9 +102,12 @@ fn ema_and_return_follow_row_order() {
             Some(17.333333333333332),
             Some(96.66666666666667),
             Some(22.444444444444443),
-        ]
+        ],
     );
-    assert_float_options_eq(&ret_values, &[None, None, None, Some(0.9), None, Some(0.5625)]);
+    assert_float_options_eq(
+        &ret_values,
+        &[None, None, None, Some(0.9), None, Some(0.5625)],
+    );
 }
 
 #[test]
@@ -112,7 +115,10 @@ fn return_outputs_null_during_warmup() {
     let ret_spec = TsReturnSpec::new("id", "value", 3, "ret_3");
     let mut ret = ret_spec.build().unwrap();
 
-    let values = float64_values(&ret.evaluate(&batch(vec!["x", "x"], vec![10.0, 11.0])).unwrap());
+    let values = float64_values(
+        &ret.evaluate(&batch(vec!["x", "x"], vec![10.0, 11.0]))
+            .unwrap(),
+    );
 
     assert_eq!(values, vec![None, None]);
 }
@@ -165,7 +171,10 @@ fn state_continues_across_evaluate_calls() {
     let second_ret = float64_values(&ret.evaluate(&second_batch).unwrap());
 
     assert_float_options_eq(&first_ema, &[Some(10.0), Some(14.0)]);
-    assert_float_options_eq(&second_ema, &[Some(17.333333333333332), Some(22.444444444444443)]);
+    assert_float_options_eq(
+        &second_ema,
+        &[Some(17.333333333333332), Some(22.444444444444443)],
+    );
     assert_float_options_eq(&first_ret, &[None, None]);
     assert_float_options_eq(&second_ret, &[Some(0.9), Some(0.5625)]);
 }
@@ -207,7 +216,10 @@ fn v1_reactive_factors_cover_windowed_pointwise_and_cast_outputs() {
         mean.output_field(),
         Field::new("mean_3", DataType::Float64, true)
     );
-    assert_eq!(std.output_field(), Field::new("std_3", DataType::Float64, true));
+    assert_eq!(
+        std.output_field(),
+        Field::new("std_3", DataType::Float64, true)
+    );
     assert_eq!(
         delay.output_field(),
         Field::new("delay_2", DataType::Float64, true)
@@ -295,7 +307,10 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
         .build(schema.as_ref())
         .unwrap();
 
-    assert_eq!(factor.output_field(), Field::new("score", DataType::Float64, false));
+    assert_eq!(
+        factor.output_field(),
+        Field::new("score", DataType::Float64, false)
+    );
     assert_float_options_eq(
         &float64_values(&factor.evaluate(&batch).unwrap()),
         &[Some(11.0), Some(20.0)],
@@ -304,8 +319,7 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
 
 #[test]
 fn expression_factor_rejects_unknown_identifier() {
-    let error = match ExpressionSpec::new("missing + 1.0", "score").build(input_schema().as_ref())
-    {
+    let error = match ExpressionSpec::new("missing + 1.0", "score").build(input_schema().as_ref()) {
         Ok(_) => panic!("expected unknown identifier to be rejected"),
         Err(error) => error,
     };
@@ -321,8 +335,7 @@ fn expression_factor_rejects_unknown_identifier() {
 
 #[test]
 fn expression_factor_rejects_unsupported_function() {
-    let error = match ExpressionSpec::new("sqrt(value)", "score").build(input_schema().as_ref())
-    {
+    let error = match ExpressionSpec::new("sqrt(value)", "score").build(input_schema().as_ref()) {
         Ok(_) => panic!("expected unsupported function to be rejected"),
         Err(error) => error,
     };
@@ -341,9 +354,7 @@ fn log_factor_rejects_non_positive_input() {
     let spec = LogSpec::new("id", "value", "log_value");
     let mut factor = spec.build().unwrap();
 
-    let error = factor
-        .evaluate(&batch(vec!["a"], vec![0.0]))
-        .unwrap_err();
+    let error = factor.evaluate(&batch(vec!["a"], vec![0.0])).unwrap_err();
 
     assert!(matches!(
         error,

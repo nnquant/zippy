@@ -279,13 +279,7 @@ pub struct ClipSpec {
 
 impl ClipSpec {
     /// Create a new clip factor spec.
-    pub fn new(
-        id_field: &str,
-        value_field: &str,
-        min: f64,
-        max: f64,
-        output_field: &str,
-    ) -> Self {
+    pub fn new(id_field: &str, value_field: &str, min: f64, max: f64, output_field: &str) -> Self {
         Self {
             id_field: id_field.to_string(),
             value_field: value_field.to_string(),
@@ -447,7 +441,8 @@ impl ReactiveFactor for WindowHistoryFactor {
                     if history.len() < self.size {
                         builder.append_null();
                     } else {
-                        builder.append_value(*history.front().expect("history length checked above"));
+                        builder
+                            .append_value(*history.front().expect("history length checked above"));
                     }
                     history.push_back(value);
                     trim_history(history, self.size);
@@ -573,7 +568,9 @@ impl ReactiveFactor for CastFactor {
 
         match self.kind {
             CastKind::Float64 => Ok(Arc::new(Float64Array::from(
-                (0..values.len()).map(|index| values.value(index)).collect::<Vec<_>>(),
+                (0..values.len())
+                    .map(|index| values.value(index))
+                    .collect::<Vec<_>>(),
             )) as ArrayRef),
             CastKind::Float32 => Ok(Arc::new(Float32Array::from(
                 (0..values.len())

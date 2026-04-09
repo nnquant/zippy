@@ -1,4 +1,4 @@
-use std::fs::{File, create_dir_all};
+use std::fs::{create_dir_all, File};
 use std::path::PathBuf;
 
 use arrow::record_batch::RecordBatch;

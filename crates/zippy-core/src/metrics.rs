@@ -48,7 +48,8 @@ impl EngineMetrics {
     }
 
     pub fn inc_publish_errors(&self, count: u64) {
-        self.publish_errors_total.fetch_add(count, Ordering::Relaxed);
+        self.publish_errors_total
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn apply_delta(&self, delta: EngineMetricsDelta) {

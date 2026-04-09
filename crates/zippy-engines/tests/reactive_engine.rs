@@ -80,10 +80,11 @@ fn column_names(batch: &RecordBatch) -> Vec<String> {
 fn reactive_engine_appends_factor_columns_in_order() {
     let factors = vec![
         TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap(),
-        TsReturnSpec::new("id", "value", 2, "ret_2").build().unwrap(),
+        TsReturnSpec::new("id", "value", 2, "ret_2")
+            .build()
+            .unwrap(),
     ];
-    let mut engine =
-        ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+    let mut engine = ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
 
     let outputs = engine
         .on_data(batch(vec!["a", "a", "a"], vec![10.0, 16.0, 19.0]))
@@ -116,13 +117,11 @@ fn reactive_engine_appends_factor_columns_in_order() {
     );
     assert_float_options_eq(
         &float64_values(output.column(2)),
-        vec![Some(10.0), Some(14.0), Some(17.333333333333332)]
-            .as_slice(),
+        vec![Some(10.0), Some(14.0), Some(17.333333333333332)].as_slice(),
     );
     assert_float_options_eq(
         &float64_values(output.column(3)),
-        vec![None, None, Some(0.9)]
-            .as_slice(),
+        vec![None, None, Some(0.9)].as_slice(),
     );
 }
 
@@ -130,13 +129,18 @@ fn reactive_engine_appends_factor_columns_in_order() {
 fn reactive_engine_keeps_factor_state_across_on_data_calls() {
     let factors = vec![
         TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap(),
-        TsReturnSpec::new("id", "value", 2, "ret_2").build().unwrap(),
+        TsReturnSpec::new("id", "value", 2, "ret_2")
+            .build()
+            .unwrap(),
     ];
-    let mut engine =
-        ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+    let mut engine = ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
 
-    let first_outputs = engine.on_data(batch(vec!["a", "a"], vec![10.0, 16.0])).unwrap();
-    let second_outputs = engine.on_data(batch(vec!["a", "a"], vec![19.0, 25.0])).unwrap();
+    let first_outputs = engine
+        .on_data(batch(vec!["a", "a"], vec![10.0, 16.0]))
+        .unwrap();
+    let second_outputs = engine
+        .on_data(batch(vec!["a", "a"], vec![19.0, 25.0]))
+        .unwrap();
 
     assert_eq!(first_outputs.len(), 1);
     assert_eq!(second_outputs.len(), 1);
@@ -169,7 +173,9 @@ fn reactive_engine_new_rejects_duplicate_output_field_names() {
         input_schema(),
         vec![
             TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap(),
-            TsReturnSpec::new("id", "value", 2, "ema_2").build().unwrap(),
+            TsReturnSpec::new("id", "value", 2, "ema_2")
+                .build()
+                .unwrap(),
         ],
     );
 
@@ -200,8 +206,7 @@ fn reactive_engine_supports_mixed_output_dtypes() {
             .build()
             .unwrap(),
     ];
-    let mut engine =
-        ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+    let mut engine = ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
 
     let outputs = engine
         .on_data(batch(vec!["a", "a"], vec![10.0, 16.0]))
@@ -237,8 +242,7 @@ fn reactive_engine_expression_factor_can_reference_previous_factor_output() {
             .build(expr_schema.as_ref())
             .unwrap(),
     ];
-    let mut engine =
-        ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+    let mut engine = ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
 
     let outputs = engine
         .on_data(batch(vec!["a", "a"], vec![10.0, 16.0]))
@@ -252,8 +256,5 @@ fn reactive_engine_expression_factor_can_reference_previous_factor_output() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
-    assert_float_options_eq(
-        &float64_values(output.column(3)),
-        &[Some(20.0), Some(30.0)],
-    );
+    assert_float_options_eq(&float64_values(output.column(3)), &[Some(20.0), Some(30.0)]);
 }

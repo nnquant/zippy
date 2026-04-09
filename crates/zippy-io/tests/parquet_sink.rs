@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};

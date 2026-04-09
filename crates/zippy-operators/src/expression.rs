@@ -211,7 +211,10 @@ impl<'a> Parser<'a> {
         match self.current() {
             Token::End => Ok(()),
             token => Err(ZippyError::InvalidConfig {
-                reason: format!("unexpected trailing token token=[{}]", describe_token(token)),
+                reason: format!(
+                    "unexpected trailing token token=[{}]",
+                    describe_token(token)
+                ),
             }),
         }
     }
@@ -388,7 +391,10 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
         "abs" => {
             if args.len() != 1 {
                 return Err(ZippyError::InvalidConfig {
-                    reason: format!("expression function abs expects 1 argument args=[{}]", args.len()),
+                    reason: format!(
+                        "expression function abs expects 1 argument args=[{}]",
+                        args.len()
+                    ),
                 });
             }
             let nullable = args[0].nullable;
@@ -405,7 +411,10 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
         "log" => {
             if args.len() != 1 {
                 return Err(ZippyError::InvalidConfig {
-                    reason: format!("expression function log expects 1 argument args=[{}]", args.len()),
+                    reason: format!(
+                        "expression function log expects 1 argument args=[{}]",
+                        args.len()
+                    ),
                 });
             }
             let nullable = args[0].nullable;
@@ -422,7 +431,10 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
         "clip" => {
             if args.len() != 3 {
                 return Err(ZippyError::InvalidConfig {
-                    reason: format!("expression function clip expects 3 arguments args=[{}]", args.len()),
+                    reason: format!(
+                        "expression function clip expects 3 arguments args=[{}]",
+                        args.len()
+                    ),
                 });
             }
             for arg in &args {
@@ -440,14 +452,18 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
         "cast" => {
             if args.len() != 2 {
                 return Err(ZippyError::InvalidConfig {
-                    reason: format!("expression function cast expects 2 arguments args=[{}]", args.len()),
+                    reason: format!(
+                        "expression function cast expects 2 arguments args=[{}]",
+                        args.len()
+                    ),
                 });
             }
             let dtype = match &args[1].kind {
                 TypedExprKind::String(value) => value.clone(),
                 _ => {
                     return Err(ZippyError::InvalidConfig {
-                        reason: "expression function cast expects a string dtype literal".to_string(),
+                        reason: "expression function cast expects a string dtype literal"
+                            .to_string(),
                     })
                 }
             };
@@ -598,12 +614,13 @@ fn cast_value(kind: CastKind, value: EvalValue) -> Result<EvalValue> {
         },
         CastKind::Int64 => match value {
             EvalValue::Null => Ok(EvalValue::Null),
-            EvalValue::String(value) => value
-                .parse::<i64>()
-                .map(EvalValue::Int64)
-                .map_err(|error| ZippyError::InvalidConfig {
-                    reason: format!("failed to cast utf8 to int64 error=[{}]", error),
-                }),
+            EvalValue::String(value) => {
+                value.parse::<i64>().map(EvalValue::Int64).map_err(|error| {
+                    ZippyError::InvalidConfig {
+                        reason: format!("failed to cast utf8 to int64 error=[{}]", error),
+                    }
+                })
+            }
             other => other
                 .as_f64()?
                 .map(|value| EvalValue::Int64(value as i64))
@@ -613,12 +630,13 @@ fn cast_value(kind: CastKind, value: EvalValue) -> Result<EvalValue> {
         },
         CastKind::Int32 => match value {
             EvalValue::Null => Ok(EvalValue::Null),
-            EvalValue::String(value) => value
-                .parse::<i32>()
-                .map(EvalValue::Int32)
-                .map_err(|error| ZippyError::InvalidConfig {
-                    reason: format!("failed to cast utf8 to int32 error=[{}]", error),
-                }),
+            EvalValue::String(value) => {
+                value.parse::<i32>().map(EvalValue::Int32).map_err(|error| {
+                    ZippyError::InvalidConfig {
+                        reason: format!("failed to cast utf8 to int32 error=[{}]", error),
+                    }
+                })
+            }
             other => other
                 .as_f64()?
                 .map(|value| EvalValue::Int32(value as i32))
@@ -626,9 +644,9 @@ fn cast_value(kind: CastKind, value: EvalValue) -> Result<EvalValue> {
                     reason: "failed to cast null to int32".to_string(),
                 }),
         },
-        CastKind::Utf8 => value.as_string().map(|value| {
-            value.map_or(EvalValue::Null, EvalValue::String)
-        }),
+        CastKind::Utf8 => value
+            .as_string()
+            .map(|value| value.map_or(EvalValue::Null, EvalValue::String)),
     }
 }
 
@@ -693,7 +711,10 @@ fn build_output_array(data_type: &DataType, values: Vec<EvalValue>) -> Result<Ar
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
         _ => Err(ZippyError::InvalidConfig {
-            reason: format!("unsupported expression output dtype dtype=[{:?}]", data_type),
+            reason: format!(
+                "unsupported expression output dtype dtype=[{:?}]",
+                data_type
+            ),
         }),
     }
 }
@@ -815,9 +836,14 @@ fn tokenize(expression: &str) -> Result<Vec<Token>> {
                         break;
                     }
                 }
-                let number = value.parse::<f64>().map_err(|error| ZippyError::InvalidConfig {
-                    reason: format!("invalid numeric literal literal=[{}] error=[{}]", value, error),
-                })?;
+                let number = value
+                    .parse::<f64>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                            "invalid numeric literal literal=[{}] error=[{}]",
+                            value, error
+                        ),
+                    })?;
                 tokens.push(Token::Number(number));
             }
             '\'' | '"' => {

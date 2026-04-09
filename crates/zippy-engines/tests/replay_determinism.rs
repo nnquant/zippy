@@ -25,13 +25,17 @@ fn replaying_same_ticks_produces_same_batches() {
     let mut first = ReactiveStateEngine::new(
         "run_one",
         schema.clone(),
-        vec![TsEmaSpec::new("symbol", "price", 2, "ema_2").build().unwrap()],
+        vec![TsEmaSpec::new("symbol", "price", 2, "ema_2")
+            .build()
+            .unwrap()],
     )
     .unwrap();
     let mut second = ReactiveStateEngine::new(
         "run_two",
         schema,
-        vec![TsEmaSpec::new("symbol", "price", 2, "ema_2").build().unwrap()],
+        vec![TsEmaSpec::new("symbol", "price", 2, "ema_2")
+            .build()
+            .unwrap()],
     )
     .unwrap();
 

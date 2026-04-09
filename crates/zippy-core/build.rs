@@ -37,7 +37,10 @@ fn resolve_git_dirs(workspace_root: &Path) -> (PathBuf, PathBuf) {
             .trim()
             .strip_prefix("gitdir: ")
             .expect(".git file should start with gitdir: ");
-        workspace_root.join(path).canonicalize().expect("git dir should resolve")
+        workspace_root
+            .join(path)
+            .canonicalize()
+            .expect("git dir should resolve")
     };
 
     let git_common_dir = match fs::read_to_string(git_dir.join("commondir")) {

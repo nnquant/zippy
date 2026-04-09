@@ -131,11 +131,7 @@ impl<T> QueueSender<T> {
         Ok(())
     }
 
-    pub fn send_drop_oldest<F>(
-        &self,
-        value: T,
-        can_drop: F,
-    ) -> Result<Option<T>, QueueSendError<T>>
+    pub fn send_drop_oldest<F>(&self, value: T, can_drop: F) -> Result<Option<T>, QueueSendError<T>>
     where
         F: Fn(&T) -> bool,
     {

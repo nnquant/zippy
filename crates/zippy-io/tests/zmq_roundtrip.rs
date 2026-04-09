@@ -9,9 +9,9 @@ use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 #[cfg(not(feature = "zmq-publisher"))]
 use zippy_core::ZippyError;
-use zippy_io::{NullPublisher, Publisher};
 #[cfg(not(feature = "zmq-publisher"))]
 use zippy_io::ZmqPublisher;
+use zippy_io::{NullPublisher, Publisher};
 #[cfg(feature = "zmq-publisher")]
 use zippy_io::{ZmqPublisher, ZmqSubscriber};
 
@@ -22,8 +22,8 @@ fn null_publisher_accepts_arrow_batches() {
         DataType::Float64,
         false,
     )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))])
-        .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))]).unwrap();
 
     let mut publisher = NullPublisher::default();
     publisher.publish(&batch).unwrap();
@@ -51,8 +51,8 @@ fn zmq_publisher_binds_and_publishes_arrow_batches() {
         DataType::Float64,
         false,
     )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))])
-        .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))]).unwrap();
     let mut publisher = ZmqPublisher::bind("tcp://127.0.0.1:*").unwrap();
 
     publisher.publish(&batch).unwrap();
@@ -66,8 +66,8 @@ fn zmq_publisher_roundtrips_arrow_batches_to_subscriber() {
         DataType::Float64,
         false,
     )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))])
-        .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))]).unwrap();
     let mut publisher = ZmqPublisher::bind("tcp://127.0.0.1:*").unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let context = zmq::Context::new();
@@ -95,8 +95,8 @@ fn zmq_subscriber_receives_arrow_batches_from_publisher() {
         DataType::Float64,
         false,
     )]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![2.0]))])
-        .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![2.0]))]).unwrap();
     let mut publisher = ZmqPublisher::bind("tcp://127.0.0.1:*").unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let mut subscriber = ZmqSubscriber::connect(&endpoint, 1_000).unwrap();

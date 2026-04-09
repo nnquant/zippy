@@ -27,7 +27,9 @@ fn bench_reactive_pipeline(c: &mut Criterion) {
             let mut engine = ReactiveStateEngine::new(
                 "bench",
                 schema.clone(),
-                vec![TsEmaSpec::new("symbol", "price", 8, "ema_8").build().unwrap()],
+                vec![TsEmaSpec::new("symbol", "price", 8, "ema_8")
+                    .build()
+                    .unwrap()],
             )
             .unwrap();
             let _ = engine.on_data(batch.clone()).unwrap();

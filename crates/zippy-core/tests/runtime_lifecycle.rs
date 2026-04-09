@@ -1,10 +1,10 @@
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 use arrow::array::Float64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 use zippy_core::{
     spawn_engine, spawn_engine_with_publisher, Engine, EngineConfig, EngineStatus, OverflowPolicy,
     Publisher, Result, ZippyError,
@@ -225,9 +225,13 @@ fn reject_overflow_returns_error() {
     )
     .unwrap();
 
-    handle.write(single_price_batch(schema.clone(), 1.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 1.0))
+        .unwrap();
     assert_eq!(started_rx.recv().unwrap(), 1.0);
-    handle.write(single_price_batch(schema.clone(), 2.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 2.0))
+        .unwrap();
     let err = handle.write(single_price_batch(schema, 3.0)).unwrap_err();
     assert!(matches!(err, ZippyError::ChannelSend));
 
@@ -261,9 +265,13 @@ fn drop_oldest_overflow_discards_queued_batch_and_updates_metrics() {
     )
     .unwrap();
 
-    handle.write(single_price_batch(schema.clone(), 1.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 1.0))
+        .unwrap();
     assert_eq!(started_rx.recv().unwrap(), 1.0);
-    handle.write(single_price_batch(schema.clone(), 2.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 2.0))
+        .unwrap();
     handle.write(single_price_batch(schema, 3.0)).unwrap();
 
     for _ in 0..2 {
@@ -297,9 +305,13 @@ fn blocked_write_after_data_failure_returns_invalid_state() {
     )
     .unwrap();
 
-    handle.write(single_price_batch(schema.clone(), 1.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 1.0))
+        .unwrap();
     assert_eq!(started_rx.recv().unwrap(), 1.0);
-    handle.write(single_price_batch(schema.clone(), 2.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 2.0))
+        .unwrap();
 
     let releaser = thread::spawn(move || {
         fail_rx.recv().unwrap();
@@ -307,7 +319,9 @@ fn blocked_write_after_data_failure_returns_invalid_state() {
     });
 
     fail_tx.send(()).unwrap();
-    let err = handle.write(single_price_batch(schema.clone(), 3.0)).unwrap_err();
+    let err = handle
+        .write(single_price_batch(schema.clone(), 3.0))
+        .unwrap_err();
     match err {
         ZippyError::InvalidState { status } => assert_eq!(status, "failed"),
         other => panic!("unexpected write error: {other:?}"),
@@ -346,7 +360,9 @@ fn stop_preserves_control_semantics_when_reject_queue_is_full() {
     )
     .unwrap();
 
-    handle.write(single_price_batch(schema.clone(), 1.0)).unwrap();
+    handle
+        .write(single_price_batch(schema.clone(), 1.0))
+        .unwrap();
     assert_eq!(started_rx.recv().unwrap(), 1.0);
     handle.write(single_price_batch(schema, 2.0)).unwrap();
 
