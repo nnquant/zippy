@@ -85,6 +85,7 @@ pub struct ReactiveExpressionPlan {
     id_field: String,
     output_field: Field,
     output_node: PlanNodeId,
+    #[cfg_attr(not(test), allow(dead_code))]
     nodes: Vec<ReactivePlanNode>,
 }
 
@@ -115,9 +116,11 @@ impl ReactiveExpressionPlan {
     pub fn output_node_id(&self) -> usize {
         self.output_node.as_usize()
     }
+}
 
-    /// Count stateful nodes whose operator name matches `operator_name`.
-    pub fn stateful_node_count(&self, operator_name: &str) -> usize {
+#[cfg(test)]
+impl ReactiveExpressionPlan {
+    fn stateful_node_count(&self, operator_name: &str) -> usize {
         self.nodes
             .iter()
             .filter(|node| match &node.kind {
@@ -189,6 +192,7 @@ enum PlannedTsOp {
     Return { period: usize },
 }
 
+#[cfg(test)]
 impl PlannedTsOp {
     fn canonical_name(self) -> &'static str {
         match self {
@@ -247,48 +251,7 @@ impl Planner {
                     .iter()
                     .map(|arg| self.lower_expr(arg))
                     .collect::<Result<Vec<_>>>()?;
-                match kind {
-                    FunctionKind::Abs => ReactivePlanNodeKind::ColumnOp {
-                        op: PlannedColumnOp::Function(PlannedFunctionOp::Abs),
-                        inputs,
-                    },
-                    FunctionKind::Log => ReactivePlanNodeKind::ColumnOp {
-                        op: PlannedColumnOp::Function(PlannedFunctionOp::Log),
-                        inputs,
-                    },
-                    FunctionKind::Clip => ReactivePlanNodeKind::ColumnOp {
-                        op: PlannedColumnOp::Function(PlannedFunctionOp::Clip),
-                        inputs,
-                    },
-                    FunctionKind::Cast(kind) => ReactivePlanNodeKind::ColumnOp {
-                        op: PlannedColumnOp::Function(PlannedFunctionOp::Cast(*kind)),
-                        inputs,
-                    },
-                    FunctionKind::TsEma { span } => ReactivePlanNodeKind::TsOp {
-                        op: PlannedTsOp::Ema { span: *span },
-                        inputs,
-                    },
-                    FunctionKind::TsMean { window } => ReactivePlanNodeKind::TsOp {
-                        op: PlannedTsOp::Mean { window: *window },
-                        inputs,
-                    },
-                    FunctionKind::TsStd { window } => ReactivePlanNodeKind::TsOp {
-                        op: PlannedTsOp::Std { window: *window },
-                        inputs,
-                    },
-                    FunctionKind::TsDelay { period } => ReactivePlanNodeKind::TsOp {
-                        op: PlannedTsOp::Delay { period: *period },
-                        inputs,
-                    },
-                    FunctionKind::TsDiff { period } => ReactivePlanNodeKind::TsOp {
-                        op: PlannedTsOp::Diff { period: *period },
-                        inputs,
-                    },
-                    FunctionKind::TsReturn { period } => ReactivePlanNodeKind::TsOp {
-                        op: PlannedTsOp::Return { period: *period },
-                        inputs,
-                    },
-                }
+                kind.plan_node_kind(inputs)
             }
         };
 
@@ -376,6 +339,73 @@ impl FunctionKind {
                 | Self::TsDiff { .. }
                 | Self::TsReturn { .. }
         )
+    }
+
+    fn plan_node_kind(self, inputs: Vec<PlanNodeId>) -> ReactivePlanNodeKind {
+        match self {
+            Self::Abs => ReactivePlanNodeKind::ColumnOp {
+                op: PlannedColumnOp::Function(PlannedFunctionOp::Abs),
+                inputs,
+            },
+            Self::Log => ReactivePlanNodeKind::ColumnOp {
+                op: PlannedColumnOp::Function(PlannedFunctionOp::Log),
+                inputs,
+            },
+            Self::Clip => ReactivePlanNodeKind::ColumnOp {
+                op: PlannedColumnOp::Function(PlannedFunctionOp::Clip),
+                inputs,
+            },
+            Self::Cast(kind) => ReactivePlanNodeKind::ColumnOp {
+                op: PlannedColumnOp::Function(PlannedFunctionOp::Cast(kind)),
+                inputs,
+            },
+            Self::TsEma { span } => ReactivePlanNodeKind::TsOp {
+                op: PlannedTsOp::Ema { span },
+                inputs,
+            },
+            Self::TsMean { window } => ReactivePlanNodeKind::TsOp {
+                op: PlannedTsOp::Mean { window },
+                inputs,
+            },
+            Self::TsStd { window } => ReactivePlanNodeKind::TsOp {
+                op: PlannedTsOp::Std { window },
+                inputs,
+            },
+            Self::TsDelay { period } => ReactivePlanNodeKind::TsOp {
+                op: PlannedTsOp::Delay { period },
+                inputs,
+            },
+            Self::TsDiff { period } => ReactivePlanNodeKind::TsOp {
+                op: PlannedTsOp::Diff { period },
+                inputs,
+            },
+            Self::TsReturn { period } => ReactivePlanNodeKind::TsOp {
+                op: PlannedTsOp::Return { period },
+                inputs,
+            },
+        }
+    }
+
+    fn signature_key(self) -> String {
+        match self {
+            Self::Abs | Self::Log | Self::Clip => self.canonical_name().to_string(),
+            Self::Cast(kind) => format!("CAST:{kind:?}"),
+            Self::TsEma { span } => format!("TS_EMA:{span}"),
+            Self::TsMean { window } => format!("TS_MEAN:{window}"),
+            Self::TsStd { window } => format!("TS_STD:{window}"),
+            Self::TsDelay { period } => format!("TS_DELAY:{period}"),
+            Self::TsDiff { period } => format!("TS_DIFF:{period}"),
+            Self::TsReturn { period } => format!("TS_RETURN:{period}"),
+        }
+    }
+
+    fn reactive_planner_error(self) -> ZippyError {
+        ZippyError::InvalidConfig {
+            reason: format!(
+                "stateful expression function requires build_reactive_plan function=[{}]",
+                self.canonical_name()
+            ),
+        }
     }
 }
 
@@ -974,12 +1004,7 @@ fn ensure_row_evaluable(expr: &TypedExpr) -> Result<()> {
         }
         TypedExprKind::Function { kind, args } => {
             if kind.is_stateful() {
-                return Err(ZippyError::InvalidConfig {
-                    reason: format!(
-                        "stateful expression function requires build_reactive_plan function=[{}]",
-                        kind.canonical_name()
-                    ),
-                });
+                return Err(kind.reactive_planner_error());
             }
 
             for arg in args {
@@ -1029,20 +1054,7 @@ fn expr_signature(expr: &TypedExpr) -> String {
                 .map(expr_signature)
                 .collect::<Vec<_>>()
                 .join(",");
-            match kind {
-                FunctionKind::Abs | FunctionKind::Log | FunctionKind::Clip => {
-                    format!("fn:{}({args})", kind.canonical_name())
-                }
-                FunctionKind::Cast(cast_kind) => {
-                    format!("fn:CAST:{cast_kind:?}({args})")
-                }
-                FunctionKind::TsEma { span } => format!("fn:TS_EMA:{span}({args})"),
-                FunctionKind::TsMean { window } => format!("fn:TS_MEAN:{window}({args})"),
-                FunctionKind::TsStd { window } => format!("fn:TS_STD:{window}({args})"),
-                FunctionKind::TsDelay { period } => format!("fn:TS_DELAY:{period}({args})"),
-                FunctionKind::TsDiff { period } => format!("fn:TS_DIFF:{period}({args})"),
-                FunctionKind::TsReturn { period } => format!("fn:TS_RETURN:{period}({args})"),
-            }
+            format!("fn:{}({args})", kind.signature_key())
         }
     }
 }
@@ -1138,12 +1150,7 @@ fn evaluate_expr(expr: &TypedExpr, batch: &RecordBatch, row: usize) -> Result<Ev
             | FunctionKind::TsStd { .. }
             | FunctionKind::TsDelay { .. }
             | FunctionKind::TsDiff { .. }
-            | FunctionKind::TsReturn { .. } => Err(ZippyError::InvalidConfig {
-                reason: format!(
-                    "stateful expression function requires build_reactive_plan function=[{}]",
-                    kind.canonical_name()
-                ),
-            }),
+            | FunctionKind::TsReturn { .. } => Err(kind.reactive_planner_error()),
         },
     }
 }
@@ -1448,5 +1455,41 @@ fn describe_token(token: &Token) -> String {
         Token::RParen => ")".to_string(),
         Token::Comma => ",".to_string(),
         Token::End => "end".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]))
+    }
+
+    #[test]
+    fn reactive_plan_deduplicates_repeated_ts_diff_subexpressions() {
+        let plan = ExpressionSpec::new("TS_DIFF(value, 2) / TS_STD(TS_DIFF(value, 2), 3)", "score")
+            .build_reactive_plan(input_schema().as_ref(), "id")
+            .unwrap();
+
+        assert_eq!(plan.stateful_node_count("TS_DIFF"), 1);
+        assert_eq!(plan.stateful_node_count("TS_STD"), 1);
+    }
+
+    #[test]
+    fn reactive_plan_preserves_output_metadata_for_stateful_expressions() {
+        let plan = ExpressionSpec::new("TS_DIFF(value, 2) / TS_STD(TS_DIFF(value, 2), 3)", "score")
+            .build_reactive_plan(input_schema().as_ref(), "id")
+            .unwrap();
+
+        assert_eq!(plan.id_field(), "id");
+        assert_eq!(
+            plan.output_field(),
+            Field::new("score", DataType::Float64, true)
+        );
+        assert_eq!(plan.output_node_id(), plan.nodes.len() - 1);
     }
 }

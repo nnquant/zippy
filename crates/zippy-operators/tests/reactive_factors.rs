@@ -326,12 +326,43 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
 }
 
 #[test]
-fn expression_planner_deduplicates_repeated_ts_diff_subexpressions() {
-    let plan = ExpressionSpec::new("TS_DIFF(value, 2) / TS_STD(TS_DIFF(value, 2), 3)", "score")
-        .build_reactive_plan(input_schema().as_ref(), "id")
-        .unwrap();
+fn expression_row_evaluator_rejects_stateful_functions() {
+    let error =
+        match ExpressionSpec::new("TS_DIFF(value, 2)", "score").build(input_schema().as_ref()) {
+            Ok(_) => panic!("expected stateful expression to be rejected on row evaluator"),
+            Err(error) => error,
+        };
 
-    assert_eq!(plan.stateful_node_count("TS_DIFF"), 1);
+    match error {
+        ZippyError::InvalidConfig { reason } => {
+            assert!(reason.contains("build_reactive_plan"));
+            assert!(reason.contains("TS_DIFF"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn expression_reactive_plan_requires_utf8_id_field() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Float64, false),
+    ]));
+
+    let error = match ExpressionSpec::new("TS_DIFF(value, 2)", "score")
+        .build_reactive_plan(schema.as_ref(), "id")
+    {
+        Ok(_) => panic!("expected non-utf8 id field to be rejected"),
+        Err(error) => error,
+    };
+
+    match error {
+        ZippyError::InvalidConfig { reason } => {
+            assert!(reason.contains("reactive id field must be utf8"));
+            assert!(reason.contains("id"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
