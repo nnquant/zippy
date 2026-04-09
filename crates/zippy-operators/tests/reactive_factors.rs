@@ -307,7 +307,7 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
         ],
     )
     .unwrap();
-    let mut factor = ExpressionSpec::new("clip(abs(value) + 1.0, 0.0, 20.0)", "score")
+    let mut factor = ExpressionSpec::new("CLIP(ABS(value) + 1.0, 0.0, 20.0)", "score")
         .build(schema.as_ref())
         .unwrap();
 
