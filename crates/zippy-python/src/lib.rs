@@ -1,5 +1,7 @@
 #![allow(clippy::useless_conversion)]
 
+mod native_source_bridge;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, SyncSender};
@@ -16,7 +18,8 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use zippy_core::{
     python_dev_version, spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine,
     EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy,
-    OverflowPolicy, Publisher as CorePublisher, SourceMode as RustSourceMode, ZippyError,
+    OverflowPolicy, Publisher as CorePublisher, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode,
+    SourceSink, StreamHello, ZippyError,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
@@ -41,6 +44,8 @@ use zippy_operators::{
     TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
 };
 
+use native_source_bridge::create_native_source_sink_capsule;
+
 fn py_value_error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
@@ -53,6 +58,12 @@ type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
 type SharedArchive = Arc<Mutex<Option<ArchiveHandle>>>;
 type SharedStatus = Arc<Mutex<EngineStatus>>;
 type SharedMetrics = Arc<Mutex<EngineMetricsSnapshot>>;
+type SourceOwner = Option<Py<PyAny>>;
+type RegisteredSource = (
+    SourceOwner,
+    Option<RemoteSourceConfig>,
+    Option<PythonSourceConfig>,
+);
 
 #[derive(Clone)]
 struct DownstreamLink {
@@ -72,6 +83,13 @@ struct RuntimeOptions {
 struct RemoteSourceConfig {
     endpoint: String,
     expected_schema: Arc<Schema>,
+    mode: RustSourceMode,
+}
+
+struct PythonSourceConfig {
+    owner: Py<PyAny>,
+    name: String,
+    output_schema: Arc<Schema>,
     mode: RustSourceMode,
 }
 
@@ -107,6 +125,120 @@ impl CorePublisher for InProcessPublisher {
             status: "engine not started",
         })?;
         handle.write(batch.clone())
+    }
+}
+
+#[pyclass]
+struct SourceSinkProxy {
+    sink: Arc<dyn SourceSink>,
+    schema: Arc<Schema>,
+}
+
+#[pymethods]
+impl SourceSinkProxy {
+    #[pyo3(signature = (stream_name, protocol_version=1))]
+    fn emit_hello(&self, py: Python<'_>, stream_name: String, protocol_version: u16) -> PyResult<()> {
+        let hello = StreamHello::new(&stream_name, Arc::clone(&self.schema), protocol_version)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        py.allow_threads(|| self.sink.emit(SourceEvent::Hello(hello)))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn emit_data(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = value_to_record_batches(py, value, self.schema.as_ref())?;
+        for batch in batches {
+            py.allow_threads(|| self.sink.emit(SourceEvent::Data(batch)))
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn emit_flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.sink.emit(SourceEvent::Flush))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn emit_stop(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.sink.emit(SourceEvent::Stop))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn emit_error(&self, py: Python<'_>, reason: String) -> PyResult<()> {
+        py.allow_threads(|| self.sink.emit(SourceEvent::Error(reason)))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+}
+
+struct PythonSourceBridge {
+    owner: Py<PyAny>,
+    name: String,
+    output_schema: Arc<Schema>,
+    mode: RustSourceMode,
+}
+
+impl Source for PythonSourceBridge {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.output_schema)
+    }
+
+    fn mode(&self) -> RustSourceMode {
+        self.mode
+    }
+
+    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
+        let owner = Python::with_gil(|py| self.owner.clone_ref(py));
+        let schema = Arc::clone(&self.output_schema);
+        let runtime_handle = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+            let owner_bound = owner.bind(py);
+            if owner_bound.hasattr("_zippy_start_native")? {
+                let capsule =
+                    create_native_source_sink_capsule(py, Arc::clone(&sink), Arc::clone(&schema))?;
+                owner_bound
+                    .call_method1("_zippy_start_native", (capsule,))
+                    .map(|value| value.unbind())
+            } else {
+                let sink_proxy = Py::new(
+                    py,
+                    SourceSinkProxy {
+                        sink,
+                        schema,
+                    },
+                )?;
+                owner_bound
+                    .call_method1("_zippy_start", (sink_proxy,))
+                    .map(|value| value.unbind())
+            }
+        })
+        .map_err(map_python_source_error)?;
+
+        let join_handle_object = Python::with_gil(|py| runtime_handle.clone_ref(py));
+        let join_handle = thread::spawn(move || -> zippy_core::Result<()> {
+            Python::with_gil(|py| {
+                join_handle_object
+                    .bind(py)
+                    .call_method0("join")
+                    .map(|_| ())
+            })
+            .map_err(map_python_source_error)
+        });
+
+        let stop_handle_object = Python::with_gil(|py| runtime_handle.clone_ref(py));
+        let stop_fn: Box<dyn FnMut() -> zippy_core::Result<()> + Send> =
+            Box::new(move || {
+                Python::with_gil(|py| {
+                    stop_handle_object
+                        .bind(py)
+                        .call_method0("stop")
+                        .map(|_| ())
+                })
+                .map_err(map_python_source_error)
+            });
+
+        Ok(SourceHandle::new_with_stop(join_handle, stop_fn))
     }
 }
 
@@ -927,6 +1059,7 @@ struct ReactiveStateEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
+    python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -949,6 +1082,7 @@ struct TimeSeriesEngine {
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
     remote_source: Option<RemoteSourceConfig>,
+    python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -989,6 +1123,7 @@ struct StreamTableEngine {
     handle: SharedHandle,
     engine: Option<RustStreamTableEngine>,
     remote_source: Option<RemoteSourceConfig>,
+    python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -1027,7 +1162,7 @@ impl ReactiveStateEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, _) = register_source(
+        let (source_owner, _, python_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1053,6 +1188,7 @@ impl ReactiveStateEngine {
             archive,
             handle,
             engine: Some(engine),
+            python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
         })
@@ -1065,6 +1201,7 @@ impl ReactiveStateEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             None,
+            self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1127,7 +1264,7 @@ impl ReactiveStateEngine {
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
 }
 
@@ -1168,7 +1305,7 @@ impl StreamTableEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source) = register_source(
+        let (source_owner, remote_source, python_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1194,6 +1331,7 @@ impl StreamTableEngine {
             handle,
             engine: Some(engine),
             remote_source,
+            python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
         })
@@ -1206,6 +1344,7 @@ impl StreamTableEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
+            self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1269,7 +1408,7 @@ impl StreamTableEngine {
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
 }
 
@@ -1336,7 +1475,7 @@ impl TimeSeriesEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source) = register_source(
+        let (source_owner, remote_source, python_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1366,6 +1505,7 @@ impl TimeSeriesEngine {
             handle,
             engine: Some(engine),
             remote_source,
+            python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
         })
@@ -1378,6 +1518,7 @@ impl TimeSeriesEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
+            self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1443,7 +1584,7 @@ impl TimeSeriesEngine {
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
 }
 
@@ -1547,6 +1688,7 @@ impl CrossSectionalEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
+            None,
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1612,7 +1754,7 @@ impl CrossSectionalEngine {
 
     fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
-        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
 }
 
@@ -1722,9 +1864,9 @@ fn register_source(
     source: Option<&Bound<'_, PyAny>>,
     downstream: DownstreamLink,
     input_schema: &Schema,
-) -> PyResult<(Option<Py<PyAny>>, Option<RemoteSourceConfig>)> {
+) -> PyResult<RegisteredSource> {
     let Some(source) = source else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
@@ -1739,7 +1881,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None));
+        return Ok((Some(source.clone().unbind()), None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableEngine>>() {
@@ -1754,7 +1896,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None));
+        return Ok((Some(source.clone().unbind()), None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
@@ -1769,7 +1911,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok((Some(source.clone().unbind()), None));
+        return Ok((Some(source.clone().unbind()), None, None));
     }
 
     if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
@@ -1786,11 +1928,46 @@ fn register_source(
                 expected_schema: remote_source.expected_schema.clone(),
                 mode: remote_source.mode,
             }),
+            None,
+        ));
+    }
+
+    if source.hasattr("_zippy_start")? && source.hasattr("_zippy_output_schema")? {
+        let output_schema = Arc::new(
+            Schema::from_pyarrow_bound(&source.call_method0("_zippy_output_schema")?)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        if output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+
+        let mode = if source.hasattr("_zippy_source_mode")? {
+            parse_python_source_mode(&source.call_method0("_zippy_source_mode")?)?
+        } else {
+            RustSourceMode::Pipeline
+        };
+        let name = if source.hasattr("_zippy_source_name")? {
+            source.call_method0("_zippy_source_name")?.extract::<String>()?
+        } else {
+            "python-source".to_string()
+        };
+
+        return Ok((
+            Some(source.clone().unbind()),
+            None,
+            Some(PythonSourceConfig {
+                owner: source.clone().unbind(),
+                name,
+                output_schema,
+                mode,
+            }),
         ));
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, or ZmqSource",
+        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, or a Python source plugin",
     ))
 }
 
@@ -1943,12 +2120,14 @@ fn ensure_runtime_is_not_running(handle: &SharedHandle) -> PyResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_runtime_engine<E: Engine>(
     name: &str,
     runtime_options: &RuntimeOptions,
     targets: &[TargetConfig],
     parquet_sink: Option<&ParquetSinkConfig>,
     remote_source: Option<&RemoteSourceConfig>,
+    python_source: Option<&PythonSourceConfig>,
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
 ) -> PyResult<(EngineHandle, Option<ArchiveHandle>)> {
@@ -1978,8 +2157,8 @@ fn start_runtime_engine<E: Engine>(
         None => return Err(py_runtime_error("engine already started")),
     };
 
-    let handle = match remote_source {
-        Some(remote_source) => {
+    let handle = match (remote_source, python_source) {
+        (Some(remote_source), None) => {
             let source = Box::new(
                 RustZmqSource::connect(
                     &format!("{name}_source"),
@@ -1991,7 +2170,21 @@ fn start_runtime_engine<E: Engine>(
             );
             spawn_source_engine_with_publisher(source, engine, config, publisher)
         }
-        None => spawn_engine_with_publisher(engine, config, publisher),
+        (None, Some(python_source)) => {
+            let source = Box::new(PythonSourceBridge {
+                owner: Python::with_gil(|py| python_source.owner.clone_ref(py)),
+                name: python_source.name.clone(),
+                output_schema: Arc::clone(&python_source.output_schema),
+                mode: python_source.mode,
+            });
+            spawn_source_engine_with_publisher(source, engine, config, publisher)
+        }
+        (None, None) => spawn_engine_with_publisher(engine, config, publisher),
+        (Some(_), Some(_)) => {
+            return Err(py_runtime_error(
+                "engine cannot use remote source and python source at the same time",
+            ));
+        }
     }
     .map_err(|error| py_runtime_error(error.to_string()))?;
 
@@ -2054,6 +2247,7 @@ fn flush_runtime_engine(
 }
 
 fn stop_runtime_engine(
+    py: Python<'_>,
     handle: &SharedHandle,
     archive: &SharedArchive,
     status: &SharedStatus,
@@ -2065,14 +2259,13 @@ fn stop_runtime_engine(
         None => return Err(py_runtime_error("engine not started")),
     };
 
-    let stop_result = match runtime.stop() {
+    let stop_result = match py.allow_threads(|| runtime.stop()) {
         Ok(()) => Ok(()),
         Err(_error) if runtime.status() == EngineStatus::Stopped => Ok(()),
         Err(error) => Err(py_runtime_error(error.to_string())),
     };
     let archive_result = if let Some(archive) = archive.lock().unwrap().take() {
-        archive
-            .close()
+        py.allow_threads(|| archive.close())
             .map_err(|error| py_runtime_error(error.to_string()))
     } else {
         Ok(())
@@ -2139,6 +2332,22 @@ fn parse_source_mode(value: &Bound<'_, PyAny>) -> PyResult<RustSourceMode> {
         "pipeline" => Ok(RustSourceMode::Pipeline),
         "consumer" => Ok(RustSourceMode::Consumer),
         _ => Err(py_value_error("mode must be zippy.SourceMode")),
+    }
+}
+
+fn parse_python_source_mode(value: &Bound<'_, PyAny>) -> PyResult<RustSourceMode> {
+    match value.extract::<String>()?.as_str() {
+        "pipeline" => Ok(RustSourceMode::Pipeline),
+        "consumer" => Ok(RustSourceMode::Consumer),
+        _ => Err(py_value_error(
+            "python source mode must be 'pipeline' or 'consumer'",
+        )),
+    }
+}
+
+fn map_python_source_error(error: PyErr) -> ZippyError {
+    ZippyError::Io {
+        reason: format!("python source bridge failed error=[{}]", error),
     }
 }
 

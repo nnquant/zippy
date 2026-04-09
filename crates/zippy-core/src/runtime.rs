@@ -11,6 +11,22 @@ use crate::{
     SourceSink, ZippyError,
 };
 
+fn zippy_debug_stop_enabled() -> bool {
+    match std::env::var("ZIPPY_DEBUG_STOP") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+fn zippy_debug_stop_log(message: &str) {
+    if zippy_debug_stop_enabled() {
+        eprintln!("zippy_debug_stop: {message}");
+    }
+}
+
 #[derive(Default)]
 struct NoopPublisher;
 
@@ -59,6 +75,11 @@ impl EngineHandle {
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        zippy_debug_stop_log(&format!(
+            "engine_handle.stop entered status=[{}] has_source=[{}]",
+            self.status().as_str(),
+            self.source_handle.is_some()
+        ));
         if self.status() == EngineStatus::Stopped {
             let join_result = self.join_worker();
             let source_result = self.join_source();
@@ -71,12 +92,28 @@ impl EngineHandle {
         }
 
         match self.source_handle.as_ref() {
-            Some(source_handle) => source_handle.stop(),
+            Some(source_handle) => {
+                zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
+                source_handle.stop()
+            }
             None => Ok(()),
         }?;
+        zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
         let command_result = self.enqueue_command(Command::Stop);
+        zippy_debug_stop_log(&format!(
+            "engine_handle.stop enqueue stop returned ok=[{}]",
+            command_result.is_ok()
+        ));
         let join_result = self.join_worker();
+        zippy_debug_stop_log(&format!(
+            "engine_handle.stop join_worker returned ok=[{}]",
+            join_result.is_ok()
+        ));
         let source_result = self.join_source();
+        zippy_debug_stop_log(&format!(
+            "engine_handle.stop join_source returned ok=[{}]",
+            source_result.is_ok()
+        ));
 
         match (command_result, join_result, source_result) {
             (_, Err(err), _) => Err(err),
@@ -96,6 +133,7 @@ impl EngineHandle {
 
     fn join_worker(&mut self) -> Result<()> {
         if let Some(join_handle) = self.join_handle.take() {
+            zippy_debug_stop_log("engine_handle.join_worker waiting for worker thread");
             return join_handle.join().map_err(|_| ZippyError::Io {
                 reason: "worker thread panicked".to_string(),
             })?;
@@ -106,10 +144,12 @@ impl EngineHandle {
 
     fn join_source(&mut self) -> Result<()> {
         if let Some(source_handle) = self.source_handle.as_ref() {
+            zippy_debug_stop_log("engine_handle.join_source waiting for source handle");
             source_handle.join()?;
         }
         self.source_handle = None;
         if let Some(source_monitor_handle) = self.source_monitor_handle.take() {
+            zippy_debug_stop_log("engine_handle.join_source waiting for source monitor thread");
             source_monitor_handle.join().map_err(|_| ZippyError::Io {
                 reason: "source monitor thread panicked".to_string(),
             })?;
