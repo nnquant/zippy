@@ -13,14 +13,6 @@ def setup_log(
 ) -> dict[str, str | None]: ...
 
 
-def log_info(
-    component: str,
-    event: str,
-    message: str,
-    status: str | None = None,
-) -> None: ...
-
-
 class _WindowTypeValue: ...
 
 
