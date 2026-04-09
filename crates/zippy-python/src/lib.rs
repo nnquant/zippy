@@ -16,6 +16,7 @@ use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
+use tracing::{error, info};
 use zippy_core::{
     current_log_snapshot, python_dev_version, setup_log as setup_core_log, spawn_engine_with_publisher,
     spawn_source_engine_with_publisher, Engine, EngineConfig, EngineHandle,
@@ -519,13 +520,13 @@ impl ArchiveFileState {
         let root = self
             .active_root
             .clone()
-            .ok_or_else(|| ZippyError::InvalidState {
+            .ok_or(ZippyError::InvalidState {
                 status: "parquet archive root is not available",
             })?;
         let schema = self
             .active_schema
             .clone()
-            .ok_or_else(|| ZippyError::InvalidState {
+            .ok_or(ZippyError::InvalidState {
                 status: "parquet archive schema is not available",
             })?;
 
@@ -2375,8 +2376,27 @@ fn start_runtime_engine<E: Engine>(
                 "engine cannot use remote source and python source at the same time",
             ));
         }
-    }
-    .map_err(|error| py_runtime_error(error.to_string()))?;
+    };
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            error!(
+                component = "python_bridge",
+                engine = name,
+                event = "start_failure",
+                error = %error,
+                "python runtime bridge start failed"
+            );
+            return Err(py_runtime_error(error.to_string()));
+        }
+    };
+
+    info!(
+        component = "python_bridge",
+        engine = name,
+        event = "start",
+        "python runtime bridge started"
+    );
 
     Ok((handle, archive))
 }
@@ -2465,6 +2485,29 @@ fn stop_runtime_engine(
         final_status = EngineStatus::Failed;
     }
     set_cached_runtime_state(status, metrics, final_status, runtime.metrics());
+
+    if let Err(error) = &stop_result {
+        error!(
+            component = "python_bridge",
+            event = "stop_failure",
+            error = %error,
+            "python runtime bridge stop failed"
+        );
+    } else if let Err(error) = &archive_result {
+        error!(
+            component = "python_bridge",
+            event = "stop_failure",
+            error = %error,
+            "python runtime bridge stop failed"
+        );
+    } else {
+        info!(
+            component = "python_bridge",
+            event = "stop",
+            status = final_status.as_str(),
+            "python runtime bridge stopped"
+        );
+    }
 
     match (stop_result, archive_result) {
         (Err(error), _) => Err(error),

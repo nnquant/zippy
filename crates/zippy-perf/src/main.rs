@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use tracing::{error, info};
+use zippy_core::{setup_log, LogConfig};
 use zippy_perf::{
     format_report, run_profile, write_report_json, OverflowPolicyConfig, PerfConfig, PerfProfile,
 };
@@ -47,6 +49,13 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+    let _ = setup_log(LogConfig::new(
+        "zippy_perf",
+        "info",
+        PathBuf::from("logs"),
+        true,
+        true,
+    ));
     let config = PerfConfig {
         profile: match cli.profile {
             CliProfile::InprocTimeseries => PerfProfile::InprocTimeseries,
@@ -67,10 +76,21 @@ fn main() {
         },
     };
 
+    info!(
+        component = "perf",
+        event = "profile_start",
+        profile = ?config.profile,
+        "performance profile started"
+    );
     let report = match run_profile(&config) {
         Ok(report) => report,
         Err(error) => {
-            eprintln!("{error}");
+            error!(
+                component = "perf",
+                event = "profile_error",
+                error = %error,
+                "performance profile failed"
+            );
             std::process::exit(1);
         }
     };
@@ -79,10 +99,24 @@ fn main() {
 
     if let Some(path) = cli.report_json.as_ref() {
         if let Err(error) = write_report_json(path, &report) {
-            eprintln!("{error}");
+            error!(
+                component = "perf",
+                event = "report_write_error",
+                error = %error,
+                path = %path.display(),
+                "performance report write failed"
+            );
             std::process::exit(1);
         }
     }
+
+    info!(
+        component = "perf",
+        event = "profile_finish",
+        profile = ?report.profile,
+        pass = report.pass,
+        "performance profile finished"
+    );
 
     if !report.pass {
         std::process::exit(2);

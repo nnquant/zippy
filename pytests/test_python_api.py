@@ -346,6 +346,56 @@ print(json.dumps(result))
     assert "_" in file_path.stem
 
 
+def test_setup_log_file_contains_runtime_message(tmp_path: Path) -> None:
+    script = """
+import json
+from pathlib import Path
+
+import pyarrow as pa
+import zippy
+
+snapshot = zippy.setup_log(
+    app="bridge_test",
+    level="info",
+    log_dir=r\"\"\"%s\"\"\",
+    to_console=False,
+    to_file=True,
+)
+engine = zippy.StreamTableEngine(
+    name="ticks",
+    input_schema=pa.schema([("price", pa.float64())]),
+    target=zippy.NullPublisher(),
+)
+engine.start()
+engine.stop()
+print(json.dumps(snapshot))
+""" % str(tmp_path)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    snapshot = json.loads(completed.stdout.strip())
+    file_path = Path(snapshot["file_path"])
+    contents = file_path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in contents if line.strip()]
+
+    assert any(
+        record.get("component") == "runtime"
+        and record.get("event") == "start"
+        and record.get("message")
+        for record in records
+    )
+    assert any(
+        record.get("component") == "python_bridge"
+        and record.get("event") == "stop"
+        and record.get("message") == "python runtime bridge stopped"
+        for record in records
+    )
+
+
 def test_timeseries_engine_accepts_polars_and_exposes_output_schema() -> None:
     input_schema = pa.schema(
         [

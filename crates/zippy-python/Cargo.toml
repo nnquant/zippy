@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 arrow = { workspace = true, features = ["pyarrow"] }
 pyo3 = { version = "0.22", features = ["extension-module"] }
+tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-engines = { path = "../zippy-engines" }
 zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
