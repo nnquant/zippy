@@ -135,3 +135,51 @@ fn parquet_sink_writes_multiple_files_without_conflict() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+fn read_back_row_count(path: PathBuf) -> usize {
+    let file = File::open(path).unwrap();
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut rows = 0;
+    while let Some(batch) = reader.next() {
+        rows += batch.unwrap().num_rows();
+    }
+    rows
+}
+
+#[test]
+fn parquet_sink_writer_appends_multiple_batches_into_single_file() {
+    let root = temp_dir_path();
+    let sink = ParquetSink::new(&root);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("price", DataType::Float64, false),
+    ]));
+    let first = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(Float64Array::from(vec![1.0])),
+        ],
+    )
+    .unwrap();
+    let second = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["b", "c"])),
+            Arc::new(Float64Array::from(vec![2.0, 3.0])),
+        ],
+    )
+    .unwrap();
+
+    let mut writer = sink.create_writer("bars.parquet", schema).unwrap();
+    writer.write_batch(&first).unwrap();
+    writer.write_batch(&second).unwrap();
+    writer.close().unwrap();
+
+    assert_eq!(read_back_row_count(root.join("bars.parquet")), 3);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}

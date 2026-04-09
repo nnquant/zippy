@@ -200,6 +200,8 @@ class ParquetSink:
         rotation: str = "none",
         write_input: bool = False,
         write_output: bool = True,
+        rows_per_batch: int = 8192,
+        flush_interval_ms: int = 1000,
     ) -> None: ...
 
 

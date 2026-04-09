@@ -4,11 +4,12 @@ mod native_source_bridge;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver as StdReceiver, SyncSender};
+use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
@@ -28,7 +29,8 @@ use zippy_engines::{
 };
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
-    ParquetSink as RustParquetSink, ZmqPublisher as RustZmqPublisher,
+    ParquetSink as RustParquetSink, ParquetSinkWriter as RustParquetSinkWriter,
+    ZmqPublisher as RustZmqPublisher,
     ZmqSource as RustZmqSource, ZmqStreamPublisher as RustZmqStreamPublisher,
     ZmqSubscriber as RustZmqSubscriber,
 };
@@ -271,6 +273,8 @@ struct ParquetSinkConfig {
     rotation: ParquetRotation,
     write_input: bool,
     write_output: bool,
+    rows_per_batch: usize,
+    flush_interval_ms: u64,
 }
 
 enum ArchiveKind {
@@ -392,43 +396,187 @@ fn parquet_archive_worker(
     config: ParquetSinkConfig,
     rx: StdReceiver<ArchiveCommand>,
 ) -> zippy_core::Result<()> {
-    let mut input_index = 0_u64;
-    let mut output_index = 0_u64;
+    let mut input_state = ArchiveFileState::new(config.rows_per_batch);
+    let mut output_state = ArchiveFileState::new(config.rows_per_batch);
 
-    while let Ok(command) = rx.recv() {
+    loop {
+        let command = if config.flush_interval_ms == 0 {
+            match rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(config.flush_interval_ms)) {
+                Ok(command) => command,
+                Err(RecvTimeoutError::Timeout) => {
+                    input_state.flush_if_due(config.flush_interval_ms)?;
+                    output_state.flush_if_due(config.flush_interval_ms)?;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        };
+
         match command {
             ArchiveCommand::Write { kind, batch } => match kind {
                 ArchiveKind::Input => {
-                    input_index += 1;
-                    write_archive_batch(&config, &kind, input_index, &batch)?;
+                    input_state.write(&config, &kind, batch)?;
                 }
                 ArchiveKind::Output => {
-                    output_index += 1;
-                    write_archive_batch(&config, &kind, output_index, &batch)?;
+                    output_state.write(&config, &kind, batch)?;
                 }
             },
             ArchiveCommand::Flush(reply_tx) => {
-                let _ = reply_tx.send(Ok(()));
+                let result = input_state.flush().and_then(|_| output_state.flush());
+                let _ = reply_tx.send(result);
             }
             ArchiveCommand::Close(reply_tx) => {
-                let _ = reply_tx.send(Ok(()));
+                let result = input_state.close().and_then(|_| output_state.close());
+                let _ = reply_tx.send(result);
                 return Ok(());
             }
         }
     }
 
-    Ok(())
+    input_state.close().and_then(|_| output_state.close())
 }
 
-fn write_archive_batch(
-    config: &ParquetSinkConfig,
-    kind: &ArchiveKind,
-    index: u64,
-    batch: &RecordBatch,
-) -> zippy_core::Result<()> {
-    let root = archive_root(config, kind)?;
-    let sink = RustParquetSink::new(root);
-    sink.write_batch(&format!("{index:06}.parquet"), batch)
+struct ArchiveFileState {
+    next_index: u64,
+    active_root: Option<PathBuf>,
+    active_schema: Option<Arc<Schema>>,
+    writer: Option<RustParquetSinkWriter>,
+    buffered_batches: Vec<RecordBatch>,
+    buffered_rows: usize,
+    rows_per_batch: usize,
+    first_buffered_at: Option<Instant>,
+}
+
+impl ArchiveFileState {
+    fn new(rows_per_batch: usize) -> Self {
+        Self {
+            next_index: 0,
+            active_root: None,
+            active_schema: None,
+            writer: None,
+            buffered_batches: Vec::new(),
+            buffered_rows: 0,
+            rows_per_batch: rows_per_batch.max(1),
+            first_buffered_at: None,
+        }
+    }
+
+    fn write(
+        &mut self,
+        config: &ParquetSinkConfig,
+        kind: &ArchiveKind,
+        batch: RecordBatch,
+    ) -> zippy_core::Result<()> {
+        let root = archive_root(config, kind)?;
+        let needs_rotate = self
+            .active_root
+            .as_ref()
+            .map(|active_root| active_root != &root)
+            .unwrap_or(false);
+        let needs_schema_roll = self
+            .active_schema
+            .as_ref()
+            .map(|schema| schema.as_ref() != batch.schema().as_ref())
+            .unwrap_or(false);
+
+        if needs_rotate || needs_schema_roll {
+            self.flush()?;
+        }
+
+        if self.active_root.is_none() {
+            self.active_root = Some(root);
+        }
+        if self.active_schema.is_none() {
+            self.active_schema = Some(batch.schema());
+        }
+        if self.first_buffered_at.is_none() {
+            self.first_buffered_at = Some(Instant::now());
+        }
+
+        self.buffered_rows += batch.num_rows();
+        self.buffered_batches.push(batch);
+
+        if self.buffered_rows >= self.rows_per_batch {
+            self.flush_buffer()?;
+        }
+
+        Ok(())
+    }
+
+    fn flush_if_due(&mut self, flush_interval_ms: u64) -> zippy_core::Result<()> {
+        if flush_interval_ms == 0 || self.buffered_batches.is_empty() {
+            return Ok(());
+        }
+
+        let Some(first_buffered_at) = self.first_buffered_at else {
+            return Ok(());
+        };
+        if first_buffered_at.elapsed() >= Duration::from_millis(flush_interval_ms) {
+            self.flush_buffer()?;
+        }
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> zippy_core::Result<()> {
+        if self.buffered_batches.is_empty() {
+            return Ok(());
+        }
+
+        let root = self
+            .active_root
+            .clone()
+            .ok_or_else(|| ZippyError::InvalidState {
+                status: "parquet archive root is not available",
+            })?;
+        let schema = self
+            .active_schema
+            .clone()
+            .ok_or_else(|| ZippyError::InvalidState {
+                status: "parquet archive schema is not available",
+            })?;
+
+        if self.writer.is_none() {
+            self.next_index += 1;
+            let sink = RustParquetSink::new(root);
+            self.writer = Some(
+                sink.create_writer(&format!("{:06}.parquet", self.next_index), schema.clone())?,
+            );
+        }
+
+        let merged = concat_batches(&schema, self.buffered_batches.iter()).map_err(|error| {
+            ZippyError::Io {
+                reason: format!("failed to concat archive batches error=[{}]", error),
+            }
+        })?;
+        self.writer
+            .as_mut()
+            .expect("archive writer must exist before flush")
+            .write_batch(&merged)?;
+        self.buffered_batches.clear();
+        self.buffered_rows = 0;
+        self.first_buffered_at = None;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> zippy_core::Result<()> {
+        self.flush_buffer()?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.close()?;
+        }
+        self.writer = None;
+        self.active_root = None;
+        self.active_schema = None;
+        Ok(())
+    }
+
+    fn close(&mut self) -> zippy_core::Result<()> {
+        self.flush()
+    }
 }
 
 fn archive_root(config: &ParquetSinkConfig, kind: &ArchiveKind) -> zippy_core::Result<PathBuf> {
@@ -854,17 +1002,31 @@ struct ParquetSink {
     rotation: String,
     write_input: bool,
     write_output: bool,
+    rows_per_batch: usize,
+    flush_interval_ms: u64,
 }
 
 #[pymethods]
 impl ParquetSink {
     #[new]
-    #[pyo3(signature = (path, rotation="none", write_input=false, write_output=true))]
-    fn new(path: String, rotation: &str, write_input: bool, write_output: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path, rotation="none", write_input=false, write_output=true, rows_per_batch=8192, flush_interval_ms=1000))]
+    fn new(
+        path: String,
+        rotation: &str,
+        write_input: bool,
+        write_output: bool,
+        rows_per_batch: usize,
+        flush_interval_ms: u64,
+    ) -> PyResult<Self> {
         ParquetRotation::parse(rotation)?;
         if !write_input && !write_output {
             return Err(py_value_error(
                 "parquet_sink must enable write_input or write_output",
+            ));
+        }
+        if rows_per_batch == 0 {
+            return Err(py_value_error(
+                "parquet_sink rows_per_batch must be greater than zero",
             ));
         }
 
@@ -873,6 +1035,8 @@ impl ParquetSink {
             rotation: rotation.to_string(),
             write_input,
             write_output,
+            rows_per_batch,
+            flush_interval_ms,
         })
     }
 }
@@ -1857,6 +2021,8 @@ fn parse_parquet_sink(
         rotation,
         write_input: sink.write_input,
         write_output: sink.write_output,
+        rows_per_batch: sink.rows_per_batch,
+        flush_interval_ms: sink.flush_interval_ms,
     }))
 }
 
@@ -2482,6 +2648,8 @@ fn parquet_sink_to_pyobject(
     dict.set_item("rotation", parquet_sink.rotation.as_str())?;
     dict.set_item("write_input", parquet_sink.write_input)?;
     dict.set_item("write_output", parquet_sink.write_output)?;
+    dict.set_item("rows_per_batch", parquet_sink.rows_per_batch)?;
+    dict.set_item("flush_interval_ms", parquet_sink.flush_interval_ms)?;
     Ok(dict.into_any().unbind())
 }
 

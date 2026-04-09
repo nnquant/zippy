@@ -1244,6 +1244,7 @@ def test_reactive_engine_accepts_parquet_sink_and_archives_input_and_output(
 
     engine.start()
     engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
+    engine.write(pl.DataFrame({"symbol": ["A"], "price": [11.0]}))
     engine.stop()
 
     parquet_files = list(tmp_path.rglob("*.parquet"))
@@ -1254,6 +1255,52 @@ def test_reactive_engine_accepts_parquet_sink_and_archives_input_and_output(
     assert output_files
     assert pq.read_schema(input_files[0]).names == ["symbol", "price"]
     assert pq.read_schema(output_files[0]).names == ["symbol", "price", "ema_2"]
+    assert len(input_files) == 1
+    assert len(output_files) == 1
+    assert pq.read_table(input_files[0]).num_rows == 2
+    assert pq.read_table(output_files[0]).num_rows == 2
+
+
+def test_parquet_sink_flush_interval_flushes_small_batches(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[
+            zippy.TsEmaSpec(
+                id_column="symbol",
+                value_column="price",
+                span=2,
+                output="ema_2",
+            )
+        ],
+        target=zippy.NullPublisher(),
+        parquet_sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=True,
+            write_output=False,
+            rows_per_batch=10_000,
+            flush_interval_ms=50,
+        ),
+    )
+
+    engine.start()
+    engine.write(pl.DataFrame({"symbol": ["A"], "price": [10.0]}))
+    time.sleep(0.12)
+    engine.stop()
+
+    input_files = list((tmp_path / "input").rglob("*.parquet"))
+
+    assert len(input_files) == 1
+    assert pq.read_table(input_files[0]).num_rows == 1
 
 
 def test_source_pipeline_archives_downstream_input_via_parquet_sink(
@@ -1290,6 +1337,8 @@ def test_source_pipeline_archives_downstream_input_via_parquet_sink(
             rotation="none",
             write_input=True,
             write_output=False,
+            rows_per_batch=4,
+            flush_interval_ms=250,
         ),
     )
 
@@ -1406,6 +1455,8 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
         "rotation": "none",
         "write_input": True,
         "write_output": False,
+        "rows_per_batch": 4,
+        "flush_interval_ms": 250,
     }
 
     engine.start()
@@ -1465,6 +1516,8 @@ def test_timeseries_engine_config_and_output_archive_roundtrip(
     assert config["overflow_policy"] == "drop_oldest"
     assert config["archive_buffer_capacity"] == 9
     assert config["parquet_sink"]["write_output"] is True
+    assert config["parquet_sink"]["rows_per_batch"] == 8192
+    assert config["parquet_sink"]["flush_interval_ms"] == 1000
 
     engine.start()
     engine.write(
@@ -1605,6 +1658,8 @@ def test_stream_table_engine_supports_source_target_and_sink(tmp_path: Path) -> 
             rotation="none",
             write_input=True,
             write_output=True,
+            rows_per_batch=16,
+            flush_interval_ms=500,
         ),
     )
 
@@ -1618,6 +1673,8 @@ def test_stream_table_engine_supports_source_target_and_sink(tmp_path: Path) -> 
         "rotation": "none",
         "write_input": True,
         "write_output": True,
+        "rows_per_batch": 16,
+        "flush_interval_ms": 500,
     }
     assert "parquet_sink" not in config
 
