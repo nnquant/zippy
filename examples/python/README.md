@@ -5,8 +5,17 @@
 - `publish_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布
 - `cross_sectional_pipeline.py`：`ReactiveStateEngine -> TimeSeriesEngine -> CrossSectionalEngine` 进程内级联，并通过 `ZmqPublisher` 对外发布截面因子
 - `remote_pipeline.py`：`TimeSeriesEngine -> ZmqStreamPublisher -> ZmqSource -> CrossSectionalEngine` 的跨进程处理链
+- `stream_table_pipeline.py`：`StreamTableEngine` 作为原始流数据中心入口，原样透传输入 batch，同时写入 `sink` 并发布到 `target`
 - `subscribe_bars.py`：使用 `ZmqSubscriber` 订阅并读取一个 `RecordBatch`
 - `archive_reactive.py`：使用 `ParquetSink` 归档 `ReactiveStateEngine` 的输入和输出
+
+`StreamTableEngine` 用于原始流数据中心场景：
+
+- 原样透传原始输入 batch，不做聚合或状态计算
+- 同时写入 `sink`，用于本地归档或后续离线分析
+- 同时发布到 `target`，用于下游实时消费
+- 最小示例只归档 `write_output=True`，不同时开启 `write_input=True`，因为 `StreamTableEngine` 的输出就是原样透传输入，双写会把同一批数据归档两次
+- 示例每次运行都会写到 `/tmp/zippy-stream-table-demo/run-<timestamp>/`，用于隔离历史 parquet 文件
 
 表达式因子：
 
@@ -116,6 +125,12 @@ uv run python examples/python/remote_pipeline.py upstream
 ```
 `remote_pipeline.py` 的 downstream 进程会直接打印最终状态和 metrics。
 
+6. 如果要看 `StreamTableEngine` 的原始流透传示例，单独运行：
+
+```bash
+uv run python examples/python/stream_table_pipeline.py
+```
+
 如果要订阅 `cross_sectional_pipeline.py` 的输出，请使用 `tcp://127.0.0.1:5557`。
 仓库里现成的 `subscribe_bars.py` 默认监听 `tcp://127.0.0.1:5556`，适用于
 `publish_pipeline.py`，不直接复用到截面示例。
@@ -129,6 +144,7 @@ uv run python examples/python/remote_pipeline.py upstream
 - 示例默认使用 `tcp://127.0.0.1:5555` 发布 reactive 输出，`tcp://127.0.0.1:5556` 发布 bars 输出
 - `cross_sectional_pipeline.py` 默认使用 `tcp://127.0.0.1:5557` 发布 `CrossSectionalEngine` 输出
 - `remote_pipeline.py` 默认使用 `tcp://127.0.0.1:5560` 作为远程 source 输入流，`tcp://127.0.0.1:5561` 发布 downstream 输出
+- `stream_table_pipeline.py` 默认使用 `tcp://127.0.0.1:5562` 发布原始流，并写入 `/tmp/zippy-stream-table-demo/run-<timestamp>/`
 - 发布侧遵守当前 source 生命周期约束：先启动 downstream，再写 source；停止时先停 source，再停 downstream
 - `archive_reactive.py` 默认把文件写到 `/tmp/zippy-parquet-demo/input/` 和 `/tmp/zippy-parquet-demo/output/`
 - 当前 Python API 使用预定义常量传递策略参数，例如 `zippy.WindowType.TUMBLING`、`zippy.LateDataPolicy.REJECT`、`zippy.OverflowPolicy.BLOCK`

@@ -21,6 +21,7 @@ use zippy_core::{
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
     ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
+    StreamTableEngine as RustStreamTableEngine,
 };
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
@@ -974,6 +975,24 @@ struct CrossSectionalEngine {
     _source_owner: Option<Py<PyAny>>,
 }
 
+#[pyclass]
+struct StreamTableEngine {
+    name: String,
+    input_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
+    archive: SharedArchive,
+    handle: SharedHandle,
+    engine: Option<RustStreamTableEngine>,
+    remote_source: Option<RemoteSourceConfig>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
+}
+
 #[pymethods]
 impl ReactiveStateEngine {
     #[new]
@@ -1097,6 +1116,148 @@ impl ReactiveStateEngine {
             self._source_owner.is_some(),
         )?;
         dict.set_item("id_column", &self.id_column)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    fn flush(&self) -> PyResult<()> {
+        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics)
+    }
+}
+
+#[pymethods]
+impl StreamTableEngine {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    fn new(
+        name: String,
+        input_schema: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        source: Option<&Bound<'_, PyAny>>,
+        sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
+        archive_buffer_capacity: usize,
+    ) -> PyResult<Self> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(input_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let engine = RustStreamTableEngine::new(&name, Arc::clone(&schema))
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let output_schema = engine.output_schema();
+        let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(sink).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("parquet_sink must be zippy.ParquetSink") {
+                PyTypeError::new_err("sink must be zippy.ParquetSink")
+            } else {
+                error
+            }
+        })?;
+        let runtime_options =
+            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
+        let handle = Arc::new(Mutex::new(None));
+        let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
+        let (source_owner, remote_source) = register_source(
+            source,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+        )?;
+
+        Ok(Self {
+            name,
+            input_schema: schema,
+            output_schema,
+            target,
+            parquet_sink,
+            runtime_options,
+            status,
+            metrics,
+            archive,
+            handle,
+            engine: Some(engine),
+            remote_source,
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
+        })
+    }
+
+    fn start(&mut self) -> PyResult<()> {
+        let (handle, archive) = start_runtime_engine(
+            &self.name,
+            &self.runtime_options,
+            &self.target,
+            self.parquet_sink.as_ref(),
+            self.remote_source.as_ref(),
+            &self.downstreams,
+            &mut self.engine,
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
+        *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        Ok(())
+    }
+
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
+        let result = write_runtime_input(
+            py,
+            &self.handle,
+            &self.archive,
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.output_schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "stream_table",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            self._source_owner.is_some(),
+        )?;
+        dict.del_item("parquet_sink")?;
+        dict.set_item("sink", parquet_sink_to_pyobject(py, &self.parquet_sink)?)?;
         Ok(dict.into_any().unbind())
     }
 
@@ -1487,6 +1648,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ZmqSubscriber>()?;
     module.add_class::<ZmqSource>()?;
     module.add_class::<ReactiveStateEngine>()?;
+    module.add_class::<StreamTableEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
     Ok(())
@@ -1580,6 +1742,21 @@ fn register_source(
         return Ok((Some(source.clone().unbind()), None));
     }
 
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream.clone());
+        return Ok((Some(source.clone().unbind()), None));
+    }
+
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
         if engine.engine.is_none() {
             return Err(py_runtime_error(
@@ -1613,7 +1790,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, TimeSeriesEngine, or ZmqSource",
+        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, or ZmqSource",
     ))
 }
 
@@ -1738,6 +1915,10 @@ fn ensure_source_stopped(py: Python<'_>, source_owner: &Option<Py<PyAny>>) -> Py
     let source = source_owner.bind(py);
 
     if let Ok(engine) = source.extract::<PyRef<'_, ReactiveStateEngine>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
+    if let Ok(engine) = source.extract::<PyRef<'_, StreamTableEngine>>() {
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
@@ -2046,6 +2227,7 @@ fn engine_base_config_dict<'py>(
         runtime_options.archive_buffer_capacity,
     )?;
     dict.set_item("source_linked", source_linked)?;
+    dict.set_item("has_sink", parquet_sink.is_some())?;
     dict.set_item("targets", target_configs_to_pylist(py, targets)?)?;
     dict.set_item("parquet_sink", parquet_sink_to_pyobject(py, parquet_sink)?)?;
     Ok(dict)

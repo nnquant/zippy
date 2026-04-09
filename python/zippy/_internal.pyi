@@ -312,6 +312,37 @@ class ReactiveStateEngine:
     def stop(self) -> None: ...
 
 
+class StreamTableEngine:
+    def __init__(
+        self,
+        name: str,
+        input_schema: pa.Schema,
+        target: PublisherTarget,
+        *,
+        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | None = None,
+        sink: ParquetSink | None = None,
+        buffer_capacity: int = 1024,
+        overflow_policy: _OverflowPolicyValue | None = None,
+        archive_buffer_capacity: int = 1024,
+    ) -> None: ...
+
+    def start(self) -> None: ...
+
+    def write(self, value: WriteValue) -> None: ...
+
+    def output_schema(self) -> pa.Schema: ...
+
+    def status(self) -> str: ...
+
+    def metrics(self) -> dict[str, int]: ...
+
+    def config(self) -> dict[str, object]: ...
+
+    def flush(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
 class TimeSeriesEngine:
     def __init__(
         self,

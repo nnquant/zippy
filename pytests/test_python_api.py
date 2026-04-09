@@ -1565,6 +1565,239 @@ def test_parquet_sink_failure_marks_engine_failed_status(tmp_path: Path) -> None
     assert engine.status() == "failed"
 
 
+def test_stream_table_engine_exposes_input_schema_as_output_schema() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.StreamTableEngine(
+        name="ticks",
+        input_schema=schema,
+        target=zippy.NullPublisher(),
+    )
+
+    assert engine.output_schema() == schema
+
+
+def test_stream_table_engine_supports_source_target_and_sink(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    source = zippy.ZmqSource(
+        endpoint="tcp://127.0.0.1:9999",
+        expected_schema=schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+    engine = zippy.StreamTableEngine(
+        name="ticks",
+        input_schema=schema,
+        source=source,
+        target=zippy.NullPublisher(),
+        sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=True,
+            write_output=True,
+        ),
+    )
+
+    config = engine.config()
+
+    assert config["engine_type"] == "stream_table"
+    assert config["source_linked"] is True
+    assert config["has_sink"] is True
+    assert config["sink"] == {
+        "path": str(tmp_path),
+        "rotation": "none",
+        "write_input": True,
+        "write_output": True,
+    }
+    assert "parquet_sink" not in config
+
+
+def test_stream_table_engine_rejects_invalid_sink_type() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(TypeError, match="sink must be zippy.ParquetSink"):
+        zippy.StreamTableEngine(
+            name="ticks",
+            input_schema=schema,
+            target=zippy.NullPublisher(),
+            sink=zippy.NullPublisher(),
+        )
+
+
+def test_stream_table_engine_passthrough_archives_output_and_publishes_remote_stream(
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+    first_dt = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+    second_dt = datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc)
+    relay_port = reserve_tcp_port()
+    relay_endpoint = f"tcp://127.0.0.1:{relay_port}"
+
+    stream_target = zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:*",
+        stream_name="tick_table",
+        schema=schema,
+    )
+    relay_source = zippy.ZmqSource(
+        endpoint=stream_target.last_endpoint(),
+        expected_schema=schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+    relay = zippy.StreamTableEngine(
+        name="tick_table_relay",
+        source=relay_source,
+        input_schema=schema,
+        target=zippy.ZmqPublisher(endpoint=relay_endpoint),
+    )
+    engine = zippy.StreamTableEngine(
+        name="tick_table",
+        input_schema=schema,
+        target=stream_target,
+        sink=zippy.ParquetSink(
+            path=str(tmp_path),
+            rotation="none",
+            write_input=False,
+            write_output=True,
+        ),
+    )
+
+    relay.start()
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=relay_endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    engine.write(
+        pl.DataFrame(
+            {
+                "symbol": ["IF2606", "IH2606"],
+                "dt": [first_dt, second_dt],
+                "price": [3898.2, 2675.4],
+                "volume": [12.0, 8.0],
+            }
+        )
+    )
+    engine.flush()
+
+    received = subscriber.recv()
+
+    assert received.schema == schema
+    assert received.column(0).to_pylist() == ["IF2606", "IH2606"]
+    assert received.column(1).to_pylist() == [first_dt, second_dt]
+    assert received.column(2).to_pylist() == [3898.2, 2675.4]
+    assert received.column(3).to_pylist() == [12.0, 8.0]
+
+    engine.stop()
+    relay.stop()
+    subscriber.close()
+
+    parquet_files = list(tmp_path.rglob("*.parquet"))
+    output_files = [path for path in parquet_files if "output" in path.parts]
+
+    assert output_files
+
+    archived = pq.read_table(output_files[0])
+    assert archived.schema == schema
+    assert archived.column("symbol").to_pylist() == ["IF2606", "IH2606"]
+    assert archived.column("dt").to_pylist() == [first_dt, second_dt]
+    assert archived.column("price").to_pylist() == [3898.2, 2675.4]
+    assert archived.column("volume").to_pylist() == [12.0, 8.0]
+
+
+def test_stream_table_engine_can_drive_timeseries_downstream_pipeline() -> None:
+    tick_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    source = zippy.StreamTableEngine(
+        name="tick_table",
+        input_schema=tick_schema,
+        target=zippy.NullPublisher(),
+    )
+    bars = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        source=source,
+        input_schema=tick_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[
+            zippy.AGG_FIRST(column="price", output="open"),
+            zippy.AGG_LAST(column="price", output="close"),
+            zippy.AGG_SUM(column="volume", output="volume"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+    bucket_start = datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc)
+    bucket_end = datetime(2026, 4, 2, 9, 31, 0, tzinfo=timezone.utc)
+
+    bars.start()
+    source.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    source.write(
+        {
+            "symbol": ["A", "A"],
+            "dt": [bucket_start, datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc)],
+            "price": [10.0, 11.0],
+            "volume": [100.0, 120.0],
+        }
+    )
+    source.flush()
+    bars.flush()
+
+    received = subscriber.recv()
+
+    assert received.column_names == [
+        "symbol",
+        "window_start",
+        "window_end",
+        "open",
+        "close",
+        "volume",
+    ]
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(1).to_pylist() == [bucket_start]
+    assert received.column(2).to_pylist() == [bucket_end]
+    assert received.column(3).to_pylist() == [10.0]
+    assert received.column(4).to_pylist() == [11.0]
+    assert received.column(5).to_pylist() == [220.0]
+
+    source.stop()
+    bars.stop()
+    subscriber.close()
+
+
 def test_cross_sectional_engine_accepts_duration_trigger_interval_and_exposes_output_schema() -> None:
     input_schema = pa.schema(
         [

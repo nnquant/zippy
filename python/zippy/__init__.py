@@ -17,6 +17,7 @@ from ._internal import LogSpec
 from ._internal import NullPublisher
 from ._internal import ParquetSink
 from ._internal import ReactiveStateEngine
+from ._internal import StreamTableEngine
 from ._internal import TimeSeriesEngine
 from ._internal import TsDelaySpec
 from ._internal import TsDiffSpec
@@ -296,6 +297,8 @@ __all__ = [
     "OverflowPolicy",
     "ParquetSink",
     "ReactiveStateEngine",
+    "SourceMode",
+    "StreamTableEngine",
     "TimeSeriesEngine",
     "TsDelaySpec",
     "TsDiffSpec",
@@ -326,6 +329,8 @@ __all__ = [
     "TS_RETURN",
     "TS_STD",
     "ZmqPublisher",
+    "ZmqSource",
+    "ZmqStreamPublisher",
     "ZmqSubscriber",
     "__version__",
     "version",
