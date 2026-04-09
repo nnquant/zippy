@@ -47,6 +47,10 @@ fn input_batch() -> RecordBatch {
     batch(vec!["a", "b", "c"], vec![-10.0, 0.5, 25.0])
 }
 
+fn positive_input_batch() -> RecordBatch {
+    batch(vec!["a", "b", "c"], vec![1.0, 2.0, 25.0])
+}
+
 fn float64_values(array: &ArrayRef) -> Vec<Option<f64>> {
     let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
     (0..values.len())
@@ -323,24 +327,38 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
 
 #[test]
 fn expression_rejects_lowercase_function_names() {
-    let error = match ExpressionSpec::new("abs(value)", "score").build(input_schema().as_ref()) {
-        Ok(_) => panic!("expected lowercase function to be rejected"),
-        Err(error) => error,
-    };
+    for (expression, expected) in [
+        ("abs(value)", "ABS"),
+        ("log(value)", "LOG"),
+        ("clip(value, 0.0, 1.0)", "CLIP"),
+        ("cast(value, 'int64')", "CAST"),
+    ] {
+        let error = match ExpressionSpec::new(expression, "score").build(input_schema().as_ref()) {
+            Ok(_) => panic!("expected lowercase function to be rejected expression=[{expression}]"),
+            Err(error) => error,
+        };
 
-    assert!(error
-        .to_string()
-        .contains("function names must be uppercase"));
+        let message = error.to_string();
+        assert!(message.contains("function names must be uppercase"));
+        assert!(message.contains(expected));
+    }
 }
 
 #[test]
 fn expression_accepts_uppercase_functions() {
-    let mut factor = ExpressionSpec::new("ABS(value)", "score")
-        .build(input_schema().as_ref())
-        .unwrap();
+    for (expression, batch) in [
+        ("ABS(value)", input_batch()),
+        ("LOG(value)", positive_input_batch()),
+        ("CLIP(value, 0.0, 1.0)", input_batch()),
+        ("CAST(value, 'int64')", input_batch()),
+    ] {
+        let mut factor = ExpressionSpec::new(expression, "score")
+            .build(input_schema().as_ref())
+            .unwrap();
 
-    let output = factor.evaluate(&input_batch()).unwrap();
-    assert_eq!(output.len(), input_batch().num_rows());
+        let output = factor.evaluate(&batch).unwrap();
+        assert_eq!(output.len(), batch.num_rows());
+    }
 }
 
 #[test]
