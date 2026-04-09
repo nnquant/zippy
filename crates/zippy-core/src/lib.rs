@@ -11,7 +11,7 @@ pub mod version;
 
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};
-pub use logging::{setup_log, LogConfig, LogSnapshot};
+pub use logging::{current_log_snapshot, setup_log, LogConfig, LogSnapshot};
 pub use metrics::{EngineMetrics, EngineMetricsDelta, EngineMetricsSnapshot};
 pub use publisher::Publisher;
 pub use queue::BoundedQueue;
