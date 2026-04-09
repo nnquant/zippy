@@ -21,6 +21,8 @@ use zippy_operators::{AggLastSpec, CSDemeanSpec, CSRankSpec, CSZscoreSpec};
 const DEFAULT_WINDOW_NS: i64 = 1_000_000;
 const REMOTE_STARTUP_DELAY_MS: u64 = 500;
 const REMOTE_SHUTDOWN_GRACE_SEC: u64 = 5;
+const REMOTE_IDLE_GRACE_SEC: u64 = 3;
+const REMOTE_STARTUP_GRACE_SEC: u64 = 30;
 const MIN_PASS_RATIO: f64 = 0.90;
 
 type PerfResult<T> = std::result::Result<T, String>;
@@ -282,7 +284,7 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
     )
     .map_err(|error| error.to_string())?;
 
-    wait_for_remote_shutdown(&mut handle, config)?;
+    wait_for_remote_shutdown(&mut handle, config, &source_counters)?;
 
     let engine_metrics = engine_metrics_report(handle.metrics());
     let source_metrics = source_metrics_report(&source_counters);
@@ -320,20 +322,71 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
 fn wait_for_remote_shutdown(
     handle: &mut zippy_core::EngineHandle,
     config: &PerfConfig,
+    source_counters: &Arc<SourceCountersState>,
 ) -> PerfResult<()> {
-    let deadline = Instant::now()
-        + Duration::from_secs(config.warmup_sec + config.duration_sec + REMOTE_SHUTDOWN_GRACE_SEC);
+    let startup_deadline = Instant::now() + Duration::from_secs(REMOTE_STARTUP_GRACE_SEC);
 
-    while handle.status() == EngineStatus::Running && Instant::now() < deadline {
+    while handle.status() == EngineStatus::Running {
+        let now = Instant::now();
+        if let Some(first_observed_at) = source_counters.first_observed_at() {
+            let deadline = compute_remote_downstream_deadline(
+                first_observed_at,
+                config.warmup_sec,
+                config.duration_sec,
+                REMOTE_SHUTDOWN_GRACE_SEC,
+            );
+            if remote_downstream_should_stop_for_idle(
+                Some(first_observed_at),
+                source_counters.last_event_at(),
+                now,
+            ) {
+                handle.stop().map_err(|error| error.to_string())?;
+                break;
+            }
+            if now >= deadline {
+                handle.stop().map_err(|error| error.to_string())?;
+                return Err("remote downstream did not stop before deadline".to_string());
+            }
+        } else if now >= startup_deadline {
+            handle.stop().map_err(|error| error.to_string())?;
+            return Err("remote downstream did not observe source events before startup deadline".to_string());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let shutdown_deadline = Instant::now() + Duration::from_secs(REMOTE_SHUTDOWN_GRACE_SEC);
+    while handle.status() == EngineStatus::Running && Instant::now() < shutdown_deadline {
         thread::sleep(Duration::from_millis(20));
     }
 
     if handle.status() == EngineStatus::Running {
-        handle.stop().map_err(|error| error.to_string())?;
-        return Err("remote downstream did not stop before deadline".to_string());
+        return Err("remote downstream did not stop after shutdown request".to_string());
     }
 
     handle.stop().map_err(|error| error.to_string())
+}
+
+fn compute_remote_downstream_deadline(
+    first_observed_at: Instant,
+    warmup_sec: u64,
+    duration_sec: u64,
+    shutdown_grace_sec: u64,
+) -> Instant {
+    first_observed_at + Duration::from_secs(warmup_sec + duration_sec + shutdown_grace_sec)
+}
+
+fn remote_downstream_should_stop_for_idle(
+    first_observed_at: Option<Instant>,
+    last_event_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    match (first_observed_at, last_event_at) {
+        (Some(_), Some(last_event_at)) => {
+            now.saturating_duration_since(last_event_at)
+                >= Duration::from_secs(REMOTE_IDLE_GRACE_SEC)
+        }
+        _ => false,
+    }
 }
 
 fn validate_config(config: &PerfConfig) -> PerfResult<()> {
@@ -539,11 +592,20 @@ struct SourceCountersState {
     source_decode_errors_total: AtomicU64,
     source_schema_mismatches_total: AtomicU64,
     source_sequence_gaps_total: AtomicU64,
+    first_observed_at: Mutex<Option<Instant>>,
     first_data_at: Mutex<Option<Instant>>,
     last_event_at: Mutex<Option<Instant>>,
 }
 
 impl SourceCountersState {
+    fn first_observed_at(&self) -> Option<Instant> {
+        *self.first_observed_at.lock().unwrap()
+    }
+
+    fn last_event_at(&self) -> Option<Instant> {
+        *self.last_event_at.lock().unwrap()
+    }
+
     fn observed_seconds(&self) -> Option<f64> {
         let first = *self.first_data_at.lock().unwrap();
         let last = *self.last_event_at.lock().unwrap();
@@ -579,10 +641,17 @@ struct CountingSourceSink {
 
 impl SourceSink for CountingSourceSink {
     fn emit(&self, event: SourceEvent) -> Result<()> {
+        let now = Instant::now();
         self.counters
             .source_events_total
             .fetch_add(1, Ordering::Relaxed);
-        *self.counters.last_event_at.lock().unwrap() = Some(Instant::now());
+        {
+            let mut first_observed_at = self.counters.first_observed_at.lock().unwrap();
+            if first_observed_at.is_none() {
+                *first_observed_at = Some(now);
+            }
+        }
+        *self.counters.last_event_at.lock().unwrap() = Some(now);
         match &event {
             SourceEvent::Data(_) => {
                 self.counters
@@ -590,7 +659,7 @@ impl SourceSink for CountingSourceSink {
                     .fetch_add(1, Ordering::Relaxed);
                 let mut first_data_at = self.counters.first_data_at.lock().unwrap();
                 if first_data_at.is_none() {
-                    *first_data_at = Some(Instant::now());
+                    *first_data_at = Some(now);
                 }
             }
             SourceEvent::Hello(_) | SourceEvent::Flush | SourceEvent::Stop | SourceEvent::Error(_) => {
@@ -808,7 +877,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
+        compute_remote_downstream_deadline, remote_downstream_should_stop_for_idle,
         run_profile, write_report_json, OverflowPolicyConfig, PerfConfig, PerfProfile,
+        REMOTE_IDLE_GRACE_SEC,
     };
 
     fn test_endpoint() -> String {
@@ -888,5 +959,43 @@ mod tests {
         assert!(content.contains("profile"));
         assert!(content.contains("pass"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn remote_downstream_deadline_starts_after_first_observed_event() {
+        let observed_at = std::time::Instant::now();
+        let deadline = compute_remote_downstream_deadline(
+            observed_at,
+            10,
+            60,
+            REMOTE_IDLE_GRACE_SEC,
+        );
+
+        assert_eq!(
+            deadline.saturating_duration_since(observed_at),
+            std::time::Duration::from_secs(10 + 60 + REMOTE_IDLE_GRACE_SEC),
+        );
+    }
+
+    #[test]
+    fn remote_downstream_stops_after_idle_once_stream_was_observed() {
+        let now = std::time::Instant::now();
+
+        assert!(remote_downstream_should_stop_for_idle(
+            Some(now - std::time::Duration::from_secs(10)),
+            Some(now - std::time::Duration::from_secs(REMOTE_IDLE_GRACE_SEC + 1)),
+            now,
+        ));
+    }
+
+    #[test]
+    fn remote_downstream_does_not_stop_for_idle_before_observing_stream() {
+        let now = std::time::Instant::now();
+
+        assert!(!remote_downstream_should_stop_for_idle(
+            None,
+            Some(now - std::time::Duration::from_secs(REMOTE_IDLE_GRACE_SEC + 1)),
+            now,
+        ));
     }
 }

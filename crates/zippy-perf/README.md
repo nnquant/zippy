@@ -49,6 +49,12 @@ cargo run -p zippy-perf --release -- remote-pipeline-upstream \
   --symbols 1024
 ```
 
+`remote-pipeline-downstream` 的运行时语义：
+
+- 会先等待远端 stream 的首个 `HELLO/DATA` 事件，再进入正式观察窗口
+- 在已经观测到远端 stream 后，如果长时间没有新的事件到达，会按 idle grace 主动收口
+- 因为底层控制事件走单通道 `PUB/SUB`，`STOP` 仍是 best-effort；idle 收口是为了避免下游因为漏掉 `STOP` 一直挂到 deadline
+
 输出 JSON 报告：
 
 ```bash
