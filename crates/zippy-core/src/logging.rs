@@ -244,7 +244,7 @@ pub fn setup_log(config: LogConfig) -> Result<LogSnapshot> {
 
     let run_id = generate_run_id()?;
     let file_path = if config.to_file {
-        Some(prepare_file_path(&config.log_dir, &config.app, &run_id)?)
+        Some(prepare_file_path(&config.log_dir, &config.app, &run_id))
     } else {
         None
     };
