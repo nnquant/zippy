@@ -2,13 +2,21 @@ use arrow::array::Float64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use serde_json::Value;
+use std::env;
+use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing_subscriber::prelude::*;
 use zippy_core::{
     spawn_engine, spawn_engine_with_publisher, Engine, EngineConfig, EngineStatus, OverflowPolicy,
     Publisher, Result, ZippyError,
 };
+
+const RUNTIME_LOG_CASE_ENV: &str = "ZIPPY_RUNTIME_LOG_CASE";
+const RUNTIME_LOG_PATH_ENV: &str = "ZIPPY_RUNTIME_LOG_PATH";
 
 struct FlushEngine {
     schema: Arc<Schema>,
@@ -200,6 +208,133 @@ fn wait_for_status(handle: &zippy_core::EngineHandle, expected: EngineStatus) {
         expected.as_str(),
         handle.status().as_str()
     );
+}
+
+#[test]
+fn runtime_log_case_dispatch() {
+    let Ok(case) = env::var(RUNTIME_LOG_CASE_ENV) else {
+        return;
+    };
+    let log_path = env::var(RUNTIME_LOG_PATH_ENV).unwrap();
+    let log_path = std::path::PathBuf::from(log_path);
+    let file_path = log_path.clone();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&file_path)
+                    .unwrap()
+            }),
+    );
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    match case.as_str() {
+        "start_flush_stop" => start_flush_stop_case(),
+        "worker_failure" => worker_failure_case(),
+        other => panic!("unknown runtime log case: {other}"),
+    }
+}
+
+#[test]
+fn runtime_emits_start_flush_and_stop_events() {
+    let records = run_runtime_log_case("start_flush_stop");
+    assert!(has_event(&records, "start"));
+    assert!(has_event(&records, "flush"));
+    assert!(has_event(&records, "stop"));
+}
+
+#[test]
+fn runtime_emits_worker_failure_event() {
+    let records = run_runtime_log_case("worker_failure");
+    assert!(has_event(&records, "start"));
+    assert!(has_event(&records, "worker_failure"));
+    assert!(records.iter().any(|record| {
+        record_field(record, "error")
+            .map(|value| value.contains("data failure"))
+            .unwrap_or(false)
+    }));
+}
+
+fn run_runtime_log_case(case: &str) -> Vec<Value> {
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = temp.path().join(format!("{case}.jsonl"));
+    let status = Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("runtime_log_case_dispatch")
+        .env(RUNTIME_LOG_CASE_ENV, case)
+        .env(RUNTIME_LOG_PATH_ENV, &log_path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "runtime log case failed case=[{case}]");
+
+    std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect()
+}
+
+fn has_event(records: &[Value], expected_event: &str) -> bool {
+    records
+        .iter()
+        .any(|record| record_field(record, "event") == Some(expected_event))
+}
+
+fn record_field<'a>(record: &'a Value, field: &str) -> Option<&'a str> {
+    record
+        .get("fields")
+        .and_then(|fields| fields.get(field))
+        .and_then(Value::as_str)
+}
+
+fn start_flush_stop_case() {
+    let schema = price_schema();
+    let engine = FlushEngine {
+        schema: schema.clone(),
+        flushed: false,
+    };
+    let mut handle = spawn_engine(
+        engine,
+        EngineConfig {
+            name: "runtime-log-engine".to_string(),
+            buffer_capacity: 8,
+            overflow_policy: OverflowPolicy::Block,
+            late_data_policy: Default::default(),
+        },
+    )
+    .unwrap();
+
+    handle
+        .write(single_price_batch(schema, 1.0))
+        .unwrap();
+    let flushed = handle.flush().unwrap();
+    assert_eq!(flushed.len(), 1);
+    handle.stop().unwrap();
+}
+
+fn worker_failure_case() {
+    let schema = price_schema();
+    let engine = FailingDataEngine {
+        schema: schema.clone(),
+    };
+    let mut handle = spawn_engine(
+        engine,
+        EngineConfig {
+            name: "runtime-log-failure-engine".to_string(),
+            buffer_capacity: 8,
+            overflow_policy: OverflowPolicy::Block,
+            late_data_policy: Default::default(),
+        },
+    )
+    .unwrap();
+
+    handle.write(single_price_batch(schema, 1.0)).unwrap();
+    wait_for_status(&handle, EngineStatus::Failed);
+    let _ = handle.stop();
 }
 
 #[test]

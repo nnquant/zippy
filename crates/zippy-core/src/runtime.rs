@@ -3,6 +3,7 @@ use std::thread::{self, JoinHandle};
 
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Sender};
+use tracing::{debug, error, info};
 
 use crate::{
     queue::{QueueSendError, QueueSender},
@@ -23,7 +24,12 @@ fn zippy_debug_stop_enabled() -> bool {
 
 fn zippy_debug_stop_log(message: &str) {
     if zippy_debug_stop_enabled() {
-        eprintln!("zippy_debug_stop: {message}");
+        debug!(
+            component = "runtime",
+            event = "stop_debug",
+            message = message,
+            "{message}"
+        );
     }
 }
 
@@ -208,6 +214,7 @@ where
     P: Publisher,
 {
     config.validate()?;
+    let engine_name = config.name.clone();
     let queue = crate::queue::BoundedQueue::new(config.buffer_capacity);
     let status = Arc::new(Mutex::new(EngineStatus::Running));
     let metrics = Arc::new(EngineMetrics::default());
@@ -215,6 +222,7 @@ where
     let metrics_clone = metrics.clone();
     let rx = queue.receiver();
     let tx = queue.sender();
+    let worker_engine_name = engine_name.clone();
 
     let join_handle = thread::spawn(move || -> Result<()> {
         let worker_result = (|| -> Result<()> {
@@ -247,6 +255,13 @@ where
                                 let _ = reply_tx.send(Err(err.clone()));
                                 return Err(err);
                             }
+                            info!(
+                                component = "runtime",
+                                engine = worker_engine_name.as_str(),
+                                event = "flush",
+                                batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                "engine flushed"
+                            );
                             let _ = reply_tx.send(Ok(outputs));
                         }
                         Err(err) => {
@@ -275,6 +290,13 @@ where
                                     return Err(err);
                                 }
                                 *status_clone.lock().unwrap() = EngineStatus::Stopped;
+                                info!(
+                                    component = "runtime",
+                                    engine = worker_engine_name.as_str(),
+                                    event = "stop",
+                                    batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                    "engine stopped"
+                                );
                                 return Ok(());
                             }
                             Err(err) => {
@@ -295,12 +317,27 @@ where
             Ok(())
         })();
 
-        if worker_result.is_err() {
+        if let Err(err) = &worker_result {
+            error!(
+                component = "runtime",
+                engine = worker_engine_name.as_str(),
+                event = "worker_failure",
+                error = %err,
+                "worker failed"
+            );
             *status_clone.lock().unwrap() = EngineStatus::Failed;
         }
 
         worker_result
     });
+
+    info!(
+        component = "runtime",
+        engine = engine_name.as_str(),
+        event = "start",
+        status = EngineStatus::Running.as_str(),
+        "engine started"
+    );
 
     Ok(EngineHandle {
         status,
@@ -325,6 +362,7 @@ where
     P: Publisher,
 {
     config.validate()?;
+    let engine_name = config.name.clone();
     let queue = crate::queue::BoundedQueue::new(config.buffer_capacity);
     let status = Arc::new(Mutex::new(EngineStatus::Running));
     let metrics = Arc::new(EngineMetrics::default());
@@ -335,6 +373,7 @@ where
     let source_mode = source.mode();
     let source_schema = source.output_schema();
     let engine_schema = engine.input_schema();
+    let source_name = source.name().to_string();
     let sink = Arc::new(SourceRuntimeSink {
         status: status.clone(),
         overflow_policy: config.overflow_policy,
@@ -346,6 +385,7 @@ where
     let monitor_status = status.clone();
     let monitor_tx = tx.clone();
     let monitor_metrics = metrics.clone();
+    let monitor_engine_name = engine_name.clone();
     let source_monitor_handle = thread::spawn(move || {
         let source_result = monitor_source_handle.join();
         if monitor_source_handle.stop_requested() && source_result.is_ok() {
@@ -364,7 +404,15 @@ where
             &monitor_metrics,
             Command::SourceTerminated(source_result),
         );
+        debug!(
+            component = "runtime",
+            engine = monitor_engine_name.as_str(),
+            event = "source_terminated",
+            "source termination forwarded"
+        );
     });
+    let worker_engine_name = engine_name.clone();
+    let worker_source_name = source_name.clone();
 
     let join_handle = thread::spawn(move || -> Result<()> {
         let worker_result = (|| -> Result<()> {
@@ -469,7 +517,7 @@ where
                                 );
                             }
                             if source_mode == SourceMode::Pipeline {
-                                process_flush_event(
+                                let outputs = process_flush_event(
                                     &mut engine,
                                     &mut publisher,
                                     &metrics_clone,
@@ -478,6 +526,14 @@ where
                                 .inspect_err(|_| {
                                     *status_clone.lock().unwrap() = EngineStatus::Failed;
                                 })?;
+                                info!(
+                                    component = "runtime",
+                                    engine = worker_engine_name.as_str(),
+                                    source = worker_source_name.as_str(),
+                                    event = "flush",
+                                    batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                    "engine flushed"
+                                );
                             }
                         }
                         SourceEvent::Stop => {
@@ -492,15 +548,32 @@ where
                             }
                             if source_mode == SourceMode::Pipeline {
                                 *status_clone.lock().unwrap() = EngineStatus::Stopping;
-                                process_stop_event(&mut engine, &mut publisher, &metrics_clone)
+                                let outputs =
+                                    process_stop_event(&mut engine, &mut publisher, &metrics_clone)
                                     .inspect_err(|_| {
                                         *status_clone.lock().unwrap() = EngineStatus::Failed;
                                     })?;
                                 *status_clone.lock().unwrap() = EngineStatus::Stopped;
+                                info!(
+                                    component = "runtime",
+                                    engine = worker_engine_name.as_str(),
+                                    source = worker_source_name.as_str(),
+                                    event = "stop",
+                                    batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                    "engine stopped"
+                                );
                                 return Ok(());
                             }
                             *status_clone.lock().unwrap() = EngineStatus::Stopped;
                             shutdown_source_pipeline(&mut publisher, &metrics_clone)?;
+                            info!(
+                                component = "runtime",
+                                engine = worker_engine_name.as_str(),
+                                source = worker_source_name.as_str(),
+                                event = "stop",
+                                batch_rows = 0usize,
+                                "engine stopped"
+                            );
                             return Ok(());
                         }
                         SourceEvent::Error(reason) => {
@@ -516,12 +589,29 @@ where
             Ok(())
         })();
 
-        if worker_result.is_err() {
+        if let Err(err) = &worker_result {
+            error!(
+                component = "runtime",
+                engine = worker_engine_name.as_str(),
+                source = worker_source_name.as_str(),
+                event = "worker_failure",
+                error = %err,
+                "worker failed"
+            );
             *status_clone.lock().unwrap() = EngineStatus::Failed;
         }
 
         worker_result
     });
+
+    info!(
+        component = "runtime",
+        engine = engine_name.as_str(),
+        source = source_name.as_str(),
+        event = "start",
+        status = EngineStatus::Running.as_str(),
+        "engine started"
+    );
 
     Ok(EngineHandle {
         status,
