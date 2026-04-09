@@ -43,6 +43,10 @@ fn nullable_batch(ids: Vec<Option<&str>>, values: Vec<Option<f64>>) -> RecordBat
     .unwrap()
 }
 
+fn input_batch() -> RecordBatch {
+    batch(vec!["a", "b", "c"], vec![-10.0, 0.5, 25.0])
+}
+
 fn float64_values(array: &ArrayRef) -> Vec<Option<f64>> {
     let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
     (0..values.len())
@@ -315,6 +319,28 @@ fn expression_factor_supports_arithmetic_and_builtin_functions() {
         &float64_values(&factor.evaluate(&batch).unwrap()),
         &[Some(11.0), Some(20.0)],
     );
+}
+
+#[test]
+fn expression_rejects_lowercase_function_names() {
+    let error = match ExpressionSpec::new("abs(value)", "score").build(input_schema().as_ref()) {
+        Ok(_) => panic!("expected lowercase function to be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(error
+        .to_string()
+        .contains("function names must be uppercase"));
+}
+
+#[test]
+fn expression_accepts_uppercase_functions() {
+    let mut factor = ExpressionSpec::new("ABS(value)", "score")
+        .build(input_schema().as_ref())
+        .unwrap();
+
+    let output = factor.evaluate(&input_batch()).unwrap();
+    assert_eq!(output.len(), input_batch().num_rows());
 }
 
 #[test]

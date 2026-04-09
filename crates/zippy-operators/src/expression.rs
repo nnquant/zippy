@@ -385,10 +385,29 @@ fn build_identifier_expr(schema: &Schema, name: &str) -> Result<TypedExpr> {
 }
 
 fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
-    let normalized = name.to_ascii_lowercase();
+    let builtin = match name {
+        "ABS" => Some("ABS"),
+        "LOG" => Some("LOG"),
+        "CLIP" => Some("CLIP"),
+        "CAST" => Some("CAST"),
+        _ => ["ABS", "LOG", "CLIP", "CAST"]
+            .into_iter()
+            .find(|expected| name.eq_ignore_ascii_case(expected)),
+    };
 
-    match normalized.as_str() {
-        "abs" => {
+    if let Some(expected) = builtin {
+        if name != expected {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "function names must be uppercase function=[{}] expected=[{}]",
+                    name, expected
+                ),
+            });
+        }
+    }
+
+    match name {
+        "ABS" => {
             if args.len() != 1 {
                 return Err(ZippyError::InvalidConfig {
                     reason: format!(
@@ -408,7 +427,7 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
                 nullable,
             })
         }
-        "log" => {
+        "LOG" => {
             if args.len() != 1 {
                 return Err(ZippyError::InvalidConfig {
                     reason: format!(
@@ -428,7 +447,7 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
                 nullable,
             })
         }
-        "clip" => {
+        "CLIP" => {
             if args.len() != 3 {
                 return Err(ZippyError::InvalidConfig {
                     reason: format!(
@@ -449,7 +468,7 @@ fn build_function_expr(name: &str, args: Vec<TypedExpr>) -> Result<TypedExpr> {
                 nullable: args.iter().any(|arg| arg.nullable),
             })
         }
-        "cast" => {
+        "CAST" => {
             if args.len() != 2 {
                 return Err(ZippyError::InvalidConfig {
                     reason: format!(
