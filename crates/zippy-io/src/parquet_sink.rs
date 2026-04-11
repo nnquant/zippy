@@ -49,11 +49,10 @@ impl ParquetSink {
         let file = File::create(self.root.join(file_name)).map_err(|error| ZippyError::Io {
             reason: format!("failed to create parquet file error=[{}]", error),
         })?;
-        let writer = ArrowWriter::try_new(file, schema.clone(), None).map_err(|error| {
-            ZippyError::Io {
+        let writer =
+            ArrowWriter::try_new(file, schema.clone(), None).map_err(|error| ZippyError::Io {
                 reason: format!("failed to create parquet writer error=[{}]", error),
-            }
-        })?;
+            })?;
 
         Ok(ParquetSinkWriter {
             writer: Some(writer),

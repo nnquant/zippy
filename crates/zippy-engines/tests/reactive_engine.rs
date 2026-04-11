@@ -1,9 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, ZippyError};
+use zippy_core::{
+    spawn_engine, Engine, EngineConfig, EngineMetricsSnapshot, LateDataPolicy, OverflowPolicy,
+    ZippyError,
+};
 use zippy_engines::ReactiveStateEngine;
 use zippy_operators::{CastSpec, ExpressionSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
 
@@ -257,4 +262,241 @@ fn reactive_engine_expression_factor_can_reference_previous_factor_output() {
             .collect::<Vec<_>>()
     );
     assert_float_options_eq(&float64_values(output.column(3)), &[Some(20.0), Some(30.0)]);
+}
+
+#[test]
+fn reactive_engine_filters_rows_by_id_whitelist_before_state_updates() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        factors,
+        "id",
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["A", "B"], vec![10.0, 20.0]))
+        .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert_eq!(output.num_rows(), 1);
+    assert_eq!(
+        column_names(output),
+        vec!["id", "value", "ema_2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_float_options_eq(&float64_values(output.column(2)), &[Some(10.0)]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn reactive_engine_returns_empty_output_when_all_rows_are_filtered() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        factors,
+        "id",
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine.on_data(batch(vec!["B"], vec![20.0])).unwrap();
+
+    assert!(outputs.is_empty());
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn reactive_engine_filtered_rows_do_not_pollute_later_whitelist_state() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        factors,
+        "id",
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let filtered_outputs = engine
+        .on_data(batch(vec!["B", "B"], vec![100.0, 200.0]))
+        .unwrap();
+    let whitelist_outputs = engine
+        .on_data(batch(vec!["A", "A"], vec![10.0, 16.0]))
+        .unwrap();
+
+    assert!(filtered_outputs.is_empty());
+    assert_eq!(whitelist_outputs.len(), 1);
+    let output = &whitelist_outputs[0];
+    assert_eq!(output.num_rows(), 2);
+    assert_float_options_eq(&float64_values(output.column(2)), &[Some(10.0), Some(14.0)]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 2);
+}
+
+#[test]
+fn reactive_engine_never_calls_factors_for_filtered_rows() {
+    let seen_ids = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let factor = Box::new(PanicOnUnexpectedIdFactor::new(
+        "id",
+        "A",
+        Arc::clone(&seen_ids),
+    ));
+    let mut engine = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        vec![factor],
+        "id",
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["B", "B"], vec![100.0, 200.0]))
+        .unwrap();
+    assert!(outputs.is_empty());
+
+    let outputs = engine
+        .on_data(batch(vec!["A", "A"], vec![10.0, 16.0]))
+        .unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_float_options_eq(
+        &float64_values(outputs[0].column(2)),
+        &[Some(0.0), Some(0.0)],
+    );
+    assert_eq!(
+        seen_ids.lock().unwrap().clone(),
+        vec![vec!["A".to_string(), "A".to_string()]]
+    );
+}
+
+fn wait_for_filtered_rows(
+    handle: &zippy_core::EngineHandle,
+    expected: u64,
+) -> EngineMetricsSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(1);
+
+    loop {
+        let metrics = handle.metrics();
+        if metrics.filtered_rows_total == expected {
+            return metrics;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "filtered rows total did not reach expected value expected=[{}] actual=[{}]",
+                expected, metrics.filtered_rows_total
+            );
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn reactive_engine_runtime_metrics_include_filtered_rows_total() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let engine = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        factors,
+        "id",
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+    let mut handle = spawn_engine(
+        engine,
+        EngineConfig {
+            name: "reactive".to_string(),
+            buffer_capacity: 16,
+            overflow_policy: OverflowPolicy::Block,
+            late_data_policy: LateDataPolicy::Reject,
+        },
+    )
+    .unwrap();
+
+    handle
+        .write(batch(vec!["A", "B"], vec![10.0, 20.0]))
+        .unwrap();
+    let metrics = wait_for_filtered_rows(&handle, 1);
+
+    assert_eq!(metrics.filtered_rows_total, 1);
+    assert_eq!(metrics.processed_rows_total, 2);
+
+    handle.stop().unwrap();
+}
+
+#[test]
+fn reactive_engine_rejects_empty_id_filter() {
+    let factors = vec![ExpressionSpec::new("value + 1.0", "bump")
+        .build_reactive_factor(input_schema().as_ref(), "id")
+        .unwrap()];
+
+    let result = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        factors,
+        "id",
+        Some(vec![]),
+    );
+
+    match result {
+        Err(ZippyError::InvalidConfig { reason }) => {
+            assert!(reason.contains("id_filter must not be empty"));
+        }
+        Ok(_) => panic!("expected empty id_filter to be rejected"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+struct PanicOnUnexpectedIdFactor {
+    id_field: String,
+    allowed_id: String,
+    seen_ids: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl PanicOnUnexpectedIdFactor {
+    fn new(id_field: &str, allowed_id: &str, seen_ids: Arc<Mutex<Vec<Vec<String>>>>) -> Self {
+        Self {
+            id_field: id_field.to_string(),
+            allowed_id: allowed_id.to_string(),
+            seen_ids,
+        }
+    }
+}
+
+impl zippy_operators::ReactiveFactor for PanicOnUnexpectedIdFactor {
+    fn output_field(&self) -> Field {
+        Field::new("guard", DataType::Float64, false)
+    }
+
+    fn evaluate(&mut self, batch: &RecordBatch) -> zippy_core::Result<ArrayRef> {
+        let index = batch.schema().index_of(&self.id_field).unwrap();
+        let ids = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let seen = (0..ids.len())
+            .map(|row_index| ids.value(row_index).to_string())
+            .collect::<Vec<_>>();
+
+        for id in &seen {
+            if id != &self.allowed_id {
+                panic!(
+                    "factor saw unexpected id id=[{}] allowed_id=[{}]",
+                    id, self.allowed_id
+                );
+            }
+        }
+
+        self.seen_ids.lock().unwrap().push(seen);
+
+        Ok(Arc::new(Float64Array::from(vec![0.0; batch.num_rows()])) as ArrayRef)
+    }
 }

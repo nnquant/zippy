@@ -16,6 +16,7 @@ fn logging_case_dispatch() {
 
     match case.as_str() {
         "create_snapshot" => create_snapshot_case(&temp_dir),
+        "console_format" => console_format_case(&temp_dir),
         "reuse_snapshot" => reuse_snapshot_case(&temp_dir),
         "reject_different_config" => reject_different_config_case(&temp_dir),
         other => panic!("unknown logging test case: {other}"),
@@ -35,6 +36,37 @@ fn setup_log_reuses_existing_snapshot_without_creating_extra_files() {
 #[test]
 fn setup_log_rejects_different_config_without_creating_extra_files() {
     run_logging_case("reject_different_config");
+}
+
+#[test]
+fn setup_log_formats_console_logs_with_tracing_style_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_exe = env::current_exe().unwrap();
+    let output = Command::new(current_exe)
+        .arg("--exact")
+        .arg("logging_case_dispatch")
+        .env(LOGGING_CASE_ENV, "console_format")
+        .env(LOGGING_TEMP_ENV, temp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "logging child case failed stderr=[{}]",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("console format test"));
+    assert!(combined.contains("component=[logging_test]"));
+    assert!(combined.contains("event=[console_format]"));
+    assert!(combined.contains("status=[running]"));
+    assert!(!combined.contains("app=["));
+    assert!(!combined.contains("run_id=["));
 }
 
 fn run_logging_case(case: &str) {
@@ -79,7 +111,10 @@ fn create_snapshot_case(temp_dir: &Path) {
     let file_name = file_path.file_name().unwrap().to_string_lossy();
     assert!(file_name.ends_with(".jsonl"));
     assert!(file_name.contains('_'));
-    let (date_part, run_part) = file_name.trim_end_matches(".jsonl").split_once('_').unwrap();
+    let (date_part, run_part) = file_name
+        .trim_end_matches(".jsonl")
+        .split_once('_')
+        .unwrap();
     assert_eq!(date_part.len(), 10);
     assert_eq!(&date_part[4..5], "-");
     assert_eq!(&date_part[7..8], "-");
@@ -92,11 +127,30 @@ fn create_snapshot_case(temp_dir: &Path) {
 
     let contents = std::fs::read_to_string(&file_path).expect("missing log contents");
     let record: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+    assert!(record["ts"].as_str().is_some());
     assert_eq!(record["app"], snapshot.app);
     assert_eq!(record["run_id"], snapshot.run_id);
     assert_eq!(record["component"], "logging_test");
     assert_eq!(record["event"], "create_snapshot");
     assert_eq!(record["message"], "created logging snapshot");
+}
+
+fn console_format_case(temp_dir: &Path) {
+    zippy_core::setup_log(zippy_core::LogConfig::new(
+        "runtime_test",
+        "info",
+        temp_dir,
+        true,
+        false,
+    ))
+    .unwrap();
+
+    tracing::info!(
+        component = "logging_test",
+        event = "console_format",
+        status = "running",
+        "console format test"
+    );
 }
 
 fn reuse_snapshot_case(temp_dir: &Path) {

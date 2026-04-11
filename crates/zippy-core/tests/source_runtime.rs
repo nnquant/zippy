@@ -582,7 +582,9 @@ fn source_runtime_stream_hello_schema_hash_is_stable_and_structure_sensitive() {
     let hash_b = StreamHello::new("bars", schema_with_metadata(), 1)
         .unwrap()
         .schema_hash;
-    let hash_c = StreamHello::new("bars", test_schema(), 1).unwrap().schema_hash;
+    let hash_c = StreamHello::new("bars", test_schema(), 1)
+        .unwrap()
+        .schema_hash;
 
     assert_eq!(hash_a, hash_b);
     assert_ne!(hash_a, hash_c);
@@ -647,7 +649,11 @@ fn source_runtime_rejects_flush_before_hello() {
 #[test]
 fn source_runtime_rejects_stop_before_hello() {
     let schema = test_schema();
-    let source = StaticSource::new(SourceMode::Pipeline, schema.clone(), vec![SourceEvent::Stop]);
+    let source = StaticSource::new(
+        SourceMode::Pipeline,
+        schema.clone(),
+        vec![SourceEvent::Stop],
+    );
     let engine = RecordingEngine::new(schema, Arc::new(Mutex::new(RecordedCalls::default())));
     let mut handle = spawn_source_engine_with_publisher(
         Box::new(source),

@@ -2,7 +2,9 @@
 
 mod native_source_bridge;
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -18,11 +20,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use tracing::{error, info};
 use zippy_core::{
-    current_log_snapshot, python_dev_version, setup_log as setup_core_log, spawn_engine_with_publisher,
-    spawn_source_engine_with_publisher, Engine, EngineConfig, EngineHandle,
-    EngineMetricsSnapshot, EngineStatus, LateDataPolicy, LogConfig, OverflowPolicy,
-    Publisher as CorePublisher, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode,
-    SourceSink, StreamHello, ZippyError,
+    current_log_snapshot, python_dev_version, setup_log as setup_core_log,
+    spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine, EngineConfig,
+    EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy, LogConfig,
+    MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
+    Reader as CoreBusReader, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode,
+    SourceSink, StreamHello, Writer as CoreBusWriter, ZippyError,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
@@ -35,6 +38,8 @@ use zippy_io::{
     ZmqPublisher as RustZmqPublisher, ZmqSource as RustZmqSource,
     ZmqStreamPublisher as RustZmqStreamPublisher, ZmqSubscriber as RustZmqSubscriber,
 };
+use zippy_master::daemon::{run_master_daemon as run_rust_master_daemon, MasterDaemonConfig};
+use zippy_master::server::MasterServer as RustMasterServer;
 use zippy_operators::{
     AbsSpec as RustAbsSpec, AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
     AggLastSpec as RustAggLastSpec, AggMaxSpec as RustAggMaxSpec, AggMinSpec as RustAggMinSpec,
@@ -56,14 +61,51 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
     PyRuntimeError::new_err(message.into())
 }
 
+fn resolve_control_endpoint_path(control_endpoint: &str) -> PyResult<PathBuf> {
+    let path = if let Some(relative) = control_endpoint.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            py_runtime_error("HOME is not set; cannot expand control endpoint path")
+        })?;
+        Path::new(&home).join(relative)
+    } else {
+        PathBuf::from(control_endpoint)
+    };
+    Ok(path)
+}
+
+fn prepare_control_endpoint_path(control_endpoint: &str) -> PyResult<PathBuf> {
+    let path = resolve_control_endpoint_path(control_endpoint)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            py_runtime_error(format!(
+                "failed to create control endpoint parent path=[{}] error=[{}]",
+                parent.display(),
+                error
+            ))
+        })?;
+    }
+    Ok(path)
+}
+
+fn parse_startup_timeout(startup_timeout_sec: f64) -> PyResult<Duration> {
+    if !startup_timeout_sec.is_finite() || startup_timeout_sec <= 0.0 {
+        return Err(py_value_error(
+            "startup_timeout_sec must be a positive finite number",
+        ));
+    }
+    Ok(Duration::from_secs_f64(startup_timeout_sec))
+}
+
 type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
 type SharedArchive = Arc<Mutex<Option<ArchiveHandle>>>;
 type SharedStatus = Arc<Mutex<EngineStatus>>;
 type SharedMetrics = Arc<Mutex<EngineMetricsSnapshot>>;
+type SharedMasterClient = Arc<Mutex<CoreMasterClient>>;
 type SourceOwner = Option<Py<PyAny>>;
 type RegisteredSource = (
     SourceOwner,
     Option<RemoteSourceConfig>,
+    Option<BusSourceConfig>,
     Option<PythonSourceConfig>,
 );
 
@@ -88,6 +130,14 @@ struct RemoteSourceConfig {
     mode: RustSourceMode,
 }
 
+#[derive(Clone)]
+struct BusSourceConfig {
+    stream_name: String,
+    expected_schema: Arc<Schema>,
+    master: SharedMasterClient,
+    mode: RustSourceMode,
+}
+
 struct PythonSourceConfig {
     owner: Py<PyAny>,
     name: String,
@@ -100,6 +150,10 @@ enum TargetConfig {
     Null,
     Zmq {
         endpoint: String,
+    },
+    BusStream {
+        stream_name: String,
+        master: SharedMasterClient,
     },
     ZmqStream {
         endpoint: String,
@@ -517,18 +571,12 @@ impl ArchiveFileState {
             return Ok(());
         }
 
-        let root = self
-            .active_root
-            .clone()
-            .ok_or(ZippyError::InvalidState {
-                status: "parquet archive root is not available",
-            })?;
-        let schema = self
-            .active_schema
-            .clone()
-            .ok_or(ZippyError::InvalidState {
-                status: "parquet archive schema is not available",
-            })?;
+        let root = self.active_root.clone().ok_or(ZippyError::InvalidState {
+            status: "parquet archive root is not available",
+        })?;
+        let schema = self.active_schema.clone().ok_or(ZippyError::InvalidState {
+            status: "parquet archive schema is not available",
+        })?;
 
         if self.writer.is_none() {
             self.next_index += 1;
@@ -1199,9 +1247,442 @@ impl ZmqSource {
 }
 
 #[pyclass]
+struct MasterClient {
+    control_endpoint: String,
+    client: SharedMasterClient,
+    schemas: Arc<Mutex<BTreeMap<String, Arc<Schema>>>>,
+}
+
+#[pymethods]
+impl MasterClient {
+    #[new]
+    #[pyo3(signature = (control_endpoint))]
+    fn new(control_endpoint: String) -> PyResult<Self> {
+        let resolved_control_endpoint = resolve_control_endpoint_path(&control_endpoint)?;
+        let resolved_control_endpoint = resolved_control_endpoint.display().to_string();
+        let client = CoreMasterClient::connect(&resolved_control_endpoint)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        Ok(Self {
+            control_endpoint: resolved_control_endpoint,
+            client: Arc::new(Mutex::new(client)),
+            schemas: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    fn register_process(&self, app: String) -> PyResult<String> {
+        self.client
+            .lock()
+            .unwrap()
+            .register_process(&app)
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn register_stream(
+        &self,
+        stream_name: String,
+        schema: &Bound<'_, PyAny>,
+        ring_capacity: usize,
+    ) -> PyResult<()> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        self.client
+            .lock()
+            .unwrap()
+            .register_stream(&stream_name, Arc::clone(&schema), ring_capacity)
+            .map_err(|error| py_runtime_error(error.to_string()))
+            .map(|_| {
+                self.schemas.lock().unwrap().insert(stream_name, schema);
+            })
+    }
+
+    fn write_to(&self, stream_name: String) -> PyResult<BusWriter> {
+        let schema = self
+            .schemas
+            .lock()
+            .unwrap()
+            .get(&stream_name)
+            .cloned()
+            .ok_or_else(|| py_runtime_error("stream schema is not registered in this client"))?;
+        let writer = self
+            .client
+            .lock()
+            .unwrap()
+            .write_to(&stream_name)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        Ok(BusWriter {
+            writer: Arc::new(Mutex::new(Some(writer))),
+            schema,
+        })
+    }
+
+    fn read_from(&self, stream_name: String) -> PyResult<BusReader> {
+        let reader = self
+            .client
+            .lock()
+            .unwrap()
+            .read_from(&stream_name)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        Ok(BusReader {
+            reader: Arc::new(Mutex::new(Some(reader))),
+        })
+    }
+
+    fn list_streams(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let streams = self
+            .client
+            .lock()
+            .unwrap()
+            .list_streams()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let records = PyList::empty_bound(py);
+        for stream in streams {
+            let dict = PyDict::new_bound(py);
+            dict.set_item("stream_name", stream.stream_name)?;
+            dict.set_item("ring_capacity", stream.ring_capacity)?;
+            dict.set_item("writer_process_id", stream.writer_process_id)?;
+            dict.set_item("reader_count", stream.reader_count)?;
+            dict.set_item("status", stream.status)?;
+            records.append(dict)?;
+        }
+        Ok(records.into_py(py))
+    }
+
+    fn get_stream(&self, py: Python<'_>, stream_name: String) -> PyResult<PyObject> {
+        let stream = self
+            .client
+            .lock()
+            .unwrap()
+            .get_stream(&stream_name)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let dict = PyDict::new_bound(py);
+        dict.set_item("stream_name", stream.stream_name)?;
+        dict.set_item("ring_capacity", stream.ring_capacity)?;
+        dict.set_item("writer_process_id", stream.writer_process_id)?;
+        dict.set_item("reader_count", stream.reader_count)?;
+        dict.set_item("status", stream.status)?;
+        Ok(dict.into_py(py))
+    }
+
+    fn process_id(&self) -> PyResult<Option<String>> {
+        Ok(self
+            .client
+            .lock()
+            .unwrap()
+            .process_id()
+            .map(ToOwned::to_owned))
+    }
+
+    fn control_endpoint(&self) -> PyResult<String> {
+        Ok(self.control_endpoint.clone())
+    }
+}
+
+#[pyclass(name = "MasterServer")]
+struct MasterDaemon {
+    control_endpoint: String,
+    server: RustMasterServer,
+    join_handle: Arc<Mutex<Option<JoinHandle<zippy_core::Result<()>>>>>,
+}
+
+#[pymethods]
+impl MasterDaemon {
+    #[new]
+    #[pyo3(signature = (control_endpoint))]
+    fn new(control_endpoint: String) -> PyResult<Self> {
+        let resolved_control_endpoint = resolve_control_endpoint_path(&control_endpoint)?
+            .display()
+            .to_string();
+        Ok(Self {
+            control_endpoint: resolved_control_endpoint,
+            server: RustMasterServer::default(),
+            join_handle: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[pyo3(signature = (startup_timeout_sec=10.0))]
+    fn start(&self, startup_timeout_sec: f64) -> PyResult<()> {
+        let mut guard = self.join_handle.lock().unwrap();
+        if guard.is_some() {
+            return Err(py_runtime_error("master daemon already started"));
+        }
+        let startup_timeout = parse_startup_timeout(startup_timeout_sec)?;
+        let socket_path = prepare_control_endpoint_path(&self.control_endpoint)?;
+        let server = self.server.clone();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let join_handle = thread::spawn(move || {
+            server.serve_with_ready(&socket_path, Some(startup_tx))
+        });
+
+        match startup_rx.recv_timeout(startup_timeout) {
+            Ok(Ok(())) => {
+                *guard = Some(join_handle);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let _ = join_handle.join();
+                Err(py_runtime_error(error))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.server.shutdown();
+                let _ = join_handle.join();
+                Err(py_runtime_error(format!(
+                    "master daemon did not become ready before timeout timeout_sec=[{}]",
+                    startup_timeout_sec
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let result = join_handle
+                    .join()
+                    .map_err(|_| py_runtime_error("master daemon thread panicked"))?;
+                result.map_err(|error| py_runtime_error(error.to_string()))
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.server.shutdown();
+    }
+
+    fn control_endpoint(&self) -> String {
+        self.control_endpoint.clone()
+    }
+
+    fn join(&self, py: Python<'_>) -> PyResult<()> {
+        let join_handle = self.join_handle.lock().unwrap().take();
+        let Some(join_handle) = join_handle else {
+            return Ok(());
+        };
+        py.allow_threads(move || {
+            join_handle.join().map_err(|_| ZippyError::Io {
+                reason: "master daemon thread panicked".to_string(),
+            })?
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+}
+
+#[pyclass]
+struct BusStreamTarget {
+    stream_name: String,
+    master: SharedMasterClient,
+}
+
+#[pymethods]
+impl BusStreamTarget {
+    #[new]
+    #[pyo3(signature = (stream_name, master))]
+    fn new(stream_name: String, master: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let master = master
+            .extract::<PyRef<'_, MasterClient>>()
+            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
+        Ok(Self {
+            stream_name,
+            master: Arc::clone(&master.client),
+        })
+    }
+}
+
+#[pyclass]
+struct BusStreamSource {
+    stream_name: String,
+    expected_schema: Arc<Schema>,
+    mode: RustSourceMode,
+    master: SharedMasterClient,
+}
+
+#[pymethods]
+impl BusStreamSource {
+    #[new]
+    #[pyo3(signature = (stream_name, expected_schema, master, mode=None))]
+    fn new(
+        stream_name: String,
+        expected_schema: &Bound<'_, PyAny>,
+        master: &Bound<'_, PyAny>,
+        mode: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let expected_schema = Arc::new(
+            Schema::from_pyarrow_bound(expected_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let master = master
+            .extract::<PyRef<'_, MasterClient>>()
+            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
+        Ok(Self {
+            stream_name,
+            expected_schema,
+            mode: match mode {
+                Some(mode) => parse_source_mode(mode)?,
+                None => RustSourceMode::Pipeline,
+            },
+            master: Arc::clone(&master.client),
+        })
+    }
+}
+
+#[pyclass]
+struct BusWriter {
+    writer: Arc<Mutex<Option<CoreBusWriter>>>,
+    schema: Arc<Schema>,
+}
+
+#[pymethods]
+impl BusWriter {
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = value_to_record_batches(py, value, self.schema.as_ref())?;
+        let mut guard = self.writer.lock().unwrap();
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("bus writer is closed"))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> PyResult<()> {
+        let mut guard = self.writer.lock().unwrap();
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("bus writer is closed"))?;
+        writer
+            .flush()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn close(&self) -> PyResult<()> {
+        let mut guard = self.writer.lock().unwrap();
+        let mut writer = guard
+            .take()
+            .ok_or_else(|| py_runtime_error("bus writer is closed"))?;
+        writer
+            .close()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+}
+
+#[pyclass]
+struct BusReader {
+    reader: Arc<Mutex<Option<CoreBusReader>>>,
+}
+
+#[pymethods]
+impl BusReader {
+    #[pyo3(signature = (timeout_ms=1000))]
+    fn read(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<PyObject> {
+        let mut guard = self.reader.lock().unwrap();
+        let reader = guard
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
+        let batch = reader
+            .read(Some(timeout_ms))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        batch
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn seek_latest(&self) -> PyResult<()> {
+        let mut guard = self.reader.lock().unwrap();
+        let reader = guard
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
+        reader
+            .seek_latest()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn close(&self) -> PyResult<()> {
+        let mut guard = self.reader.lock().unwrap();
+        let mut reader = guard
+            .take()
+            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
+        reader
+            .close()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+}
+
+struct BusTargetPublisher {
+    writer: CoreBusWriter,
+}
+
+impl CorePublisher for BusTargetPublisher {
+    fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
+        self.writer.write(batch.clone())
+    }
+
+    fn flush(&mut self) -> zippy_core::Result<()> {
+        self.writer.flush()
+    }
+
+    fn close(&mut self) -> zippy_core::Result<()> {
+        self.writer.close()
+    }
+}
+
+struct BusSourceBridge {
+    stream_name: String,
+    expected_schema: Arc<Schema>,
+    mode: RustSourceMode,
+    master: SharedMasterClient,
+}
+
+impl Source for BusSourceBridge {
+    fn name(&self) -> &str {
+        &self.stream_name
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.expected_schema)
+    }
+
+    fn mode(&self) -> RustSourceMode {
+        self.mode
+    }
+
+    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
+        let mut reader = self.master.lock().unwrap().read_from(&self.stream_name)?;
+        let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
+        sink.emit(SourceEvent::Hello(hello))?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_flag = Arc::clone(&running);
+        let join_handle = thread::spawn(move || {
+            while running_flag.load(Ordering::SeqCst) {
+                match reader.read(Some(100)) {
+                    Ok(batch) => sink.emit(SourceEvent::Data(batch))?,
+                    Err(ZippyError::Io { reason }) if reason.contains("reader timed out") => {
+                        continue;
+                    }
+                    Err(error) => {
+                        sink.emit(SourceEvent::Error(error.to_string()))?;
+                        return Err(error);
+                    }
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(SourceHandle::new_with_stop(
+            join_handle,
+            Box::new(move || {
+                running.store(false, Ordering::SeqCst);
+                Ok(())
+            }),
+        ))
+    }
+}
+
+#[pyclass]
 struct ReactiveStateEngine {
     name: String,
     id_column: String,
+    id_filter: Option<Vec<String>>,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
@@ -1212,6 +1693,8 @@ struct ReactiveStateEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
+    remote_source: Option<RemoteSourceConfig>,
+    bus_source: Option<BusSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
@@ -1221,6 +1704,7 @@ struct ReactiveStateEngine {
 struct TimeSeriesEngine {
     name: String,
     id_column: String,
+    id_filter: Option<Vec<String>>,
     dt_column: String,
     window_ns: i64,
     late_data_policy: String,
@@ -1235,6 +1719,7 @@ struct TimeSeriesEngine {
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
     remote_source: Option<RemoteSourceConfig>,
+    bus_source: Option<BusSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
@@ -1276,6 +1761,7 @@ struct StreamTableEngine {
     handle: SharedHandle,
     engine: Option<RustStreamTableEngine>,
     remote_source: Option<RemoteSourceConfig>,
+    bus_source: Option<BusSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
@@ -1285,7 +1771,7 @@ struct StreamTableEngine {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -1293,6 +1779,7 @@ impl ReactiveStateEngine {
         id_column: String,
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
+        id_filter: Option<&Bound<'_, PyAny>>,
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
@@ -1303,9 +1790,16 @@ impl ReactiveStateEngine {
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
+        let id_filter = parse_id_filter(id_filter)?;
         let factor_specs = build_reactive_specs(py, &schema, &id_column, factors)?;
-        let engine = RustReactiveStateEngine::new(&name, Arc::clone(&schema), factor_specs)
-            .map_err(|error| py_value_error(error.to_string()))?;
+        let engine = RustReactiveStateEngine::new_with_id_filter(
+            &name,
+            Arc::clone(&schema),
+            factor_specs,
+            &id_column,
+            id_filter.clone(),
+        )
+        .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
@@ -1315,7 +1809,7 @@ impl ReactiveStateEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, _, python_source) = register_source(
+        let (source_owner, remote_source, bus_source, python_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1331,6 +1825,7 @@ impl ReactiveStateEngine {
         Ok(Self {
             name,
             id_column,
+            id_filter,
             input_schema: schema,
             output_schema,
             target,
@@ -1341,6 +1836,8 @@ impl ReactiveStateEngine {
             archive,
             handle,
             engine: Some(engine),
+            remote_source,
+            bus_source,
             python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
@@ -1353,7 +1850,8 @@ impl ReactiveStateEngine {
             &self.runtime_options,
             &self.target,
             self.parquet_sink.as_ref(),
-            None,
+            self.remote_source.as_ref(),
+            self.bus_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
@@ -1406,6 +1904,7 @@ impl ReactiveStateEngine {
             self._source_owner.is_some(),
         )?;
         dict.set_item("id_column", &self.id_column)?;
+        dict.set_item("id_filter", self.id_filter.clone())?;
         Ok(dict.into_any().unbind())
     }
 
@@ -1458,7 +1957,7 @@ impl StreamTableEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, python_source) = register_source(
+        let (source_owner, remote_source, bus_source, python_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1484,6 +1983,7 @@ impl StreamTableEngine {
             handle,
             engine: Some(engine),
             remote_source,
+            bus_source,
             python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
@@ -1497,6 +1997,7 @@ impl StreamTableEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
+            self.bus_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
@@ -1569,7 +2070,7 @@ impl StreamTableEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -1584,6 +2085,7 @@ impl TimeSeriesEngine {
         window_ns: Option<i64>,
         pre_factors: Option<Vec<Py<PyAny>>>,
         post_factors: Option<Vec<Py<PyAny>>>,
+        id_filter: Option<&Bound<'_, PyAny>>,
         source: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
@@ -1599,6 +2101,7 @@ impl TimeSeriesEngine {
             build_expression_specs(py, pre_factors.unwrap_or_default(), "pre_factors")?;
         let post_factor_specs =
             build_expression_specs(py, post_factors.unwrap_or_default(), "post_factors")?;
+        let id_filter = parse_id_filter(id_filter)?;
         let late_data_policy_value = parse_required_policy_value(
             late_data_policy,
             "late_data_policy",
@@ -1607,7 +2110,7 @@ impl TimeSeriesEngine {
         )?;
         let late_data_policy_enum = parse_late_data_policy(&late_data_policy_value)?;
         let window_ns = parse_window_ns(window, window_type, window_ns)?;
-        let engine = RustTimeSeriesEngine::new(
+        let engine = RustTimeSeriesEngine::new_with_id_filter(
             &name,
             Arc::clone(&schema),
             &id_column,
@@ -1617,6 +2120,7 @@ impl TimeSeriesEngine {
             factor_specs,
             pre_factor_specs,
             post_factor_specs,
+            id_filter.clone(),
         )
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
@@ -1628,7 +2132,7 @@ impl TimeSeriesEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, python_source) = register_source(
+        let (source_owner, remote_source, bus_source, python_source) = register_source(
             source,
             DownstreamLink {
                 handle: Arc::clone(&handle),
@@ -1644,6 +2148,7 @@ impl TimeSeriesEngine {
         Ok(Self {
             name,
             id_column,
+            id_filter,
             dt_column,
             window_ns,
             late_data_policy: late_data_policy_value,
@@ -1658,6 +2163,7 @@ impl TimeSeriesEngine {
             handle,
             engine: Some(engine),
             remote_source,
+            bus_source,
             python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
@@ -1671,6 +2177,7 @@ impl TimeSeriesEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
+            self.bus_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
@@ -1723,6 +2230,7 @@ impl TimeSeriesEngine {
             self._source_owner.is_some(),
         )?;
         dict.set_item("id_column", &self.id_column)?;
+        dict.set_item("id_filter", self.id_filter.clone())?;
         dict.set_item("dt_column", &self.dt_column)?;
         dict.set_item("window_ns", self.window_ns)?;
         dict.set_item("late_data_policy", &self.late_data_policy)?;
@@ -1842,6 +2350,7 @@ impl CrossSectionalEngine {
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
             None,
+            None,
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -1915,7 +2424,9 @@ impl CrossSectionalEngine {
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", python_dev_version())?;
     module.add_function(wrap_pyfunction!(version, module)?)?;
+    module.add_function(wrap_pyfunction!(run_master_daemon, module)?)?;
     module.add_function(wrap_pyfunction!(setup_log, module)?)?;
+    module.add_function(wrap_pyfunction!(log_info, module)?)?;
     module.add_class::<TsEmaSpec>()?;
     module.add_class::<TsReturnSpec>()?;
     module.add_class::<TsMeanSpec>()?;
@@ -1943,6 +2454,12 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ZmqStreamPublisher>()?;
     module.add_class::<ZmqSubscriber>()?;
     module.add_class::<ZmqSource>()?;
+    module.add_class::<MasterDaemon>()?;
+    module.add_class::<MasterClient>()?;
+    module.add_class::<BusWriter>()?;
+    module.add_class::<BusReader>()?;
+    module.add_class::<BusStreamTarget>()?;
+    module.add_class::<BusStreamSource>()?;
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<StreamTableEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
@@ -1953,6 +2470,14 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 fn version() -> String {
     python_dev_version()
+}
+
+#[pyfunction]
+fn run_master_daemon(py: Python<'_>, control_endpoint: String) -> PyResult<()> {
+    let control_endpoint = prepare_control_endpoint_path(&control_endpoint)?;
+    let config = MasterDaemonConfig::new(control_endpoint);
+    py.allow_threads(move || run_rust_master_daemon(config))
+        .map_err(|error| py_runtime_error(error.to_string()))
 }
 
 #[pyfunction]
@@ -1990,6 +2515,27 @@ fn setup_log(
     Ok(dict.into_any().unbind())
 }
 
+#[pyfunction]
+#[pyo3(signature = (component, event, message, status=None))]
+fn log_info(component: String, event: String, message: String, status: Option<String>) {
+    if let Some(status) = status {
+        info!(
+            component = component.as_str(),
+            event = event.as_str(),
+            status = status.as_str(),
+            message = message.as_str(),
+            "{message}"
+        );
+    } else {
+        info!(
+            component = component.as_str(),
+            event = event.as_str(),
+            message = message.as_str(),
+            "{message}"
+        );
+    }
+}
+
 fn parse_targets(target: &Bound<'_, PyAny>) -> PyResult<Vec<TargetConfig>> {
     if let Ok(targets) = target.downcast::<PyList>() {
         if targets.is_empty() {
@@ -2003,6 +2549,22 @@ fn parse_targets(target: &Bound<'_, PyAny>) -> PyResult<Vec<TargetConfig>> {
     }
 
     Ok(vec![parse_single_target(target)?])
+}
+
+fn parse_id_filter(id_filter: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<String>>> {
+    let Some(id_filter) = id_filter else {
+        return Ok(None);
+    };
+
+    let values = id_filter
+        .extract::<Vec<String>>()
+        .map_err(|_| py_value_error("id_filter must be a sequence of strings"))?;
+
+    if values.is_empty() {
+        return Err(py_value_error("id_filter must not be empty"));
+    }
+
+    Ok(Some(values))
 }
 
 fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
@@ -2024,8 +2586,15 @@ fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
         });
     }
 
+    if let Ok(target) = target.extract::<PyRef<'_, BusStreamTarget>>() {
+        return Ok(TargetConfig::BusStream {
+            stream_name: target.stream_name.clone(),
+            master: Arc::clone(&target.master),
+        });
+    }
+
     Err(PyTypeError::new_err(
-        "target must be NullPublisher, ZmqPublisher, ZmqStreamPublisher, or a non-empty list of them",
+        "target must be NullPublisher, ZmqPublisher, ZmqStreamPublisher, BusStreamTarget, or a non-empty list of them",
     ))
 }
 
@@ -2057,7 +2626,7 @@ fn register_source(
     input_schema: &Schema,
 ) -> PyResult<RegisteredSource> {
     let Some(source) = source else {
-        return Ok((None, None, None));
+        return Ok((None, None, None, None));
     };
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
@@ -2072,7 +2641,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableEngine>>() {
@@ -2087,7 +2656,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
@@ -2102,7 +2671,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok((Some(source.clone().unbind()), None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
@@ -2118,6 +2687,27 @@ fn register_source(
                 endpoint: remote_source.endpoint.clone(),
                 expected_schema: remote_source.expected_schema.clone(),
                 mode: remote_source.mode,
+            }),
+            None,
+            None,
+        ));
+    }
+
+    if let Ok(bus_source) = source.extract::<PyRef<'_, BusStreamSource>>() {
+        if bus_source.expected_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+
+        return Ok((
+            Some(source.clone().unbind()),
+            None,
+            Some(BusSourceConfig {
+                stream_name: bus_source.stream_name.clone(),
+                expected_schema: bus_source.expected_schema.clone(),
+                master: Arc::clone(&bus_source.master),
+                mode: bus_source.mode,
             }),
             None,
         ));
@@ -2150,6 +2740,7 @@ fn register_source(
         return Ok((
             Some(source.clone().unbind()),
             None,
+            None,
             Some(PythonSourceConfig {
                 owner: source.clone().unbind(),
                 name,
@@ -2160,7 +2751,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, BusStreamSource, or a Python source plugin",
     ))
 }
 
@@ -2234,6 +2825,17 @@ fn build_publisher(
                     )
                 })?;
                 publishers.push(Box::new(publisher));
+            }
+            TargetConfig::BusStream {
+                stream_name,
+                master,
+            } => {
+                let writer = master
+                    .lock()
+                    .unwrap()
+                    .write_to(stream_name)
+                    .map_err(|error| py_runtime_error(error.to_string()))?;
+                publishers.push(Box::new(BusTargetPublisher { writer }));
             }
         }
     }
@@ -2320,6 +2922,7 @@ fn start_runtime_engine<E: Engine>(
     targets: &[TargetConfig],
     parquet_sink: Option<&ParquetSinkConfig>,
     remote_source: Option<&RemoteSourceConfig>,
+    bus_source: Option<&BusSourceConfig>,
     python_source: Option<&PythonSourceConfig>,
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
@@ -2350,8 +2953,8 @@ fn start_runtime_engine<E: Engine>(
         None => return Err(py_runtime_error("engine already started")),
     };
 
-    let handle = match (remote_source, python_source) {
-        (Some(remote_source), None) => {
+    let handle = match (remote_source, bus_source, python_source) {
+        (Some(remote_source), None, None) => {
             let source = Box::new(
                 RustZmqSource::connect(
                     &format!("{name}_source"),
@@ -2363,7 +2966,16 @@ fn start_runtime_engine<E: Engine>(
             );
             spawn_source_engine_with_publisher(source, engine, config, publisher)
         }
-        (None, Some(python_source)) => {
+        (None, Some(bus_source), None) => {
+            let source = Box::new(BusSourceBridge {
+                stream_name: bus_source.stream_name.clone(),
+                expected_schema: Arc::clone(&bus_source.expected_schema),
+                mode: bus_source.mode,
+                master: Arc::clone(&bus_source.master),
+            });
+            spawn_source_engine_with_publisher(source, engine, config, publisher)
+        }
+        (None, None, Some(python_source)) => {
             let source = Box::new(PythonSourceBridge {
                 owner: Python::with_gil(|py| python_source.owner.clone_ref(py)),
                 name: python_source.name.clone(),
@@ -2372,10 +2984,10 @@ fn start_runtime_engine<E: Engine>(
             });
             spawn_source_engine_with_publisher(source, engine, config, publisher)
         }
-        (None, None) => spawn_engine_with_publisher(engine, config, publisher),
-        (Some(_), Some(_)) => {
+        (None, None, None) => spawn_engine_with_publisher(engine, config, publisher),
+        _ => {
             return Err(py_runtime_error(
-                "engine cannot use remote source and python source at the same time",
+                "engine cannot use more than one external source at the same time",
             ));
         }
     };
@@ -2639,6 +3251,7 @@ fn metrics_snapshot_to_pydict(
     dict.set_item("output_batches_total", snapshot.output_batches_total)?;
     dict.set_item("dropped_batches_total", snapshot.dropped_batches_total)?;
     dict.set_item("late_rows_total", snapshot.late_rows_total)?;
+    dict.set_item("filtered_rows_total", snapshot.filtered_rows_total)?;
     dict.set_item("publish_errors_total", snapshot.publish_errors_total)?;
     dict.set_item("queue_depth", snapshot.queue_depth)?;
     Ok(dict.into_any().unbind())
@@ -2691,6 +3304,10 @@ fn target_configs_to_pylist(py: Python<'_>, targets: &[TargetConfig]) -> PyResul
             } => {
                 item.set_item("type", "zmq_stream")?;
                 item.set_item("endpoint", endpoint)?;
+                item.set_item("stream_name", stream_name)?;
+            }
+            TargetConfig::BusStream { stream_name, .. } => {
+                item.set_item("type", "bus_stream")?;
                 item.set_item("stream_name", stream_name)?;
             }
         }
@@ -2941,7 +3558,7 @@ fn build_reactive_spec(
 
     if let Ok(spec) = factor.extract::<PyRef<'_, ExpressionFactor>>() {
         return RustExpressionSpec::new(&spec.expression, &spec.output)
-            .build(current_schema)
+            .build_reactive_factor(current_schema, id_column)
             .map_err(|error| py_value_error(error.to_string()));
     }
 

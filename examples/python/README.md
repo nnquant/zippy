@@ -24,7 +24,7 @@
 - `TimeSeriesEngine` 额外支持 `pre_factors=[...]` 和 `post_factors=[...]`
 - `pre_factors` 在晚到数据过滤之后、窗口聚合之前执行
 - `post_factors` 在 `AGG_*` 输出之后执行，`flush()` 也会触发这一阶段
-- 当前支持的语法边界是：`+` / `-` / `*` / `/`、括号、数值字面量，以及 `abs(...)`、`log(...)`、`clip(...)`、`cast(...)`
+- 当前支持的语法边界是：`+` / `-` / `*` / `/`、括号、数值字面量，以及 `ABS(...)`、`LOG(...)`、`CLIP(...)`、`CAST(...)`
 - 未知标识符和不支持函数会在 `ReactiveStateEngine(...)` 构造阶段直接报错，而不是等到 `start()` 或 `write()` 才失败
 
 最小示例：
@@ -37,7 +37,7 @@ engine = zippy.ReactiveStateEngine(
     factors=[
         zippy.TS_EMA(column="price", span=2, output="ema_2"),
         zippy.Expr(expression="price + ema_2", output="price_plus_ema"),
-        zippy.Expr(expression="clip(price_plus_ema, 20.0, 30.0)", output="clipped_total"),
+        zippy.Expr(expression="CLIP(price_plus_ema, 20.0, 30.0)", output="clipped_total"),
     ],
     target=zippy.NullPublisher(),
 )
@@ -156,3 +156,31 @@ uv run python examples/python/stream_table_pipeline.py
 - `pipeline`：下游跟随上游 `Flush/Stop` 边界，适合正式处理链
 - `consumer`：下游只消费 `Data`，忽略上游 `Flush`；如果需要结算，要由本地下游显式 `flush()`
 - `remote_pipeline.py --mode consumer` 会在本地等待一段时间后手动 `flush()` 和 `stop()`，目的是把这种差异跑出来
+
+Python CLI：
+
+- 启动本地 master：
+
+```bash
+uv run zippy master run ~/.zippy/master.sock
+```
+
+- `zippy master run` 现在会直接进入 Rust daemon 的阻塞式运行入口；Python CLI 不再通过
+  `MasterServer.start()/join()` 线程包装来模拟生命周期。
+- ready 语义以 Rust daemon 的真实监听完成为准：只有在控制 socket 绑定完成后，才会写出
+  `master_listening` 记录。默认同时输出到控制台，并写入 `logs/zippy-master/` 下的 JSONL
+  文件。
+- 直接按 `Ctrl-C` 即可触发同一套 Rust 信号处理与优雅关闭逻辑；会看到
+  `master_shutdown_requested` 和 `master_stopped` 生命周期记录。
+
+- 查看当前已注册 stream：
+
+```bash
+uv run zippy stream ls --control-endpoint ~/.zippy/master.sock
+```
+
+- 查看单个 stream 详情：
+
+```bash
+uv run zippy stream show openctp_ticks --control-endpoint ~/.zippy/master.sock
+```

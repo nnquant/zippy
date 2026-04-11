@@ -418,6 +418,38 @@ fn expression_accepts_uppercase_functions() {
 }
 
 #[test]
+fn expression_division_by_zero_returns_null_in_row_evaluator() {
+    let schema = input_schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut factor = ExpressionSpec::new("value / 0.0", "score")
+        .build(schema.as_ref())
+        .unwrap();
+
+    assert_float_options_eq(&float64_values(&factor.evaluate(&batch).unwrap()), &[None]);
+}
+
+#[test]
+fn expression_division_by_zero_returns_null_in_reactive_planner() {
+    let mut factor =
+        ExpressionSpec::new("TS_DIFF(value, 1) / TS_STD(TS_DIFF(value, 1), 2)", "score")
+            .build_reactive_factor(input_schema().as_ref(), "id")
+            .unwrap();
+
+    let batch = batch(vec!["a", "a", "a", "a"], vec![1.0, 2.0, 3.0, 4.0]);
+    assert_float_options_eq(
+        &float64_values(&factor.evaluate(&batch).unwrap()),
+        &[None, None, None, None],
+    );
+}
+
+#[test]
 fn expression_factor_rejects_unknown_identifier() {
     let error = match ExpressionSpec::new("missing + 1.0", "score").build(input_schema().as_ref()) {
         Ok(_) => panic!("expected unknown identifier to be rejected"),

@@ -134,7 +134,10 @@ pub fn format_report(report: &PerfReport) -> String {
             "actual_average_rows_per_sec={:.2}",
             report.actual_average_rows_per_sec
         ),
-        format!("actual_peak_rows_per_sec={:.2}", report.actual_peak_rows_per_sec),
+        format!(
+            "actual_peak_rows_per_sec={:.2}",
+            report.actual_peak_rows_per_sec
+        ),
         format!("batches_per_sec={:.2}", report.batches_per_sec),
         format!(
             "latency_micros[p50={:.2}, p95={:.2}, p99={:.2}]",
@@ -181,7 +184,9 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
 
     let engine_metrics = engine_metrics_report(handle.metrics());
     let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_counters.output_batches_total.load(Ordering::Relaxed);
+    let output_batches_total = publisher_counters
+        .output_batches_total
+        .load(Ordering::Relaxed);
     let pass = evaluate_pass(
         config,
         drive_stats.actual_average_rows_per_sec,
@@ -235,7 +240,9 @@ fn run_remote_pipeline_upstream(config: &PerfConfig) -> PerfResult<PerfReport> {
 
     let engine_metrics = engine_metrics_report(handle.metrics());
     let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_counters.output_batches_total.load(Ordering::Relaxed);
+    let output_batches_total = publisher_counters
+        .output_batches_total
+        .load(Ordering::Relaxed);
     let pass = evaluate_pass(
         config,
         drive_stats.actual_average_rows_per_sec,
@@ -289,7 +296,9 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
     let engine_metrics = engine_metrics_report(handle.metrics());
     let source_metrics = source_metrics_report(&source_counters);
     let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_counters.output_batches_total.load(Ordering::Relaxed);
+    let output_batches_total = publisher_counters
+        .output_batches_total
+        .load(Ordering::Relaxed);
     let observed_secs = source_counters
         .observed_seconds()
         .unwrap_or(config.duration_sec as f64)
@@ -349,7 +358,10 @@ fn wait_for_remote_shutdown(
             }
         } else if now >= startup_deadline {
             handle.stop().map_err(|error| error.to_string())?;
-            return Err("remote downstream did not observe source events before startup deadline".to_string());
+            return Err(
+                "remote downstream did not observe source events before startup deadline"
+                    .to_string(),
+            );
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -450,18 +462,13 @@ fn build_timeseries_engine(name: &str, tick_schema: SchemaRef) -> Result<TimeSer
         "dt",
         DEFAULT_WINDOW_NS,
         LateDataPolicy::Reject,
-        vec![
-            AggLastSpec::new("price", "close").build().unwrap(),
-        ],
+        vec![AggLastSpec::new("price", "close").build().unwrap()],
         vec![],
         vec![],
     )
 }
 
-fn build_cross_sectional_engine(
-    name: &str,
-    bar_schema: SchemaRef,
-) -> Result<CrossSectionalEngine> {
+fn build_cross_sectional_engine(name: &str, bar_schema: SchemaRef) -> Result<CrossSectionalEngine> {
     CrossSectionalEngine::new(
         name,
         bar_schema,
@@ -526,9 +533,8 @@ impl TickBatchFactory {
             Arc::clone(&self.schema),
             vec![
                 Arc::clone(&self.symbols),
-                Arc::new(
-                    TimestampNanosecondArray::from(timestamps).with_timezone("UTC"),
-                ) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(timestamps).with_timezone("UTC"))
+                    as ArrayRef,
                 Arc::clone(&self.prices),
                 Arc::clone(&self.volumes),
             ],
@@ -662,7 +668,10 @@ impl SourceSink for CountingSourceSink {
                     *first_data_at = Some(now);
                 }
             }
-            SourceEvent::Hello(_) | SourceEvent::Flush | SourceEvent::Stop | SourceEvent::Error(_) => {
+            SourceEvent::Hello(_)
+            | SourceEvent::Flush
+            | SourceEvent::Stop
+            | SourceEvent::Error(_) => {
                 self.counters
                     .source_control_events_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -729,9 +738,9 @@ where
     let warmup_duration = Duration::from_secs(config.warmup_sec);
     let steady_duration = Duration::from_secs(config.duration_sec);
     let total_duration = warmup_duration + steady_duration;
-    let batch_interval_ns =
-        ((1_000_000_000_u128 * config.rows_per_batch as u128) / config.target_rows_per_sec as u128)
-            .max(1) as u64;
+    let batch_interval_ns = ((1_000_000_000_u128 * config.rows_per_batch as u128)
+        / config.target_rows_per_sec as u128)
+        .max(1) as u64;
     let batch_interval = Duration::from_nanos(batch_interval_ns);
     let start = Instant::now();
     let warmup_end = start + warmup_duration;
@@ -877,9 +886,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        compute_remote_downstream_deadline, remote_downstream_should_stop_for_idle,
-        run_profile, write_report_json, OverflowPolicyConfig, PerfConfig, PerfProfile,
-        REMOTE_IDLE_GRACE_SEC,
+        compute_remote_downstream_deadline, remote_downstream_should_stop_for_idle, run_profile,
+        write_report_json, OverflowPolicyConfig, PerfConfig, PerfProfile, REMOTE_IDLE_GRACE_SEC,
     };
 
     fn test_endpoint() -> String {
@@ -906,11 +914,8 @@ mod tests {
 
     #[test]
     fn inproc_timeseries_profile_produces_nonzero_rows_and_passes() {
-        let report = run_profile(&test_config(
-            PerfProfile::InprocTimeseries,
-            test_endpoint(),
-        ))
-        .unwrap();
+        let report =
+            run_profile(&test_config(PerfProfile::InprocTimeseries, test_endpoint())).unwrap();
 
         assert!(report.input_rows_total > 0);
         assert!(report.actual_average_rows_per_sec > 0.0);
@@ -922,14 +927,21 @@ mod tests {
         let endpoint = test_endpoint();
         let downstream_handle = std::thread::spawn({
             let endpoint = endpoint.clone();
-            move || run_profile(&test_config(PerfProfile::RemotePipelineDownstream, endpoint))
+            move || {
+                run_profile(&test_config(
+                    PerfProfile::RemotePipelineDownstream,
+                    endpoint,
+                ))
+            }
         });
 
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let upstream_report =
-            run_profile(&test_config(PerfProfile::RemotePipelineUpstream, endpoint.clone()))
-                .unwrap();
+        let upstream_report = run_profile(&test_config(
+            PerfProfile::RemotePipelineUpstream,
+            endpoint.clone(),
+        ))
+        .unwrap();
         let downstream_report = downstream_handle.join().unwrap().unwrap();
 
         assert!(upstream_report.input_rows_total > 0);
@@ -940,11 +952,8 @@ mod tests {
 
     #[test]
     fn writes_report_json_with_profile_and_pass_fields() {
-        let report = run_profile(&test_config(
-            PerfProfile::InprocTimeseries,
-            test_endpoint(),
-        ))
-        .unwrap();
+        let report =
+            run_profile(&test_config(PerfProfile::InprocTimeseries, test_endpoint())).unwrap();
         let path = PathBuf::from(format!(
             "/tmp/zippy-perf-report-{}.json",
             SystemTime::now()
@@ -964,12 +973,8 @@ mod tests {
     #[test]
     fn remote_downstream_deadline_starts_after_first_observed_event() {
         let observed_at = std::time::Instant::now();
-        let deadline = compute_remote_downstream_deadline(
-            observed_at,
-            10,
-            60,
-            REMOTE_IDLE_GRACE_SEC,
-        );
+        let deadline =
+            compute_remote_downstream_deadline(observed_at, 10, 60, REMOTE_IDLE_GRACE_SEC);
 
         assert_eq!(
             deadline.saturating_duration_since(observed_at),

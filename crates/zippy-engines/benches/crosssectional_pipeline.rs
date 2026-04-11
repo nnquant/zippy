@@ -26,9 +26,7 @@ fn bench_crosssectional_pipeline(c: &mut Criterion) {
                     .map(|index| format!("S{:03}", index % 32))
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(
-                TimestampNanosecondArray::from(vec![0_i64; 1024]).with_timezone("UTC"),
-            ),
+            Arc::new(TimestampNanosecondArray::from(vec![0_i64; 1024]).with_timezone("UTC")),
             Arc::new(Float64Array::from(
                 (0..1024)
                     .map(|index| (index % 17) as f64 - 8.0)

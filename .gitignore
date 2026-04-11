@@ -7,5 +7,8 @@ __pycache__/
 .codex
 python/zippy/*.so
 /plugins/zippy-openctp/
+logs/
+/~/
+crates/zippy-master/--no-console-log/
 
 docs/superpowers

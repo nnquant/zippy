@@ -1,16 +1,16 @@
 [package]
-name = "zippy-core"
+name = "zippy-master"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-arrow.workspace = true
-crossbeam-channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+signal-hook = { version = "0.3", features = ["iterator"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+zippy-core = { path = "../zippy-core" }
 
 [dev-dependencies]
+arrow.workspace = true
+libc = "0.2"
 tempfile = "3"

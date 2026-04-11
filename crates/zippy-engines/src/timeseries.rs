@@ -22,6 +22,7 @@ pub struct TimeSeriesEngine {
     output_schema: SchemaRef,
     id_column: String,
     dt_column: String,
+    id_filter: Option<HashSet<String>>,
     window_ns: i64,
     late_data_policy: LateDataPolicy,
     specs: Vec<Box<dyn AggregationSpec>>,
@@ -30,6 +31,7 @@ pub struct TimeSeriesEngine {
     open_windows: BTreeMap<String, OpenWindow>,
     last_dt_by_id: BTreeMap<String, i64>,
     pending_late_rows: u64,
+    pending_filtered_rows: u64,
 }
 
 impl TimeSeriesEngine {
@@ -67,6 +69,57 @@ impl TimeSeriesEngine {
         pre_factor_specs: Vec<ExpressionSpec>,
         post_factor_specs: Vec<ExpressionSpec>,
     ) -> Result<Self> {
+        Self::new_with_id_filter(
+            name,
+            input_schema,
+            id_column,
+            dt_column,
+            window_ns,
+            late_data_policy,
+            specs,
+            pre_factor_specs,
+            post_factor_specs,
+            None,
+        )
+    }
+
+    /// Create a new fixed-window aggregation engine with an optional id whitelist.
+    ///
+    /// :param name: Engine instance name.
+    /// :type name: impl Into<String>
+    /// :param input_schema: Input schema consumed by the engine.
+    /// :type input_schema: SchemaRef
+    /// :param id_column: Utf8 identifier column name.
+    /// :type id_column: &str
+    /// :param dt_column: UTC nanosecond timestamp column name.
+    /// :type dt_column: &str
+    /// :param window_ns: Window size in nanoseconds.
+    /// :type window_ns: i64
+    /// :param late_data_policy: Late-row handling mode.
+    /// :type late_data_policy: LateDataPolicy
+    /// :param specs: Aggregation specs appended in stable order.
+    /// :type specs: Vec<Box<dyn AggregationSpec>>
+    /// :param pre_factor_specs: Expression specs evaluated on accepted input rows.
+    /// :type pre_factor_specs: Vec<ExpressionSpec>
+    /// :param post_factor_specs: Expression specs evaluated on aggregate outputs.
+    /// :type post_factor_specs: Vec<ExpressionSpec>
+    /// :param id_filter: Optional exact-match whitelist for the id column.
+    /// :type id_filter: Option<Vec<String>>
+    /// :returns: Initialized time-series engine.
+    /// :rtype: Result<TimeSeriesEngine>
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_id_filter(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        id_column: &str,
+        dt_column: &str,
+        window_ns: i64,
+        late_data_policy: LateDataPolicy,
+        specs: Vec<Box<dyn AggregationSpec>>,
+        pre_factor_specs: Vec<ExpressionSpec>,
+        post_factor_specs: Vec<ExpressionSpec>,
+        id_filter: Option<Vec<String>>,
+    ) -> Result<Self> {
         if window_ns <= 0 {
             return Err(ZippyError::InvalidConfig {
                 reason: format!("window size must be positive window_ns=[{}]", window_ns),
@@ -81,6 +134,7 @@ impl TimeSeriesEngine {
         let agg_schema = build_aggregation_schema(&input_schema, &pre_schema, id_column, &specs)?;
         let (post_factors, output_schema) =
             build_expression_factors(Arc::clone(&agg_schema), post_factor_specs, "post factor")?;
+        let id_filter = normalize_id_filter(id_filter)?;
 
         Ok(Self {
             name: name.into(),
@@ -90,6 +144,7 @@ impl TimeSeriesEngine {
             output_schema,
             id_column: id_column.to_string(),
             dt_column: dt_column.to_string(),
+            id_filter,
             window_ns,
             late_data_policy,
             specs,
@@ -98,6 +153,7 @@ impl TimeSeriesEngine {
             open_windows: BTreeMap::new(),
             last_dt_by_id: BTreeMap::new(),
             pending_late_rows: 0,
+            pending_filtered_rows: 0,
         })
     }
 
@@ -152,6 +208,16 @@ impl TimeSeriesEngine {
     }
 }
 
+fn normalize_id_filter(id_filter: Option<Vec<String>>) -> Result<Option<HashSet<String>>> {
+    match id_filter {
+        Some(values) if values.is_empty() => Err(ZippyError::InvalidConfig {
+            reason: "id_filter must not be empty".to_string(),
+        }),
+        Some(values) => Ok(Some(values.into_iter().collect::<HashSet<_>>())),
+        None => Ok(None),
+    }
+}
+
 impl Engine for TimeSeriesEngine {
     fn name(&self) -> &str {
         &self.name
@@ -174,6 +240,12 @@ impl Engine for TimeSeriesEngine {
                 ),
             });
         }
+
+        if batch.num_rows() == 0 {
+            return Ok(vec![]);
+        }
+
+        let batch = self.filter_by_id_whitelist(batch)?;
 
         if batch.num_rows() == 0 {
             return Ok(vec![]);
@@ -285,9 +357,40 @@ impl Engine for TimeSeriesEngine {
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
         let delta = EngineMetricsDelta {
             late_rows_total: self.pending_late_rows,
+            filtered_rows_total: self.pending_filtered_rows,
         };
         self.pending_late_rows = 0;
+        self.pending_filtered_rows = 0;
         delta
+    }
+}
+
+impl TimeSeriesEngine {
+    fn filter_by_id_whitelist(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let Some(id_filter) = &self.id_filter else {
+            return Ok(batch);
+        };
+
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+
+        let ids = extract_id_array(&batch, &self.id_column)?;
+        let mut kept_rows = Vec::with_capacity(batch.num_rows());
+        let mut filtered_rows = 0u64;
+
+        for row_index in 0..batch.num_rows() {
+            let id = ids.value(row_index);
+
+            if id_filter.contains(id) {
+                kept_rows.push(row_index as u32);
+            } else {
+                filtered_rows += 1;
+            }
+        }
+
+        self.pending_filtered_rows += filtered_rows;
+        filter_record_batch(&batch, &kept_rows, &self.input_schema)
     }
 }
 

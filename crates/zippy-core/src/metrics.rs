@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EngineMetricsDelta {
     pub late_rows_total: u64,
+    pub filtered_rows_total: u64,
 }
 
 #[derive(Default)]
@@ -12,6 +13,7 @@ pub struct EngineMetrics {
     output_batches_total: AtomicU64,
     dropped_batches_total: AtomicU64,
     late_rows_total: AtomicU64,
+    filtered_rows_total: AtomicU64,
     publish_errors_total: AtomicU64,
 }
 
@@ -22,6 +24,7 @@ pub struct EngineMetricsSnapshot {
     pub output_batches_total: u64,
     pub dropped_batches_total: u64,
     pub late_rows_total: u64,
+    pub filtered_rows_total: u64,
     pub publish_errors_total: u64,
     pub queue_depth: usize,
 }
@@ -47,6 +50,10 @@ impl EngineMetrics {
         self.late_rows_total.fetch_add(count, Ordering::Relaxed);
     }
 
+    pub fn inc_filtered_rows(&self, count: u64) {
+        self.filtered_rows_total.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn inc_publish_errors(&self, count: u64) {
         self.publish_errors_total
             .fetch_add(count, Ordering::Relaxed);
@@ -54,6 +61,7 @@ impl EngineMetrics {
 
     pub fn apply_delta(&self, delta: EngineMetricsDelta) {
         self.inc_late_rows(delta.late_rows_total);
+        self.inc_filtered_rows(delta.filtered_rows_total);
     }
 
     pub fn snapshot(&self, queue_depth: usize) -> EngineMetricsSnapshot {
@@ -63,6 +71,7 @@ impl EngineMetrics {
             output_batches_total: self.output_batches_total.load(Ordering::Relaxed),
             dropped_batches_total: self.dropped_batches_total.load(Ordering::Relaxed),
             late_rows_total: self.late_rows_total.load(Ordering::Relaxed),
+            filtered_rows_total: self.filtered_rows_total.load(Ordering::Relaxed),
             publish_errors_total: self.publish_errors_total.load(Ordering::Relaxed),
             queue_depth,
         }

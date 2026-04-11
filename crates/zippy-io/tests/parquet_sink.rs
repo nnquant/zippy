@@ -138,12 +138,12 @@ fn parquet_sink_writes_multiple_files_without_conflict() {
 
 fn read_back_row_count(path: PathBuf) -> usize {
     let file = File::open(path).unwrap();
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .unwrap()
         .build()
         .unwrap();
     let mut rows = 0;
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         rows += batch.unwrap().num_rows();
     }
     rows

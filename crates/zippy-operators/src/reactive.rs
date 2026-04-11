@@ -11,6 +11,32 @@ use zippy_core::{Result, ZippyError};
 
 const LOG_INPUT_MUST_BE_POSITIVE: &str = "log input must be positive";
 
+#[derive(Clone, Copy)]
+pub(crate) enum StatefulFloatKind {
+    Ema { span: usize },
+    Mean { window: usize },
+    Std { window: usize },
+    Delay { period: usize },
+    Diff { period: usize },
+    Return { period: usize },
+}
+
+pub(crate) struct StatefulFloatById {
+    state: StatefulFloatState,
+}
+
+enum StatefulFloatState {
+    Ema {
+        alpha: f64,
+        state_by_id: HashMap<String, f64>,
+    },
+    Window {
+        size: usize,
+        kind: WindowHistoryKind,
+        history_by_id: HashMap<String, VecDeque<f64>>,
+    },
+}
+
 /// Evaluate a stateful factor against rows in input order.
 pub trait ReactiveFactor: Send {
     /// Return the output field definition for this factor.
@@ -51,8 +77,7 @@ impl TsEmaSpec {
             id_field: self.id_field.clone(),
             value_field: self.value_field.clone(),
             output_field: Field::new(&self.output_field, DataType::Float64, false),
-            alpha: 2.0 / (self.span as f64 + 1.0),
-            state_by_id: HashMap::new(),
+            state: StatefulFloatById::new(StatefulFloatKind::Ema { span: self.span }),
         }))
     }
 }
@@ -85,6 +110,136 @@ impl TsMeanSpec {
             &self.output_field,
             WindowHistoryKind::Mean,
         )
+    }
+}
+
+impl StatefulFloatById {
+    pub(crate) fn new(kind: StatefulFloatKind) -> Self {
+        let state = match kind {
+            StatefulFloatKind::Ema { span } => StatefulFloatState::Ema {
+                alpha: 2.0 / (span as f64 + 1.0),
+                state_by_id: HashMap::new(),
+            },
+            StatefulFloatKind::Mean { window } => StatefulFloatState::Window {
+                size: window,
+                kind: WindowHistoryKind::Mean,
+                history_by_id: HashMap::new(),
+            },
+            StatefulFloatKind::Std { window } => StatefulFloatState::Window {
+                size: window,
+                kind: WindowHistoryKind::Std,
+                history_by_id: HashMap::new(),
+            },
+            StatefulFloatKind::Delay { period } => StatefulFloatState::Window {
+                size: period,
+                kind: WindowHistoryKind::Delay,
+                history_by_id: HashMap::new(),
+            },
+            StatefulFloatKind::Diff { period } => StatefulFloatState::Window {
+                size: period,
+                kind: WindowHistoryKind::Diff,
+                history_by_id: HashMap::new(),
+            },
+            StatefulFloatKind::Return { period } => StatefulFloatState::Window {
+                size: period,
+                kind: WindowHistoryKind::Return,
+                history_by_id: HashMap::new(),
+            },
+        };
+
+        Self { state }
+    }
+
+    pub(crate) fn evaluate_optional(
+        &mut self,
+        id: &str,
+        input: Option<f64>,
+    ) -> Result<Option<f64>> {
+        let Some(value) = input else {
+            return Ok(None);
+        };
+
+        match &mut self.state {
+            StatefulFloatState::Ema { alpha, state_by_id } => {
+                let next = match state_by_id.get(id).copied() {
+                    Some(previous) => *alpha * value + (1.0 - *alpha) * previous,
+                    None => value,
+                };
+                state_by_id.insert(id.to_string(), next);
+                Ok(Some(next))
+            }
+            StatefulFloatState::Window {
+                size,
+                kind,
+                history_by_id,
+            } => {
+                let history = history_by_id.entry(id.to_string()).or_default();
+
+                let output = match kind {
+                    WindowHistoryKind::Mean => {
+                        history.push_back(value);
+                        trim_history(history, *size);
+                        if history.len() < *size {
+                            None
+                        } else {
+                            Some(history.iter().copied().sum::<f64>() / *size as f64)
+                        }
+                    }
+                    WindowHistoryKind::Std => {
+                        history.push_back(value);
+                        trim_history(history, *size);
+                        if history.len() < *size {
+                            None
+                        } else {
+                            let mean = history.iter().copied().sum::<f64>() / *size as f64;
+                            let variance = history
+                                .iter()
+                                .map(|item| {
+                                    let centered = *item - mean;
+                                    centered * centered
+                                })
+                                .sum::<f64>()
+                                / *size as f64;
+                            Some(variance.sqrt())
+                        }
+                    }
+                    WindowHistoryKind::Delay => {
+                        let output = if history.len() < *size {
+                            None
+                        } else {
+                            Some(*history.front().expect("history length checked above"))
+                        };
+                        history.push_back(value);
+                        trim_history(history, *size);
+                        output
+                    }
+                    WindowHistoryKind::Diff => {
+                        let output = if history.len() < *size {
+                            None
+                        } else {
+                            let base = *history.front().expect("history length checked above");
+                            Some(value - base)
+                        };
+                        history.push_back(value);
+                        trim_history(history, *size);
+                        output
+                    }
+                    WindowHistoryKind::Return => {
+                        let output = if history.len() < *size {
+                            None
+                        } else {
+                            let base = *history.front().expect("history length checked above");
+                            Some((value / base) - 1.0)
+                        };
+                        history.push_back(value);
+                        trim_history(history, *size);
+                        output
+                    }
+                };
+
+                Ok(output)
+            }
+        }
     }
 }
 
@@ -348,8 +503,7 @@ struct TsEmaFactor {
     id_field: String,
     value_field: String,
     output_field: Field,
-    alpha: f64,
-    state_by_id: HashMap<String, f64>,
+    state: StatefulFloatById,
 }
 
 impl ReactiveFactor for TsEmaFactor {
@@ -364,11 +518,10 @@ impl ReactiveFactor for TsEmaFactor {
         for index in 0..batch.num_rows() {
             let id = ids.value(index);
             let value = values.value(index);
-            let next = match self.state_by_id.get(id).copied() {
-                Some(previous) => self.alpha * value + (1.0 - self.alpha) * previous,
-                None => value,
-            };
-            self.state_by_id.insert(id.to_string(), next);
+            let next = self
+                .state
+                .evaluate_optional(id, Some(value))?
+                .expect("ema emits a value for non-null input");
             builder.append_value(next);
         }
 
@@ -389,9 +542,7 @@ struct WindowHistoryFactor {
     id_field: String,
     value_field: String,
     output_field: Field,
-    size: usize,
-    kind: WindowHistoryKind,
-    history_by_id: HashMap<String, VecDeque<f64>>,
+    state: StatefulFloatById,
 }
 
 impl ReactiveFactor for WindowHistoryFactor {
@@ -406,67 +557,9 @@ impl ReactiveFactor for WindowHistoryFactor {
         for index in 0..batch.num_rows() {
             let id = ids.value(index);
             let value = values.value(index);
-            let history = self.history_by_id.entry(id.to_string()).or_default();
-
-            match self.kind {
-                WindowHistoryKind::Mean => {
-                    history.push_back(value);
-                    trim_history(history, self.size);
-                    if history.len() < self.size {
-                        builder.append_null();
-                    } else {
-                        let sum = history.iter().copied().sum::<f64>();
-                        builder.append_value(sum / self.size as f64);
-                    }
-                }
-                WindowHistoryKind::Std => {
-                    history.push_back(value);
-                    trim_history(history, self.size);
-                    if history.len() < self.size {
-                        builder.append_null();
-                    } else {
-                        let mean = history.iter().copied().sum::<f64>() / self.size as f64;
-                        let variance = history
-                            .iter()
-                            .map(|item| {
-                                let centered = *item - mean;
-                                centered * centered
-                            })
-                            .sum::<f64>()
-                            / self.size as f64;
-                        builder.append_value(variance.sqrt());
-                    }
-                }
-                WindowHistoryKind::Delay => {
-                    if history.len() < self.size {
-                        builder.append_null();
-                    } else {
-                        builder
-                            .append_value(*history.front().expect("history length checked above"));
-                    }
-                    history.push_back(value);
-                    trim_history(history, self.size);
-                }
-                WindowHistoryKind::Diff => {
-                    if history.len() < self.size {
-                        builder.append_null();
-                    } else {
-                        let base = *history.front().expect("history length checked above");
-                        builder.append_value(value - base);
-                    }
-                    history.push_back(value);
-                    trim_history(history, self.size);
-                }
-                WindowHistoryKind::Return => {
-                    if history.len() < self.size {
-                        builder.append_null();
-                    } else {
-                        let base = *history.front().expect("history length checked above");
-                        builder.append_value((value / base) - 1.0);
-                    }
-                    history.push_back(value);
-                    trim_history(history, self.size);
-                }
+            match self.state.evaluate_optional(id, Some(value))? {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
             }
         }
 
@@ -615,9 +708,13 @@ fn build_window_history_factor(
         id_field: id_field.to_string(),
         value_field: value_field.to_string(),
         output_field: Field::new(output_field, DataType::Float64, true),
-        size,
-        kind,
-        history_by_id: HashMap::new(),
+        state: StatefulFloatById::new(match kind {
+            WindowHistoryKind::Mean => StatefulFloatKind::Mean { window: size },
+            WindowHistoryKind::Std => StatefulFloatKind::Std { window: size },
+            WindowHistoryKind::Delay => StatefulFloatKind::Delay { period: size },
+            WindowHistoryKind::Diff => StatefulFloatKind::Diff { period: size },
+            WindowHistoryKind::Return => StatefulFloatKind::Return { period: size },
+        }),
     }))
 }
 

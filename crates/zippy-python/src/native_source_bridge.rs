@@ -148,9 +148,10 @@ fn emit_error_impl(ctx: *mut c_void, reason: *const c_char, len: usize) -> Resul
 }
 
 fn decode_ipc_batch(bytes: &[u8]) -> Result<RecordBatch, ZippyError> {
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|error| ZippyError::Io {
-        reason: format!("native source sink failed to open ipc stream error=[{error}]"),
-    })?;
+    let mut reader =
+        StreamReader::try_new(Cursor::new(bytes), None).map_err(|error| ZippyError::Io {
+            reason: format!("native source sink failed to open ipc stream error=[{error}]"),
+        })?;
     let Some(batch_result) = reader.next() else {
         return Err(ZippyError::Io {
             reason: "native source sink ipc stream contained no batch".to_string(),

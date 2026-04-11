@@ -1,13 +1,13 @@
 #[cfg(feature = "zmq-publisher")]
 mod implementation {
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError, Sender};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use arrow::ipc::convert::{IpcSchemaEncoder, fb_to_schema};
+    use arrow::ipc::convert::{fb_to_schema, IpcSchemaEncoder};
     use arrow::ipc::reader::StreamReader;
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
@@ -171,7 +171,10 @@ mod implementation {
 
     fn decode_schema(payload: &[u8]) -> Result<SchemaRef> {
         let schema = arrow::ipc::root_as_schema(payload).map_err(|error| ZippyError::Io {
-            reason: format!("failed to decode arrow ipc schema payload error=[{}]", error),
+            reason: format!(
+                "failed to decode arrow ipc schema payload error=[{}]",
+                error
+            ),
         })?;
         Ok(Arc::new(fb_to_schema(schema)))
     }
@@ -224,20 +227,12 @@ mod implementation {
         }
 
         let mut frames = frames.into_iter();
-        let kind = MessageKind::parse(
-            &frames
-                .next()
-                .ok_or_else(|| ZippyError::Io {
-                    reason: "failed to decode missing message kind frame".to_string(),
-                })?,
-        )?;
-        let meta = EnvelopeMeta::decode(
-            &frames
-                .next()
-                .ok_or_else(|| ZippyError::Io {
-                    reason: "failed to decode missing meta frame".to_string(),
-                })?,
-        )?;
+        let kind = MessageKind::parse(&frames.next().ok_or_else(|| ZippyError::Io {
+            reason: "failed to decode missing message kind frame".to_string(),
+        })?)?;
+        let meta = EnvelopeMeta::decode(&frames.next().ok_or_else(|| ZippyError::Io {
+            reason: "failed to decode missing meta frame".to_string(),
+        })?)?;
         let payload = frames.next();
 
         Ok(Envelope {
@@ -487,12 +482,7 @@ mod implementation {
                     let result = (|| {
                         stream_maybe_publish_hello_for_command(&socket, &mut state)?;
                         let seq_no = state.allocate_seq_no();
-                        stream_send_repeated_control(
-                            &socket,
-                            &mut state,
-                            MessageKind::Stop,
-                            seq_no,
-                        )
+                        stream_send_repeated_control(&socket, &mut state, MessageKind::Stop, seq_no)
                     })();
                     let _ = ack.send(result.clone());
                     return result;
@@ -796,12 +786,14 @@ mod implementation {
                         ZMQ_RECV_TIMEOUT_MS, error
                     ),
                 })?;
-            socket.connect(&self.endpoint).map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to connect zmq endpoint endpoint=[{}] error=[{}]",
-                    self.endpoint, error
-                ),
-            })?;
+            socket
+                .connect(&self.endpoint)
+                .map_err(|error| ZippyError::Io {
+                    reason: format!(
+                        "failed to connect zmq endpoint endpoint=[{}] error=[{}]",
+                        self.endpoint, error
+                    ),
+                })?;
 
             let mut accepted_hello: Option<StreamHello> = None;
 
@@ -817,7 +809,10 @@ mod implementation {
                     Ok(frames) => frames,
                     Err(zmq::Error::EAGAIN) => continue,
                     Err(error) => {
-                        return Err(socket_error("failed to receive zmq multipart payload", error));
+                        return Err(socket_error(
+                            "failed to receive zmq multipart payload",
+                            error,
+                        ));
                     }
                 };
 
@@ -833,11 +828,10 @@ mod implementation {
 
                 match envelope.kind {
                     MessageKind::Hello => {
-                        let meta_schema_hash = require_schema_hash(&envelope.meta, MessageKind::Hello)?;
-                        let schema = decode_schema(&require_payload(
-                            MessageKind::Hello,
-                            envelope.payload,
-                        )?)?;
+                        let meta_schema_hash =
+                            require_schema_hash(&envelope.meta, MessageKind::Hello)?;
+                        let schema =
+                            decode_schema(&require_payload(MessageKind::Hello, envelope.payload)?)?;
                         let hello = StreamHello::new(
                             &envelope.meta.stream_name,
                             schema,
@@ -874,16 +868,12 @@ mod implementation {
                     }
                     MessageKind::Data => {
                         if accepted_hello.is_none() {
-                            return Err(ZippyError::InvalidConfig {
-                                reason: "source hello must arrive before data".to_string(),
-                            });
+                            continue;
                         }
                         validate_stream_name(&accepted_hello, &envelope.meta.stream_name)?;
 
-                        let batch = decode_batch(&require_payload(
-                            MessageKind::Data,
-                            envelope.payload,
-                        )?)?;
+                        let batch =
+                            decode_batch(&require_payload(MessageKind::Data, envelope.payload)?)?;
                         if batch.schema() != self.expected_schema {
                             return Err(ZippyError::SchemaMismatch {
                                 reason: "incoming batch schema does not match expected schema"
@@ -918,11 +908,9 @@ mod implementation {
                     MessageKind::Error => {
                         validate_stream_name(&accepted_hello, &envelope.meta.stream_name)?;
                         ensure_no_payload(MessageKind::Error, envelope.payload)?;
-                        sink.emit(SourceEvent::Error(
-                            envelope.meta.message.unwrap_or_else(|| {
-                                "remote source sent empty error message".to_string()
-                            }),
-                        ))?;
+                        sink.emit(SourceEvent::Error(envelope.meta.message.unwrap_or_else(
+                            || "remote source sent empty error message".to_string(),
+                        )))?;
                         return Ok(());
                     }
                 }
@@ -930,10 +918,7 @@ mod implementation {
         }
     }
 
-    fn validate_stream_name(
-        accepted_hello: &Option<StreamHello>,
-        stream_name: &str,
-    ) -> Result<()> {
+    fn validate_stream_name(accepted_hello: &Option<StreamHello>, stream_name: &str) -> Result<()> {
         if let Some(accepted_hello) = accepted_hello.as_ref() {
             if accepted_hello.stream_name != stream_name {
                 return Err(ZippyError::InvalidConfig {

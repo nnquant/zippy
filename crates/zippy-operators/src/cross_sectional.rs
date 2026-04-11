@@ -206,12 +206,13 @@ impl CrossSectionalFactor for CSDemeanFactor {
 }
 
 fn float64_values(batch: &RecordBatch, value_field: &str) -> Result<Vec<Option<f64>>> {
-    let column_index = batch
-        .schema()
-        .index_of(value_field)
-        .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing value field [{value_field}]"),
-        })?;
+    let column_index =
+        batch
+            .schema()
+            .index_of(value_field)
+            .map_err(|_| ZippyError::SchemaMismatch {
+                reason: format!("missing value field [{value_field}]"),
+            })?;
     let column = batch.column(column_index);
 
     if column.data_type() != &DataType::Float64 {

@@ -9,9 +9,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Result, ZippyError};
 
-use crate::reactive::ReactiveFactor;
+use crate::reactive::{ReactiveFactor, StatefulFloatById, StatefulFloatKind};
 
-const EXPRESSION_DIVISION_BY_ZERO: &str = "expression division by zero";
 const EXPRESSION_LOG_INPUT_MUST_BE_POSITIVE: &str = "expression log input must be positive";
 const EXPRESSION_CLIP_BOUNDS_INVALID: &str = "expression clip bounds invalid";
 
@@ -57,6 +56,16 @@ impl ExpressionSpec {
 
         ReactiveExpressionPlan::build(ast, id_field, &self.output_field)
     }
+
+    /// Build a reactive factor backed by the typed reactive expression plan.
+    pub fn build_reactive_factor(
+        &self,
+        input_schema: &Schema,
+        id_field: &str,
+    ) -> Result<Box<dyn ReactiveFactor>> {
+        let plan = self.build_reactive_plan(input_schema, id_field)?;
+        Ok(Box::new(PlannedExpressionFactor::new(plan)))
+    }
 }
 
 struct ExpressionFactor {
@@ -77,6 +86,94 @@ impl ReactiveFactor for ExpressionFactor {
         }
 
         build_output_array(self.output_field.data_type(), values)
+    }
+}
+
+struct PlannedExpressionFactor {
+    plan: ReactiveExpressionPlan,
+    node_states: Vec<Option<StatefulFloatById>>,
+}
+
+impl PlannedExpressionFactor {
+    fn new(plan: ReactiveExpressionPlan) -> Self {
+        let node_states = plan
+            .nodes
+            .iter()
+            .map(|node| match &node.kind {
+                ReactivePlanNodeKind::TsOp { op, .. } => {
+                    Some(StatefulFloatById::new(op.stateful_kind()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        Self { plan, node_states }
+    }
+}
+
+impl ReactiveFactor for PlannedExpressionFactor {
+    fn output_field(&self) -> Field {
+        self.plan.output_field()
+    }
+
+    fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let id_index = batch.schema().index_of(self.plan.id_field()).map_err(|_| {
+            ZippyError::SchemaMismatch {
+                reason: format!("missing utf8 id field field=[{}]", self.plan.id_field()),
+            }
+        })?;
+        let id_array = batch
+            .column(id_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ZippyError::SchemaMismatch {
+                reason: format!("id field must be utf8 field=[{}]", self.plan.id_field()),
+            })?;
+
+        if id_array.null_count() > 0 {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!("id field contains nulls field=[{}]", self.plan.id_field()),
+            });
+        }
+
+        let mut output_values = Vec::with_capacity(batch.num_rows());
+
+        for row in 0..batch.num_rows() {
+            let id = id_array.value(row);
+            let mut row_values = Vec::with_capacity(self.plan.nodes.len());
+
+            for node in &self.plan.nodes {
+                let value = match &node.kind {
+                    ReactivePlanNodeKind::Input { field } => {
+                        extract_batch_value(batch, field, row)?
+                    }
+                    ReactivePlanNodeKind::Literal(PlanLiteral::Number(value)) => {
+                        EvalValue::Float64(*value)
+                    }
+                    ReactivePlanNodeKind::Literal(PlanLiteral::String(value)) => {
+                        EvalValue::String(value.clone())
+                    }
+                    ReactivePlanNodeKind::ColumnOp { op, inputs } => {
+                        evaluate_planned_column_op(*op, inputs, &row_values)?
+                    }
+                    ReactivePlanNodeKind::TsOp { op: _, inputs } => {
+                        let input = row_values[inputs[0].as_usize()].clone();
+                        let state = self.node_states[node.id.as_usize()]
+                            .as_mut()
+                            .expect("ts state initialized for ts nodes");
+                        match state.evaluate_optional(id, input.as_f64()?)? {
+                            Some(value) => EvalValue::Float64(value),
+                            None => EvalValue::Null,
+                        }
+                    }
+                };
+                row_values.push(value);
+            }
+
+            output_values.push(row_values[self.plan.output_node.as_usize()].clone());
+        }
+
+        build_output_array(self.plan.output_field.data_type(), output_values)
     }
 }
 
@@ -190,6 +287,19 @@ enum PlannedTsOp {
     Delay { period: usize },
     Diff { period: usize },
     Return { period: usize },
+}
+
+impl PlannedTsOp {
+    fn stateful_kind(self) -> StatefulFloatKind {
+        match self {
+            Self::Ema { span } => StatefulFloatKind::Ema { span },
+            Self::Mean { window } => StatefulFloatKind::Mean { window },
+            Self::Std { window } => StatefulFloatKind::Std { window },
+            Self::Delay { period } => StatefulFloatKind::Delay { period },
+            Self::Diff { period } => StatefulFloatKind::Diff { period },
+            Self::Return { period } => StatefulFloatKind::Return { period },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1169,83 @@ fn expr_signature(expr: &TypedExpr) -> String {
     }
 }
 
+fn evaluate_planned_column_op(
+    op: PlannedColumnOp,
+    inputs: &[PlanNodeId],
+    row_values: &[EvalValue],
+) -> Result<EvalValue> {
+    match op {
+        PlannedColumnOp::UnaryNeg => match row_values[inputs[0].as_usize()].as_f64()? {
+            Some(value) => Ok(EvalValue::Float64(-value)),
+            None => Ok(EvalValue::Null),
+        },
+        PlannedColumnOp::Binary(binary_op) => {
+            let left = row_values[inputs[0].as_usize()].as_f64()?;
+            let right = row_values[inputs[1].as_usize()].as_f64()?;
+            let Some(left) = left else {
+                return Ok(EvalValue::Null);
+            };
+            let Some(right) = right else {
+                return Ok(EvalValue::Null);
+            };
+
+            let value = match binary_op {
+                BinaryOp::Add => left + right,
+                BinaryOp::Sub => left - right,
+                BinaryOp::Mul => left * right,
+                BinaryOp::Div => {
+                    if right == 0.0 {
+                        return Ok(EvalValue::Null);
+                    }
+                    left / right
+                }
+            };
+
+            Ok(EvalValue::Float64(value))
+        }
+        PlannedColumnOp::Function(function_op) => match function_op {
+            PlannedFunctionOp::Abs => match row_values[inputs[0].as_usize()].as_f64()? {
+                Some(value) => Ok(EvalValue::Float64(value.abs())),
+                None => Ok(EvalValue::Null),
+            },
+            PlannedFunctionOp::Log => match row_values[inputs[0].as_usize()].as_f64()? {
+                Some(value) => {
+                    if value <= 0.0 {
+                        return Err(ZippyError::InvalidState {
+                            status: EXPRESSION_LOG_INPUT_MUST_BE_POSITIVE,
+                        });
+                    }
+                    Ok(EvalValue::Float64(value.ln()))
+                }
+                None => Ok(EvalValue::Null),
+            },
+            PlannedFunctionOp::Clip => {
+                let value = row_values[inputs[0].as_usize()].as_f64()?;
+                let min = row_values[inputs[1].as_usize()].as_f64()?;
+                let max = row_values[inputs[2].as_usize()].as_f64()?;
+                let Some(value) = value else {
+                    return Ok(EvalValue::Null);
+                };
+                let Some(min) = min else {
+                    return Ok(EvalValue::Null);
+                };
+                let Some(max) = max else {
+                    return Ok(EvalValue::Null);
+                };
+                if min > max {
+                    return Err(ZippyError::InvalidState {
+                        status: EXPRESSION_CLIP_BOUNDS_INVALID,
+                    });
+                }
+                Ok(EvalValue::Float64(value.clamp(min, max)))
+            }
+            PlannedFunctionOp::Cast(kind) => {
+                cast_value(kind, row_values[inputs[0].as_usize()].clone())
+            }
+        },
+    }
+}
+
 fn evaluate_expr(expr: &TypedExpr, batch: &RecordBatch, row: usize) -> Result<EvalValue> {
     match &expr.kind {
         TypedExprKind::Number(value) => Ok(EvalValue::Float64(*value)),
@@ -1087,9 +1274,7 @@ fn evaluate_expr(expr: &TypedExpr, batch: &RecordBatch, row: usize) -> Result<Ev
                 BinaryOp::Mul => left * right,
                 BinaryOp::Div => {
                     if right == 0.0 {
-                        return Err(ZippyError::InvalidState {
-                            status: EXPRESSION_DIVISION_BY_ZERO,
-                        });
+                        return Ok(EvalValue::Null);
                     }
                     left / right
                 }

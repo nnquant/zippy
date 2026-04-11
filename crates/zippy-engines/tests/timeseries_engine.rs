@@ -102,7 +102,7 @@ fn post_invalid_input_exprs() -> Vec<ExpressionSpec> {
 }
 
 fn post_invalid_runtime_exprs() -> Vec<ExpressionSpec> {
-    vec![ExpressionSpec::new("log(close - open)", "bad_log")]
+    vec![ExpressionSpec::new("LOG(close - open)", "bad_log")]
 }
 
 #[test]
@@ -253,6 +253,126 @@ fn timeseries_engine_rejects_late_data_for_same_id() {
     assert_eq!(float_values(flushed[0].column(3)), vec![12.0]);
     assert_eq!(float_values(flushed[0].column(4)), vec![12.0]);
     assert_eq!(float_values(flushed[0].column(5)), vec![12.0]);
+}
+
+#[test]
+fn timeseries_engine_id_filter_keeps_only_whitelisted_rows_and_counts_filtered_rows() {
+    let mut engine = TimeSeriesEngine::new_with_id_filter(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        specs(),
+        vec![],
+        vec![],
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["A", "B"],
+            vec![1_000_000_000, 2_000_000_000],
+            vec![10.0, 99.0],
+            vec![1.0, 1.0],
+        ))
+        .unwrap();
+
+    assert!(outputs.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(string_values(flushed[0].column(0)), vec!["A".to_string()]);
+    assert_eq!(float_values(flushed[0].column(3)), vec![10.0]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn timeseries_engine_filtered_rows_do_not_increment_late_rows_metric() {
+    let mut engine = TimeSeriesEngine::new_with_id_filter(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::DropWithMetric,
+        specs(),
+        vec![],
+        vec![],
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["B", "B"],
+            vec![MINUTE_NS + 1_000_000_000, 30_000_000_000],
+            vec![20.0, 21.0],
+            vec![1.0, 1.0],
+        ))
+        .unwrap();
+
+    assert!(outputs.is_empty());
+    let metrics = engine.drain_metrics();
+    assert_eq!(metrics.late_rows_total, 0);
+    assert_eq!(metrics.filtered_rows_total, 2);
+}
+
+#[test]
+fn timeseries_engine_all_filtered_batch_returns_no_output_and_no_error() {
+    let mut engine = TimeSeriesEngine::new_with_id_filter(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        specs(),
+        vec![],
+        vec![],
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["B", "C"],
+            vec![1_000_000_000, 2_000_000_000],
+            vec![20.0, 21.0],
+            vec![1.0, 1.0],
+        ))
+        .unwrap();
+
+    assert!(outputs.is_empty());
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 2);
+    assert!(engine.on_flush().unwrap().is_empty());
+}
+
+#[test]
+fn timeseries_engine_rejects_empty_id_filter() {
+    let result = TimeSeriesEngine::new_with_id_filter(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        specs(),
+        vec![],
+        vec![],
+        Some(vec![]),
+    );
+
+    match result {
+        Err(ZippyError::InvalidConfig { reason }) => {
+            assert!(reason.contains("id_filter must not be empty"));
+        }
+        Ok(_) => panic!("expected empty id_filter to be rejected"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
@@ -469,6 +589,47 @@ fn timeseries_runtime_records_late_rows_metric_for_drop_with_metric() {
 }
 
 #[test]
+fn timeseries_runtime_records_filtered_rows_metric() {
+    let engine = TimeSeriesEngine::new_with_id_filter(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        specs(),
+        vec![],
+        vec![],
+        Some(vec!["a".to_string()]),
+    )
+    .unwrap();
+    let mut handle = spawn_engine(
+        engine,
+        EngineConfig {
+            name: "timeseries-filtered-metric".to_string(),
+            buffer_capacity: 16,
+            overflow_policy: Default::default(),
+            late_data_policy: LateDataPolicy::Reject,
+        },
+    )
+    .unwrap();
+
+    handle
+        .write(batch(
+            vec!["a", "b"],
+            vec![1_000_000_000, 2_000_000_000],
+            vec![10.0, 99.0],
+            vec![1.0, 1.0],
+        ))
+        .unwrap();
+
+    handle.stop().unwrap();
+
+    assert_eq!(handle.metrics().filtered_rows_total, 1);
+    assert_eq!(handle.metrics().late_rows_total, 0);
+}
+
+#[test]
 fn timeseries_engine_pre_factors_can_generate_columns_for_agg_sum_inputs() {
     let mut engine = TimeSeriesEngine::new(
         "bars",
@@ -579,6 +740,54 @@ fn timeseries_engine_post_factors_reject_raw_input_column_references() {
 }
 
 #[test]
+fn timeseries_engine_pre_factors_reject_ts_expr_nodes() {
+    let result = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![AggSumSpec::new("value", "sum_value").build().unwrap()],
+        vec![ExpressionSpec::new("TS_DIFF(value, 2)", "bad")],
+        vec![],
+    );
+
+    match result {
+        Err(ZippyError::InvalidConfig { reason }) => {
+            assert!(reason.contains("stateful expression function requires build_reactive_plan"));
+            assert!(reason.contains("function=[TS_DIFF]"));
+        }
+        Ok(_) => panic!("expected pre factor with TS_* expression to be rejected"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn timeseries_engine_post_factors_reject_ts_expr_nodes() {
+    let result = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![AggSumSpec::new("value", "sum_value").build().unwrap()],
+        vec![],
+        vec![ExpressionSpec::new("TS_STD(sum_value, 2)", "bad")],
+    );
+
+    match result {
+        Err(ZippyError::InvalidConfig { reason }) => {
+            assert!(reason.contains("stateful expression function requires build_reactive_plan"));
+            assert!(reason.contains("function=[TS_STD]"));
+        }
+        Ok(_) => panic!("expected post factor with TS_* expression to be rejected"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn timeseries_engine_flush_runs_post_factors() {
     let mut engine = TimeSeriesEngine::new(
         "bars",
@@ -680,7 +889,7 @@ fn timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors() {
         vec![AggSumSpec::new("log_value", "sum_log_value")
             .build()
             .unwrap()],
-        vec![ExpressionSpec::new("log(value)", "log_value")],
+        vec![ExpressionSpec::new("LOG(value)", "log_value")],
         vec![],
     )
     .unwrap();

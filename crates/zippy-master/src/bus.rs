@@ -1,0 +1,228 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use zippy_core::bus_protocol::{ReaderDescriptor, WriterDescriptor, BUS_LAYOUT_VERSION};
+
+use crate::ring::{ReaderAttachment, StreamRing};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusError {
+    StreamAlreadyExists {
+        stream_name: String,
+    },
+    StreamNotFound {
+        stream_name: String,
+    },
+    InvalidRingCapacity {
+        stream_name: String,
+        ring_capacity: usize,
+    },
+    WriterAlreadyAttached {
+        stream_name: String,
+        writer_process_id: String,
+    },
+    ReaderNotFound {
+        stream_name: String,
+        reader_id: String,
+    },
+    StorageInitFailed {
+        stream_name: String,
+        reason: String,
+    },
+}
+
+impl fmt::Display for BusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StreamAlreadyExists { stream_name } => {
+                write!(f, "stream already exists stream_name=[{}]", stream_name)
+            }
+            Self::StreamNotFound { stream_name } => {
+                write!(f, "stream not found stream_name=[{}]", stream_name)
+            }
+            Self::InvalidRingCapacity {
+                stream_name,
+                ring_capacity,
+            } => write!(
+                f,
+                "invalid ring capacity stream_name=[{}] ring_capacity=[{}]",
+                stream_name, ring_capacity
+            ),
+            Self::WriterAlreadyAttached {
+                stream_name,
+                writer_process_id,
+            } => write!(
+                f,
+                "writer already attached stream_name=[{}] writer_process_id=[{}]",
+                stream_name, writer_process_id
+            ),
+            Self::ReaderNotFound {
+                stream_name,
+                reader_id,
+            } => write!(
+                f,
+                "reader not found stream_name=[{}] reader_id=[{}]",
+                stream_name, reader_id
+            ),
+            Self::StorageInitFailed {
+                stream_name,
+                reason,
+            } => write!(
+                f,
+                "storage init failed stream_name=[{}] reason=[{}]",
+                stream_name, reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BusError {}
+
+#[derive(Debug)]
+struct StreamState {
+    ring: StreamRing,
+    writer_process_id: Option<String>,
+    writer_id: Option<String>,
+    shm_name: String,
+    layout_version: u32,
+}
+
+#[derive(Debug)]
+pub struct Bus {
+    streams: BTreeMap<String, StreamState>,
+    root_dir: PathBuf,
+    instance_id: String,
+}
+
+impl Default for Bus {
+    fn default() -> Self {
+        let instance_id = format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root_dir = std::env::temp_dir().join("zippy-master-bus");
+        Self {
+            streams: BTreeMap::new(),
+            root_dir,
+            instance_id,
+        }
+    }
+}
+
+impl Bus {
+    pub fn create_stream(
+        &mut self,
+        stream_name: &str,
+        ring_capacity: usize,
+    ) -> Result<(), BusError> {
+        if self.streams.contains_key(stream_name) {
+            return Err(BusError::StreamAlreadyExists {
+                stream_name: stream_name.to_string(),
+            });
+        }
+
+        let ring =
+            StreamRing::new(ring_capacity).map_err(|error| BusError::InvalidRingCapacity {
+                stream_name: stream_name.to_string(),
+                ring_capacity: error.capacity,
+            })?;
+
+        std::fs::create_dir_all(&self.root_dir).map_err(|error| BusError::StorageInitFailed {
+            stream_name: stream_name.to_string(),
+            reason: error.to_string(),
+        })?;
+
+        let stream_dir = self
+            .root_dir
+            .join(format!("{}_{}", stream_name, self.instance_id));
+        std::fs::create_dir_all(&stream_dir).map_err(|error| BusError::StorageInitFailed {
+            stream_name: stream_name.to_string(),
+            reason: error.to_string(),
+        })?;
+
+        self.streams.insert(
+            stream_name.to_string(),
+            StreamState {
+                ring,
+                writer_process_id: None,
+                writer_id: None,
+                shm_name: stream_dir.to_string_lossy().into_owned(),
+                layout_version: BUS_LAYOUT_VERSION,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn write_to(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+    ) -> Result<WriterDescriptor, BusError> {
+        let Some(stream) = self.streams.get_mut(stream_name) else {
+            return Err(BusError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            });
+        };
+
+        if let Some(writer_process_id) = &stream.writer_process_id {
+            return Err(BusError::WriterAlreadyAttached {
+                stream_name: stream_name.to_string(),
+                writer_process_id: writer_process_id.clone(),
+            });
+        }
+
+        let writer_id = format!("{stream_name}_writer");
+        let ring_capacity = stream.ring.capacity();
+        let next_write_seq = stream.ring.next_write_seq();
+        stream.writer_process_id = Some(process_id.to_string());
+        stream.writer_id = Some(writer_id.clone());
+
+        Ok(WriterDescriptor {
+            stream_name: stream_name.to_string(),
+            ring_capacity,
+            layout_version: stream.layout_version,
+            shm_name: stream.shm_name.clone(),
+            writer_id,
+            process_id: process_id.to_string(),
+            next_write_seq,
+        })
+    }
+
+    pub fn read_from(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+    ) -> Result<ReaderDescriptor, BusError> {
+        let Some(stream) = self.streams.get_mut(stream_name) else {
+            return Err(BusError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            });
+        };
+
+        let ReaderAttachment {
+            reader_id,
+            next_read_seq,
+        } = stream.ring.attach_reader();
+
+        Ok(ReaderDescriptor {
+            stream_name: stream_name.to_string(),
+            ring_capacity: stream.ring.capacity(),
+            layout_version: stream.layout_version,
+            shm_name: stream.shm_name.clone(),
+            reader_id,
+            process_id: process_id.to_string(),
+            next_read_seq,
+        })
+    }
+
+    pub fn remove_stream(&mut self, stream_name: &str) {
+        if let Some(stream) = self.streams.remove(stream_name) {
+            let _ = std::fs::remove_dir_all(stream.shm_name);
+        }
+    }
+}

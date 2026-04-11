@@ -1,0 +1,57 @@
+"""
+Shared helpers for the zippy Python CLI.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import NoReturn
+
+import click
+
+DEFAULT_CONTROL_ENDPOINT = "~/.zippy/master.sock"
+
+
+def echo_json(payload: object) -> None:
+    """
+    Emit a JSON payload to stdout.
+
+    :param payload: JSON-serializable Python object.
+    :type payload: object
+    """
+    click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def resolve_control_endpoint(control_endpoint: str) -> str:
+    """
+    Expand a user-facing control endpoint path.
+
+    :param control_endpoint: Raw CLI control endpoint value.
+    :type control_endpoint: str
+    :returns: Expanded filesystem path.
+    :rtype: str
+    """
+    return str(Path(control_endpoint).expanduser())
+
+
+def ensure_control_parent_dir(control_endpoint: str) -> None:
+    """
+    Ensure the parent directory for a Unix socket path exists.
+
+    :param control_endpoint: Expanded control endpoint path.
+    :type control_endpoint: str
+    """
+    parent = Path(control_endpoint).parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+
+def cli_error(message: str) -> NoReturn:
+    """
+    Raise a CLI-friendly error.
+
+    :param message: Human-readable error message.
+    :type message: str
+    :raises click.ClickException: Always.
+    """
+    raise click.ClickException(message)

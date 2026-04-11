@@ -125,7 +125,9 @@ impl CrossSectionalEngine {
         match self.late_data_policy {
             LateDataPolicy::Reject => Err(ZippyError::LateData {
                 dt,
-                last_dt: current_bucket_start.or(last_closed_bucket_start).unwrap_or(dt),
+                last_dt: current_bucket_start
+                    .or(last_closed_bucket_start)
+                    .unwrap_or(dt),
             }),
             LateDataPolicy::DropWithMetric => {
                 *pending_late_rows += 1;
@@ -252,6 +254,7 @@ impl Engine for CrossSectionalEngine {
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
         let delta = EngineMetricsDelta {
             late_rows_total: self.pending_late_rows,
+            filtered_rows_total: 0,
         };
         self.pending_late_rows = 0;
         delta
@@ -310,7 +313,10 @@ fn build_bucket_batch<'a>(
     rows: impl Iterator<Item = &'a OwnedRow>,
 ) -> Result<RecordBatch> {
     concat_batches(schema, rows.map(|row| &row.batch)).map_err(|error| ZippyError::Io {
-        reason: format!("failed to build cross-sectional bucket batch error=[{}]", error),
+        reason: format!(
+            "failed to build cross-sectional bucket batch error=[{}]",
+            error
+        ),
     })
 }
 

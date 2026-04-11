@@ -4,6 +4,9 @@ import pyarrow as pa
 __version__: str
 
 
+def run_master_daemon(control_endpoint: str) -> None: ...
+
+
 def setup_log(
     app: str,
     level: str = "info",
@@ -11,6 +14,14 @@ def setup_log(
     to_console: bool = True,
     to_file: bool = True,
 ) -> dict[str, str | None]: ...
+
+
+def log_info(
+    component: str,
+    event: str,
+    message: str,
+    status: str | None = None,
+) -> None: ...
 
 
 class _WindowTypeValue: ...
@@ -255,6 +266,66 @@ class ZmqSource:
     ) -> None: ...
 
 
+class MasterServer:
+    def __init__(self, control_endpoint: str) -> None: ...
+
+    def start(self, startup_timeout_sec: float = 10.0, /) -> None: ...
+
+    def join(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class BusWriter:
+    def write(self, value: WriteValue) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class BusReader:
+    def read(self, timeout_ms: int = 1000) -> pa.RecordBatch: ...
+
+    def seek_latest(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class MasterClient:
+    def __init__(self, control_endpoint: str) -> None: ...
+
+    def register_process(self, app: str) -> str: ...
+
+    def process_id(self) -> str | None: ...
+
+    def control_endpoint(self) -> str: ...
+
+    def register_stream(self, stream_name: str, schema: pa.Schema, ring_capacity: int) -> None: ...
+
+    def write_to(self, stream_name: str) -> BusWriter: ...
+
+    def read_from(self, stream_name: str) -> BusReader: ...
+
+    def list_streams(self) -> list[dict[str, object]]: ...
+
+    def get_stream(self, stream_name: str) -> dict[str, object]: ...
+
+
+class BusStreamTarget:
+    def __init__(self, stream_name: str, master: MasterClient) -> None: ...
+
+
+class BusStreamSource:
+    def __init__(
+        self,
+        stream_name: str,
+        expected_schema: pa.Schema,
+        master: MasterClient,
+        mode: _SourceModeValue | None = None,
+    ) -> None: ...
+
+
 WriteValue = (
     pl.DataFrame
     | pa.RecordBatch
@@ -266,7 +337,8 @@ PublisherTarget = (
     NullPublisher
     | ZmqPublisher
     | ZmqStreamPublisher
-    | list[NullPublisher | ZmqPublisher | ZmqStreamPublisher]
+    | BusStreamTarget
+    | list[NullPublisher | ZmqPublisher | ZmqStreamPublisher | BusStreamTarget]
 )
 ReactiveFactor = (
     TsEmaSpec
@@ -302,7 +374,8 @@ class ReactiveStateEngine:
         factors: list[ReactiveFactor],
         target: PublisherTarget,
         *,
-        source: ReactiveStateEngine | TimeSeriesEngine | ZmqSource | None = None,
+        id_filter: list[str] | None = None,
+        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | BusStreamSource | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -333,7 +406,7 @@ class StreamTableEngine:
         input_schema: pa.Schema,
         target: PublisherTarget,
         *,
-        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | None = None,
+        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | BusStreamSource | None = None,
         sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -373,7 +446,8 @@ class TimeSeriesEngine:
         window_ns: int | None = None,
         pre_factors: list[ExpressionFactor] | None = None,
         post_factors: list[ExpressionFactor] | None = None,
-        source: ReactiveStateEngine | TimeSeriesEngine | None = None,
+        id_filter: list[str] | None = None,
+        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | BusStreamSource | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,

@@ -5,8 +5,8 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use serde_json::Value;
 use std::env;
 use std::fs::OpenOptions;
-use std::sync::{Arc, Mutex};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing_subscriber::prelude::*;
@@ -308,9 +308,7 @@ fn start_flush_stop_case() {
     )
     .unwrap();
 
-    handle
-        .write(single_price_batch(schema, 1.0))
-        .unwrap();
+    handle.write(single_price_batch(schema, 1.0)).unwrap();
     let flushed = handle.flush().unwrap();
     assert_eq!(flushed.len(), 1);
     handle.stop().unwrap();

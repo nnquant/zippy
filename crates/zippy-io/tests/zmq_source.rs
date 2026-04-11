@@ -5,7 +5,7 @@ use std::{thread, time::Duration};
 
 use arrow::array::Float64Array;
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::convert::{IpcSchemaEncoder, fb_to_schema};
+use arrow::ipc::convert::{fb_to_schema, IpcSchemaEncoder};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Result, SchemaRef, Source, SourceEvent, SourceHandle, SourceMode, SourceSink};
@@ -203,10 +203,9 @@ impl ManualPublisher {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::PUB).unwrap();
         socket.bind(WILDCARD_ENDPOINT).unwrap();
-        let endpoint = socket
-            .get_last_endpoint()
-            .unwrap()
-            .unwrap_or_else(|bytes| panic!("failed to decode zmq last endpoint bytes=[{:?}]", bytes));
+        let endpoint = socket.get_last_endpoint().unwrap().unwrap_or_else(|bytes| {
+            panic!("failed to decode zmq last endpoint bytes=[{:?}]", bytes)
+        });
 
         Self {
             _context: context,
@@ -224,12 +223,7 @@ fn bind_manual_publisher() -> ManualPublisher {
     ManualPublisher::bind()
 }
 
-fn send_manual_message(
-    socket: &zmq::Socket,
-    kind: &str,
-    meta: Vec<u8>,
-    payload: Option<Vec<u8>>,
-) {
+fn send_manual_message(socket: &zmq::Socket, kind: &str, meta: Vec<u8>, payload: Option<Vec<u8>>) {
     for _ in 0..MANUAL_SEND_REPEAT_COUNT {
         let mut frames = vec![kind.as_bytes().to_vec(), meta.clone()];
         if let Some(payload) = payload.clone() {
@@ -241,13 +235,8 @@ fn send_manual_message(
 }
 
 fn start_source(endpoint: &str) -> (SourceHandle, Arc<RecordingSink>) {
-    let source = ZmqSource::connect(
-        "bars_source",
-        endpoint,
-        test_schema(),
-        SourceMode::Pipeline,
-    )
-    .unwrap();
+    let source =
+        ZmqSource::connect("bars_source", endpoint, test_schema(), SourceMode::Pipeline).unwrap();
     let sink = Arc::new(RecordingSink::default());
     let handle = Box::new(source).start(sink.clone()).unwrap();
     sleep_for_pubsub();
@@ -256,7 +245,8 @@ fn start_source(endpoint: &str) -> (SourceHandle, Arc<RecordingSink>) {
 
 #[test]
 fn zmq_source_protocol_hello_schema_encodes_correctly() {
-    let mut publisher = ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
+    let mut publisher =
+        ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let context = zmq::Context::new();
     let subscriber = context.socket(zmq::SUB).unwrap();
@@ -285,7 +275,8 @@ fn zmq_source_protocol_hello_schema_encodes_correctly() {
 
 #[test]
 fn zmq_source_decodes_data_payload_from_stream_publisher() {
-    let mut publisher = ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
+    let mut publisher =
+        ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let (handle, sink) = start_source(&endpoint);
 
@@ -351,15 +342,19 @@ fn zmq_source_decodes_flush_and_stop_without_payload_when_seq_no_present() {
     handle.join().unwrap();
 
     let events = sink.snapshot();
-    assert!(events.iter().any(|event| *event == RecordedEventSnapshot::Flush));
-    assert!(events.iter().any(|event| *event == RecordedEventSnapshot::Stop));
+    assert!(events
+        .iter()
+        .any(|event| *event == RecordedEventSnapshot::Flush));
+    assert!(events
+        .iter()
+        .any(|event| *event == RecordedEventSnapshot::Stop));
 }
 
 #[test]
-fn zmq_source_rejects_data_before_hello() {
+fn zmq_source_ignores_data_before_hello_until_stream_lock() {
     let manual_publisher = bind_manual_publisher();
     let endpoint = manual_publisher.endpoint().to_string();
-    let (handle, _sink) = start_source(&endpoint);
+    let (handle, sink) = start_source(&endpoint);
     let socket = &manual_publisher.socket;
 
     sleep_for_pubsub();
@@ -369,9 +364,63 @@ fn zmq_source_rejects_data_before_hello() {
         encode_meta(PROTOCOL_VERSION, STREAM_NAME, Some(1), None, None),
         Some(encode_batch(&test_batch())),
     );
+    thread::sleep(Duration::from_millis(100));
+    send_manual_message(
+        socket,
+        "HELLO",
+        encode_meta(
+            PROTOCOL_VERSION,
+            STREAM_NAME,
+            Some(2),
+            Some(&expected_schema_hash(&test_schema())),
+            None,
+        ),
+        Some(encode_schema(&test_schema())),
+    );
+    thread::sleep(Duration::from_millis(100));
+    send_manual_message(
+        socket,
+        "DATA",
+        encode_meta(
+            PROTOCOL_VERSION,
+            STREAM_NAME,
+            Some(3),
+            Some(&expected_schema_hash(&test_schema())),
+            None,
+        ),
+        Some(encode_batch(&test_batch())),
+    );
+    send_manual_message(
+        socket,
+        "STOP",
+        encode_meta(
+            PROTOCOL_VERSION,
+            STREAM_NAME,
+            Some(4),
+            Some(&expected_schema_hash(&test_schema())),
+            None,
+        ),
+        None,
+    );
 
-    let error = handle.join().unwrap_err();
-    assert!(error.to_string().contains("hello"));
+    handle.join().unwrap();
+
+    let events = sink.snapshot();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, RecordedEventSnapshot::Hello { .. }))
+            .count(),
+        1
+    );
+    let data_events = events
+        .iter()
+        .filter(|event| matches!(event, RecordedEventSnapshot::Data(_)))
+        .count();
+    assert_eq!(data_events, MANUAL_SEND_REPEAT_COUNT);
+    assert!(events
+        .iter()
+        .any(|event| *event == RecordedEventSnapshot::Stop));
 }
 
 #[test]
@@ -467,8 +516,12 @@ fn zmq_source_accepts_repeated_consistent_hello() {
             .count(),
         1
     );
-    assert!(events.iter().any(|event| matches!(event, RecordedEventSnapshot::Data(_))));
-    assert!(events.iter().any(|event| *event == RecordedEventSnapshot::Stop));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, RecordedEventSnapshot::Data(_))));
+    assert!(events
+        .iter()
+        .any(|event| *event == RecordedEventSnapshot::Stop));
 }
 
 #[test]
@@ -495,7 +548,13 @@ fn zmq_source_rejects_repeated_inconsistent_hello() {
     send_manual_message(
         socket,
         "HELLO",
-        encode_meta(PROTOCOL_VERSION, STREAM_NAME, Some(2), Some("deadbeef"), None),
+        encode_meta(
+            PROTOCOL_VERSION,
+            STREAM_NAME,
+            Some(2),
+            Some("deadbeef"),
+            None,
+        ),
         Some(encode_schema(&test_schema())),
     );
 
@@ -600,7 +659,8 @@ fn zmq_source_rejects_stop_without_seq_no() {
 
 #[test]
 fn zmq_source_publisher_emits_seq_no_on_flush_and_stop() {
-    let mut publisher = ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
+    let mut publisher =
+        ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let context = zmq::Context::new();
     let subscriber = context.socket(zmq::SUB).unwrap();
@@ -636,7 +696,8 @@ fn zmq_source_publisher_emits_seq_no_on_flush_and_stop() {
 
 #[test]
 fn zmq_source_publisher_repeats_hello_during_runtime() {
-    let mut publisher = ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
+    let mut publisher =
+        ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let context = zmq::Context::new();
     let subscriber = context.socket(zmq::SUB).unwrap();
@@ -679,7 +740,8 @@ fn zmq_source_publisher_repeats_hello_during_runtime() {
 
 #[test]
 fn zmq_source_publisher_repeats_hello_while_idle() {
-    let publisher = ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
+    let publisher =
+        ZmqStreamPublisher::bind(WILDCARD_ENDPOINT, STREAM_NAME, test_schema()).unwrap();
     let endpoint = publisher.last_endpoint().unwrap();
     let context = zmq::Context::new();
     let subscriber = context.socket(zmq::SUB).unwrap();

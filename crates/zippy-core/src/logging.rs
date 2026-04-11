@@ -128,6 +128,42 @@ impl JsonLogFormatter {
     }
 }
 
+struct ConsoleLogFormatter;
+
+impl ConsoleLogFormatter {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for ConsoleLogFormatter
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let metadata = event.metadata();
+        let mut visitor = ConsoleFieldVisitor::default();
+        event.record(&mut visitor);
+
+        let timestamp = utc_timestamp_string();
+        write!(writer, "{timestamp}  ")?;
+        write_level(&mut writer, *metadata.level())?;
+        write!(writer, " {}", visitor.message.unwrap_or_default())?;
+
+        for (name, value) in visitor.fields {
+            write!(writer, " {name}=[{value}]")?;
+        }
+
+        writeln!(writer)
+    }
+}
+
 impl<S, N> FormatEvent<S, N> for JsonLogFormatter
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
@@ -144,6 +180,7 @@ where
         event.record(&mut visitor);
 
         let mut record = Map::new();
+        record.insert("ts".to_string(), Value::String(utc_timestamp_string()));
         record.insert("app".to_string(), Value::String(self.app.clone()));
         record.insert("run_id".to_string(), Value::String(self.run_id.clone()));
         record.insert(
@@ -194,15 +231,9 @@ impl Visit for JsonFieldVisitor {
             .insert(field.name().to_string(), Value::String(value.to_string()));
     }
 
-    fn record_error(
-        &mut self,
-        field: &Field,
-        value: &(dyn std::error::Error + 'static),
-    ) {
-        self.fields.insert(
-            field.name().to_string(),
-            Value::String(value.to_string()),
-        );
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.fields
+            .insert(field.name().to_string(), Value::String(value.to_string()));
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
@@ -217,6 +248,52 @@ impl Visit for JsonFieldVisitor {
             field.name().to_string(),
             Value::String(format!("{value:?}")),
         );
+    }
+}
+
+#[derive(Default)]
+struct ConsoleFieldVisitor {
+    message: Option<String>,
+    fields: Vec<(String, String)>,
+}
+
+impl ConsoleFieldVisitor {
+    fn push_value(&mut self, field: &Field, value: String) {
+        if field.name() == "message" {
+            self.message = Some(value);
+        } else {
+            self.fields.push((field.name().to_string(), value));
+        }
+    }
+}
+
+impl Visit for ConsoleFieldVisitor {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.push_value(field, value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.push_value(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.push_value(field, value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.push_value(field, value.to_string());
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.push_value(field, value.to_string());
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.push_value(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.push_value(field, format!("{value:?}"));
     }
 }
 
@@ -249,19 +326,18 @@ pub fn setup_log(config: LogConfig) -> Result<LogSnapshot> {
         None
     };
 
-    let console_layer = config
-        .to_console
-        .then(|| tracing_subscriber::fmt::layer().with_target(false));
+    let console_layer = config.to_console.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .event_format(ConsoleLogFormatter::new())
+    });
 
     let file_layer = if let Some(path) = file_path.clone() {
         Some(
             tracing_subscriber::fmt::layer()
                 .json()
                 .with_ansi(false)
-                .event_format(JsonLogFormatter::new(
-                    config.app.clone(),
-                    run_id.clone(),
-                ))
+                .event_format(JsonLogFormatter::new(config.app.clone(), run_id.clone()))
                 .with_writer(move || LazyFileWriter::new(path.clone())),
         )
     } else {
@@ -353,6 +429,36 @@ fn utc_date_string() -> Result<String> {
     let days_since_epoch = (duration.as_secs() / 86_400) as i64;
     let (year, month, day) = civil_from_days(days_since_epoch);
     Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn utc_timestamp_string() -> String {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return "1970-01-01T00:00:00.000000000Z".to_string();
+    };
+    let total_secs = duration.as_secs();
+    let days_since_epoch = (total_secs / 86_400) as i64;
+    let seconds_of_day = total_secs % 86_400;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let nanos = duration.subsec_nanos();
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z")
+}
+
+fn write_level(writer: &mut Writer<'_>, level: tracing::Level) -> std::fmt::Result {
+    if writer.has_ansi_escapes() {
+        let color = match level {
+            tracing::Level::TRACE => "\u{1b}[35m",
+            tracing::Level::DEBUG => "\u{1b}[34m",
+            tracing::Level::INFO => "\u{1b}[32m",
+            tracing::Level::WARN => "\u{1b}[33m",
+            tracing::Level::ERROR => "\u{1b}[31m",
+        };
+        write!(writer, "{color}{level}\u{1b}[0m")
+    } else {
+        write!(writer, "{level}")
+    }
 }
 
 fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {

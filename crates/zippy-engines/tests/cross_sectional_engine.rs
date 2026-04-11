@@ -153,7 +153,11 @@ fn cross_sectional_engine_handles_out_of_order_buckets_within_same_batch() {
     let outputs = engine
         .on_data(batch(
             vec!["A", "C", "B"],
-            vec![1_000_000_000, 2 * MINUTE_NS + 1_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![
+                1_000_000_000,
+                2 * MINUTE_NS + 1_000_000_000,
+                MINUTE_NS + 1_000_000_000,
+            ],
             vec![1.0, 3.0, 2.0],
         ))
         .unwrap();
@@ -202,7 +206,10 @@ fn cross_sectional_engine_preserves_same_bucket_last_row_after_batch_reordering(
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(string_values(outputs[0].column(0)), vec!["A", "B"]);
-    assert_eq!(timestamp_values(outputs[0].column(1)), vec![MINUTE_NS, MINUTE_NS]);
+    assert_eq!(
+        timestamp_values(outputs[0].column(1)),
+        vec![MINUTE_NS, MINUTE_NS]
+    );
     assert_float_slices_eq(&float_values(outputs[0].column(2)), &[2.0, 1.0]);
 }
 

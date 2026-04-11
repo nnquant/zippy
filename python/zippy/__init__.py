@@ -14,6 +14,13 @@ from ._internal import CSZscoreSpec
 from ._internal import CrossSectionalEngine
 from ._internal import ExpressionFactor
 from ._internal import LogSpec
+from ._internal import MasterClient
+from ._internal import MasterServer
+from ._internal import run_master_daemon
+from ._internal import BusReader
+from ._internal import BusStreamSource
+from ._internal import BusStreamTarget
+from ._internal import BusWriter
 from ._internal import NullPublisher
 from ._internal import ParquetSink
 from ._internal import ReactiveStateEngine
@@ -30,9 +37,9 @@ from ._internal import ZmqSource
 from ._internal import ZmqStreamPublisher
 from ._internal import ZmqSubscriber
 from ._internal import __version__
+from ._internal import log_info
 from ._internal import setup_log
 from ._internal import version
-
 
 class _PolicyConstant:
     """Represent a predefined policy constant understood by the Rust bindings."""
@@ -294,6 +301,13 @@ __all__ = [
     "ExpressionFactor",
     "LateDataPolicy",
     "LogSpec",
+    "MasterClient",
+    "MasterServer",
+    "run_master_daemon",
+    "BusReader",
+    "BusStreamSource",
+    "BusStreamTarget",
+    "BusWriter",
     "NullPublisher",
     "OverflowPolicy",
     "ParquetSink",
@@ -334,5 +348,6 @@ __all__ = [
     "ZmqStreamPublisher",
     "ZmqSubscriber",
     "__version__",
+    "log_info",
     "version",
 ]

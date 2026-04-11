@@ -259,7 +259,8 @@ where
                                 component = "runtime",
                                 engine = worker_engine_name.as_str(),
                                 event = "flush",
-                                batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                batch_rows =
+                                    outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                                 "engine flushed"
                             );
                             let _ = reply_tx.send(Ok(outputs));
@@ -294,7 +295,8 @@ where
                                     component = "runtime",
                                     engine = worker_engine_name.as_str(),
                                     event = "stop",
-                                    batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                    batch_rows =
+                                        outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                                     "engine stopped"
                                 );
                                 return Ok(());
@@ -310,7 +312,9 @@ where
                         unreachable!("source events are not dispatched into spawn_engine worker");
                     }
                     Command::SourceTerminated(_) => {
-                        unreachable!("source termination is not dispatched into spawn_engine worker");
+                        unreachable!(
+                            "source termination is not dispatched into spawn_engine worker"
+                        );
                     }
                 }
             }
@@ -484,8 +488,9 @@ where
                                     &mut engine,
                                     &status_clone,
                                     ZippyError::SchemaMismatch {
-                                        reason: "source hello schema does not match engine input schema"
-                                            .to_string(),
+                                        reason:
+                                            "source hello schema does not match engine input schema"
+                                                .to_string(),
                                     },
                                 );
                             }
@@ -531,7 +536,8 @@ where
                                     engine = worker_engine_name.as_str(),
                                     source = worker_source_name.as_str(),
                                     event = "flush",
-                                    batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                    batch_rows =
+                                        outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                                     "engine flushed"
                                 );
                             }
@@ -550,16 +556,17 @@ where
                                 *status_clone.lock().unwrap() = EngineStatus::Stopping;
                                 let outputs =
                                     process_stop_event(&mut engine, &mut publisher, &metrics_clone)
-                                    .inspect_err(|_| {
-                                        *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                    })?;
+                                        .inspect_err(|_| {
+                                            *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                        })?;
                                 *status_clone.lock().unwrap() = EngineStatus::Stopped;
                                 info!(
                                     component = "runtime",
                                     engine = worker_engine_name.as_str(),
                                     source = worker_source_name.as_str(),
                                     event = "stop",
-                                    batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                                    batch_rows =
+                                        outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                                     "engine stopped"
                                 );
                                 return Ok(());
@@ -733,11 +740,7 @@ where
     close_publisher(publisher, metrics)
 }
 
-fn fail_worker<E>(
-    engine: &mut E,
-    status: &Arc<Mutex<EngineStatus>>,
-    err: ZippyError,
-) -> Result<()>
+fn fail_worker<E>(engine: &mut E, status: &Arc<Mutex<EngineStatus>>, err: ZippyError) -> Result<()>
 where
     E: Engine,
 {

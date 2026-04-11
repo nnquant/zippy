@@ -1,6 +1,8 @@
+pub mod bus_protocol;
 pub mod engine;
 pub mod error;
 pub mod logging;
+pub mod master_client;
 pub mod metrics;
 pub mod publisher;
 pub mod queue;
@@ -9,9 +11,15 @@ pub mod source;
 pub mod types;
 pub mod version;
 
+pub use bus_protocol::{
+    AttachStreamRequest, ControlRequest, ControlResponse, GetStreamRequest, GetStreamResponse,
+    ListStreamsRequest, ListStreamsResponse, ReaderDescriptor, RegisterProcessRequest,
+    RegisterStreamRequest, StreamInfo, WriterDescriptor, BUS_LAYOUT_VERSION,
+};
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};
 pub use logging::{current_log_snapshot, setup_log, LogConfig, LogSnapshot};
+pub use master_client::{MasterClient, Reader, Writer};
 pub use metrics::{EngineMetrics, EngineMetricsDelta, EngineMetricsSnapshot};
 pub use publisher::Publisher;
 pub use queue::BoundedQueue;

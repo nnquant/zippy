@@ -1,6 +1,8 @@
 import json
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -699,6 +701,64 @@ def test_reactive_engine_accepts_expression_factor_helper() -> None:
     subscriber.close()
 
 
+def test_reactive_engine_expr_supports_ts_nodes() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+    expected_output_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+            pa.field("score", pa.float64(), nullable=True),
+        ]
+    )
+
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=input_schema,
+        id_column="symbol",
+        factors=[
+            zippy.Expr(
+                expression="TS_DIFF(price, 2) / TS_STD(TS_DIFF(price, 2), 3)",
+                output="score",
+            ),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    assert engine.output_schema() == expected_output_schema
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+    engine.write(
+        {
+            "symbol": ["A", "A", "A", "A", "A", "A"],
+            "price": [10.0, 11.0, 13.0, 16.0, 20.0, 25.0],
+        }
+    )
+    engine.flush()
+
+    received = subscriber.recv()
+
+    assert received.column(2).to_pylist() == [
+        None,
+        None,
+        None,
+        None,
+        pytest.approx(4.286607049870562),
+        pytest.approx(5.5113519212621505),
+    ]
+
+    engine.stop()
+    subscriber.close()
+
+
 def test_expression_factor_rejects_unknown_identifier() -> None:
     input_schema = pa.schema(
         [
@@ -916,6 +976,66 @@ def test_timeseries_engine_rejects_post_factors_referencing_raw_input_columns() 
         )
 
 
+def test_timeseries_engine_pre_factors_reject_ts_expr_nodes() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="stateful TS_\\* functions are only supported inside ReactiveStateEngine",
+    ):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            pre_factors=[
+                zippy.Expr(expression="TS_DIFF(price, 2)", output="bad"),
+            ],
+            factors=[zippy.AGG_SUM(column="price", output="sum_price")],
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_timeseries_engine_post_factors_reject_ts_expr_nodes() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+            ("volume", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="stateful TS_\\* functions are only supported inside ReactiveStateEngine",
+    ):
+        zippy.TimeSeriesEngine(
+            name="bar_1m",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_SUM(column="price", output="sum_price")],
+            post_factors=[
+                zippy.Expr(expression="TS_STD(sum_price, 2)", output="bad"),
+            ],
+            target=zippy.NullPublisher(),
+        )
+
+
 def test_timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors() -> None:
     input_schema = pa.schema(
         [
@@ -934,7 +1054,7 @@ def test_timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors
         window_type=zippy.WindowType.TUMBLING,
         late_data_policy=zippy.LateDataPolicy.DROP_WITH_METRIC,
         pre_factors=[
-            zippy.Expr(expression="log(price)", output="log_price"),
+            zippy.Expr(expression="LOG(price)", output="log_price"),
         ],
         factors=[zippy.AGG_SUM(column="log_price", output="sum_log_price")],
         target=zippy.NullPublisher(),
@@ -1526,6 +1646,8 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
             rotation="none",
             write_input=True,
             write_output=False,
+            rows_per_batch=4,
+            flush_interval_ms=250,
         ),
         buffer_capacity=32,
         overflow_policy=zippy.OverflowPolicy.REJECT,
@@ -1539,6 +1661,7 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
         "output_batches_total": 0,
         "dropped_batches_total": 0,
         "late_rows_total": 0,
+        "filtered_rows_total": 0,
         "publish_errors_total": 0,
         "queue_depth": 0,
     }
@@ -1569,11 +1692,90 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
     assert metrics["processed_batches_total"] == 1
     assert metrics["processed_rows_total"] == 1
     assert metrics["output_batches_total"] == 1
+    assert metrics["filtered_rows_total"] == 0
     assert metrics["queue_depth"] == 0
 
     engine.stop()
     assert engine.status() == "stopped"
     assert engine.metrics()["processed_batches_total"] == 1
+
+
+def test_reactive_engine_id_filter_filters_rows_and_updates_config_and_metrics() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_filter",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[zippy.Expr(expression="price * 2.0", output="price_x2")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+        id_filter=["A"],
+    )
+
+    config = engine.config()
+    assert config["id_filter"] == ["A"]
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    engine.write({"symbol": ["A", "B"], "price": [10.0, 99.0]})
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "price", "price_x2"]
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(1).to_pylist() == [10.0]
+    assert received.column(2).to_pylist() == [20.0]
+
+    engine.stop()
+    metrics = engine.metrics()
+    assert metrics["filtered_rows_total"] == 1
+    assert metrics["late_rows_total"] == 0
+    subscriber.close()
+
+
+def test_reactive_engine_rejects_empty_id_filter() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="id_filter must not be empty"):
+        zippy.ReactiveStateEngine(
+            name="reactive_filter",
+            input_schema=schema,
+            id_column="symbol",
+            factors=[zippy.Expr(expression="price * 2.0", output="price_x2")],
+            target=zippy.NullPublisher(),
+            id_filter=[],
+        )
+
+
+def test_reactive_engine_rejects_non_string_id_filter_elements() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="id_filter must be a sequence of strings"):
+        zippy.ReactiveStateEngine(
+            name="reactive_filter",
+            input_schema=schema,
+            id_column="symbol",
+            factors=[zippy.Expr(expression="price * 2.0", output="price_x2")],
+            target=zippy.NullPublisher(),
+            id_filter=["A", 1],
+        )
 
 
 def test_timeseries_engine_config_and_output_archive_roundtrip(
@@ -1638,6 +1840,108 @@ def test_timeseries_engine_config_and_output_archive_roundtrip(
         "window_end",
         "open",
     ]
+
+
+def test_timeseries_engine_id_filter_filters_rows_and_updates_config_and_metrics() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.TimeSeriesEngine(
+        name="bar_filter",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_LAST(column="price", output="close")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+        id_filter=["A"],
+    )
+
+    config = engine.config()
+    assert config["id_filter"] == ["A"]
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    engine.write(
+        {
+            "symbol": ["A", "B"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 99.0],
+        }
+    )
+    engine.flush()
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "window_start", "window_end", "close"]
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(3).to_pylist() == [10.0]
+
+    engine.stop()
+    metrics = engine.metrics()
+    assert metrics["filtered_rows_total"] == 1
+    assert metrics["late_rows_total"] == 0
+    subscriber.close()
+
+
+def test_timeseries_engine_rejects_empty_id_filter() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="id_filter must not be empty"):
+        zippy.TimeSeriesEngine(
+            name="bar_filter",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_LAST(column="price", output="close")],
+            target=zippy.NullPublisher(),
+            id_filter=[],
+        )
+
+
+def test_timeseries_engine_rejects_non_string_id_filter_elements() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="id_filter must be a sequence of strings"):
+        zippy.TimeSeriesEngine(
+            name="bar_filter",
+            input_schema=input_schema,
+            id_column="symbol",
+            dt_column="dt",
+            window=zippy.Duration.minutes(1),
+            window_type=zippy.WindowType.TUMBLING,
+            late_data_policy=zippy.LateDataPolicy.REJECT,
+            factors=[zippy.AGG_LAST(column="price", output="close")],
+            target=zippy.NullPublisher(),
+            id_filter=["A", 1],
+        )
 
 
 def test_timeseries_engine_metrics_report_late_rows() -> None:
@@ -1953,6 +2257,216 @@ def test_stream_table_engine_can_drive_timeseries_downstream_pipeline() -> None:
     source.stop()
     bars.stop()
     subscriber.close()
+
+
+def test_stream_table_engine_can_publish_to_master_bus(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    control_endpoint = str(tmp_path / "zippy-master.sock")
+    server = zippy.MasterServer(control_endpoint=control_endpoint)
+    server.start()
+
+    writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    writer_master.register_process("writer")
+    writer_master.register_stream("ticks", schema, 64)
+
+    reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    reader_master.register_process("reader")
+
+    engine = zippy.StreamTableEngine(
+        name="ticks",
+        input_schema=schema,
+        target=zippy.BusStreamTarget(stream_name="ticks", master=writer_master),
+    )
+    reader = reader_master.read_from("ticks")
+
+    try:
+        engine.start()
+        engine.write(
+            pl.DataFrame(
+                {
+                    "instrument_id": ["IF2606", "IH2606"],
+                    "last_price": [3898.2, 2675.4],
+                }
+            )
+        )
+        received = reader.read(1_000)
+
+        assert received.schema == schema
+        assert received.column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
+        assert received.column("last_price").to_pylist() == [3898.2, 2675.4]
+    finally:
+        reader.close()
+        engine.stop()
+        server.stop()
+        server.join()
+
+
+def test_master_server_start_raises_when_socket_is_already_active(tmp_path: Path) -> None:
+    control_endpoint = str(tmp_path / "zippy-master.sock")
+    first_server = zippy.MasterServer(control_endpoint=control_endpoint)
+    second_server = zippy.MasterServer(control_endpoint=control_endpoint)
+    first_server.start()
+
+    try:
+        with pytest.raises(RuntimeError, match="control endpoint socket is already active"):
+            second_server.start()
+    finally:
+        first_server.stop()
+        first_server.join()
+
+
+def test_master_server_start_waits_for_configured_ready_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control_endpoint = str(tmp_path / "zippy-master.sock")
+    server = zippy.MasterServer(control_endpoint=control_endpoint)
+    monkeypatch.setenv("ZIPPY_MASTER_TEST_PAUSE_BEFORE_READY_MS", "1200")
+
+    try:
+        server.start(3.0)
+        assert Path(control_endpoint).exists()
+    finally:
+        server.stop()
+        server.join()
+
+
+def test_master_server_start_expands_user_path_and_creates_parent_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control_endpoint = "~/.zippy/master.sock"
+    expected_socket_path = tmp_path / ".zippy" / "master.sock"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    server = zippy.MasterServer(control_endpoint=control_endpoint)
+
+    try:
+        server.start()
+        assert expected_socket_path.exists()
+    finally:
+        server.stop()
+        server.join()
+
+
+def test_run_master_daemon_expands_user_path_and_creates_parent_dir(tmp_path: Path) -> None:
+    socket_path = tmp_path / ".zippy" / "master.sock"
+    script = "import zippy; zippy.run_master_daemon('~/.zippy/master.sock')"
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path)
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if socket_path.exists():
+                break
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AssertionError(
+                    "run_master_daemon exited before creating expanded socket "
+                    f"stdout=[{stdout}] stderr=[{stderr}]"
+                )
+            time.sleep(0.05)
+        else:
+            stdout, stderr = process.communicate(timeout=5)
+            raise AssertionError(
+                "run_master_daemon did not create expanded socket before timeout "
+                f"stdout=[{stdout}] stderr=[{stderr}]"
+            )
+
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=10)
+
+        assert process.returncode == 0, stdout + stderr
+        assert socket_path.parent.is_dir()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_reactive_engine_can_consume_master_bus_stream(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    control_endpoint = str(tmp_path / "zippy-master.sock")
+    server = zippy.MasterServer(control_endpoint=control_endpoint)
+    server.start()
+
+    writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    writer_master.register_process("writer")
+    writer_master.register_stream("ticks", schema, 64)
+    writer = writer_master.write_to("ticks")
+
+    reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    reader_master.register_process("reactive_reader")
+
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_bus",
+        source=zippy.BusStreamSource(
+            stream_name="ticks",
+            expected_schema=schema,
+            master=reader_master,
+            mode=zippy.SourceMode.PIPELINE,
+        ),
+        input_schema=schema,
+        id_column="instrument_id",
+        factors=[
+            zippy.Expr(expression="last_price * 2.0", output="price_x2"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    try:
+        engine.start()
+        time.sleep(0.3)
+        writer.write(
+            pl.DataFrame(
+                {
+                    "instrument_id": ["IF2606"],
+                    "last_price": [10.0],
+                }
+            )
+        )
+
+        deadline = time.time() + 2.0
+        while True:
+            try:
+                received = subscriber.recv()
+                break
+            except RuntimeError as error:
+                if (
+                    "Resource temporarily unavailable" not in str(error)
+                    or time.time() >= deadline
+                ):
+                    raise
+                time.sleep(0.05)
+        assert received.column("instrument_id").to_pylist() == ["IF2606"]
+        assert received.column("last_price").to_pylist() == [10.0]
+        assert received.column("price_x2").to_pylist() == [20.0]
+    finally:
+        writer.close()
+        engine.stop()
+        subscriber.close()
+        server.stop()
+        server.join()
 
 
 def test_cross_sectional_engine_accepts_duration_trigger_interval_and_exposes_output_schema() -> None:
@@ -2377,6 +2891,69 @@ def test_timeseries_engine_accepts_zmq_stream_target_for_remote_pipeline() -> No
     subscriber.close()
 
 
+def test_timeseries_engine_filters_remote_zmq_source_rows_by_id_filter() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    upstream = zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:*",
+        stream_name="ticks",
+        schema=input_schema,
+    )
+    source = zippy.ZmqSource(
+        endpoint=upstream.last_endpoint(),
+        expected_schema=input_schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.TimeSeriesEngine(
+        name="bar_remote_filter",
+        source=source,
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_LAST(column="price", output="close")],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+        id_filter=["A"],
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    upstream.publish(
+        {
+            "symbol": ["A", "B"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 99.0],
+        }
+    )
+    upstream.flush()
+
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "window_start", "window_end", "close"]
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(3).to_pylist() == [10.0]
+
+    engine.stop()
+    assert engine.metrics()["filtered_rows_total"] == 1
+    upstream.stop()
+    subscriber.close()
+
+
 def test_zmq_source_consumer_mode_ignores_upstream_flush_until_local_flush() -> None:
     input_schema = pa.schema(
         [
@@ -2479,6 +3056,126 @@ def test_timeseries_engine_rejects_remote_source_schema_mismatch() -> None:
         )
 
 
+def test_reactive_engine_processes_remote_zmq_source() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    upstream = zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:*",
+        stream_name="ticks",
+        schema=input_schema,
+    )
+    source = zippy.ZmqSource(
+        endpoint=upstream.last_endpoint(),
+        expected_schema=input_schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_remote",
+        source=source,
+        input_schema=input_schema,
+        id_column="symbol",
+        factors=[
+            zippy.Expr(expression="price * 2.0", output="price_x2"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    upstream.publish(
+        {
+            "symbol": ["A", "A"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 11.0],
+        }
+    )
+
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "dt", "price", "price_x2"]
+    assert received.column(0).to_pylist() == ["A", "A"]
+    assert received.column(2).to_pylist() == [10.0, 11.0]
+    assert received.column(3).to_pylist() == [20.0, 22.0]
+
+    engine.stop()
+    upstream.stop()
+    subscriber.close()
+
+
+def test_reactive_engine_filters_remote_zmq_source_rows_by_id_filter() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    upstream = zippy.ZmqStreamPublisher(
+        endpoint="tcp://127.0.0.1:*",
+        stream_name="ticks",
+        schema=input_schema,
+    )
+    source = zippy.ZmqSource(
+        endpoint=upstream.last_endpoint(),
+        expected_schema=input_schema,
+        mode=zippy.SourceMode.PIPELINE,
+    )
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_remote_filter",
+        source=source,
+        input_schema=input_schema,
+        id_column="symbol",
+        id_filter=["A"],
+        factors=[
+            zippy.Expr(expression="price * 2.0", output="price_x2"),
+        ],
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    engine.start()
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    time.sleep(0.1)
+
+    upstream.publish(
+        {
+            "symbol": ["A", "B"],
+            "dt": [
+                datetime(2026, 4, 2, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 4, 2, 9, 30, 1, tzinfo=timezone.utc),
+            ],
+            "price": [10.0, 99.0],
+        }
+    )
+
+    received = subscriber.recv()
+
+    assert received.column_names == ["symbol", "dt", "price", "price_x2"]
+    assert received.column(0).to_pylist() == ["A"]
+    assert received.column(2).to_pylist() == [10.0]
+    assert received.column(3).to_pylist() == [20.0]
+
+    engine.stop()
+    assert engine.metrics()["filtered_rows_total"] == 1
+    upstream.stop()
+    subscriber.close()
+
+
 def test_cross_sectional_engine_archives_output_parquet(tmp_path: Path) -> None:
     input_schema = pa.schema(
         [
@@ -2566,3 +3263,190 @@ def test_cross_sectional_engine_start_can_retry_after_publisher_failure() -> Non
     blocker.stop()
     engine.start()
     engine.stop()
+
+
+def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
+    control_endpoint = str(tmp_path / "zippy-master.sock")
+    server = zippy.MasterServer(control_endpoint=control_endpoint)
+    server.start()
+    return server, control_endpoint
+
+
+def test_master_client_roundtrips_batches_through_master_bus_direct_reader(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    writer_client.register_process("writer")
+    writer_client.register_stream("ticks", tick_schema, 64)
+    writer = writer_client.write_to("ticks")
+
+    reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    reader_client.register_process("reader")
+    reader = reader_client.read_from("ticks")
+
+    writer.write({"instrument_id": ["IF2606"], "last_price": [4102.5]})
+    batch = reader.read(timeout_ms=1000)
+
+    assert batch.schema == tick_schema
+    assert batch.column("instrument_id").to_pylist() == ["IF2606"]
+    assert batch.column("last_price").to_pylist() == [4102.5]
+
+    reader.close()
+    writer.close()
+    server.stop()
+
+
+def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    writer_client.register_process("stream_table_writer")
+    writer_client.register_stream("openctp_ticks", tick_schema, 64)
+
+    reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    reader_client.register_process("stream_table_reader")
+    reader = reader_client.read_from("openctp_ticks")
+
+    engine = zippy.StreamTableEngine(
+        name="ticks",
+        input_schema=tick_schema,
+        target=zippy.BusStreamTarget(
+            stream_name="openctp_ticks",
+            master=writer_client,
+        ),
+    )
+
+    engine.start()
+    engine.write(
+        {
+            "instrument_id": ["IF2606"],
+            "dt": [datetime(2026, 4, 10, 9, 30, 0, tzinfo=timezone.utc)],
+            "last_price": [4102.5],
+        }
+    )
+    received = reader.read(timeout_ms=1000)
+    engine.stop()
+
+    assert received.schema == tick_schema
+    assert received.column("instrument_id").to_pylist() == ["IF2606"]
+    assert received.column("last_price").to_pylist() == [4102.5]
+
+    reader.close()
+    server.stop()
+
+
+def test_master_client_lists_streams(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream("openctp_ticks", tick_schema, 64)
+
+    streams = client.list_streams()
+
+    assert len(streams) == 1
+    assert streams[0]["stream_name"] == "openctp_ticks"
+    assert streams[0]["ring_capacity"] == 64
+    assert streams[0]["writer_process_id"] is None
+    assert streams[0]["reader_count"] == 0
+    assert streams[0]["status"] == "registered"
+
+    server.stop()
+
+
+def test_master_client_gets_stream(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream("openctp_ticks", tick_schema, 64)
+
+    stream = client.get_stream("openctp_ticks")
+
+    assert stream["stream_name"] == "openctp_ticks"
+    assert stream["ring_capacity"] == 64
+    assert stream["writer_process_id"] is None
+    assert stream["reader_count"] == 0
+    assert stream["status"] == "registered"
+
+    server.stop()
+
+
+def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    factor_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("price_x2", pa.float64()),
+        ]
+    )
+
+    input_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    input_client.register_process("tick_writer")
+    input_client.register_stream("openctp_ticks", tick_schema, 64)
+    writer = input_client.write_to("openctp_ticks")
+
+    factor_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    factor_client.register_process("reactive_engine")
+    factor_client.register_stream("openctp_factor_ticks", factor_schema, 64)
+
+    output_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    output_client.register_process("factor_reader")
+    output_reader = output_client.read_from("openctp_factor_ticks")
+
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_bus",
+        input_schema=tick_schema,
+        id_column="instrument_id",
+        factors=[zippy.Expr(expression="last_price * 2.0", output="price_x2")],
+        source=zippy.BusStreamSource(
+            stream_name="openctp_ticks",
+            expected_schema=tick_schema,
+            master=factor_client,
+            mode=zippy.SourceMode.PIPELINE,
+        ),
+        target=zippy.BusStreamTarget(
+            stream_name="openctp_factor_ticks",
+            master=factor_client,
+        ),
+    )
+
+    engine.start()
+    writer.write({"instrument_id": ["IF2606"], "last_price": [4102.5]})
+    received = output_reader.read(timeout_ms=1000)
+    engine.stop()
+
+    assert received.schema == factor_schema
+    assert received.column("instrument_id").to_pylist() == ["IF2606"]
+    assert received.column("price_x2").to_pylist() == [8205.0]
+
+    output_reader.close()
+    writer.close()
+    server.stop()
