@@ -3304,6 +3304,31 @@ def test_master_client_roundtrips_batches_through_master_bus_direct_reader(
     server.stop()
 
 
+def test_master_bus_writer_close_releases_stream_for_restart(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    first_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    first_client.register_process("writer_1")
+    first_client.register_stream("ticks", tick_schema, 64)
+    first_writer = first_client.write_to("ticks")
+    first_writer.close()
+
+    second_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    second_client.register_process("writer_2")
+    second_client.register_stream("ticks", tick_schema, 64)
+    second_writer = second_client.write_to("ticks")
+
+    second_writer.write({"instrument_id": ["IF2606"], "last_price": [4102.5]})
+    second_writer.close()
+    server.stop()
+
+
 def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
     tmp_path: Path,
 ) -> None:
@@ -3386,6 +3411,18 @@ def test_master_client_gets_stream(tmp_path: Path) -> None:
     assert stream["writer_process_id"] is None
     assert stream["reader_count"] == 0
     assert stream["status"] == "registered"
+
+    server.stop()
+
+
+def test_master_client_heartbeat_keeps_registered_process_alive(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    process_id = client.register_process("worker_a")
+    client.heartbeat()
+
+    assert process_id.startswith("proc_")
 
     server.stop()
 

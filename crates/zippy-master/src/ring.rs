@@ -147,6 +147,20 @@ impl StreamRing {
         Ok(())
     }
 
+    pub fn detach_reader(&mut self, reader_id: &str) -> Result<(), ReaderNotFound> {
+        if self.readers.remove(reader_id).is_some() {
+            return Ok(());
+        }
+
+        Err(ReaderNotFound {
+            reader_id: reader_id.to_string(),
+        })
+    }
+
+    pub fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
+
     fn oldest_available_seq(&self) -> u64 {
         self.items
             .front()

@@ -19,6 +19,11 @@ pub enum BusError {
         stream_name: String,
         ring_capacity: usize,
     },
+    StreamRingCapacityMismatch {
+        stream_name: String,
+        existing_ring_capacity: usize,
+        requested_ring_capacity: usize,
+    },
     WriterAlreadyAttached {
         stream_name: String,
         writer_process_id: String,
@@ -26,6 +31,10 @@ pub enum BusError {
     ReaderNotFound {
         stream_name: String,
         reader_id: String,
+    },
+    WriterNotFound {
+        stream_name: String,
+        writer_id: String,
     },
     StorageInitFailed {
         stream_name: String,
@@ -50,6 +59,15 @@ impl fmt::Display for BusError {
                 "invalid ring capacity stream_name=[{}] ring_capacity=[{}]",
                 stream_name, ring_capacity
             ),
+            Self::StreamRingCapacityMismatch {
+                stream_name,
+                existing_ring_capacity,
+                requested_ring_capacity,
+            } => write!(
+                f,
+                "stream ring capacity mismatch stream_name=[{}] existing_ring_capacity=[{}] requested_ring_capacity=[{}]",
+                stream_name, existing_ring_capacity, requested_ring_capacity
+            ),
             Self::WriterAlreadyAttached {
                 stream_name,
                 writer_process_id,
@@ -65,6 +83,14 @@ impl fmt::Display for BusError {
                 f,
                 "reader not found stream_name=[{}] reader_id=[{}]",
                 stream_name, reader_id
+            ),
+            Self::WriterNotFound {
+                stream_name,
+                writer_id,
+            } => write!(
+                f,
+                "writer not found stream_name=[{}] writer_id=[{}]",
+                stream_name, writer_id
             ),
             Self::StorageInitFailed {
                 stream_name,
@@ -115,6 +141,27 @@ impl Default for Bus {
 }
 
 impl Bus {
+    pub fn ensure_stream(
+        &mut self,
+        stream_name: &str,
+        ring_capacity: usize,
+    ) -> Result<bool, BusError> {
+        if let Some(existing) = self.streams.get(stream_name) {
+            let existing_ring_capacity = existing.ring.capacity();
+            if existing_ring_capacity != ring_capacity {
+                return Err(BusError::StreamRingCapacityMismatch {
+                    stream_name: stream_name.to_string(),
+                    existing_ring_capacity,
+                    requested_ring_capacity: ring_capacity,
+                });
+            }
+            return Ok(false);
+        }
+
+        self.create_stream(stream_name, ring_capacity)?;
+        Ok(true)
+    }
+
     pub fn create_stream(
         &mut self,
         stream_name: &str,
@@ -218,6 +265,51 @@ impl Bus {
             process_id: process_id.to_string(),
             next_read_seq,
         })
+    }
+
+    pub fn detach_writer(&mut self, stream_name: &str, writer_id: &str) -> Result<(), BusError> {
+        let Some(stream) = self.streams.get_mut(stream_name) else {
+            return Err(BusError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            });
+        };
+
+        if stream.writer_id.as_deref() != Some(writer_id) {
+            return Err(BusError::WriterNotFound {
+                stream_name: stream_name.to_string(),
+                writer_id: writer_id.to_string(),
+            });
+        }
+
+        stream.writer_id = None;
+        stream.writer_process_id = None;
+        Ok(())
+    }
+
+    pub fn detach_reader(&mut self, stream_name: &str, reader_id: &str) -> Result<(), BusError> {
+        let Some(stream) = self.streams.get_mut(stream_name) else {
+            return Err(BusError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            });
+        };
+
+        stream
+            .ring
+            .detach_reader(reader_id)
+            .map_err(|_| BusError::ReaderNotFound {
+                stream_name: stream_name.to_string(),
+                reader_id: reader_id.to_string(),
+            })
+    }
+
+    pub fn reader_count(&self, stream_name: &str) -> Result<usize, BusError> {
+        let Some(stream) = self.streams.get(stream_name) else {
+            return Err(BusError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            });
+        };
+
+        Ok(stream.ring.reader_count())
     }
 
     pub fn remove_stream(&mut self, stream_name: &str) {

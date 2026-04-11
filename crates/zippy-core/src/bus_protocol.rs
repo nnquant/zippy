@@ -9,6 +9,11 @@ pub struct RegisterProcessRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    pub process_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterStreamRequest {
     pub stream_name: String,
     pub ring_capacity: usize,
@@ -18,6 +23,20 @@ pub struct RegisterStreamRequest {
 pub struct AttachStreamRequest {
     pub stream_name: String,
     pub process_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetachWriterRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub writer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetachReaderRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub reader_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,9 +91,12 @@ pub struct ReaderDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
     RegisterProcess(RegisterProcessRequest),
+    Heartbeat(HeartbeatRequest),
     RegisterStream(RegisterStreamRequest),
     WriteTo(AttachStreamRequest),
     ReadFrom(AttachStreamRequest),
+    CloseWriter(DetachWriterRequest),
+    CloseReader(DetachReaderRequest),
     ListStreams(ListStreamsRequest),
     GetStream(GetStreamRequest),
 }
@@ -82,9 +104,12 @@ pub enum ControlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
     ProcessRegistered { process_id: String },
+    HeartbeatAccepted { process_id: String },
     StreamRegistered { stream_name: String },
     WriterAttached { descriptor: WriterDescriptor },
     ReaderAttached { descriptor: ReaderDescriptor },
+    WriterDetached { stream_name: String, writer_id: String },
+    ReaderDetached { stream_name: String, reader_id: String },
     StreamsListed(ListStreamsResponse),
     StreamFetched(GetStreamResponse),
     Error { reason: String },
@@ -95,6 +120,9 @@ impl fmt::Display for ControlResponse {
         match self {
             Self::ProcessRegistered { process_id } => {
                 write!(f, "process registered process_id=[{}]", process_id)
+            }
+            Self::HeartbeatAccepted { process_id } => {
+                write!(f, "heartbeat accepted process_id=[{}]", process_id)
             }
             Self::StreamRegistered { stream_name } => {
                 write!(f, "stream registered stream_name=[{}]", stream_name)
@@ -120,6 +148,22 @@ impl fmt::Display for ControlResponse {
                 descriptor.layout_version,
                 descriptor.shm_name,
                 descriptor.next_read_seq
+            ),
+            Self::WriterDetached {
+                stream_name,
+                writer_id,
+            } => write!(
+                f,
+                "writer detached stream_name=[{}] writer_id=[{}]",
+                stream_name, writer_id
+            ),
+            Self::ReaderDetached {
+                stream_name,
+                reader_id,
+            } => write!(
+                f,
+                "reader detached stream_name=[{}] reader_id=[{}]",
+                stream_name, reader_id
             ),
             Self::StreamsListed(response) => write!(
                 f,

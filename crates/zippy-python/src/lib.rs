@@ -1277,6 +1277,14 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    fn heartbeat(&self) -> PyResult<()> {
+        self.client
+            .lock()
+            .unwrap()
+            .heartbeat()
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     fn register_stream(
         &self,
         stream_name: String,
@@ -1287,14 +1295,22 @@ impl MasterClient {
             Schema::from_pyarrow_bound(schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        self.client
+        let register_result = self
+            .client
             .lock()
             .unwrap()
-            .register_stream(&stream_name, Arc::clone(&schema), ring_capacity)
-            .map_err(|error| py_runtime_error(error.to_string()))
-            .map(|_| {
+            .register_stream(&stream_name, Arc::clone(&schema), ring_capacity);
+        match register_result {
+            Ok(()) => {
                 self.schemas.lock().unwrap().insert(stream_name, schema);
-            })
+                Ok(())
+            }
+            Err(error) if error.to_string().contains("stream already exists") => {
+                self.schemas.lock().unwrap().insert(stream_name, schema);
+                Ok(())
+            }
+            Err(error) => Err(py_runtime_error(error.to_string())),
+        }
     }
 
     fn write_to(&self, stream_name: String) -> PyResult<BusWriter> {

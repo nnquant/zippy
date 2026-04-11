@@ -46,6 +46,19 @@ fn spawn_test_server(socket_path: &Path) -> (MasterServer, thread::JoinHandle<()
     (server, join_handle)
 }
 
+fn send_request(socket_path: &Path, payload: &str) -> String {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path).unwrap();
+    stream.write_all(payload.as_bytes()).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
 #[test]
 fn writer_and_reader_roundtrip_batches_through_master_bus() {
     let socket_path = unique_socket_path();
@@ -68,6 +81,55 @@ fn writer_and_reader_roundtrip_batches_through_master_bus() {
     assert_eq!(received.num_rows(), batch.num_rows());
     assert_eq!(received.num_columns(), batch.num_columns());
     assert_eq!(format!("{received:?}"), format!("{batch:?}"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn closing_writer_allows_restarting_same_stream_writer() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64)
+        .unwrap();
+
+    let mut first_writer = client.write_to("ticks").unwrap();
+    first_writer.close().unwrap();
+
+    let second_writer = client.write_to("ticks").unwrap();
+    assert_eq!(second_writer.descriptor().stream_name, "ticks");
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn expired_process_writer_is_reclaimed_for_new_writer() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut first = MasterClient::connect(&socket_path).unwrap();
+    first.register_process("writer_a").unwrap();
+    first.register_stream("ticks", test_schema(), 64).unwrap();
+    let _writer = first.write_to("ticks").unwrap();
+
+    let response = send_request(
+        &socket_path,
+        "{\"ExpireProcessForTest\":{\"process_id\":\"proc_1\"}}\n",
+    );
+    assert!(response.contains("proc_1"));
+
+    let mut second = MasterClient::connect(&socket_path).unwrap();
+    second.register_process("writer_b").unwrap();
+    second.register_stream("ticks", test_schema(), 64).unwrap();
+    let second_writer = second.write_to("ticks").unwrap();
+    assert_eq!(second_writer.descriptor().process_id, "proc_2");
 
     server.shutdown();
     join_handle.join().unwrap();

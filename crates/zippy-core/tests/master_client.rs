@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::Schema;
 use zippy_core::{
-    AttachStreamRequest, ControlRequest, ControlResponse, MasterClient, ReaderDescriptor,
+    AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest,
+    DetachWriterRequest, HeartbeatRequest, MasterClient, ReaderDescriptor,
     RegisterProcessRequest, RegisterStreamRequest, SchemaRef, StreamInfo, WriterDescriptor,
     BUS_LAYOUT_VERSION,
 };
@@ -50,8 +51,15 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
 
             let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
             let response = match request {
-                ControlRequest::RegisterProcess(RegisterProcessRequest { .. }) => {
+                ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
+                    assert_eq!(app, "local_dc");
                     ControlResponse::ProcessRegistered {
+                        process_id: "proc_1".to_string(),
+                    }
+                }
+                ControlRequest::Heartbeat(HeartbeatRequest { process_id }) => {
+                    assert_eq!(process_id, "proc_1");
+                    ControlResponse::HeartbeatAccepted {
                         process_id: "proc_1".to_string(),
                     }
                 }
@@ -85,6 +93,22 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         process_id,
                         next_read_seq: 1,
                     },
+                },
+                ControlRequest::CloseWriter(DetachWriterRequest {
+                    stream_name,
+                    writer_id,
+                    ..
+                }) => ControlResponse::WriterDetached {
+                    stream_name,
+                    writer_id,
+                },
+                ControlRequest::CloseReader(DetachReaderRequest {
+                    stream_name,
+                    reader_id,
+                    ..
+                }) => ControlResponse::ReaderDetached {
+                    stream_name,
+                    reader_id,
                 },
                 ControlRequest::ListStreams(_) => {
                     ControlResponse::StreamsListed(zippy_core::ListStreamsResponse {
@@ -152,7 +176,7 @@ fn master_client_lists_streams() {
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("writer").unwrap();
+    client.register_process("local_dc").unwrap();
     client
         .register_stream("ticks", empty_schema(), 1024)
         .unwrap();
@@ -173,7 +197,7 @@ fn master_client_gets_single_stream() {
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("writer").unwrap();
+    client.register_process("local_dc").unwrap();
     client
         .register_stream("ticks", empty_schema(), 1024)
         .unwrap();
@@ -182,6 +206,19 @@ fn master_client_gets_single_stream() {
     assert_eq!(stream.stream_name, "ticks");
     assert_eq!(stream.ring_capacity, 1024);
     assert_eq!(stream.status, "registered");
+
+    server.join().unwrap();
+}
+
+#[test]
+fn master_client_sends_heartbeat_for_registered_process() {
+    let socket_path = unique_socket_path();
+    let server = spawn_fake_server(&socket_path, 2);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client.heartbeat().unwrap();
 
     server.join().unwrap();
 }

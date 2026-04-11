@@ -10,8 +10,10 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::bus_protocol::{
-    AttachStreamRequest, ControlRequest, ControlResponse, GetStreamRequest, ListStreamsRequest,
-    ReaderDescriptor, RegisterProcessRequest, RegisterStreamRequest, StreamInfo, WriterDescriptor,
+    AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest,
+    DetachWriterRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
+    ReaderDescriptor, RegisterProcessRequest, RegisterStreamRequest, StreamInfo,
+    WriterDescriptor,
 };
 use crate::{Result, SchemaRef, ZippyError};
 
@@ -24,14 +26,18 @@ pub struct MasterClient {
 
 #[derive(Debug, Clone)]
 pub struct Writer {
+    socket_path: PathBuf,
     descriptor: WriterDescriptor,
     next_write_seq: u64,
+    closed: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Reader {
+    socket_path: PathBuf,
     descriptor: ReaderDescriptor,
     next_read_seq: u64,
+    closed: bool,
 }
 
 impl MasterClient {
@@ -58,6 +64,18 @@ impl MasterClient {
                 Ok(process_id)
             }
             other => Err(unexpected_response("ProcessRegistered", other)),
+        }
+    }
+
+    pub fn heartbeat(&self) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::Heartbeat(HeartbeatRequest {
+            process_id,
+        }))?;
+
+        match response {
+            ControlResponse::HeartbeatAccepted { .. } => Ok(()),
+            other => Err(unexpected_response("HeartbeatAccepted", other)),
         }
     }
 
@@ -88,8 +106,10 @@ impl MasterClient {
 
         match response {
             ControlResponse::WriterAttached { descriptor } => Ok(Writer {
+                socket_path: self.socket_path.clone(),
                 next_write_seq: descriptor.next_write_seq,
                 descriptor,
+                closed: false,
             }),
             other => Err(unexpected_response("WriterAttached", other)),
         }
@@ -104,8 +124,10 @@ impl MasterClient {
 
         match response {
             ControlResponse::ReaderAttached { descriptor } => Ok(Reader {
+                socket_path: self.socket_path.clone(),
                 next_read_seq: descriptor.next_read_seq,
                 descriptor,
+                closed: false,
             }),
             other => Err(unexpected_response("ReaderAttached", other)),
         }
@@ -186,7 +208,32 @@ impl Writer {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        Ok(())
+        if self.closed {
+            return Ok(());
+        }
+
+        let response = send_control_request(
+            &self.socket_path,
+            ControlRequest::CloseWriter(DetachWriterRequest {
+                stream_name: self.descriptor.stream_name.clone(),
+                process_id: self.descriptor.process_id.clone(),
+                writer_id: self.descriptor.writer_id.clone(),
+            }),
+        )?;
+
+        match response {
+            ControlResponse::WriterDetached { .. } => {
+                self.closed = true;
+                Ok(())
+            }
+            other => Err(unexpected_response("WriterDetached", other)),
+        }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -251,7 +298,53 @@ impl Reader {
     }
 
     pub fn close(&mut self) -> Result<()> {
-        Ok(())
+        if self.closed {
+            return Ok(());
+        }
+
+        let response = send_control_request(
+            &self.socket_path,
+            ControlRequest::CloseReader(DetachReaderRequest {
+                stream_name: self.descriptor.stream_name.clone(),
+                process_id: self.descriptor.process_id.clone(),
+                reader_id: self.descriptor.reader_id.clone(),
+            }),
+        )?;
+
+        match response {
+            ControlResponse::ReaderDetached { .. } => {
+                self.closed = true;
+                Ok(())
+            }
+            other => Err(unexpected_response("ReaderDetached", other)),
+        }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn send_control_request(socket_path: &Path, request: ControlRequest) -> Result<ControlResponse> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let payload = serde_json::to_string(&request).map_err(json_error)?;
+    stream.write_all(payload.as_bytes()).map_err(io_error)?;
+    stream.write_all(b"\n").map_err(io_error)?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(io_error)?;
+
+    let mut response_line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut response_line).map_err(io_error)?;
+    let response: ControlResponse =
+        serde_json::from_str(response_line.trim_end()).map_err(json_error)?;
+
+    match response {
+        ControlResponse::Error { reason } => Err(ZippyError::Io { reason }),
+        other => Ok(other),
     }
 }
 

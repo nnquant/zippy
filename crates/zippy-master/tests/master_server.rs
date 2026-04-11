@@ -4,6 +4,7 @@ use zippy_core::bus_protocol::{
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
 use zippy_master::registry::Registry;
+use zippy_master::snapshot::{RegistrySnapshot, SnapshotStore, SnapshotStreamRecord};
 use zippy_master::server::MasterServer;
 
 use std::fs;
@@ -45,6 +46,108 @@ fn registry_stores_process_and_stream_records() {
     assert_eq!(registry.streams_len(), 1);
     assert!(registry.get_process(&process_id).is_some());
     assert!(registry.get_stream("openctp_ticks").is_some());
+}
+
+#[test]
+fn master_restores_registered_streams_from_snapshot_as_restored() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot_path = temp.path().join("master-registry.json");
+
+    SnapshotStore::write(
+        &snapshot_path,
+        &RegistrySnapshot {
+            streams: vec![SnapshotStreamRecord {
+                stream_name: "openctp_ticks".to_string(),
+                ring_capacity: 1024,
+                status: "registered".to_string(),
+            }],
+            sources: vec![],
+            engines: vec![],
+            sinks: vec![],
+        },
+    )
+    .unwrap();
+
+    let server = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let stream = server
+        .registry()
+        .lock()
+        .unwrap()
+        .get_stream("openctp_ticks")
+        .unwrap()
+        .clone();
+
+    assert_eq!(stream.status, "restored");
+}
+
+#[test]
+fn registry_updates_process_lease_timestamp_on_heartbeat() {
+    let mut registry = Registry::default();
+    let process_id = registry.register_process("local_dc");
+
+    let first_seen = registry.get_process(&process_id).unwrap().last_heartbeat_at;
+    thread::sleep(Duration::from_millis(5));
+    registry.record_heartbeat(&process_id).unwrap();
+    let second_seen = registry.get_process(&process_id).unwrap().last_heartbeat_at;
+
+    assert!(second_seen >= first_seen);
+    assert_eq!(registry.get_process(&process_id).unwrap().lease_status, "alive");
+}
+
+#[test]
+fn master_server_accepts_process_heartbeat_over_unix_socket() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_register_process(&socket_path, "local_dc");
+    let process_response: ControlResponse =
+        serde_json::from_str(process_response.trim_end()).unwrap();
+    let process_id = match process_response {
+        ControlResponse::ProcessRegistered { process_id } => process_id,
+        other => panic!("unexpected process response: {:?}", other),
+    };
+
+    let response = send_request(
+        &socket_path,
+        &format!("{{\"Heartbeat\":{{\"process_id\":\"{process_id}\"}}}}\n"),
+    );
+    let response: ControlResponse = serde_json::from_str(response.trim_end()).unwrap();
+    match response {
+        ControlResponse::HeartbeatAccepted {
+            process_id: accepted_process_id,
+        } => assert_eq!(accepted_process_id, process_id),
+        other => panic!("unexpected heartbeat response: {:?}", other),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_returns_structured_error_for_unknown_process_heartbeat() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let response = send_request(
+        &socket_path,
+        "{\"Heartbeat\":{\"process_id\":\"proc_missing\"}}\n",
+    );
+    let response: ControlResponse = serde_json::from_str(response.trim_end()).unwrap();
+    match response {
+        ControlResponse::Error { reason } => {
+            assert!(reason.contains("process not found"));
+            assert!(reason.contains("proc_missing"));
+        }
+        other => panic!("unexpected heartbeat response: {:?}", other),
+    }
+
+    let process_response = send_register_process(&socket_path, "local_dc");
+    assert!(process_response.contains("proc_1"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
 }
 
 #[test]
@@ -244,7 +347,103 @@ fn master_server_registers_stream_and_attaches_reader_writer() {
 }
 
 #[test]
-fn master_server_rejects_duplicate_stream_names() {
+fn master_server_rejects_close_writer_from_other_process() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    assert!(send_register_process(&socket_path, "writer").contains("proc_1"));
+    assert!(send_register_process(&socket_path, "intruder").contains("proc_2"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+    )
+    .contains("StreamRegistered"));
+
+    let writer_response = send_request(
+        &socket_path,
+        "{\"WriteTo\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_1\"}}\n",
+    );
+    let writer_response: ControlResponse =
+        serde_json::from_str(writer_response.trim_end()).unwrap();
+    let writer_descriptor = match writer_response {
+        ControlResponse::WriterAttached { descriptor } => descriptor,
+        other => panic!("unexpected writer response: {:?}", other),
+    };
+
+    let close_response = send_request(
+        &socket_path,
+        &format!(
+            "{{\"CloseWriter\":{{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_2\",\"writer_id\":\"{}\"}}}}\n",
+            writer_descriptor.writer_id
+        ),
+    );
+    let close_response: ControlResponse = serde_json::from_str(close_response.trim_end()).unwrap();
+    match close_response {
+        ControlResponse::Error { reason } => {
+            assert!(reason.contains("writer not owned"));
+            assert!(reason.contains("proc_2"));
+        }
+        other => panic!("unexpected close writer response: {:?}", other),
+    }
+
+    let stream = send_request(
+        &socket_path,
+        "{\"GetStream\":{\"stream_name\":\"openctp_ticks\"}}\n",
+    );
+    assert!(stream.contains("\"writer_process_id\":\"proc_1\""));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_rejects_close_reader_from_other_process() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    assert!(send_register_process(&socket_path, "reader_a").contains("proc_1"));
+    assert!(send_register_process(&socket_path, "reader_b").contains("proc_2"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+    )
+    .contains("StreamRegistered"));
+
+    let reader_response = send_request(
+        &socket_path,
+        "{\"ReadFrom\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_1\"}}\n",
+    );
+    let reader_response: ControlResponse =
+        serde_json::from_str(reader_response.trim_end()).unwrap();
+    let reader_descriptor = match reader_response {
+        ControlResponse::ReaderAttached { descriptor } => descriptor,
+        other => panic!("unexpected reader response: {:?}", other),
+    };
+
+    let close_response = send_request(
+        &socket_path,
+        &format!(
+            "{{\"CloseReader\":{{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_2\",\"reader_id\":\"{}\"}}}}\n",
+            reader_descriptor.reader_id
+        ),
+    );
+    let close_response: ControlResponse = serde_json::from_str(close_response.trim_end()).unwrap();
+    match close_response {
+        ControlResponse::Error { reason } => {
+            assert!(reason.contains("reader not owned"));
+            assert!(reason.contains("proc_2"));
+        }
+        other => panic!("unexpected close reader response: {:?}", other),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_treats_duplicate_stream_registration_as_idempotent_success() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
 
@@ -261,8 +460,8 @@ fn master_server_rejects_duplicate_stream_names() {
         &socket_path,
         "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
     );
-    assert!(duplicate_response.contains("Error"));
-    assert!(duplicate_response.contains("stream already exists"));
+    assert!(duplicate_response.contains("StreamRegistered"));
+    assert!(duplicate_response.contains("openctp_ticks"));
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -441,11 +640,16 @@ fn master_server_logs_cleanup_failure_without_stopped_log() {
         "ERROR",
         &[("component", "master")],
         &[],
+        &[],
     );
     assert!(
         !records
             .iter()
-            .any(|record| { record["event"] == "master_stopped" && record["status"] == "stopped" }),
+            .any(|record| {
+                record["event"] == "master_stopped"
+                    && record["status"] == "stopped"
+                    && record["control_endpoint"].as_str() == Some(socket_path.to_string_lossy().as_ref())
+            }),
         "unexpected stopped log after cleanup failure"
     );
 }
@@ -509,8 +713,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
         &socket_path,
         "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
     );
-    assert!(duplicate_response.contains("Error"));
-    assert!(duplicate_response.contains("stream already exists"));
+    assert!(duplicate_response.contains("StreamRegistered"));
 
     let writer_response = send_request(
         &socket_path,
@@ -544,6 +747,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
         "INFO",
         &[("component", "master_server"), ("process_id", "proc_1")],
         &[],
+        &[],
     );
     assert_record_has_fields(
         &records,
@@ -555,18 +759,19 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
             ("stream_name", "openctp_ticks"),
         ],
         &[("ring_capacity", 1024)],
+        &[],
     );
     assert_record_has_fields(
         &records,
         "register_stream",
-        "error",
-        "ERROR",
+        "success",
+        "INFO",
         &[
             ("component", "master_server"),
             ("stream_name", "openctp_ticks"),
-            ("error", "stream already exists stream_name=[openctp_ticks]"),
         ],
         &[("ring_capacity", 1024)],
+        &[("existing", true)],
     );
     assert_record_has_fields(
         &records,
@@ -578,6 +783,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
             ("stream_name", "openctp_ticks"),
             ("process_id", "proc_1"),
         ],
+        &[],
         &[],
     );
     assert_record_has_fields(
@@ -591,6 +797,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
             ("process_id", "proc_2"),
         ],
         &[],
+        &[],
     );
     assert_record_has_fields(
         &records,
@@ -599,6 +806,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
         "INFO",
         &[("component", "master_server")],
         &[("stream_count", 1)],
+        &[],
     );
     assert_record_has_fields(
         &records,
@@ -609,6 +817,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
             ("component", "master_server"),
             ("stream_name", "openctp_ticks"),
         ],
+        &[],
         &[],
     );
 }
@@ -628,11 +837,29 @@ fn assert_record_has_fields(
     level: &str,
     expected_fields: &[(&str, &str)],
     expected_numbers: &[(&str, u64)],
+    expected_bools: &[(&str, bool)],
 ) {
     let record = records
         .iter()
         .find(|record| {
-            record["event"] == event && record["status"] == status && record["level"] == level
+            if !(record["event"] == event
+                && record["status"] == status
+                && record["level"] == level)
+            {
+                return false;
+            }
+
+            let fields_match = expected_fields
+                .iter()
+                .all(|(field, expected)| record[*field].as_str() == Some(*expected));
+            let numbers_match = expected_numbers
+                .iter()
+                .all(|(field, expected)| record[*field].as_u64() == Some(*expected));
+            let bools_match = expected_bools
+                .iter()
+                .all(|(field, expected)| record[*field].as_bool() == Some(*expected));
+
+            fields_match && numbers_match && bools_match
         })
         .unwrap_or_else(|| {
             panic!(
@@ -655,6 +882,15 @@ fn assert_record_has_fields(
             record[*field].as_u64(),
             Some(*expected),
             "unexpected numeric field field=[{}] event=[{}]",
+            field,
+            event
+        );
+    }
+    for (field, expected) in expected_bools {
+        assert_eq!(
+            record[*field].as_bool(),
+            Some(*expected),
+            "unexpected bool field field=[{}] event=[{}]",
             field,
             event
         );

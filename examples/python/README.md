@@ -184,3 +184,10 @@ uv run zippy stream ls --control-endpoint ~/.zippy/master.sock
 ```bash
 uv run zippy stream show openctp_ticks --control-endpoint ~/.zippy/master.sock
 ```
+
+Master lease and snapshot behavior:
+
+- worker 进程应持有单个 `MasterClient`，并周期性发送 `heartbeat()`
+- `zippy-master` 会在 lease 超时后回收 stale `writer/reader`
+- 控制面 snapshot 只恢复 stream 元数据，并把恢复状态标成 `restored`
+- `zippy-master` 重启后，worker 需要重新注册并重新 `write_to()/read_from()`
