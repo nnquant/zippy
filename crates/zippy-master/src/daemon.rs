@@ -77,7 +77,49 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         "starting zippy master"
     );
 
-    let server = MasterServer::default();
+    let snapshot_path = control_endpoint
+        .parent()
+        .map(|parent| parent.join("master-registry.json"))
+        .unwrap_or_else(|| PathBuf::from("master-registry.json"));
+
+    let server = if snapshot_path.exists() {
+        tracing::info!(
+            component = "master",
+            event = "snapshot_load_start",
+            status = "starting",
+            snapshot_path = snapshot_path.display().to_string(),
+            "loading registry snapshot"
+        );
+        match MasterServer::from_snapshot_path(&snapshot_path) {
+            Ok(server) => {
+                tracing::info!(
+                    component = "master",
+                    event = "snapshot_load_success",
+                    status = "success",
+                    snapshot_path = snapshot_path.display().to_string(),
+                    "loaded registry snapshot"
+                );
+                server
+            }
+            Err(error) => {
+                tracing::error!(
+                    component = "master",
+                    event = "snapshot_load_failure",
+                    status = "error",
+                    snapshot_path = snapshot_path.display().to_string(),
+                    error = %error,
+                    "failed to load registry snapshot"
+                );
+                return Err(error);
+            }
+        }
+    } else {
+        MasterServer::with_runtime_config(
+            Some(snapshot_path),
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+    };
     install_shutdown_handlers(&control_endpoint, server.clone())?;
 
     if std::env::var_os("ZIPPY_MASTER_TEST_PAUSE_BEFORE_SERVE").is_some() {

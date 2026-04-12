@@ -12,7 +12,8 @@ use arrow::record_batch::RecordBatch;
 use crate::bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest,
     DetachWriterRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
-    ReaderDescriptor, RegisterProcessRequest, RegisterStreamRequest, StreamInfo,
+    ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
+    RegisterSourceRequest, RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest,
     WriterDescriptor,
 };
 use crate::{Result, SchemaRef, ZippyError};
@@ -94,6 +95,96 @@ impl MasterClient {
         match response {
             ControlResponse::StreamRegistered { .. } => Ok(()),
             other => Err(unexpected_response("StreamRegistered", other)),
+        }
+    }
+
+    pub fn register_source(
+        &mut self,
+        source_name: &str,
+        source_type: &str,
+        output_stream: &str,
+        config: serde_json::Value,
+    ) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::RegisterSource(RegisterSourceRequest {
+            source_name: source_name.to_string(),
+            source_type: source_type.to_string(),
+            process_id,
+            output_stream: output_stream.to_string(),
+            config,
+        }))?;
+
+        match response {
+            ControlResponse::SourceRegistered { .. } => Ok(()),
+            other => Err(unexpected_response("SourceRegistered", other)),
+        }
+    }
+
+    pub fn register_engine(
+        &mut self,
+        engine_name: &str,
+        engine_type: &str,
+        input_stream: &str,
+        output_stream: &str,
+        sink_names: Vec<String>,
+        config: serde_json::Value,
+    ) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::RegisterEngine(RegisterEngineRequest {
+            engine_name: engine_name.to_string(),
+            engine_type: engine_type.to_string(),
+            process_id,
+            input_stream: input_stream.to_string(),
+            output_stream: output_stream.to_string(),
+            sink_names,
+            config,
+        }))?;
+
+        match response {
+            ControlResponse::EngineRegistered { .. } => Ok(()),
+            other => Err(unexpected_response("EngineRegistered", other)),
+        }
+    }
+
+    pub fn register_sink(
+        &mut self,
+        sink_name: &str,
+        sink_type: &str,
+        input_stream: &str,
+        config: serde_json::Value,
+    ) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::RegisterSink(RegisterSinkRequest {
+            sink_name: sink_name.to_string(),
+            sink_type: sink_type.to_string(),
+            process_id,
+            input_stream: input_stream.to_string(),
+            config,
+        }))?;
+
+        match response {
+            ControlResponse::SinkRegistered { .. } => Ok(()),
+            other => Err(unexpected_response("SinkRegistered", other)),
+        }
+    }
+
+    pub fn update_status(
+        &self,
+        kind: &str,
+        name: &str,
+        status: &str,
+        metrics: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let response = self.send_request(ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            status: status.to_string(),
+            metrics,
+        }))?;
+
+        match response {
+            ControlResponse::StatusUpdated { .. } => Ok(()),
+            other => Err(unexpected_response("StatusUpdated", other)),
         }
     }
 

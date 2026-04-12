@@ -1,10 +1,14 @@
 use zippy_core::bus_protocol::{
-    ControlRequest, ControlResponse, RegisterProcessRequest, BUS_LAYOUT_VERSION,
+    ControlRequest, ControlResponse, RegisterEngineRequest, RegisterProcessRequest,
+    RegisterSinkRequest, RegisterSourceRequest, UpdateRecordStatusRequest, BUS_LAYOUT_VERSION,
 };
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
 use zippy_master::registry::Registry;
 use zippy_master::snapshot::{RegistrySnapshot, SnapshotStore, SnapshotStreamRecord};
+use zippy_master::snapshot::{
+    SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord,
+};
 use zippy_master::server::MasterServer;
 
 use std::fs;
@@ -81,6 +85,91 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
 }
 
 #[test]
+fn master_restores_control_plane_entities_from_snapshot_as_restored() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot_path = temp.path().join("master-registry.json");
+
+    SnapshotStore::write(
+        &snapshot_path,
+        &RegistrySnapshot {
+            streams: vec![SnapshotStreamRecord {
+                stream_name: "openctp_ticks".to_string(),
+                ring_capacity: 1024,
+                status: "registered".to_string(),
+            }],
+            sources: vec![SnapshotSourceRecord {
+                source_name: "openctp_md".to_string(),
+                source_type: "openctp".to_string(),
+                process_id: "proc_1".to_string(),
+                output_stream: "openctp_ticks".to_string(),
+                config: serde_json::json!({"front": "tcp://example"}),
+                status: "running".to_string(),
+                metrics: serde_json::json!({}),
+            }],
+            engines: vec![SnapshotEngineRecord {
+                engine_name: "mid_price_factor".to_string(),
+                engine_type: "reactive".to_string(),
+                process_id: "proc_2".to_string(),
+                input_stream: "openctp_ticks".to_string(),
+                output_stream: "openctp_mid_price_factors".to_string(),
+                sink_names: vec!["factor_sink".to_string()],
+                config: serde_json::json!({"id_filter": ["IF2606"]}),
+                status: "running".to_string(),
+                metrics: serde_json::json!({}),
+            }],
+            sinks: vec![SnapshotSinkRecord {
+                sink_name: "factor_sink".to_string(),
+                sink_type: "parquet".to_string(),
+                process_id: "proc_3".to_string(),
+                input_stream: "openctp_mid_price_factors".to_string(),
+                config: serde_json::json!({"path": "data/factors"}),
+                status: "running".to_string(),
+            }],
+        },
+    )
+    .unwrap();
+
+    let server = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let registry_handle = server.registry();
+    let registry = registry_handle.lock().unwrap();
+    assert_eq!(registry.get_stream("openctp_ticks").unwrap().status, "restored");
+    assert_eq!(registry.get_source("openctp_md").unwrap().status, "restored");
+    assert_eq!(registry.get_engine("mid_price_factor").unwrap().status, "restored");
+    assert_eq!(registry.get_sink("factor_sink").unwrap().status, "restored");
+}
+
+#[test]
+fn master_persists_registered_streams_to_snapshot_on_register_stream() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path.clone()),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+
+    let response = send_request(
+        &wait_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+    );
+    assert!(response.contains("StreamRegistered"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert_eq!(snapshot.streams.len(), 1);
+    assert_eq!(snapshot.streams[0].stream_name, "openctp_ticks");
+    assert_eq!(snapshot.streams[0].ring_capacity, 1024);
+}
+
+#[test]
 fn registry_updates_process_lease_timestamp_on_heartbeat() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("local_dc");
@@ -92,6 +181,18 @@ fn registry_updates_process_lease_timestamp_on_heartbeat() {
 
     assert!(second_seen >= first_seen);
     assert_eq!(registry.get_process(&process_id).unwrap().lease_status, "alive");
+}
+
+#[test]
+fn registry_rejects_heartbeat_for_expired_process() {
+    let mut registry = Registry::default();
+    let process_id = registry.register_process("local_dc");
+
+    assert!(registry.claim_expired_process(&process_id, 0).unwrap());
+
+    let error = registry.record_heartbeat(&process_id).unwrap_err();
+    assert!(format!("{error}").contains("process lease expired"));
+    assert!(format!("{error}").contains(&process_id));
 }
 
 #[test]
@@ -144,6 +245,143 @@ fn master_server_returns_structured_error_for_unknown_process_heartbeat() {
 
     let process_response = send_register_process(&socket_path, "local_dc");
     assert!(process_response.contains("proc_1"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let blocked_parent = temp.path().join("blocked-parent");
+    fs::write(&blocked_parent, b"not-a-dir").unwrap();
+    let snapshot_path = blocked_parent.join("master-registry.json");
+
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path).unwrap_err());
+    wait_for_socket_ready(&wait_path);
+
+    let response = send_request(
+        &wait_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+    );
+    assert!(response.contains("Error"));
+    assert!(response.contains("failed to create registry snapshot parent"));
+
+    let stream = server.registry().lock().unwrap().get_stream("openctp_ticks").cloned();
+    assert!(stream.is_none());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(wait_path);
+}
+
+#[test]
+fn master_server_returns_error_when_shutdown_snapshot_flush_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let blocked_parent = temp.path().join("blocked-parent");
+    fs::write(&blocked_parent, b"not-a-dir").unwrap();
+    let snapshot_path = blocked_parent.join("master-registry.json");
+
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path));
+    wait_for_socket_ready(&wait_path);
+
+    server.shutdown();
+    let result = join_handle.join().unwrap();
+    assert!(result.is_err());
+    assert!(format!("{}", result.unwrap_err()).contains("failed to create registry snapshot parent"));
+}
+
+#[test]
+fn registry_marks_control_plane_entities_lost_when_process_expires() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_register_process(&socket_path, "local_dc");
+    let process_response: ControlResponse =
+        serde_json::from_str(process_response.trim_end()).unwrap();
+    let process_id = match process_response {
+        ControlResponse::ProcessRegistered { process_id } => process_id,
+        other => panic!("unexpected process response: {:?}", other),
+    };
+
+    let source_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterSource(RegisterSourceRequest {
+            source_name: "openctp_md".to_string(),
+            source_type: "openctp".to_string(),
+            process_id: process_id.clone(),
+            output_stream: "openctp_ticks".to_string(),
+            config: serde_json::json!({"front": "tcp://example"}),
+        }),
+    );
+    assert!(matches!(source_response, ControlResponse::SourceRegistered { .. }));
+
+    let engine_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterEngine(RegisterEngineRequest {
+            engine_name: "mid_price_factor".to_string(),
+            engine_type: "reactive".to_string(),
+            process_id: process_id.clone(),
+            input_stream: "openctp_ticks".to_string(),
+            output_stream: "openctp_mid_price_factors".to_string(),
+            sink_names: vec!["factor_sink".to_string()],
+            config: serde_json::json!({"id_filter": ["IF2606"]}),
+        }),
+    );
+    assert!(matches!(engine_response, ControlResponse::EngineRegistered { .. }));
+
+    let sink_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterSink(RegisterSinkRequest {
+            sink_name: "factor_sink".to_string(),
+            sink_type: "parquet".to_string(),
+            process_id: process_id.clone(),
+            input_stream: "openctp_mid_price_factors".to_string(),
+            config: serde_json::json!({"path": "data/factors"}),
+        }),
+    );
+    assert!(matches!(sink_response, ControlResponse::SinkRegistered { .. }));
+
+    let status_response = send_control_request(
+        &socket_path,
+        ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+            kind: "engine".to_string(),
+            name: "mid_price_factor".to_string(),
+            status: "running".to_string(),
+            metrics: Some(serde_json::json!({"processed_rows_total": 42})),
+        }),
+    );
+    assert!(matches!(status_response, ControlResponse::StatusUpdated { .. }));
+
+    let expire_response = send_request(
+        &socket_path,
+        &format!("{{\"ExpireProcessForTest\":{{\"process_id\":\"{process_id}\"}}}}\n"),
+    );
+    assert!(expire_response.contains(&process_id));
+
+    let registry_handle = server.registry();
+    let registry = registry_handle.lock().unwrap();
+    assert_eq!(registry.get_source("openctp_md").unwrap().status, "lost");
+    assert_eq!(registry.get_engine("mid_price_factor").unwrap().status, "lost");
+    assert_eq!(registry.get_sink("factor_sink").unwrap().status, "lost");
+    drop(registry);
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -249,6 +487,12 @@ fn send_register_process(socket_path: &Path, app: &str) -> String {
         socket_path,
         &format!("{{\"RegisterProcess\":{{\"app\":\"{app}\"}}}}\n"),
     )
+}
+
+fn send_control_request(socket_path: &Path, request: ControlRequest) -> ControlResponse {
+    let payload = format!("{}\n", serde_json::to_string(&request).unwrap());
+    let response = send_request(socket_path, &payload);
+    serde_json::from_str(response.trim_end()).unwrap()
 }
 
 fn send_request(socket_path: &Path, payload: &str) -> String {

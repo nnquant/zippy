@@ -3,8 +3,10 @@
 mod native_source_bridge;
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -94,6 +96,89 @@ fn parse_startup_timeout(startup_timeout_sec: f64) -> PyResult<Duration> {
         ));
     }
     Ok(Duration::from_secs_f64(startup_timeout_sec))
+}
+
+fn python_json_dumps(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let json = PyModule::import_bound(py, "json")?;
+    json.call_method1("dumps", (value,))?
+        .extract::<String>()
+        .map_err(|error| py_value_error(error.to_string()))
+}
+
+fn python_json_loads<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
+    let json = PyModule::import_bound(py, "json")?;
+    json.call_method1("loads", (text,)).map_err(|error| py_value_error(error.to_string()))
+}
+
+fn send_master_control_request(
+    py: Python<'_>,
+    control_endpoint: &str,
+    request: &Bound<'_, PyAny>,
+    expected_response_key: &str,
+) -> PyResult<()> {
+    let payload = python_json_dumps(py, request)?;
+    let mut stream = UnixStream::connect(control_endpoint).map_err(|error| {
+        py_runtime_error(format!(
+            "failed to connect control endpoint path=[{}] error=[{}]",
+            control_endpoint, error
+        ))
+    })?;
+    stream.write_all(payload.as_bytes()).map_err(|error| {
+        py_runtime_error(format!(
+            "failed to write control request path=[{}] error=[{}]",
+            control_endpoint, error
+        ))
+    })?;
+    stream.write_all(b"\n").map_err(|error| {
+        py_runtime_error(format!(
+            "failed to write control request terminator path=[{}] error=[{}]",
+            control_endpoint, error
+        ))
+    })?;
+    stream.shutdown(std::net::Shutdown::Write).map_err(|error| {
+        py_runtime_error(format!(
+            "failed to shutdown control request write path=[{}] error=[{}]",
+            control_endpoint, error
+        ))
+    })?;
+
+    let mut response_line = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut response_line).map_err(|error| {
+        py_runtime_error(format!(
+            "failed to read control response path=[{}] error=[{}]",
+            control_endpoint, error
+        ))
+    })?;
+
+    let response = python_json_loads(py, response_line.trim_end())?;
+    let response = response
+        .downcast::<PyDict>()
+        .map_err(|_| py_runtime_error("invalid control response"))?;
+
+    if let Some((key, value)) = response.iter().next() {
+        let key = key.extract::<String>().map_err(|error| py_value_error(error.to_string()))?;
+        if key == "Error" {
+            let error = value
+                .downcast::<PyDict>()
+                .map_err(|_| py_runtime_error("invalid control error response"))?;
+            let reason = error
+                .get_item("reason")?
+                .ok_or_else(|| py_runtime_error("control error response is missing reason"))?
+                .extract::<String>()
+                .map_err(|error| py_value_error(error.to_string()))?;
+            return Err(py_runtime_error(reason));
+        }
+
+        if key == expected_response_key {
+            return Ok(());
+        }
+    }
+
+    Err(py_runtime_error(format!(
+        "unexpected control response expected_key=[{}]",
+        expected_response_key
+    )))
 }
 
 type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
@@ -1269,6 +1354,15 @@ impl MasterClient {
         })
     }
 
+    fn require_process_id(&self) -> PyResult<String> {
+        self.client
+            .lock()
+            .unwrap()
+            .process_id()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| py_runtime_error("master client process not registered"))
+    }
+
     fn register_process(&self, app: String) -> PyResult<String> {
         self.client
             .lock()
@@ -1311,6 +1405,115 @@ impl MasterClient {
             }
             Err(error) => Err(py_runtime_error(error.to_string())),
         }
+    }
+
+    #[pyo3(signature = (source_name, source_type, output_stream, config))]
+    fn register_source(
+        &self,
+        py: Python<'_>,
+        source_name: String,
+        source_type: String,
+        output_stream: String,
+        config: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let process_id = self.require_process_id()?;
+        let request = PyDict::new_bound(py);
+        let payload = PyDict::new_bound(py);
+        payload.set_item("source_name", source_name)?;
+        payload.set_item("source_type", source_type)?;
+        payload.set_item("process_id", process_id)?;
+        payload.set_item("output_stream", output_stream)?;
+        payload.set_item("config", config)?;
+        request.set_item("RegisterSource", payload)?;
+        send_master_control_request(
+            py,
+            &self.control_endpoint,
+            request.as_any(),
+            "SourceRegistered",
+        )
+    }
+
+    #[pyo3(signature = (engine_name, engine_type, input_stream, output_stream, sink_names, config))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_engine(
+        &self,
+        py: Python<'_>,
+        engine_name: String,
+        engine_type: String,
+        input_stream: String,
+        output_stream: String,
+        sink_names: Vec<String>,
+        config: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let process_id = self.require_process_id()?;
+        let request = PyDict::new_bound(py);
+        let payload = PyDict::new_bound(py);
+        let sink_name_values = PyList::empty_bound(py);
+        for sink_name in sink_names {
+            sink_name_values.append(sink_name)?;
+        }
+        payload.set_item("engine_name", engine_name)?;
+        payload.set_item("engine_type", engine_type)?;
+        payload.set_item("process_id", process_id)?;
+        payload.set_item("input_stream", input_stream)?;
+        payload.set_item("output_stream", output_stream)?;
+        payload.set_item("sink_names", sink_name_values)?;
+        payload.set_item("config", config)?;
+        request.set_item("RegisterEngine", payload)?;
+        send_master_control_request(
+            py,
+            &self.control_endpoint,
+            request.as_any(),
+            "EngineRegistered",
+        )
+    }
+
+    #[pyo3(signature = (sink_name, sink_type, input_stream, config))]
+    fn register_sink(
+        &self,
+        py: Python<'_>,
+        sink_name: String,
+        sink_type: String,
+        input_stream: String,
+        config: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let process_id = self.require_process_id()?;
+        let request = PyDict::new_bound(py);
+        let payload = PyDict::new_bound(py);
+        payload.set_item("sink_name", sink_name)?;
+        payload.set_item("sink_type", sink_type)?;
+        payload.set_item("process_id", process_id)?;
+        payload.set_item("input_stream", input_stream)?;
+        payload.set_item("config", config)?;
+        request.set_item("RegisterSink", payload)?;
+        send_master_control_request(py, &self.control_endpoint, request.as_any(), "SinkRegistered")
+    }
+
+    #[pyo3(signature = (kind, name, status, metrics=None))]
+    fn update_status(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        name: String,
+        status: String,
+        metrics: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let request = PyDict::new_bound(py);
+        let payload = PyDict::new_bound(py);
+        payload.set_item("kind", kind)?;
+        payload.set_item("name", name)?;
+        payload.set_item("status", status)?;
+        match metrics {
+            Some(metrics) => payload.set_item("metrics", metrics)?,
+            None => payload.set_item("metrics", py.None())?,
+        }
+        request.set_item("UpdateStatus", payload)?;
+        send_master_control_request(
+            py,
+            &self.control_endpoint,
+            request.as_any(),
+            "StatusUpdated",
+        )
     }
 
     fn write_to(&self, stream_name: String) -> PyResult<BusWriter> {

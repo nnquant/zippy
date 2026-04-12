@@ -305,6 +305,40 @@ class MasterClient:
 
     def register_stream(self, stream_name: str, schema: pa.Schema, ring_capacity: int) -> None: ...
 
+    def register_source(
+        self,
+        source_name: str,
+        source_type: str,
+        output_stream: str,
+        config: object,
+    ) -> None: ...
+
+    def register_engine(
+        self,
+        engine_name: str,
+        engine_type: str,
+        input_stream: str,
+        output_stream: str,
+        sink_names: list[str],
+        config: object,
+    ) -> None: ...
+
+    def register_sink(
+        self,
+        sink_name: str,
+        sink_type: str,
+        input_stream: str,
+        config: object,
+    ) -> None: ...
+
+    def update_status(
+        self,
+        kind: str,
+        name: str,
+        status: str,
+        metrics: object | None = None,
+    ) -> None: ...
+
     def write_to(self, stream_name: str) -> BusWriter: ...
 
     def read_from(self, stream_name: str) -> BusReader: ...

@@ -3427,6 +3427,55 @@ def test_master_client_heartbeat_keeps_registered_process_alive(tmp_path: Path) 
     server.stop()
 
 
+def test_master_client_registers_control_plane_entities_and_updates_status(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("openctp_worker")
+    client.register_stream("openctp_ticks", tick_schema, 64)
+    client.register_stream("openctp_mid_price_factors", tick_schema, 64)
+    client.register_source(
+        "openctp_md",
+        "openctp",
+        "openctp_ticks",
+        {
+            "front": "tcp://127.0.0.1:12345",
+            "instruments": ["IF2606"],
+        },
+    )
+    client.register_engine(
+        "mid_price_factor",
+        "reactive",
+        "openctp_ticks",
+        "openctp_mid_price_factors",
+        ["factor_sink"],
+        {
+            "id_filter": ["IF2606"],
+        },
+    )
+    client.register_sink(
+        "factor_sink",
+        "parquet",
+        "openctp_mid_price_factors",
+        {
+            "path": "data/openctp_mid_price_factors",
+        },
+    )
+    client.update_status(
+        "engine",
+        "mid_price_factor",
+        "running",
+        {
+            "rows": 12,
+        },
+    )
+
+    server.stop()
+
+
 def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
     tmp_path: Path,
 ) -> None:

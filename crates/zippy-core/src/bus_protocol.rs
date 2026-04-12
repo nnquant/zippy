@@ -20,6 +20,43 @@ pub struct RegisterStreamRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSourceRequest {
+    pub source_name: String,
+    pub source_type: String,
+    pub process_id: String,
+    pub output_stream: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterEngineRequest {
+    pub engine_name: String,
+    pub engine_type: String,
+    pub process_id: String,
+    pub input_stream: String,
+    pub output_stream: String,
+    pub sink_names: Vec<String>,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSinkRequest {
+    pub sink_name: String,
+    pub sink_type: String,
+    pub process_id: String,
+    pub input_stream: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRecordStatusRequest {
+    pub kind: String,
+    pub name: String,
+    pub status: String,
+    pub metrics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachStreamRequest {
     pub stream_name: String,
     pub process_id: String,
@@ -93,6 +130,10 @@ pub enum ControlRequest {
     RegisterProcess(RegisterProcessRequest),
     Heartbeat(HeartbeatRequest),
     RegisterStream(RegisterStreamRequest),
+    RegisterSource(RegisterSourceRequest),
+    RegisterEngine(RegisterEngineRequest),
+    RegisterSink(RegisterSinkRequest),
+    UpdateStatus(UpdateRecordStatusRequest),
     WriteTo(AttachStreamRequest),
     ReadFrom(AttachStreamRequest),
     CloseWriter(DetachWriterRequest),
@@ -106,6 +147,10 @@ pub enum ControlResponse {
     ProcessRegistered { process_id: String },
     HeartbeatAccepted { process_id: String },
     StreamRegistered { stream_name: String },
+    SourceRegistered { source_name: String },
+    EngineRegistered { engine_name: String },
+    SinkRegistered { sink_name: String },
+    StatusUpdated { kind: String, name: String },
     WriterAttached { descriptor: WriterDescriptor },
     ReaderAttached { descriptor: ReaderDescriptor },
     WriterDetached { stream_name: String, writer_id: String },
@@ -126,6 +171,18 @@ impl fmt::Display for ControlResponse {
             }
             Self::StreamRegistered { stream_name } => {
                 write!(f, "stream registered stream_name=[{}]", stream_name)
+            }
+            Self::SourceRegistered { source_name } => {
+                write!(f, "source registered source_name=[{}]", source_name)
+            }
+            Self::EngineRegistered { engine_name } => {
+                write!(f, "engine registered engine_name=[{}]", engine_name)
+            }
+            Self::SinkRegistered { sink_name } => {
+                write!(f, "sink registered sink_name=[{}]", sink_name)
+            }
+            Self::StatusUpdated { kind, name } => {
+                write!(f, "status updated kind=[{}] name=[{}]", kind, name)
             }
             Self::WriterAttached { descriptor } => write!(
                 f,

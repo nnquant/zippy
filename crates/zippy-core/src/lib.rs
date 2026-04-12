@@ -14,8 +14,10 @@ pub mod version;
 pub use bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest,
     DetachWriterRequest, GetStreamRequest, GetStreamResponse, HeartbeatRequest,
-    ListStreamsRequest, ListStreamsResponse, ReaderDescriptor, RegisterProcessRequest,
-    RegisterStreamRequest, StreamInfo, WriterDescriptor, BUS_LAYOUT_VERSION,
+    ListStreamsRequest, ListStreamsResponse, ReaderDescriptor, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
+    RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
+    BUS_LAYOUT_VERSION,
 };
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};

@@ -2,19 +2,27 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use zippy_core::bus_protocol::{GetStreamResponse, ListStreamsResponse, StreamInfo};
+use zippy_core::bus_protocol::{
+    GetStreamResponse, ListStreamsResponse, StreamInfo,
+};
 use zippy_core::{ControlRequest, ControlResponse, Result, ZippyError};
 
-use crate::bus::Bus;
+use crate::bus::{Bus, BusError};
 use crate::registry::Registry;
-use crate::snapshot::SnapshotStore;
+use crate::snapshot::{
+    RegistrySnapshot, SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord,
+    SnapshotStore, SnapshotStreamRecord,
+};
+
+const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct MasterServer {
@@ -22,19 +30,35 @@ pub struct MasterServer {
     #[allow(dead_code)]
     bus: Arc<Mutex<Bus>>,
     running: Arc<AtomicBool>,
+    snapshot_lock: Arc<Mutex<()>>,
+    snapshot_path: Option<PathBuf>,
+    lease_timeout: Duration,
+    lease_reaper_interval: Duration,
 }
 
 impl Default for MasterServer {
     fn default() -> Self {
-        Self {
-            registry: Arc::new(Mutex::new(Registry::default())),
-            bus: Arc::new(Mutex::new(Bus::default())),
-            running: Arc::new(AtomicBool::new(true)),
-        }
+        Self::with_runtime_config(None, DEFAULT_LEASE_TIMEOUT, DEFAULT_LEASE_REAPER_INTERVAL)
     }
 }
 
 impl MasterServer {
+    pub fn with_runtime_config(
+        snapshot_path: Option<PathBuf>,
+        lease_timeout: Duration,
+        lease_reaper_interval: Duration,
+    ) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(Registry::default())),
+            bus: Arc::new(Mutex::new(Bus::default())),
+            running: Arc::new(AtomicBool::new(true)),
+            snapshot_lock: Arc::new(Mutex::new(())),
+            snapshot_path,
+            lease_timeout,
+            lease_reaper_interval,
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -45,7 +69,11 @@ impl MasterServer {
 
     pub fn from_snapshot_path(snapshot_path: &Path) -> Result<Self> {
         let snapshot = SnapshotStore::load(snapshot_path)?;
-        let server = Self::default();
+        let server = Self::with_runtime_config(
+            Some(snapshot_path.to_path_buf()),
+            DEFAULT_LEASE_TIMEOUT,
+            DEFAULT_LEASE_REAPER_INTERVAL,
+        );
 
         {
             let mut bus = server.bus.lock().unwrap();
@@ -59,6 +87,53 @@ impl MasterServer {
                     .map_err(registry_error)?;
                 registry
                     .set_stream_status(&stream.stream_name, "restored")
+                    .map_err(registry_error)?;
+            }
+
+            for source in snapshot.sources {
+                registry
+                    .register_source(
+                        &source.source_name,
+                        &source.source_type,
+                        &source.process_id,
+                        &source.output_stream,
+                        source.config,
+                    )
+                    .map_err(registry_error)?;
+                registry
+                    .set_source_status(&source.source_name, "restored", Some(source.metrics))
+                    .map_err(registry_error)?;
+            }
+
+            for engine in snapshot.engines {
+                registry
+                    .register_engine(
+                        &engine.engine_name,
+                        &engine.engine_type,
+                        &engine.process_id,
+                        &engine.input_stream,
+                        &engine.output_stream,
+                        engine.sink_names,
+                        engine.config,
+                    )
+                    .map_err(registry_error)?;
+                registry
+                    .set_engine_status(&engine.engine_name, "restored", Some(engine.metrics))
+                    .map_err(registry_error)?;
+            }
+
+            for sink in snapshot.sinks {
+                registry
+                    .register_sink(
+                        &sink.sink_name,
+                        &sink.sink_type,
+                        &sink.process_id,
+                        &sink.input_stream,
+                        sink.config,
+                    )
+                    .map_err(registry_error)?;
+                registry
+                    .set_sink_status(&sink.sink_name, "restored")
                     .map_err(registry_error)?;
             }
         }
@@ -140,6 +215,8 @@ impl MasterServer {
             "master listening"
         );
 
+        self.start_lease_reaper();
+
         let accept_result = loop {
             if !self.running.load(Ordering::SeqCst) {
                 break Ok(());
@@ -188,9 +265,20 @@ impl MasterServer {
         }
 
         let cleanup_result = cleanup_socket(socket_path, &socket_ownership);
+        let snapshot_flush_result = self.write_snapshot();
 
-        match (accept_result, cleanup_result) {
-            (Ok(()), Ok(())) => {
+        if let Err(error) = &snapshot_flush_result {
+            tracing::error!(
+                component = "master",
+                event = "snapshot_write_failure",
+                status = "error",
+                error = %error,
+                "failed to write registry snapshot"
+            );
+        }
+
+        match (accept_result, cleanup_result, snapshot_flush_result) {
+            (Ok(()), Ok(()), Ok(())) => {
                 tracing::info!(
                     component = "master",
                     event = "master_stopped",
@@ -200,8 +288,9 @@ impl MasterServer {
                 );
                 Ok(())
             }
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => {
+            (Err(error), Ok(()), _) => Err(error),
+            (Ok(()), Ok(()), Err(error)) => Err(error),
+            (Ok(()), Err(error), _) => {
                 tracing::error!(
                     component = "master",
                     event = "master_cleanup_error",
@@ -212,7 +301,7 @@ impl MasterServer {
                 );
                 Err(error)
             }
-            (Err(error), Err(cleanup_error)) => {
+            (Err(error), Err(cleanup_error), _) => {
                 tracing::error!(
                     component = "master",
                     event = "master_cleanup_error",
@@ -296,6 +385,7 @@ impl MasterServer {
                 }
             }
             ControlRequest::RegisterStream(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut bus = self.bus.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 match bus.ensure_stream(&request.stream_name, request.ring_capacity) {
@@ -318,6 +408,31 @@ impl MasterServer {
                                     "registered stream"
                                 }
                             );
+                            if !existing {
+                                let snapshot = Self::snapshot_from_registry(&registry);
+                                if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                                    if registry_created {
+                                        registry.unregister_stream(&request.stream_name);
+                                    }
+                                    if bus_created {
+                                        bus.remove_stream(&request.stream_name);
+                                    }
+                                    tracing::error!(
+                                        component = "master_server",
+                                        event = "snapshot_write_failure",
+                                        status = "error",
+                                        stream_name = request.stream_name.as_str(),
+                                        error = %error,
+                                        "failed to persist stream snapshot"
+                                    );
+                                    return write_control_response(
+                                        &mut stream,
+                                        &ControlResponse::Error {
+                                            reason: error.to_string(),
+                                        },
+                                    );
+                                }
+                            }
                             ControlResponse::StreamRegistered {
                                 stream_name: request.stream_name,
                             }
@@ -354,6 +469,217 @@ impl MasterServer {
                             reason: format!("{}", error),
                         }
                     }
+                }
+            }
+            ControlRequest::RegisterSource(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                let mut registry = self.registry.lock().unwrap();
+                match registry.register_source(
+                    &request.source_name,
+                    &request.source_type,
+                    &request.process_id,
+                    &request.output_stream,
+                    request.config,
+                ) {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            registry.unregister_source(&request.source_name);
+                            tracing::error!(
+                                component = "master_server",
+                                event = "snapshot_write_failure",
+                                status = "error",
+                                source_name = request.source_name.as_str(),
+                                error = %error,
+                                "failed to persist source snapshot"
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "register_source",
+                            status = "success",
+                            source_name = request.source_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            output_stream = request.output_stream.as_str(),
+                            "registered source"
+                        );
+                        ControlResponse::SourceRegistered {
+                            source_name: request.source_name,
+                        }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            ControlRequest::RegisterEngine(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                let mut registry = self.registry.lock().unwrap();
+                match registry.register_engine(
+                    &request.engine_name,
+                    &request.engine_type,
+                    &request.process_id,
+                    &request.input_stream,
+                    &request.output_stream,
+                    request.sink_names,
+                    request.config,
+                ) {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            registry.unregister_engine(&request.engine_name);
+                            tracing::error!(
+                                component = "master_server",
+                                event = "snapshot_write_failure",
+                                status = "error",
+                                engine_name = request.engine_name.as_str(),
+                                error = %error,
+                                "failed to persist engine snapshot"
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "register_engine",
+                            status = "success",
+                            engine_name = request.engine_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            input_stream = request.input_stream.as_str(),
+                            output_stream = request.output_stream.as_str(),
+                            "registered engine"
+                        );
+                        ControlResponse::EngineRegistered {
+                            engine_name: request.engine_name,
+                        }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            ControlRequest::RegisterSink(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                let mut registry = self.registry.lock().unwrap();
+                match registry.register_sink(
+                    &request.sink_name,
+                    &request.sink_type,
+                    &request.process_id,
+                    &request.input_stream,
+                    request.config,
+                ) {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            registry.unregister_sink(&request.sink_name);
+                            tracing::error!(
+                                component = "master_server",
+                                event = "snapshot_write_failure",
+                                status = "error",
+                                sink_name = request.sink_name.as_str(),
+                                error = %error,
+                                "failed to persist sink snapshot"
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "register_sink",
+                            status = "success",
+                            sink_name = request.sink_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            input_stream = request.input_stream.as_str(),
+                            "registered sink"
+                        );
+                        ControlResponse::SinkRegistered {
+                            sink_name: request.sink_name,
+                        }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            ControlRequest::UpdateStatus(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                let mut registry = self.registry.lock().unwrap();
+                let update_result = match request.kind.as_str() {
+                    "source" => {
+                        let previous = registry.get_source(&request.name).cloned();
+                        let result = registry.set_source_status(
+                            &request.name,
+                            &request.status,
+                            request.metrics.clone(),
+                        );
+                        (result, previous.map(|record| ("source", serde_json::to_value(record).unwrap())))
+                    }
+                    "engine" => {
+                        let previous = registry.get_engine(&request.name).cloned();
+                        let result = registry.set_engine_status(
+                            &request.name,
+                            &request.status,
+                            request.metrics.clone(),
+                        );
+                        (result, previous.map(|record| ("engine", serde_json::to_value(record).unwrap())))
+                    }
+                    "sink" => {
+                        let previous = registry.get_sink(&request.name).cloned();
+                        let result = registry.set_sink_status(&request.name, &request.status);
+                        (result, previous.map(|record| ("sink", serde_json::to_value(record).unwrap())))
+                    }
+                    _ => (
+                        Err(crate::registry::RegistryError::InvalidRecordKind {
+                            kind: request.kind.clone(),
+                        }),
+                        None,
+                    ),
+                };
+                match update_result.0 {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            if let Some((kind, previous)) = update_result.1 {
+                                let _ = restore_previous_record(&mut registry, kind, previous);
+                            }
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "update_status",
+                            status = "success",
+                            kind = request.kind.as_str(),
+                            name = request.name.as_str(),
+                            record_status = request.status.as_str(),
+                            "updated record status"
+                        );
+                        ControlResponse::StatusUpdated {
+                            kind: request.kind,
+                            name: request.name,
+                        }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        reason: error.to_string(),
+                    },
                 }
             }
             ControlRequest::WriteTo(request) => {
@@ -666,17 +992,240 @@ impl MasterServer {
         let mut bus = self.bus.lock().unwrap();
         let mut registry = self.registry.lock().unwrap();
         registry
-            .mark_process_expired(process_id)
+            .force_expire_process(process_id)
             .map_err(registry_error)?;
-        let stale_streams = registry.streams_for_writer_process(process_id);
 
+        let stale_streams = registry.streams_for_writer_process(process_id);
         for stream_name in stale_streams {
             let writer_id = format!("{stream_name}_writer");
-            bus.detach_writer(&stream_name, &writer_id).map_err(bus_error)?;
+            match bus.detach_writer(&stream_name, &writer_id) {
+                Ok(()) => {}
+                Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                Err(error) => return Err(bus_error(error)),
+            }
             registry.detach_writer(&stream_name).map_err(registry_error)?;
         }
 
+        let stale_readers = registry.readers_for_process(process_id);
+        for (stream_name, reader_id) in stale_readers {
+            match bus.detach_reader(&stream_name, &reader_id) {
+                Ok(()) => {}
+                Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                Err(error) => return Err(bus_error(error)),
+            }
+            registry
+                .detach_reader(&stream_name, &reader_id)
+                .map_err(registry_error)?;
+        }
+        registry.mark_records_lost_for_process(process_id);
         Ok(())
+    }
+
+    fn start_lease_reaper(&self) {
+        let server = self.clone();
+        thread::spawn(move || {
+            while server.is_running() {
+                thread::sleep(server.lease_reaper_interval);
+                if !server.is_running() {
+                    break;
+                }
+
+                let expired_processes = {
+                    let registry = server.registry.lock().unwrap();
+                    registry.expired_processes(server.lease_timeout.as_millis() as u64)
+                };
+
+                for process_id in expired_processes {
+                    if let Err(error) = server.expire_process_attachments(&process_id) {
+                        tracing::error!(
+                            component = "master",
+                            event = "process_lease_expired",
+                            status = "error",
+                            process_id = process_id.as_str(),
+                            error = %error,
+                            "failed to reclaim expired process attachments"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn expire_process_attachments(&self, process_id: &str) -> Result<()> {
+        let mut bus = self.bus.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
+        let claimed = registry
+            .claim_expired_process(process_id, self.lease_timeout.as_millis() as u64)
+            .map_err(registry_error)?;
+        if !claimed {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            component = "master",
+            event = "process_lease_expired",
+            status = "expired",
+            process_id = process_id,
+            "process lease expired"
+        );
+
+        let stale_streams = registry.streams_for_writer_process(process_id);
+        for stream_name in stale_streams {
+            let writer_id = format!("{stream_name}_writer");
+            match bus.detach_writer(&stream_name, &writer_id) {
+                Ok(()) => {}
+                Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                Err(error) => return Err(bus_error(error)),
+            }
+            registry.detach_writer(&stream_name).map_err(registry_error)?;
+            tracing::info!(
+                component = "master",
+                event = "writer_reclaimed",
+                status = "success",
+                process_id = process_id,
+                stream_name = stream_name.as_str(),
+                writer_id = writer_id.as_str(),
+                "reclaimed stale writer"
+            );
+        }
+
+        let stale_readers = registry.readers_for_process(process_id);
+        for (stream_name, reader_id) in stale_readers {
+            match bus.detach_reader(&stream_name, &reader_id) {
+                Ok(()) => {}
+                Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                Err(error) => return Err(bus_error(error)),
+            }
+            registry
+                .detach_reader(&stream_name, &reader_id)
+                .map_err(registry_error)?;
+            tracing::info!(
+                component = "master",
+                event = "reader_reclaimed",
+                status = "success",
+                process_id = process_id,
+                stream_name = stream_name.as_str(),
+                reader_id = reader_id.as_str(),
+                "reclaimed stale reader"
+            );
+        }
+
+        registry.mark_records_lost_for_process(process_id);
+
+        Ok(())
+    }
+
+    fn snapshot_from_registry(registry: &Registry) -> RegistrySnapshot {
+        RegistrySnapshot {
+            streams: registry
+                .list_streams()
+                .into_iter()
+                .map(|stream| SnapshotStreamRecord {
+                    stream_name: stream.stream_name,
+                    ring_capacity: stream.ring_capacity,
+                    status: stream.status,
+                })
+                .collect(),
+            sources: registry
+                .list_sources()
+                .into_iter()
+                .map(|source| SnapshotSourceRecord {
+                    source_name: source.source_name,
+                    source_type: source.source_type,
+                    process_id: source.process_id,
+                    output_stream: source.output_stream,
+                    config: source.config,
+                    status: source.status,
+                    metrics: source.metrics,
+                })
+                .collect(),
+            engines: registry
+                .list_engines()
+                .into_iter()
+                .map(|engine| SnapshotEngineRecord {
+                    engine_name: engine.engine_name,
+                    engine_type: engine.engine_type,
+                    process_id: engine.process_id,
+                    input_stream: engine.input_stream,
+                    output_stream: engine.output_stream,
+                    sink_names: engine.sink_names,
+                    config: engine.config,
+                    status: engine.status,
+                    metrics: engine.metrics,
+                })
+                .collect(),
+            sinks: registry
+                .list_sinks()
+                .into_iter()
+                .map(|sink| SnapshotSinkRecord {
+                    sink_name: sink.sink_name,
+                    sink_type: sink.sink_type,
+                    process_id: sink.process_id,
+                    input_stream: sink.input_stream,
+                    config: sink.config,
+                    status: sink.status,
+                })
+                .collect(),
+        }
+    }
+
+    fn write_snapshot(&self) -> Result<()> {
+        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+        let snapshot = {
+            let registry = self.registry.lock().unwrap();
+            Self::snapshot_from_registry(&registry)
+        };
+        self.write_snapshot_from_snapshot(&snapshot)
+    }
+
+    fn write_snapshot_from_snapshot(&self, snapshot: &RegistrySnapshot) -> Result<()> {
+        let Some(snapshot_path) = self.snapshot_path.as_ref() else {
+            return Ok(());
+        };
+
+        SnapshotStore::write(snapshot_path, snapshot)?;
+        tracing::info!(
+            component = "master",
+            event = "snapshot_write_success",
+            status = "success",
+            snapshot_path = snapshot_path.display().to_string(),
+            stream_count = snapshot.streams.len() as u64,
+            "wrote registry snapshot"
+        );
+        Ok(())
+    }
+}
+
+fn restore_previous_record(
+    registry: &mut Registry,
+    kind: &str,
+    previous: serde_json::Value,
+) -> Result<()> {
+    match kind {
+        "source" => {
+            let record: crate::snapshot::SnapshotSourceRecord =
+                serde_json::from_value(previous).map_err(json_error)?;
+            registry
+                .set_source_status(&record.source_name, &record.status, Some(record.metrics))
+                .map_err(registry_error)
+        }
+        "engine" => {
+            let record: crate::snapshot::SnapshotEngineRecord =
+                serde_json::from_value(previous).map_err(json_error)?;
+            registry
+                .set_engine_status(&record.engine_name, &record.status, Some(record.metrics))
+                .map_err(registry_error)
+        }
+        "sink" => {
+            let record: crate::snapshot::SnapshotSinkRecord =
+                serde_json::from_value(previous).map_err(json_error)?;
+            registry
+                .set_sink_status(&record.sink_name, &record.status)
+                .map_err(registry_error)
+        }
+        _ => Err(ZippyError::Io {
+            reason: format!("invalid restore kind kind=[{}]", kind),
+        }),
     }
 }
 
@@ -691,6 +1240,12 @@ fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
+    }
+}
+
+fn json_error(error: serde_json::Error) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
     }

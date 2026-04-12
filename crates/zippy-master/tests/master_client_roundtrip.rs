@@ -46,6 +46,51 @@ fn spawn_test_server(socket_path: &Path) -> (MasterServer, thread::JoinHandle<()
     (server, join_handle)
 }
 
+fn spawn_test_server_with_lease(
+    socket_path: &Path,
+    lease_timeout: Duration,
+    lease_reaper_interval: Duration,
+) -> (MasterServer, thread::JoinHandle<()>) {
+    let server = MasterServer::with_runtime_config(None, lease_timeout, lease_reaper_interval);
+    let handle_server = server.clone();
+    let socket_path = socket_path.to_path_buf();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || {
+        handle_server.serve(&socket_path).unwrap();
+    });
+    wait_for_socket_ready(&wait_path);
+    (server, join_handle)
+}
+
+fn wait_for_socket_ready(socket_path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(stream) => {
+                drop(stream);
+                return;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!(
+                "unexpected error while waiting for socket path=[{}] error=[{}]",
+                socket_path.display(),
+                error
+            ),
+        }
+    }
+
+    panic!("socket was not ready path=[{}]", socket_path.display());
+}
+
 fn send_request(socket_path: &Path, payload: &str) -> String {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
@@ -130,6 +175,64 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
     second.register_stream("ticks", test_schema(), 64).unwrap();
     let second_writer = second.write_to("ticks").unwrap();
     assert_eq!(second_writer.descriptor().process_id, "proc_2");
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn lease_reaper_reclaims_expired_writer_for_new_writer() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server_with_lease(
+        &socket_path,
+        Duration::from_millis(50),
+        Duration::from_millis(10),
+    );
+
+    let mut first = MasterClient::connect(&socket_path).unwrap();
+    first.register_process("writer_a").unwrap();
+    first.register_stream("ticks", test_schema(), 64).unwrap();
+    let _writer = first.write_to("ticks").unwrap();
+
+    thread::sleep(Duration::from_millis(120));
+
+    let mut second = MasterClient::connect(&socket_path).unwrap();
+    second.register_process("writer_b").unwrap();
+    second.register_stream("ticks", test_schema(), 64).unwrap();
+    let second_writer = second.write_to("ticks").unwrap();
+    assert_eq!(second_writer.descriptor().process_id, "proc_2");
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn lease_reaper_reclaims_expired_reader_attachments() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server_with_lease(
+        &socket_path,
+        Duration::from_millis(50),
+        Duration::from_millis(10),
+    );
+
+    let mut writer = MasterClient::connect(&socket_path).unwrap();
+    writer.register_process("writer").unwrap();
+    writer.register_stream("ticks", test_schema(), 64).unwrap();
+    let _writer = writer.write_to("ticks").unwrap();
+
+    let mut reader = MasterClient::connect(&socket_path).unwrap();
+    reader.register_process("reader").unwrap();
+    let _reader = reader.read_from("ticks").unwrap();
+
+    thread::sleep(Duration::from_millis(120));
+
+    let stream_response = send_request(
+        &socket_path,
+        "{\"GetStream\":{\"stream_name\":\"ticks\"}}\n",
+    );
+    assert!(stream_response.contains("\"reader_count\":0"));
 
     server.shutdown();
     join_handle.join().unwrap();

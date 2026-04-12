@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -12,12 +13,46 @@ pub struct SnapshotStreamRecord {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotSourceRecord {
+    pub source_name: String,
+    pub source_type: String,
+    pub process_id: String,
+    pub output_stream: String,
+    pub config: serde_json::Value,
+    pub status: String,
+    pub metrics: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotEngineRecord {
+    pub engine_name: String,
+    pub engine_type: String,
+    pub process_id: String,
+    pub input_stream: String,
+    pub output_stream: String,
+    pub sink_names: Vec<String>,
+    pub config: serde_json::Value,
+    pub status: String,
+    pub metrics: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotSinkRecord {
+    pub sink_name: String,
+    pub sink_type: String,
+    pub process_id: String,
+    pub input_stream: String,
+    pub config: serde_json::Value,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistrySnapshot {
     pub streams: Vec<SnapshotStreamRecord>,
-    pub sources: Vec<serde_json::Value>,
-    pub engines: Vec<serde_json::Value>,
-    pub sinks: Vec<serde_json::Value>,
+    pub sources: Vec<SnapshotSourceRecord>,
+    pub engines: Vec<SnapshotEngineRecord>,
+    pub sinks: Vec<SnapshotSinkRecord>,
 }
 
 pub struct SnapshotStore;
@@ -34,8 +69,14 @@ impl SnapshotStore {
         let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| ZippyError::Io {
             reason: format!("failed to serialize registry snapshot error=[{}]", error),
         })?;
-        fs::write(&temp_path, bytes).map_err(|error| ZippyError::Io {
+        let mut temp_file = fs::File::create(&temp_path).map_err(|error| ZippyError::Io {
+            reason: format!("failed to create registry snapshot temp file error=[{}]", error),
+        })?;
+        temp_file.write_all(&bytes).map_err(|error| ZippyError::Io {
             reason: format!("failed to write registry snapshot temp file error=[{}]", error),
+        })?;
+        temp_file.sync_all().map_err(|error| ZippyError::Io {
+            reason: format!("failed to fsync registry snapshot temp file error=[{}]", error),
         })?;
         fs::rename(&temp_path, path).map_err(|error| ZippyError::Io {
             reason: format!("failed to move registry snapshot into place error=[{}]", error),

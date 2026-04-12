@@ -9,7 +9,8 @@ use arrow::datatypes::Schema;
 use zippy_core::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest,
     DetachWriterRequest, HeartbeatRequest, MasterClient, ReaderDescriptor,
-    RegisterProcessRequest, RegisterStreamRequest, SchemaRef, StreamInfo, WriterDescriptor,
+    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
+    RegisterStreamRequest, SchemaRef, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
     BUS_LAYOUT_VERSION,
 };
 
@@ -65,6 +66,57 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                 }
                 ControlRequest::RegisterStream(RegisterStreamRequest { stream_name, .. }) => {
                     ControlResponse::StreamRegistered { stream_name }
+                }
+                ControlRequest::RegisterSource(RegisterSourceRequest {
+                    source_name,
+                    source_type,
+                    output_stream,
+                    ..
+                }) => {
+                    assert_eq!(source_type, "openctp");
+                    assert_eq!(output_stream, "openctp_ticks");
+                    ControlResponse::SourceRegistered { source_name }
+                }
+                ControlRequest::RegisterEngine(RegisterEngineRequest {
+                    engine_name,
+                    engine_type,
+                    input_stream,
+                    output_stream,
+                    sink_names,
+                    ..
+                }) => {
+                    assert_eq!(engine_type, "reactive");
+                    assert_eq!(input_stream, "openctp_ticks");
+                    assert_eq!(output_stream, "openctp_mid_price_factors");
+                    assert_eq!(sink_names, vec!["factor_sink".to_string()]);
+                    ControlResponse::EngineRegistered { engine_name }
+                }
+                ControlRequest::RegisterSink(RegisterSinkRequest {
+                    sink_name,
+                    sink_type,
+                    input_stream,
+                    ..
+                }) => {
+                    assert_eq!(sink_type, "parquet");
+                    assert_eq!(input_stream, "openctp_mid_price_factors");
+                    ControlResponse::SinkRegistered { sink_name }
+                }
+                ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+                    kind,
+                    name,
+                    status,
+                    metrics,
+                }) => {
+                    assert_eq!(kind, "engine");
+                    assert_eq!(name, "mid_price_factor");
+                    assert_eq!(status, "running");
+                    assert_eq!(
+                        metrics,
+                        Some(serde_json::json!({
+                            "rows": 12,
+                        }))
+                    );
+                    ControlResponse::StatusUpdated { kind, name }
                 }
                 ControlRequest::WriteTo(AttachStreamRequest {
                     stream_name,
@@ -219,6 +271,60 @@ fn master_client_sends_heartbeat_for_registered_process() {
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("local_dc").unwrap();
     client.heartbeat().unwrap();
+
+    server.join().unwrap();
+}
+
+#[test]
+fn master_client_registers_control_plane_entities_and_updates_status() {
+    let socket_path = unique_socket_path();
+    let server = spawn_fake_server(&socket_path, 5);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client
+        .register_source(
+            "openctp_md",
+            "openctp",
+            "openctp_ticks",
+            serde_json::json!({
+                "front": "tcp://127.0.0.1:12345",
+            }),
+        )
+        .unwrap();
+    client
+        .register_engine(
+            "mid_price_factor",
+            "reactive",
+            "openctp_ticks",
+            "openctp_mid_price_factors",
+            vec!["factor_sink".to_string()],
+            serde_json::json!({
+                "id_filter": ["IF2606"],
+            }),
+        )
+        .unwrap();
+    client
+        .register_sink(
+            "factor_sink",
+            "parquet",
+            "openctp_mid_price_factors",
+            serde_json::json!({
+                "path": "data/openctp_mid_price_factors",
+            }),
+        )
+        .unwrap();
+    client
+        .update_status(
+            "engine",
+            "mid_price_factor",
+            "running",
+            Some(serde_json::json!({
+                "rows": 12,
+            })),
+        )
+        .unwrap();
 
     server.join().unwrap();
 }
