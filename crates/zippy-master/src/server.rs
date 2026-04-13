@@ -1136,7 +1136,7 @@ impl MasterServer {
                 .into_iter()
                 .map(|stream| SnapshotStreamRecord {
                     stream_name: stream.stream_name,
-                    ring_capacity: stream.ring_capacity,
+                    ring_capacity: stream.buffer_size,
                     status: stream.status,
                 })
                 .collect(),
@@ -1310,8 +1310,8 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
     fn from(stream: crate::registry::StreamRecord) -> Self {
         Self {
             stream_name: stream.stream_name,
-            buffer_size: stream.ring_capacity,
-            frame_size: stream.ring_capacity,
+            buffer_size: stream.buffer_size,
+            frame_size: stream.frame_size,
             write_seq: 0,
             writer_process_id: stream.writer_process_id,
             reader_count: stream.reader_count,

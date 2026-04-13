@@ -759,7 +759,7 @@ fn master_server_lists_registered_streams_over_unix_socket() {
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].stream_name, "openctp_ticks");
     assert_eq!(streams[0].buffer_size, 1024);
-    assert_eq!(streams[0].frame_size, 1024);
+    assert_eq!(streams[0].frame_size, 256);
     assert_eq!(streams[0].write_seq, 0);
 
     server.shutdown();
@@ -792,7 +792,7 @@ fn master_server_fetches_single_stream_over_unix_socket() {
     };
     assert_eq!(stream.stream_name, "openctp_ticks");
     assert_eq!(stream.buffer_size, 1024);
-    assert_eq!(stream.frame_size, 1024);
+    assert_eq!(stream.frame_size, 256);
     assert_eq!(stream.write_seq, 0);
 
     server.shutdown();

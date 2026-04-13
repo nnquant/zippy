@@ -17,6 +17,8 @@ pub struct ProcessRecord {
 pub struct StreamRecord {
     pub stream_name: String,
     pub ring_capacity: usize,
+    pub buffer_size: usize,
+    pub frame_size: usize,
     pub writer_process_id: Option<String>,
     pub reader_count: usize,
     pub status: String,
@@ -222,7 +224,7 @@ impl Registry {
         &mut self,
         stream_name: &str,
         buffer_size: usize,
-        _frame_size: usize,
+        frame_size: usize,
     ) -> Result<bool, RegistryError> {
         if buffer_size == 0 {
             return Err(RegistryError::InvalidRingCapacity {
@@ -232,7 +234,10 @@ impl Registry {
         }
 
         if let Some(existing) = self.streams.get(stream_name) {
-            if existing.ring_capacity != buffer_size {
+            if existing.ring_capacity != buffer_size
+                || existing.buffer_size != buffer_size
+                || existing.frame_size != frame_size
+            {
                 return Err(RegistryError::StreamRingCapacityMismatch {
                     stream_name: stream_name.to_string(),
                     existing_ring_capacity: existing.ring_capacity,
@@ -242,7 +247,7 @@ impl Registry {
             return Ok(false);
         }
 
-        self.register_stream_with_sizes(stream_name, buffer_size, buffer_size)?;
+        self.register_stream_with_sizes(stream_name, buffer_size, frame_size)?;
         Ok(true)
     }
 
@@ -335,7 +340,7 @@ impl Registry {
         &mut self,
         stream_name: &str,
         buffer_size: usize,
-        _frame_size: usize,
+        frame_size: usize,
     ) -> Result<(), RegistryError> {
         if buffer_size == 0 {
             return Err(RegistryError::InvalidRingCapacity {
@@ -353,6 +358,8 @@ impl Registry {
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
             ring_capacity: buffer_size,
+            buffer_size,
+            frame_size,
             writer_process_id: None,
             reader_count: 0,
             status: "registered".to_string(),
