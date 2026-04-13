@@ -2272,7 +2272,7 @@ def test_stream_table_engine_can_publish_to_master_bus(tmp_path: Path) -> None:
 
     writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
     writer_master.register_process("writer")
-    writer_master.register_stream("ticks", schema, 64)
+    writer_master.register_stream("ticks", schema, 64, 4096)
 
     reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
     reader_master.register_process("reader")
@@ -2409,7 +2409,7 @@ def test_reactive_engine_can_consume_master_bus_stream(tmp_path: Path) -> None:
 
     writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
     writer_master.register_process("writer")
-    writer_master.register_stream("ticks", schema, 64)
+    writer_master.register_stream("ticks", schema, 64, 4096)
     writer = writer_master.write_to("ticks")
 
     reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
@@ -3285,7 +3285,7 @@ def test_master_client_roundtrips_batches_through_master_bus_direct_reader(
 
     writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
     writer_client.register_process("writer")
-    writer_client.register_stream("ticks", tick_schema, 64)
+    writer_client.register_stream("ticks", tick_schema, 64, 4096)
     writer = writer_client.write_to("ticks")
 
     reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
@@ -3315,13 +3315,13 @@ def test_master_bus_writer_close_releases_stream_for_restart(tmp_path: Path) -> 
 
     first_client = zippy.MasterClient(control_endpoint=control_endpoint)
     first_client.register_process("writer_1")
-    first_client.register_stream("ticks", tick_schema, 64)
+    first_client.register_stream("ticks", tick_schema, 64, 4096)
     first_writer = first_client.write_to("ticks")
     first_writer.close()
 
     second_client = zippy.MasterClient(control_endpoint=control_endpoint)
     second_client.register_process("writer_2")
-    second_client.register_stream("ticks", tick_schema, 64)
+    second_client.register_stream("ticks", tick_schema, 64, 4096)
     second_writer = second_client.write_to("ticks")
 
     second_writer.write({"instrument_id": ["IF2606"], "last_price": [4102.5]})
@@ -3342,31 +3342,24 @@ def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
     )
     writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
     writer_client.register_process("stream_table_writer")
-    writer_client.register_stream("openctp_ticks", tick_schema, 64)
+    writer_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    writer = writer_client.write_to("openctp_ticks")
 
     reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
     reader_client.register_process("stream_table_reader")
     reader = reader_client.read_from("openctp_ticks")
 
-    engine = zippy.StreamTableEngine(
-        name="ticks",
-        input_schema=tick_schema,
-        target=zippy.BusStreamTarget(
-            stream_name="openctp_ticks",
-            master=writer_client,
-        ),
-    )
-
-    engine.start()
-    engine.write(
-        {
-            "instrument_id": ["IF2606"],
-            "dt": [datetime(2026, 4, 10, 9, 30, 0, tzinfo=timezone.utc)],
-            "last_price": [4102.5],
-        }
+    writer.write(
+        pl.DataFrame(
+            {
+                "instrument_id": ["IF2606"],
+                "dt": [datetime(2026, 4, 10, 9, 30, 0, tzinfo=timezone.utc)],
+                "last_price": [4102.5],
+            }
+        )
     )
     received = reader.read(timeout_ms=1000)
-    engine.stop()
+    writer.close()
 
     assert received.schema == tick_schema
     assert received.column("instrument_id").to_pylist() == ["IF2606"]
@@ -3382,13 +3375,15 @@ def test_master_client_lists_streams(tmp_path: Path) -> None:
 
     client = zippy.MasterClient(control_endpoint=control_endpoint)
     client.register_process("writer")
-    client.register_stream("openctp_ticks", tick_schema, 64)
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
 
     streams = client.list_streams()
 
     assert len(streams) == 1
     assert streams[0]["stream_name"] == "openctp_ticks"
-    assert streams[0]["ring_capacity"] == 64
+    assert streams[0]["buffer_size"] == 64
+    assert streams[0]["frame_size"] == 4096
+    assert "ring_capacity" not in streams[0]
     assert streams[0]["writer_process_id"] is None
     assert streams[0]["reader_count"] == 0
     assert streams[0]["status"] == "registered"
@@ -3402,12 +3397,14 @@ def test_master_client_gets_stream(tmp_path: Path) -> None:
 
     client = zippy.MasterClient(control_endpoint=control_endpoint)
     client.register_process("writer")
-    client.register_stream("openctp_ticks", tick_schema, 64)
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
 
     stream = client.get_stream("openctp_ticks")
 
     assert stream["stream_name"] == "openctp_ticks"
-    assert stream["ring_capacity"] == 64
+    assert stream["buffer_size"] == 64
+    assert stream["frame_size"] == 4096
+    assert "ring_capacity" not in stream
     assert stream["writer_process_id"] is None
     assert stream["reader_count"] == 0
     assert stream["status"] == "registered"
@@ -3435,8 +3432,8 @@ def test_master_client_registers_control_plane_entities_and_updates_status(
 
     client = zippy.MasterClient(control_endpoint=control_endpoint)
     client.register_process("openctp_worker")
-    client.register_stream("openctp_ticks", tick_schema, 64)
-    client.register_stream("openctp_mid_price_factors", tick_schema, 64)
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_stream("openctp_mid_price_factors", tick_schema, 64, 4096)
     client.register_source(
         "openctp_md",
         "openctp",
@@ -3496,12 +3493,12 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
 
     input_client = zippy.MasterClient(control_endpoint=control_endpoint)
     input_client.register_process("tick_writer")
-    input_client.register_stream("openctp_ticks", tick_schema, 64)
+    input_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
     writer = input_client.write_to("openctp_ticks")
 
     factor_client = zippy.MasterClient(control_endpoint=control_endpoint)
     factor_client.register_process("reactive_engine")
-    factor_client.register_stream("openctp_factor_ticks", factor_schema, 64)
+    factor_client.register_stream("openctp_factor_ticks", factor_schema, 64, 4096)
 
     output_client = zippy.MasterClient(control_endpoint=control_endpoint)
     output_client.register_process("factor_reader")

@@ -303,7 +303,13 @@ class MasterClient:
 
     def control_endpoint(self) -> str: ...
 
-    def register_stream(self, stream_name: str, schema: pa.Schema, ring_capacity: int) -> None: ...
+    def register_stream(
+        self,
+        stream_name: str,
+        schema: pa.Schema,
+        buffer_size: int,
+        frame_size: int,
+    ) -> None: ...
 
     def register_source(
         self,

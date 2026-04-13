@@ -51,10 +51,13 @@ def list_streams(control_endpoint: str, as_json: bool) -> None:
         echo_json(streams)
         return
 
-    click.echo("STREAM NAME                 RING CAPACITY  STATUS")
+    click.echo("STREAM NAME                 BUFFER SIZE  FRAME SIZE  STATUS")
     for stream in streams:
         click.echo(
-            f"{stream['stream_name']:<27} {stream['ring_capacity']:<14} {stream['status']}"
+            f"{stream['stream_name']:<27} "
+            f"{stream['buffer_size']:<12} "
+            f"{stream['frame_size']:<11} "
+            f"{stream['status']}"
         )
 
 
@@ -80,5 +83,12 @@ def show_stream(stream_name: str, control_endpoint: str, as_json: bool) -> None:
         echo_json(stream)
         return
 
-    for key in ["stream_name", "ring_capacity", "writer_process_id", "reader_count", "status"]:
+    for key in [
+        "stream_name",
+        "buffer_size",
+        "frame_size",
+        "writer_process_id",
+        "reader_count",
+        "status",
+    ]:
         click.echo(f"{key}: {stream[key]}")

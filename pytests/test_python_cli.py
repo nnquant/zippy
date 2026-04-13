@@ -180,6 +180,7 @@ def test_stream_ls_lists_registered_streams(tmp_path) -> None:
         "openctp_ticks",
         pa.schema([("instrument_id", pa.string())]),
         64,
+        4096,
     )
 
     runner = CliRunner()
@@ -187,7 +188,11 @@ def test_stream_ls_lists_registered_streams(tmp_path) -> None:
 
     assert result.exit_code == 0
     assert "openctp_ticks" in result.output
+    assert "BUFFER SIZE" in result.output
+    assert "FRAME SIZE" in result.output
     assert "64" in result.output
+    assert "4096" in result.output
+    assert "ring_capacity" not in result.output
 
     server.stop()
     server.join()
@@ -201,6 +206,7 @@ def test_stream_show_returns_single_stream(tmp_path) -> None:
         "openctp_ticks",
         pa.schema([("instrument_id", pa.string())]),
         64,
+        4096,
     )
 
     runner = CliRunner()
@@ -211,7 +217,9 @@ def test_stream_show_returns_single_stream(tmp_path) -> None:
 
     assert result.exit_code == 0
     assert "stream_name: openctp_ticks" in result.output
-    assert "ring_capacity: 64" in result.output
+    assert "buffer_size: 64" in result.output
+    assert "frame_size: 4096" in result.output
+    assert "ring_capacity" not in result.output
     assert "status: registered" in result.output
 
     server.stop()

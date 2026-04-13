@@ -1379,32 +1379,33 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    #[pyo3(signature = (stream_name, schema, buffer_size, frame_size))]
     fn register_stream(
         &self,
+        py: Python<'_>,
         stream_name: String,
         schema: &Bound<'_, PyAny>,
-        ring_capacity: usize,
+        buffer_size: usize,
+        frame_size: usize,
     ) -> PyResult<()> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        let register_result = self
-            .client
-            .lock()
-            .unwrap()
-            .register_stream(&stream_name, Arc::clone(&schema), ring_capacity);
-        match register_result {
-            Ok(()) => {
-                self.schemas.lock().unwrap().insert(stream_name, schema);
-                Ok(())
-            }
-            Err(error) if error.to_string().contains("stream already exists") => {
-                self.schemas.lock().unwrap().insert(stream_name, schema);
-                Ok(())
-            }
-            Err(error) => Err(py_runtime_error(error.to_string())),
-        }
+        let request = PyDict::new_bound(py);
+        let payload = PyDict::new_bound(py);
+        payload.set_item("stream_name", stream_name.clone())?;
+        payload.set_item("buffer_size", buffer_size)?;
+        payload.set_item("frame_size", frame_size)?;
+        request.set_item("RegisterStream", payload)?;
+        send_master_control_request(
+            py,
+            &self.control_endpoint,
+            request.as_any(),
+            "StreamRegistered",
+        )?;
+        self.schemas.lock().unwrap().insert(stream_name, schema);
+        Ok(())
     }
 
     #[pyo3(signature = (source_name, source_type, output_stream, config))]
@@ -1559,7 +1560,8 @@ impl MasterClient {
         for stream in streams {
             let dict = PyDict::new_bound(py);
             dict.set_item("stream_name", stream.stream_name)?;
-            dict.set_item("ring_capacity", stream.ring_capacity)?;
+            dict.set_item("buffer_size", stream.buffer_size)?;
+            dict.set_item("frame_size", stream.frame_size)?;
             dict.set_item("writer_process_id", stream.writer_process_id)?;
             dict.set_item("reader_count", stream.reader_count)?;
             dict.set_item("status", stream.status)?;
@@ -1577,7 +1579,8 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         let dict = PyDict::new_bound(py);
         dict.set_item("stream_name", stream.stream_name)?;
-        dict.set_item("ring_capacity", stream.ring_capacity)?;
+        dict.set_item("buffer_size", stream.buffer_size)?;
+        dict.set_item("frame_size", stream.frame_size)?;
         dict.set_item("writer_process_id", stream.writer_process_id)?;
         dict.set_item("reader_count", stream.reader_count)?;
         dict.set_item("status", stream.status)?;
