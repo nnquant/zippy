@@ -22,22 +22,19 @@ pub enum ReadError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RingWriteError {
-    FrameTooLarge {
-        payload_len: usize,
-        frame_size: usize,
-    },
+    FrameTooLarge { frame_len: usize, frame_size: usize },
 }
 
 impl fmt::Display for RingWriteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FrameTooLarge {
-                payload_len,
+                frame_len,
                 frame_size,
             } => write!(
                 f,
-                "frame payload exceeds frame size payload_len=[{}] frame_size=[{}]",
-                payload_len, frame_size
+                "frame size exceeds configured limit frame_len=[{}] frame_size=[{}]",
+                frame_len, frame_size
             ),
         }
     }
@@ -47,15 +44,15 @@ impl std::error::Error for RingWriteError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingConfigError {
-    pub capacity: usize,
+    pub buffer_size: usize,
 }
 
 impl fmt::Display for RingConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "stream ring capacity must be positive capacity=[{}]",
-            self.capacity
+            "stream ring buffer size must be positive buffer_size=[{}]",
+            self.buffer_size
         )
     }
 }
@@ -63,15 +60,15 @@ impl fmt::Display for RingConfigError {
 impl std::error::Error for RingConfigError {}
 
 #[derive(Debug, Clone)]
-struct RingItem {
+struct StoredFrame {
     seq: u64,
-    payload: Vec<u8>,
+    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub seq: u64,
-    pub payload: Vec<u8>,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,42 +80,42 @@ pub struct ReaderAttachment {
 /// Best-effort per-stream ring buffer with independent reader offsets.
 #[derive(Debug)]
 pub struct StreamRing {
-    capacity: usize,
+    buffer_size: usize,
     frame_size: usize,
-    write_seq: u64,
-    items: VecDeque<RingItem>,
+    latest_frame_seq: u64,
+    frames: VecDeque<StoredFrame>,
     readers: BTreeMap<String, u64>,
     next_reader_id: u64,
 }
 
 impl StreamRing {
-    /// Create a legacy best-effort ring without per-frame size enforcement.
-    pub fn new(capacity: usize) -> Result<Self, RingConfigError> {
-        Self::with_frame_size(capacity, usize::MAX)
-    }
-
-    /// Create a frame ring with fixed payload capacity for each logical frame.
-    pub fn with_frame_size(capacity: usize, frame_size: usize) -> Result<Self, RingConfigError> {
-        if capacity == 0 {
-            return Err(RingConfigError { capacity });
+    /// Create a frame ring using buffer_size/frame_size semantics.
+    pub fn new(buffer_size: usize, frame_size: usize) -> Result<Self, RingConfigError> {
+        if buffer_size == 0 {
+            return Err(RingConfigError { buffer_size });
         }
 
         Ok(Self {
-            capacity,
+            buffer_size,
             frame_size,
-            write_seq: 0,
-            items: VecDeque::new(),
+            latest_frame_seq: 0,
+            frames: VecDeque::new(),
             readers: BTreeMap::new(),
             next_reader_id: 0,
         })
     }
 
+    /// Create a legacy best-effort ring without per-frame size enforcement.
+    pub fn new_best_effort(buffer_size: usize) -> Result<Self, RingConfigError> {
+        Self::new(buffer_size, usize::MAX)
+    }
+
     pub fn attach_reader(&mut self) -> ReaderAttachment {
-        self.attach_reader_at_seq(self.write_seq + 1)
+        self.attach_reader_at_seq(self.latest_frame_seq + 1)
     }
 
     pub fn attach_reader_at_latest(&mut self) -> ReaderAttachment {
-        self.attach_reader_at_seq(self.write_seq + 1)
+        self.attach_reader_at_seq(self.latest_frame_seq + 1)
     }
 
     fn attach_reader_at_seq(&mut self, next_read_seq: u64) -> ReaderAttachment {
@@ -136,32 +133,32 @@ impl StreamRing {
         Ok(())
     }
 
-    pub fn publish_frame(&mut self, payload: &[u8]) -> Result<u64, RingWriteError> {
-        self.validate_frame_size(payload.len())?;
-        self.write_seq += 1;
-        self.items.push_back(RingItem {
-            seq: self.write_seq,
-            payload: payload.to_vec(),
+    pub fn publish_frame(&mut self, frame_bytes: &[u8]) -> Result<u64, RingWriteError> {
+        self.validate_frame_size(frame_bytes.len())?;
+        self.latest_frame_seq += 1;
+        self.frames.push_back(StoredFrame {
+            seq: self.latest_frame_seq,
+            bytes: frame_bytes.to_vec(),
         });
 
-        while self.items.len() > self.capacity {
-            self.items.pop_front();
+        while self.frames.len() > self.buffer_size {
+            self.frames.pop_front();
         }
 
-        Ok(self.write_seq)
+        Ok(self.latest_frame_seq)
     }
 
     pub fn read(&mut self, reader_id: &str) -> Result<Vec<Vec<u8>>, ReadError> {
         Ok(self
             .read_frames(reader_id)?
             .into_iter()
-            .map(|frame| frame.payload)
+            .map(|frame| frame.bytes)
             .collect())
     }
 
     pub fn read_frames(&mut self, reader_id: &str) -> Result<Vec<Frame>, ReadError> {
         let oldest_available_seq = self.oldest_available_seq();
-        let latest_write_seq = self.write_seq;
+        let latest_write_seq = self.latest_frame_seq;
 
         let Some(next_seq) = self.readers.get_mut(reader_id) else {
             return Err(ReadError::ReaderNotFound(ReaderNotFound {
@@ -181,11 +178,11 @@ impl StreamRing {
         }
 
         let mut output = Vec::new();
-        for item in &self.items {
-            if item.seq >= requested_seq {
+        for frame in &self.frames {
+            if frame.seq >= requested_seq {
                 output.push(Frame {
-                    seq: item.seq,
-                    payload: item.payload.clone(),
+                    seq: frame.seq,
+                    bytes: frame.bytes.clone(),
                 });
             }
         }
@@ -201,7 +198,7 @@ impl StreamRing {
             });
         };
 
-        *next_seq = self.write_seq + 1;
+        *next_seq = self.latest_frame_seq + 1;
         Ok(())
     }
 
@@ -220,14 +217,14 @@ impl StreamRing {
     }
 
     fn oldest_available_seq(&self) -> u64 {
-        self.items
+        self.frames
             .front()
-            .map(|item| item.seq)
-            .unwrap_or(self.write_seq + 1)
+            .map(|frame| frame.seq)
+            .unwrap_or(self.latest_frame_seq + 1)
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
     }
 
     pub fn frame_size(&self) -> usize {
@@ -235,13 +232,13 @@ impl StreamRing {
     }
 
     pub fn next_write_seq(&self) -> u64 {
-        self.write_seq + 1
+        self.latest_frame_seq + 1
     }
 
-    fn validate_frame_size(&self, payload_len: usize) -> Result<(), RingWriteError> {
-        if payload_len > self.frame_size {
+    fn validate_frame_size(&self, frame_len: usize) -> Result<(), RingWriteError> {
+        if frame_len > self.frame_size {
             return Err(RingWriteError::FrameTooLarge {
-                payload_len,
+                frame_len,
                 frame_size: self.frame_size,
             });
         }
@@ -255,7 +252,7 @@ mod tests {
 
     #[test]
     fn frame_ring_new_reader_starts_after_current_write_seq() {
-        let mut ring = StreamRing::with_frame_size(4, 1024).unwrap();
+        let mut ring = StreamRing::new(4, 1024).unwrap();
         ring.publish_frame(b"a").unwrap();
         ring.publish_frame(b"b").unwrap();
 
@@ -265,7 +262,7 @@ mod tests {
 
     #[test]
     fn frame_ring_reports_lagged_reader_after_overwrite() {
-        let mut ring = StreamRing::with_frame_size(2, 1024).unwrap();
+        let mut ring = StreamRing::new(2, 1024).unwrap();
         let reader = ring.attach_reader();
         ring.publish_frame(b"a").unwrap();
         ring.publish_frame(b"b").unwrap();
@@ -277,13 +274,13 @@ mod tests {
 
     #[test]
     fn frame_ring_rejects_payload_larger_than_frame_size() {
-        let mut ring = StreamRing::with_frame_size(2, 2).unwrap();
+        let mut ring = StreamRing::new(2, 2).unwrap();
 
         let error = ring.publish_frame(b"abc").unwrap_err();
         assert!(matches!(
             error,
             RingWriteError::FrameTooLarge {
-                payload_len: 3,
+                frame_len: 3,
                 frame_size: 2,
             }
         ));

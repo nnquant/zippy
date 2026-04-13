@@ -7,6 +7,7 @@ use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{MasterClient, SchemaRef};
+use zippy_master::ring::{ReadError, RingWriteError, StreamRing};
 use zippy_master::server::MasterServer;
 
 fn test_schema() -> SchemaRef {
@@ -106,6 +107,50 @@ fn send_request(socket_path: &Path, payload: &str) -> String {
 }
 
 #[test]
+fn frame_ring_new_reader_on_existing_stream_starts_after_latest_frame() {
+    let mut ring = StreamRing::new(4, 1024).unwrap();
+    ring.publish_frame(b"a").unwrap();
+    ring.publish_frame(b"b").unwrap();
+
+    let reader = ring.attach_reader_at_latest();
+    assert_eq!(reader.next_read_seq, 3);
+    assert!(ring.read_frames(&reader.reader_id).unwrap().is_empty());
+
+    ring.publish_frame(b"c").unwrap();
+
+    let frames = ring.read_frames(&reader.reader_id).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].seq, 3);
+    assert_eq!(frames[0].bytes, b"c");
+}
+
+#[test]
+fn frame_ring_reports_lagged_reader_after_overwrite() {
+    let mut ring = StreamRing::new(2, 1024).unwrap();
+    let reader = ring.attach_reader();
+    ring.publish_frame(b"a").unwrap();
+    ring.publish_frame(b"b").unwrap();
+    ring.publish_frame(b"c").unwrap();
+
+    let error = ring.read_frames(&reader.reader_id).unwrap_err();
+    assert!(matches!(error, ReadError::ReaderLagged(_)));
+}
+
+#[test]
+fn frame_ring_rejects_frame_larger_than_frame_size() {
+    let mut ring = StreamRing::new(2, 2).unwrap();
+
+    let error = ring.publish_frame(b"abc").unwrap_err();
+    assert!(matches!(
+        error,
+        RingWriteError::FrameTooLarge {
+            frame_len: 3,
+            frame_size: 2,
+        }
+    ));
+}
+
+#[test]
 fn writer_and_reader_roundtrip_batches_through_master_bus() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
@@ -140,9 +185,7 @@ fn closing_writer_allows_restarting_same_stream_writer() {
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("writer").unwrap();
-    client
-        .register_stream("ticks", test_schema(), 64)
-        .unwrap();
+    client.register_stream("ticks", test_schema(), 64).unwrap();
 
     let mut first_writer = client.write_to("ticks").unwrap();
     first_writer.close().unwrap();

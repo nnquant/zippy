@@ -185,7 +185,7 @@ impl Bus {
         frame_size: usize,
     ) -> Result<bool, BusError> {
         if let Some(existing) = self.streams.get(stream_name) {
-            let existing_ring_capacity = existing.ring.capacity();
+            let existing_ring_capacity = existing.ring.buffer_size();
             if existing_ring_capacity != buffer_size
                 || existing.buffer_size != buffer_size
                 || existing.frame_size != frame_size
@@ -223,11 +223,12 @@ impl Bus {
             });
         }
 
-        let ring =
-            StreamRing::new(buffer_size).map_err(|error| BusError::InvalidRingCapacity {
+        let ring = StreamRing::new(buffer_size, frame_size).map_err(|error| {
+            BusError::InvalidRingCapacity {
                 stream_name: stream_name.to_string(),
-                ring_capacity: error.capacity,
-            })?;
+                ring_capacity: error.buffer_size,
+            }
+        })?;
 
         std::fs::create_dir_all(&self.root_dir).map_err(|error| BusError::StorageInitFailed {
             stream_name: stream_name.to_string(),
