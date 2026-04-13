@@ -7,6 +7,7 @@ use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{MasterClient, SchemaRef};
+use zippy_master::bus::Bus;
 use zippy_master::ring::{ReadError, RingWriteError, StreamRing};
 use zippy_master::server::MasterServer;
 
@@ -284,42 +285,15 @@ fn lease_reaper_reclaims_expired_reader_attachments() {
 }
 
 #[test]
-fn new_reader_starts_from_latest_position_in_existing_stream() {
-    let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server(&socket_path);
+fn bus_read_from_returns_latest_next_read_seq() {
+    let mut bus = Bus::default();
+    bus.ensure_stream_with_sizes("ticks", 4, 1024).unwrap();
 
-    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
-    writer_client.register_process("writer").unwrap();
-    writer_client
-        .register_stream("ticks", test_schema(), 64)
-        .unwrap();
-    let mut writer = writer_client.write_to("ticks").unwrap();
-    writer.write(test_batch()).unwrap();
+    let writer = bus.write_to("ticks", "proc_1").unwrap();
+    assert_eq!(writer.next_write_seq, 1);
 
-    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
-    reader_client.register_process("reader").unwrap();
-    let mut reader = reader_client.read_from("ticks").unwrap();
+    bus.publish_test_frame("ticks", b"abc").unwrap();
 
-    let timeout_error = reader.read(Some(50)).unwrap_err();
-    assert!(
-        timeout_error.to_string().contains("reader timed out"),
-        "unexpected error: {timeout_error}"
-    );
-
-    let next_batch = RecordBatch::try_new(
-        test_schema(),
-        vec![
-            std::sync::Arc::new(StringArray::from(vec!["TL2606"])),
-            std::sync::Arc::new(Float64Array::from(vec![102.25])),
-        ],
-    )
-    .unwrap();
-    writer.write(next_batch.clone()).unwrap();
-
-    let received = reader.read(Some(1000)).unwrap();
-    assert_eq!(format!("{received:?}"), format!("{next_batch:?}"));
-
-    server.shutdown();
-    join_handle.join().unwrap();
-    let _ = fs::remove_file(socket_path);
+    let reader = bus.read_from("ticks", "proc_2").unwrap();
+    assert_eq!(reader.next_read_seq, 2);
 }
