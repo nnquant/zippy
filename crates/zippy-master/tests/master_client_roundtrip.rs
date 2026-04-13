@@ -39,10 +39,11 @@ fn spawn_test_server(socket_path: &Path) -> (MasterServer, thread::JoinHandle<()
     let server = MasterServer::default();
     let handle_server = server.clone();
     let socket_path = socket_path.to_path_buf();
+    let wait_path = socket_path.clone();
     let join_handle = thread::spawn(move || {
         handle_server.serve(&socket_path).unwrap();
     });
-    thread::sleep(Duration::from_millis(50));
+    wait_for_socket_ready(&wait_path);
     (server, join_handle)
 }
 
@@ -233,6 +234,47 @@ fn lease_reaper_reclaims_expired_reader_attachments() {
         "{\"GetStream\":{\"stream_name\":\"ticks\"}}\n",
     );
     assert!(stream_response.contains("\"reader_count\":0"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn new_reader_starts_from_latest_position_in_existing_stream() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
+    writer_client.register_process("writer").unwrap();
+    writer_client
+        .register_stream("ticks", test_schema(), 64)
+        .unwrap();
+    let mut writer = writer_client.write_to("ticks").unwrap();
+    writer.write(test_batch()).unwrap();
+
+    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
+    reader_client.register_process("reader").unwrap();
+    let mut reader = reader_client.read_from("ticks").unwrap();
+
+    let timeout_error = reader.read(Some(50)).unwrap_err();
+    assert!(
+        timeout_error.to_string().contains("reader timed out"),
+        "unexpected error: {timeout_error}"
+    );
+
+    let next_batch = RecordBatch::try_new(
+        test_schema(),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["TL2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![102.25])),
+        ],
+    )
+    .unwrap();
+    writer.write(next_batch.clone()).unwrap();
+
+    let received = reader.read(Some(1000)).unwrap();
+    assert_eq!(format!("{received:?}"), format!("{next_batch:?}"));
 
     server.shutdown();
     join_handle.join().unwrap();

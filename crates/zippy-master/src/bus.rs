@@ -140,6 +140,33 @@ impl Default for Bus {
     }
 }
 
+fn next_storage_sequence(shm_name: &str) -> std::io::Result<u64> {
+    let stream_dir = std::path::Path::new(shm_name);
+    if !stream_dir.exists() {
+        return Ok(1);
+    }
+
+    let mut latest = 0_u64;
+    for entry in std::fs::read_dir(stream_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(sequence) = parse_seq_file_name(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        latest = latest.max(sequence);
+    }
+    Ok(latest + 1)
+}
+
+fn parse_seq_file_name(name: &str) -> Option<u64> {
+    if !name.starts_with("seq_") || !name.ends_with(".ipc") {
+        return None;
+    }
+    name[4..name.len() - 4].parse::<u64>().ok()
+}
+
 impl Bus {
     pub fn ensure_stream(
         &mut self,
@@ -225,7 +252,12 @@ impl Bus {
 
         let writer_id = format!("{stream_name}_writer");
         let ring_capacity = stream.ring.capacity();
-        let next_write_seq = stream.ring.next_write_seq();
+        let next_write_seq = next_storage_sequence(&stream.shm_name).map_err(|error| {
+            BusError::StorageInitFailed {
+                stream_name: stream_name.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
         stream.writer_process_id = Some(process_id.to_string());
         stream.writer_id = Some(writer_id.clone());
 
@@ -253,8 +285,14 @@ impl Bus {
 
         let ReaderAttachment {
             reader_id,
-            next_read_seq,
+            next_read_seq: _,
         } = stream.ring.attach_reader();
+        let next_read_seq = next_storage_sequence(&stream.shm_name).map_err(|error| {
+            BusError::StorageInitFailed {
+                stream_name: stream_name.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
 
         Ok(ReaderDescriptor {
             stream_name: stream_name.to_string(),
