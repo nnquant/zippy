@@ -161,7 +161,7 @@ fn writer_and_reader_roundtrip_batches_through_master_bus() {
     client_a.register_process("writer").unwrap();
     client_b.register_process("reader").unwrap();
     client_a
-        .register_stream("ticks", test_schema(), 64)
+        .register_stream("ticks", test_schema(), 4096)
         .unwrap();
 
     let batch = test_batch();
@@ -186,7 +186,9 @@ fn closing_writer_allows_restarting_same_stream_writer() {
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("writer").unwrap();
-    client.register_stream("ticks", test_schema(), 64).unwrap();
+    client
+        .register_stream("ticks", test_schema(), 4096)
+        .unwrap();
 
     let mut first_writer = client.write_to("ticks").unwrap();
     first_writer.close().unwrap();
@@ -206,7 +208,7 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
 
     let mut first = MasterClient::connect(&socket_path).unwrap();
     first.register_process("writer_a").unwrap();
-    first.register_stream("ticks", test_schema(), 64).unwrap();
+    first.register_stream("ticks", test_schema(), 4096).unwrap();
     let _writer = first.write_to("ticks").unwrap();
 
     let response = send_request(
@@ -217,7 +219,9 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
 
     let mut second = MasterClient::connect(&socket_path).unwrap();
     second.register_process("writer_b").unwrap();
-    second.register_stream("ticks", test_schema(), 64).unwrap();
+    second
+        .register_stream("ticks", test_schema(), 4096)
+        .unwrap();
     let second_writer = second.write_to("ticks").unwrap();
     assert_eq!(second_writer.descriptor().process_id, "proc_2");
 
@@ -237,14 +241,16 @@ fn lease_reaper_reclaims_expired_writer_for_new_writer() {
 
     let mut first = MasterClient::connect(&socket_path).unwrap();
     first.register_process("writer_a").unwrap();
-    first.register_stream("ticks", test_schema(), 64).unwrap();
+    first.register_stream("ticks", test_schema(), 4096).unwrap();
     let _writer = first.write_to("ticks").unwrap();
 
     thread::sleep(Duration::from_millis(120));
 
     let mut second = MasterClient::connect(&socket_path).unwrap();
     second.register_process("writer_b").unwrap();
-    second.register_stream("ticks", test_schema(), 64).unwrap();
+    second
+        .register_stream("ticks", test_schema(), 4096)
+        .unwrap();
     let second_writer = second.write_to("ticks").unwrap();
     assert_eq!(second_writer.descriptor().process_id, "proc_2");
 
@@ -264,7 +270,9 @@ fn lease_reaper_reclaims_expired_reader_attachments() {
 
     let mut writer = MasterClient::connect(&socket_path).unwrap();
     writer.register_process("writer").unwrap();
-    writer.register_stream("ticks", test_schema(), 64).unwrap();
+    writer
+        .register_stream("ticks", test_schema(), 4096)
+        .unwrap();
     let _writer = writer.write_to("ticks").unwrap();
 
     let mut reader = MasterClient::connect(&socket_path).unwrap();
@@ -296,4 +304,45 @@ fn bus_read_from_returns_latest_next_read_seq() {
 
     let reader = bus.read_from("ticks", "proc_2").unwrap();
     assert_eq!(reader.next_read_seq, 2);
+}
+
+#[test]
+fn late_reader_skips_existing_frames_with_frame_ring_hot_path() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
+    writer_client.register_process("writer").unwrap();
+    writer_client
+        .register_stream("ticks", test_schema(), 4096)
+        .unwrap();
+    let mut writer = writer_client.write_to("ticks").unwrap();
+    writer.write(test_batch()).unwrap();
+
+    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
+    reader_client.register_process("reader").unwrap();
+    let mut reader = reader_client.read_from("ticks").unwrap();
+
+    let timeout_error = reader.read(Some(50)).unwrap_err();
+    assert!(
+        timeout_error.to_string().contains("reader timed out"),
+        "unexpected error: {timeout_error}"
+    );
+
+    let next_batch = RecordBatch::try_new(
+        test_schema(),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["TL2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![102.25])),
+        ],
+    )
+    .unwrap();
+    writer.write(next_batch.clone()).unwrap();
+
+    let received = reader.read(Some(1000)).unwrap();
+    assert_eq!(format!("{received:?}"), format!("{next_batch:?}"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
 }

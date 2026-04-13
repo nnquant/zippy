@@ -1,7 +1,8 @@
-use std::fs;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,11 +11,10 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::bus_protocol::{
-    AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest,
-    DetachWriterRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
-    ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
-    RegisterSourceRequest, RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest,
-    WriterDescriptor,
+    AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
+    GetStreamRequest, HeartbeatRequest, ListStreamsRequest, ReaderDescriptor,
+    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
+    RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
 };
 use crate::{Result, SchemaRef, ZippyError};
 
@@ -39,6 +39,92 @@ pub struct Reader {
     descriptor: ReaderDescriptor,
     next_read_seq: u64,
     closed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LocalFrame {
+    seq: u64,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct LocalFrameRing {
+    buffer_size: usize,
+    frame_size: usize,
+    latest_seq: u64,
+    frames: VecDeque<LocalFrame>,
+}
+
+#[derive(Debug)]
+enum LocalReadResult {
+    Ready(Vec<u8>),
+    Pending,
+    Lagged { oldest_seq: u64, latest_seq: u64 },
+}
+
+type SharedFrameRing = Arc<Mutex<LocalFrameRing>>;
+type FrameRingRegistry = Mutex<BTreeMap<String, SharedFrameRing>>;
+
+static FRAME_RING_REGISTRY: OnceLock<FrameRingRegistry> = OnceLock::new();
+
+impl LocalFrameRing {
+    fn new(buffer_size: usize, frame_size: usize) -> Self {
+        Self {
+            buffer_size,
+            frame_size,
+            latest_seq: 0,
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.latest_seq + 1
+    }
+
+    fn publish(&mut self, payload: Vec<u8>) -> Result<u64> {
+        if payload.len() > self.frame_size {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "frame size exceeds configured limit frame_len=[{}] frame_size=[{}]",
+                    payload.len(),
+                    self.frame_size
+                ),
+            });
+        }
+
+        self.latest_seq += 1;
+        self.frames.push_back(LocalFrame {
+            seq: self.latest_seq,
+            payload,
+        });
+
+        while self.frames.len() > self.buffer_size {
+            self.frames.pop_front();
+        }
+
+        Ok(self.latest_seq)
+    }
+
+    fn read(&self, requested_seq: u64) -> LocalReadResult {
+        let Some(oldest_seq) = self.frames.front().map(|frame| frame.seq) else {
+            return LocalReadResult::Pending;
+        };
+
+        if requested_seq < oldest_seq {
+            return LocalReadResult::Lagged {
+                oldest_seq,
+                latest_seq: self.latest_seq,
+            };
+        }
+
+        for frame in &self.frames {
+            if frame.seq == requested_seq {
+                return LocalReadResult::Ready(frame.payload.clone());
+            }
+        }
+
+        LocalReadResult::Pending
+    }
 }
 
 impl MasterClient {
@@ -70,9 +156,8 @@ impl MasterClient {
 
     pub fn heartbeat(&self) -> Result<()> {
         let process_id = self.require_process_id()?;
-        let response = self.send_request(ControlRequest::Heartbeat(HeartbeatRequest {
-            process_id,
-        }))?;
+        let response =
+            self.send_request(ControlRequest::Heartbeat(HeartbeatRequest { process_id }))?;
 
         match response {
             ControlResponse::HeartbeatAccepted { .. } => Ok(()),
@@ -107,13 +192,14 @@ impl MasterClient {
         config: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
-        let response = self.send_request(ControlRequest::RegisterSource(RegisterSourceRequest {
-            source_name: source_name.to_string(),
-            source_type: source_type.to_string(),
-            process_id,
-            output_stream: output_stream.to_string(),
-            config,
-        }))?;
+        let response =
+            self.send_request(ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: source_name.to_string(),
+                source_type: source_type.to_string(),
+                process_id,
+                output_stream: output_stream.to_string(),
+                config,
+            }))?;
 
         match response {
             ControlResponse::SourceRegistered { .. } => Ok(()),
@@ -131,15 +217,16 @@ impl MasterClient {
         config: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
-        let response = self.send_request(ControlRequest::RegisterEngine(RegisterEngineRequest {
-            engine_name: engine_name.to_string(),
-            engine_type: engine_type.to_string(),
-            process_id,
-            input_stream: input_stream.to_string(),
-            output_stream: output_stream.to_string(),
-            sink_names,
-            config,
-        }))?;
+        let response =
+            self.send_request(ControlRequest::RegisterEngine(RegisterEngineRequest {
+                engine_name: engine_name.to_string(),
+                engine_type: engine_type.to_string(),
+                process_id,
+                input_stream: input_stream.to_string(),
+                output_stream: output_stream.to_string(),
+                sink_names,
+                config,
+            }))?;
 
         match response {
             ControlResponse::EngineRegistered { .. } => Ok(()),
@@ -176,12 +263,13 @@ impl MasterClient {
         status: &str,
         metrics: Option<serde_json::Value>,
     ) -> Result<()> {
-        let response = self.send_request(ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
-            kind: kind.to_string(),
-            name: name.to_string(),
-            status: status.to_string(),
-            metrics,
-        }))?;
+        let response =
+            self.send_request(ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+                kind: kind.to_string(),
+                name: name.to_string(),
+                status: status.to_string(),
+                metrics,
+            }))?;
 
         match response {
             ControlResponse::StatusUpdated { .. } => Ok(()),
@@ -197,12 +285,15 @@ impl MasterClient {
         }))?;
 
         match response {
-            ControlResponse::WriterAttached { descriptor } => Ok(Writer {
-                socket_path: self.socket_path.clone(),
-                next_write_seq: descriptor.next_write_seq,
-                descriptor,
-                closed: false,
-            }),
+            ControlResponse::WriterAttached { descriptor } => {
+                let next_write_seq = next_write_seq_for_writer(&descriptor)?;
+                Ok(Writer {
+                    socket_path: self.socket_path.clone(),
+                    next_write_seq,
+                    descriptor,
+                    closed: false,
+                })
+            }
             other => Err(unexpected_response("WriterAttached", other)),
         }
     }
@@ -215,12 +306,15 @@ impl MasterClient {
         }))?;
 
         match response {
-            ControlResponse::ReaderAttached { descriptor } => Ok(Reader {
-                socket_path: self.socket_path.clone(),
-                next_read_seq: descriptor.next_read_seq,
-                descriptor,
-                closed: false,
-            }),
+            ControlResponse::ReaderAttached { descriptor } => {
+                let next_read_seq = next_read_seq_for_reader(&descriptor)?;
+                Ok(Reader {
+                    socket_path: self.socket_path.clone(),
+                    next_read_seq,
+                    descriptor,
+                    closed: false,
+                })
+            }
             other => Err(unexpected_response("ReaderAttached", other)),
         }
     }
@@ -280,18 +374,14 @@ impl Writer {
 
     pub fn write(&mut self, batch: RecordBatch) -> Result<()> {
         let payload = encode_batch(&batch)?;
-        let stream_dir = Path::new(&self.descriptor.shm_name);
-        fs::create_dir_all(stream_dir).map_err(io_error)?;
-
-        let file_name = seq_file_name(self.next_write_seq);
-        let temp_name = format!("{file_name}.tmp");
-        let temp_path = stream_dir.join(temp_name);
-        let final_path = stream_dir.join(file_name);
-
-        fs::write(&temp_path, payload).map_err(io_error)?;
-        fs::rename(&temp_path, &final_path).map_err(io_error)?;
-        prune_old_batch_files(stream_dir, self.descriptor.buffer_size)?;
-        self.next_write_seq += 1;
+        let ring = shared_frame_ring(
+            &self.descriptor.shm_name,
+            self.descriptor.buffer_size,
+            self.descriptor.frame_size,
+        )?;
+        let mut ring = lock_frame_ring(&ring)?;
+        let published_seq = ring.publish(payload)?;
+        self.next_write_seq = published_seq + 1;
         Ok(())
     }
 
@@ -336,12 +426,23 @@ impl Reader {
 
     pub fn read(&mut self, timeout_ms: Option<u64>) -> Result<RecordBatch> {
         let deadline = timeout_ms.map(|timeout| Instant::now() + Duration::from_millis(timeout));
-        let stream_dir = Path::new(&self.descriptor.shm_name);
+        let ring = shared_frame_ring(
+            &self.descriptor.shm_name,
+            self.descriptor.buffer_size,
+            self.descriptor.frame_size,
+        )?;
 
         loop {
-            let sequences = list_available_sequences(stream_dir)?;
-            if let Some((&oldest_seq, &latest_seq)) = sequences.first().zip(sequences.last()) {
-                if self.next_read_seq < oldest_seq {
+            match lock_frame_ring(&ring)?.read(self.next_read_seq) {
+                LocalReadResult::Ready(payload) => {
+                    let batch = decode_batch(&payload)?;
+                    self.next_read_seq += 1;
+                    return Ok(batch);
+                }
+                LocalReadResult::Lagged {
+                    oldest_seq,
+                    latest_seq,
+                } => {
                     return Err(ZippyError::Io {
                         reason: format!(
                             "reader lagged reader_id=[{}] requested_seq=[{}] oldest_available_seq=[{}] latest_write_seq=[{}]",
@@ -352,14 +453,7 @@ impl Reader {
                         ),
                     });
                 }
-
-                if sequences.binary_search(&self.next_read_seq).is_ok() {
-                    let path = stream_dir.join(seq_file_name(self.next_read_seq));
-                    let payload = fs::read(path).map_err(io_error)?;
-                    let batch = decode_batch(&payload)?;
-                    self.next_read_seq += 1;
-                    return Ok(batch);
-                }
+                LocalReadResult::Pending => {}
             }
 
             if let Some(deadline) = deadline {
@@ -380,12 +474,12 @@ impl Reader {
     }
 
     pub fn seek_latest(&mut self) -> Result<()> {
-        let stream_dir = Path::new(&self.descriptor.shm_name);
-        let sequences = list_available_sequences(stream_dir)?;
-        self.next_read_seq = sequences
-            .last()
-            .map(|seq| seq + 1)
-            .unwrap_or(self.next_read_seq);
+        let ring = shared_frame_ring(
+            &self.descriptor.shm_name,
+            self.descriptor.buffer_size,
+            self.descriptor.frame_size,
+        )?;
+        self.next_read_seq = lock_frame_ring(&ring)?.next_seq();
         Ok(())
     }
 
@@ -462,51 +556,60 @@ fn decode_batch(payload: &[u8]) -> Result<RecordBatch> {
     }
 }
 
-fn prune_old_batch_files(stream_dir: &Path, buffer_size: usize) -> Result<()> {
-    let sequences = list_available_sequences(stream_dir)?;
-    if sequences.len() <= buffer_size {
-        return Ok(());
-    }
-
-    let remove_count = sequences.len() - buffer_size;
-    for sequence in sequences.into_iter().take(remove_count) {
-        fs::remove_file(stream_dir.join(seq_file_name(sequence))).map_err(io_error)?;
-    }
-    Ok(())
+fn next_write_seq_for_writer(descriptor: &WriterDescriptor) -> Result<u64> {
+    let ring = shared_frame_ring(
+        &descriptor.shm_name,
+        descriptor.buffer_size,
+        descriptor.frame_size,
+    )?;
+    let next_seq = lock_frame_ring(&ring)?.next_seq();
+    Ok(descriptor.next_write_seq.max(next_seq))
 }
 
-fn list_available_sequences(stream_dir: &Path) -> Result<Vec<u64>> {
-    if !stream_dir.exists() {
-        return Ok(Vec::new());
-    }
+fn next_read_seq_for_reader(descriptor: &ReaderDescriptor) -> Result<u64> {
+    let ring = shared_frame_ring(
+        &descriptor.shm_name,
+        descriptor.buffer_size,
+        descriptor.frame_size,
+    )?;
+    let next_seq = lock_frame_ring(&ring)?.next_seq();
+    Ok(descriptor.next_read_seq.max(next_seq))
+}
 
-    let mut sequences = Vec::new();
-    for entry in fs::read_dir(stream_dir).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let file_type = entry.file_type().map_err(io_error)?;
-        if !file_type.is_file() {
-            continue;
+fn shared_frame_ring(
+    shm_name: &str,
+    buffer_size: usize,
+    frame_size: usize,
+) -> Result<SharedFrameRing> {
+    let registry = FRAME_RING_REGISTRY.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry.lock().map_err(|_| ZippyError::Io {
+        reason: "frame ring registry lock poisoned".to_string(),
+    })?;
+
+    if let Some(existing) = registry.get(shm_name) {
+        let ring = existing.clone();
+        let ring_guard = lock_frame_ring(&ring)?;
+        if ring_guard.buffer_size != buffer_size || ring_guard.frame_size != frame_size {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "frame ring descriptor mismatch shm_name=[{}] buffer_size=[{}] frame_size=[{}]",
+                    shm_name, buffer_size, frame_size
+                ),
+            });
         }
-
-        let Some(sequence) = parse_seq_file_name(&entry.file_name().to_string_lossy()) else {
-            continue;
-        };
-        sequences.push(sequence);
+        drop(ring_guard);
+        return Ok(ring);
     }
-    sequences.sort_unstable();
-    Ok(sequences)
+
+    let ring = Arc::new(Mutex::new(LocalFrameRing::new(buffer_size, frame_size)));
+    registry.insert(shm_name.to_string(), ring.clone());
+    Ok(ring)
 }
 
-fn seq_file_name(sequence: u64) -> String {
-    format!("seq_{sequence:020}.ipc")
-}
-
-fn parse_seq_file_name(name: &str) -> Option<u64> {
-    if !name.starts_with("seq_") || !name.ends_with(".ipc") {
-        return None;
-    }
-    let value = &name[4..name.len() - 4];
-    value.parse::<u64>().ok()
+fn lock_frame_ring(ring: &SharedFrameRing) -> Result<std::sync::MutexGuard<'_, LocalFrameRing>> {
+    ring.lock().map_err(|_| ZippyError::Io {
+        reason: "frame ring lock poisoned".to_string(),
+    })
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {
