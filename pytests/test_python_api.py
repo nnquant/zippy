@@ -3343,30 +3343,37 @@ def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
     writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
     writer_client.register_process("stream_table_writer")
     writer_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
-    writer = writer_client.write_to("openctp_ticks")
 
     reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
     reader_client.register_process("stream_table_reader")
     reader = reader_client.read_from("openctp_ticks")
 
-    writer.write(
-        pl.DataFrame(
-            {
-                "instrument_id": ["IF2606"],
-                "dt": [datetime(2026, 4, 10, 9, 30, 0, tzinfo=timezone.utc)],
-                "last_price": [4102.5],
-            }
-        )
+    engine = zippy.StreamTableEngine(
+        name="stream_table_writer",
+        input_schema=tick_schema,
+        target=zippy.BusStreamTarget(stream_name="openctp_ticks", master=writer_client),
     )
-    received = reader.read(timeout_ms=1000)
-    writer.close()
 
-    assert received.schema == tick_schema
-    assert received.column("instrument_id").to_pylist() == ["IF2606"]
-    assert received.column("last_price").to_pylist() == [4102.5]
+    try:
+        engine.start()
+        engine.write(
+            pl.DataFrame(
+                {
+                    "instrument_id": ["IF2606"],
+                    "dt": [datetime(2026, 4, 10, 9, 30, 0, tzinfo=timezone.utc)],
+                    "last_price": [4102.5],
+                }
+            )
+        )
+        received = reader.read(timeout_ms=1000)
 
-    reader.close()
-    server.stop()
+        assert received.schema == tick_schema
+        assert received.column("instrument_id").to_pylist() == ["IF2606"]
+        assert received.column("last_price").to_pylist() == [4102.5]
+    finally:
+        reader.close()
+        engine.stop()
+        server.stop()
 
 
 def test_master_client_lists_streams(tmp_path: Path) -> None:
@@ -3494,7 +3501,11 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
     input_client = zippy.MasterClient(control_endpoint=control_endpoint)
     input_client.register_process("tick_writer")
     input_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
-    writer = input_client.write_to("openctp_ticks")
+    upstream = zippy.StreamTableEngine(
+        name="stream_table_writer",
+        input_schema=tick_schema,
+        target=zippy.BusStreamTarget(stream_name="openctp_ticks", master=input_client),
+    )
 
     factor_client = zippy.MasterClient(control_endpoint=control_endpoint)
     factor_client.register_process("reactive_engine")
@@ -3521,15 +3532,24 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
         ),
     )
 
-    engine.start()
-    writer.write({"instrument_id": ["IF2606"], "last_price": [4102.5]})
-    received = output_reader.read(timeout_ms=1000)
-    engine.stop()
+    try:
+        engine.start()
+        upstream.start()
+        upstream.write(
+            pl.DataFrame(
+                {
+                    "instrument_id": ["IF2606"],
+                    "last_price": [4102.5],
+                }
+            )
+        )
+        received = output_reader.read(timeout_ms=1000)
 
-    assert received.schema == factor_schema
-    assert received.column("instrument_id").to_pylist() == ["IF2606"]
-    assert received.column("price_x2").to_pylist() == [8205.0]
-
-    output_reader.close()
-    writer.close()
-    server.stop()
+        assert received.schema == factor_schema
+        assert received.column("instrument_id").to_pylist() == ["IF2606"]
+        assert received.column("price_x2").to_pylist() == [8205.0]
+    finally:
+        output_reader.close()
+        upstream.stop()
+        engine.stop()
+        server.stop()
