@@ -88,6 +88,42 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
 }
 
 #[test]
+fn master_restores_legacy_snapshot_without_frame_size() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot_path = temp.path().join("master-registry.json");
+
+    fs::write(
+        &snapshot_path,
+        r#"{
+  "streams": [
+    {
+      "stream_name": "openctp_ticks",
+      "ring_capacity": 1024,
+      "status": "registered"
+    }
+  ],
+  "sources": [],
+  "engines": [],
+  "sinks": []
+}"#,
+    )
+    .unwrap();
+
+    let server = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let stream = server
+        .registry()
+        .lock()
+        .unwrap()
+        .get_stream("openctp_ticks")
+        .unwrap()
+        .clone();
+
+    assert_eq!(stream.status, "restored");
+    assert_eq!(stream.ring_capacity, 1024);
+    assert_eq!(stream.frame_size, 1024);
+}
+
+#[test]
 fn master_restores_control_plane_entities_from_snapshot_as_restored() {
     let temp = tempfile::tempdir().unwrap();
     let snapshot_path = temp.path().join("master-registry.json");

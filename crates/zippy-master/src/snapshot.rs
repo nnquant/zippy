@@ -2,16 +2,43 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use zippy_core::{Result, ZippyError};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SnapshotStreamRecord {
     pub stream_name: String,
     pub ring_capacity: usize,
     pub frame_size: usize,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotStreamRecordV1 {
+    stream_name: String,
+    ring_capacity: usize,
+    #[serde(default)]
+    frame_size: Option<usize>,
+    status: String,
+}
+
+impl<'de> Deserialize<'de> for SnapshotStreamRecord {
+    fn deserialize<D>(
+        deserializer: D,
+    ) -> std::result::Result<Self, <D as Deserializer<'de>>::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let record = SnapshotStreamRecordV1::deserialize(deserializer)?;
+        let frame_size = record.frame_size.unwrap_or(record.ring_capacity);
+        Ok(Self {
+            stream_name: record.stream_name,
+            ring_capacity: record.ring_capacity,
+            frame_size,
+            status: record.status,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
