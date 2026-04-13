@@ -80,7 +80,10 @@ impl MasterServer {
             let mut registry = server.registry.lock().unwrap();
 
             for stream in snapshot.streams {
-                bus.ensure_stream(&stream.stream_name, stream.ring_capacity)
+                bus.ensure_stream(
+                    &stream.stream_name,
+                    stream.ring_capacity,
+                )
                     .map_err(bus_error)?;
                 registry
                     .ensure_stream(&stream.stream_name, stream.ring_capacity)
@@ -388,9 +391,17 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut bus = self.bus.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                match bus.ensure_stream(&request.stream_name, request.ring_capacity) {
+                match bus.ensure_stream_with_sizes(
+                    &request.stream_name,
+                    request.buffer_size,
+                    request.frame_size,
+                ) {
                     Ok(bus_created) => match registry
-                        .ensure_stream(&request.stream_name, request.ring_capacity)
+                        .ensure_stream_with_sizes(
+                            &request.stream_name,
+                            request.buffer_size,
+                            request.frame_size,
+                        )
                     {
                         Ok(registry_created) => {
                             let existing = !(bus_created || registry_created);
@@ -399,7 +410,8 @@ impl MasterServer {
                                 event = "register_stream",
                                 status = "success",
                                 stream_name = request.stream_name.as_str(),
-                                ring_capacity = request.ring_capacity,
+                                buffer_size = request.buffer_size,
+                                frame_size = request.frame_size,
                                 existing = existing,
                                 "{}",
                                 if existing {
@@ -443,7 +455,8 @@ impl MasterServer {
                                 event = "register_stream",
                                 status = "error",
                                 stream_name = request.stream_name.as_str(),
-                                ring_capacity = request.ring_capacity,
+                                buffer_size = request.buffer_size,
+                                frame_size = request.frame_size,
                                 error = %error,
                                 "failed to register stream"
                             );
@@ -456,15 +469,16 @@ impl MasterServer {
                         }
                     },
                     Err(error) => {
-                        tracing::error!(
-                            component = "master_server",
-                            event = "register_stream",
-                            status = "error",
-                            stream_name = request.stream_name.as_str(),
-                            ring_capacity = request.ring_capacity,
-                            error = %error,
-                            "failed to register stream"
-                        );
+                            tracing::error!(
+                                component = "master_server",
+                                event = "register_stream",
+                                status = "error",
+                                stream_name = request.stream_name.as_str(),
+                                buffer_size = request.buffer_size,
+                                frame_size = request.frame_size,
+                                error = %error,
+                                "failed to register stream"
+                            );
                         ControlResponse::Error {
                             reason: format!("{}", error),
                         }
@@ -1296,7 +1310,9 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
     fn from(stream: crate::registry::StreamRecord) -> Self {
         Self {
             stream_name: stream.stream_name,
-            ring_capacity: stream.ring_capacity,
+            buffer_size: stream.ring_capacity,
+            frame_size: stream.ring_capacity,
+            write_seq: 0,
             writer_process_id: stream.writer_process_id,
             reader_count: stream.reader_count,
             status: stream.status,

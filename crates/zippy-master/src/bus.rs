@@ -109,6 +109,8 @@ impl std::error::Error for BusError {}
 #[derive(Debug)]
 struct StreamState {
     ring: StreamRing,
+    buffer_size: usize,
+    frame_size: usize,
     writer_process_id: Option<String>,
     writer_id: Option<String>,
     shm_name: String,
@@ -173,19 +175,31 @@ impl Bus {
         stream_name: &str,
         ring_capacity: usize,
     ) -> Result<bool, BusError> {
+        self.ensure_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
+    }
+
+    pub fn ensure_stream_with_sizes(
+        &mut self,
+        stream_name: &str,
+        buffer_size: usize,
+        frame_size: usize,
+    ) -> Result<bool, BusError> {
         if let Some(existing) = self.streams.get(stream_name) {
             let existing_ring_capacity = existing.ring.capacity();
-            if existing_ring_capacity != ring_capacity {
+            if existing_ring_capacity != buffer_size
+                || existing.buffer_size != buffer_size
+                || existing.frame_size != frame_size
+            {
                 return Err(BusError::StreamRingCapacityMismatch {
                     stream_name: stream_name.to_string(),
                     existing_ring_capacity,
-                    requested_ring_capacity: ring_capacity,
+                    requested_ring_capacity: buffer_size,
                 });
             }
             return Ok(false);
         }
 
-        self.create_stream(stream_name, ring_capacity)?;
+        self.create_stream_with_sizes(stream_name, buffer_size, frame_size)?;
         Ok(true)
     }
 
@@ -194,6 +208,15 @@ impl Bus {
         stream_name: &str,
         ring_capacity: usize,
     ) -> Result<(), BusError> {
+        self.create_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
+    }
+
+    pub fn create_stream_with_sizes(
+        &mut self,
+        stream_name: &str,
+        buffer_size: usize,
+        frame_size: usize,
+    ) -> Result<(), BusError> {
         if self.streams.contains_key(stream_name) {
             return Err(BusError::StreamAlreadyExists {
                 stream_name: stream_name.to_string(),
@@ -201,7 +224,7 @@ impl Bus {
         }
 
         let ring =
-            StreamRing::new(ring_capacity).map_err(|error| BusError::InvalidRingCapacity {
+            StreamRing::new(buffer_size).map_err(|error| BusError::InvalidRingCapacity {
                 stream_name: stream_name.to_string(),
                 ring_capacity: error.capacity,
             })?;
@@ -223,6 +246,8 @@ impl Bus {
             stream_name.to_string(),
             StreamState {
                 ring,
+                buffer_size,
+                frame_size,
                 writer_process_id: None,
                 writer_id: None,
                 shm_name: stream_dir.to_string_lossy().into_owned(),
@@ -251,7 +276,8 @@ impl Bus {
         }
 
         let writer_id = format!("{stream_name}_writer");
-        let ring_capacity = stream.ring.capacity();
+        let buffer_size = stream.buffer_size;
+        let frame_size = stream.frame_size;
         let next_write_seq = next_storage_sequence(&stream.shm_name).map_err(|error| {
             BusError::StorageInitFailed {
                 stream_name: stream_name.to_string(),
@@ -263,7 +289,8 @@ impl Bus {
 
         Ok(WriterDescriptor {
             stream_name: stream_name.to_string(),
-            ring_capacity,
+            buffer_size,
+            frame_size,
             layout_version: stream.layout_version,
             shm_name: stream.shm_name.clone(),
             writer_id,
@@ -296,7 +323,8 @@ impl Bus {
 
         Ok(ReaderDescriptor {
             stream_name: stream_name.to_string(),
-            ring_capacity: stream.ring.capacity(),
+            buffer_size: stream.buffer_size,
+            frame_size: stream.frame_size,
             layout_version: stream.layout_version,
             shm_name: stream.shm_name.clone(),
             reader_id,

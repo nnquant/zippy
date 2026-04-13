@@ -215,25 +215,34 @@ impl Registry {
         stream_name: &str,
         ring_capacity: usize,
     ) -> Result<bool, RegistryError> {
-        if ring_capacity == 0 {
+        self.ensure_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
+    }
+
+    pub fn ensure_stream_with_sizes(
+        &mut self,
+        stream_name: &str,
+        buffer_size: usize,
+        _frame_size: usize,
+    ) -> Result<bool, RegistryError> {
+        if buffer_size == 0 {
             return Err(RegistryError::InvalidRingCapacity {
                 stream_name: stream_name.to_string(),
-                ring_capacity,
+                ring_capacity: buffer_size,
             });
         }
 
         if let Some(existing) = self.streams.get(stream_name) {
-            if existing.ring_capacity != ring_capacity {
+            if existing.ring_capacity != buffer_size {
                 return Err(RegistryError::StreamRingCapacityMismatch {
                     stream_name: stream_name.to_string(),
                     existing_ring_capacity: existing.ring_capacity,
-                    requested_ring_capacity: ring_capacity,
+                    requested_ring_capacity: buffer_size,
                 });
             }
             return Ok(false);
         }
 
-        self.register_stream(stream_name, ring_capacity)?;
+        self.register_stream_with_sizes(stream_name, buffer_size, buffer_size)?;
         Ok(true)
     }
 
@@ -319,10 +328,19 @@ impl Registry {
         stream_name: &str,
         ring_capacity: usize,
     ) -> Result<(), RegistryError> {
-        if ring_capacity == 0 {
+        self.register_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
+    }
+
+    pub fn register_stream_with_sizes(
+        &mut self,
+        stream_name: &str,
+        buffer_size: usize,
+        _frame_size: usize,
+    ) -> Result<(), RegistryError> {
+        if buffer_size == 0 {
             return Err(RegistryError::InvalidRingCapacity {
                 stream_name: stream_name.to_string(),
-                ring_capacity,
+                ring_capacity: buffer_size,
             });
         }
 
@@ -334,7 +352,7 @@ impl Registry {
 
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
-            ring_capacity,
+            ring_capacity: buffer_size,
             writer_process_id: None,
             reader_count: 0,
             status: "registered".to_string(),

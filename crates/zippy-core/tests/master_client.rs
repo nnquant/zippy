@@ -64,7 +64,14 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         process_id: "proc_1".to_string(),
                     }
                 }
-                ControlRequest::RegisterStream(RegisterStreamRequest { stream_name, .. }) => {
+                ControlRequest::RegisterStream(RegisterStreamRequest {
+                    stream_name,
+                    buffer_size,
+                    frame_size,
+                }) => {
+                    assert_eq!(stream_name, "ticks");
+                    assert_eq!(buffer_size, 1024);
+                    assert_eq!(frame_size, 1024);
                     ControlResponse::StreamRegistered { stream_name }
                 }
                 ControlRequest::RegisterSource(RegisterSourceRequest {
@@ -391,6 +398,7 @@ fn control_response_display_uses_buffer_and_frame_sizes() {
     );
     assert!(stream_output.contains("buffer_size=[1024]"));
     assert!(stream_output.contains("frame_size=[256]"));
+    assert!(stream_output.contains("write_seq=[42]"));
     assert!(!stream_output.contains("ring_capacity"));
 }
 

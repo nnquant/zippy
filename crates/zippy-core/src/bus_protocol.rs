@@ -236,10 +236,11 @@ impl fmt::Display for ControlResponse {
             ),
             Self::StreamFetched(response) => write!(
                 f,
-                "stream fetched stream_name=[{}] buffer_size=[{}] frame_size=[{}] writer_process_id=[{:?}] reader_count=[{}] status=[{}]",
+                "stream fetched stream_name=[{}] buffer_size=[{}] frame_size=[{}] write_seq=[{}] writer_process_id=[{:?}] reader_count=[{}] status=[{}]",
                 response.stream.stream_name,
                 response.stream.buffer_size,
                 response.stream.frame_size,
+                response.stream.write_seq,
                 response.stream.writer_process_id,
                 response.stream.reader_count,
                 response.stream.status

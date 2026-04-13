@@ -156,7 +156,7 @@ fn master_persists_registered_streams_to_snapshot_on_register_stream() {
 
     let response = send_request(
         &wait_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(response.contains("StreamRegistered"));
 
@@ -271,7 +271,7 @@ fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
 
     let response = send_request(
         &wait_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(response.contains("Error"));
     assert!(response.contains("failed to create registry snapshot parent"));
@@ -407,12 +407,14 @@ fn bus_enforces_single_writer_and_multiple_readers() {
     let reader_b = bus.read_from("openctp_ticks", "proc_3").unwrap();
 
     assert_eq!(writer.stream_name, "openctp_ticks");
-    assert_eq!(writer.ring_capacity, 1024);
+    assert_eq!(writer.buffer_size, 1024);
+    assert_eq!(writer.frame_size, 1024);
     assert_eq!(writer.layout_version, BUS_LAYOUT_VERSION);
     assert!(writer.shm_name.contains("openctp_ticks"));
     assert_eq!(writer.next_write_seq, 1);
     assert_eq!(reader_a.stream_name, "openctp_ticks");
-    assert_eq!(reader_a.ring_capacity, 1024);
+    assert_eq!(reader_a.buffer_size, 1024);
+    assert_eq!(reader_a.frame_size, 1024);
     assert_eq!(reader_a.layout_version, BUS_LAYOUT_VERSION);
     assert!(reader_a.shm_name.contains("openctp_ticks"));
     assert_eq!(reader_a.next_read_seq, 1);
@@ -547,7 +549,7 @@ fn master_server_registers_stream_and_attaches_reader_writer() {
 
     let stream_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(stream_response.contains("StreamRegistered"));
     assert!(stream_response.contains("openctp_ticks"));
@@ -563,7 +565,8 @@ fn master_server_registers_stream_and_attaches_reader_writer() {
         other => panic!("unexpected writer response: {:?}", other),
     };
     assert_eq!(writer_descriptor.stream_name, "openctp_ticks");
-    assert_eq!(writer_descriptor.ring_capacity, 1024);
+    assert_eq!(writer_descriptor.buffer_size, 1024);
+    assert_eq!(writer_descriptor.frame_size, 256);
     assert_eq!(writer_descriptor.layout_version, BUS_LAYOUT_VERSION);
     assert!(writer_descriptor.shm_name.contains("openctp_ticks"));
     assert_eq!(writer_descriptor.next_write_seq, 1);
@@ -579,7 +582,8 @@ fn master_server_registers_stream_and_attaches_reader_writer() {
         other => panic!("unexpected reader response: {:?}", other),
     };
     assert_eq!(reader_descriptor.stream_name, "openctp_ticks");
-    assert_eq!(reader_descriptor.ring_capacity, 1024);
+    assert_eq!(reader_descriptor.buffer_size, 1024);
+    assert_eq!(reader_descriptor.frame_size, 256);
     assert_eq!(reader_descriptor.layout_version, BUS_LAYOUT_VERSION);
     assert!(reader_descriptor.shm_name.contains("openctp_ticks"));
     assert_eq!(reader_descriptor.next_read_seq, 1);
@@ -599,7 +603,7 @@ fn master_server_rejects_close_writer_from_other_process() {
     assert!(send_register_process(&socket_path, "intruder").contains("proc_2"));
     assert!(send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     )
     .contains("StreamRegistered"));
 
@@ -650,7 +654,7 @@ fn master_server_rejects_close_reader_from_other_process() {
     assert!(send_register_process(&socket_path, "reader_b").contains("proc_2"));
     assert!(send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     )
     .contains("StreamRegistered"));
 
@@ -696,13 +700,13 @@ fn master_server_treats_duplicate_stream_registration_as_idempotent_success() {
 
     let first_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(first_response.contains("StreamRegistered"));
 
     let duplicate_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(duplicate_response.contains("StreamRegistered"));
     assert!(duplicate_response.contains("openctp_ticks"));
@@ -722,7 +726,7 @@ fn master_server_rejects_zero_capacity_stream_registration() {
 
     let response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":0}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":0,\"frame_size\":0}}\n",
     );
     assert!(response.contains("Error"));
     assert!(response.contains("invalid ring capacity"));
@@ -742,7 +746,7 @@ fn master_server_lists_registered_streams_over_unix_socket() {
 
     let stream_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(stream_response.contains("StreamRegistered"));
 
@@ -754,7 +758,9 @@ fn master_server_lists_registered_streams_over_unix_socket() {
     };
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].stream_name, "openctp_ticks");
-    assert_eq!(streams[0].ring_capacity, 1024);
+    assert_eq!(streams[0].buffer_size, 1024);
+    assert_eq!(streams[0].frame_size, 1024);
+    assert_eq!(streams[0].write_seq, 0);
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -771,7 +777,7 @@ fn master_server_fetches_single_stream_over_unix_socket() {
 
     let stream_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(stream_response.contains("StreamRegistered"));
 
@@ -785,7 +791,9 @@ fn master_server_fetches_single_stream_over_unix_socket() {
         other => panic!("unexpected get stream response: {:?}", other),
     };
     assert_eq!(stream.stream_name, "openctp_ticks");
-    assert_eq!(stream.ring_capacity, 1024);
+    assert_eq!(stream.buffer_size, 1024);
+    assert_eq!(stream.frame_size, 1024);
+    assert_eq!(stream.write_seq, 0);
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -949,13 +957,13 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
 
     let stream_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(stream_response.contains("StreamRegistered"));
 
     let duplicate_response = send_request(
         &socket_path,
-        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"ring_capacity\":1024}}\n",
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
     );
     assert!(duplicate_response.contains("StreamRegistered"));
 
@@ -1002,7 +1010,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
             ("component", "master_server"),
             ("stream_name", "openctp_ticks"),
         ],
-        &[("ring_capacity", 1024)],
+        &[("buffer_size", 1024), ("frame_size", 256)],
         &[],
     );
     assert_record_has_fields(
@@ -1014,7 +1022,7 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
             ("component", "master_server"),
             ("stream_name", "openctp_ticks"),
         ],
-        &[("ring_capacity", 1024)],
+        &[("buffer_size", 1024), ("frame_size", 256)],
         &[("existing", true)],
     );
     assert_record_has_fields(
