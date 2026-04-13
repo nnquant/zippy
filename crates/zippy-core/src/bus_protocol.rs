@@ -149,20 +149,47 @@ pub enum ControlRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
-    ProcessRegistered { process_id: String },
-    HeartbeatAccepted { process_id: String },
-    StreamRegistered { stream_name: String },
-    SourceRegistered { source_name: String },
-    EngineRegistered { engine_name: String },
-    SinkRegistered { sink_name: String },
-    StatusUpdated { kind: String, name: String },
-    WriterAttached { descriptor: WriterDescriptor },
-    ReaderAttached { descriptor: ReaderDescriptor },
-    WriterDetached { stream_name: String, writer_id: String },
-    ReaderDetached { stream_name: String, reader_id: String },
+    ProcessRegistered {
+        process_id: String,
+    },
+    HeartbeatAccepted {
+        process_id: String,
+    },
+    StreamRegistered {
+        stream_name: String,
+    },
+    SourceRegistered {
+        source_name: String,
+    },
+    EngineRegistered {
+        engine_name: String,
+    },
+    SinkRegistered {
+        sink_name: String,
+    },
+    StatusUpdated {
+        kind: String,
+        name: String,
+    },
+    WriterAttached {
+        descriptor: WriterDescriptor,
+    },
+    ReaderAttached {
+        descriptor: ReaderDescriptor,
+    },
+    WriterDetached {
+        stream_name: String,
+        writer_id: String,
+    },
+    ReaderDetached {
+        stream_name: String,
+        reader_id: String,
+    },
     StreamsListed(ListStreamsResponse),
     StreamFetched(GetStreamResponse),
-    Error { reason: String },
+    Error {
+        reason: String,
+    },
 }
 
 impl fmt::Display for ControlResponse {
