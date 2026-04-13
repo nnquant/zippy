@@ -124,7 +124,8 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                 }) => ControlResponse::WriterAttached {
                     descriptor: WriterDescriptor {
                         stream_name,
-                        ring_capacity: 1024,
+                        buffer_size: 1024,
+                        frame_size: 256,
                         layout_version: BUS_LAYOUT_VERSION,
                         shm_name: "shm_ticks".to_string(),
                         writer_id: "ticks_writer".to_string(),
@@ -138,7 +139,8 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                 }) => ControlResponse::ReaderAttached {
                     descriptor: ReaderDescriptor {
                         stream_name,
-                        ring_capacity: 1024,
+                        buffer_size: 1024,
+                        frame_size: 256,
                         layout_version: BUS_LAYOUT_VERSION,
                         shm_name: "shm_ticks".to_string(),
                         reader_id: "reader_1".to_string(),
@@ -166,7 +168,8 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                     ControlResponse::StreamsListed(zippy_core::ListStreamsResponse {
                         streams: vec![StreamInfo {
                             stream_name: "ticks".to_string(),
-                            ring_capacity: 1024,
+                            buffer_size: 1024,
+                            frame_size: 256,
                             writer_process_id: None,
                             reader_count: 0,
                             status: "registered".to_string(),
@@ -177,7 +180,8 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                     ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
                         stream: StreamInfo {
                             stream_name: "ticks".to_string(),
-                            ring_capacity: 1024,
+                            buffer_size: 1024,
+                            frame_size: 256,
                             writer_process_id: None,
                             reader_count: 0,
                             status: "registered".to_string(),
@@ -236,7 +240,8 @@ fn master_client_lists_streams() {
     let streams = client.list_streams().unwrap();
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0].stream_name, "ticks");
-    assert_eq!(streams[0].ring_capacity, 1024);
+    assert_eq!(streams[0].buffer_size, 1024);
+    assert_eq!(streams[0].frame_size, 256);
     assert_eq!(streams[0].status, "registered");
 
     server.join().unwrap();
@@ -256,7 +261,8 @@ fn master_client_gets_single_stream() {
 
     let stream = client.get_stream("ticks").unwrap();
     assert_eq!(stream.stream_name, "ticks");
-    assert_eq!(stream.ring_capacity, 1024);
+    assert_eq!(stream.buffer_size, 1024);
+    assert_eq!(stream.frame_size, 256);
     assert_eq!(stream.status, "registered");
 
     server.join().unwrap();
@@ -327,4 +333,58 @@ fn master_client_registers_control_plane_entities_and_updates_status() {
         .unwrap();
 
     server.join().unwrap();
+}
+
+#[test]
+fn control_request_serialization_uses_buffer_and_frame_sizes() {
+    let request = ControlRequest::RegisterStream(RegisterStreamRequest {
+        stream_name: "ticks".to_string(),
+        buffer_size: 1024,
+        frame_size: 256,
+    });
+
+    let json = serde_json::to_string(&request).unwrap();
+
+    assert!(json.contains("\"buffer_size\":1024"));
+    assert!(json.contains("\"frame_size\":256"));
+    assert!(!json.contains("ring_capacity"));
+}
+
+#[test]
+fn control_response_display_uses_buffer_and_frame_sizes() {
+    let writer_output = format!(
+        "{}",
+        ControlResponse::WriterAttached {
+            descriptor: WriterDescriptor {
+                stream_name: "ticks".to_string(),
+                buffer_size: 1024,
+                frame_size: 256,
+                layout_version: BUS_LAYOUT_VERSION,
+                shm_name: "shm_ticks".to_string(),
+                writer_id: "writer_1".to_string(),
+                process_id: "proc_1".to_string(),
+                next_write_seq: 1,
+            },
+        }
+    );
+    assert!(writer_output.contains("buffer_size=[1024]"));
+    assert!(writer_output.contains("frame_size=[256]"));
+    assert!(!writer_output.contains("ring_capacity"));
+
+    let stream_output = format!(
+        "{}",
+        ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
+            stream: StreamInfo {
+                stream_name: "ticks".to_string(),
+                buffer_size: 1024,
+                frame_size: 256,
+                writer_process_id: None,
+                reader_count: 0,
+                status: "registered".to_string(),
+            },
+        })
+    );
+    assert!(stream_output.contains("buffer_size=[1024]"));
+    assert!(stream_output.contains("frame_size=[256]"));
+    assert!(!stream_output.contains("ring_capacity"));
 }

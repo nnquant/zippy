@@ -16,7 +16,8 @@ pub struct HeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterStreamRequest {
     pub stream_name: String,
-    pub ring_capacity: usize,
+    pub buffer_size: usize,
+    pub frame_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,7 +80,8 @@ pub struct DetachReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub stream_name: String,
-    pub ring_capacity: usize,
+    pub buffer_size: usize,
+    pub frame_size: usize,
     pub writer_process_id: Option<String>,
     pub reader_count: usize,
     pub status: String,
@@ -106,7 +108,8 @@ pub struct GetStreamResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterDescriptor {
     pub stream_name: String,
-    pub ring_capacity: usize,
+    pub buffer_size: usize,
+    pub frame_size: usize,
     pub layout_version: u32,
     pub shm_name: String,
     pub writer_id: String,
@@ -117,7 +120,8 @@ pub struct WriterDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReaderDescriptor {
     pub stream_name: String,
-    pub ring_capacity: usize,
+    pub buffer_size: usize,
+    pub frame_size: usize,
     pub layout_version: u32,
     pub shm_name: String,
     pub reader_id: String,
@@ -186,22 +190,24 @@ impl fmt::Display for ControlResponse {
             }
             Self::WriterAttached { descriptor } => write!(
                 f,
-                "writer attached stream_name=[{}] writer_id=[{}] process_id=[{}] ring_capacity=[{}] layout_version=[{}] shm_name=[{}] next_write_seq=[{}]",
+                "writer attached stream_name=[{}] writer_id=[{}] process_id=[{}] buffer_size=[{}] frame_size=[{}] layout_version=[{}] shm_name=[{}] next_write_seq=[{}]",
                 descriptor.stream_name,
                 descriptor.writer_id,
                 descriptor.process_id,
-                descriptor.ring_capacity,
+                descriptor.buffer_size,
+                descriptor.frame_size,
                 descriptor.layout_version,
                 descriptor.shm_name,
                 descriptor.next_write_seq
             ),
             Self::ReaderAttached { descriptor } => write!(
                 f,
-                "reader attached stream_name=[{}] reader_id=[{}] process_id=[{}] ring_capacity=[{}] layout_version=[{}] shm_name=[{}] next_read_seq=[{}]",
+                "reader attached stream_name=[{}] reader_id=[{}] process_id=[{}] buffer_size=[{}] frame_size=[{}] layout_version=[{}] shm_name=[{}] next_read_seq=[{}]",
                 descriptor.stream_name,
                 descriptor.reader_id,
                 descriptor.process_id,
-                descriptor.ring_capacity,
+                descriptor.buffer_size,
+                descriptor.frame_size,
                 descriptor.layout_version,
                 descriptor.shm_name,
                 descriptor.next_read_seq
@@ -229,9 +235,10 @@ impl fmt::Display for ControlResponse {
             ),
             Self::StreamFetched(response) => write!(
                 f,
-                "stream fetched stream_name=[{}] ring_capacity=[{}] writer_process_id=[{:?}] reader_count=[{}] status=[{}]",
+                "stream fetched stream_name=[{}] buffer_size=[{}] frame_size=[{}] writer_process_id=[{:?}] reader_count=[{}] status=[{}]",
                 response.stream.stream_name,
-                response.stream.ring_capacity,
+                response.stream.buffer_size,
+                response.stream.frame_size,
                 response.stream.writer_process_id,
                 response.stream.reader_count,
                 response.stream.status

@@ -89,7 +89,8 @@ impl MasterClient {
         let response =
             self.send_request(ControlRequest::RegisterStream(RegisterStreamRequest {
                 stream_name: stream_name.to_string(),
-                ring_capacity,
+                buffer_size: ring_capacity,
+                frame_size: ring_capacity,
             }))?;
 
         match response {
@@ -289,7 +290,7 @@ impl Writer {
 
         fs::write(&temp_path, payload).map_err(io_error)?;
         fs::rename(&temp_path, &final_path).map_err(io_error)?;
-        prune_old_batch_files(stream_dir, self.descriptor.ring_capacity)?;
+        prune_old_batch_files(stream_dir, self.descriptor.buffer_size)?;
         self.next_write_seq += 1;
         Ok(())
     }
@@ -461,13 +462,13 @@ fn decode_batch(payload: &[u8]) -> Result<RecordBatch> {
     }
 }
 
-fn prune_old_batch_files(stream_dir: &Path, ring_capacity: usize) -> Result<()> {
+fn prune_old_batch_files(stream_dir: &Path, buffer_size: usize) -> Result<()> {
     let sequences = list_available_sequences(stream_dir)?;
-    if sequences.len() <= ring_capacity {
+    if sequences.len() <= buffer_size {
         return Ok(());
     }
 
-    let remove_count = sequences.len() - ring_capacity;
+    let remove_count = sequences.len() - buffer_size;
     for sequence in sequences.into_iter().take(remove_count) {
         fs::remove_file(stream_dir.join(seq_file_name(sequence))).map_err(io_error)?;
     }
