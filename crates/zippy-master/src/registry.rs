@@ -16,7 +16,6 @@ pub struct ProcessRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamRecord {
     pub stream_name: String,
-    pub ring_capacity: usize,
     pub buffer_size: usize,
     pub frame_size: usize,
     pub writer_process_id: Option<String>,
@@ -234,13 +233,10 @@ impl Registry {
         }
 
         if let Some(existing) = self.streams.get(stream_name) {
-            if existing.ring_capacity != buffer_size
-                || existing.buffer_size != buffer_size
-                || existing.frame_size != frame_size
-            {
+            if existing.buffer_size != buffer_size || existing.frame_size != frame_size {
                 return Err(RegistryError::StreamRingCapacityMismatch {
                     stream_name: stream_name.to_string(),
-                    existing_ring_capacity: existing.ring_capacity,
+                    existing_ring_capacity: existing.buffer_size,
                     requested_ring_capacity: buffer_size,
                 });
             }
@@ -267,12 +263,12 @@ impl Registry {
     }
 
     pub fn record_heartbeat(&mut self, process_id: &str) -> Result<(), RegistryError> {
-        let process = self
-            .processes
-            .get_mut(process_id)
-            .ok_or_else(|| RegistryError::ProcessNotFound {
-                process_id: process_id.to_string(),
-            })?;
+        let process =
+            self.processes
+                .get_mut(process_id)
+                .ok_or_else(|| RegistryError::ProcessNotFound {
+                    process_id: process_id.to_string(),
+                })?;
         if process.lease_status != "alive" {
             return Err(RegistryError::ProcessLeaseExpired {
                 process_id: process_id.to_string(),
@@ -288,12 +284,12 @@ impl Registry {
         process_id: &str,
         lease_timeout_millis: u64,
     ) -> Result<bool, RegistryError> {
-        let process = self
-            .processes
-            .get_mut(process_id)
-            .ok_or_else(|| RegistryError::ProcessNotFound {
-                process_id: process_id.to_string(),
-            })?;
+        let process =
+            self.processes
+                .get_mut(process_id)
+                .ok_or_else(|| RegistryError::ProcessNotFound {
+                    process_id: process_id.to_string(),
+                })?;
         if process.lease_status != "alive" {
             return Ok(false);
         }
@@ -306,12 +302,12 @@ impl Registry {
     }
 
     pub fn force_expire_process(&mut self, process_id: &str) -> Result<(), RegistryError> {
-        let process = self
-            .processes
-            .get_mut(process_id)
-            .ok_or_else(|| RegistryError::ProcessNotFound {
-                process_id: process_id.to_string(),
-            })?;
+        let process =
+            self.processes
+                .get_mut(process_id)
+                .ok_or_else(|| RegistryError::ProcessNotFound {
+                    process_id: process_id.to_string(),
+                })?;
         process.lease_status = "expired".to_string();
         Ok(())
     }
@@ -357,7 +353,6 @@ impl Registry {
 
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
-            ring_capacity: buffer_size,
             buffer_size,
             frame_size,
             writer_process_id: None,
@@ -502,12 +497,12 @@ impl Registry {
         stream_name: &str,
         status: &str,
     ) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get_mut(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
         stream.status = status.to_string();
         Ok(())
     }
@@ -518,12 +513,12 @@ impl Registry {
         status: &str,
         metrics: Option<serde_json::Value>,
     ) -> Result<(), RegistryError> {
-        let source = self
-            .sources
-            .get_mut(source_name)
-            .ok_or_else(|| RegistryError::SourceNotFound {
-                source_name: source_name.to_string(),
-            })?;
+        let source =
+            self.sources
+                .get_mut(source_name)
+                .ok_or_else(|| RegistryError::SourceNotFound {
+                    source_name: source_name.to_string(),
+                })?;
         source.status = status.to_string();
         if let Some(metrics) = metrics {
             source.metrics = metrics;
@@ -537,12 +532,12 @@ impl Registry {
         status: &str,
         metrics: Option<serde_json::Value>,
     ) -> Result<(), RegistryError> {
-        let engine = self
-            .engines
-            .get_mut(engine_name)
-            .ok_or_else(|| RegistryError::EngineNotFound {
-                engine_name: engine_name.to_string(),
-            })?;
+        let engine =
+            self.engines
+                .get_mut(engine_name)
+                .ok_or_else(|| RegistryError::EngineNotFound {
+                    engine_name: engine_name.to_string(),
+                })?;
         engine.status = status.to_string();
         if let Some(metrics) = metrics {
             engine.metrics = metrics;
@@ -561,13 +556,17 @@ impl Registry {
         Ok(())
     }
 
-    pub fn attach_writer(&mut self, stream_name: &str, process_id: &str) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get_mut(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+    pub fn attach_writer(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+    ) -> Result<(), RegistryError> {
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
         stream.writer_process_id = Some(process_id.to_string());
         stream.status = "writer_attached".to_string();
         Ok(())
@@ -578,12 +577,12 @@ impl Registry {
         stream_name: &str,
         process_id: &str,
     ) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
 
         if stream.writer_process_id.as_deref() != Some(process_id) {
             return Err(RegistryError::WriterNotOwnedByProcess {
@@ -597,12 +596,12 @@ impl Registry {
     }
 
     pub fn detach_writer(&mut self, stream_name: &str) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get_mut(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
         stream.writer_process_id = None;
         stream.status = if stream.reader_count > 0 {
             "active".to_string()
@@ -618,12 +617,12 @@ impl Registry {
         process_id: &str,
         reader_id: &str,
     ) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get_mut(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
         stream.reader_count += 1;
         stream
             .reader_process_ids
@@ -642,12 +641,12 @@ impl Registry {
         reader_id: &str,
         process_id: &str,
     ) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
         let owner_process_id = stream.reader_process_ids.get(reader_id).cloned();
         if owner_process_id.as_deref() != Some(process_id) {
             return Err(RegistryError::ReaderNotOwnedByProcess {
@@ -666,12 +665,12 @@ impl Registry {
         stream_name: &str,
         reader_id: &str,
     ) -> Result<(), RegistryError> {
-        let stream = self
-            .streams
-            .get_mut(stream_name)
-            .ok_or_else(|| RegistryError::StreamNotFound {
-                stream_name: stream_name.to_string(),
-            })?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
         stream.reader_process_ids.remove(reader_id);
         stream.reader_count = stream.reader_count.saturating_sub(1);
         stream.status = if stream.writer_process_id.is_some() {

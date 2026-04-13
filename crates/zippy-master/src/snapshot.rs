@@ -9,7 +9,7 @@ use zippy_core::{Result, ZippyError};
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotStreamRecord {
     pub stream_name: String,
-    pub ring_capacity: usize,
+    pub buffer_size: usize,
     pub frame_size: usize,
     pub status: String,
 }
@@ -17,24 +17,28 @@ pub struct SnapshotStreamRecord {
 #[derive(Debug, Clone, Deserialize)]
 struct SnapshotStreamRecordV1 {
     stream_name: String,
-    ring_capacity: usize,
+    #[serde(default)]
+    buffer_size: Option<usize>,
+    #[serde(default)]
+    ring_capacity: Option<usize>,
     #[serde(default)]
     frame_size: Option<usize>,
     status: String,
 }
 
 impl<'de> Deserialize<'de> for SnapshotStreamRecord {
-    fn deserialize<D>(
-        deserializer: D,
-    ) -> std::result::Result<Self, <D as Deserializer<'de>>::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, <D as Deserializer<'de>>::Error>
     where
         D: Deserializer<'de>,
     {
         let record = SnapshotStreamRecordV1::deserialize(deserializer)?;
-        let frame_size = record.frame_size.unwrap_or(record.ring_capacity);
+        let buffer_size = record.buffer_size.or(record.ring_capacity).ok_or_else(|| {
+            serde::de::Error::missing_field("buffer_size")
+        })?;
+        let frame_size = record.frame_size.unwrap_or(buffer_size);
         Ok(Self {
             stream_name: record.stream_name,
-            ring_capacity: record.ring_capacity,
+            buffer_size,
             frame_size,
             status: record.status,
         })
@@ -89,7 +93,10 @@ impl SnapshotStore {
     pub fn write(path: &Path, snapshot: &RegistrySnapshot) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
-                reason: format!("failed to create registry snapshot parent error=[{}]", error),
+                reason: format!(
+                    "failed to create registry snapshot parent error=[{}]",
+                    error
+                ),
             })?;
         }
 
@@ -98,16 +105,30 @@ impl SnapshotStore {
             reason: format!("failed to serialize registry snapshot error=[{}]", error),
         })?;
         let mut temp_file = fs::File::create(&temp_path).map_err(|error| ZippyError::Io {
-            reason: format!("failed to create registry snapshot temp file error=[{}]", error),
+            reason: format!(
+                "failed to create registry snapshot temp file error=[{}]",
+                error
+            ),
         })?;
-        temp_file.write_all(&bytes).map_err(|error| ZippyError::Io {
-            reason: format!("failed to write registry snapshot temp file error=[{}]", error),
-        })?;
+        temp_file
+            .write_all(&bytes)
+            .map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to write registry snapshot temp file error=[{}]",
+                    error
+                ),
+            })?;
         temp_file.sync_all().map_err(|error| ZippyError::Io {
-            reason: format!("failed to fsync registry snapshot temp file error=[{}]", error),
+            reason: format!(
+                "failed to fsync registry snapshot temp file error=[{}]",
+                error
+            ),
         })?;
         fs::rename(&temp_path, path).map_err(|error| ZippyError::Io {
-            reason: format!("failed to move registry snapshot into place error=[{}]", error),
+            reason: format!(
+                "failed to move registry snapshot into place error=[{}]",
+                error
+            ),
         })?;
         Ok(())
     }

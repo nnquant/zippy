@@ -5,11 +5,9 @@ use zippy_core::bus_protocol::{
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
 use zippy_master::registry::Registry;
-use zippy_master::snapshot::{RegistrySnapshot, SnapshotStore, SnapshotStreamRecord};
-use zippy_master::snapshot::{
-    SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord,
-};
 use zippy_master::server::MasterServer;
+use zippy_master::snapshot::{RegistrySnapshot, SnapshotStore, SnapshotStreamRecord};
+use zippy_master::snapshot::{SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord};
 
 use std::fs;
 use std::io::{Read, Write};
@@ -44,12 +42,16 @@ fn protocol_types_roundtrip_debug_repr() {
 fn registry_stores_process_and_stream_records() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("local_dc");
-    registry.register_stream("openctp_ticks", 1024).unwrap();
+    registry
+        .register_stream_with_sizes("openctp_ticks", 1024, 256)
+        .unwrap();
 
     assert_eq!(registry.processes_len(), 1);
     assert_eq!(registry.streams_len(), 1);
     assert!(registry.get_process(&process_id).is_some());
-    assert!(registry.get_stream("openctp_ticks").is_some());
+    let stream = registry.get_stream("openctp_ticks").unwrap();
+    assert_eq!(stream.buffer_size, 1024);
+    assert_eq!(stream.frame_size, 256);
 }
 
 #[test]
@@ -62,7 +64,7 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
         &RegistrySnapshot {
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
-                ring_capacity: 1024,
+                buffer_size: 1024,
                 frame_size: 256,
                 status: "registered".to_string(),
             }],
@@ -83,7 +85,7 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
         .clone();
 
     assert_eq!(stream.status, "restored");
-    assert_eq!(stream.ring_capacity, 1024);
+    assert_eq!(stream.buffer_size, 1024);
     assert_eq!(stream.frame_size, 256);
 }
 
@@ -119,7 +121,7 @@ fn master_restores_legacy_snapshot_without_frame_size() {
         .clone();
 
     assert_eq!(stream.status, "restored");
-    assert_eq!(stream.ring_capacity, 1024);
+    assert_eq!(stream.buffer_size, 1024);
     assert_eq!(stream.frame_size, 1024);
 }
 
@@ -133,7 +135,7 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
         &RegistrySnapshot {
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
-                ring_capacity: 1024,
+                buffer_size: 1024,
                 frame_size: 256,
                 status: "registered".to_string(),
             }],
@@ -172,11 +174,26 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
     let server = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
     let registry_handle = server.registry();
     let registry = registry_handle.lock().unwrap();
-    assert_eq!(registry.get_stream("openctp_ticks").unwrap().status, "restored");
-    assert_eq!(registry.get_stream("openctp_ticks").unwrap().ring_capacity, 1024);
-    assert_eq!(registry.get_stream("openctp_ticks").unwrap().frame_size, 256);
-    assert_eq!(registry.get_source("openctp_md").unwrap().status, "restored");
-    assert_eq!(registry.get_engine("mid_price_factor").unwrap().status, "restored");
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().status,
+        "restored"
+    );
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().buffer_size,
+        1024
+    );
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().frame_size,
+        256
+    );
+    assert_eq!(
+        registry.get_source("openctp_md").unwrap().status,
+        "restored"
+    );
+    assert_eq!(
+        registry.get_engine("mid_price_factor").unwrap().status,
+        "restored"
+    );
     assert_eq!(registry.get_sink("factor_sink").unwrap().status, "restored");
 }
 
@@ -208,8 +225,40 @@ fn master_persists_registered_streams_to_snapshot_on_register_stream() {
     let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
     assert_eq!(snapshot.streams.len(), 1);
     assert_eq!(snapshot.streams[0].stream_name, "openctp_ticks");
-    assert_eq!(snapshot.streams[0].ring_capacity, 1024);
+    assert_eq!(snapshot.streams[0].buffer_size, 1024);
     assert_eq!(snapshot.streams[0].frame_size, 256);
+
+    let snapshot_json = fs::read_to_string(&snapshot_path).unwrap();
+    assert!(snapshot_json.contains("\"buffer_size\": 1024"));
+    assert!(!snapshot_json.contains("\"ring_capacity\""));
+}
+
+#[test]
+fn snapshot_store_reads_legacy_ring_capacity_into_buffer_and_frame_size() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot_path = temp.path().join("master-registry.json");
+
+    fs::write(
+        &snapshot_path,
+        r#"{
+  "streams": [
+    {
+      "stream_name": "ticks",
+      "ring_capacity": 512,
+      "status": "registered"
+    }
+  ],
+  "sources": [],
+  "engines": [],
+  "sinks": []
+}"#,
+    )
+    .unwrap();
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert_eq!(snapshot.streams.len(), 1);
+    assert_eq!(snapshot.streams[0].buffer_size, 512);
+    assert_eq!(snapshot.streams[0].frame_size, 512);
 }
 
 #[test]
@@ -223,7 +272,10 @@ fn registry_updates_process_lease_timestamp_on_heartbeat() {
     let second_seen = registry.get_process(&process_id).unwrap().last_heartbeat_at;
 
     assert!(second_seen >= first_seen);
-    assert_eq!(registry.get_process(&process_id).unwrap().lease_status, "alive");
+    assert_eq!(
+        registry.get_process(&process_id).unwrap().lease_status,
+        "alive"
+    );
 }
 
 #[test]
@@ -319,7 +371,12 @@ fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
     assert!(response.contains("Error"));
     assert!(response.contains("failed to create registry snapshot parent"));
 
-    let stream = server.registry().lock().unwrap().get_stream("openctp_ticks").cloned();
+    let stream = server
+        .registry()
+        .lock()
+        .unwrap()
+        .get_stream("openctp_ticks")
+        .cloned();
     assert!(stream.is_none());
 
     server.shutdown();
@@ -348,7 +405,9 @@ fn master_server_returns_error_when_shutdown_snapshot_flush_fails() {
     server.shutdown();
     let result = join_handle.join().unwrap();
     assert!(result.is_err());
-    assert!(format!("{}", result.unwrap_err()).contains("failed to create registry snapshot parent"));
+    assert!(
+        format!("{}", result.unwrap_err()).contains("failed to create registry snapshot parent")
+    );
 }
 
 #[test]
@@ -374,7 +433,10 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
             config: serde_json::json!({"front": "tcp://example"}),
         }),
     );
-    assert!(matches!(source_response, ControlResponse::SourceRegistered { .. }));
+    assert!(matches!(
+        source_response,
+        ControlResponse::SourceRegistered { .. }
+    ));
 
     let engine_response = send_control_request(
         &socket_path,
@@ -388,7 +450,10 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
             config: serde_json::json!({"id_filter": ["IF2606"]}),
         }),
     );
-    assert!(matches!(engine_response, ControlResponse::EngineRegistered { .. }));
+    assert!(matches!(
+        engine_response,
+        ControlResponse::EngineRegistered { .. }
+    ));
 
     let sink_response = send_control_request(
         &socket_path,
@@ -400,7 +465,10 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
             config: serde_json::json!({"path": "data/factors"}),
         }),
     );
-    assert!(matches!(sink_response, ControlResponse::SinkRegistered { .. }));
+    assert!(matches!(
+        sink_response,
+        ControlResponse::SinkRegistered { .. }
+    ));
 
     let status_response = send_control_request(
         &socket_path,
@@ -411,7 +479,10 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
             metrics: Some(serde_json::json!({"processed_rows_total": 42})),
         }),
     );
-    assert!(matches!(status_response, ControlResponse::StatusUpdated { .. }));
+    assert!(matches!(
+        status_response,
+        ControlResponse::StatusUpdated { .. }
+    ));
 
     let expire_response = send_request(
         &socket_path,
@@ -422,7 +493,10 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
     let registry_handle = server.registry();
     let registry = registry_handle.lock().unwrap();
     assert_eq!(registry.get_source("openctp_md").unwrap().status, "lost");
-    assert_eq!(registry.get_engine("mid_price_factor").unwrap().status, "lost");
+    assert_eq!(
+        registry.get_engine("mid_price_factor").unwrap().status,
+        "lost"
+    );
     assert_eq!(registry.get_sink("factor_sink").unwrap().status, "lost");
     drop(registry);
 
@@ -630,7 +704,7 @@ fn master_server_registers_stream_and_attaches_reader_writer() {
     assert_eq!(reader_descriptor.layout_version, BUS_LAYOUT_VERSION);
     assert!(reader_descriptor.shm_name.contains("openctp_ticks"));
     assert_eq!(reader_descriptor.next_read_seq, 1);
-    assert_eq!(reader_descriptor.reader_id, "reader_1");
+    assert_eq!(reader_descriptor.reader_id, "openctp_ticks_reader_1");
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -938,13 +1012,12 @@ fn master_server_logs_cleanup_failure_without_stopped_log() {
         &[],
     );
     assert!(
-        !records
-            .iter()
-            .any(|record| {
-                record["event"] == "master_stopped"
-                    && record["status"] == "stopped"
-                    && record["control_endpoint"].as_str() == Some(socket_path.to_string_lossy().as_ref())
-            }),
+        !records.iter().any(|record| {
+            record["event"] == "master_stopped"
+                && record["status"] == "stopped"
+                && record["control_endpoint"].as_str()
+                    == Some(socket_path.to_string_lossy().as_ref())
+        }),
         "unexpected stopped log after cleanup failure"
     );
 }
@@ -1137,9 +1210,7 @@ fn assert_record_has_fields(
     let record = records
         .iter()
         .find(|record| {
-            if !(record["event"] == event
-                && record["status"] == status
-                && record["level"] == level)
+            if !(record["event"] == event && record["status"] == status && record["level"] == level)
             {
                 return false;
             }

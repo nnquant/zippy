@@ -3,15 +3,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::SyncSender;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use zippy_core::bus_protocol::{
-    GetStreamResponse, ListStreamsResponse, StreamInfo,
-};
+use zippy_core::bus_protocol::{GetStreamResponse, ListStreamsResponse, StreamInfo};
 use zippy_core::{ControlRequest, ControlResponse, Result, ZippyError};
 
 use crate::bus::{Bus, BusError};
@@ -82,14 +80,14 @@ impl MasterServer {
             for stream in snapshot.streams {
                 bus.ensure_stream_with_sizes(
                     &stream.stream_name,
-                    stream.ring_capacity,
+                    stream.buffer_size,
                     stream.frame_size,
                 )
-                    .map_err(bus_error)?;
+                .map_err(bus_error)?;
                 registry
                     .ensure_stream_with_sizes(
                         &stream.stream_name,
-                        stream.ring_capacity,
+                        stream.buffer_size,
                         stream.frame_size,
                     )
                     .map_err(registry_error)?;
@@ -401,13 +399,11 @@ impl MasterServer {
                     request.buffer_size,
                     request.frame_size,
                 ) {
-                    Ok(bus_created) => match registry
-                        .ensure_stream_with_sizes(
-                            &request.stream_name,
-                            request.buffer_size,
-                            request.frame_size,
-                        )
-                    {
+                    Ok(bus_created) => match registry.ensure_stream_with_sizes(
+                        &request.stream_name,
+                        request.buffer_size,
+                        request.frame_size,
+                    ) {
                         Ok(registry_created) => {
                             let existing = !(bus_created || registry_created);
                             tracing::info!(
@@ -474,16 +470,16 @@ impl MasterServer {
                         }
                     },
                     Err(error) => {
-                            tracing::error!(
-                                component = "master_server",
-                                event = "register_stream",
-                                status = "error",
-                                stream_name = request.stream_name.as_str(),
-                                buffer_size = request.buffer_size,
-                                frame_size = request.frame_size,
-                                error = %error,
-                                "failed to register stream"
-                            );
+                        tracing::error!(
+                            component = "master_server",
+                            event = "register_stream",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            buffer_size = request.buffer_size,
+                            frame_size = request.frame_size,
+                            error = %error,
+                            "failed to register stream"
+                        );
                         ControlResponse::Error {
                             reason: format!("{}", error),
                         }
@@ -645,7 +641,11 @@ impl MasterServer {
                             &request.status,
                             request.metrics.clone(),
                         );
-                        (result, previous.map(|record| ("source", serde_json::to_value(record).unwrap())))
+                        (
+                            result,
+                            previous
+                                .map(|record| ("source", serde_json::to_value(record).unwrap())),
+                        )
                     }
                     "engine" => {
                         let previous = registry.get_engine(&request.name).cloned();
@@ -654,12 +654,19 @@ impl MasterServer {
                             &request.status,
                             request.metrics.clone(),
                         );
-                        (result, previous.map(|record| ("engine", serde_json::to_value(record).unwrap())))
+                        (
+                            result,
+                            previous
+                                .map(|record| ("engine", serde_json::to_value(record).unwrap())),
+                        )
                     }
                     "sink" => {
                         let previous = registry.get_sink(&request.name).cloned();
                         let result = registry.set_sink_status(&request.name, &request.status);
-                        (result, previous.map(|record| ("sink", serde_json::to_value(record).unwrap())))
+                        (
+                            result,
+                            previous.map(|record| ("sink", serde_json::to_value(record).unwrap())),
+                        )
                     }
                     _ => (
                         Err(crate::registry::RegistryError::InvalidRecordKind {
@@ -824,41 +831,39 @@ impl MasterServer {
                             reason: error.to_string(),
                         }
                     }
-                    Ok(()) => {
-                        match bus.detach_writer(&request.stream_name, &request.writer_id) {
-                            Ok(()) => {
-                                let _ = registry.detach_writer(&request.stream_name);
-                                tracing::info!(
-                                    component = "master_server",
-                                    event = "close_writer",
-                                    status = "success",
-                                    stream_name = request.stream_name.as_str(),
-                                    process_id = request.process_id.as_str(),
-                                    writer_id = request.writer_id.as_str(),
-                                    "detached writer"
-                                );
-                                ControlResponse::WriterDetached {
-                                    stream_name: request.stream_name,
-                                    writer_id: request.writer_id,
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    component = "master_server",
-                                    event = "close_writer",
-                                    status = "error",
-                                    stream_name = request.stream_name.as_str(),
-                                    process_id = request.process_id.as_str(),
-                                    writer_id = request.writer_id.as_str(),
-                                    error = %error,
-                                    "failed to detach writer"
-                                );
-                                ControlResponse::Error {
-                                    reason: format!("{}", error),
-                                }
+                    Ok(()) => match bus.detach_writer(&request.stream_name, &request.writer_id) {
+                        Ok(()) => {
+                            let _ = registry.detach_writer(&request.stream_name);
+                            tracing::info!(
+                                component = "master_server",
+                                event = "close_writer",
+                                status = "success",
+                                stream_name = request.stream_name.as_str(),
+                                process_id = request.process_id.as_str(),
+                                writer_id = request.writer_id.as_str(),
+                                "detached writer"
+                            );
+                            ControlResponse::WriterDetached {
+                                stream_name: request.stream_name,
+                                writer_id: request.writer_id,
                             }
                         }
-                    }
+                        Err(error) => {
+                            tracing::error!(
+                                component = "master_server",
+                                event = "close_writer",
+                                status = "error",
+                                stream_name = request.stream_name.as_str(),
+                                process_id = request.process_id.as_str(),
+                                writer_id = request.writer_id.as_str(),
+                                error = %error,
+                                "failed to detach writer"
+                            );
+                            ControlResponse::Error {
+                                reason: format!("{}", error),
+                            }
+                        }
+                    },
                 }
             }
             ControlRequest::CloseReader(request) => {
@@ -884,42 +889,40 @@ impl MasterServer {
                             reason: error.to_string(),
                         }
                     }
-                    Ok(()) => {
-                        match bus.detach_reader(&request.stream_name, &request.reader_id) {
-                            Ok(()) => {
-                                let _ =
-                                    registry.detach_reader(&request.stream_name, &request.reader_id);
-                                tracing::info!(
-                                    component = "master_server",
-                                    event = "close_reader",
-                                    status = "success",
-                                    stream_name = request.stream_name.as_str(),
-                                    process_id = request.process_id.as_str(),
-                                    reader_id = request.reader_id.as_str(),
-                                    "detached reader"
-                                );
-                                ControlResponse::ReaderDetached {
-                                    stream_name: request.stream_name,
-                                    reader_id: request.reader_id,
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    component = "master_server",
-                                    event = "close_reader",
-                                    status = "error",
-                                    stream_name = request.stream_name.as_str(),
-                                    process_id = request.process_id.as_str(),
-                                    reader_id = request.reader_id.as_str(),
-                                    error = %error,
-                                    "failed to detach reader"
-                                );
-                                ControlResponse::Error {
-                                    reason: format!("{}", error),
-                                }
+                    Ok(()) => match bus.detach_reader(&request.stream_name, &request.reader_id) {
+                        Ok(()) => {
+                            let _ =
+                                registry.detach_reader(&request.stream_name, &request.reader_id);
+                            tracing::info!(
+                                component = "master_server",
+                                event = "close_reader",
+                                status = "success",
+                                stream_name = request.stream_name.as_str(),
+                                process_id = request.process_id.as_str(),
+                                reader_id = request.reader_id.as_str(),
+                                "detached reader"
+                            );
+                            ControlResponse::ReaderDetached {
+                                stream_name: request.stream_name,
+                                reader_id: request.reader_id,
                             }
                         }
-                    }
+                        Err(error) => {
+                            tracing::error!(
+                                component = "master_server",
+                                event = "close_reader",
+                                status = "error",
+                                stream_name = request.stream_name.as_str(),
+                                process_id = request.process_id.as_str(),
+                                reader_id = request.reader_id.as_str(),
+                                error = %error,
+                                "failed to detach reader"
+                            );
+                            ControlResponse::Error {
+                                reason: format!("{}", error),
+                            }
+                        }
+                    },
                 }
             }
             ControlRequest::ListStreams(_) => {
@@ -979,7 +982,10 @@ impl MasterServer {
     }
 
     #[cfg(debug_assertions)]
-    fn try_handle_test_control_request(&self, request_line: &str) -> Result<Option<ControlResponse>> {
+    fn try_handle_test_control_request(
+        &self,
+        request_line: &str,
+    ) -> Result<Option<ControlResponse>> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(request_line) else {
             return Ok(None);
         };
@@ -1022,7 +1028,9 @@ impl MasterServer {
                 Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
                 Err(error) => return Err(bus_error(error)),
             }
-            registry.detach_writer(&stream_name).map_err(registry_error)?;
+            registry
+                .detach_writer(&stream_name)
+                .map_err(registry_error)?;
         }
 
         let stale_readers = registry.readers_for_process(process_id);
@@ -1096,7 +1104,9 @@ impl MasterServer {
                 Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
                 Err(error) => return Err(bus_error(error)),
             }
-            registry.detach_writer(&stream_name).map_err(registry_error)?;
+            registry
+                .detach_writer(&stream_name)
+                .map_err(registry_error)?;
             tracing::info!(
                 component = "master",
                 event = "writer_reclaimed",
@@ -1141,7 +1151,7 @@ impl MasterServer {
                 .into_iter()
                 .map(|stream| SnapshotStreamRecord {
                     stream_name: stream.stream_name,
-                    ring_capacity: stream.buffer_size,
+                    buffer_size: stream.buffer_size,
                     frame_size: stream.frame_size,
                     status: stream.status,
                 })
@@ -1251,8 +1261,8 @@ fn restore_previous_record(
 
 fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<()> {
     let payload = serde_json::to_string(response).map_err(|error| ZippyError::Io {
-            reason: format!("failed to encode control response error=[{}]", error),
-        })?;
+        reason: format!("failed to encode control response error=[{}]", error),
+    })?;
     stream.write_all(payload.as_bytes()).map_err(io_error)?;
     stream.write_all(b"\n").map_err(io_error)?;
     stream.flush().map_err(io_error)?;
