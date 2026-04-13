@@ -63,6 +63,7 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
                 ring_capacity: 1024,
+                frame_size: 256,
                 status: "registered".to_string(),
             }],
             sources: vec![],
@@ -82,6 +83,8 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
         .clone();
 
     assert_eq!(stream.status, "restored");
+    assert_eq!(stream.ring_capacity, 1024);
+    assert_eq!(stream.frame_size, 256);
 }
 
 #[test]
@@ -95,6 +98,7 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
                 ring_capacity: 1024,
+                frame_size: 256,
                 status: "registered".to_string(),
             }],
             sources: vec![SnapshotSourceRecord {
@@ -133,6 +137,8 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
     let registry_handle = server.registry();
     let registry = registry_handle.lock().unwrap();
     assert_eq!(registry.get_stream("openctp_ticks").unwrap().status, "restored");
+    assert_eq!(registry.get_stream("openctp_ticks").unwrap().ring_capacity, 1024);
+    assert_eq!(registry.get_stream("openctp_ticks").unwrap().frame_size, 256);
     assert_eq!(registry.get_source("openctp_md").unwrap().status, "restored");
     assert_eq!(registry.get_engine("mid_price_factor").unwrap().status, "restored");
     assert_eq!(registry.get_sink("factor_sink").unwrap().status, "restored");
@@ -167,6 +173,7 @@ fn master_persists_registered_streams_to_snapshot_on_register_stream() {
     assert_eq!(snapshot.streams.len(), 1);
     assert_eq!(snapshot.streams[0].stream_name, "openctp_ticks");
     assert_eq!(snapshot.streams[0].ring_capacity, 1024);
+    assert_eq!(snapshot.streams[0].frame_size, 256);
 }
 
 #[test]

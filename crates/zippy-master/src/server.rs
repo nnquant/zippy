@@ -80,13 +80,18 @@ impl MasterServer {
             let mut registry = server.registry.lock().unwrap();
 
             for stream in snapshot.streams {
-                bus.ensure_stream(
+                bus.ensure_stream_with_sizes(
                     &stream.stream_name,
                     stream.ring_capacity,
+                    stream.frame_size,
                 )
                     .map_err(bus_error)?;
                 registry
-                    .ensure_stream(&stream.stream_name, stream.ring_capacity)
+                    .ensure_stream_with_sizes(
+                        &stream.stream_name,
+                        stream.ring_capacity,
+                        stream.frame_size,
+                    )
                     .map_err(registry_error)?;
                 registry
                     .set_stream_status(&stream.stream_name, "restored")
@@ -1137,6 +1142,7 @@ impl MasterServer {
                 .map(|stream| SnapshotStreamRecord {
                     stream_name: stream.stream_name,
                     ring_capacity: stream.buffer_size,
+                    frame_size: stream.frame_size,
                     status: stream.status,
                 })
                 .collect(),

@@ -10,6 +10,7 @@ use zippy_core::{Result, ZippyError};
 pub struct SnapshotStreamRecord {
     pub stream_name: String,
     pub ring_capacity: usize,
+    pub frame_size: usize,
     pub status: String,
 }
 
