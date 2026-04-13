@@ -170,6 +170,7 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                             stream_name: "ticks".to_string(),
                             buffer_size: 1024,
                             frame_size: 256,
+                            write_seq: 42,
                             writer_process_id: None,
                             reader_count: 0,
                             status: "registered".to_string(),
@@ -182,6 +183,7 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                             stream_name: "ticks".to_string(),
                             buffer_size: 1024,
                             frame_size: 256,
+                            write_seq: 42,
                             writer_process_id: None,
                             reader_count: 0,
                             status: "registered".to_string(),
@@ -242,6 +244,7 @@ fn master_client_lists_streams() {
     assert_eq!(streams[0].stream_name, "ticks");
     assert_eq!(streams[0].buffer_size, 1024);
     assert_eq!(streams[0].frame_size, 256);
+    assert_eq!(streams[0].write_seq, 42);
     assert_eq!(streams[0].status, "registered");
 
     server.join().unwrap();
@@ -263,6 +266,7 @@ fn master_client_gets_single_stream() {
     assert_eq!(stream.stream_name, "ticks");
     assert_eq!(stream.buffer_size, 1024);
     assert_eq!(stream.frame_size, 256);
+    assert_eq!(stream.write_seq, 42);
     assert_eq!(stream.status, "registered");
 
     server.join().unwrap();
@@ -378,6 +382,7 @@ fn control_response_display_uses_buffer_and_frame_sizes() {
                 stream_name: "ticks".to_string(),
                 buffer_size: 1024,
                 frame_size: 256,
+                write_seq: 42,
                 writer_process_id: None,
                 reader_count: 0,
                 status: "registered".to_string(),
@@ -387,4 +392,24 @@ fn control_response_display_uses_buffer_and_frame_sizes() {
     assert!(stream_output.contains("buffer_size=[1024]"));
     assert!(stream_output.contains("frame_size=[256]"));
     assert!(!stream_output.contains("ring_capacity"));
+}
+
+#[test]
+fn stream_info_serialization_includes_write_seq() {
+    let stream = StreamInfo {
+        stream_name: "ticks".to_string(),
+        buffer_size: 1024,
+        frame_size: 256,
+        write_seq: 42,
+        writer_process_id: None,
+        reader_count: 0,
+        status: "registered".to_string(),
+    };
+
+    let json = serde_json::to_string(&stream).unwrap();
+
+    assert!(json.contains("\"write_seq\":42"));
+    assert!(json.contains("\"buffer_size\":1024"));
+    assert!(json.contains("\"frame_size\":256"));
+    assert!(!json.contains("ring_capacity"));
 }

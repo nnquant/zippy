@@ -82,6 +82,7 @@ pub struct StreamInfo {
     pub stream_name: String,
     pub buffer_size: usize,
     pub frame_size: usize,
+    pub write_seq: u64,
     pub writer_process_id: Option<String>,
     pub reader_count: usize,
     pub status: String,
