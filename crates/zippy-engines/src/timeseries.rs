@@ -525,7 +525,9 @@ fn build_expression_factors(
     let mut factors = Vec::with_capacity(specs.len());
 
     for spec in specs {
-        let factor = spec.build(current_schema.as_ref())?;
+        let factor = spec
+            .build(current_schema.as_ref())
+            .map_err(map_timeseries_expression_error)?;
         let output_field = factor.output_field();
         let inserted = field_names.insert(output_field.name().clone());
 
@@ -545,6 +547,20 @@ fn build_expression_factors(
     }
 
     Ok((factors, current_schema))
+}
+
+fn map_timeseries_expression_error(error: ZippyError) -> ZippyError {
+    match error {
+        ZippyError::InvalidConfig { reason }
+            if reason.contains("stateful expression function requires build_reactive_plan") =>
+        {
+            ZippyError::InvalidConfig {
+                reason: "stateful TS_* functions are only supported inside ReactiveStateEngine"
+                    .to_string(),
+            }
+        }
+        other => other,
+    }
 }
 
 fn build_aggregation_schema(

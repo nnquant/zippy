@@ -755,8 +755,11 @@ fn timeseries_engine_pre_factors_reject_ts_expr_nodes() {
 
     match result {
         Err(ZippyError::InvalidConfig { reason }) => {
-            assert!(reason.contains("stateful expression function requires build_reactive_plan"));
-            assert!(reason.contains("function=[TS_DIFF]"));
+            assert!(
+                reason.contains(
+                    "stateful TS_* functions are only supported inside ReactiveStateEngine"
+                )
+            );
         }
         Ok(_) => panic!("expected pre factor with TS_* expression to be rejected"),
         Err(other) => panic!("unexpected error: {other:?}"),
@@ -779,8 +782,11 @@ fn timeseries_engine_post_factors_reject_ts_expr_nodes() {
 
     match result {
         Err(ZippyError::InvalidConfig { reason }) => {
-            assert!(reason.contains("stateful expression function requires build_reactive_plan"));
-            assert!(reason.contains("function=[TS_STD]"));
+            assert!(
+                reason.contains(
+                    "stateful TS_* functions are only supported inside ReactiveStateEngine"
+                )
+            );
         }
         Ok(_) => panic!("expected post factor with TS_* expression to be rejected"),
         Err(other) => panic!("unexpected error: {other:?}"),
