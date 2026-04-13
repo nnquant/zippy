@@ -43,7 +43,7 @@ fn registry_stores_process_and_stream_records() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("local_dc");
     registry
-        .register_stream_with_sizes("openctp_ticks", 1024, 256)
+        .register_stream("openctp_ticks", 1024, 256)
         .unwrap();
 
     assert_eq!(registry.processes_len(), 1);
@@ -508,9 +508,9 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
 #[test]
 fn registry_rejects_duplicate_stream_names() {
     let mut registry = Registry::default();
-    registry.register_stream("openctp_ticks", 1024).unwrap();
+    registry.register_stream("openctp_ticks", 1024, 256).unwrap();
 
-    let error = registry.register_stream("openctp_ticks", 1024).unwrap_err();
+    let error = registry.register_stream("openctp_ticks", 1024, 256).unwrap_err();
     assert!(format!("{error}").contains("stream already exists"));
 }
 
@@ -846,7 +846,38 @@ fn master_server_rejects_zero_capacity_stream_registration() {
         "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":0,\"frame_size\":0}}\n",
     );
     assert!(response.contains("Error"));
-    assert!(response.contains("invalid ring capacity"));
+    assert!(response.contains("invalid stream sizing"));
+    assert!(response.contains("buffer_size=[0]"));
+    assert!(response.contains("frame_size=[0]"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_rejects_stream_registration_with_frame_size_mismatch() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_register_process(&socket_path, "local_dc");
+    assert!(process_response.contains("proc_1"));
+
+    let first_response = send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
+    );
+    assert!(first_response.contains("StreamRegistered"));
+
+    let mismatch_response = send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":512}}\n",
+    );
+    assert!(mismatch_response.contains("stream configuration mismatch"));
+    assert!(mismatch_response.contains("existing_buffer_size=[1024]"));
+    assert!(mismatch_response.contains("existing_frame_size=[256]"));
+    assert!(mismatch_response.contains("requested_buffer_size=[1024]"));
+    assert!(mismatch_response.contains("requested_frame_size=[512]"));
 
     server.shutdown();
     join_handle.join().unwrap();

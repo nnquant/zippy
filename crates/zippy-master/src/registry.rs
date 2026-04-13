@@ -72,14 +72,17 @@ pub enum RegistryError {
     StreamAlreadyExists {
         stream_name: String,
     },
-    InvalidRingCapacity {
+    InvalidStreamConfig {
         stream_name: String,
-        ring_capacity: usize,
+        buffer_size: usize,
+        frame_size: usize,
     },
-    StreamRingCapacityMismatch {
+    StreamConfigMismatch {
         stream_name: String,
-        existing_ring_capacity: usize,
-        requested_ring_capacity: usize,
+        existing_buffer_size: usize,
+        existing_frame_size: usize,
+        requested_buffer_size: usize,
+        requested_frame_size: usize,
     },
     WriterNotOwnedByProcess {
         stream_name: String,
@@ -130,22 +133,29 @@ impl fmt::Display for RegistryError {
             Self::StreamAlreadyExists { stream_name } => {
                 write!(f, "stream already exists stream_name=[{}]", stream_name)
             }
-            Self::InvalidRingCapacity {
+            Self::InvalidStreamConfig {
                 stream_name,
-                ring_capacity,
+                buffer_size,
+                frame_size,
             } => write!(
                 f,
-                "invalid ring capacity stream_name=[{}] ring_capacity=[{}]",
-                stream_name, ring_capacity
+                "invalid stream sizing stream_name=[{}] buffer_size=[{}] frame_size=[{}]",
+                stream_name, buffer_size, frame_size
             ),
-            Self::StreamRingCapacityMismatch {
+            Self::StreamConfigMismatch {
                 stream_name,
-                existing_ring_capacity,
-                requested_ring_capacity,
+                existing_buffer_size,
+                existing_frame_size,
+                requested_buffer_size,
+                requested_frame_size,
             } => write!(
                 f,
-                "stream ring capacity mismatch stream_name=[{}] existing_ring_capacity=[{}] requested_ring_capacity=[{}]",
-                stream_name, existing_ring_capacity, requested_ring_capacity
+                "stream configuration mismatch stream_name=[{}] existing_buffer_size=[{}] existing_frame_size=[{}] requested_buffer_size=[{}] requested_frame_size=[{}]",
+                stream_name,
+                existing_buffer_size,
+                existing_frame_size,
+                requested_buffer_size,
+                requested_frame_size
             ),
             Self::WriterNotOwnedByProcess {
                 stream_name,
@@ -214,36 +224,31 @@ impl Registry {
     pub fn ensure_stream(
         &mut self,
         stream_name: &str,
-        ring_capacity: usize,
-    ) -> Result<bool, RegistryError> {
-        self.ensure_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
-    }
-
-    pub fn ensure_stream_with_sizes(
-        &mut self,
-        stream_name: &str,
         buffer_size: usize,
         frame_size: usize,
     ) -> Result<bool, RegistryError> {
-        if buffer_size == 0 {
-            return Err(RegistryError::InvalidRingCapacity {
+        if buffer_size == 0 || frame_size == 0 {
+            return Err(RegistryError::InvalidStreamConfig {
                 stream_name: stream_name.to_string(),
-                ring_capacity: buffer_size,
+                buffer_size,
+                frame_size,
             });
         }
 
         if let Some(existing) = self.streams.get(stream_name) {
             if existing.buffer_size != buffer_size || existing.frame_size != frame_size {
-                return Err(RegistryError::StreamRingCapacityMismatch {
+                return Err(RegistryError::StreamConfigMismatch {
                     stream_name: stream_name.to_string(),
-                    existing_ring_capacity: existing.buffer_size,
-                    requested_ring_capacity: buffer_size,
+                    existing_buffer_size: existing.buffer_size,
+                    existing_frame_size: existing.frame_size,
+                    requested_buffer_size: buffer_size,
+                    requested_frame_size: frame_size,
                 });
             }
             return Ok(false);
         }
 
-        self.register_stream_with_sizes(stream_name, buffer_size, frame_size)?;
+        self.register_stream(stream_name, buffer_size, frame_size)?;
         Ok(true)
     }
 
@@ -327,21 +332,14 @@ impl Registry {
     pub fn register_stream(
         &mut self,
         stream_name: &str,
-        ring_capacity: usize,
-    ) -> Result<(), RegistryError> {
-        self.register_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
-    }
-
-    pub fn register_stream_with_sizes(
-        &mut self,
-        stream_name: &str,
         buffer_size: usize,
         frame_size: usize,
     ) -> Result<(), RegistryError> {
-        if buffer_size == 0 {
-            return Err(RegistryError::InvalidRingCapacity {
+        if buffer_size == 0 || frame_size == 0 {
+            return Err(RegistryError::InvalidStreamConfig {
                 stream_name: stream_name.to_string(),
-                ring_capacity: buffer_size,
+                buffer_size,
+                frame_size,
             });
         }
 

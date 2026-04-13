@@ -85,11 +85,7 @@ impl MasterServer {
                 )
                 .map_err(bus_error)?;
                 registry
-                    .ensure_stream_with_sizes(
-                        &stream.stream_name,
-                        stream.buffer_size,
-                        stream.frame_size,
-                    )
+                    .ensure_stream(&stream.stream_name, stream.buffer_size, stream.frame_size)
                     .map_err(registry_error)?;
                 registry
                     .set_stream_status(&stream.stream_name, "restored")
@@ -394,12 +390,35 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut bus = self.bus.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                if let Err(error) = validate_register_stream_request(
+                    &registry,
+                    &request.stream_name,
+                    request.buffer_size,
+                    request.frame_size,
+                ) {
+                    tracing::error!(
+                        component = "master_server",
+                        event = "register_stream",
+                        status = "error",
+                        stream_name = request.stream_name.as_str(),
+                        buffer_size = request.buffer_size,
+                        frame_size = request.frame_size,
+                        error = %error,
+                        "failed to register stream"
+                    );
+                    return write_control_response(
+                        &mut stream,
+                        &ControlResponse::Error {
+                            reason: error.to_string(),
+                        },
+                    );
+                }
                 match bus.ensure_stream_with_sizes(
                     &request.stream_name,
                     request.buffer_size,
                     request.frame_size,
                 ) {
-                    Ok(bus_created) => match registry.ensure_stream_with_sizes(
+                    Ok(bus_created) => match registry.ensure_stream(
                         &request.stream_name,
                         request.buffer_size,
                         request.frame_size,
@@ -470,6 +489,13 @@ impl MasterServer {
                         }
                     },
                     Err(error) => {
+                        let error = normalize_register_stream_bus_error(
+                            &registry,
+                            &request.stream_name,
+                            request.buffer_size,
+                            request.frame_size,
+                            error,
+                        );
                         tracing::error!(
                             component = "master_server",
                             event = "register_stream",
@@ -481,7 +507,7 @@ impl MasterServer {
                             "failed to register stream"
                         );
                         ControlResponse::Error {
-                            reason: format!("{}", error),
+                            reason: error.to_string(),
                         }
                     }
                 }
@@ -1267,6 +1293,72 @@ fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -
     stream.write_all(b"\n").map_err(io_error)?;
     stream.flush().map_err(io_error)?;
     Ok(())
+}
+
+fn validate_register_stream_request(
+    registry: &Registry,
+    stream_name: &str,
+    buffer_size: usize,
+    frame_size: usize,
+) -> std::result::Result<(), crate::registry::RegistryError> {
+    if buffer_size == 0 || frame_size == 0 {
+        return Err(crate::registry::RegistryError::InvalidStreamConfig {
+            stream_name: stream_name.to_string(),
+            buffer_size,
+            frame_size,
+        });
+    }
+
+    if let Some(existing) = registry.get_stream(stream_name) {
+        if existing.buffer_size != buffer_size || existing.frame_size != frame_size {
+            return Err(crate::registry::RegistryError::StreamConfigMismatch {
+                stream_name: stream_name.to_string(),
+                existing_buffer_size: existing.buffer_size,
+                existing_frame_size: existing.frame_size,
+                requested_buffer_size: buffer_size,
+                requested_frame_size: frame_size,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_register_stream_bus_error(
+    registry: &Registry,
+    stream_name: &str,
+    buffer_size: usize,
+    frame_size: usize,
+    error: crate::bus::BusError,
+) -> ZippyError {
+    match error {
+        BusError::InvalidRingCapacity { .. } => registry_error(
+            crate::registry::RegistryError::InvalidStreamConfig {
+                stream_name: stream_name.to_string(),
+                buffer_size,
+                frame_size,
+            },
+        ),
+        BusError::StreamRingCapacityMismatch { .. } => {
+            if let Some(existing) = registry.get_stream(stream_name) {
+                registry_error(crate::registry::RegistryError::StreamConfigMismatch {
+                    stream_name: stream_name.to_string(),
+                    existing_buffer_size: existing.buffer_size,
+                    existing_frame_size: existing.frame_size,
+                    requested_buffer_size: buffer_size,
+                    requested_frame_size: frame_size,
+                })
+            } else {
+                ZippyError::Io {
+                    reason: format!(
+                        "stream configuration mismatch stream_name=[{}] requested_buffer_size=[{}] requested_frame_size=[{}] bus state differs from registry",
+                        stream_name, buffer_size, frame_size
+                    ),
+                }
+            }
+        }
+        other => bus_error(other),
+    }
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {
