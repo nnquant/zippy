@@ -9,6 +9,7 @@ serde_json.workspace = true
 signal-hook = { version = "0.3", features = ["iterator"] }
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
+zippy-shm-bridge = { path = "../../vendor/zippy-shm-bridge" }
 
 [dev-dependencies]
 arrow.workspace = true

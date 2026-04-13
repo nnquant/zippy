@@ -8,6 +8,10 @@ members = [
     "crates/zippy-perf",
     "crates/zippy-master",
 ]
+exclude = [
+    "vendor/shared_memory-0.12.4",
+    "vendor/zippy-shm-bridge",
+]
 resolver = "2"
 
 [workspace.package]

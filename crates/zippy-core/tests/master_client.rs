@@ -432,7 +432,9 @@ fn writer_and_reader_hot_path_do_not_create_seq_ipc_files() {
             .unwrap()
             .as_nanos()
     ));
-    let shm_name = shm_dir.to_string_lossy().into_owned();
+    fs::create_dir_all(&shm_dir).unwrap();
+    let flink_path = shm_dir.join("ticks.flink");
+    let shm_name = flink_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -520,9 +522,18 @@ fn writer_and_reader_hot_path_do_not_create_seq_ipc_files() {
     let received = reader.read(Some(1000)).unwrap();
 
     assert_eq!(received.num_rows(), batch.num_rows());
+    let entry_names = fs::read_dir(&shm_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     assert!(
-        !shm_dir.exists() || fs::read_dir(&shm_dir).unwrap().next().is_none(),
-        "seq_*.ipc files should not be created path=[{}]",
+        entry_names.iter().all(|name| !name.starts_with("seq_")),
+        "seq_*.ipc files should not be created path=[{}] entries={entry_names:?}",
+        shm_dir.display()
+    );
+    assert!(
+        entry_names.iter().any(|name| name == "ticks.flink"),
+        "shared memory flink should exist path=[{}] entries={entry_names:?}",
         shm_dir.display()
     );
 

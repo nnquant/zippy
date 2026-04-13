@@ -1,0 +1,8 @@
+[package]
+name = "zippy-shm-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+shared_memory = { path = "../shared_memory-0.12.4" }

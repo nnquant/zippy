@@ -1,11 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zippy_core::bus_protocol::{ReaderDescriptor, WriterDescriptor, BUS_LAYOUT_VERSION};
-
-use crate::ring::{ReaderAttachment, StreamRing};
+use zippy_shm_bridge::{SharedFrameRing, SharedFrameRingError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusError {
@@ -108,11 +107,13 @@ impl std::error::Error for BusError {}
 
 #[derive(Debug)]
 struct StreamState {
-    ring: StreamRing,
+    shared_ring: SharedFrameRing,
     buffer_size: usize,
     frame_size: usize,
     writer_process_id: Option<String>,
     writer_id: Option<String>,
+    reader_ids: BTreeSet<String>,
+    next_reader_id: u64,
     shm_name: String,
     layout_version: u32,
 }
@@ -158,7 +159,7 @@ impl Bus {
         frame_size: usize,
     ) -> Result<bool, BusError> {
         if let Some(existing) = self.streams.get(stream_name) {
-            let existing_ring_capacity = existing.ring.buffer_size();
+            let existing_ring_capacity = existing.buffer_size;
             if existing_ring_capacity != buffer_size
                 || existing.buffer_size != buffer_size
                 || existing.frame_size != frame_size
@@ -196,35 +197,41 @@ impl Bus {
             });
         }
 
-        let ring = StreamRing::new(buffer_size, frame_size).map_err(|error| {
-            BusError::InvalidRingCapacity {
-                stream_name: stream_name.to_string(),
-                ring_capacity: error.buffer_size,
-            }
-        })?;
-
         std::fs::create_dir_all(&self.root_dir).map_err(|error| BusError::StorageInitFailed {
             stream_name: stream_name.to_string(),
             reason: error.to_string(),
         })?;
 
-        let stream_dir = self
+        let shm_path = self
             .root_dir
-            .join(format!("{}_{}", stream_name, self.instance_id));
-        std::fs::create_dir_all(&stream_dir).map_err(|error| BusError::StorageInitFailed {
-            stream_name: stream_name.to_string(),
-            reason: error.to_string(),
-        })?;
+            .join(format!("{}_{}.flink", stream_name, self.instance_id));
+        let shared_ring =
+            SharedFrameRing::create_or_open(&shm_path, buffer_size, frame_size).map_err(
+                |error| match error {
+                    SharedFrameRingError::InvalidConfig { buffer_size, .. } => {
+                        BusError::InvalidRingCapacity {
+                            stream_name: stream_name.to_string(),
+                            ring_capacity: buffer_size,
+                        }
+                    }
+                    other => BusError::StorageInitFailed {
+                        stream_name: stream_name.to_string(),
+                        reason: other.to_string(),
+                    },
+                },
+            )?;
 
         self.streams.insert(
             stream_name.to_string(),
             StreamState {
-                ring,
+                shared_ring,
                 buffer_size,
                 frame_size,
                 writer_process_id: None,
                 writer_id: None,
-                shm_name: stream_dir.to_string_lossy().into_owned(),
+                reader_ids: BTreeSet::new(),
+                next_reader_id: 1,
+                shm_name: shm_path.to_string_lossy().into_owned(),
                 layout_version: BUS_LAYOUT_VERSION,
             },
         );
@@ -252,7 +259,14 @@ impl Bus {
         let writer_id = format!("{stream_name}_writer");
         let buffer_size = stream.buffer_size;
         let frame_size = stream.frame_size;
-        let next_write_seq = stream.ring.next_write_seq();
+        let next_write_seq =
+            stream
+                .shared_ring
+                .next_seq()
+                .map_err(|error| BusError::StorageInitFailed {
+                    stream_name: stream_name.to_string(),
+                    reason: error.to_string(),
+                })?;
         stream.writer_process_id = Some(process_id.to_string());
         stream.writer_id = Some(writer_id.clone());
 
@@ -279,10 +293,17 @@ impl Bus {
             });
         };
 
-        let ReaderAttachment {
-            reader_id,
-            next_read_seq,
-        } = stream.ring.attach_reader_at_latest();
+        let reader_id = format!("{}_reader_{}", stream_name, stream.next_reader_id);
+        let next_read_seq =
+            stream
+                .shared_ring
+                .seek_latest()
+                .map_err(|error| BusError::StorageInitFailed {
+                    stream_name: stream_name.to_string(),
+                    reason: error.to_string(),
+                })?;
+        stream.next_reader_id += 1;
+        stream.reader_ids.insert(reader_id.clone());
 
         Ok(ReaderDescriptor {
             stream_name: stream_name.to_string(),
@@ -308,8 +329,8 @@ impl Bus {
         };
 
         stream
-            .ring
-            .publish_frame(frame_bytes)
+            .shared_ring
+            .publish(frame_bytes)
             .map_err(|error| BusError::StorageInitFailed {
                 stream_name: stream_name.to_string(),
                 reason: error.to_string(),
@@ -342,13 +363,14 @@ impl Bus {
             });
         };
 
-        stream
-            .ring
-            .detach_reader(reader_id)
-            .map_err(|_| BusError::ReaderNotFound {
+        if stream.reader_ids.remove(reader_id) {
+            Ok(())
+        } else {
+            Err(BusError::ReaderNotFound {
                 stream_name: stream_name.to_string(),
                 reader_id: reader_id.to_string(),
             })
+        }
     }
 
     pub fn reader_count(&self, stream_name: &str) -> Result<usize, BusError> {
@@ -358,12 +380,14 @@ impl Bus {
             });
         };
 
-        Ok(stream.ring.reader_count())
+        Ok(stream.reader_ids.len())
     }
 
     pub fn remove_stream(&mut self, stream_name: &str) {
         if let Some(stream) = self.streams.remove(stream_name) {
-            let _ = std::fs::remove_dir_all(stream.shm_name);
+            let shm_name = stream.shm_name.clone();
+            let _ = std::fs::remove_file(&shm_name);
+            let _ = std::fs::remove_file(format!("{shm_name}.lock"));
         }
     }
 }
