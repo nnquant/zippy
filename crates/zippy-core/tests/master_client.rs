@@ -71,7 +71,7 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                 }) => {
                     assert_eq!(stream_name, "ticks");
                     assert_eq!(buffer_size, 1024);
-                    assert_eq!(frame_size, 1024);
+                    assert_eq!(frame_size, 256);
                     ControlResponse::StreamRegistered { stream_name }
                 }
                 ControlRequest::RegisterSource(RegisterSourceRequest {
@@ -221,7 +221,7 @@ fn master_client_registers_process_and_fetches_writer_descriptor() {
     assert_eq!(client.process_id(), Some("proc_1"));
 
     client
-        .register_stream("ticks", empty_schema(), 1024)
+        .register_stream("ticks", empty_schema(), 1024, 256)
         .unwrap();
     let writer = client.write_to("ticks").unwrap();
     let reader = client.read_from("ticks").unwrap();
@@ -243,7 +243,7 @@ fn master_client_lists_streams() {
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("local_dc").unwrap();
     client
-        .register_stream("ticks", empty_schema(), 1024)
+        .register_stream("ticks", empty_schema(), 1024, 256)
         .unwrap();
 
     let streams = client.list_streams().unwrap();
@@ -266,7 +266,7 @@ fn master_client_gets_single_stream() {
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("local_dc").unwrap();
     client
-        .register_stream("ticks", empty_schema(), 1024)
+        .register_stream("ticks", empty_schema(), 1024, 256)
         .unwrap();
 
     let stream = client.get_stream("ticks").unwrap();
@@ -504,7 +504,9 @@ fn writer_and_reader_hot_path_do_not_create_seq_ipc_files() {
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("local_dc").unwrap();
-    client.register_stream("ticks", empty_schema(), 4).unwrap();
+    client
+        .register_stream("ticks", empty_schema(), 4, 4096)
+        .unwrap();
 
     let mut writer = client.write_to("ticks").unwrap();
     let mut reader = client.read_from("ticks").unwrap();

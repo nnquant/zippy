@@ -1332,14 +1332,14 @@ fn normalize_register_stream_bus_error(
     error: crate::bus::BusError,
 ) -> ZippyError {
     match error {
-        BusError::InvalidRingCapacity { .. } => registry_error(
+        BusError::InvalidBufferOrFrameSize { .. } => registry_error(
             crate::registry::RegistryError::InvalidStreamConfig {
                 stream_name: stream_name.to_string(),
                 buffer_size,
                 frame_size,
             },
         ),
-        BusError::StreamRingCapacityMismatch { .. } => {
+        BusError::StreamConfigMismatch { .. } => {
             if let Some(existing) = registry.get_stream(stream_name) {
                 registry_error(crate::registry::RegistryError::StreamConfigMismatch {
                     stream_name: stream_name.to_string(),

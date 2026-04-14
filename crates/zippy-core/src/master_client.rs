@@ -82,13 +82,14 @@ impl MasterClient {
         &mut self,
         stream_name: &str,
         _schema: SchemaRef,
-        ring_capacity: usize,
+        buffer_size: usize,
+        frame_size: usize,
     ) -> Result<()> {
         let response =
             self.send_request(ControlRequest::RegisterStream(RegisterStreamRequest {
                 stream_name: stream_name.to_string(),
-                buffer_size: ring_capacity,
-                frame_size: ring_capacity,
+                buffer_size,
+                frame_size,
             }))?;
 
         match response {

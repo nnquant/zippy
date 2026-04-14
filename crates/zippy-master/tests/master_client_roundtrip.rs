@@ -161,7 +161,7 @@ fn writer_and_reader_roundtrip_batches_through_master_bus() {
     client_a.register_process("writer").unwrap();
     client_b.register_process("reader").unwrap();
     client_a
-        .register_stream("ticks", test_schema(), 4096)
+        .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
 
     let batch = test_batch();
@@ -187,7 +187,7 @@ fn closing_writer_allows_restarting_same_stream_writer() {
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("writer").unwrap();
     client
-        .register_stream("ticks", test_schema(), 4096)
+        .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
 
     let mut first_writer = client.write_to("ticks").unwrap();
@@ -208,7 +208,9 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
 
     let mut first = MasterClient::connect(&socket_path).unwrap();
     first.register_process("writer_a").unwrap();
-    first.register_stream("ticks", test_schema(), 4096).unwrap();
+    first
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
     let _writer = first.write_to("ticks").unwrap();
 
     let response = send_request(
@@ -220,7 +222,7 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
     let mut second = MasterClient::connect(&socket_path).unwrap();
     second.register_process("writer_b").unwrap();
     second
-        .register_stream("ticks", test_schema(), 4096)
+        .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let second_writer = loop {
@@ -256,7 +258,9 @@ fn lease_reaper_reclaims_expired_writer_for_new_writer() {
 
     let mut first = MasterClient::connect(&socket_path).unwrap();
     first.register_process("writer_a").unwrap();
-    first.register_stream("ticks", test_schema(), 4096).unwrap();
+    first
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
     let _writer = first.write_to("ticks").unwrap();
 
     thread::sleep(Duration::from_millis(120));
@@ -264,7 +268,7 @@ fn lease_reaper_reclaims_expired_writer_for_new_writer() {
     let mut second = MasterClient::connect(&socket_path).unwrap();
     second.register_process("writer_b").unwrap();
     second
-        .register_stream("ticks", test_schema(), 4096)
+        .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let second_writer = loop {
@@ -300,7 +304,7 @@ fn lease_reaper_reclaims_expired_reader_attachments() {
     let mut writer = MasterClient::connect(&socket_path).unwrap();
     writer.register_process("writer").unwrap();
     writer
-        .register_stream("ticks", test_schema(), 4096)
+        .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
     let _writer = writer.write_to("ticks").unwrap();
 
@@ -343,7 +347,7 @@ fn late_reader_skips_existing_frames_with_frame_ring_hot_path() {
     let mut writer_client = MasterClient::connect(&socket_path).unwrap();
     writer_client.register_process("writer").unwrap();
     writer_client
-        .register_stream("ticks", test_schema(), 4096)
+        .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
     let mut writer = writer_client.write_to("ticks").unwrap();
     writer.write(test_batch()).unwrap();

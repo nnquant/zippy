@@ -14,14 +14,17 @@ pub enum BusError {
     StreamNotFound {
         stream_name: String,
     },
-    InvalidRingCapacity {
+    InvalidBufferOrFrameSize {
         stream_name: String,
-        ring_capacity: usize,
+        buffer_size: usize,
+        frame_size: usize,
     },
-    StreamRingCapacityMismatch {
+    StreamConfigMismatch {
         stream_name: String,
-        existing_ring_capacity: usize,
-        requested_ring_capacity: usize,
+        existing_buffer_size: usize,
+        existing_frame_size: usize,
+        requested_buffer_size: usize,
+        requested_frame_size: usize,
     },
     WriterAlreadyAttached {
         stream_name: String,
@@ -50,22 +53,29 @@ impl fmt::Display for BusError {
             Self::StreamNotFound { stream_name } => {
                 write!(f, "stream not found stream_name=[{}]", stream_name)
             }
-            Self::InvalidRingCapacity {
+            Self::InvalidBufferOrFrameSize {
                 stream_name,
-                ring_capacity,
+                buffer_size,
+                frame_size,
             } => write!(
                 f,
-                "invalid ring capacity stream_name=[{}] ring_capacity=[{}]",
-                stream_name, ring_capacity
+                "invalid stream sizing stream_name=[{}] buffer_size=[{}] frame_size=[{}]",
+                stream_name, buffer_size, frame_size
             ),
-            Self::StreamRingCapacityMismatch {
+            Self::StreamConfigMismatch {
                 stream_name,
-                existing_ring_capacity,
-                requested_ring_capacity,
+                existing_buffer_size,
+                existing_frame_size,
+                requested_buffer_size,
+                requested_frame_size,
             } => write!(
                 f,
-                "stream ring capacity mismatch stream_name=[{}] existing_ring_capacity=[{}] requested_ring_capacity=[{}]",
-                stream_name, existing_ring_capacity, requested_ring_capacity
+                "stream configuration mismatch stream_name=[{}] existing_buffer_size=[{}] existing_frame_size=[{}] requested_buffer_size=[{}] requested_frame_size=[{}]",
+                stream_name,
+                existing_buffer_size,
+                existing_frame_size,
+                requested_buffer_size,
+                requested_frame_size
             ),
             Self::WriterAlreadyAttached {
                 stream_name,
@@ -147,9 +157,9 @@ impl Bus {
     pub fn ensure_stream(
         &mut self,
         stream_name: &str,
-        ring_capacity: usize,
+        buffer_size: usize,
     ) -> Result<bool, BusError> {
-        self.ensure_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
+        self.ensure_stream_with_sizes(stream_name, buffer_size, buffer_size)
     }
 
     pub fn ensure_stream_with_sizes(
@@ -159,15 +169,13 @@ impl Bus {
         frame_size: usize,
     ) -> Result<bool, BusError> {
         if let Some(existing) = self.streams.get(stream_name) {
-            let existing_ring_capacity = existing.buffer_size;
-            if existing_ring_capacity != buffer_size
-                || existing.buffer_size != buffer_size
-                || existing.frame_size != frame_size
-            {
-                return Err(BusError::StreamRingCapacityMismatch {
+            if existing.buffer_size != buffer_size || existing.frame_size != frame_size {
+                return Err(BusError::StreamConfigMismatch {
                     stream_name: stream_name.to_string(),
-                    existing_ring_capacity,
-                    requested_ring_capacity: buffer_size,
+                    existing_buffer_size: existing.buffer_size,
+                    existing_frame_size: existing.frame_size,
+                    requested_buffer_size: buffer_size,
+                    requested_frame_size: frame_size,
                 });
             }
             return Ok(false);
@@ -180,9 +188,9 @@ impl Bus {
     pub fn create_stream(
         &mut self,
         stream_name: &str,
-        ring_capacity: usize,
+        buffer_size: usize,
     ) -> Result<(), BusError> {
-        self.create_stream_with_sizes(stream_name, ring_capacity, ring_capacity)
+        self.create_stream_with_sizes(stream_name, buffer_size, buffer_size)
     }
 
     pub fn create_stream_with_sizes(
@@ -208,12 +216,14 @@ impl Bus {
         let shared_ring =
             SharedFrameRing::create_or_open(&shm_path, buffer_size, frame_size).map_err(
                 |error| match error {
-                    SharedFrameRingError::InvalidConfig { buffer_size, .. } => {
-                        BusError::InvalidRingCapacity {
+                    SharedFrameRingError::InvalidConfig {
+                        buffer_size,
+                        frame_size,
+                    } => BusError::InvalidBufferOrFrameSize {
                             stream_name: stream_name.to_string(),
-                            ring_capacity: buffer_size,
-                        }
-                    }
+                            buffer_size,
+                            frame_size,
+                        },
                     other => BusError::StorageInitFailed {
                         stream_name: stream_name.to_string(),
                         reason: other.to_string(),
