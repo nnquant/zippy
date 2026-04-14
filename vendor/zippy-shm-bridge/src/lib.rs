@@ -1,8 +1,10 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
+use std::mem::align_of;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use shared_memory::{Shmem, ShmemConf, ShmemError};
 
@@ -125,6 +127,34 @@ struct RingHeader {
     latest_seq: u64,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameState {
+    Empty = 0,
+    Writing = 1,
+    Ready = 2,
+}
+
+impl FrameState {
+    fn from_u8(value: u8) -> Result<Self, SharedFrameRingError> {
+        match value {
+            0 => Ok(Self::Empty),
+            1 => Ok(Self::Writing),
+            2 => Ok(Self::Ready),
+            other => Err(SharedFrameRingError::Corrupted {
+                reason: format!("invalid frame state value=[{}]", other),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublishInProgress {
+    seq: u64,
+    slot: usize,
+    payload_len: u32,
+}
+
 #[derive(Debug)]
 struct FileLockGuard {
     file: File,
@@ -140,6 +170,7 @@ impl FileLockGuard {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path_for(flink_path))?;
 
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -176,11 +207,12 @@ impl fmt::Debug for SharedFrameRing {
 }
 
 // Safety: access to the underlying mapping is only exposed through methods that
-// synchronize with a process-shared file lock before reading or writing bytes.
+// use atomic publish/observe ordering for the hot path and a file lock only
+// during create/open layout initialization.
 unsafe impl Send for SharedFrameRing {}
 
-// Safety: immutable references do not expose interior pointers, and every public
-// operation still serializes access through the same file lock.
+// Safety: immutable references do not expose interior pointers, and the public
+// data path is synchronized with atomics rather than aliasing mutable references.
 unsafe impl Sync for SharedFrameRing {}
 
 impl SharedFrameRing {
@@ -238,9 +270,7 @@ impl SharedFrameRing {
     }
 
     pub fn next_seq(&self) -> Result<u64, SharedFrameRingError> {
-        let _lock = FileLockGuard::acquire(&self.flink_path)?;
-        let header = self.read_header()?;
-        Ok(header.latest_seq + 1)
+        Ok(self.latest_seq().load(Ordering::Acquire) + 1)
     }
 
     pub fn publish(&mut self, payload: &[u8]) -> Result<u64, SharedFrameRingError> {
@@ -251,24 +281,13 @@ impl SharedFrameRing {
             });
         }
 
-        let _lock = FileLockGuard::acquire(&self.flink_path)?;
-        let header = self.read_header()?;
-        let seq = header.latest_seq + 1;
-        let slot = slot_index(seq, self.buffer_size);
-        let frame_header_offset = frame_header_offset(slot);
-        let payload_offset = payload_offset(self.buffer_size, self.frame_size, slot)?;
-        let bytes = self.mapping_bytes_mut();
-
-        bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-        write_u64(bytes, frame_header_offset, seq);
-        write_u64(bytes, frame_header_offset + 8, payload.len() as u64);
-        write_u64(bytes, LATEST_SEQ_OFFSET, seq);
-
+        let seq = self.next_seq()?;
+        let progress = self.begin_publish(seq, payload)?;
+        self.finish_publish(progress)?;
         Ok(seq)
     }
 
     pub fn read(&self, requested_seq: u64) -> Result<ReadResult, SharedFrameRingError> {
-        let _lock = FileLockGuard::acquire(&self.flink_path)?;
         let header = self.read_header()?;
 
         if header.latest_seq == 0 || requested_seq > header.latest_seq {
@@ -285,41 +304,44 @@ impl SharedFrameRing {
 
         let slot = slot_index(requested_seq, self.buffer_size);
         let frame_header_offset = frame_header_offset(slot);
-        let bytes = self.mapping_bytes();
-        let stored_seq = read_u64(bytes, frame_header_offset);
-        let stored_len = read_u64(bytes, frame_header_offset + 8) as usize;
+        let state = self.frame_state_load(frame_header_offset)?;
+        let stored_seq = self.frame_seq_load(frame_header_offset)?;
 
-        if stored_seq != requested_seq {
-            return Err(SharedFrameRingError::Corrupted {
-                reason: format!(
-                    "frame sequence mismatch requested_seq=[{}] stored_seq=[{}] slot=[{}]",
-                    requested_seq, stored_seq, slot
-                ),
-            });
+        match state {
+            FrameState::Ready if stored_seq == requested_seq => {
+                let stored_len = self.frame_len_load(frame_header_offset)? as usize;
+                if stored_len > self.frame_size {
+                    return Err(SharedFrameRingError::Corrupted {
+                        reason: format!(
+                            "frame length exceeds configured size stored_len=[{}] frame_size=[{}]",
+                            stored_len, self.frame_size
+                        ),
+                    });
+                }
+
+                let payload_offset = payload_offset(self.buffer_size, self.frame_size, slot)?;
+                let bytes = self.mapping_bytes();
+                let payload = bytes[payload_offset..payload_offset + stored_len].to_vec();
+                let confirmed_state = self.frame_state_load(frame_header_offset)?;
+                let confirmed_seq = self.frame_seq_load(frame_header_offset)?;
+
+                if confirmed_state != FrameState::Ready || confirmed_seq != requested_seq {
+                    return Ok(self.classify_frame_availability(requested_seq, confirmed_seq));
+                }
+
+                Ok(ReadResult::Ready(Frame {
+                    seq: requested_seq,
+                    payload,
+                }))
+            }
+            FrameState::Ready | FrameState::Writing | FrameState::Empty => {
+                Ok(self.classify_frame_availability(requested_seq, stored_seq))
+            }
         }
-
-        if stored_len > self.frame_size {
-            return Err(SharedFrameRingError::Corrupted {
-                reason: format!(
-                    "frame length exceeds configured size stored_len=[{}] frame_size=[{}]",
-                    stored_len, self.frame_size
-                ),
-            });
-        }
-
-        let payload_offset = payload_offset(self.buffer_size, self.frame_size, slot)?;
-        let payload = bytes[payload_offset..payload_offset + stored_len].to_vec();
-
-        Ok(ReadResult::Ready(Frame {
-            seq: requested_seq,
-            payload,
-        }))
     }
 
     pub fn seek_latest(&self) -> Result<u64, SharedFrameRingError> {
-        let _lock = FileLockGuard::acquire(&self.flink_path)?;
-        let header = self.read_header()?;
-        Ok(header.latest_seq + 1)
+        Ok(self.latest_seq().load(Ordering::Acquire) + 1)
     }
 
     fn initialize_layout(&mut self) -> Result<(), SharedFrameRingError> {
@@ -354,7 +376,7 @@ impl SharedFrameRing {
         let layout_version = read_u32(bytes, VERSION_OFFSET);
         let buffer_size = read_u64(bytes, BUFFER_SIZE_OFFSET) as usize;
         let frame_size = read_u64(bytes, FRAME_SIZE_OFFSET) as usize;
-        let latest_seq = read_u64(bytes, LATEST_SEQ_OFFSET);
+        let latest_seq = self.latest_seq().load(Ordering::Acquire);
 
         if magic != RING_MAGIC {
             return Err(SharedFrameRingError::Corrupted {
@@ -395,6 +417,120 @@ impl SharedFrameRing {
     fn mapping_bytes_mut(&mut self) -> &mut [u8] {
         assert_eq!(self.shmem.len(), self.total_size);
         unsafe { self.shmem.as_slice_mut() }
+    }
+
+    fn latest_seq(&self) -> &AtomicU64 {
+        self.atomic_u64(LATEST_SEQ_OFFSET)
+    }
+
+    fn frame_seq(&self, slot: usize) -> &AtomicU64 {
+        self.atomic_u64(frame_header_offset(slot))
+    }
+
+    fn frame_len(&self, slot: usize) -> &AtomicU32 {
+        self.atomic_u32(frame_header_offset(slot) + 8)
+    }
+
+    fn frame_state(&self, slot: usize) -> &AtomicU8 {
+        self.atomic_u8(frame_header_offset(slot) + 12)
+    }
+
+    fn begin_publish(
+        &mut self,
+        seq: u64,
+        payload: &[u8],
+    ) -> Result<PublishInProgress, SharedFrameRingError> {
+        let slot = slot_index(seq, self.buffer_size);
+        let payload_len = payload.len() as u32;
+        self.frame_state(slot)
+            .store(FrameState::Writing as u8, Ordering::Release);
+
+        let payload_offset = payload_offset(self.buffer_size, self.frame_size, slot)?;
+        let bytes = self.mapping_bytes_mut();
+        bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
+        self.frame_len(slot).store(payload_len, Ordering::Release);
+        self.frame_seq(slot).store(seq, Ordering::Release);
+
+        Ok(PublishInProgress {
+            seq,
+            slot,
+            payload_len,
+        })
+    }
+
+    fn finish_publish(&self, progress: PublishInProgress) -> Result<(), SharedFrameRingError> {
+        if progress.payload_len as usize > self.frame_size {
+            return Err(SharedFrameRingError::FrameTooLarge {
+                frame_len: progress.payload_len as usize,
+                frame_size: self.frame_size,
+            });
+        }
+
+        self.frame_state(progress.slot)
+            .store(FrameState::Ready as u8, Ordering::Release);
+        self.latest_seq().store(progress.seq, Ordering::Release);
+        Ok(())
+    }
+
+    fn classify_frame_availability(&self, requested_seq: u64, observed_seq: u64) -> ReadResult {
+        let latest_seq = self.latest_seq().load(Ordering::Acquire);
+        if latest_seq == 0 || requested_seq > latest_seq {
+            return ReadResult::Pending;
+        }
+
+        let oldest_seq = oldest_seq(latest_seq, self.buffer_size);
+        if requested_seq < oldest_seq || observed_seq > requested_seq {
+            return ReadResult::Lagged {
+                oldest_seq,
+                latest_seq,
+            };
+        }
+
+        ReadResult::Pending
+    }
+
+    fn frame_seq_load(&self, frame_header_offset: usize) -> Result<u64, SharedFrameRingError> {
+        Ok(unsafe { (*self.atomic_u64_ptr(frame_header_offset)).load(Ordering::Acquire) })
+    }
+
+    fn frame_len_load(&self, frame_header_offset: usize) -> Result<u32, SharedFrameRingError> {
+        Ok(unsafe { (*self.atomic_u32_ptr(frame_header_offset + 8)).load(Ordering::Acquire) })
+    }
+
+    fn frame_state_load(&self, frame_header_offset: usize) -> Result<FrameState, SharedFrameRingError> {
+        let value = unsafe { (*self.atomic_u8_ptr(frame_header_offset + 12)).load(Ordering::Acquire) };
+        FrameState::from_u8(value)
+    }
+
+    fn atomic_u64(&self, offset: usize) -> &AtomicU64 {
+        unsafe { &*self.atomic_u64_ptr(offset) }
+    }
+
+    fn atomic_u32(&self, offset: usize) -> &AtomicU32 {
+        unsafe { &*self.atomic_u32_ptr(offset) }
+    }
+
+    fn atomic_u8(&self, offset: usize) -> &AtomicU8 {
+        unsafe { &*self.atomic_u8_ptr(offset) }
+    }
+
+    fn atomic_u64_ptr(&self, offset: usize) -> *const AtomicU64 {
+        assert_eq!(offset % align_of::<AtomicU64>(), 0);
+        let base = self.mapping_bytes().as_ptr();
+        assert_eq!((base as usize) % align_of::<AtomicU64>(), 0);
+        unsafe { base.add(offset) as *const AtomicU64 }
+    }
+
+    fn atomic_u32_ptr(&self, offset: usize) -> *const AtomicU32 {
+        assert_eq!(offset % align_of::<AtomicU32>(), 0);
+        let base = self.mapping_bytes().as_ptr();
+        assert_eq!((base as usize) % align_of::<AtomicU32>(), 0);
+        unsafe { base.add(offset) as *const AtomicU32 }
+    }
+
+    fn atomic_u8_ptr(&self, offset: usize) -> *const AtomicU8 {
+        let base = self.mapping_bytes().as_ptr();
+        unsafe { base.add(offset) as *const AtomicU8 }
     }
 }
 
@@ -517,6 +653,14 @@ mod tests {
     }
 
     #[test]
+    fn reader_is_pending_before_first_publish() {
+        let flink_path = unique_flink_path();
+        let reader = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+
+        assert_eq!(reader.read(1).unwrap(), ReadResult::Pending);
+    }
+
+    #[test]
     fn seek_latest_returns_latest_plus_one() {
         let flink_path = unique_flink_path();
         let mut ring = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
@@ -543,6 +687,42 @@ mod tests {
                 oldest_seq: 2,
                 latest_seq: 3,
             }
+        );
+    }
+
+    #[test]
+    fn reader_does_not_observe_in_progress_frame() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let flink_path = unique_flink_path();
+        let mut writer = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+        let reader = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+        let ready = Arc::new(Barrier::new(2));
+        let proceed = Arc::new(Barrier::new(2));
+        let ready_writer = Arc::clone(&ready);
+        let proceed_writer = Arc::clone(&proceed);
+
+        let handle = thread::spawn(move || {
+            let seq = writer.next_seq().unwrap();
+            let progress = writer.begin_publish(seq, b"abc").unwrap();
+            ready_writer.wait();
+            proceed_writer.wait();
+            writer.finish_publish(progress).unwrap();
+        });
+
+        ready.wait();
+        assert_eq!(reader.read(1).unwrap(), ReadResult::Pending);
+        proceed.wait();
+        handle.join().unwrap();
+
+        let result = reader.read(1).unwrap();
+        assert_eq!(
+            result,
+            ReadResult::Ready(Frame {
+                seq: 1,
+                payload: b"abc".to_vec(),
+            })
         );
     }
 
