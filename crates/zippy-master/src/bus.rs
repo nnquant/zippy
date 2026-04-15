@@ -315,6 +315,10 @@ impl Bus {
                 })?;
         stream.next_reader_id += 1;
         stream.reader_ids.insert(reader_id.clone());
+        let instrument_filter = match instrument_filter {
+            Some(filters) if filters.is_empty() => None,
+            other => other,
+        };
 
         Ok(ReaderDescriptor {
             stream_name: stream_name.to_string(),

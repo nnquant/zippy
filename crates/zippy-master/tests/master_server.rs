@@ -1,6 +1,7 @@
 use zippy_core::bus_protocol::{
-    ControlRequest, ControlResponse, RegisterEngineRequest, RegisterProcessRequest,
-    RegisterSinkRequest, RegisterSourceRequest, UpdateRecordStatusRequest, BUS_LAYOUT_VERSION,
+    AttachStreamRequest, ControlRequest, ControlResponse, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    UpdateRecordStatusRequest, BUS_LAYOUT_VERSION,
 };
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
@@ -538,6 +539,60 @@ fn bus_enforces_single_writer_and_multiple_readers() {
     assert_eq!(reader_b.stream_name, "openctp_ticks");
     assert_ne!(reader_a.reader_id, reader_b.reader_id);
     assert!(bus.write_to("openctp_ticks", "proc_9").is_err());
+}
+
+#[test]
+fn master_server_roundtrips_reader_instrument_filter_over_control_plane() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "local_dc".to_string(),
+        }),
+    );
+    let process_id = match process_response {
+        ControlResponse::ProcessRegistered { process_id } => process_id,
+        other => panic!("unexpected process response: {:?}", other),
+    };
+
+    let stream_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterStream(RegisterStreamRequest {
+            stream_name: "ticks".to_string(),
+            buffer_size: 1024,
+            frame_size: 256,
+        }),
+    );
+    assert!(matches!(
+        stream_response,
+        ControlResponse::StreamRegistered { .. }
+    ));
+
+    let read_response = send_control_request(
+        &socket_path,
+        ControlRequest::ReadFrom(AttachStreamRequest {
+            stream_name: "ticks".to_string(),
+            process_id,
+            instrument_ids: Some(vec!["IF2606".to_string(), "IH2606".to_string()]),
+        }),
+    );
+
+    match read_response {
+        ControlResponse::ReaderAttached { descriptor } => {
+            assert_eq!(descriptor.stream_name, "ticks");
+            assert_eq!(
+                descriptor.instrument_filter,
+                Some(vec!["IF2606".to_string(), "IH2606".to_string()])
+            );
+        }
+        other => panic!("unexpected read response: {:?}", other),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
 }
 
 fn unique_socket_path() -> PathBuf {

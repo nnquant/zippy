@@ -61,6 +61,7 @@ pub struct UpdateRecordStatusRequest {
 pub struct AttachStreamRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instrument_ids: Option<Vec<String>>,
 }
 
@@ -129,6 +130,7 @@ pub struct ReaderDescriptor {
     pub reader_id: String,
     pub process_id: String,
     pub next_read_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instrument_filter: Option<Vec<String>>,
 }
 

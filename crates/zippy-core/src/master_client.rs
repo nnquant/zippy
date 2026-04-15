@@ -230,7 +230,7 @@ impl MasterClient {
         stream_name: &str,
         instrument_ids: Vec<String>,
     ) -> Result<Reader> {
-        self.attach_reader(stream_name, Some(instrument_ids))
+        self.attach_reader(stream_name, normalize_instrument_filter(Some(instrument_ids)))
     }
 
     fn attach_reader(
@@ -499,6 +499,13 @@ fn open_shared_ring(
     frame_size: usize,
 ) -> Result<SharedFrameRing> {
     SharedFrameRing::create_or_open(shm_name, buffer_size, frame_size).map_err(shared_ring_error)
+}
+
+fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Option<Vec<String>> {
+    match instrument_ids {
+        Some(ids) if ids.is_empty() => None,
+        other => other,
+    }
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {

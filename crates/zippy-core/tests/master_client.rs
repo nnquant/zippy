@@ -319,6 +319,76 @@ fn master_client_sends_instrument_filter_when_attaching_reader() {
 }
 
 #[test]
+fn master_client_normalizes_empty_instrument_filter_when_attaching_reader() {
+    let socket_path = unique_socket_path();
+    let server = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            if socket_path.exists() {
+                let _ = fs::remove_file(&socket_path);
+            }
+
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+
+                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
+                let response = match request {
+                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
+                        assert_eq!(app, "local_dc");
+                        ControlResponse::ProcessRegistered {
+                            process_id: "proc_1".to_string(),
+                        }
+                    }
+                    ControlRequest::ReadFrom(AttachStreamRequest {
+                        stream_name,
+                        process_id,
+                        instrument_ids,
+                    }) => {
+                        assert_eq!(stream_name, "ticks");
+                        assert_eq!(process_id, "proc_1");
+                        assert_eq!(instrument_ids, None);
+                        ControlResponse::ReaderAttached {
+                            descriptor: ReaderDescriptor {
+                                stream_name,
+                                buffer_size: 1024,
+                                frame_size: 256,
+                                layout_version: BUS_LAYOUT_VERSION,
+                                shm_name: "shm_ticks".to_string(),
+                                reader_id: "reader_1".to_string(),
+                                process_id,
+                                next_read_seq: 1,
+                                instrument_filter: None,
+                            },
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+
+                let payload = serde_json::to_string(&response).unwrap();
+                stream.write_all(payload.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                stream.flush().unwrap();
+            }
+
+            let _ = fs::remove_file(&socket_path);
+        }
+    });
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    let reader = client.read_from_filtered("ticks", Vec::new()).unwrap();
+
+    assert_eq!(reader.descriptor().instrument_filter, None);
+
+    server.join().unwrap();
+}
+
+#[test]
 fn master_client_lists_streams() {
     let socket_path = unique_socket_path();
     let server = spawn_fake_server(&socket_path, 3);
@@ -443,6 +513,36 @@ fn control_request_serialization_uses_buffer_and_frame_sizes() {
     assert!(json.contains("\"buffer_size\":1024"));
     assert!(json.contains("\"frame_size\":256"));
     assert!(!json.contains("ring_capacity"));
+}
+
+#[test]
+fn attach_stream_request_omits_filter_fields_when_not_set() {
+    let request = ControlRequest::ReadFrom(AttachStreamRequest {
+        stream_name: "ticks".to_string(),
+        process_id: "proc_1".to_string(),
+        instrument_ids: None,
+    });
+    let response = ControlResponse::ReaderAttached {
+        descriptor: ReaderDescriptor {
+            stream_name: "ticks".to_string(),
+            buffer_size: 1024,
+            frame_size: 256,
+            layout_version: BUS_LAYOUT_VERSION,
+            shm_name: "shm_ticks".to_string(),
+            reader_id: "reader_1".to_string(),
+            process_id: "proc_1".to_string(),
+            next_read_seq: 1,
+            instrument_filter: None,
+        },
+    };
+
+    let request_json = serde_json::to_string(&request).unwrap();
+    let response_json = serde_json::to_string(&response).unwrap();
+
+    assert!(!request_json.contains("instrument_ids"));
+    assert!(!response_json.contains("instrument_filter"));
+    assert!(!request_json.contains(":null"));
+    assert!(!response_json.contains(":null"));
 }
 
 #[test]
