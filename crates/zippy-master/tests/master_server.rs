@@ -520,8 +520,8 @@ fn bus_enforces_single_writer_and_multiple_readers() {
     bus.create_stream("openctp_ticks", 1024).unwrap();
 
     let writer = bus.write_to("openctp_ticks", "proc_1").unwrap();
-    let reader_a = bus.read_from("openctp_ticks", "proc_2").unwrap();
-    let reader_b = bus.read_from("openctp_ticks", "proc_3").unwrap();
+    let reader_a = bus.read_from("openctp_ticks", "proc_2", None).unwrap();
+    let reader_b = bus.read_from("openctp_ticks", "proc_3", None).unwrap();
 
     assert_eq!(writer.stream_name, "openctp_ticks");
     assert_eq!(writer.buffer_size, 1024);

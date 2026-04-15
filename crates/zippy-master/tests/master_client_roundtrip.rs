@@ -335,7 +335,7 @@ fn bus_read_from_returns_latest_next_read_seq() {
 
     bus.publish_test_frame("ticks", b"abc").unwrap();
 
-    let reader = bus.read_from("ticks", "proc_2").unwrap();
+    let reader = bus.read_from("ticks", "proc_2", None).unwrap();
     assert_eq!(reader.next_read_seq, 2);
 }
 
