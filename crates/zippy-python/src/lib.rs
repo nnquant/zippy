@@ -13,13 +13,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::compute::concat_batches;
+use arrow::array::{Array, BooleanArray, StringArray};
+use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::Schema;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule};
+use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
 use tracing::{error, info};
 use zippy_core::{
     current_log_snapshot, python_dev_version, setup_log as setup_core_log,
@@ -1537,7 +1538,13 @@ impl MasterClient {
         })
     }
 
-    fn read_from(&self, stream_name: String) -> PyResult<BusReader> {
+    #[pyo3(signature = (stream_name, instrument_ids=None))]
+    fn read_from(
+        &self,
+        stream_name: String,
+        instrument_ids: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<BusReader> {
+        let instrument_ids = parse_instrument_ids(instrument_ids)?;
         let reader = self
             .client
             .lock()
@@ -1546,6 +1553,7 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         Ok(BusReader {
             reader: Arc::new(Mutex::new(Some(reader))),
+            instrument_ids,
         })
     }
 
@@ -1789,22 +1797,47 @@ impl BusWriter {
 #[pyclass]
 struct BusReader {
     reader: Arc<Mutex<Option<CoreBusReader>>>,
+    instrument_ids: Option<Vec<String>>,
 }
 
 #[pymethods]
 impl BusReader {
     #[pyo3(signature = (timeout_ms=1000))]
     fn read(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<PyObject> {
-        let mut guard = self.reader.lock().unwrap();
-        let reader = guard
-            .as_mut()
-            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
-        let batch = reader
-            .read(Some(timeout_ms))
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        batch
-            .to_pyarrow(py)
-            .map_err(|error| py_value_error(error.to_string()))
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(timeout_ms))
+            .ok_or_else(|| py_runtime_error("reader timeout is too large"))?;
+
+        loop {
+            let batch = {
+                let mut guard = self.reader.lock().unwrap();
+                let reader = guard
+                    .as_mut()
+                    .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(py_runtime_error("reader timed out"));
+                }
+                let remaining_ms = remaining.as_millis().max(1) as u64;
+                reader
+                    .read(Some(remaining_ms))
+                    .map_err(|error| py_runtime_error(error.to_string()))?
+            };
+
+            if let Some(instrument_ids) = &self.instrument_ids {
+                let filtered = filter_record_batch_by_instrument_ids(&batch, instrument_ids)?;
+                if filtered.num_rows() == 0 {
+                    continue;
+                }
+                return filtered
+                    .to_pyarrow(py)
+                    .map_err(|error| py_value_error(error.to_string()));
+            }
+
+            return batch
+                .to_pyarrow(py)
+                .map_err(|error| py_value_error(error.to_string()));
+        }
     }
 
     fn seek_latest(&self) -> PyResult<()> {
@@ -2787,6 +2820,65 @@ fn parse_id_filter(id_filter: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<
     }
 
     Ok(Some(values))
+}
+
+fn parse_instrument_ids(
+    instrument_ids: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<Vec<String>>> {
+    let Some(instrument_ids) = instrument_ids else {
+        return Ok(None);
+    };
+
+    if instrument_ids.is_instance_of::<PyList>() || instrument_ids.is_instance_of::<PyTuple>() {
+        let values = instrument_ids.extract::<Vec<String>>().map_err(|_| {
+            py_value_error("instrument_ids must be a string or a sequence of strings")
+        })?;
+        if values.is_empty() {
+            return Err(py_value_error("instrument_ids must not be empty"));
+        }
+
+        return Ok(Some(values));
+    }
+
+    instrument_ids
+        .extract::<String>()
+        .map_err(|_| py_value_error("instrument_ids must be a string or a sequence of strings"))
+        .and_then(|value| normalize_instrument_id(Some(value)))
+}
+
+fn normalize_instrument_id(instrument_id: Option<String>) -> PyResult<Option<Vec<String>>> {
+    match instrument_id {
+        Some(instrument_id) if instrument_id.is_empty() => Err(py_value_error(
+            "instrument_ids must not contain empty strings",
+        )),
+        Some(instrument_id) => Ok(Some(vec![instrument_id])),
+        None => Ok(None),
+    }
+}
+
+fn filter_record_batch_by_instrument_ids(
+    batch: &RecordBatch,
+    instrument_ids: &[String],
+) -> PyResult<RecordBatch> {
+    let instrument_id_index = batch.schema().index_of("instrument_id").map_err(|_| {
+        py_value_error("filtered bus reader requires an instrument_id column")
+    })?;
+    let instrument_id_column = batch.column(instrument_id_index);
+    let instrument_id_values = instrument_id_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| py_value_error("instrument_id column must be utf8"))?;
+
+    let predicate = BooleanArray::from_iter((0..instrument_id_values.len()).map(|row| {
+        Some(
+            instrument_id_values.is_valid(row)
+                && instrument_ids
+                    .iter()
+                    .any(|instrument_id| instrument_id == instrument_id_values.value(row)),
+        )
+    }));
+
+    filter_record_batch(batch, &predicate).map_err(|error| py_value_error(error.to_string()))
 }
 
 fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
@@ -4102,6 +4194,13 @@ mod tests {
     fn float_values(array: &ArrayRef) -> Vec<f64> {
         let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
         (0..values.len()).map(|index| values.value(index)).collect()
+    }
+
+    #[test]
+    fn normalize_instrument_ids_single_string_to_list() {
+        let parsed = normalize_instrument_id(Some("IF2606".to_string())).unwrap();
+
+        assert_eq!(parsed, Some(vec!["IF2606".to_string()]));
     }
 
     #[test]
