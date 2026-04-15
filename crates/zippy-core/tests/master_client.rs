@@ -433,6 +433,29 @@ fn master_client_normalizes_empty_instrument_filter_when_attaching_reader() {
 }
 
 #[test]
+fn master_client_rejects_empty_string_instrument_filter_when_attaching_reader() {
+    let socket_path = unique_socket_path();
+    let server = spawn_fake_server(&socket_path, 1);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    let error = match client.read_from_filtered("ticks", vec!["".to_string()]) {
+        Ok(_) => panic!("expected empty string filter to be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("instrument filter contains empty value"),
+        "unexpected error: {error}"
+    );
+
+    server.join().unwrap();
+}
+
+#[test]
 fn master_client_lists_streams() {
     let socket_path = unique_socket_path();
     let server = spawn_fake_server(&socket_path, 3);

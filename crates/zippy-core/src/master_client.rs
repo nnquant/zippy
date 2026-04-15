@@ -236,7 +236,7 @@ impl MasterClient {
     ) -> Result<Reader> {
         self.attach_reader(
             stream_name,
-            normalize_instrument_filter(Some(instrument_ids)),
+            normalize_instrument_filter(Some(instrument_ids))?,
         )
     }
 
@@ -539,10 +539,18 @@ fn open_shared_ring(
     SharedFrameRing::create_or_open(shm_name, buffer_size, frame_size).map_err(shared_ring_error)
 }
 
-fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Option<Vec<String>> {
+fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Result<Option<Vec<String>>> {
     match instrument_ids {
-        Some(ids) if ids.is_empty() => None,
-        other => other,
+        Some(ids) if ids.is_empty() => Ok(None),
+        Some(ids) => {
+            if ids.iter().any(|id| id.is_empty()) {
+                return Err(ZippyError::Io {
+                    reason: "instrument filter contains empty value".to_string(),
+                });
+            }
+            Ok(Some(ids))
+        }
+        None => Ok(None),
     }
 }
 
