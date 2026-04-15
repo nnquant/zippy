@@ -330,8 +330,11 @@ impl Writer {
 
     pub fn write(&mut self, batch: RecordBatch) -> Result<()> {
         let arrow_payload = encode_batch(&batch)?;
-        let instrument_ids = extract_instrument_ids(&batch);
-        let frame = encode_bus_frame(&instrument_ids, &arrow_payload)?;
+        let instrument_ids = extract_instrument_ids(&batch)?;
+        let frame = match instrument_ids {
+            Some(ids) => encode_bus_frame(&ids, &arrow_payload)?,
+            None => encode_bus_frame::<String>(&[], &arrow_payload)?,
+        };
         let published_seq = self.ring.publish(&frame).map_err(shared_ring_error)?;
         self.next_write_seq = published_seq + 1;
         Ok(())
@@ -564,27 +567,43 @@ fn instrument_filter_matches(filter: &BTreeSet<String>, instrument_ids: &[&str])
         .any(|instrument_id| filter.contains(*instrument_id))
 }
 
-fn extract_instrument_ids(batch: &RecordBatch) -> Vec<String> {
+fn extract_instrument_ids(batch: &RecordBatch) -> Result<Option<Vec<String>>> {
     let Ok(instrument_column_index) = batch.schema().index_of("instrument_id") else {
-        return Vec::new();
+        return Ok(None);
     };
     let instrument_column = batch.column(instrument_column_index);
     let Some(instrument_ids) = instrument_column.as_any().downcast_ref::<StringArray>() else {
-        return Vec::new();
+        return Err(ZippyError::Io {
+            reason: format!(
+                "instrument_id column must be utf8 actual_type=[{:?}]",
+                instrument_column.data_type()
+            ),
+        });
     };
 
     let mut unique_instrument_ids = BTreeSet::new();
     for row_index in 0..instrument_ids.len() {
         if instrument_ids.is_null(row_index) {
-            return Vec::new();
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "instrument_id column contains null row_index=[{}]",
+                    row_index
+                ),
+            });
         }
         let instrument_id = instrument_ids.value(row_index);
-        if !instrument_id.is_empty() {
-            unique_instrument_ids.insert(instrument_id.to_string());
+        if instrument_id.is_empty() {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "instrument_id column contains empty value row_index=[{}]",
+                    row_index
+                ),
+            });
         }
+        unique_instrument_ids.insert(instrument_id.to_string());
     }
 
-    unique_instrument_ids.into_iter().collect()
+    Ok(Some(unique_instrument_ids.into_iter().collect()))
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {
