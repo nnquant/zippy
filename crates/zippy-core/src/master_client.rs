@@ -1,14 +1,17 @@
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arrow::array::{Array, StringArray};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_shm_bridge::{ReadResult as SharedReadResult, SharedFrameRing};
 
+use crate::bus_frame::{encode_bus_frame, parse_bus_frame, BusFrameKind};
 use crate::bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
     GetStreamRequest, HeartbeatRequest, ListStreamsRequest, ReaderDescriptor,
@@ -35,6 +38,7 @@ pub struct Writer {
 pub struct Reader {
     socket_path: PathBuf,
     descriptor: ReaderDescriptor,
+    instrument_filter: Option<BTreeSet<String>>,
     next_read_seq: u64,
     ring: SharedFrameRing,
     closed: bool,
@@ -230,7 +234,10 @@ impl MasterClient {
         stream_name: &str,
         instrument_ids: Vec<String>,
     ) -> Result<Reader> {
-        self.attach_reader(stream_name, normalize_instrument_filter(Some(instrument_ids)))
+        self.attach_reader(
+            stream_name,
+            normalize_instrument_filter(Some(instrument_ids)),
+        )
     }
 
     fn attach_reader(
@@ -257,6 +264,7 @@ impl MasterClient {
                     .max(ring.seek_latest().map_err(shared_ring_error)?);
                 Ok(Reader {
                     socket_path: self.socket_path.clone(),
+                    instrument_filter: instrument_filter_set(&descriptor.instrument_filter),
                     next_read_seq,
                     ring,
                     descriptor,
@@ -321,8 +329,10 @@ impl Writer {
     }
 
     pub fn write(&mut self, batch: RecordBatch) -> Result<()> {
-        let payload = encode_batch(&batch)?;
-        let published_seq = self.ring.publish(&payload).map_err(shared_ring_error)?;
+        let arrow_payload = encode_batch(&batch)?;
+        let instrument_ids = extract_instrument_ids(&batch)?;
+        let frame = encode_bus_frame(&instrument_ids, &arrow_payload)?;
+        let published_seq = self.ring.publish(&frame).map_err(shared_ring_error)?;
         self.next_write_seq = published_seq + 1;
         Ok(())
     }
@@ -376,8 +386,33 @@ impl Reader {
                 .map_err(shared_ring_error)?
             {
                 SharedReadResult::Ready(frame) => {
-                    let payload = frame.payload;
-                    let batch = decode_batch(&payload)?;
+                    let parsed = parse_bus_frame(&frame.payload)?;
+                    if let Some(filter) = &self.instrument_filter {
+                        match &parsed.kind {
+                            BusFrameKind::Legacy => {
+                                return Err(ZippyError::Io {
+                                    reason: format!(
+                                        "filtered reader requires enveloped bus frame reader_id=[{}] stream_name=[{}] seq=[{}]",
+                                        self.descriptor.reader_id,
+                                        self.descriptor.stream_name,
+                                        self.next_read_seq
+                                    ),
+                                });
+                            }
+                            BusFrameKind::EnvelopedWithoutDirectory => {
+                                self.next_read_seq += 1;
+                                continue;
+                            }
+                            BusFrameKind::EnvelopedWithDirectory { instrument_ids } => {
+                                if !instrument_filter_matches(filter, instrument_ids) {
+                                    self.next_read_seq += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    let batch = decode_batch(parsed.arrow_payload)?;
                     self.next_read_seq += 1;
                     return Ok(batch);
                 }
@@ -506,6 +541,62 @@ fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Option<Ve
         Some(ids) if ids.is_empty() => None,
         other => other,
     }
+}
+
+fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Option<BTreeSet<String>> {
+    instrument_ids.as_ref().and_then(|ids| {
+        let normalized = ids
+            .iter()
+            .filter(|id| !id.is_empty())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    })
+}
+
+fn instrument_filter_matches(filter: &BTreeSet<String>, instrument_ids: &[&str]) -> bool {
+    instrument_ids
+        .iter()
+        .any(|instrument_id| filter.contains(*instrument_id))
+}
+
+fn extract_instrument_ids(batch: &RecordBatch) -> Result<Vec<String>> {
+    let instrument_column_index =
+        batch
+            .schema()
+            .index_of("instrument_id")
+            .map_err(|_| ZippyError::Io {
+                reason: "missing instrument_id column required for bus frame envelope".to_string(),
+            })?;
+    let instrument_column = batch.column(instrument_column_index);
+    let instrument_ids = instrument_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ZippyError::Io {
+            reason: format!(
+                "instrument_id column must be utf8 actual_type=[{:?}]",
+                instrument_column.data_type()
+            ),
+        })?;
+
+    let mut unique_instrument_ids = BTreeSet::new();
+    for row_index in 0..instrument_ids.len() {
+        if instrument_ids.is_null(row_index) {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "instrument_id column contains null row_index=[{}]",
+                    row_index
+                ),
+            });
+        }
+        unique_instrument_ids.insert(instrument_ids.value(row_index).to_string());
+    }
+
+    Ok(unique_instrument_ids.into_iter().collect())
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {
