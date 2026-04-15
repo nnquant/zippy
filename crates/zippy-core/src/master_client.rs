@@ -264,7 +264,7 @@ impl MasterClient {
                     .max(ring.seek_latest().map_err(shared_ring_error)?);
                 Ok(Reader {
                     socket_path: self.socket_path.clone(),
-                    instrument_filter: instrument_filter_set(&descriptor.instrument_filter),
+                    instrument_filter: instrument_filter_set(&descriptor.instrument_filter)?,
                     next_read_seq,
                     ring,
                     descriptor,
@@ -554,19 +554,24 @@ fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Result<Op
     }
 }
 
-fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Option<BTreeSet<String>> {
-    instrument_ids.as_ref().and_then(|ids| {
-        let normalized = ids
-            .iter()
-            .filter(|id| !id.is_empty())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if normalized.is_empty() {
-            None
-        } else {
-            Some(normalized)
+fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Result<Option<BTreeSet<String>>> {
+    match instrument_ids {
+        Some(ids) => {
+            if ids.iter().any(|id| id.is_empty()) {
+                return Err(ZippyError::Io {
+                    reason: "descriptor instrument filter contains empty value".to_string(),
+                });
+            }
+
+            let normalized = ids.iter().cloned().collect::<BTreeSet<_>>();
+            if normalized.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(normalized))
+            }
         }
-    })
+        None => Ok(None),
+    }
 }
 
 fn instrument_filter_matches(filter: &BTreeSet<String>, instrument_ids: &[&str]) -> bool {
