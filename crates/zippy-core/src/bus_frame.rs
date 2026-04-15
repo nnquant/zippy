@@ -15,8 +15,10 @@ pub const FLAG_HAS_INSTRUMENT_DIRECTORY: u16 = 0x0001;
 pub enum BusFrameKind<'a> {
     /// Legacy frame without envelope metadata.
     Legacy,
+    /// Enveloped frame without an instrument directory.
+    EnvelopedWithoutDirectory,
     /// Enveloped frame with an instrument directory.
-    Enveloped { instrument_ids: Vec<&'a str> },
+    EnvelopedWithDirectory { instrument_ids: Vec<&'a str> },
 }
 
 /// Parsed bus frame envelope.
@@ -37,15 +39,14 @@ pub struct ParsedBusFrame<'a> {
 /// :returns: Encoded bus frame bytes.
 /// :rtype: crate::Result<Vec<u8>>
 /// :raises crate::ZippyError::Io: If the directory is too large to encode.
-pub fn encode_bus_frame(instrument_ids: &[String], arrow_payload: &[u8]) -> Result<Vec<u8>> {
-    if instrument_ids.is_empty() {
-        return Ok(arrow_payload.to_vec());
-    }
-
+pub fn encode_bus_frame<S>(instrument_ids: &[S], arrow_payload: &[u8]) -> Result<Vec<u8>>
+where
+    S: AsRef<str>,
+{
     let directory_bytes = instrument_ids
         .iter()
         .try_fold(0usize, |acc, instrument_id| {
-            let id_len = instrument_id.len();
+            let id_len = instrument_id.as_ref().len();
             let len_field = usize::from(u16::MAX);
             if id_len > len_field {
                 return Err(invalid_bus_frame("instrument id too long"));
@@ -58,20 +59,31 @@ pub fn encode_bus_frame(instrument_ids: &[String], arrow_payload: &[u8]) -> Resu
     let directory_count = u16::try_from(instrument_ids.len())
         .map_err(|_| invalid_bus_frame("too many instrument ids"))?;
 
+    let has_directory = !instrument_ids.is_empty();
     let mut encoded = Vec::with_capacity(
-        BUS_FRAME_MAGIC.len() + 2 + 2 + 2 + directory_bytes + arrow_payload.len(),
+        BUS_FRAME_MAGIC.len()
+            + 2
+            + 2
+            + if has_directory { 2 } else { 0 }
+            + directory_bytes
+            + arrow_payload.len(),
     );
     encoded.extend_from_slice(&BUS_FRAME_MAGIC);
     encoded.extend_from_slice(&BUS_FRAME_VERSION.to_le_bytes());
-    encoded.extend_from_slice(&FLAG_HAS_INSTRUMENT_DIRECTORY.to_le_bytes());
-    encoded.extend_from_slice(&directory_count.to_le_bytes());
 
-    for instrument_id in instrument_ids {
-        let instrument_bytes = instrument_id.as_bytes();
-        let instrument_len = u16::try_from(instrument_bytes.len())
-            .map_err(|_| invalid_bus_frame("instrument id too long"))?;
-        encoded.extend_from_slice(&instrument_len.to_le_bytes());
-        encoded.extend_from_slice(instrument_bytes);
+    if has_directory {
+        encoded.extend_from_slice(&FLAG_HAS_INSTRUMENT_DIRECTORY.to_le_bytes());
+        encoded.extend_from_slice(&directory_count.to_le_bytes());
+
+        for instrument_id in instrument_ids {
+            let instrument_bytes = instrument_id.as_ref().as_bytes();
+            let instrument_len = u16::try_from(instrument_bytes.len())
+                .map_err(|_| invalid_bus_frame("instrument id too long"))?;
+            encoded.extend_from_slice(&instrument_len.to_le_bytes());
+            encoded.extend_from_slice(instrument_bytes);
+        }
+    } else {
+        encoded.extend_from_slice(&0u16.to_le_bytes());
     }
 
     encoded.extend_from_slice(arrow_payload);
@@ -100,10 +112,14 @@ pub fn parse_bus_frame(bytes: &[u8]) -> Result<ParsedBusFrame<'_>> {
     }
 
     let flags = read_u16(bytes, &mut cursor, "truncated bus frame header")?;
-    let directory_count = read_u16(bytes, &mut cursor, "truncated bus frame header")?;
+    let unsupported_flags = flags & !FLAG_HAS_INSTRUMENT_DIRECTORY;
+    if unsupported_flags != 0 {
+        return Err(invalid_bus_frame("unsupported bus frame flags"));
+    }
 
-    let mut instrument_ids = Vec::with_capacity(usize::from(directory_count));
     if flags & FLAG_HAS_INSTRUMENT_DIRECTORY != 0 {
+        let directory_count = read_u16(bytes, &mut cursor, "truncated bus frame header")?;
+        let mut instrument_ids = Vec::with_capacity(usize::from(directory_count));
         for _ in 0..directory_count {
             let id_len = usize::from(read_u16(
                 bytes,
@@ -116,16 +132,21 @@ pub fn parse_bus_frame(bytes: &[u8]) -> Result<ParsedBusFrame<'_>> {
                 .map_err(|_| invalid_bus_frame("instrument id is not valid utf-8"))?;
             instrument_ids.push(id);
         }
-    } else if directory_count != 0 {
-        return Err(invalid_bus_frame("bus frame directory flag missing"));
+        return Ok(ParsedBusFrame {
+            kind: BusFrameKind::EnvelopedWithDirectory { instrument_ids },
+            arrow_payload: &bytes[cursor..],
+        });
+    }
+
+    if cursor == bytes.len() {
+        return Ok(ParsedBusFrame {
+            kind: BusFrameKind::EnvelopedWithoutDirectory,
+            arrow_payload: &[],
+        });
     }
 
     Ok(ParsedBusFrame {
-        kind: if flags & FLAG_HAS_INSTRUMENT_DIRECTORY != 0 {
-            BusFrameKind::Enveloped { instrument_ids }
-        } else {
-            BusFrameKind::Legacy
-        },
+        kind: BusFrameKind::EnvelopedWithoutDirectory,
         arrow_payload: &bytes[cursor..],
     })
 }
