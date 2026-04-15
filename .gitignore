@@ -12,3 +12,4 @@ logs/
 crates/zippy-master/--no-console-log/
 
 docs/superpowers
+.worktrees/
