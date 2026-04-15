@@ -534,6 +534,84 @@ fn master_client_rejects_invalid_descriptor_instrument_filter() {
 }
 
 #[test]
+fn master_client_rejects_missing_descriptor_filter_for_filtered_reader() {
+    let socket_path = unique_socket_path();
+    let server = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            if socket_path.exists() {
+                let _ = fs::remove_file(&socket_path);
+            }
+
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+
+                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
+                let response = match request {
+                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
+                        assert_eq!(app, "local_dc");
+                        ControlResponse::ProcessRegistered {
+                            process_id: "proc_1".to_string(),
+                        }
+                    }
+                    ControlRequest::ReadFrom(AttachStreamRequest {
+                        stream_name,
+                        process_id,
+                        instrument_ids,
+                    }) => {
+                        assert_eq!(stream_name, "ticks");
+                        assert_eq!(process_id, "proc_1");
+                        assert_eq!(instrument_ids, Some(vec!["IF2606".to_string()]));
+                        ControlResponse::ReaderAttached {
+                            descriptor: ReaderDescriptor {
+                                stream_name,
+                                buffer_size: 1024,
+                                frame_size: 256,
+                                layout_version: BUS_LAYOUT_VERSION,
+                                shm_name: "shm_ticks".to_string(),
+                                reader_id: "reader_1".to_string(),
+                                process_id,
+                                next_read_seq: 1,
+                                instrument_filter: None,
+                            },
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+
+                let payload = serde_json::to_string(&response).unwrap();
+                stream.write_all(payload.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                stream.flush().unwrap();
+            }
+
+            let _ = fs::remove_file(&socket_path);
+        }
+    });
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    let error = match client.read_from_filtered("ticks", vec!["IF2606".to_string()]) {
+        Ok(_) => panic!("expected mismatched descriptor filter to be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("descriptor instrument filter mismatch"),
+        "unexpected error: {error}"
+    );
+
+    server.join().unwrap();
+}
+
+#[test]
 fn master_client_lists_streams() {
     let socket_path = unique_socket_path();
     let server = spawn_fake_server(&socket_path, 3);

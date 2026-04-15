@@ -245,6 +245,7 @@ impl MasterClient {
         stream_name: &str,
         instrument_ids: Option<Vec<String>>,
     ) -> Result<Reader> {
+        let requested_filter = instrument_filter_request_set(&instrument_ids);
         let process_id = self.require_process_id()?;
         let response = self.send_request(ControlRequest::ReadFrom(AttachStreamRequest {
             stream_name: stream_name.to_string(),
@@ -262,9 +263,24 @@ impl MasterClient {
                 let next_read_seq = descriptor
                     .next_read_seq
                     .max(ring.seek_latest().map_err(shared_ring_error)?);
+                let descriptor_filter = instrument_filter_set(&descriptor.instrument_filter)?;
+                if let Some(requested_filter) = &requested_filter {
+                    match &descriptor_filter {
+                        Some(returned_filter) if returned_filter == requested_filter => {}
+                        _ => {
+                            return Err(ZippyError::Io {
+                                reason: format!(
+                                    "descriptor instrument filter mismatch requested=[{}] actual=[{}]",
+                                    format_instrument_filter_set(Some(requested_filter)),
+                                    format_instrument_filter_set(descriptor_filter.as_ref())
+                                ),
+                            });
+                        }
+                    }
+                }
                 Ok(Reader {
                     socket_path: self.socket_path.clone(),
-                    instrument_filter: instrument_filter_set(&descriptor.instrument_filter)?,
+                    instrument_filter: descriptor_filter,
                     next_read_seq,
                     ring,
                     descriptor,
@@ -554,6 +570,12 @@ fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Result<Op
     }
 }
 
+fn instrument_filter_request_set(instrument_ids: &Option<Vec<String>>) -> Option<BTreeSet<String>> {
+    instrument_ids
+        .as_ref()
+        .map(|ids| ids.iter().cloned().collect())
+}
+
 fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Result<Option<BTreeSet<String>>> {
     match instrument_ids {
         Some(ids) => {
@@ -571,6 +593,13 @@ fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Result<Option<
             }
         }
         None => Ok(None),
+    }
+}
+
+fn format_instrument_filter_set(filter: Option<&BTreeSet<String>>) -> String {
+    match filter {
+        Some(filter) => filter.iter().cloned().collect::<Vec<_>>().join(","),
+        None => "unfiltered".to_string(),
     }
 }
 
