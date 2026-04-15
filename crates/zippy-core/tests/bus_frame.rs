@@ -1,6 +1,6 @@
 use zippy_core::{
     encode_bus_frame, parse_bus_frame, BusFrameKind, ZippyError, BUS_FRAME_MAGIC,
-    BUS_FRAME_VERSION, FLAG_HAS_INSTRUMENT_DIRECTORY,
+    BUS_FRAME_VERSION,
 };
 
 #[test]
@@ -37,10 +37,6 @@ fn truncated_header_rejected() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&BUS_FRAME_MAGIC);
     bytes.extend_from_slice(&BUS_FRAME_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&FLAG_HAS_INSTRUMENT_DIRECTORY.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&4u16.to_le_bytes());
-    bytes.extend_from_slice(b"ES");
 
     let err = parse_bus_frame(&bytes).expect_err("truncated header should fail");
 
