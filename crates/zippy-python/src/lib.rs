@@ -2814,7 +2814,7 @@ fn parse_instrument_ids(
             return Ok(None);
         }
         if values.iter().any(|value| value.is_empty()) {
-            return Err(py_value_error("instrument_ids must not contain empty strings"));
+            return Err(py_value_error("instrument filter contains empty value"));
         }
         return Ok(Some(values));
     }
@@ -2823,7 +2823,7 @@ fn parse_instrument_ids(
         .extract::<String>()
         .map_err(|_| py_value_error("instrument_ids must be a string or a sequence of strings"))?;
     if value.is_empty() {
-        return Err(py_value_error("instrument_ids must not contain empty strings"));
+        return Err(py_value_error("instrument filter contains empty value"));
     }
     Ok(Some(vec![value]))
 }
@@ -4168,6 +4168,18 @@ mod tests {
         Python::with_gil(|py| {
             let empty = PyList::empty_bound(py);
             assert_eq!(parse_instrument_ids(Some(empty.as_any())).unwrap(), None);
+
+            let tuple_values = PyTuple::new_bound(py, ["IH2606", "IF2606"]);
+            assert_eq!(
+                parse_instrument_ids(Some(tuple_values.as_any())).unwrap(),
+                Some(vec!["IH2606".to_string(), "IF2606".to_string()])
+            );
+
+            let scalar = pyo3::types::PyString::new_bound(py, "IF2606");
+            assert_eq!(
+                parse_instrument_ids(Some(scalar.as_any())).unwrap(),
+                Some(vec!["IF2606".to_string()])
+            );
 
             let values = PyList::empty_bound(py);
             values.append("IF2606").unwrap();
