@@ -1,3 +1,4 @@
+pub mod bus_frame;
 pub mod bus_protocol;
 pub mod engine;
 pub mod error;
@@ -11,6 +12,10 @@ pub mod source;
 pub mod types;
 pub mod version;
 
+pub use bus_frame::{
+    encode_bus_frame, parse_bus_frame, BusFrameKind, ParsedBusFrame, BUS_FRAME_MAGIC,
+    BUS_FRAME_VERSION, FLAG_HAS_INSTRUMENT_DIRECTORY,
+};
 pub use bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
     GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
