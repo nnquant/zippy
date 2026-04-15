@@ -13,8 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, BooleanArray, StringArray};
-use arrow::compute::{concat_batches, filter_record_batch};
+use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
@@ -1545,15 +1544,18 @@ impl MasterClient {
         instrument_ids: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<BusReader> {
         let instrument_ids = parse_instrument_ids(instrument_ids)?;
-        let reader = self
-            .client
-            .lock()
-            .unwrap()
-            .read_from(&stream_name)
+        let reader = attach_bus_reader_with(
+            &self.client,
+            &stream_name,
+            instrument_ids,
+            |client, stream_name| client.read_from(stream_name),
+            |client, stream_name, instrument_ids| {
+                client.read_from_filtered(stream_name, instrument_ids)
+            },
+        )
             .map_err(|error| py_runtime_error(error.to_string()))?;
         Ok(BusReader {
             reader: Arc::new(Mutex::new(Some(reader))),
-            instrument_ids,
         })
     }
 
@@ -1797,47 +1799,22 @@ impl BusWriter {
 #[pyclass]
 struct BusReader {
     reader: Arc<Mutex<Option<CoreBusReader>>>,
-    instrument_ids: Option<Vec<String>>,
 }
 
 #[pymethods]
 impl BusReader {
     #[pyo3(signature = (timeout_ms=1000))]
     fn read(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<PyObject> {
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(timeout_ms))
-            .ok_or_else(|| py_runtime_error("reader timeout is too large"))?;
-
-        loop {
-            let batch = {
-                let mut guard = self.reader.lock().unwrap();
-                let reader = guard
-                    .as_mut()
-                    .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(py_runtime_error("reader timed out"));
-                }
-                let remaining_ms = remaining.as_millis().max(1) as u64;
-                reader
-                    .read(Some(remaining_ms))
-                    .map_err(|error| py_runtime_error(error.to_string()))?
-            };
-
-            if let Some(instrument_ids) = &self.instrument_ids {
-                let filtered = filter_record_batch_by_instrument_ids(&batch, instrument_ids)?;
-                if filtered.num_rows() == 0 {
-                    continue;
-                }
-                return filtered
-                    .to_pyarrow(py)
-                    .map_err(|error| py_value_error(error.to_string()));
-            }
-
-            return batch
-                .to_pyarrow(py)
-                .map_err(|error| py_value_error(error.to_string()));
-        }
+        let mut guard = self.reader.lock().unwrap();
+        let reader = guard
+            .as_mut()
+            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
+        let batch = reader
+            .read(Some(timeout_ms))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        batch
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
     }
 
     fn seek_latest(&self) -> PyResult<()> {
@@ -2834,7 +2811,13 @@ fn parse_instrument_ids(
             py_value_error("instrument_ids must be a string or a sequence of strings")
         })?;
         if values.is_empty() {
-            return Err(py_value_error("instrument_ids must not be empty"));
+            return Ok(None);
+        }
+
+        if values.iter().any(|value| value.is_empty()) {
+            return Err(py_value_error(
+                "instrument_ids must not contain empty strings",
+            ));
         }
 
         return Ok(Some(values));
@@ -2843,42 +2826,33 @@ fn parse_instrument_ids(
     instrument_ids
         .extract::<String>()
         .map_err(|_| py_value_error("instrument_ids must be a string or a sequence of strings"))
-        .and_then(|value| normalize_instrument_id(Some(value)))
+        .and_then(|value| {
+            if value.is_empty() {
+                Err(py_value_error(
+                    "instrument_ids must not contain empty strings",
+                ))
+            } else {
+                Ok(Some(vec![value]))
+            }
+        })
 }
 
-fn normalize_instrument_id(instrument_id: Option<String>) -> PyResult<Option<Vec<String>>> {
-    match instrument_id {
-        Some(instrument_id) if instrument_id.is_empty() => Err(py_value_error(
-            "instrument_ids must not contain empty strings",
-        )),
-        Some(instrument_id) => Ok(Some(vec![instrument_id])),
-        None => Ok(None),
+fn attach_bus_reader_with<F, G>(
+    client: &SharedMasterClient,
+    stream_name: &str,
+    instrument_ids: Option<Vec<String>>,
+    read_from: F,
+    read_from_filtered: G,
+) -> zippy_core::Result<CoreBusReader>
+where
+    F: FnOnce(&mut CoreMasterClient, &str) -> zippy_core::Result<CoreBusReader>,
+    G: FnOnce(&mut CoreMasterClient, &str, Vec<String>) -> zippy_core::Result<CoreBusReader>,
+{
+    let mut guard = client.lock().unwrap();
+    match instrument_ids {
+        None => read_from(&mut guard, stream_name),
+        Some(instrument_ids) => read_from_filtered(&mut guard, stream_name, instrument_ids),
     }
-}
-
-fn filter_record_batch_by_instrument_ids(
-    batch: &RecordBatch,
-    instrument_ids: &[String],
-) -> PyResult<RecordBatch> {
-    let instrument_id_index = batch.schema().index_of("instrument_id").map_err(|_| {
-        py_value_error("filtered bus reader requires an instrument_id column")
-    })?;
-    let instrument_id_column = batch.column(instrument_id_index);
-    let instrument_id_values = instrument_id_column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| py_value_error("instrument_id column must be utf8"))?;
-
-    let predicate = BooleanArray::from_iter((0..instrument_id_values.len()).map(|row| {
-        Some(
-            instrument_id_values.is_valid(row)
-                && instrument_ids
-                    .iter()
-                    .any(|instrument_id| instrument_id == instrument_id_values.value(row)),
-        )
-    }));
-
-    filter_record_batch(batch, &predicate).map_err(|error| py_value_error(error.to_string()))
 }
 
 fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
@@ -4145,6 +4119,7 @@ mod tests {
 
     use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use pyo3::types::PyList;
     use zippy_engines::{
         ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
     };
@@ -4197,10 +4172,94 @@ mod tests {
     }
 
     #[test]
-    fn normalize_instrument_ids_single_string_to_list() {
-        let parsed = normalize_instrument_id(Some("IF2606".to_string())).unwrap();
+    fn normalize_and_dispatch_bus_reader_respects_instrument_ids() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let empty = PyList::empty_bound(py);
+            assert_eq!(parse_instrument_ids(Some(empty.as_any())).unwrap(), None);
 
-        assert_eq!(parsed, Some(vec!["IF2606".to_string()]));
+            let values = PyList::empty_bound(py);
+            values.append("IF2606").unwrap();
+            assert_eq!(
+                parse_instrument_ids(Some(values.as_any())).unwrap(),
+                Some(vec!["IF2606".to_string()])
+            );
+
+            let invalid = PyList::empty_bound(py);
+            invalid.append("").unwrap();
+            assert!(parse_instrument_ids(Some(invalid.as_any())).is_err());
+        });
+
+        let client: SharedMasterClient = Arc::new(Mutex::new(
+            CoreMasterClient::connect("/tmp/zippy-python-test").unwrap(),
+        ));
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let unfiltered_read_calls = Arc::clone(&calls);
+        let unfiltered_filtered_calls = Arc::clone(&calls);
+        let unfiltered_result = attach_bus_reader_with(
+            &client,
+            "ticks",
+            None,
+            move |_, stream_name| {
+                unfiltered_read_calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("read_from:[{}]", stream_name));
+                Err(ZippyError::Io {
+                    reason: "stop".to_string(),
+                })
+            },
+            move |_, stream_name, instrument_ids| {
+                unfiltered_filtered_calls.lock().unwrap().push(format!(
+                    "read_from_filtered:[{}]:{:?}",
+                    stream_name, instrument_ids
+                ));
+                Err(ZippyError::Io {
+                    reason: "stop".to_string(),
+                })
+            },
+        );
+
+        assert!(unfiltered_result.is_err());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["read_from:[ticks]".to_string()]
+        );
+
+        calls.lock().unwrap().clear();
+
+        let filtered_read_calls = Arc::clone(&calls);
+        let filtered_filtered_calls = Arc::clone(&calls);
+        let filtered_result = attach_bus_reader_with(
+            &client,
+            "ticks",
+            Some(vec!["IF2606".to_string()]),
+            move |_, stream_name| {
+                filtered_read_calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("read_from:[{}]", stream_name));
+                Err(ZippyError::Io {
+                    reason: "stop".to_string(),
+                })
+            },
+            move |_, stream_name, instrument_ids| {
+                filtered_filtered_calls.lock().unwrap().push(format!(
+                    "read_from_filtered:[{}]:{:?}",
+                    stream_name, instrument_ids
+                ));
+                Err(ZippyError::Io {
+                    reason: "stop".to_string(),
+                })
+            },
+        );
+
+        assert!(filtered_result.is_err());
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["read_from_filtered:[ticks]:[\"IF2606\"]".to_string()]
+        );
     }
 
     #[test]

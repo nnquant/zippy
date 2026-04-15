@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arrow::array::{Array, BooleanArray, StringArray};
+use arrow::compute::filter_record_batch;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -37,6 +39,7 @@ pub struct Reader {
     descriptor: ReaderDescriptor,
     next_read_seq: u64,
     ring: SharedFrameRing,
+    instrument_ids: Option<Vec<String>>,
     closed: bool,
 }
 
@@ -221,6 +224,26 @@ impl MasterClient {
     }
 
     pub fn read_from(&mut self, stream_name: &str) -> Result<Reader> {
+        self.read_from_with_instrument_ids(stream_name, None)
+    }
+
+    pub fn read_from_filtered(
+        &mut self,
+        stream_name: &str,
+        instrument_ids: Vec<String>,
+    ) -> Result<Reader> {
+        if instrument_ids.is_empty() {
+            return self.read_from(stream_name);
+        }
+
+        self.read_from_with_instrument_ids(stream_name, Some(instrument_ids))
+    }
+
+    fn read_from_with_instrument_ids(
+        &mut self,
+        stream_name: &str,
+        instrument_ids: Option<Vec<String>>,
+    ) -> Result<Reader> {
         let process_id = self.require_process_id()?;
         let response = self.send_request(ControlRequest::ReadFrom(AttachStreamRequest {
             stream_name: stream_name.to_string(),
@@ -242,6 +265,7 @@ impl MasterClient {
                     next_read_seq,
                     ring,
                     descriptor,
+                    instrument_ids,
                     closed: false,
                 })
             }
@@ -357,6 +381,13 @@ impl Reader {
                     let payload = frame.payload;
                     let batch = decode_batch(&payload)?;
                     self.next_read_seq += 1;
+                    if let Some(instrument_ids) = &self.instrument_ids {
+                        let filtered = filter_record_batch_by_instrument_ids(&batch, instrument_ids)?;
+                        if filtered.num_rows() == 0 {
+                            continue;
+                        }
+                        return Ok(filtered);
+                    }
                     return Ok(batch);
                 }
                 SharedReadResult::Lagged {
@@ -426,6 +457,37 @@ impl Drop for Reader {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+fn filter_record_batch_by_instrument_ids(
+    batch: &RecordBatch,
+    instrument_ids: &[String],
+) -> Result<RecordBatch> {
+    let instrument_id_index = batch.schema().index_of("instrument_id").map_err(|_| {
+        ZippyError::Io {
+            reason: "filtered reader requires an instrument_id column".to_string(),
+        }
+    })?;
+    let instrument_id_column = batch.column(instrument_id_index);
+    let instrument_id_values = instrument_id_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ZippyError::Io {
+            reason: "instrument_id column must be utf8".to_string(),
+        })?;
+
+    let predicate = BooleanArray::from_iter((0..instrument_id_values.len()).map(|row| {
+        Some(
+            instrument_id_values.is_valid(row)
+                && instrument_ids
+                    .iter()
+                    .any(|instrument_id| instrument_id == instrument_id_values.value(row)),
+        )
+    }));
+
+    filter_record_batch(batch, &predicate).map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
 }
 
 fn send_control_request(socket_path: &Path, request: ControlRequest) -> Result<ControlResponse> {
