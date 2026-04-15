@@ -88,6 +88,75 @@ fn unknown_flags_rejected() {
 }
 
 #[test]
+fn directory_flag_missing_directory_count_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&BUS_FRAME_MAGIC);
+    bytes.extend_from_slice(&BUS_FRAME_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0x0001u16.to_le_bytes());
+
+    let err = parse_bus_frame(&bytes).expect_err("missing directory metadata should fail");
+
+    match err {
+        ZippyError::Io { reason } => {
+            assert!(
+                reason.contains("truncated bus frame header"),
+                "unexpected reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected io error, got {:?}", other),
+    }
+}
+
+#[test]
+fn truncated_directory_entry_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&BUS_FRAME_MAGIC);
+    bytes.extend_from_slice(&BUS_FRAME_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0x0001u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(b"ES");
+
+    let err = parse_bus_frame(&bytes).expect_err("truncated directory entry should fail");
+
+    match err {
+        ZippyError::Io { reason } => {
+            assert!(
+                reason.contains("truncated instrument directory"),
+                "unexpected reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected io error, got {:?}", other),
+    }
+}
+
+#[test]
+fn invalid_utf8_instrument_id_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&BUS_FRAME_MAGIC);
+    bytes.extend_from_slice(&BUS_FRAME_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0x0001u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.push(0xff);
+
+    let err = parse_bus_frame(&bytes).expect_err("invalid utf-8 should fail");
+
+    match err {
+        ZippyError::Io { reason } => {
+            assert!(
+                reason.contains("not valid utf-8"),
+                "unexpected reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected io error, got {:?}", other),
+    }
+}
+
+#[test]
 fn truncated_header_rejected() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&BUS_FRAME_MAGIC);

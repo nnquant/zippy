@@ -33,7 +33,8 @@ pub struct ParsedBusFrame<'a> {
 /// Encode a bus frame envelope.
 ///
 /// :param instrument_ids: Instrument identifiers to place in the directory.
-/// :type instrument_ids: &[String]
+/// :type instrument_ids: &[S]
+/// :type S: AsRef<str>
 /// :param arrow_payload: Raw Arrow IPC payload.
 /// :type arrow_payload: &[u8]
 /// :returns: Encoded bus frame bytes.
