@@ -296,6 +296,7 @@ impl Bus {
         &mut self,
         stream_name: &str,
         process_id: &str,
+        instrument_filter: Option<Vec<String>>,
     ) -> Result<ReaderDescriptor, BusError> {
         let Some(stream) = self.streams.get_mut(stream_name) else {
             return Err(BusError::StreamNotFound {
@@ -324,6 +325,7 @@ impl Bus {
             reader_id,
             process_id: process_id.to_string(),
             next_read_seq,
+            instrument_filter,
         })
     }
 

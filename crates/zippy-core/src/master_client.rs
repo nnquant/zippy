@@ -196,6 +196,7 @@ impl MasterClient {
         let response = self.send_request(ControlRequest::WriteTo(AttachStreamRequest {
             stream_name: stream_name.to_string(),
             process_id,
+            instrument_ids: None,
         }))?;
 
         match response {
@@ -221,10 +222,27 @@ impl MasterClient {
     }
 
     pub fn read_from(&mut self, stream_name: &str) -> Result<Reader> {
+        self.attach_reader(stream_name, None)
+    }
+
+    pub fn read_from_filtered(
+        &mut self,
+        stream_name: &str,
+        instrument_ids: Vec<String>,
+    ) -> Result<Reader> {
+        self.attach_reader(stream_name, Some(instrument_ids))
+    }
+
+    fn attach_reader(
+        &mut self,
+        stream_name: &str,
+        instrument_ids: Option<Vec<String>>,
+    ) -> Result<Reader> {
         let process_id = self.require_process_id()?;
         let response = self.send_request(ControlRequest::ReadFrom(AttachStreamRequest {
             stream_name: stream_name.to_string(),
             process_id,
+            instrument_ids,
         }))?;
 
         match response {
@@ -352,7 +370,11 @@ impl Reader {
         let deadline = timeout_ms.map(|timeout| Instant::now() + Duration::from_millis(timeout));
 
         loop {
-            match self.ring.read(self.next_read_seq).map_err(shared_ring_error)? {
+            match self
+                .ring
+                .read(self.next_read_seq)
+                .map_err(shared_ring_error)?
+            {
                 SharedReadResult::Ready(frame) => {
                     let payload = frame.payload;
                     let batch = decode_batch(&payload)?;

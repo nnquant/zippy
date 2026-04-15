@@ -61,6 +61,7 @@ pub struct UpdateRecordStatusRequest {
 pub struct AttachStreamRequest {
     pub stream_name: String,
     pub process_id: String,
+    pub instrument_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +129,7 @@ pub struct ReaderDescriptor {
     pub reader_id: String,
     pub process_id: String,
     pub next_read_seq: u64,
+    pub instrument_filter: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,7 +232,7 @@ impl fmt::Display for ControlResponse {
             ),
             Self::ReaderAttached { descriptor } => write!(
                 f,
-                "reader attached stream_name=[{}] reader_id=[{}] process_id=[{}] buffer_size=[{}] frame_size=[{}] layout_version=[{}] shm_name=[{}] next_read_seq=[{}]",
+                "reader attached stream_name=[{}] reader_id=[{}] process_id=[{}] buffer_size=[{}] frame_size=[{}] layout_version=[{}] shm_name=[{}] next_read_seq=[{}] instrument_filter=[{}]",
                 descriptor.stream_name,
                 descriptor.reader_id,
                 descriptor.process_id,
@@ -238,7 +240,12 @@ impl fmt::Display for ControlResponse {
                 descriptor.frame_size,
                 descriptor.layout_version,
                 descriptor.shm_name,
-                descriptor.next_read_seq
+                descriptor.next_read_seq,
+                descriptor
+                    .instrument_filter
+                    .as_ref()
+                    .map(|filters| filters.join(","))
+                    .unwrap_or_default()
             ),
             Self::WriterDetached {
                 stream_name,
