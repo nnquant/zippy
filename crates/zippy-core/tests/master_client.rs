@@ -70,6 +70,22 @@ fn unique_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("zippy-master-client-test-{nanos}.sock"))
 }
 
+fn unique_shm_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("zippy-master-client-{label}-{nanos}"))
+}
+
+fn unique_shm_name(label: &str) -> (PathBuf, String) {
+    let shm_dir = unique_shm_dir(label);
+    fs::create_dir_all(&shm_dir).unwrap();
+    let flink_path = shm_dir.join("ticks.flink");
+    let shm_name = flink_path.to_string_lossy().into_owned();
+    (shm_dir, shm_name)
+}
+
 fn wait_for_socket(socket_path: &Path) {
     for _ in 0..50 {
         if socket_path.exists() {
@@ -80,7 +96,11 @@ fn wait_for_socket(socket_path: &Path) {
     panic!("socket did not appear path={}", socket_path.display());
 }
 
-fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread::JoinHandle<()> {
+fn spawn_fake_server(
+    socket_path: &Path,
+    expected_connections: usize,
+    shm_name: String,
+) -> thread::JoinHandle<()> {
     let socket_path = socket_path.to_path_buf();
     thread::spawn(move || {
         if socket_path.exists() {
@@ -179,7 +199,7 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         buffer_size: 1024,
                         frame_size: 256,
                         layout_version: BUS_LAYOUT_VERSION,
-                        shm_name: "shm_ticks".to_string(),
+                        shm_name: shm_name.clone(),
                         writer_id: "ticks_writer".to_string(),
                         process_id,
                         next_write_seq: 1,
@@ -195,7 +215,7 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         buffer_size: 1024,
                         frame_size: 256,
                         layout_version: BUS_LAYOUT_VERSION,
-                        shm_name: "shm_ticks".to_string(),
+                        shm_name: shm_name.clone(),
                         reader_id: "reader_1".to_string(),
                         process_id,
                         next_read_seq: 1,
@@ -259,7 +279,8 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
 #[test]
 fn master_client_registers_process_and_fetches_writer_descriptor() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 4);
+    let (shm_dir, shm_name) = unique_shm_name("basic-attach");
+    let server = spawn_fake_server(&socket_path, 4, shm_name);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -279,13 +300,16 @@ fn master_client_registers_process_and_fetches_writer_descriptor() {
     assert_eq!(reader.descriptor().process_id, "proc_1");
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_sends_instrument_filter_when_attaching_reader() {
     let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("reader-filter");
     let server = thread::spawn({
         let socket_path = socket_path.clone();
+        let shm_name = shm_name.clone();
         move || {
             if socket_path.exists() {
                 let _ = fs::remove_file(&socket_path);
@@ -323,7 +347,7 @@ fn master_client_sends_instrument_filter_when_attaching_reader() {
                                 buffer_size: 1024,
                                 frame_size: 256,
                                 layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: "shm_ticks".to_string(),
+                                shm_name: shm_name.clone(),
                                 reader_id: "reader_1".to_string(),
                                 process_id,
                                 next_read_seq: 1,
@@ -360,13 +384,16 @@ fn master_client_sends_instrument_filter_when_attaching_reader() {
     );
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_normalizes_empty_instrument_filter_when_attaching_reader() {
     let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("reader-empty-filter");
     let server = thread::spawn({
         let socket_path = socket_path.clone();
+        let shm_name = shm_name.clone();
         move || {
             if socket_path.exists() {
                 let _ = fs::remove_file(&socket_path);
@@ -401,7 +428,7 @@ fn master_client_normalizes_empty_instrument_filter_when_attaching_reader() {
                                 buffer_size: 1024,
                                 frame_size: 256,
                                 layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: "shm_ticks".to_string(),
+                                shm_name: shm_name.clone(),
                                 reader_id: "reader_1".to_string(),
                                 process_id,
                                 next_read_seq: 1,
@@ -430,12 +457,14 @@ fn master_client_normalizes_empty_instrument_filter_when_attaching_reader() {
     assert_eq!(reader.descriptor().instrument_filter, None);
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_rejects_empty_string_instrument_filter_when_attaching_reader() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 1);
+    let (shm_dir, shm_name) = unique_shm_name("reader-empty-value");
+    let server = spawn_fake_server(&socket_path, 1, shm_name);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -453,13 +482,16 @@ fn master_client_rejects_empty_string_instrument_filter_when_attaching_reader() 
     );
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_rejects_invalid_descriptor_instrument_filter() {
     let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("reader-invalid-descriptor");
     let server = thread::spawn({
         let socket_path = socket_path.clone();
+        let shm_name = shm_name.clone();
         move || {
             if socket_path.exists() {
                 let _ = fs::remove_file(&socket_path);
@@ -494,7 +526,7 @@ fn master_client_rejects_invalid_descriptor_instrument_filter() {
                                 buffer_size: 1024,
                                 frame_size: 256,
                                 layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: "shm_ticks".to_string(),
+                                shm_name: shm_name.clone(),
                                 reader_id: "reader_1".to_string(),
                                 process_id,
                                 next_read_seq: 1,
@@ -531,13 +563,16 @@ fn master_client_rejects_invalid_descriptor_instrument_filter() {
     );
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_rejects_missing_descriptor_filter_for_filtered_reader() {
     let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("reader-missing-descriptor");
     let server = thread::spawn({
         let socket_path = socket_path.clone();
+        let shm_name = shm_name.clone();
         move || {
             if socket_path.exists() {
                 let _ = fs::remove_file(&socket_path);
@@ -572,7 +607,7 @@ fn master_client_rejects_missing_descriptor_filter_for_filtered_reader() {
                                 buffer_size: 1024,
                                 frame_size: 256,
                                 layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: "shm_ticks".to_string(),
+                                shm_name: shm_name.clone(),
                                 reader_id: "reader_1".to_string(),
                                 process_id,
                                 next_read_seq: 1,
@@ -609,12 +644,14 @@ fn master_client_rejects_missing_descriptor_filter_for_filtered_reader() {
     );
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_lists_streams() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 3);
+    let (shm_dir, shm_name) = unique_shm_name("list-streams");
+    let server = spawn_fake_server(&socket_path, 3, shm_name);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -632,12 +669,14 @@ fn master_client_lists_streams() {
     assert_eq!(streams[0].status, "registered");
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_gets_single_stream() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 3);
+    let (shm_dir, shm_name) = unique_shm_name("get-stream");
+    let server = spawn_fake_server(&socket_path, 3, shm_name);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -654,12 +693,14 @@ fn master_client_gets_single_stream() {
     assert_eq!(stream.status, "registered");
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_sends_heartbeat_for_registered_process() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 2);
+    let (shm_dir, shm_name) = unique_shm_name("heartbeat");
+    let server = spawn_fake_server(&socket_path, 2, shm_name);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -667,12 +708,14 @@ fn master_client_sends_heartbeat_for_registered_process() {
     client.heartbeat().unwrap();
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_registers_control_plane_entities_and_updates_status() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 5);
+    let (shm_dir, shm_name) = unique_shm_name("control-plane");
+    let server = spawn_fake_server(&socket_path, 5, shm_name);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -721,6 +764,7 @@ fn master_client_registers_control_plane_entities_and_updates_status() {
         .unwrap();
 
     server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]

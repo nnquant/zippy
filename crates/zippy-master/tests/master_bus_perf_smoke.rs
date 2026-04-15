@@ -165,6 +165,7 @@ fn master_bus_perf_smoke_filtered_reader_skips_non_matching_batches() {
     let mut reader_client = MasterClient::connect(&socket_path).unwrap();
     writer_client.register_process("perf_writer").unwrap();
     reader_client.register_process("perf_reader").unwrap();
+    let rounds = 5_000usize;
 
     let stream_name = format!(
         "perf_ticks_{}",
@@ -174,7 +175,7 @@ fn master_bus_perf_smoke_filtered_reader_skips_non_matching_batches() {
             .as_nanos()
     );
     writer_client
-        .register_stream(&stream_name, smoke_schema(), 16 * 1024 * 1024, 2048)
+        .register_stream(&stream_name, smoke_schema(), rounds, 2048)
         .unwrap();
 
     let mut writer = writer_client.write_to(&stream_name).unwrap();
@@ -182,7 +183,6 @@ fn master_bus_perf_smoke_filtered_reader_skips_non_matching_batches() {
         .read_from_filtered(&stream_name, vec!["IF2606".to_string()])
         .unwrap();
 
-    let rounds = 5_000usize;
     let expected_matches = rounds / 100;
     let expected_batch = batch_for_instrument("IF2606");
     let start = Instant::now();
