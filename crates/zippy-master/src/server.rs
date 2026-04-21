@@ -788,7 +788,11 @@ impl MasterServer {
             ControlRequest::ReadFrom(request) => {
                 let mut bus = self.bus.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                match bus.read_from(&request.stream_name, &request.process_id) {
+                match bus.read_from(
+                    &request.stream_name,
+                    &request.process_id,
+                    request.instrument_ids.clone(),
+                ) {
                     Ok(descriptor) => {
                         if let Err(error) = registry.attach_reader(
                             &request.stream_name,

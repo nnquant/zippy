@@ -29,6 +29,17 @@ fn test_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn batch_with_rows(instrument_ids: Vec<&str>, mid_prices: Vec<f64>) -> RecordBatch {
+    RecordBatch::try_new(
+        test_schema(),
+        vec![
+            std::sync::Arc::new(StringArray::from(instrument_ids)),
+            std::sync::Arc::new(Float64Array::from(mid_prices)),
+        ],
+    )
+    .unwrap()
+}
+
 fn unique_socket_path() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -180,6 +191,40 @@ fn writer_and_reader_roundtrip_batches_through_master_bus() {
 }
 
 #[test]
+fn filtered_reader_skips_non_matching_frames_until_match() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
+    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
+    writer_client.register_process("writer").unwrap();
+    reader_client.register_process("reader").unwrap();
+    writer_client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+
+    let mut writer = writer_client.write_to("ticks").unwrap();
+    let mut reader = reader_client
+        .read_from_filtered("ticks", vec!["IF2606".to_string()])
+        .unwrap();
+
+    let non_matching_batch = batch_with_rows(vec!["IH2606"], vec![2987.0]);
+    let matching_batch = batch_with_rows(vec!["IF2606", "IH2606"], vec![3210.5, 2987.0]);
+
+    writer.write(non_matching_batch).unwrap();
+    writer.write(matching_batch.clone()).unwrap();
+
+    let received = reader.read(Some(1000)).unwrap();
+    assert_eq!(received.num_rows(), matching_batch.num_rows());
+    assert_eq!(received.num_columns(), matching_batch.num_columns());
+    assert_eq!(format!("{received:?}"), format!("{matching_batch:?}"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
 fn closing_writer_allows_restarting_same_stream_writer() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
@@ -229,9 +274,7 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
         match second.write_to("ticks") {
             Ok(writer) => break writer,
             Err(error)
-                if error
-                    .to_string()
-                    .contains("writer already attached")
+                if error.to_string().contains("writer already attached")
                     && std::time::Instant::now() < deadline =>
             {
                 thread::sleep(Duration::from_millis(20));
@@ -275,9 +318,7 @@ fn lease_reaper_reclaims_expired_writer_for_new_writer() {
         match second.write_to("ticks") {
             Ok(writer) => break writer,
             Err(error)
-                if error
-                    .to_string()
-                    .contains("writer already attached")
+                if error.to_string().contains("writer already attached")
                     && std::time::Instant::now() < deadline =>
             {
                 thread::sleep(Duration::from_millis(20));
@@ -335,7 +376,7 @@ fn bus_read_from_returns_latest_next_read_seq() {
 
     bus.publish_test_frame("ticks", b"abc").unwrap();
 
-    let reader = bus.read_from("ticks", "proc_2").unwrap();
+    let reader = bus.read_from("ticks", "proc_2", None).unwrap();
     assert_eq!(reader.next_read_seq, 2);
 }
 

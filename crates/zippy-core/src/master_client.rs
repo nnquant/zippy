@@ -1,16 +1,17 @@
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, BooleanArray, StringArray};
-use arrow::compute::filter_record_batch;
+use arrow::array::{Array, StringArray};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_shm_bridge::{ReadResult as SharedReadResult, SharedFrameRing};
 
+use crate::bus_frame::{encode_bus_frame, parse_bus_frame, BusFrameKind};
 use crate::bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
     GetStreamRequest, HeartbeatRequest, ListStreamsRequest, ReaderDescriptor,
@@ -37,9 +38,9 @@ pub struct Writer {
 pub struct Reader {
     socket_path: PathBuf,
     descriptor: ReaderDescriptor,
+    instrument_filter: Option<BTreeSet<String>>,
     next_read_seq: u64,
     ring: SharedFrameRing,
-    instrument_ids: Option<Vec<String>>,
     closed: bool,
 }
 
@@ -199,6 +200,7 @@ impl MasterClient {
         let response = self.send_request(ControlRequest::WriteTo(AttachStreamRequest {
             stream_name: stream_name.to_string(),
             process_id,
+            instrument_ids: None,
         }))?;
 
         match response {
@@ -224,7 +226,7 @@ impl MasterClient {
     }
 
     pub fn read_from(&mut self, stream_name: &str) -> Result<Reader> {
-        self.read_from_with_instrument_ids(stream_name, None)
+        self.attach_reader(stream_name, None)
     }
 
     pub fn read_from_filtered(
@@ -232,22 +234,23 @@ impl MasterClient {
         stream_name: &str,
         instrument_ids: Vec<String>,
     ) -> Result<Reader> {
-        if instrument_ids.is_empty() {
-            return self.read_from(stream_name);
-        }
-
-        self.read_from_with_instrument_ids(stream_name, Some(instrument_ids))
+        self.attach_reader(
+            stream_name,
+            normalize_instrument_filter(Some(instrument_ids))?,
+        )
     }
 
-    fn read_from_with_instrument_ids(
+    fn attach_reader(
         &mut self,
         stream_name: &str,
         instrument_ids: Option<Vec<String>>,
     ) -> Result<Reader> {
+        let requested_filter = instrument_filter_request_set(&instrument_ids);
         let process_id = self.require_process_id()?;
         let response = self.send_request(ControlRequest::ReadFrom(AttachStreamRequest {
             stream_name: stream_name.to_string(),
             process_id,
+            instrument_ids,
         }))?;
 
         match response {
@@ -260,12 +263,27 @@ impl MasterClient {
                 let next_read_seq = descriptor
                     .next_read_seq
                     .max(ring.seek_latest().map_err(shared_ring_error)?);
+                let descriptor_filter = instrument_filter_set(&descriptor.instrument_filter)?;
+                if let Some(requested_filter) = &requested_filter {
+                    match &descriptor_filter {
+                        Some(returned_filter) if returned_filter == requested_filter => {}
+                        _ => {
+                            return Err(ZippyError::Io {
+                                reason: format!(
+                                    "descriptor instrument filter mismatch requested=[{}] actual=[{}]",
+                                    format_instrument_filter_set(Some(requested_filter)),
+                                    format_instrument_filter_set(descriptor_filter.as_ref())
+                                ),
+                            });
+                        }
+                    }
+                }
                 Ok(Reader {
                     socket_path: self.socket_path.clone(),
+                    instrument_filter: descriptor_filter,
                     next_read_seq,
                     ring,
                     descriptor,
-                    instrument_ids,
                     closed: false,
                 })
             }
@@ -327,8 +345,13 @@ impl Writer {
     }
 
     pub fn write(&mut self, batch: RecordBatch) -> Result<()> {
-        let payload = encode_batch(&batch)?;
-        let published_seq = self.ring.publish(&payload).map_err(shared_ring_error)?;
+        let arrow_payload = encode_batch(&batch)?;
+        let instrument_ids = extract_instrument_ids(&batch)?;
+        let frame = match instrument_ids {
+            Some(ids) => encode_bus_frame(&ids, &arrow_payload)?,
+            None => encode_bus_frame::<String>(&[], &arrow_payload)?,
+        };
+        let published_seq = self.ring.publish(&frame).map_err(shared_ring_error)?;
         self.next_write_seq = published_seq + 1;
         Ok(())
     }
@@ -376,18 +399,40 @@ impl Reader {
         let deadline = timeout_ms.map(|timeout| Instant::now() + Duration::from_millis(timeout));
 
         loop {
-            match self.ring.read(self.next_read_seq).map_err(shared_ring_error)? {
+            match self
+                .ring
+                .read(self.next_read_seq)
+                .map_err(shared_ring_error)?
+            {
                 SharedReadResult::Ready(frame) => {
-                    let payload = frame.payload;
-                    let batch = decode_batch(&payload)?;
-                    self.next_read_seq += 1;
-                    if let Some(instrument_ids) = &self.instrument_ids {
-                        let filtered = filter_record_batch_by_instrument_ids(&batch, instrument_ids)?;
-                        if filtered.num_rows() == 0 {
-                            continue;
+                    let parsed = parse_bus_frame(&frame.payload)?;
+                    if let Some(filter) = &self.instrument_filter {
+                        match &parsed.kind {
+                            BusFrameKind::Legacy => {
+                                return Err(ZippyError::Io {
+                                    reason: format!(
+                                        "filtered reader requires enveloped bus frame reader_id=[{}] stream_name=[{}] seq=[{}]",
+                                        self.descriptor.reader_id,
+                                        self.descriptor.stream_name,
+                                        self.next_read_seq
+                                    ),
+                                });
+                            }
+                            BusFrameKind::EnvelopedWithoutDirectory => {
+                                self.next_read_seq += 1;
+                                continue;
+                            }
+                            BusFrameKind::EnvelopedWithDirectory { instrument_ids } => {
+                                if !instrument_filter_matches(filter, instrument_ids) {
+                                    self.next_read_seq += 1;
+                                    continue;
+                                }
+                            }
                         }
-                        return Ok(filtered);
                     }
+
+                    let batch = decode_batch(parsed.arrow_payload)?;
+                    self.next_read_seq += 1;
                     return Ok(batch);
                 }
                 SharedReadResult::Lagged {
@@ -459,37 +504,6 @@ impl Drop for Reader {
     }
 }
 
-fn filter_record_batch_by_instrument_ids(
-    batch: &RecordBatch,
-    instrument_ids: &[String],
-) -> Result<RecordBatch> {
-    let instrument_id_index = batch.schema().index_of("instrument_id").map_err(|_| {
-        ZippyError::Io {
-            reason: "filtered reader requires an instrument_id column".to_string(),
-        }
-    })?;
-    let instrument_id_column = batch.column(instrument_id_index);
-    let instrument_id_values = instrument_id_column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ZippyError::Io {
-            reason: "instrument_id column must be utf8".to_string(),
-        })?;
-
-    let predicate = BooleanArray::from_iter((0..instrument_id_values.len()).map(|row| {
-        Some(
-            instrument_id_values.is_valid(row)
-                && instrument_ids
-                    .iter()
-                    .any(|instrument_id| instrument_id == instrument_id_values.value(row)),
-        )
-    }));
-
-    filter_record_batch(batch, &predicate).map_err(|error| ZippyError::Io {
-        reason: error.to_string(),
-    })
-}
-
 fn send_control_request(socket_path: &Path, request: ControlRequest) -> Result<ControlResponse> {
     let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
     let payload = serde_json::to_string(&request).map_err(json_error)?;
@@ -539,6 +553,99 @@ fn open_shared_ring(
     frame_size: usize,
 ) -> Result<SharedFrameRing> {
     SharedFrameRing::create_or_open(shm_name, buffer_size, frame_size).map_err(shared_ring_error)
+}
+
+fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Result<Option<Vec<String>>> {
+    match instrument_ids {
+        Some(ids) if ids.is_empty() => Ok(None),
+        Some(ids) => {
+            if ids.iter().any(|id| id.is_empty()) {
+                return Err(ZippyError::Io {
+                    reason: "instrument filter contains empty value".to_string(),
+                });
+            }
+            Ok(Some(ids))
+        }
+        None => Ok(None),
+    }
+}
+
+fn instrument_filter_request_set(instrument_ids: &Option<Vec<String>>) -> Option<BTreeSet<String>> {
+    instrument_ids
+        .as_ref()
+        .map(|ids| ids.iter().cloned().collect())
+}
+
+fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Result<Option<BTreeSet<String>>> {
+    match instrument_ids {
+        Some(ids) => {
+            if ids.iter().any(|id| id.is_empty()) {
+                return Err(ZippyError::Io {
+                    reason: "descriptor instrument filter contains empty value".to_string(),
+                });
+            }
+
+            let normalized = ids.iter().cloned().collect::<BTreeSet<_>>();
+            if normalized.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(normalized))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn format_instrument_filter_set(filter: Option<&BTreeSet<String>>) -> String {
+    match filter {
+        Some(filter) => filter.iter().cloned().collect::<Vec<_>>().join(","),
+        None => "unfiltered".to_string(),
+    }
+}
+
+fn instrument_filter_matches(filter: &BTreeSet<String>, instrument_ids: &[&str]) -> bool {
+    instrument_ids
+        .iter()
+        .any(|instrument_id| filter.contains(*instrument_id))
+}
+
+fn extract_instrument_ids(batch: &RecordBatch) -> Result<Option<Vec<String>>> {
+    let Ok(instrument_column_index) = batch.schema().index_of("instrument_id") else {
+        return Ok(None);
+    };
+    let instrument_column = batch.column(instrument_column_index);
+    let Some(instrument_ids) = instrument_column.as_any().downcast_ref::<StringArray>() else {
+        return Err(ZippyError::Io {
+            reason: format!(
+                "instrument_id column must be utf8 actual_type=[{:?}]",
+                instrument_column.data_type()
+            ),
+        });
+    };
+
+    let mut unique_instrument_ids = BTreeSet::new();
+    for row_index in 0..instrument_ids.len() {
+        if instrument_ids.is_null(row_index) {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "instrument_id column contains null row_index=[{}]",
+                    row_index
+                ),
+            });
+        }
+        let instrument_id = instrument_ids.value(row_index);
+        if instrument_id.is_empty() {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "instrument_id column contains empty value row_index=[{}]",
+                    row_index
+                ),
+            });
+        }
+        unique_instrument_ids.insert(instrument_id.to_string());
+    }
+
+    Ok(Some(unique_instrument_ids.into_iter().collect()))
 }
 
 fn io_error(error: std::io::Error) -> ZippyError {

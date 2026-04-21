@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,25 @@ fn smoke_batch() -> RecordBatch {
                 "IF2606", "IH2606", "TL2606", "IC2606",
             ])),
             std::sync::Arc::new(Float64Array::from(vec![3210.5, 2987.0, 120.25, 5867.5])),
+        ],
+    )
+    .unwrap()
+}
+
+fn batch_for_instrument(instrument_id: &str) -> RecordBatch {
+    let mid_price = match instrument_id {
+        "IF2606" => 3210.5,
+        "IH2606" => 2987.0,
+        "TL2606" => 120.25,
+        "IC2606" => 5867.5,
+        other => panic!("unexpected instrument_id=[{}]", other),
+    };
+
+    RecordBatch::try_new(
+        smoke_schema(),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec![instrument_id])),
+            std::sync::Arc::new(Float64Array::from(vec![mid_price])),
         ],
     )
     .unwrap()
@@ -71,9 +91,16 @@ fn spawn_master_server(socket_path: &Path) -> (MasterServer, thread::JoinHandle<
     let handle_server = server.clone();
     let socket_path = socket_path.to_path_buf();
     let wait_path = socket_path.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let join_handle = thread::spawn(move || {
-        handle_server.serve(&socket_path).unwrap();
+        let result = handle_server.serve_with_ready(&socket_path, Some(ready_tx));
+        result.unwrap();
     });
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("master server failed to start error=[{}]", error),
+        Err(error) => panic!("master server did not report readiness error=[{}]", error),
+    }
     wait_for_socket_ready(&wait_path);
     (server, join_handle)
 }
@@ -120,6 +147,67 @@ fn master_bus_perf_smoke_roundtrips_batches() {
         elapsed.as_millis(),
         elapsed.as_micros() as f64 / rounds as f64
     );
+
+    reader.close().unwrap();
+    writer.close().unwrap();
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+#[ignore = "perf smoke"]
+fn master_bus_perf_smoke_filtered_reader_skips_non_matching_batches() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_master_server(&socket_path);
+
+    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
+    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
+    writer_client.register_process("perf_writer").unwrap();
+    reader_client.register_process("perf_reader").unwrap();
+    let rounds = 5_000usize;
+
+    let stream_name = format!(
+        "perf_ticks_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    writer_client
+        .register_stream(&stream_name, smoke_schema(), rounds, 2048)
+        .unwrap();
+
+    let mut writer = writer_client.write_to(&stream_name).unwrap();
+    let mut reader = reader_client
+        .read_from_filtered(&stream_name, vec!["IF2606".to_string()])
+        .unwrap();
+
+    let expected_matches = rounds / 100;
+    let expected_batch = batch_for_instrument("IF2606");
+    let start = Instant::now();
+    for round in 0..rounds {
+        let instrument_id = if round % 100 == 0 { "IF2606" } else { "IH2606" };
+        writer.write(batch_for_instrument(instrument_id)).unwrap();
+    }
+
+    let mut observed_matches = 0usize;
+    for _ in 0..expected_matches {
+        let received = reader.read(Some(1_000)).unwrap();
+        assert_eq!(received.num_rows(), expected_batch.num_rows());
+        assert_eq!(received.num_columns(), expected_batch.num_columns());
+        assert_eq!(format!("{received:?}"), format!("{expected_batch:?}"));
+        observed_matches += 1;
+    }
+
+    eprintln!(
+        "filtered reader perf smoke rounds=[{}] matches=[{}] elapsed_ms=[{}]",
+        rounds,
+        observed_matches,
+        start.elapsed().as_millis(),
+    );
+
+    assert_eq!(observed_matches, expected_matches);
 
     reader.close().unwrap();
     writer.close().unwrap();
