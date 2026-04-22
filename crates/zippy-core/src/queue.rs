@@ -171,6 +171,15 @@ impl<T> Drop for QueueSender<T> {
 }
 
 impl<T> QueueReceiver<T> {
+    pub fn try_recv(&self) -> Option<T> {
+        let mut state = self.inner.state.lock().unwrap();
+        let value = state.items.pop_front();
+        if value.is_some() {
+            self.inner.not_full.notify_one();
+        }
+        value
+    }
+
     pub fn recv(&self) -> Result<T, QueueRecvError> {
         let mut state = self.inner.state.lock().unwrap();
 
