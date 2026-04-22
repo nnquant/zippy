@@ -19,6 +19,7 @@ struct Inner<T> {
 struct State<T> {
     items: VecDeque<T>,
     capacity: usize,
+    closed: bool,
 }
 
 impl<T> SpscDataQueue<T> {
@@ -41,6 +42,7 @@ impl<T> SpscDataQueue<T> {
                 state: Mutex::new(State {
                     items: VecDeque::with_capacity(capacity),
                     capacity,
+                    closed: false,
                 }),
                 not_empty: Condvar::new(),
                 not_full: Condvar::new(),
@@ -57,13 +59,19 @@ impl<T> SpscDataQueue<T> {
     pub fn push_blocking(&self, value: T) -> Result<()> {
         let mut state = self.inner.state.lock().unwrap();
 
-        while state.items.len() >= state.capacity {
+        loop {
+            if state.closed {
+                return Err(ZippyError::QueueClosed);
+            }
+
+            if state.items.len() < state.capacity {
+                state.items.push_back(value);
+                self.inner.not_empty.notify_one();
+                return Ok(());
+            }
+
             state = self.inner.not_full.wait(state).unwrap();
         }
-
-        state.items.push_back(value);
-        self.inner.not_empty.notify_one();
-        Ok(())
     }
 
     /// 尝试弹出一个元素。
@@ -77,6 +85,19 @@ impl<T> SpscDataQueue<T> {
             self.inner.not_full.notify_one();
         }
         value
+    }
+
+    /// 关闭队列并唤醒等待中的生产者和消费者。
+    pub fn close(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+
+        state.closed = true;
+        drop(state);
+        self.inner.not_empty.notify_all();
+        self.inner.not_full.notify_all();
     }
 
     /// 判断队列是否为空。

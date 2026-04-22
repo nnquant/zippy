@@ -16,6 +16,8 @@ pub enum ZippyError {
     ChannelSend,
     #[error("channel receive failed")]
     ChannelReceive,
+    #[error("queue closed")]
+    QueueClosed,
     #[error("io error reason=[{reason}]")]
     Io { reason: String },
 }
