@@ -1,5 +1,7 @@
 use std::{
+    collections::HashMap,
     os::fd::{AsFd, OwnedFd},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -9,13 +11,22 @@ use rustix::io;
 #[derive(Debug)]
 pub struct SegmentNotifier {
     fd: OwnedFd,
+    subscription_id: u64,
+    subscriptions: Weak<Mutex<HashMap<u64, OwnedFd>>>,
 }
 
 impl SegmentNotifier {
     /// 创建新的通知器。
-    pub fn new() -> std::io::Result<Self> {
+    fn new(
+        subscription_id: u64,
+        subscriptions: Weak<Mutex<HashMap<u64, OwnedFd>>>,
+    ) -> std::io::Result<Self> {
         let fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            subscription_id,
+            subscriptions,
+        })
     }
 
     /// 返回可供 broadcaster 保存的文件描述符副本。
@@ -45,27 +56,51 @@ impl SegmentNotifier {
     }
 }
 
+impl Drop for SegmentNotifier {
+    fn drop(&mut self) {
+        let Some(subscriptions) = self.subscriptions.upgrade() else {
+            return;
+        };
+        subscriptions.lock().unwrap().remove(&self.subscription_id);
+    }
+}
+
 /// 维护一组订阅者。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SegmentBroadcaster {
-    subscribers: std::sync::Mutex<Vec<OwnedFd>>,
+    next_subscription_id: std::sync::atomic::AtomicU64,
+    subscribers: Arc<Mutex<HashMap<u64, OwnedFd>>>,
+}
+
+impl Default for SegmentBroadcaster {
+    fn default() -> Self {
+        Self {
+            next_subscription_id: std::sync::atomic::AtomicU64::new(1),
+            subscribers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl SegmentBroadcaster {
     /// 注册新的 eventfd 订阅者。
     pub(crate) fn subscribe(&self) -> std::io::Result<SegmentNotifier> {
-        let notifier = SegmentNotifier::new()?;
+        let subscription_id = self
+            .next_subscription_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let notifier = SegmentNotifier::new(subscription_id, Arc::downgrade(&self.subscribers))?;
         self.subscribers
             .lock()
             .unwrap()
-            .push(notifier.try_clone_fd()?);
+            .insert(subscription_id, notifier.try_clone_fd()?);
         Ok(notifier)
     }
 
     /// 广播一次事件给所有订阅者。
     pub(crate) fn notify_all(&self) -> std::io::Result<()> {
-        let mut subscribers = self.subscribers.lock().unwrap();
-        subscribers.retain(|fd| write_eventfd(fd, 1).is_ok());
+        let subscribers = self.subscribers.lock().unwrap();
+        for fd in subscribers.values() {
+            write_eventfd(fd, 1)?;
+        }
         Ok(())
     }
 }
@@ -94,4 +129,31 @@ fn read_eventfd(fd: &OwnedFd) -> std::io::Result<u64> {
         std::io::ErrorKind::UnexpectedEof,
         "short read from eventfd",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn dropping_notifier_removes_subscription() {
+        let broadcaster = SegmentBroadcaster::default();
+        let notifier = broadcaster.subscribe().unwrap();
+        assert_eq!(broadcaster.subscribers.lock().unwrap().len(), 1);
+
+        drop(notifier);
+
+        assert_eq!(broadcaster.subscribers.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn notify_all_propagates_write_error() {
+        let broadcaster = SegmentBroadcaster::default();
+        let file = File::open("/dev/null").unwrap();
+        let fd: OwnedFd = file.into();
+        broadcaster.subscribers.lock().unwrap().insert(1, fd);
+
+        assert!(broadcaster.notify_all().is_err());
+    }
 }

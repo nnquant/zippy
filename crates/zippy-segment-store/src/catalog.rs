@@ -106,6 +106,17 @@ impl SegmentStore {
                 self.decrement_pin(lease.segment_id);
             }
         }
+
+        let handles = self
+            .partitions
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.collect_garbage(self);
+        }
         Ok(())
     }
 
@@ -191,6 +202,7 @@ impl PartitionHandle {
                     active_segment_id: 1,
                     generation: 0,
                     writer,
+                    retired_segments: HashMap::new(),
                 }),
                 broadcaster: SegmentBroadcaster::default(),
             }),
@@ -223,6 +235,13 @@ impl PartitionHandle {
             generation: state.generation,
         })
     }
+
+    fn collect_garbage(&self, store: &SegmentStore) {
+        let mut state = self.inner.state.lock().unwrap();
+        state
+            .retired_segments
+            .retain(|segment_id, _| store.pin_count(*segment_id) > 0);
+    }
 }
 
 #[derive(Debug)]
@@ -239,6 +258,13 @@ struct PartitionState {
     active_segment_id: u64,
     generation: u64,
     writer: ActiveSegmentWriter,
+    retired_segments: HashMap<u64, RetainedSegment>,
+}
+
+#[derive(Debug)]
+struct RetainedSegment {
+    _generation: u64,
+    _writer: ActiveSegmentWriter,
 }
 
 /// 分区写入句柄。
@@ -291,18 +317,28 @@ impl PartitionWriterHandle {
     pub fn rollover(&self) -> Result<(), ZippySegmentStoreError> {
         {
             let mut state = self.handle.inner.state.lock().unwrap();
+            let old_segment_id = state.active_segment_id;
+            let old_generation = state.generation;
             state.active_segment_id += 1;
             state.generation += 1;
             let schema = test_schema()?;
             let layout = LayoutPlan::for_schema(&schema, state.row_capacity)
                 .map_err(ZippySegmentStoreError::Layout)?;
-            state.writer = ActiveSegmentWriter::new_with_ids_for_test(
+            let new_writer = ActiveSegmentWriter::new_with_ids_for_test(
                 schema,
                 layout,
                 state.active_segment_id,
                 state.generation,
             )
             .map_err(ZippySegmentStoreError::Writer)?;
+            let old_writer = std::mem::replace(&mut state.writer, new_writer);
+            state.retired_segments.insert(
+                old_segment_id,
+                RetainedSegment {
+                    _generation: old_generation,
+                    _writer: old_writer,
+                },
+            );
         }
 
         self.handle
@@ -348,4 +384,32 @@ fn test_schema() -> Result<crate::CompiledSchema, ZippySegmentStoreError> {
         ColumnSpec::new("last_price", ColumnType::Float64),
     ])
     .map_err(ZippySegmentStoreError::Schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollover_keeps_pinned_old_segment_until_collect_garbage() {
+        let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+        let handle = store.open_partition("ticks", "rb2501").unwrap();
+        let session = store.open_session("reader-a").unwrap();
+        let lease = session.attach_active(&handle).unwrap();
+        let old_segment_id = lease.segment_id();
+
+        handle.writer().rollover().unwrap();
+
+        {
+            let state = handle.inner.state.lock().unwrap();
+            assert_ne!(state.active_segment_id, old_segment_id);
+            assert!(state.retired_segments.contains_key(&old_segment_id));
+        }
+
+        drop(lease);
+        store.collect_garbage().unwrap();
+
+        let state = handle.inner.state.lock().unwrap();
+        assert!(!state.retired_segments.contains_key(&old_segment_id));
+    }
 }
