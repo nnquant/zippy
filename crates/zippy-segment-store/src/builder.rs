@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use crate::{ColumnType, CompiledSchema, LayoutPlan, SegmentHeader};
+use crate::{
+    segment::{SealedSegmentData, SealedUtf8Column},
+    ColumnType, CompiledSchema, LayoutPlan, SealedSegmentHandle, SegmentHeader,
+};
 
 #[derive(Debug, Clone)]
 struct Utf8ColumnBuffer {
@@ -205,6 +208,71 @@ impl ActiveSegmentWriter {
         String::from_utf8(bytes.to_vec()).map_err(|_| "invalid utf8")
     }
 
+    /// 追加一条测试 tick，仅写入 schema 中存在的测试列。
+    pub fn append_tick_for_test(
+        &mut self,
+        dt: i64,
+        instrument_id: &str,
+        last_price: f64,
+    ) -> Result<(), &'static str> {
+        self.begin_row()?;
+
+        if self.column_type("dt").is_ok() {
+            self.write_i64("dt", dt)?;
+        }
+        if self.column_type("instrument_id").is_ok() {
+            self.write_utf8("instrument_id", instrument_id)?;
+        }
+        if self.column_type("last_price").is_ok() {
+            self.write_f64("last_price", last_price)?;
+        }
+
+        self.commit_row()
+    }
+
+    /// 导出测试用 sealed snapshot。
+    pub fn sealed_handle_for_test(&self) -> Result<SealedSegmentHandle, &'static str> {
+        Ok(self.snapshot_sealed_handle())
+    }
+
+    pub(crate) fn into_sealed_handle(self) -> SealedSegmentHandle {
+        let row_count = self.committed_row_count();
+        let i64_columns = self
+            .i64_columns
+            .into_iter()
+            .map(|(name, values)| (name, values.into_iter().take(row_count).collect()))
+            .collect();
+        let f64_columns = self
+            .f64_columns
+            .into_iter()
+            .map(|(name, values)| (name, values.into_iter().take(row_count).collect()))
+            .collect();
+        let utf8_columns = self
+            .utf8_columns
+            .into_iter()
+            .map(|(name, values)| {
+                let end = values.offsets[row_count] as usize;
+                (
+                    name,
+                    SealedUtf8Column {
+                        offsets: values.offsets.into_iter().take(row_count + 1).collect(),
+                        values: values.values.into_iter().take(end).collect(),
+                    },
+                )
+            })
+            .collect();
+
+        SealedSegmentHandle::new(SealedSegmentData {
+            schema: self.schema,
+            segment_id: self.header.segment_id,
+            _generation: self.header.generation,
+            row_count,
+            i64_columns,
+            f64_columns,
+            utf8_columns,
+        })
+    }
+
     fn ensure_row_open(&self) -> Result<(), &'static str> {
         if !self.current_row_open {
             return Err("row is not open");
@@ -222,5 +290,43 @@ impl ActiveSegmentWriter {
             .find(|spec| spec.name == column)
             .map(|spec| &spec.data_type)
             .ok_or("missing column")
+    }
+
+    fn snapshot_sealed_handle(&self) -> SealedSegmentHandle {
+        let row_count = self.committed_row_count();
+        let i64_columns = self
+            .i64_columns
+            .iter()
+            .map(|(name, values)| (*name, values[..row_count].to_vec()))
+            .collect();
+        let f64_columns = self
+            .f64_columns
+            .iter()
+            .map(|(name, values)| (*name, values[..row_count].to_vec()))
+            .collect();
+        let utf8_columns = self
+            .utf8_columns
+            .iter()
+            .map(|(name, values)| {
+                let end = values.offsets[row_count] as usize;
+                (
+                    *name,
+                    SealedUtf8Column {
+                        offsets: values.offsets[..=row_count].to_vec(),
+                        values: values.values[..end].to_vec(),
+                    },
+                )
+            })
+            .collect();
+
+        SealedSegmentHandle::new(SealedSegmentData {
+            schema: self.schema.clone(),
+            segment_id: self.header.segment_id,
+            _generation: self.header.generation,
+            row_count,
+            i64_columns,
+            f64_columns,
+            utf8_columns,
+        })
     }
 }

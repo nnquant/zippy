@@ -8,7 +8,8 @@ use std::{
 
 use crate::{
     compile_schema, notify::SegmentBroadcaster, ActiveSegmentWriter, ColumnSpec, ColumnType,
-    LayoutPlan, ReaderSession, SegmentNotifier, ZippySegmentStoreError,
+    LayoutPlan, PersistenceQueue, ReaderSession, SealedSegmentHandle, SegmentNotifier,
+    ZippySegmentStoreError,
 };
 
 /// Segment store 的最小配置。
@@ -32,6 +33,7 @@ impl SegmentStoreConfig {
 pub struct SegmentStore {
     pub(crate) config: SegmentStoreConfig,
     pub(crate) partitions: Arc<Mutex<HashMap<(String, String), PartitionHandle>>>,
+    pub(crate) persistence: PersistenceQueue,
     pub(crate) sessions: Arc<Mutex<HashMap<u64, ReaderSessionState>>>,
     pub(crate) pins: Arc<Mutex<HashMap<u64, usize>>>,
     pub(crate) next_session_id: Arc<AtomicU64>,
@@ -43,6 +45,7 @@ impl SegmentStore {
         Ok(Self {
             config,
             partitions: Arc::new(Mutex::new(HashMap::new())),
+            persistence: PersistenceQueue::new(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pins: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
@@ -118,6 +121,23 @@ impl SegmentStore {
             handle.collect_garbage(self);
         }
         Ok(())
+    }
+
+    /// 将 sealed segment 放入最小持久化队列。
+    pub fn enqueue_persistence(
+        &self,
+        segment: SealedSegmentHandle,
+    ) -> Result<(), ZippySegmentStoreError> {
+        self.persistence
+            .enqueue(segment)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+
+    /// 仅用于测试：同步 flush 一条 parquet。
+    pub fn flush_one_for_test(&self) -> Result<std::path::PathBuf, ZippySegmentStoreError> {
+        self.persistence
+            .flush_one_for_test()
+            .map_err(ZippySegmentStoreError::Writer)
     }
 
     pub(crate) fn attach_lease(
@@ -264,7 +284,7 @@ struct PartitionState {
 #[derive(Debug)]
 struct RetainedSegment {
     _generation: u64,
-    _writer: ActiveSegmentWriter,
+    _sealed: SealedSegmentHandle,
 }
 
 /// 分区写入句柄。
@@ -285,23 +305,7 @@ impl PartitionWriterHandle {
             let mut state = self.handle.inner.state.lock().unwrap();
             state
                 .writer
-                .begin_row()
-                .map_err(ZippySegmentStoreError::Writer)?;
-            state
-                .writer
-                .write_i64("dt", dt)
-                .map_err(ZippySegmentStoreError::Writer)?;
-            state
-                .writer
-                .write_utf8("instrument_id", instrument_id)
-                .map_err(ZippySegmentStoreError::Writer)?;
-            state
-                .writer
-                .write_f64("last_price", last_price)
-                .map_err(ZippySegmentStoreError::Writer)?;
-            state
-                .writer
-                .commit_row()
+                .append_tick_for_test(dt, instrument_id, last_price)
                 .map_err(ZippySegmentStoreError::Writer)?;
         }
 
@@ -314,8 +318,8 @@ impl PartitionWriterHandle {
     }
 
     /// 创建新的 active segment 并通知 reader。
-    pub fn rollover(&self) -> Result<(), ZippySegmentStoreError> {
-        {
+    pub fn rollover(&self) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
+        let sealed = {
             let mut state = self.handle.inner.state.lock().unwrap();
             let old_segment_id = state.active_segment_id;
             let old_generation = state.generation;
@@ -332,21 +336,23 @@ impl PartitionWriterHandle {
             )
             .map_err(ZippySegmentStoreError::Writer)?;
             let old_writer = std::mem::replace(&mut state.writer, new_writer);
+            let sealed = old_writer.into_sealed_handle();
             state.retired_segments.insert(
                 old_segment_id,
                 RetainedSegment {
                     _generation: old_generation,
-                    _writer: old_writer,
+                    _sealed: sealed.clone(),
                 },
             );
-        }
+            sealed
+        };
 
         self.handle
             .inner
             .broadcaster
             .notify_all()
             .map_err(ZippySegmentStoreError::Io)?;
-        Ok(())
+        Ok(sealed)
     }
 }
 

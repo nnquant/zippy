@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 arrow.workspace = true
+crossbeam-channel.workspace = true
 parquet.workspace = true
 serde.workspace = true
 shared_memory = "0.12.4"

@@ -1,19 +1,24 @@
+mod arrow_bridge;
 mod builder;
 mod catalog;
 mod layout;
 mod lifecycle;
 mod notify;
+mod persistence;
 mod schema;
 mod segment;
 mod shm;
+mod view;
 
 pub use builder::ActiveSegmentWriter;
 pub use catalog::{PartitionHandle, PartitionWriterHandle, SegmentStore, SegmentStoreConfig};
 pub use layout::{ColumnLayout, LayoutPlan};
 pub use lifecycle::{ReaderSession, SegmentLease};
 pub use notify::SegmentNotifier;
+pub use persistence::PersistenceQueue;
 pub use schema::{compile_schema, ColumnSpec, ColumnType, CompiledSchema};
-pub use segment::SegmentHeader;
+pub use segment::{SealedSegmentHandle, SegmentHeader};
+pub use view::RowSpanView;
 
 use thiserror::Error;
 

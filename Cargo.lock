@@ -2350,6 +2350,7 @@ name = "zippy-segment-store"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "crossbeam-channel",
  "parquet",
  "rustix 0.38.44",
  "serde",
