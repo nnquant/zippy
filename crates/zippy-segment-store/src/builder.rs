@@ -29,8 +29,13 @@ pub struct ActiveSegmentWriter {
 }
 
 impl ActiveSegmentWriter {
-    /// 为测试构造一个最小 active segment writer。
-    pub fn new_for_test(schema: CompiledSchema, layout: LayoutPlan) -> Result<Self, &'static str> {
+    /// 构造指定 segment 标识的最小 active segment writer。
+    pub fn new_with_ids_for_test(
+        schema: CompiledSchema,
+        layout: LayoutPlan,
+        segment_id: u64,
+        generation: u64,
+    ) -> Result<Self, &'static str> {
         let mut i64_columns = HashMap::new();
         let mut f64_columns = HashMap::new();
         let mut utf8_columns = HashMap::new();
@@ -60,8 +65,8 @@ impl ActiveSegmentWriter {
         Ok(Self {
             header: SegmentHeader {
                 schema_id: schema.schema_id(),
-                segment_id: 1,
-                generation: 0,
+                segment_id,
+                generation,
                 capacity_rows: layout.row_capacity(),
                 row_count: 0,
                 committed_row_count: Arc::new(AtomicUsize::new(0)),
@@ -75,6 +80,11 @@ impl ActiveSegmentWriter {
             f64_columns,
             utf8_columns,
         })
+    }
+
+    /// 为测试构造一个最小 active segment writer。
+    pub fn new_for_test(schema: CompiledSchema, layout: LayoutPlan) -> Result<Self, &'static str> {
+        Self::new_with_ids_for_test(schema, layout, 1, 0)
     }
 
     /// 打开当前行写入。
@@ -117,6 +127,16 @@ impl ActiveSegmentWriter {
     /// 返回对外可见的已提交行数。
     pub fn committed_row_count(&self) -> usize {
         self.header.committed_row_count.load(Ordering::Acquire)
+    }
+
+    /// 返回当前 segment 标识。
+    pub fn segment_id(&self) -> u64 {
+        self.header.segment_id
+    }
+
+    /// 返回当前 generation。
+    pub fn generation(&self) -> u64 {
+        self.header.generation
     }
 
     /// 写入 i64 值的最小占位接口。
