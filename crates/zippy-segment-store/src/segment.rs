@@ -26,9 +26,11 @@ pub(crate) struct SealedUtf8Column {
 #[derive(Debug)]
 pub(crate) struct SealedSegmentData {
     pub(crate) schema: CompiledSchema,
+    pub(crate) persistence_key: String,
     pub(crate) segment_id: u64,
     pub(crate) _generation: u64,
     pub(crate) row_count: usize,
+    pub(crate) validity: HashMap<&'static str, Vec<bool>>,
     pub(crate) i64_columns: HashMap<&'static str, Vec<i64>>,
     pub(crate) f64_columns: HashMap<&'static str, Vec<f64>>,
     pub(crate) utf8_columns: HashMap<&'static str, SealedUtf8Column>,
@@ -58,5 +60,9 @@ impl SealedSegmentHandle {
 
     pub(crate) fn schema(&self) -> &CompiledSchema {
         &self.inner.schema
+    }
+
+    pub(crate) fn persistence_key(&self) -> &str {
+        &self.inner.persistence_key
     }
 }

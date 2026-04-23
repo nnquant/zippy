@@ -40,9 +40,20 @@ impl RowSpanView {
                     .ok_or_else(|| {
                         ArrowError::SchemaError(format!("missing column [{field_name}]"))
                     })?;
-                Ok(Arc::new(Int64Array::from(
-                    values[self.start_row..self.end_row].to_vec(),
-                )))
+                if spec.nullable {
+                    let validity = self.validity_slice(field_name)?;
+                    Ok(Arc::new(Int64Array::from(
+                        values[self.start_row..self.end_row]
+                            .iter()
+                            .zip(validity.iter().copied())
+                            .map(|(value, is_valid)| is_valid.then_some(*value))
+                            .collect::<Vec<_>>(),
+                    )))
+                } else {
+                    Ok(Arc::new(Int64Array::from(
+                        values[self.start_row..self.end_row].to_vec(),
+                    )))
+                }
             }
             ColumnType::Float64 => {
                 let values = self
@@ -53,9 +64,20 @@ impl RowSpanView {
                     .ok_or_else(|| {
                         ArrowError::SchemaError(format!("missing column [{field_name}]"))
                     })?;
-                Ok(Arc::new(Float64Array::from(
-                    values[self.start_row..self.end_row].to_vec(),
-                )))
+                if spec.nullable {
+                    let validity = self.validity_slice(field_name)?;
+                    Ok(Arc::new(Float64Array::from(
+                        values[self.start_row..self.end_row]
+                            .iter()
+                            .zip(validity.iter().copied())
+                            .map(|(value, is_valid)| is_valid.then_some(*value))
+                            .collect::<Vec<_>>(),
+                    )))
+                } else {
+                    Ok(Arc::new(Float64Array::from(
+                        values[self.start_row..self.end_row].to_vec(),
+                    )))
+                }
             }
             ColumnType::Utf8 => {
                 let values = self
@@ -66,16 +88,34 @@ impl RowSpanView {
                     .ok_or_else(|| {
                         ArrowError::SchemaError(format!("missing column [{field_name}]"))
                     })?;
-                let strings = (self.start_row..self.end_row)
-                    .map(|row| {
-                        let start = values.offsets[row] as usize;
-                        let end = values.offsets[row + 1] as usize;
-                        std::str::from_utf8(&values.values[start..end])
-                            .map(str::to_owned)
-                            .map_err(|err| ArrowError::ParseError(err.to_string()))
-                    })
-                    .collect::<Result<Vec<_>, ArrowError>>()?;
-                Ok(Arc::new(StringArray::from(strings)))
+                if spec.nullable {
+                    let validity = self.validity_slice(field_name)?;
+                    let strings = (self.start_row..self.end_row)
+                        .zip(validity.iter().copied())
+                        .map(|(row, is_valid)| {
+                            if !is_valid {
+                                return Ok(None);
+                            }
+                            let start = values.offsets[row] as usize;
+                            let end = values.offsets[row + 1] as usize;
+                            std::str::from_utf8(&values.values[start..end])
+                                .map(|value| Some(value.to_owned()))
+                                .map_err(|err| ArrowError::ParseError(err.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>()?;
+                    Ok(Arc::new(StringArray::from(strings)))
+                } else {
+                    let strings = (self.start_row..self.end_row)
+                        .map(|row| {
+                            let start = values.offsets[row] as usize;
+                            let end = values.offsets[row + 1] as usize;
+                            std::str::from_utf8(&values.values[start..end])
+                                .map(str::to_owned)
+                                .map_err(|err| ArrowError::ParseError(err.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, ArrowError>>()?;
+                    Ok(Arc::new(StringArray::from(strings)))
+                }
             }
             ColumnType::TimestampNsTz(timezone) => {
                 let values = self
@@ -86,12 +126,36 @@ impl RowSpanView {
                     .ok_or_else(|| {
                         ArrowError::SchemaError(format!("missing column [{field_name}]"))
                     })?;
-                Ok(Arc::new(
-                    TimestampNanosecondArray::from(values[self.start_row..self.end_row].to_vec())
+                if spec.nullable {
+                    let validity = self.validity_slice(field_name)?;
+                    Ok(Arc::new(
+                        TimestampNanosecondArray::from(
+                            values[self.start_row..self.end_row]
+                                .iter()
+                                .zip(validity.iter().copied())
+                                .map(|(value, is_valid)| is_valid.then_some(*value))
+                                .collect::<Vec<_>>(),
+                        )
                         .with_timezone((*timezone).to_string()),
-                ))
+                    ))
+                } else {
+                    Ok(Arc::new(
+                        TimestampNanosecondArray::from(
+                            values[self.start_row..self.end_row].to_vec(),
+                        )
+                        .with_timezone((*timezone).to_string()),
+                    ))
+                }
             }
         }
+    }
+
+    fn validity_slice(&self, field_name: &str) -> Result<&[bool], ArrowError> {
+        let validity =
+            self.handle.inner.validity.get(field_name).ok_or_else(|| {
+                ArrowError::SchemaError(format!("missing validity [{field_name}]"))
+            })?;
+        Ok(&validity[self.start_row..self.end_row])
     }
 }
 

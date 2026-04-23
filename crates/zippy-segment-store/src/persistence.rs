@@ -29,7 +29,11 @@ impl PersistenceQueue {
         let batch = sealed
             .as_record_batch()
             .map_err(|_| "batch export failed")?;
-        let path = std::env::temp_dir().join(format!("segment-{}.parquet", sealed.segment_id()));
+        let path = std::env::temp_dir().join(format!(
+            "segment-{}-{}.parquet",
+            sanitize_path_component(sealed.persistence_key()),
+            sealed.segment_id()
+        ));
         let file = std::fs::File::create(&path).map_err(|_| "create parquet failed")?;
         let mut writer =
             ArrowWriter::try_new(file, batch.schema(), None).map_err(|_| "writer init failed")?;
@@ -37,6 +41,16 @@ impl PersistenceQueue {
         writer.close().map_err(|_| "close parquet failed")?;
         Ok(path)
     }
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
 }
 
 impl Default for PersistenceQueue {

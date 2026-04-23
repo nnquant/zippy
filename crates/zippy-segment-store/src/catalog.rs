@@ -31,6 +31,7 @@ impl SegmentStoreConfig {
 /// Segment store owner。
 #[derive(Debug, Clone)]
 pub struct SegmentStore {
+    pub(crate) store_id: u64,
     pub(crate) config: SegmentStoreConfig,
     pub(crate) partitions: Arc<Mutex<HashMap<(String, String), PartitionHandle>>>,
     pub(crate) persistence: PersistenceQueue,
@@ -43,6 +44,7 @@ impl SegmentStore {
     /// 创建 store。
     pub fn new(config: SegmentStoreConfig) -> Result<Self, ZippySegmentStoreError> {
         Ok(Self {
+            store_id: next_store_id(),
             config,
             partitions: Arc::new(Mutex::new(HashMap::new())),
             persistence: PersistenceQueue::new(),
@@ -64,7 +66,12 @@ impl SegmentStore {
             return Ok(handle.clone());
         }
 
-        let handle = PartitionHandle::new(stream, partition, self.config.default_row_capacity)?;
+        let handle = PartitionHandle::new(
+            self.store_id,
+            stream,
+            partition,
+            self.config.default_row_capacity,
+        )?;
         partitions.insert(key, handle.clone());
         Ok(handle)
     }
@@ -203,6 +210,7 @@ pub struct PartitionHandle {
 impl PartitionHandle {
     /// 创建一个最小分区。
     pub fn new(
+        store_id: u64,
         stream: &str,
         partition: &str,
         row_capacity: usize,
@@ -210,11 +218,14 @@ impl PartitionHandle {
         let schema = test_schema()?;
         let layout = LayoutPlan::for_schema(&schema, row_capacity)
             .map_err(ZippySegmentStoreError::Layout)?;
-        let writer = ActiveSegmentWriter::new_with_ids_for_test(schema, layout, 1, 0)
-            .map_err(ZippySegmentStoreError::Writer)?;
+        let persistence_key = format!("store-{store_id}-{stream}-{partition}");
+        let writer =
+            ActiveSegmentWriter::new_with_origin_for_test(schema, layout, 1, 0, persistence_key)
+                .map_err(ZippySegmentStoreError::Writer)?;
 
         Ok(Self {
             inner: Arc::new(PartitionInner {
+                store_id,
                 _stream: stream.to_string(),
                 _partition: partition.to_string(),
                 state: Mutex::new(PartitionState {
@@ -266,6 +277,7 @@ impl PartitionHandle {
 
 #[derive(Debug)]
 struct PartitionInner {
+    store_id: u64,
     _stream: String,
     _partition: String,
     state: Mutex<PartitionState>,
@@ -321,6 +333,11 @@ impl PartitionWriterHandle {
     pub fn rollover(&self) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
         let sealed = {
             let mut state = self.handle.inner.state.lock().unwrap();
+            if state.writer.has_open_row() {
+                return Err(ZippySegmentStoreError::Writer(
+                    "open row exists during rollover",
+                ));
+            }
             let old_segment_id = state.active_segment_id;
             let old_generation = state.generation;
             state.active_segment_id += 1;
@@ -328,11 +345,16 @@ impl PartitionWriterHandle {
             let schema = test_schema()?;
             let layout = LayoutPlan::for_schema(&schema, state.row_capacity)
                 .map_err(ZippySegmentStoreError::Layout)?;
-            let new_writer = ActiveSegmentWriter::new_with_ids_for_test(
+            let persistence_key = format!(
+                "store-{}-{}-{}",
+                self.handle.inner.store_id, self.handle.inner._stream, self.handle.inner._partition
+            );
+            let new_writer = ActiveSegmentWriter::new_with_origin_for_test(
                 schema,
                 layout,
                 state.active_segment_id,
                 state.generation,
+                persistence_key,
             )
             .map_err(ZippySegmentStoreError::Writer)?;
             let old_writer = std::mem::replace(&mut state.writer, new_writer);
@@ -392,6 +414,11 @@ fn test_schema() -> Result<crate::CompiledSchema, ZippySegmentStoreError> {
     .map_err(ZippySegmentStoreError::Schema)
 }
 
+fn next_store_id() -> u64 {
+    static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +444,24 @@ mod tests {
 
         let state = handle.inner.state.lock().unwrap();
         assert!(!state.retired_segments.contains_key(&old_segment_id));
+    }
+
+    #[test]
+    fn rollover_rejects_open_row_instead_of_dropping_it() {
+        let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+        let handle = store.open_partition("ticks", "rb2501").unwrap();
+
+        {
+            let mut state = handle.inner.state.lock().unwrap();
+            state.writer.begin_row().unwrap();
+            state.writer.write_i64("dt", 1).unwrap();
+        }
+
+        let err = handle.writer().rollover().unwrap_err();
+        assert!(matches!(err, ZippySegmentStoreError::Writer(_)));
+
+        let state = handle.inner.state.lock().unwrap();
+        assert_eq!(state.active_segment_id, 1);
+        assert!(state.retired_segments.is_empty());
     }
 }
