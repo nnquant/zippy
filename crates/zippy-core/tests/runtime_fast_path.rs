@@ -430,6 +430,10 @@ fn source_pipeline_block_mode_with_xfast_keeps_control_ordering() {
         stop_result.recv_timeout(Duration::from_secs(1)),
         Ok(Ok(()))
     ));
+
+    runtime.wait_until_stopped();
+    let records = runtime.wait_for_records_len(3);
+    assert_eq!(records, vec!["data:1", "flush", "stop"]);
 }
 
 #[test]

@@ -334,12 +334,16 @@ fn test_batch() -> RecordBatch {
 }
 
 fn test_engine_config(name: &str) -> EngineConfig {
+    test_engine_config_with_xfast(name, false)
+}
+
+fn test_engine_config_with_xfast(name: &str, xfast: bool) -> EngineConfig {
     EngineConfig {
         name: name.to_string(),
         buffer_capacity: 16,
         overflow_policy: OverflowPolicy::Block,
         late_data_policy: Default::default(),
-        xfast: false,
+        xfast,
     }
 }
 
@@ -778,6 +782,37 @@ fn source_runtime_consumer_natural_exit_without_stop_is_failed() {
     .unwrap();
 
     wait_for_status(&handle, EngineStatus::Failed);
+
+    let err = handle.stop().unwrap_err();
+    match err {
+        ZippyError::Io { reason } => assert_eq!(reason, "source terminated without stop event"),
+        other => panic!("unexpected stop error: {other:?}"),
+    }
+}
+
+#[test]
+fn source_runtime_pipeline_xfast_drains_fast_data_before_source_terminated_failure() {
+    let schema = test_schema();
+    let calls = Arc::new(Mutex::new(RecordedCalls::default()));
+    let source = StaticSource::new(
+        SourceMode::Pipeline,
+        schema.clone(),
+        vec![
+            SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
+            SourceEvent::Data(test_batch()),
+        ],
+    );
+    let engine = RecordingEngine::new(schema, calls.clone());
+    let mut handle = spawn_source_engine_with_publisher(
+        Box::new(source),
+        engine,
+        test_engine_config_with_xfast("pipeline-natural-exit-xfast", true),
+        NoopPublisher,
+    )
+    .unwrap();
+
+    wait_for_status(&handle, EngineStatus::Failed);
+    assert_eq!(calls.lock().unwrap().data_count, 1);
 
     let err = handle.stop().unwrap_err();
     match err {
