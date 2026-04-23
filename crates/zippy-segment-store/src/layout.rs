@@ -31,7 +31,8 @@ impl LayoutPlan {
             }
         }
 
-        fn value_bytes(data_type: &ColumnType, rows: usize) -> usize {
+        // Utf8 在布局阶段只预留 values buffer 容量，不表示真实已写入字节数。
+        fn reserved_value_bytes(data_type: &ColumnType, rows: usize) -> usize {
             match data_type {
                 ColumnType::Int64 | ColumnType::Float64 | ColumnType::TimestampNsTz(_) => rows * 8,
                 ColumnType::Utf8 => rows * 32,
@@ -72,7 +73,7 @@ impl LayoutPlan {
 
             cursor = align_to(cursor, 8);
             let values_offset = cursor;
-            let values_len = value_bytes(&spec.data_type, row_capacity);
+            let values_len = reserved_value_bytes(&spec.data_type, row_capacity);
             cursor += values_len;
 
             columns.push(ColumnLayout {
