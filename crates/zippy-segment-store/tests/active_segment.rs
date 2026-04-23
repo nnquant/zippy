@@ -52,14 +52,22 @@ fn utf8_offsets_only_become_readable_after_commit() {
 }
 
 #[test]
-fn write_utf8_rejects_values_buffer_overflow() {
+fn write_utf8_respects_layout_values_len_boundary() {
     let schema = compile_schema(&[ColumnSpec::new("instrument_id", ColumnType::Utf8)]).unwrap();
     let layout = LayoutPlan::for_schema(&schema, 1).unwrap();
-    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    let capacity = layout.column("instrument_id").unwrap().values_len;
+    let mut writer = ActiveSegmentWriter::new_for_test(schema.clone(), layout.clone()).unwrap();
 
     writer.begin_row().unwrap();
-    let oversized = "x".repeat(64);
+    let exact_fit = "x".repeat(capacity);
+    assert!(writer.write_utf8("instrument_id", &exact_fit).is_ok());
+    writer.commit_row().unwrap();
+    assert_eq!(writer.committed_row_count(), 1);
 
-    assert!(writer.write_utf8("instrument_id", &oversized).is_err());
-    assert_eq!(writer.committed_row_count(), 0);
+    let mut overflow_writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    overflow_writer.begin_row().unwrap();
+    let oversized = "x".repeat(capacity + 1);
+
+    assert!(overflow_writer.write_utf8("instrument_id", &oversized).is_err());
+    assert_eq!(overflow_writer.committed_row_count(), 0);
 }
