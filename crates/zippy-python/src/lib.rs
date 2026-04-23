@@ -206,6 +206,7 @@ struct RuntimeOptions {
     buffer_capacity: usize,
     overflow_policy: OverflowPolicy,
     archive_buffer_capacity: usize,
+    xfast: bool,
 }
 
 #[derive(Clone)]
@@ -2003,7 +2004,7 @@ struct StreamTableEngine {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -2017,6 +2018,7 @@ impl ReactiveStateEngine {
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
+        xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -2035,8 +2037,12 @@ impl ReactiveStateEngine {
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
-        let runtime_options =
-            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
         let handle = Arc::new(Mutex::new(None));
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
@@ -2156,7 +2162,7 @@ impl ReactiveStateEngine {
 impl StreamTableEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         name: String,
         input_schema: &Bound<'_, PyAny>,
@@ -2166,6 +2172,7 @@ impl StreamTableEngine {
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
+        xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -2183,8 +2190,12 @@ impl StreamTableEngine {
                 error
             }
         })?;
-        let runtime_options =
-            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
         let handle = Arc::new(Mutex::new(None));
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
@@ -2302,7 +2313,7 @@ impl StreamTableEngine {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -2323,6 +2334,7 @@ impl TimeSeriesEngine {
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
+        xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -2358,8 +2370,12 @@ impl TimeSeriesEngine {
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
-        let runtime_options =
-            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
         let handle = Arc::new(Mutex::new(None));
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
@@ -2485,7 +2501,7 @@ impl TimeSeriesEngine {
 impl CrossSectionalEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -2501,6 +2517,7 @@ impl CrossSectionalEngine {
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
+        xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -2533,8 +2550,12 @@ impl CrossSectionalEngine {
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
-        let runtime_options =
-            parse_runtime_options(buffer_capacity, overflow_policy, archive_buffer_capacity)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
         let handle = Arc::new(Mutex::new(None));
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
@@ -3223,6 +3244,7 @@ fn start_runtime_engine<E: Engine>(
         buffer_capacity: runtime_options.buffer_capacity,
         overflow_policy: runtime_options.overflow_policy,
         late_data_policy: Default::default(),
+        xfast: runtime_options.xfast,
     };
     config
         .validate()
@@ -3476,6 +3498,7 @@ fn parse_runtime_options(
     buffer_capacity: usize,
     overflow_policy: Option<&Bound<'_, PyAny>>,
     archive_buffer_capacity: usize,
+    xfast: bool,
 ) -> PyResult<RuntimeOptions> {
     if buffer_capacity == 0 {
         return Err(py_value_error("buffer_capacity must be greater than zero"));
@@ -3491,6 +3514,7 @@ fn parse_runtime_options(
         buffer_capacity,
         overflow_policy: parse_overflow_policy(overflow_policy)?,
         archive_buffer_capacity,
+        xfast,
     })
 }
 
@@ -3557,6 +3581,7 @@ fn engine_base_config_dict<'py>(
         "archive_buffer_capacity",
         runtime_options.archive_buffer_capacity,
     )?;
+    dict.set_item("xfast", runtime_options.xfast)?;
     dict.set_item("source_linked", source_linked)?;
     dict.set_item("has_sink", parquet_sink.is_some())?;
     dict.set_item("targets", target_configs_to_pylist(py, targets)?)?;
@@ -4298,6 +4323,7 @@ mod tests {
                 buffer_capacity: 1024,
                 overflow_policy: Default::default(),
                 late_data_policy: Default::default(),
+                xfast: false,
             },
             Box::new(RustNullPublisher::default()),
         )
@@ -4311,6 +4337,7 @@ mod tests {
                 buffer_capacity: 1024,
                 overflow_policy: Default::default(),
                 late_data_policy: Default::default(),
+                xfast: false,
             },
             InProcessPublisher {
                 downstream: DownstreamLink {

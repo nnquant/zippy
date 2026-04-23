@@ -426,6 +426,7 @@ class ReactiveStateEngine:
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -457,6 +458,7 @@ class StreamTableEngine:
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -498,6 +500,7 @@ class TimeSeriesEngine:
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -534,6 +537,7 @@ class CrossSectionalEngine:
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
     ) -> None: ...
 
     def start(self) -> None: ...

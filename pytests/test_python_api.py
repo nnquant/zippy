@@ -1700,6 +1700,21 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
     assert engine.metrics()["processed_batches_total"] == 1
 
 
+def test_reactive_engine_config_exposes_runtime_xfast(tmp_path: Path) -> None:
+    schema = pa.schema([("symbol", pa.string()), ("price", pa.float64())])
+
+    engine = zippy.ReactiveStateEngine(
+        name="tick_factors",
+        input_schema=schema,
+        id_column="symbol",
+        factors=[zippy.Expr(expression="price * 2.0", output="price_x2")],
+        target=zippy.NullPublisher(),
+        xfast=True,
+    )
+
+    assert engine.config()["xfast"] is True
+
+
 def test_reactive_engine_id_filter_filters_rows_and_updates_config_and_metrics() -> None:
     schema = pa.schema(
         [
@@ -1840,6 +1855,16 @@ def test_timeseries_engine_config_and_output_archive_roundtrip(
         "window_end",
         "open",
     ]
+
+
+def test_stream_table_engine_runtime_xfast_defaults_false() -> None:
+    schema = pa.schema([("symbol", pa.string()), ("price", pa.float64())])
+    engine = zippy.StreamTableEngine(
+        name="ticks",
+        input_schema=schema,
+        target=zippy.NullPublisher(),
+    )
+    assert engine.config()["xfast"] is False
 
 
 def test_timeseries_engine_id_filter_filters_rows_and_updates_config_and_metrics() -> None:
