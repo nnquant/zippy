@@ -2772,7 +2772,8 @@ fn export_function_to_zippy_root(
     function: &Bound<'_, PyAny>,
 ) -> PyResult<()> {
     let sys = PyModule::import_bound(py, "sys")?;
-    let modules = sys.getattr("modules")?.downcast::<PyDict>()?;
+    let modules = sys.getattr("modules")?;
+    let modules = modules.downcast::<PyDict>()?;
 
     if let Some(zippy_module) = modules.get_item("zippy")? {
         zippy_module.setattr(name, function)?;
