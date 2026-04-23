@@ -1867,6 +1867,31 @@ def test_stream_table_engine_runtime_xfast_defaults_false() -> None:
     assert engine.config()["xfast"] is False
 
 
+def test_timeseries_engine_config_exposes_runtime_xfast() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("price", pa.float64()),
+        ]
+    )
+
+    engine = zippy.TimeSeriesEngine(
+        name="bar_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        window=zippy.Duration.minutes(1),
+        window_type=zippy.WindowType.TUMBLING,
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.AGG_FIRST(column="price", output="open")],
+        target=zippy.NullPublisher(),
+        xfast=True,
+    )
+
+    assert engine.config()["xfast"] is True
+
+
 def test_timeseries_engine_id_filter_filters_rows_and_updates_config_and_metrics() -> None:
     input_schema = pa.schema(
         [
@@ -2596,6 +2621,30 @@ def test_cross_sectional_engine_emits_bucketed_output_over_zmq() -> None:
 
     engine.stop()
     subscriber.close()
+
+
+def test_cross_sectional_engine_config_exposes_runtime_xfast() -> None:
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+
+    engine = zippy.CrossSectionalEngine(
+        name="cs_1m",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        target=zippy.NullPublisher(),
+        xfast=True,
+    )
+
+    assert engine.config()["xfast"] is True
 
 
 def test_cross_sectional_engine_rejects_unsupported_late_data_policy() -> None:
