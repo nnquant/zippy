@@ -129,16 +129,6 @@ impl ActiveSegmentWriter {
         self.header.committed_row_count.load(Ordering::Acquire)
     }
 
-    /// 返回当前 segment 标识。
-    pub fn segment_id(&self) -> u64 {
-        self.header.segment_id
-    }
-
-    /// 返回当前 generation。
-    pub fn generation(&self) -> u64 {
-        self.header.generation
-    }
-
     /// 写入 i64 值的最小占位接口。
     pub fn write_i64(&mut self, column: &str, value: i64) -> Result<(), &'static str> {
         self.ensure_row_open()?;
