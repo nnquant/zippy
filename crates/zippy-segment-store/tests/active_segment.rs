@@ -16,13 +16,20 @@ fn reader_only_observes_committed_prefix() {
     writer.begin_row().unwrap();
     writer.write_i64("dt", 1).unwrap();
     writer.write_utf8("instrument_id", "rb2510").unwrap();
-
-    assert_eq!(writer.committed_row_count(), 0);
-
     writer.write_f64("last_price", 4123.5).unwrap();
     writer.commit_row().unwrap();
+    assert_eq!(writer.committed_row_count(), 1);
+
+    writer.begin_row().unwrap();
+    writer.write_i64("dt", 2).unwrap();
+    writer.write_utf8("instrument_id", "rb2511").unwrap();
 
     assert_eq!(writer.committed_row_count(), 1);
+    assert!(writer.read_utf8_for_test("instrument_id", 1).is_err());
+
+    writer.write_f64("last_price", 4124.5).unwrap();
+    writer.commit_row().unwrap();
+    assert_eq!(writer.committed_row_count(), 2);
 }
 
 #[test]
@@ -34,6 +41,7 @@ fn utf8_offsets_only_become_readable_after_commit() {
     writer.begin_row().unwrap();
     writer.write_utf8("instrument_id", "ag2501").unwrap();
     assert_eq!(writer.committed_row_count(), 0);
+    assert!(writer.read_utf8_for_test("instrument_id", 0).is_err());
 
     writer.commit_row().unwrap();
     assert_eq!(writer.committed_row_count(), 1);
