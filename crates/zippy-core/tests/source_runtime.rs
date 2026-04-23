@@ -66,6 +66,50 @@ impl RecordingEngine {
     }
 }
 
+struct OrderedRecordingEngine {
+    schema: Arc<Schema>,
+    order: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl OrderedRecordingEngine {
+    fn new(schema: Arc<Schema>, order: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        Self { schema, order }
+    }
+}
+
+impl Engine for OrderedRecordingEngine {
+    fn name(&self) -> &str {
+        "ordered-recording-engine"
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+        self.order.lock().unwrap().push("data");
+        Ok(vec![batch])
+    }
+
+    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+        self.order.lock().unwrap().push("flush");
+        Ok(vec![test_batch()])
+    }
+
+    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+        self.order.lock().unwrap().push("stop");
+        Ok(vec![test_batch()])
+    }
+
+    fn drain_metrics(&mut self) -> EngineMetricsDelta {
+        EngineMetricsDelta::default()
+    }
+}
+
 impl Engine for RecordingEngine {
     fn name(&self) -> &str {
         "recording-engine"
@@ -140,12 +184,104 @@ impl Source for StaticSource {
     }
 }
 
+struct SyncStartSource {
+    mode: SourceMode,
+    schema: Arc<Schema>,
+    events: Vec<SourceEvent>,
+}
+
+impl Source for SyncStartSource {
+    fn name(&self) -> &str {
+        "sync-start-source"
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn mode(&self) -> SourceMode {
+        self.mode
+    }
+
+    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> Result<SourceHandle> {
+        for event in self.events {
+            sink.emit(event)?;
+        }
+
+        Ok(SourceHandle::new(thread::spawn(|| Ok(()))))
+    }
+}
+
 struct BlockingSource {
     mode: SourceMode,
     schema: Arc<Schema>,
     stop_calls: Arc<AtomicUsize>,
     release_tx: Sender<()>,
     release_rx: Receiver<()>,
+}
+
+struct AbortTrackingSource {
+    mode: SourceMode,
+    schema: Arc<Schema>,
+    stop_calls: Arc<AtomicUsize>,
+    finished_tx: Sender<()>,
+    release_tx: Sender<()>,
+    release_rx: Receiver<()>,
+}
+
+impl AbortTrackingSource {
+    fn new(
+        mode: SourceMode,
+        schema: Arc<Schema>,
+        stop_calls: Arc<AtomicUsize>,
+        finished_tx: Sender<()>,
+    ) -> Self {
+        let (release_tx, release_rx) = bounded(1);
+        Self {
+            mode,
+            schema,
+            stop_calls,
+            finished_tx,
+            release_tx,
+            release_rx,
+        }
+    }
+}
+
+impl Source for AbortTrackingSource {
+    fn name(&self) -> &str {
+        "abort-tracking-source"
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn mode(&self) -> SourceMode {
+        self.mode
+    }
+
+    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> Result<SourceHandle> {
+        let schema = self.schema.clone();
+        let stop_calls = self.stop_calls.clone();
+        let finished_tx = self.finished_tx.clone();
+        let release_tx = self.release_tx.clone();
+        let release_rx = self.release_rx;
+        let join_handle = thread::spawn(move || -> Result<()> {
+            sink.emit(SourceEvent::Hello(StreamHello::new("bars", schema, 1)?))?;
+            release_rx.recv().map_err(|_| ZippyError::ChannelReceive)?;
+            finished_tx.send(()).map_err(|_| ZippyError::ChannelSend)?;
+            Ok(())
+        });
+
+        Ok(SourceHandle::new_with_stop(
+            join_handle,
+            Box::new(move || {
+                stop_calls.fetch_add(1, Ordering::Relaxed);
+                release_tx.send(()).map_err(|_| ZippyError::ChannelSend)
+            }),
+        ))
+    }
 }
 
 impl BlockingSource {
@@ -409,6 +545,16 @@ fn test_engine_config(name: &str) -> EngineConfig {
     test_engine_config_with_xfast(name, false)
 }
 
+fn test_engine_config_with_capacity(name: &str, buffer_capacity: usize) -> EngineConfig {
+    EngineConfig {
+        name: name.to_string(),
+        buffer_capacity,
+        overflow_policy: OverflowPolicy::Block,
+        late_data_policy: Default::default(),
+        xfast: false,
+    }
+}
+
 fn test_engine_config_with_xfast(name: &str, xfast: bool) -> EngineConfig {
     EngineConfig {
         name: name.to_string(),
@@ -473,6 +619,143 @@ fn pipeline_source_runtime_forwards_flush_into_engine() {
         }
     );
     assert_eq!(handle.metrics().output_batches_total, 3);
+}
+
+#[test]
+fn prepared_source_runtime_replays_events_emitted_during_start() {
+    let schema = test_schema();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = bounded(1);
+    let prepare_schema = schema.clone();
+    thread::spawn(move || {
+        let result = zippy_core::runtime::prepare_source_runtime(
+            Box::new(SyncStartSource {
+                mode: SourceMode::Pipeline,
+                schema: prepare_schema.clone(),
+                events: vec![
+                    SourceEvent::Hello(
+                        StreamHello::new("bars", prepare_schema.clone(), 1).unwrap(),
+                    ),
+                    SourceEvent::Data(test_batch()),
+                    SourceEvent::Flush,
+                    SourceEvent::Stop,
+                ],
+            }),
+            test_engine_config_with_capacity("prepared-runtime", 3),
+        );
+        done_tx.send(result).unwrap();
+    });
+    let prepared = done_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("prepare_source_runtime should not block when pre-spawn data uses fast queue")
+        .unwrap();
+
+    let engine = OrderedRecordingEngine::new(schema, order.clone());
+    let mut handle = prepared
+        .spawn_with_publisher(engine, NoopPublisher)
+        .unwrap();
+
+    wait_for_status(&handle, EngineStatus::Stopped);
+    assert_eq!(*order.lock().unwrap(), vec!["data", "flush", "stop"]);
+    handle.stop().unwrap();
+}
+
+#[test]
+fn prepared_source_runtime_processes_data_before_error_emitted_during_start() {
+    let schema = test_schema();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done_rx) = bounded(1);
+    let prepare_schema = schema.clone();
+    thread::spawn(move || {
+        let result = zippy_core::runtime::prepare_source_runtime(
+            Box::new(SyncStartSource {
+                mode: SourceMode::Pipeline,
+                schema: prepare_schema.clone(),
+                events: vec![
+                    SourceEvent::Hello(
+                        StreamHello::new("bars", prepare_schema.clone(), 1).unwrap(),
+                    ),
+                    SourceEvent::Data(test_batch()),
+                    SourceEvent::Error("prepared-runtime-error".to_string()),
+                ],
+            }),
+            test_engine_config_with_capacity("prepared-runtime-error", 2),
+        );
+        done_tx.send(result).unwrap();
+    });
+    let prepared = done_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("prepare_source_runtime should not block when pre-spawn data uses fast queue")
+        .unwrap();
+
+    let engine = OrderedRecordingEngine::new(schema, order.clone());
+    let mut handle = prepared
+        .spawn_with_publisher(engine, NoopPublisher)
+        .unwrap();
+
+    wait_for_status(&handle, EngineStatus::Failed);
+    assert_eq!(*order.lock().unwrap(), vec!["data"]);
+
+    let err = handle.stop().unwrap_err();
+    match err {
+        ZippyError::Io { reason } => assert_eq!(reason, "prepared-runtime-error"),
+        other => panic!("unexpected stop error: {other:?}"),
+    }
+}
+
+#[test]
+fn prepared_source_runtime_abort_requests_source_shutdown_and_joins() {
+    let schema = test_schema();
+    let stop_calls = Arc::new(AtomicUsize::new(0));
+    let (finished_tx, finished_rx) = bounded(1);
+    let prepared = zippy_core::runtime::prepare_source_runtime(
+        Box::new(AbortTrackingSource::new(
+            SourceMode::Consumer,
+            schema,
+            stop_calls.clone(),
+            finished_tx,
+        )),
+        test_engine_config("prepared-abort"),
+    )
+    .unwrap();
+
+    prepared.abort().unwrap();
+
+    assert_eq!(stop_calls.load(Ordering::Relaxed), 1);
+    finished_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("abort should join the prepared source thread");
+}
+
+#[test]
+fn prepared_source_runtime_drop_requests_source_shutdown_and_joins() {
+    let schema = test_schema();
+    let stop_calls = Arc::new(AtomicUsize::new(0));
+    let (finished_tx, finished_rx) = bounded(1);
+    let prepared = zippy_core::runtime::prepare_source_runtime(
+        Box::new(AbortTrackingSource::new(
+            SourceMode::Consumer,
+            schema,
+            stop_calls.clone(),
+            finished_tx,
+        )),
+        test_engine_config("prepared-drop"),
+    )
+    .unwrap();
+
+    let (drop_done_tx, drop_done_rx) = bounded(1);
+    thread::spawn(move || {
+        drop(prepared);
+        drop_done_tx.send(()).unwrap();
+    });
+
+    drop_done_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("dropping prepared runtime should finish promptly");
+    assert_eq!(stop_calls.load(Ordering::Relaxed), 1);
+    finished_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("drop should join the prepared source thread");
 }
 
 #[test]

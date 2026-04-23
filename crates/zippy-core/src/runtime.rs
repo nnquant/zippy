@@ -9,11 +9,10 @@ use crossbeam_channel::{bounded, Sender};
 use tracing::{debug, error, info};
 
 use crate::{
-    queue::{QueueSendError, QueueSender},
-    SpscDataQueue,
+    queue::{QueueReceiver, QueueSendError, QueueSender},
     Engine, EngineConfig, EngineMetrics, EngineMetricsSnapshot, EngineStatus, OverflowPolicy,
     Publisher, Result, Source, SourceEvent, SourceHandle as RuntimeSourceHandle, SourceMode,
-    SourceSink, ZippyError,
+    SourceSink, SpscDataQueue, ZippyError,
 };
 
 fn zippy_debug_stop_enabled() -> bool {
@@ -51,15 +50,52 @@ enum Command {
     Flush(Sender<Result<Vec<RecordBatch>>>),
     Stop,
     SourceEvent(SourceEvent),
+    SourceEventWithFastDataBarrier(SourceEvent),
     SourceTerminated(Result<()>),
 }
 
 struct FastDataPath {
     data_queue: Arc<SpscDataQueue<RecordBatch>>,
-    worker_thread: std::thread::Thread,
+    worker_thread: Mutex<Option<std::thread::Thread>>,
     worker_running: Arc<AtomicBool>,
     xfast: bool,
     emit_lock: Mutex<()>,
+}
+
+impl FastDataPath {
+    fn install_worker(&self, worker_thread: std::thread::Thread) {
+        let _emit_guard = self.emit_lock.lock().unwrap();
+        *self.worker_thread.lock().unwrap() = Some(worker_thread.clone());
+        self.worker_running.store(true, Ordering::Release);
+        worker_thread.unpark();
+    }
+
+    fn notify_worker(&self) {
+        if let Some(worker_thread) = self.worker_thread.lock().unwrap().as_ref() {
+            worker_thread.unpark();
+        }
+    }
+
+    fn worker_installed(&self) -> bool {
+        self.worker_thread.lock().unwrap().is_some()
+    }
+}
+
+pub struct PreparedSourceRuntime {
+    inner: Option<PreparedSourceRuntimeInner>,
+}
+
+struct PreparedSourceRuntimeInner {
+    config: EngineConfig,
+    status: Arc<Mutex<EngineStatus>>,
+    tx: QueueSender<Command>,
+    rx: QueueReceiver<Command>,
+    metrics: Arc<EngineMetrics>,
+    sink: Arc<SourceRuntimeSink>,
+    source_handle: RuntimeSourceHandle,
+    source_mode: SourceMode,
+    source_schema: Arc<Schema>,
+    source_name: String,
 }
 
 pub struct EngineHandle {
@@ -243,23 +279,30 @@ impl SourceSink for SourceRuntimeSink {
             return match event {
                 SourceEvent::Data(batch) => {
                     path.data_queue.push_blocking(batch)?;
-                    path.worker_thread.unpark();
+                    path.notify_worker();
                     Ok(())
                 }
                 other => {
-                    match &other {
+                    let command = match &other {
                         SourceEvent::Flush | SourceEvent::Stop | SourceEvent::Error(_) => {
-                            wait_for_fast_data_drain(path.as_ref());
+                            if path.worker_installed() {
+                                wait_for_fast_data_drain(path.as_ref());
+                                Command::SourceEvent(other)
+                            } else if !path.data_queue.is_empty() {
+                                Command::SourceEventWithFastDataBarrier(other)
+                            } else {
+                                Command::SourceEvent(other)
+                            }
                         }
-                        _ => {}
-                    }
+                        _ => Command::SourceEvent(other),
+                    };
 
                     enqueue_runtime_command(
                         &self.status,
                         self.overflow_policy,
                         &self.tx,
                         &self.metrics,
-                        Command::SourceEvent(other),
+                        command,
                     )
                 }
             };
@@ -398,6 +441,9 @@ where
                     Command::SourceEvent(_) => {
                         unreachable!("source events are not dispatched into spawn_engine worker");
                     }
+                    Command::SourceEventWithFastDataBarrier(_) => {
+                        unreachable!("source events are not dispatched into spawn_engine worker");
+                    }
                     Command::SourceTerminated(_) => {
                         unreachable!(
                             "source termination is not dispatched into spawn_engine worker"
@@ -453,258 +499,297 @@ where
     E: Engine,
     P: Publisher,
 {
-    spawn_source_engine_with_publisher_inner(source, engine, config, publisher)
+    prepare_source_runtime(source, config)?.spawn_with_publisher(engine, publisher)
 }
 
-fn spawn_source_engine_with_publisher_inner<S, E, P>(
+pub fn prepare_source_runtime<S>(
     source: Box<S>,
-    mut engine: E,
     config: EngineConfig,
-    mut publisher: P,
-) -> Result<EngineHandle>
+) -> Result<PreparedSourceRuntime>
 where
     S: Source + ?Sized,
-    E: Engine,
-    P: Publisher,
 {
     config.validate()?;
-    let engine_name = config.name.clone();
     let queue = crate::queue::BoundedQueue::new(config.buffer_capacity);
     let status = Arc::new(Mutex::new(EngineStatus::Running));
     let metrics = Arc::new(EngineMetrics::default());
-    let status_clone = status.clone();
-    let metrics_clone = metrics.clone();
-    let rx = queue.receiver();
     let tx = queue.sender();
     let source_mode = source.mode();
     let source_schema = source.output_schema();
-    let engine_schema = engine.input_schema();
     let source_name = source.name().to_string();
-    let fast_data_queue =
-        if source_mode == SourceMode::Pipeline && config.overflow_policy == OverflowPolicy::Block {
-            Some(Arc::new(SpscDataQueue::new(config.buffer_capacity)?))
-        } else {
-            None
-        };
-    let fast_data_worker_running = fast_data_queue
-        .as_ref()
-        .map(|_| Arc::new(AtomicBool::new(true)));
-    let fast_data_shutdown_requested = fast_data_queue
-        .as_ref()
-        .map(|_| Arc::new(AtomicBool::new(false)));
-    let worker_fast_data_queue = fast_data_queue.clone();
-    let worker_fast_data_running = fast_data_worker_running.clone();
-    let worker_fast_data_shutdown_requested = fast_data_shutdown_requested.clone();
-    let worker_engine_name = engine_name.clone();
-    let worker_source_name = source_name.clone();
-
-    let join_handle = thread::spawn(move || -> Result<()> {
-        let worker_result = (|| -> Result<()> {
-            let mut hello_seen = false;
-
-            match &worker_fast_data_queue {
-                Some(data_queue) => loop {
-                    if worker_fast_data_shutdown_requested
-                        .as_ref()
-                        .expect("fast data shutdown flag should exist")
-                        .load(Ordering::Acquire)
-                    {
-                        return Ok(());
-                    }
-
-                    if let Some(command) = rx.try_recv() {
-                        if handle_source_control_command(
-                            &mut engine,
-                            &mut publisher,
-                            &metrics_clone,
-                            &status_clone,
-                            source_mode,
-                            &source_schema,
-                            &engine_schema,
-                            worker_engine_name.as_str(),
-                            worker_source_name.as_str(),
-                            &mut hello_seen,
-                            command,
-                        )? {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-
-                    if let Some(batch) = data_queue.try_pop() {
-                        if !hello_seen {
-                            return fail_worker(
-                                &mut engine,
-                                &status_clone,
-                                ZippyError::InvalidConfig {
-                                    reason: "source hello must arrive before data".to_string(),
-                                },
-                            );
-                        }
-                        process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)
-                            .inspect_err(|_| {
-                                *status_clone.lock().unwrap() = EngineStatus::Failed;
-                            })?;
-                        continue;
-                    }
-
-                    if worker_fast_data_shutdown_requested
-                        .as_ref()
-                        .expect("fast data shutdown flag should exist")
-                        .load(Ordering::Acquire)
-                    {
-                        return Ok(());
-                    }
-
-                    runtime_idle_wait(config.xfast);
-                },
-                None => {
-                    while let Ok(command) = rx.recv() {
-                        if handle_source_control_command(
-                            &mut engine,
-                            &mut publisher,
-                            &metrics_clone,
-                            &status_clone,
-                            source_mode,
-                            &source_schema,
-                            &engine_schema,
-                            worker_engine_name.as_str(),
-                            worker_source_name.as_str(),
-                            &mut hello_seen,
-                            command,
-                        )? {
-                            return Ok(());
-                        }
-                    }
-                    Ok(())
-                }
-            }
-        })();
-
-        if let Some(data_queue) = &worker_fast_data_queue {
-            data_queue.close();
-            drain_fast_data_queue(data_queue.as_ref());
-        }
-        if let Some(worker_running) = &worker_fast_data_running {
-            worker_running.store(false, Ordering::Release);
-        }
-
-        if let Err(err) = &worker_result {
-            error!(
-                component = "runtime",
-                engine = worker_engine_name.as_str(),
-                source = worker_source_name.as_str(),
-                event = "worker_failure",
-                error = %err,
-                "worker failed"
-            );
-            *status_clone.lock().unwrap() = EngineStatus::Failed;
-        }
-
-        worker_result
-    });
-
     let sink = Arc::new(SourceRuntimeSink {
         status: status.clone(),
         overflow_policy: config.overflow_policy,
         tx: tx.clone(),
         metrics: metrics.clone(),
-        fast_data_path: fast_data_queue.clone().map(|data_queue| {
-            Arc::new(FastDataPath {
-                data_queue,
-                worker_thread: join_handle.thread().clone(),
-                worker_running: fast_data_worker_running
-                    .as_ref()
-                    .expect("fast data worker running should exist")
-                    .clone(),
+        fast_data_path: if source_mode == SourceMode::Pipeline
+            && config.overflow_policy == OverflowPolicy::Block
+        {
+            Some(Arc::new(FastDataPath {
+                data_queue: Arc::new(SpscDataQueue::new(config.buffer_capacity)?),
+                worker_thread: Mutex::new(None),
+                worker_running: Arc::new(AtomicBool::new(false)),
                 xfast: config.xfast,
                 emit_lock: Mutex::new(()),
-            })
-        }),
+            }))
+        } else {
+            None
+        },
     });
-    let source_handle = match source.start(sink.clone()) {
-        Ok(source_handle) => source_handle,
-        Err(err) => {
-            drop(sink);
-            drop(tx);
+    let source_handle = source.start(sink.clone())?;
 
-            if let Some(shutdown_requested) = &fast_data_shutdown_requested {
-                shutdown_requested.store(true, Ordering::Release);
-                join_handle.thread().unpark();
+    Ok(PreparedSourceRuntime {
+        inner: Some(PreparedSourceRuntimeInner {
+            config,
+            status,
+            tx,
+            rx: queue.receiver(),
+            metrics,
+            sink,
+            source_handle,
+            source_mode,
+            source_schema,
+            source_name,
+        }),
+    })
+}
+
+impl PreparedSourceRuntime {
+    pub fn abort(mut self) -> Result<()> {
+        self.abort_inner()
+    }
+
+    pub fn spawn_with_publisher<E, P>(
+        mut self,
+        mut engine: E,
+        mut publisher: P,
+    ) -> Result<EngineHandle>
+    where
+        E: Engine,
+        P: Publisher,
+    {
+        let PreparedSourceRuntimeInner {
+            config,
+            status,
+            tx,
+            rx,
+            metrics,
+            sink,
+            source_handle,
+            source_mode,
+            source_schema,
+            source_name,
+        } = self
+            .inner
+            .take()
+            .expect("prepared source runtime can only be consumed once");
+        let engine_name = config.name.clone();
+        let overflow_policy = config.overflow_policy;
+        let xfast = config.xfast;
+        let engine_schema = engine.input_schema();
+        let status_clone = status.clone();
+        let metrics_clone = metrics.clone();
+        let worker_fast_data_queue = sink
+            .fast_data_path
+            .as_ref()
+            .map(|path| path.data_queue.clone());
+        let worker_fast_data_running = sink
+            .fast_data_path
+            .as_ref()
+            .map(|path| path.worker_running.clone());
+        let worker_engine_name = engine_name.clone();
+        let worker_source_name = source_name.clone();
+
+        let join_handle = thread::spawn(move || -> Result<()> {
+            let worker_result = (|| -> Result<()> {
+                let mut hello_seen = false;
+
+                match &worker_fast_data_queue {
+                    Some(data_queue) => loop {
+                        if let Some(command) = rx.try_recv() {
+                            if handle_source_control_command(
+                                &mut engine,
+                                &mut publisher,
+                                &metrics_clone,
+                                &status_clone,
+                                Some(data_queue.as_ref()),
+                                source_mode,
+                                &source_schema,
+                                &engine_schema,
+                                worker_engine_name.as_str(),
+                                worker_source_name.as_str(),
+                                &mut hello_seen,
+                                command,
+                            )? {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+
+                        if let Some(batch) = data_queue.try_pop() {
+                            if !hello_seen {
+                                return fail_worker(
+                                    &mut engine,
+                                    &status_clone,
+                                    ZippyError::InvalidConfig {
+                                        reason: "source hello must arrive before data".to_string(),
+                                    },
+                                );
+                            }
+                            process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)
+                                .inspect_err(|_| {
+                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                })?;
+                            continue;
+                        }
+
+                        runtime_idle_wait(xfast);
+                    },
+                    None => {
+                        while let Ok(command) = rx.recv() {
+                            if handle_source_control_command(
+                                &mut engine,
+                                &mut publisher,
+                                &metrics_clone,
+                                &status_clone,
+                                None,
+                                source_mode,
+                                &source_schema,
+                                &engine_schema,
+                                worker_engine_name.as_str(),
+                                worker_source_name.as_str(),
+                                &mut hello_seen,
+                                command,
+                            )? {
+                                return Ok(());
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+            })();
+
+            if let Some(data_queue) = &worker_fast_data_queue {
+                data_queue.close();
+                drain_fast_data_queue(data_queue.as_ref());
+            }
+            if let Some(worker_running) = &worker_fast_data_running {
+                worker_running.store(false, Ordering::Release);
             }
 
-            let worker_join_result = join_handle.join().map_err(|_| ZippyError::Io {
-                reason: "worker thread panicked".to_string(),
-            })?;
-            if let Err(join_err) = worker_join_result {
-                return Err(join_err);
+            if let Err(err) = &worker_result {
+                error!(
+                    component = "runtime",
+                    engine = worker_engine_name.as_str(),
+                    source = worker_source_name.as_str(),
+                    event = "worker_failure",
+                    error = %err,
+                    "worker failed"
+                );
+                *status_clone.lock().unwrap() = EngineStatus::Failed;
             }
 
-            return Err(err);
-        }
-    };
-    let monitor_source_handle = source_handle.clone();
-    let monitor_status = status.clone();
-    let monitor_tx = tx.clone();
-    let monitor_metrics = metrics.clone();
-    let monitor_fast_data_queue = fast_data_queue.clone();
-    let monitor_fast_data_running = fast_data_worker_running.clone();
-    let monitor_engine_name = engine_name.clone();
-    let source_monitor_handle = thread::spawn(move || {
-        let source_result = monitor_source_handle.join();
-        if monitor_source_handle.stop_requested() && source_result.is_ok() {
-            return;
+            worker_result
+        });
+        if let Some(path) = &sink.fast_data_path {
+            path.install_worker(join_handle.thread().clone());
         }
 
-        if let (Some(data_queue), Some(worker_running)) =
-            (&monitor_fast_data_queue, &monitor_fast_data_running)
-        {
-            wait_for_fast_data_queue_drain(
-                data_queue.as_ref(),
-                worker_running.as_ref(),
-                config.xfast,
+        let monitor_source_handle = source_handle.clone();
+        let monitor_status = status.clone();
+        let monitor_tx = tx.clone();
+        let monitor_metrics = metrics.clone();
+        let monitor_fast_data_queue = sink
+            .fast_data_path
+            .as_ref()
+            .map(|path| path.data_queue.clone());
+        let monitor_fast_data_running = sink
+            .fast_data_path
+            .as_ref()
+            .map(|path| path.worker_running.clone());
+        let monitor_engine_name = engine_name.clone();
+        let source_monitor_handle = thread::spawn(move || {
+            let source_result = monitor_source_handle.join();
+            if monitor_source_handle.stop_requested() && source_result.is_ok() {
+                return;
+            }
+
+            if let (Some(data_queue), Some(worker_running)) =
+                (&monitor_fast_data_queue, &monitor_fast_data_running)
+            {
+                wait_for_fast_data_queue_drain(data_queue.as_ref(), worker_running.as_ref(), xfast);
+            }
+
+            let current_status = *monitor_status.lock().unwrap();
+            if current_status != EngineStatus::Running {
+                return;
+            }
+
+            let _ = enqueue_runtime_command(
+                &monitor_status,
+                OverflowPolicy::Block,
+                &monitor_tx,
+                &monitor_metrics,
+                Command::SourceTerminated(source_result),
+            );
+            debug!(
+                component = "runtime",
+                engine = monitor_engine_name.as_str(),
+                event = "source_terminated",
+                "source termination forwarded"
+            );
+        });
+
+        info!(
+            component = "runtime",
+            engine = engine_name.as_str(),
+            source = source_name.as_str(),
+            event = "start",
+            status = EngineStatus::Running.as_str(),
+            "engine started"
+        );
+
+        Ok(EngineHandle {
+            status,
+            overflow_policy,
+            tx,
+            join_handle: Some(join_handle),
+            source_handle: Some(source_handle),
+            source_monitor_handle: Some(source_monitor_handle),
+            metrics,
+            fast_data_path: sink.fast_data_path.clone(),
+        })
+    }
+
+    fn abort_inner(&mut self) -> Result<()> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+
+        *inner.status.lock().unwrap() = EngineStatus::Stopping;
+        inner.source_handle.stop()?;
+        let join_result = inner.source_handle.join();
+        *inner.status.lock().unwrap() = if join_result.is_ok() {
+            EngineStatus::Stopped
+        } else {
+            EngineStatus::Failed
+        };
+        self.inner = None;
+        join_result
+    }
+}
+
+impl Drop for PreparedSourceRuntime {
+    fn drop(&mut self) {
+        if let Err(err) = self.abort_inner() {
+            error!(
+                component = "runtime",
+                event = "prepared_runtime_drop_cleanup_failed",
+                error = %err,
+                "prepared runtime cleanup failed"
             );
         }
-
-        let current_status = *monitor_status.lock().unwrap();
-        if current_status != EngineStatus::Running {
-            return;
-        }
-
-        let _ = enqueue_runtime_command(
-            &monitor_status,
-            OverflowPolicy::Block,
-            &monitor_tx,
-            &monitor_metrics,
-            Command::SourceTerminated(source_result),
-        );
-        debug!(
-            component = "runtime",
-            engine = monitor_engine_name.as_str(),
-            event = "source_terminated",
-            "source termination forwarded"
-        );
-    });
-
-    info!(
-        component = "runtime",
-        engine = engine_name.as_str(),
-        source = source_name.as_str(),
-        event = "start",
-        status = EngineStatus::Running.as_str(),
-        "engine started"
-    );
-
-    Ok(EngineHandle {
-        status,
-        overflow_policy: config.overflow_policy,
-        tx,
-        join_handle: Some(join_handle),
-        source_handle: Some(source_handle),
-        source_monitor_handle: Some(source_monitor_handle),
-        metrics,
-        fast_data_path: sink.fast_data_path.clone(),
-    })
+    }
 }
 
 fn enqueue_runtime_command(
@@ -781,6 +866,7 @@ fn handle_source_control_command<E, P>(
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
     status: &Arc<Mutex<EngineStatus>>,
+    fast_data_queue: Option<&SpscDataQueue<RecordBatch>>,
     source_mode: SourceMode,
     source_schema: &Arc<Schema>,
     engine_schema: &Arc<Schema>,
@@ -832,6 +918,24 @@ where
                 fail_worker(engine, status, err)?;
             }
         },
+        Command::SourceEventWithFastDataBarrier(event) => {
+            let data_queue = fast_data_queue.expect("fast data barrier requires fast data queue");
+            drain_fast_data_events(engine, publisher, metrics, status, data_queue, hello_seen)?;
+            return handle_source_control_command(
+                engine,
+                publisher,
+                metrics,
+                status,
+                fast_data_queue,
+                source_mode,
+                source_schema,
+                engine_schema,
+                worker_engine_name,
+                worker_source_name,
+                hello_seen,
+                Command::SourceEvent(event),
+            );
+        }
         Command::SourceEvent(event) => match event {
             SourceEvent::Hello(hello) => {
                 if *hello_seen {
@@ -899,8 +1003,7 @@ where
                         engine = worker_engine_name,
                         source = worker_source_name,
                         event = "flush",
-                        batch_rows =
-                            outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                        batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                         "engine flushed"
                     );
                 }
@@ -927,8 +1030,7 @@ where
                         engine = worker_engine_name,
                         source = worker_source_name,
                         event = "stop",
-                        batch_rows =
-                            outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                        batch_rows = outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                         "engine stopped"
                     );
                     return Ok(true);
@@ -952,6 +1054,36 @@ where
     }
 
     Ok(false)
+}
+
+fn drain_fast_data_events<E, P>(
+    engine: &mut E,
+    publisher: &mut P,
+    metrics: &Arc<EngineMetrics>,
+    status: &Arc<Mutex<EngineStatus>>,
+    data_queue: &SpscDataQueue<RecordBatch>,
+    hello_seen: &mut bool,
+) -> Result<()>
+where
+    E: Engine,
+    P: Publisher,
+{
+    while let Some(batch) = data_queue.try_pop() {
+        if !*hello_seen {
+            return fail_worker(
+                engine,
+                status,
+                ZippyError::InvalidConfig {
+                    reason: "source hello must arrive before data".to_string(),
+                },
+            );
+        }
+        process_data_event(engine, publisher, metrics, batch).inspect_err(|_| {
+            *status.lock().unwrap() = EngineStatus::Failed;
+        })?;
+    }
+
+    Ok(())
 }
 
 fn process_data_event<E, P>(
@@ -1065,4 +1197,43 @@ where
     publisher.close().inspect_err(|_| {
         metrics.inc_publish_errors(1);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crossbeam_channel::bounded;
+
+    #[test]
+    fn fast_data_path_install_worker_waits_for_emit_lock() {
+        let path = Arc::new(FastDataPath {
+            data_queue: Arc::new(SpscDataQueue::new(1).unwrap()),
+            worker_thread: Mutex::new(None),
+            worker_running: Arc::new(AtomicBool::new(false)),
+            xfast: false,
+            emit_lock: Mutex::new(()),
+        });
+        let emit_guard = path.emit_lock.lock().unwrap();
+        let (done_tx, done_rx) = bounded(1);
+        let install_path = path.clone();
+        let installer = thread::spawn(move || {
+            install_path.install_worker(thread::current());
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "install_worker should not finish while emit_lock is held"
+        );
+
+        drop(emit_guard);
+
+        done_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("install_worker should finish after emit_lock is released");
+        installer.join().unwrap();
+        assert!(path.worker_installed());
+        assert!(path.worker_running.load(Ordering::Acquire));
+    }
 }
