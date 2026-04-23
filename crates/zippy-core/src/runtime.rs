@@ -70,6 +70,7 @@ pub struct EngineHandle {
     source_handle: Option<RuntimeSourceHandle>,
     source_monitor_handle: Option<JoinHandle<()>>,
     metrics: Arc<EngineMetrics>,
+    fast_data_path: Option<Arc<FastDataPath>>,
 }
 
 struct SourceRuntimeSink {
@@ -77,7 +78,7 @@ struct SourceRuntimeSink {
     overflow_policy: OverflowPolicy,
     tx: QueueSender<Command>,
     metrics: Arc<EngineMetrics>,
-    fast_data_path: Option<FastDataPath>,
+    fast_data_path: Option<Arc<FastDataPath>>,
 }
 
 impl EngineHandle {
@@ -89,7 +90,7 @@ impl EngineHandle {
     pub fn flush(&self) -> Result<Vec<RecordBatch>> {
         self.ensure_running()?;
         let (tx, rx) = bounded(1);
-        self.enqueue_command(Command::Flush(tx))?;
+        self.enqueue_control_command_with_fast_data_barrier(Command::Flush(tx))?;
         rx.recv().map_err(|_| ZippyError::ChannelReceive)?
     }
 
@@ -110,19 +111,16 @@ impl EngineHandle {
             };
         }
 
-        match self.source_handle.as_ref() {
-            Some(source_handle) => {
-                zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
-                source_handle.stop()
-            }
-            None => Ok(()),
-        }?;
-        zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
-        let command_result = self.enqueue_command(Command::Stop);
+        let command_result = self.enqueue_stop_command_with_fast_data_barrier();
         zippy_debug_stop_log(&format!(
             "engine_handle.stop enqueue stop returned ok=[{}]",
             command_result.is_ok()
         ));
+        if let Err(err) = &command_result {
+            if !matches!(err, ZippyError::InvalidState { .. }) {
+                return Err(err.clone());
+            }
+        }
         let join_result = self.join_worker();
         zippy_debug_stop_log(&format!(
             "engine_handle.stop join_worker returned ok=[{}]",
@@ -196,6 +194,46 @@ impl EngineHandle {
             command,
         )
     }
+
+    fn enqueue_control_command_with_fast_data_barrier(&self, command: Command) -> Result<()> {
+        match &self.fast_data_path {
+            Some(path) => {
+                let _emit_guard = path.emit_lock.lock().unwrap();
+                wait_for_fast_data_drain(path.as_ref());
+                self.enqueue_command(command)
+            }
+            None => self.enqueue_command(command),
+        }
+    }
+
+    fn enqueue_stop_command_with_fast_data_barrier(&self) -> Result<()> {
+        match &self.fast_data_path {
+            Some(path) => {
+                let _emit_guard = path.emit_lock.lock().unwrap();
+                match self.source_handle.as_ref() {
+                    Some(source_handle) => {
+                        zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
+                        source_handle.stop()?;
+                        zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
+                    }
+                    None => {}
+                }
+                wait_for_fast_data_drain(path.as_ref());
+                self.enqueue_command(Command::Stop)
+            }
+            None => {
+                match self.source_handle.as_ref() {
+                    Some(source_handle) => {
+                        zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
+                        source_handle.stop()?;
+                        zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
+                    }
+                    None => {}
+                }
+                self.enqueue_command(Command::Stop)
+            }
+        }
+    }
 }
 
 impl SourceSink for SourceRuntimeSink {
@@ -211,7 +249,7 @@ impl SourceSink for SourceRuntimeSink {
                 other => {
                     match &other {
                         SourceEvent::Flush | SourceEvent::Stop | SourceEvent::Error(_) => {
-                            wait_for_fast_data_drain(path);
+                            wait_for_fast_data_drain(path.as_ref());
                         }
                         _ => {}
                     }
@@ -400,6 +438,7 @@ where
         source_handle: None,
         source_monitor_handle: None,
         metrics,
+        fast_data_path: None,
     })
 }
 
@@ -450,8 +489,12 @@ where
     let fast_data_worker_running = fast_data_queue
         .as_ref()
         .map(|_| Arc::new(AtomicBool::new(true)));
+    let fast_data_shutdown_requested = fast_data_queue
+        .as_ref()
+        .map(|_| Arc::new(AtomicBool::new(false)));
     let worker_fast_data_queue = fast_data_queue.clone();
     let worker_fast_data_running = fast_data_worker_running.clone();
+    let worker_fast_data_shutdown_requested = fast_data_shutdown_requested.clone();
     let worker_engine_name = engine_name.clone();
     let worker_source_name = source_name.clone();
 
@@ -461,6 +504,14 @@ where
 
             match &worker_fast_data_queue {
                 Some(data_queue) => loop {
+                    if worker_fast_data_shutdown_requested
+                        .as_ref()
+                        .expect("fast data shutdown flag should exist")
+                        .load(Ordering::Acquire)
+                    {
+                        return Ok(());
+                    }
+
                     if let Some(command) = rx.try_recv() {
                         if handle_source_control_command(
                             &mut engine,
@@ -495,6 +546,14 @@ where
                                 *status_clone.lock().unwrap() = EngineStatus::Failed;
                             })?;
                         continue;
+                    }
+
+                    if worker_fast_data_shutdown_requested
+                        .as_ref()
+                        .expect("fast data shutdown flag should exist")
+                        .load(Ordering::Acquire)
+                    {
+                        return Ok(());
                     }
 
                     runtime_idle_wait(config.xfast);
@@ -550,18 +609,40 @@ where
         overflow_policy: config.overflow_policy,
         tx: tx.clone(),
         metrics: metrics.clone(),
-        fast_data_path: fast_data_queue.clone().map(|data_queue| FastDataPath {
-            data_queue,
-            worker_thread: join_handle.thread().clone(),
-            worker_running: fast_data_worker_running
-                .as_ref()
-                .expect("fast data worker running should exist")
-                .clone(),
-            xfast: config.xfast,
-            emit_lock: Mutex::new(()),
+        fast_data_path: fast_data_queue.clone().map(|data_queue| {
+            Arc::new(FastDataPath {
+                data_queue,
+                worker_thread: join_handle.thread().clone(),
+                worker_running: fast_data_worker_running
+                    .as_ref()
+                    .expect("fast data worker running should exist")
+                    .clone(),
+                xfast: config.xfast,
+                emit_lock: Mutex::new(()),
+            })
         }),
     });
-    let source_handle = source.start(sink)?;
+    let source_handle = match source.start(sink.clone()) {
+        Ok(source_handle) => source_handle,
+        Err(err) => {
+            drop(sink);
+            drop(tx);
+
+            if let Some(shutdown_requested) = &fast_data_shutdown_requested {
+                shutdown_requested.store(true, Ordering::Release);
+                join_handle.thread().unpark();
+            }
+
+            let worker_join_result = join_handle.join().map_err(|_| ZippyError::Io {
+                reason: "worker thread panicked".to_string(),
+            })?;
+            if let Err(join_err) = worker_join_result {
+                return Err(join_err);
+            }
+
+            return Err(err);
+        }
+    };
     let monitor_source_handle = source_handle.clone();
     let monitor_status = status.clone();
     let monitor_tx = tx.clone();
@@ -622,6 +703,7 @@ where
         source_handle: Some(source_handle),
         source_monitor_handle: Some(source_monitor_handle),
         metrics,
+        fast_data_path: sink.fast_data_path.clone(),
     })
 }
 

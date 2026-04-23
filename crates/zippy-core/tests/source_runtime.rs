@@ -308,6 +308,78 @@ impl Source for StopThenErrorSource {
     }
 }
 
+struct StartFailSource {
+    mode: SourceMode,
+    schema: Arc<Schema>,
+}
+
+impl Source for StartFailSource {
+    fn name(&self) -> &str {
+        "start-fail-source"
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn mode(&self) -> SourceMode {
+        self.mode
+    }
+
+    fn start(self: Box<Self>, _sink: Arc<dyn SourceSink>) -> Result<SourceHandle> {
+        Err(ZippyError::Io {
+            reason: "source start failed".to_string(),
+        })
+    }
+}
+
+struct DropTrackingEngine {
+    schema: Arc<Schema>,
+    drop_count: Arc<AtomicUsize>,
+}
+
+impl DropTrackingEngine {
+    fn new(schema: Arc<Schema>, drop_count: Arc<AtomicUsize>) -> Self {
+        Self { schema, drop_count }
+    }
+}
+
+impl Drop for DropTrackingEngine {
+    fn drop(&mut self) {
+        self.drop_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Engine for DropTrackingEngine {
+    fn name(&self) -> &str {
+        "drop-tracking-engine"
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+        Ok(vec![batch])
+    }
+
+    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+        Ok(Vec::new())
+    }
+
+    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+        Ok(Vec::new())
+    }
+
+    fn drain_metrics(&mut self) -> EngineMetricsDelta {
+        EngineMetricsDelta::default()
+    }
+}
+
 fn test_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new(
         "price",
@@ -849,4 +921,41 @@ fn source_runtime_handle_concurrent_joiners_observe_same_error() {
         Err(ZippyError::Io { reason }) => assert_eq!(reason, "shared join failure"),
         other => panic!("unexpected join result b: {other:?}"),
     }
+}
+
+#[test]
+fn source_runtime_pipeline_xfast_start_failure_cleans_up_fast_path_worker() {
+    let schema = test_schema();
+    let drop_count = Arc::new(AtomicUsize::new(0));
+    let source = StartFailSource {
+        mode: SourceMode::Pipeline,
+        schema: schema.clone(),
+    };
+    let engine = DropTrackingEngine::new(schema, drop_count.clone());
+
+    let result = spawn_source_engine_with_publisher(
+        Box::new(source),
+        engine,
+        test_engine_config_with_xfast("start-fail-xfast", true),
+        NoopPublisher,
+    );
+
+    match result {
+        Err(ZippyError::Io { reason }) => assert_eq!(reason, "source start failed"),
+        Ok(_) => panic!("spawn should fail when source start returns an error"),
+        Err(other) => panic!("unexpected spawn error: {other:?}"),
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        if drop_count.load(Ordering::Relaxed) == 1 {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    panic!(
+        "drop count did not reach expected value expected=[1] actual=[{}]",
+        drop_count.load(Ordering::Relaxed)
+    );
 }

@@ -437,6 +437,81 @@ fn source_pipeline_block_mode_with_xfast_keeps_control_ordering() {
 }
 
 #[test]
+fn engine_handle_flush_with_xfast_does_not_overtake_fast_queue_data() {
+    let (mut runtime, first_data_release_tx) =
+        spawn_test_runtime_with_behavior(SourceMode::Pipeline, OverflowPolicy::Block, true, false);
+    runtime.source_emit_data(single_row_batch(1)).unwrap();
+    runtime.wait_until_first_data_started();
+
+    let second_data_result = runtime.source_emit_data_async(single_row_batch(2));
+    match second_data_result.recv_timeout(Duration::from_millis(100)) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!("second data send failed unexpectedly: {err}"),
+        Err(_) => panic!("second data send should enqueue onto the fast data queue"),
+    }
+
+    thread::scope(|scope| {
+        let handle = runtime.handle.as_ref().unwrap();
+        let (flush_tx, flush_rx) = channel();
+        scope.spawn(move || {
+            flush_tx.send(handle.flush()).unwrap();
+        });
+
+        assert!(flush_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        first_data_release_tx.send(()).unwrap();
+
+        match flush_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(outputs)) => assert!(outputs.is_empty()),
+            Ok(Err(err)) => panic!("flush failed unexpectedly: {err}"),
+            Err(_) => panic!("flush did not complete after fast data drained"),
+        }
+    });
+
+    let records = runtime.wait_for_records_len(3);
+    assert_eq!(records, vec!["data:1", "data:2", "flush"]);
+
+    runtime.handle.as_mut().unwrap().stop().unwrap();
+}
+
+#[test]
+fn engine_handle_stop_with_xfast_does_not_overtake_fast_queue_data() {
+    let (mut runtime, first_data_release_tx) =
+        spawn_test_runtime_with_behavior(SourceMode::Pipeline, OverflowPolicy::Block, true, false);
+    runtime.source_emit_data(single_row_batch(1)).unwrap();
+    runtime.wait_until_first_data_started();
+
+    let second_data_result = runtime.source_emit_data_async(single_row_batch(2));
+    match second_data_result.recv_timeout(Duration::from_millis(100)) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!("second data send failed unexpectedly: {err}"),
+        Err(_) => panic!("second data send should enqueue onto the fast data queue"),
+    }
+
+    thread::scope(|scope| {
+        let handle = runtime.handle.as_mut().unwrap();
+        let (stop_tx, stop_rx) = channel();
+        scope.spawn(move || {
+            stop_tx.send(handle.stop()).unwrap();
+        });
+
+        assert!(stop_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        first_data_release_tx.send(()).unwrap();
+
+        match stop_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => panic!("stop failed unexpectedly: {err}"),
+            Err(_) => panic!("stop did not complete after fast data drained"),
+        }
+    });
+
+    runtime.wait_until_stopped();
+    let records = runtime.wait_for_records_len(3);
+    assert_eq!(records, vec!["data:1", "data:2", "stop"]);
+}
+
+#[test]
 fn source_pipeline_worker_failure_with_pending_fast_data_does_not_hang_control_events() {
     let (runtime, first_data_release_tx) = spawn_test_pipeline_runtime_with_behavior(true);
     runtime.source_emit_data(single_row_batch(1)).unwrap();
