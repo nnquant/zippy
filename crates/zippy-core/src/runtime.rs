@@ -1,12 +1,16 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Sender};
 use tracing::{debug, error, info};
 
 use crate::{
     queue::{QueueSendError, QueueSender},
+    SpscDataQueue,
     Engine, EngineConfig, EngineMetrics, EngineMetricsSnapshot, EngineStatus, OverflowPolicy,
     Publisher, Result, Source, SourceEvent, SourceHandle as RuntimeSourceHandle, SourceMode,
     SourceSink, ZippyError,
@@ -50,6 +54,14 @@ enum Command {
     SourceTerminated(Result<()>),
 }
 
+struct FastDataPath {
+    data_queue: Arc<SpscDataQueue<RecordBatch>>,
+    worker_thread: std::thread::Thread,
+    worker_running: Arc<AtomicBool>,
+    xfast: bool,
+    emit_lock: Mutex<()>,
+}
+
 pub struct EngineHandle {
     status: Arc<Mutex<EngineStatus>>,
     overflow_policy: OverflowPolicy,
@@ -65,6 +77,7 @@ struct SourceRuntimeSink {
     overflow_policy: OverflowPolicy,
     tx: QueueSender<Command>,
     metrics: Arc<EngineMetrics>,
+    fast_data_path: Option<FastDataPath>,
 }
 
 impl EngineHandle {
@@ -187,13 +200,49 @@ impl EngineHandle {
 
 impl SourceSink for SourceRuntimeSink {
     fn emit(&self, event: SourceEvent) -> Result<()> {
-        enqueue_runtime_command(
-            &self.status,
-            self.overflow_policy,
-            &self.tx,
-            &self.metrics,
-            Command::SourceEvent(event),
-        )
+        if let Some(path) = &self.fast_data_path {
+            let _emit_guard = path.emit_lock.lock().unwrap();
+            return match event {
+                SourceEvent::Data(batch) => {
+                    path.data_queue.push_blocking(batch)?;
+                    path.worker_thread.unpark();
+                    Ok(())
+                }
+                other => {
+                    match &other {
+                        SourceEvent::Flush | SourceEvent::Stop | SourceEvent::Error(_) => {
+                            wait_for_fast_data_drain(path);
+                        }
+                        _ => {}
+                    }
+
+                    enqueue_runtime_command(
+                        &self.status,
+                        self.overflow_policy,
+                        &self.tx,
+                        &self.metrics,
+                        Command::SourceEvent(other),
+                    )
+                }
+            };
+        }
+
+        match event {
+            SourceEvent::Data(batch) => enqueue_runtime_command(
+                &self.status,
+                self.overflow_policy,
+                &self.tx,
+                &self.metrics,
+                Command::SourceEvent(SourceEvent::Data(batch)),
+            ),
+            other => enqueue_runtime_command(
+                &self.status,
+                self.overflow_policy,
+                &self.tx,
+                &self.metrics,
+                Command::SourceEvent(other),
+            ),
+        }
     }
 }
 
@@ -356,6 +405,20 @@ where
 
 pub fn spawn_source_engine_with_publisher<S, E, P>(
     source: Box<S>,
+    engine: E,
+    config: EngineConfig,
+    publisher: P,
+) -> Result<EngineHandle>
+where
+    S: Source + ?Sized,
+    E: Engine,
+    P: Publisher,
+{
+    spawn_source_engine_with_publisher_inner(source, engine, config, publisher)
+}
+
+fn spawn_source_engine_with_publisher_inner<S, E, P>(
+    source: Box<S>,
     mut engine: E,
     config: EngineConfig,
     mut publisher: P,
@@ -378,22 +441,148 @@ where
     let source_schema = source.output_schema();
     let engine_schema = engine.input_schema();
     let source_name = source.name().to_string();
+    let fast_data_queue =
+        if source_mode == SourceMode::Pipeline && config.overflow_policy == OverflowPolicy::Block {
+            Some(Arc::new(SpscDataQueue::new(config.buffer_capacity)?))
+        } else {
+            None
+        };
+    let fast_data_worker_running = fast_data_queue
+        .as_ref()
+        .map(|_| Arc::new(AtomicBool::new(true)));
+    let worker_fast_data_queue = fast_data_queue.clone();
+    let worker_fast_data_running = fast_data_worker_running.clone();
+    let worker_engine_name = engine_name.clone();
+    let worker_source_name = source_name.clone();
+
+    let join_handle = thread::spawn(move || -> Result<()> {
+        let worker_result = (|| -> Result<()> {
+            let mut hello_seen = false;
+
+            match &worker_fast_data_queue {
+                Some(data_queue) => loop {
+                    if let Some(command) = rx.try_recv() {
+                        if handle_source_control_command(
+                            &mut engine,
+                            &mut publisher,
+                            &metrics_clone,
+                            &status_clone,
+                            source_mode,
+                            &source_schema,
+                            &engine_schema,
+                            worker_engine_name.as_str(),
+                            worker_source_name.as_str(),
+                            &mut hello_seen,
+                            command,
+                        )? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+
+                    if let Some(batch) = data_queue.try_pop() {
+                        if !hello_seen {
+                            return fail_worker(
+                                &mut engine,
+                                &status_clone,
+                                ZippyError::InvalidConfig {
+                                    reason: "source hello must arrive before data".to_string(),
+                                },
+                            );
+                        }
+                        process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)
+                            .inspect_err(|_| {
+                                *status_clone.lock().unwrap() = EngineStatus::Failed;
+                            })?;
+                        continue;
+                    }
+
+                    runtime_idle_wait(config.xfast);
+                },
+                None => {
+                    while let Ok(command) = rx.recv() {
+                        if handle_source_control_command(
+                            &mut engine,
+                            &mut publisher,
+                            &metrics_clone,
+                            &status_clone,
+                            source_mode,
+                            &source_schema,
+                            &engine_schema,
+                            worker_engine_name.as_str(),
+                            worker_source_name.as_str(),
+                            &mut hello_seen,
+                            command,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        })();
+
+        if let Some(data_queue) = &worker_fast_data_queue {
+            data_queue.close();
+            drain_fast_data_queue(data_queue.as_ref());
+        }
+        if let Some(worker_running) = &worker_fast_data_running {
+            worker_running.store(false, Ordering::Release);
+        }
+
+        if let Err(err) = &worker_result {
+            error!(
+                component = "runtime",
+                engine = worker_engine_name.as_str(),
+                source = worker_source_name.as_str(),
+                event = "worker_failure",
+                error = %err,
+                "worker failed"
+            );
+            *status_clone.lock().unwrap() = EngineStatus::Failed;
+        }
+
+        worker_result
+    });
+
     let sink = Arc::new(SourceRuntimeSink {
         status: status.clone(),
         overflow_policy: config.overflow_policy,
         tx: tx.clone(),
         metrics: metrics.clone(),
+        fast_data_path: fast_data_queue.clone().map(|data_queue| FastDataPath {
+            data_queue,
+            worker_thread: join_handle.thread().clone(),
+            worker_running: fast_data_worker_running
+                .as_ref()
+                .expect("fast data worker running should exist")
+                .clone(),
+            xfast: config.xfast,
+            emit_lock: Mutex::new(()),
+        }),
     });
     let source_handle = source.start(sink)?;
     let monitor_source_handle = source_handle.clone();
     let monitor_status = status.clone();
     let monitor_tx = tx.clone();
     let monitor_metrics = metrics.clone();
+    let monitor_fast_data_queue = fast_data_queue.clone();
+    let monitor_fast_data_running = fast_data_worker_running.clone();
     let monitor_engine_name = engine_name.clone();
     let source_monitor_handle = thread::spawn(move || {
         let source_result = monitor_source_handle.join();
         if monitor_source_handle.stop_requested() && source_result.is_ok() {
             return;
+        }
+
+        if let (Some(data_queue), Some(worker_running)) =
+            (&monitor_fast_data_queue, &monitor_fast_data_running)
+        {
+            wait_for_fast_data_queue_drain(
+                data_queue.as_ref(),
+                worker_running.as_ref(),
+                config.xfast,
+            );
         }
 
         let current_status = *monitor_status.lock().unwrap();
@@ -414,201 +603,6 @@ where
             event = "source_terminated",
             "source termination forwarded"
         );
-    });
-    let worker_engine_name = engine_name.clone();
-    let worker_source_name = source_name.clone();
-
-    let join_handle = thread::spawn(move || -> Result<()> {
-        let worker_result = (|| -> Result<()> {
-            let mut hello_seen = false;
-
-            while let Ok(command) = rx.recv() {
-                match command {
-                    Command::Data(batch) => {
-                        process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)?;
-                    }
-                    Command::Flush(reply_tx) => {
-                        process_flush_event(&mut engine, &mut publisher, &metrics_clone, true)
-                            .map(|outputs| {
-                                let _ = reply_tx.send(Ok(outputs));
-                            })
-                            .inspect_err(|err| {
-                                *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                let _ = reply_tx.send(Err(err.clone()));
-                            })?;
-                    }
-                    Command::Stop => {
-                        *status_clone.lock().unwrap() = EngineStatus::Stopping;
-                        process_stop_event(&mut engine, &mut publisher, &metrics_clone)
-                            .map(|_outputs| {
-                                *status_clone.lock().unwrap() = EngineStatus::Stopped;
-                            })
-                            .inspect_err(|_err| {
-                                *status_clone.lock().unwrap() = EngineStatus::Failed;
-                            })?;
-                        return Ok(());
-                    }
-                    Command::SourceTerminated(source_result) => match source_result {
-                        Ok(()) => {
-                            return fail_worker(
-                                &mut engine,
-                                &status_clone,
-                                ZippyError::Io {
-                                    reason: "source terminated without stop event".to_string(),
-                                },
-                            );
-                        }
-                        Err(err) => {
-                            return fail_worker(&mut engine, &status_clone, err);
-                        }
-                    },
-                    Command::SourceEvent(event) => match event {
-                        SourceEvent::Hello(hello) => {
-                            if hello_seen {
-                                return fail_worker(
-                                    &mut engine,
-                                    &status_clone,
-                                    ZippyError::InvalidConfig {
-                                        reason: "source hello already received".to_string(),
-                                    },
-                                );
-                            }
-                            if hello.schema != source_schema {
-                                return fail_worker(
-                                    &mut engine,
-                                    &status_clone,
-                                    ZippyError::SchemaMismatch {
-                                        reason: "source hello schema does not match source output schema"
-                                            .to_string(),
-                                    },
-                                );
-                            }
-                            if hello.schema != engine_schema {
-                                return fail_worker(
-                                    &mut engine,
-                                    &status_clone,
-                                    ZippyError::SchemaMismatch {
-                                        reason:
-                                            "source hello schema does not match engine input schema"
-                                                .to_string(),
-                                    },
-                                );
-                            }
-                            hello_seen = true;
-                        }
-                        SourceEvent::Data(batch) => {
-                            if !hello_seen {
-                                return fail_worker(
-                                    &mut engine,
-                                    &status_clone,
-                                    ZippyError::InvalidConfig {
-                                        reason: "source hello must arrive before data".to_string(),
-                                    },
-                                );
-                            }
-                            process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)
-                                .inspect_err(|_| {
-                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                })?;
-                        }
-                        SourceEvent::Flush => {
-                            if !hello_seen {
-                                return fail_worker(
-                                    &mut engine,
-                                    &status_clone,
-                                    ZippyError::InvalidConfig {
-                                        reason: "source hello must arrive before flush".to_string(),
-                                    },
-                                );
-                            }
-                            if source_mode == SourceMode::Pipeline {
-                                let outputs = process_flush_event(
-                                    &mut engine,
-                                    &mut publisher,
-                                    &metrics_clone,
-                                    true,
-                                )
-                                .inspect_err(|_| {
-                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                })?;
-                                info!(
-                                    component = "runtime",
-                                    engine = worker_engine_name.as_str(),
-                                    source = worker_source_name.as_str(),
-                                    event = "flush",
-                                    batch_rows =
-                                        outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-                                    "engine flushed"
-                                );
-                            }
-                        }
-                        SourceEvent::Stop => {
-                            if !hello_seen {
-                                return fail_worker(
-                                    &mut engine,
-                                    &status_clone,
-                                    ZippyError::InvalidConfig {
-                                        reason: "source hello must arrive before stop".to_string(),
-                                    },
-                                );
-                            }
-                            if source_mode == SourceMode::Pipeline {
-                                *status_clone.lock().unwrap() = EngineStatus::Stopping;
-                                let outputs =
-                                    process_stop_event(&mut engine, &mut publisher, &metrics_clone)
-                                        .inspect_err(|_| {
-                                            *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                        })?;
-                                *status_clone.lock().unwrap() = EngineStatus::Stopped;
-                                info!(
-                                    component = "runtime",
-                                    engine = worker_engine_name.as_str(),
-                                    source = worker_source_name.as_str(),
-                                    event = "stop",
-                                    batch_rows =
-                                        outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-                                    "engine stopped"
-                                );
-                                return Ok(());
-                            }
-                            *status_clone.lock().unwrap() = EngineStatus::Stopped;
-                            shutdown_source_pipeline(&mut publisher, &metrics_clone)?;
-                            info!(
-                                component = "runtime",
-                                engine = worker_engine_name.as_str(),
-                                source = worker_source_name.as_str(),
-                                event = "stop",
-                                batch_rows = 0usize,
-                                "engine stopped"
-                            );
-                            return Ok(());
-                        }
-                        SourceEvent::Error(reason) => {
-                            return fail_worker(
-                                &mut engine,
-                                &status_clone,
-                                ZippyError::Io { reason },
-                            );
-                        }
-                    },
-                }
-            }
-            Ok(())
-        })();
-
-        if let Err(err) = &worker_result {
-            error!(
-                component = "runtime",
-                engine = worker_engine_name.as_str(),
-                source = worker_source_name.as_str(),
-                event = "worker_failure",
-                error = %err,
-                "worker failed"
-            );
-            *status_clone.lock().unwrap() = EngineStatus::Failed;
-        }
-
-        worker_result
     });
 
     info!(
@@ -669,6 +663,213 @@ fn command_is_data(command: &Command) -> bool {
         command,
         Command::Data(_) | Command::SourceEvent(SourceEvent::Data(_))
     )
+}
+
+fn wait_for_fast_data_drain(path: &FastDataPath) {
+    wait_for_fast_data_queue_drain(
+        path.data_queue.as_ref(),
+        path.worker_running.as_ref(),
+        path.xfast,
+    );
+}
+
+fn runtime_idle_wait(xfast: bool) {
+    std::hint::spin_loop();
+    if !xfast {
+        thread::park_timeout(Duration::from_micros(50));
+    }
+}
+
+fn wait_for_fast_data_queue_drain(
+    data_queue: &SpscDataQueue<RecordBatch>,
+    worker_running: &AtomicBool,
+    xfast: bool,
+) {
+    while worker_running.load(Ordering::Acquire) && !data_queue.is_empty() {
+        runtime_idle_wait(xfast);
+    }
+}
+
+fn drain_fast_data_queue(data_queue: &SpscDataQueue<RecordBatch>) {
+    while data_queue.try_pop().is_some() {}
+}
+
+fn handle_source_control_command<E, P>(
+    engine: &mut E,
+    publisher: &mut P,
+    metrics: &Arc<EngineMetrics>,
+    status: &Arc<Mutex<EngineStatus>>,
+    source_mode: SourceMode,
+    source_schema: &Arc<Schema>,
+    engine_schema: &Arc<Schema>,
+    worker_engine_name: &str,
+    worker_source_name: &str,
+    hello_seen: &mut bool,
+    command: Command,
+) -> Result<bool>
+where
+    E: Engine,
+    P: Publisher,
+{
+    match command {
+        Command::Data(batch) => {
+            process_data_event(engine, publisher, metrics, batch)?;
+        }
+        Command::Flush(reply_tx) => {
+            process_flush_event(engine, publisher, metrics, true)
+                .map(|outputs| {
+                    let _ = reply_tx.send(Ok(outputs));
+                })
+                .inspect_err(|err| {
+                    *status.lock().unwrap() = EngineStatus::Failed;
+                    let _ = reply_tx.send(Err(err.clone()));
+                })?;
+        }
+        Command::Stop => {
+            *status.lock().unwrap() = EngineStatus::Stopping;
+            process_stop_event(engine, publisher, metrics)
+                .map(|_outputs| {
+                    *status.lock().unwrap() = EngineStatus::Stopped;
+                })
+                .inspect_err(|_err| {
+                    *status.lock().unwrap() = EngineStatus::Failed;
+                })?;
+            return Ok(true);
+        }
+        Command::SourceTerminated(source_result) => match source_result {
+            Ok(()) => {
+                fail_worker(
+                    engine,
+                    status,
+                    ZippyError::Io {
+                        reason: "source terminated without stop event".to_string(),
+                    },
+                )?;
+            }
+            Err(err) => {
+                fail_worker(engine, status, err)?;
+            }
+        },
+        Command::SourceEvent(event) => match event {
+            SourceEvent::Hello(hello) => {
+                if *hello_seen {
+                    fail_worker(
+                        engine,
+                        status,
+                        ZippyError::InvalidConfig {
+                            reason: "source hello already received".to_string(),
+                        },
+                    )?;
+                }
+                if hello.schema != *source_schema {
+                    fail_worker(
+                        engine,
+                        status,
+                        ZippyError::SchemaMismatch {
+                            reason: "source hello schema does not match source output schema"
+                                .to_string(),
+                        },
+                    )?;
+                }
+                if hello.schema != *engine_schema {
+                    fail_worker(
+                        engine,
+                        status,
+                        ZippyError::SchemaMismatch {
+                            reason: "source hello schema does not match engine input schema"
+                                .to_string(),
+                        },
+                    )?;
+                }
+                *hello_seen = true;
+            }
+            SourceEvent::Data(batch) => {
+                if !*hello_seen {
+                    fail_worker(
+                        engine,
+                        status,
+                        ZippyError::InvalidConfig {
+                            reason: "source hello must arrive before data".to_string(),
+                        },
+                    )?;
+                }
+                process_data_event(engine, publisher, metrics, batch).inspect_err(|_| {
+                    *status.lock().unwrap() = EngineStatus::Failed;
+                })?;
+            }
+            SourceEvent::Flush => {
+                if !*hello_seen {
+                    fail_worker(
+                        engine,
+                        status,
+                        ZippyError::InvalidConfig {
+                            reason: "source hello must arrive before flush".to_string(),
+                        },
+                    )?;
+                }
+                if source_mode == SourceMode::Pipeline {
+                    let outputs = process_flush_event(engine, publisher, metrics, true)
+                        .inspect_err(|_| {
+                            *status.lock().unwrap() = EngineStatus::Failed;
+                        })?;
+                    info!(
+                        component = "runtime",
+                        engine = worker_engine_name,
+                        source = worker_source_name,
+                        event = "flush",
+                        batch_rows =
+                            outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                        "engine flushed"
+                    );
+                }
+            }
+            SourceEvent::Stop => {
+                if !*hello_seen {
+                    fail_worker(
+                        engine,
+                        status,
+                        ZippyError::InvalidConfig {
+                            reason: "source hello must arrive before stop".to_string(),
+                        },
+                    )?;
+                }
+                if source_mode == SourceMode::Pipeline {
+                    *status.lock().unwrap() = EngineStatus::Stopping;
+                    let outputs =
+                        process_stop_event(engine, publisher, metrics).inspect_err(|_| {
+                            *status.lock().unwrap() = EngineStatus::Failed;
+                        })?;
+                    *status.lock().unwrap() = EngineStatus::Stopped;
+                    info!(
+                        component = "runtime",
+                        engine = worker_engine_name,
+                        source = worker_source_name,
+                        event = "stop",
+                        batch_rows =
+                            outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                        "engine stopped"
+                    );
+                    return Ok(true);
+                }
+                *status.lock().unwrap() = EngineStatus::Stopped;
+                shutdown_source_pipeline(publisher, metrics)?;
+                info!(
+                    component = "runtime",
+                    engine = worker_engine_name,
+                    source = worker_source_name,
+                    event = "stop",
+                    batch_rows = 0usize,
+                    "engine stopped"
+                );
+                return Ok(true);
+            }
+            SourceEvent::Error(reason) => {
+                fail_worker(engine, status, ZippyError::Io { reason })?;
+            }
+        },
+    }
+
+    Ok(false)
 }
 
 fn process_data_event<E, P>(
