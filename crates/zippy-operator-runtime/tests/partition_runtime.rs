@@ -54,3 +54,9 @@ fn rolling_state_updates_incrementally() {
     state.push(4.0);
     assert_eq!(state.mean(), Some(3.0));
 }
+
+#[test]
+#[should_panic(expected = "rolling mean window must be greater than zero")]
+fn rolling_state_rejects_zero_window() {
+    let _ = zippy_operator_runtime::RollingMeanState::new(0);
+}

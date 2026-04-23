@@ -10,6 +10,7 @@ pub struct RollingMeanState {
 impl RollingMeanState {
     /// 构造指定窗口长度的状态。
     pub fn new(window: usize) -> Self {
+        assert!(window > 0, "rolling mean window must be greater than zero");
         Self {
             window,
             values: VecDeque::new(),
