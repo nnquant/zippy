@@ -5,6 +5,7 @@ __version__: str
 
 
 def run_master_daemon(control_endpoint: str) -> None: ...
+def segment_debug_snapshot_for_test() -> pa.RecordBatch: ...
 
 
 def setup_log(

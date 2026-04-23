@@ -56,6 +56,15 @@ def test_expression_factor_exposes_native_attributes() -> None:
     assert factor.output == "score"
 
 
+def test_segment_store_debug_snapshot_exposes_record_batch() -> None:
+    batch = zippy.segment_debug_snapshot_for_test()
+
+    assert isinstance(batch, pa.RecordBatch)
+    assert batch.num_rows == 1
+    assert batch.column(2).to_pylist() == [4125.0]
+    assert "last_price" in batch.schema.names
+
+
 def test_reactive_engine_accepts_polars_and_flushes() -> None:
     schema = pa.schema(
         [

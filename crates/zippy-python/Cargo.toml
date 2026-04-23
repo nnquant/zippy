@@ -16,3 +16,5 @@ zippy-engines = { path = "../zippy-engines" }
 zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
 zippy-master = { path = "../zippy-master" }
 zippy-operators = { path = "../zippy-operators" }
+zippy-operator-runtime = { path = "../zippy-operator-runtime" }
+zippy-segment-store = { path = "../zippy-segment-store" }

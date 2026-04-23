@@ -3,10 +3,10 @@
 mod native_source_bridge;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -51,6 +51,9 @@ use zippy_operators::{
     ClipSpec as RustClipSpec, ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec,
     TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec, TsEmaSpec as RustTsEmaSpec,
     TsMeanSpec as RustTsMeanSpec, TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
+};
+use zippy_segment_store::{
+    compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
@@ -107,7 +110,8 @@ fn python_json_dumps(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Strin
 
 fn python_json_loads<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
     let json = PyModule::import_bound(py, "json")?;
-    json.call_method1("loads", (text,)).map_err(|error| py_value_error(error.to_string()))
+    json.call_method1("loads", (text,))
+        .map_err(|error| py_value_error(error.to_string()))
 }
 
 fn send_master_control_request(
@@ -135,12 +139,14 @@ fn send_master_control_request(
             control_endpoint, error
         ))
     })?;
-    stream.shutdown(std::net::Shutdown::Write).map_err(|error| {
-        py_runtime_error(format!(
-            "failed to shutdown control request write path=[{}] error=[{}]",
-            control_endpoint, error
-        ))
-    })?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| {
+            py_runtime_error(format!(
+                "failed to shutdown control request write path=[{}] error=[{}]",
+                control_endpoint, error
+            ))
+        })?;
 
     let mut response_line = String::new();
     let mut reader = BufReader::new(stream);
@@ -157,7 +163,9 @@ fn send_master_control_request(
         .map_err(|_| py_runtime_error("invalid control response"))?;
 
     if let Some((key, value)) = response.iter().next() {
-        let key = key.extract::<String>().map_err(|error| py_value_error(error.to_string()))?;
+        let key = key
+            .extract::<String>()
+            .map_err(|error| py_value_error(error.to_string()))?;
         if key == "Error" {
             let error = value
                 .downcast::<PyDict>()
@@ -1488,7 +1496,12 @@ impl MasterClient {
         payload.set_item("input_stream", input_stream)?;
         payload.set_item("config", config)?;
         request.set_item("RegisterSink", payload)?;
-        send_master_control_request(py, &self.control_endpoint, request.as_any(), "SinkRegistered")
+        send_master_control_request(
+            py,
+            &self.control_endpoint,
+            request.as_any(),
+            "SinkRegistered",
+        )
     }
 
     #[pyo3(signature = (kind, name, status, metrics=None))]
@@ -1644,9 +1657,8 @@ impl MasterDaemon {
         let socket_path = prepare_control_endpoint_path(&self.control_endpoint)?;
         let server = self.server.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
-        let join_handle = thread::spawn(move || {
-            server.serve_with_ready(&socket_path, Some(startup_tx))
-        });
+        let join_handle =
+            thread::spawn(move || server.serve_with_ready(&socket_path, Some(startup_tx)));
 
         match startup_rx.recv_timeout(startup_timeout) {
             Ok(Ok(())) => {
@@ -2680,6 +2692,10 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(run_master_daemon, module)?)?;
     module.add_function(wrap_pyfunction!(setup_log, module)?)?;
     module.add_function(wrap_pyfunction!(log_info, module)?)?;
+    module.add_function(wrap_pyfunction!(segment_debug_snapshot_for_test, module)?)?;
+    if let Ok(function) = module.getattr("segment_debug_snapshot_for_test") {
+        export_function_to_zippy_root(_py, "segment_debug_snapshot_for_test", &function)?;
+    }
     module.add_class::<TsEmaSpec>()?;
     module.add_class::<TsReturnSpec>()?;
     module.add_class::<TsMeanSpec>()?;
@@ -2717,6 +2733,51 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StreamTableEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
+    Ok(())
+}
+
+#[pyfunction]
+fn segment_debug_snapshot_for_test(py: Python<'_>) -> PyResult<PyObject> {
+    let _pyarrow = PyModule::import_bound(py, "pyarrow")
+        .map_err(|error| py_runtime_error(format!("failed to import pyarrow error=[{}]", error)))?;
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .map_err(|error| py_runtime_error(error.to_string()))?;
+    let layout =
+        LayoutPlan::for_schema(&schema, 1).map_err(|error| py_runtime_error(error.to_string()))?;
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout)
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    writer
+        .append_tick_for_test(2, "rb2505", 4125.0)
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    let sealed = writer
+        .sealed_handle_for_test()
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    let batch = RowSpanView::new(sealed, 0, 1)
+        .map_err(|error| py_runtime_error(error.to_string()))?
+        .as_record_batch()
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+
+    batch
+        .to_pyarrow(py)
+        .map_err(|error| py_value_error(error.to_string()))
+}
+
+fn export_function_to_zippy_root(
+    py: Python<'_>,
+    name: &str,
+    function: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let sys = PyModule::import_bound(py, "sys")?;
+    let modules = sys.getattr("modules")?.downcast::<PyDict>()?;
+
+    if let Some(zippy_module) = modules.get_item("zippy")? {
+        zippy_module.setattr(name, function)?;
+    }
+
     Ok(())
 }
 
@@ -2828,9 +2889,9 @@ fn parse_instrument_ids(
     };
 
     if instrument_ids.is_instance_of::<PyList>() || instrument_ids.is_instance_of::<PyTuple>() {
-        let values = instrument_ids
-            .extract::<Vec<String>>()
-            .map_err(|_| py_value_error("instrument_ids must be a string or a sequence of strings"))?;
+        let values = instrument_ids.extract::<Vec<String>>().map_err(|_| {
+            py_value_error("instrument_ids must be a string or a sequence of strings")
+        })?;
         if values.is_empty() {
             return Ok(None);
         }
