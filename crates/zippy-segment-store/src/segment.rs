@@ -1,7 +1,7 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
 /// Active segment 头部元数据。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SegmentHeader {
     pub schema_id: u64,
     pub segment_id: u64,

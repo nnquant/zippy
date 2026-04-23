@@ -12,10 +12,11 @@ use crate::{ColumnType, CompiledSchema, LayoutPlan, SegmentHeader};
 struct Utf8ColumnBuffer {
     offsets: Vec<u32>,
     values: Vec<u8>,
+    values_capacity: usize,
 }
 
 /// Active segment 的最小写入器。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ActiveSegmentWriter {
     header: SegmentHeader,
     schema: CompiledSchema,
@@ -49,6 +50,7 @@ impl ActiveSegmentWriter {
                         Utf8ColumnBuffer {
                             offsets: vec![0; column_layout.offsets_len / 4],
                             values: Vec::with_capacity(column_layout.values_len),
+                            values_capacity: column_layout.values_len,
                         },
                     );
                 }
@@ -161,6 +163,14 @@ impl ActiveSegmentWriter {
                 let start = utf8.offsets[self.row_cursor] as usize;
                 if start != utf8.values.len() {
                     return Err("utf8 row already written");
+                }
+                let next_len = utf8
+                    .values
+                    .len()
+                    .checked_add(value.len())
+                    .ok_or("utf8 values overflow")?;
+                if next_len > utf8.values_capacity {
+                    return Err("utf8 values exceed layout capacity");
                 }
 
                 utf8.values.extend_from_slice(value.as_bytes());

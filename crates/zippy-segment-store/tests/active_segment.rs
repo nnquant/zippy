@@ -50,3 +50,16 @@ fn utf8_offsets_only_become_readable_after_commit() {
         "ag2501"
     );
 }
+
+#[test]
+fn write_utf8_rejects_values_buffer_overflow() {
+    let schema = compile_schema(&[ColumnSpec::new("instrument_id", ColumnType::Utf8)]).unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 1).unwrap();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.begin_row().unwrap();
+    let oversized = "x".repeat(64);
+
+    assert!(writer.write_utf8("instrument_id", &oversized).is_err());
+    assert_eq!(writer.committed_row_count(), 0);
+}
