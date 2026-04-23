@@ -34,8 +34,8 @@ pub struct ActiveSegmentWriter {
 }
 
 impl ActiveSegmentWriter {
-    /// 构造指定 segment 标识的最小 active segment writer。
-    pub fn new_with_ids_for_test(
+    /// 构造 runtime 使用的 active segment writer。
+    pub fn new_for_runtime(
         schema: CompiledSchema,
         layout: LayoutPlan,
         segment_id: u64,
@@ -48,6 +48,16 @@ impl ActiveSegmentWriter {
             generation,
             format!("segment-{segment_id}-generation-{generation}"),
         )
+    }
+
+    /// 构造指定 segment 标识的最小 active segment writer。
+    pub fn new_with_ids_for_test(
+        schema: CompiledSchema,
+        layout: LayoutPlan,
+        segment_id: u64,
+        generation: u64,
+    ) -> Result<Self, &'static str> {
+        Self::new_for_runtime(schema, layout, segment_id, generation)
     }
 
     pub(crate) fn new_with_origin_for_test(
