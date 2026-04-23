@@ -259,6 +259,20 @@ fn runtime_emits_worker_failure_event() {
     }));
 }
 
+#[test]
+fn engine_config_accepts_explicit_xfast_flag() {
+    let config = EngineConfig {
+        name: "runtime-xfast".to_string(),
+        buffer_capacity: 8,
+        overflow_policy: OverflowPolicy::Block,
+        late_data_policy: Default::default(),
+        xfast: true,
+    };
+
+    config.validate().unwrap();
+    assert!(config.xfast);
+}
+
 fn run_runtime_log_case(case: &str) -> Vec<Value> {
     let temp = tempfile::tempdir().unwrap();
     let log_path = temp.path().join(format!("{case}.jsonl"));
@@ -304,6 +318,7 @@ fn start_flush_stop_case() {
             buffer_capacity: 8,
             overflow_policy: OverflowPolicy::Block,
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -326,6 +341,7 @@ fn worker_failure_case() {
             buffer_capacity: 8,
             overflow_policy: OverflowPolicy::Block,
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -354,6 +370,7 @@ fn reject_overflow_returns_error() {
             buffer_capacity: 1,
             overflow_policy: OverflowPolicy::Reject,
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -394,6 +411,7 @@ fn drop_oldest_overflow_discards_queued_batch_and_updates_metrics() {
             buffer_capacity: 1,
             overflow_policy: OverflowPolicy::DropOldest,
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -434,6 +452,7 @@ fn blocked_write_after_data_failure_returns_invalid_state() {
             buffer_capacity: 1,
             overflow_policy: OverflowPolicy::Block,
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -489,6 +508,7 @@ fn stop_preserves_control_semantics_when_reject_queue_is_full() {
             buffer_capacity: 1,
             overflow_policy: OverflowPolicy::Reject,
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -526,6 +546,7 @@ fn lifecycle_flush_and_stop_emit_pending_batches() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -554,6 +575,7 @@ fn flush_failure_marks_engine_failed() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -585,6 +607,7 @@ fn stop_after_data_failure_returns_worker_error_and_failed_status() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -612,6 +635,7 @@ fn write_after_worker_failure_returns_invalid_state() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -640,6 +664,7 @@ fn flush_after_worker_failure_returns_invalid_state_quickly() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: Default::default(),
+            xfast: false,
         },
     )
     .unwrap();
@@ -671,6 +696,7 @@ fn publish_failure_marks_engine_failed_and_updates_metrics() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: Default::default(),
+            xfast: false,
         },
         FailingPublisher,
     )

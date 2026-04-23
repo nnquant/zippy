@@ -40,6 +40,7 @@ pub struct EngineConfig {
     pub buffer_capacity: usize,
     pub overflow_policy: OverflowPolicy,
     pub late_data_policy: LateDataPolicy,
+    pub xfast: bool,
 }
 
 impl EngineConfig {

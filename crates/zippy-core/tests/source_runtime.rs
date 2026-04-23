@@ -339,6 +339,7 @@ fn test_engine_config(name: &str) -> EngineConfig {
         buffer_capacity: 16,
         overflow_policy: OverflowPolicy::Block,
         late_data_policy: Default::default(),
+        xfast: false,
     }
 }
 
