@@ -1,0 +1,10 @@
+[package]
+name = "zippy-operator-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zippy-segment-store = { path = "../zippy-segment-store" }

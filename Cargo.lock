@@ -2258,6 +2258,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zippy-operator-runtime"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "thiserror",
+ "tracing",
+ "zippy-segment-store",
+]
+
+[[package]]
 name = "zippy-operators"
 version = "0.1.0"
 dependencies = [
@@ -2292,6 +2302,17 @@ dependencies = [
  "zippy-io",
  "zippy-master",
  "zippy-operators",
+]
+
+[[package]]
+name = "zippy-segment-store"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "parquet",
+ "serde",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
