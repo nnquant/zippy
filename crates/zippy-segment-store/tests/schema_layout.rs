@@ -39,3 +39,12 @@ fn compile_schema_rejects_duplicate_column_names() {
 
     assert!(result.is_err());
 }
+
+#[test]
+fn layout_plan_rejects_capacity_overflow() {
+    let schema = compile_schema(&[ColumnSpec::new("instrument_id", ColumnType::Utf8)]).unwrap();
+
+    let result = LayoutPlan::for_schema(&schema, usize::MAX);
+
+    assert!(result.is_err());
+}

@@ -5,6 +5,10 @@ use crate::{ColumnType, CompiledSchema};
 pub struct ColumnLayout {
     pub name: &'static str,
     pub values_offset: usize,
+    /// Values buffer bytes reserved by the layout plan.
+    ///
+    /// For `Utf8`, this is a capacity hint for the backing buffer rather than
+    /// the number of logical bytes written by a future writer.
     pub values_len: usize,
     pub offsets_offset: usize,
     pub offsets_len: usize,
@@ -22,20 +26,33 @@ pub struct LayoutPlan {
 impl LayoutPlan {
     /// 为给定 schema 构建最小布局计划。
     pub fn for_schema(schema: &CompiledSchema, row_capacity: usize) -> Result<Self, &'static str> {
-        fn align_to(cursor: usize, align: usize) -> usize {
+        fn checked_add(lhs: usize, rhs: usize) -> Result<usize, &'static str> {
+            lhs.checked_add(rhs).ok_or("layout size overflow")
+        }
+
+        fn checked_mul(lhs: usize, rhs: usize) -> Result<usize, &'static str> {
+            lhs.checked_mul(rhs).ok_or("layout size overflow")
+        }
+
+        fn align_to(cursor: usize, align: usize) -> Result<usize, &'static str> {
             let rem = cursor % align;
             if rem == 0 {
-                cursor
+                Ok(cursor)
             } else {
-                cursor + (align - rem)
+                checked_add(cursor, align - rem)
             }
         }
 
         // Utf8 在布局阶段只预留 values buffer 容量，不表示真实已写入字节数。
-        fn reserved_value_bytes(data_type: &ColumnType, rows: usize) -> usize {
+        fn reserved_value_bytes(
+            data_type: &ColumnType,
+            rows: usize,
+        ) -> Result<usize, &'static str> {
             match data_type {
-                ColumnType::Int64 | ColumnType::Float64 | ColumnType::TimestampNsTz(_) => rows * 8,
-                ColumnType::Utf8 => rows * 32,
+                ColumnType::Int64 | ColumnType::Float64 | ColumnType::TimestampNsTz(_) => {
+                    checked_mul(rows, 8)
+                }
+                ColumnType::Utf8 => checked_mul(rows, 32),
             }
         }
 
@@ -51,30 +68,30 @@ impl LayoutPlan {
             let validity_offset = if validity_len == 0 {
                 0
             } else {
-                cursor = align_to(cursor, 8);
+                cursor = align_to(cursor, 8)?;
                 let offset = cursor;
-                cursor += validity_len;
+                cursor = checked_add(cursor, validity_len)?;
                 offset
             };
 
             let offsets_len = if matches!(spec.data_type, ColumnType::Utf8) {
-                (row_capacity + 1) * 4
+                checked_mul(checked_add(row_capacity, 1)?, 4)?
             } else {
                 0
             };
             let offsets_offset = if offsets_len == 0 {
                 0
             } else {
-                cursor = align_to(cursor, 8);
+                cursor = align_to(cursor, 8)?;
                 let offset = cursor;
-                cursor += offsets_len;
+                cursor = checked_add(cursor, offsets_len)?;
                 offset
             };
 
-            cursor = align_to(cursor, 8);
+            cursor = align_to(cursor, 8)?;
             let values_offset = cursor;
-            let values_len = reserved_value_bytes(&spec.data_type, row_capacity);
-            cursor += values_len;
+            let values_len = reserved_value_bytes(&spec.data_type, row_capacity)?;
+            cursor = checked_add(cursor, values_len)?;
 
             columns.push(ColumnLayout {
                 name: spec.name,
