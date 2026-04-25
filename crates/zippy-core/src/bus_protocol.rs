@@ -98,6 +98,19 @@ pub struct GetStreamRequest {
     pub stream_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishSegmentDescriptorRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub descriptor: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSegmentDescriptorRequest {
+    pub stream_name: String,
+    pub process_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListStreamsResponse {
     pub streams: Vec<StreamInfo>,
@@ -149,6 +162,8 @@ pub enum ControlRequest {
     CloseReader(DetachReaderRequest),
     ListStreams(ListStreamsRequest),
     GetStream(GetStreamRequest),
+    PublishSegmentDescriptor(PublishSegmentDescriptorRequest),
+    GetSegmentDescriptor(GetSegmentDescriptorRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +206,13 @@ pub enum ControlResponse {
     },
     StreamsListed(ListStreamsResponse),
     StreamFetched(GetStreamResponse),
+    SegmentDescriptorPublished {
+        stream_name: String,
+    },
+    SegmentDescriptorFetched {
+        stream_name: String,
+        descriptor: Option<serde_json::Value>,
+    },
     Error {
         reason: String,
     },
@@ -280,6 +302,20 @@ impl fmt::Display for ControlResponse {
                 response.stream.writer_process_id,
                 response.stream.reader_count,
                 response.stream.status
+            ),
+            Self::SegmentDescriptorPublished { stream_name } => write!(
+                f,
+                "segment descriptor published stream_name=[{}]",
+                stream_name
+            ),
+            Self::SegmentDescriptorFetched {
+                stream_name,
+                descriptor,
+            } => write!(
+                f,
+                "segment descriptor fetched stream_name=[{}] has_descriptor=[{}]",
+                stream_name,
+                descriptor.is_some()
             ),
             Self::Error { reason } => write!(f, "control error reason=[{}]", reason),
         }

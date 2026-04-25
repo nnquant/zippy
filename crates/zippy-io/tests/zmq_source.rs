@@ -55,7 +55,7 @@ impl SourceSink for RecordingSink {
                 schema: hello.schema,
                 schema_hash: hello.schema_hash,
             },
-            SourceEvent::Data(batch) => RecordedEvent::Data(batch),
+            SourceEvent::Data(table) => RecordedEvent::Data(table.to_record_batch()?),
             SourceEvent::Flush => RecordedEvent::Flush,
             SourceEvent::Stop => RecordedEvent::Stop,
             SourceEvent::Error(reason) => RecordedEvent::Error(reason),

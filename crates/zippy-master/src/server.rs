@@ -734,6 +734,78 @@ impl MasterServer {
                     },
                 }
             }
+            ControlRequest::PublishSegmentDescriptor(request) => {
+                let mut registry = self.registry.lock().unwrap();
+                match registry.publish_segment_descriptor(
+                    &request.stream_name,
+                    &request.process_id,
+                    request.descriptor,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            component = "master_server",
+                            event = "publish_segment_descriptor",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            "published segment descriptor"
+                        );
+                        ControlResponse::SegmentDescriptorPublished {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "publish_segment_descriptor",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            error = %error,
+                            "failed to publish segment descriptor"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            ControlRequest::GetSegmentDescriptor(request) => {
+                let registry = self.registry.lock().unwrap();
+                match registry
+                    .segment_descriptor_for_process(&request.stream_name, &request.process_id)
+                {
+                    Ok(descriptor) => {
+                        tracing::info!(
+                            component = "master_server",
+                            event = "get_segment_descriptor",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            descriptor_present = descriptor.is_some(),
+                            "fetched segment descriptor"
+                        );
+                        ControlResponse::SegmentDescriptorFetched {
+                            stream_name: request.stream_name,
+                            descriptor,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "get_segment_descriptor",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            error = %error,
+                            "failed to fetch segment descriptor"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
             ControlRequest::WriteTo(request) => {
                 let mut bus = self.bus.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
@@ -1336,13 +1408,13 @@ fn normalize_register_stream_bus_error(
     error: crate::bus::BusError,
 ) -> ZippyError {
     match error {
-        BusError::InvalidBufferOrFrameSize { .. } => registry_error(
-            crate::registry::RegistryError::InvalidStreamConfig {
+        BusError::InvalidBufferOrFrameSize { .. } => {
+            registry_error(crate::registry::RegistryError::InvalidStreamConfig {
                 stream_name: stream_name.to_string(),
                 buffer_size,
                 frame_size,
-            },
-        ),
+            })
+        }
         BusError::StreamConfigMismatch { .. } => {
             if let Some(existing) = registry.get_stream(stream_name) {
                 registry_error(crate::registry::RegistryError::StreamConfigMismatch {

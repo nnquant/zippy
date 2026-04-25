@@ -1,6 +1,7 @@
 pub mod cross_sectional;
 pub mod reactive;
 pub mod stream_table;
+mod table_view;
 pub mod testing;
 pub mod timeseries;
 

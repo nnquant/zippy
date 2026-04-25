@@ -8,8 +8,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{
     spawn_source_engine_with_publisher, Engine, EngineConfig, EngineMetricsDelta, EngineStatus,
-    OverflowPolicy, Publisher, Result, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
-    StreamHello, ZippyError,
+    OverflowPolicy, Publisher, Result, SegmentTableView, Source, SourceEvent, SourceHandle,
+    SourceMode, SourceSink, StreamHello, ZippyError,
 };
 
 struct BlockingEngine {
@@ -25,7 +25,11 @@ struct BlockingEngineState {
 }
 
 impl BlockingEngine {
-    fn new(schema: Arc<Schema>, state: Arc<BlockingEngineState>, fail_after_first_release: bool) -> Self {
+    fn new(
+        schema: Arc<Schema>,
+        state: Arc<BlockingEngineState>,
+        fail_after_first_release: bool,
+    ) -> Self {
         Self {
             schema,
             state,
@@ -47,9 +51,9 @@ impl Engine for BlockingEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         let value = batch
-            .column(0)
+            .column_at(0)?
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
@@ -76,12 +80,12 @@ impl Engine for BlockingEngine {
         Ok(Vec::new())
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         self.state.records.lock().unwrap().push("flush".to_string());
         Ok(Vec::new())
     }
 
-    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
         self.state.records.lock().unwrap().push("stop".to_string());
         Ok(Vec::new())
     }
@@ -127,7 +131,11 @@ impl ManualSourceState {
 
 impl ManualSource {
     fn new(mode: SourceMode, schema: Arc<Schema>, state: Arc<ManualSourceState>) -> Self {
-        Self { mode, schema, state }
+        Self {
+            mode,
+            schema,
+            state,
+        }
     }
 }
 
@@ -173,7 +181,10 @@ struct TestPipelineRuntime {
 
 impl TestPipelineRuntime {
     fn source_emit_data(&self, batch: RecordBatch) -> Result<()> {
-        self.source_state.emit(SourceEvent::Data(batch))
+        self.source_state
+            .emit(SourceEvent::Data(SegmentTableView::from_record_batch(
+                batch,
+            )))
     }
 
     fn source_emit_flush(&self) -> Result<()> {
@@ -203,7 +214,12 @@ impl TestPipelineRuntime {
         let (tx, rx) = channel();
         let source_state = self.source_state.clone();
         thread::spawn(move || {
-            tx.send(source_state.emit(SourceEvent::Data(batch))).unwrap();
+            tx.send(
+                source_state.emit(SourceEvent::Data(SegmentTableView::from_record_batch(
+                    batch,
+                ))),
+            )
+            .unwrap();
         });
         rx
     }
@@ -299,7 +315,11 @@ fn spawn_test_runtime_with_behavior(
         first_data_release_rx: Mutex::new(first_data_release_rx),
         records: Mutex::new(Vec::new()),
     });
-    let engine = BlockingEngine::new(schema.clone(), engine_state.clone(), fail_after_first_release);
+    let engine = BlockingEngine::new(
+        schema.clone(),
+        engine_state.clone(),
+        fail_after_first_release,
+    );
 
     let handle = spawn_source_engine_with_publisher(
         Box::new(source),
@@ -361,11 +381,7 @@ fn test_schema() -> Arc<Schema> {
 }
 
 fn single_row_batch(value: i64) -> RecordBatch {
-    RecordBatch::try_new(
-        test_schema(),
-        vec![Arc::new(Int64Array::from(vec![value]))],
-    )
-    .unwrap()
+    RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
 }
 
 #[test]
@@ -400,7 +416,9 @@ fn source_pipeline_fast_path_keeps_control_events_on_control_queue() {
     runtime.source_emit_flush().unwrap();
 
     let stop_result = runtime.source_emit_stop_async();
-    assert!(stop_result.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(stop_result
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
 
     first_data_release_tx.send(()).unwrap();
     match stop_result.recv_timeout(Duration::from_secs(1)) {
@@ -423,7 +441,9 @@ fn source_pipeline_block_mode_with_xfast_keeps_control_ordering() {
 
     runtime.source_emit_flush().unwrap();
     let stop_result = runtime.source_emit_stop_async();
-    assert!(stop_result.recv_timeout(Duration::from_millis(100)).is_err());
+    assert!(stop_result
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
 
     first_data_release_tx.send(()).unwrap();
     assert!(matches!(

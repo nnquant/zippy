@@ -3364,7 +3364,7 @@ def test_master_client_roundtrips_batches_through_master_bus_direct_reader(
 
     reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
     reader_client.register_process("reader")
-    reader = reader_client.read_from("ticks")
+    reader = reader_client.read_from("ticks", xfast=True)
 
     writer.write({"instrument_id": ["IF2606"], "last_price": [4102.5]})
     batch = reader.read(timeout_ms=1000)
@@ -3493,6 +3493,34 @@ def test_master_client_gets_stream(tmp_path: Path) -> None:
     server.stop()
 
 
+def test_master_client_publishes_and_gets_segment_descriptor(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("openctp_worker")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "openctp", "openctp_ticks", {})
+    descriptor = {
+        "magic": "zippy.segment.active",
+        "version": 1,
+        "schema_id": 7,
+        "row_capacity": 64,
+        "shm_os_id": "/tmp/zippy-segment",
+        "payload_offset": 64,
+        "committed_row_count_offset": 40,
+        "segment_id": 1,
+        "generation": 0,
+    }
+
+    client.publish_segment_descriptor("openctp_ticks", descriptor)
+    fetched = client.get_segment_descriptor("openctp_ticks")
+
+    assert fetched == descriptor
+
+    server.stop()
+
+
 def test_master_client_heartbeat_keeps_registered_process_alive(tmp_path: Path) -> None:
     server, control_endpoint = start_master_server(tmp_path)
 
@@ -3599,6 +3627,7 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
             expected_schema=tick_schema,
             master=factor_client,
             mode=zippy.SourceMode.PIPELINE,
+            xfast=True,
         ),
         target=zippy.BusStreamTarget(
             stream_name="openctp_factor_ticks",
@@ -3626,4 +3655,216 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
         output_reader.close()
         upstream.stop()
         engine.stop()
+        server.stop()
+
+
+def test_stream_table_engine_accepts_segment_stream_source() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-segment-source-test.sock")
+    source = zippy.SegmentStreamSource(
+        stream_name="openctp_ticks",
+        expected_schema=schema,
+        master=master,
+        mode=zippy.SourceMode.PIPELINE,
+        xfast=True,
+    )
+
+    engine = zippy.StreamTableEngine(
+        name="segment_table",
+        input_schema=schema,
+        source=source,
+        target=zippy.NullPublisher(),
+    )
+
+    assert engine.config()["source_linked"] is True
+
+
+def test_stream_table_engine_consumes_segment_stream_source_live_cross_process(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    output_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    output_client.register_process("segment_table_writer")
+    output_client.register_stream("segment_table_ticks", tick_schema, 64, 4096)
+
+    reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    reader_client.register_process("segment_table_reader")
+    output_reader = reader_client.read_from("segment_table_ticks")
+
+    writer_code = """
+import sys
+
+import pyarrow as pa
+
+import zippy
+
+control_endpoint = sys.argv[1]
+schema = pa.schema(
+    [
+        ("dt", pa.timestamp("ns", tz="UTC")),
+        ("instrument_id", pa.string()),
+        ("last_price", pa.float64()),
+    ]
+)
+
+client = zippy.MasterClient(control_endpoint=control_endpoint)
+client.register_process("segment_writer")
+client.register_stream("openctp_ticks", schema, 64, 4096)
+client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+
+writer = zippy._internal._SegmentTestWriter("openctp_ticks", schema, row_capacity=16)
+client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+print("ready", flush=True)
+
+if sys.stdin.readline().strip() != "go":
+    raise RuntimeError("expected go command")
+
+writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+print("written", flush=True)
+
+sys.stdin.readline()
+"""
+    writer = subprocess.Popen(
+        [sys.executable, "-c", writer_code, control_endpoint],
+        cwd=WORKSPACE_ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    engine_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    engine_client.register_process("segment_table_engine")
+    source = zippy.SegmentStreamSource(
+        stream_name="openctp_ticks",
+        expected_schema=tick_schema,
+        master=engine_client,
+        mode=zippy.SourceMode.PIPELINE,
+        xfast=True,
+    )
+    engine = zippy.StreamTableEngine(
+        name="segment_table_live",
+        input_schema=tick_schema,
+        source=source,
+        target=zippy.BusStreamTarget(
+            stream_name="segment_table_ticks",
+            master=output_client,
+        ),
+    )
+
+    engine_started = False
+    try:
+        assert writer.stdout is not None
+        assert writer.stdin is not None
+        ready = writer.stdout.readline().strip()
+        if ready != "ready":
+            stdout, stderr = writer.communicate(timeout=5)
+            raise AssertionError(f"writer did not publish descriptor stdout={stdout} stderr={stderr}")
+
+        engine.start()
+        engine_started = True
+        writer.stdin.write("go\n")
+        writer.stdin.flush()
+        written = writer.stdout.readline().strip()
+        if written != "written":
+            stdout, stderr = writer.communicate(timeout=5)
+            raise AssertionError(f"writer did not append row stdout={stdout} stderr={stderr}")
+
+        received = output_reader.read(timeout_ms=2000)
+
+        assert received.schema == tick_schema
+        assert received.column("instrument_id").to_pylist() == ["IF2606"]
+        assert received.column("last_price").to_pylist() == [4102.5]
+    finally:
+        if writer.stdin is not None and writer.poll() is None:
+            writer.stdin.write("stop\n")
+            writer.stdin.flush()
+        try:
+            writer.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            writer.kill()
+            writer.communicate(timeout=5)
+        output_reader.close()
+        if engine_started:
+            engine.stop()
+        server.stop()
+
+
+def test_stream_table_engine_rejects_segment_stream_source_schema_mismatch() -> None:
+    source_schema = pa.schema([("instrument_id", pa.string())])
+    input_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-segment-source-test.sock")
+    source = zippy.SegmentStreamSource(
+        stream_name="openctp_ticks",
+        expected_schema=source_schema,
+        master=master,
+    )
+
+    with pytest.raises(ValueError, match="source output schema must match downstream input_schema"):
+        zippy.StreamTableEngine(
+            name="segment_table_mismatch",
+            input_schema=input_schema,
+            source=source,
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_bus_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    reader_master.register_process("reactive_reader")
+    writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    writer_master.register_process("writer")
+
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_bus_retry",
+        source=zippy.BusStreamSource(
+            stream_name="ticks",
+            expected_schema=tick_schema,
+            master=reader_master,
+            mode=zippy.SourceMode.PIPELINE,
+            xfast=True,
+        ),
+        input_schema=tick_schema,
+        id_column="instrument_id",
+        factors=[zippy.Expr(expression="last_price * 2.0", output="price_x2")],
+        target=zippy.NullPublisher(),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="stream not found"):
+            engine.start()
+
+        writer_master.register_stream("ticks", tick_schema, 64, 4096)
+
+        engine.start()
+        engine.stop()
+    finally:
+        if engine.status() == "running":
+            engine.stop()
         server.stop()

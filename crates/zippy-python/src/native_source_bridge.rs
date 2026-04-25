@@ -8,7 +8,7 @@ use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods};
-use zippy_core::{SourceEvent, SourceSink, StreamHello, ZippyError};
+use zippy_core::{SegmentTableView, SourceEvent, SourceSink, StreamHello, ZippyError};
 
 pub const NATIVE_SOURCE_SINK_CAPSULE_NAME: &str = "zippy.native_source_sink.v1";
 
@@ -125,7 +125,11 @@ fn emit_data_ipc_impl(ctx: *mut c_void, data: *const u8, len: usize) -> Result<(
     }
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let batch = decode_ipc_batch(bytes)?;
-    state.sink.emit(SourceEvent::Data(batch))
+    state
+        .sink
+        .emit(SourceEvent::Data(SegmentTableView::from_record_batch(
+            batch,
+        )))
 }
 
 fn emit_simple_event(ctx: *mut c_void, event: SourceEvent) -> Result<(), ZippyError> {

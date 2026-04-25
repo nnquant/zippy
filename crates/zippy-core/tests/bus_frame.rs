@@ -1,5 +1,6 @@
 use zippy_core::{
-    encode_bus_frame, parse_bus_frame, BusFrameKind, ZippyError, BUS_FRAME_MAGIC, BUS_FRAME_VERSION,
+    encode_bus_frame, encode_bus_frame_with_timing, parse_bus_frame, BusFrameKind, BusFrameTiming,
+    ZippyError, BUS_FRAME_MAGIC, BUS_FRAME_VERSION,
 };
 
 #[test]
@@ -18,6 +19,37 @@ fn enveloped_frame_roundtrip_directory_and_payload() {
         }
         other => panic!("expected enveloped frame, got {:?}", other),
     }
+    assert_eq!(parsed.arrow_payload, arrow_payload);
+    assert_eq!(parsed.timing, None);
+}
+
+#[test]
+fn enveloped_frame_roundtrip_timing_metadata_and_payload() {
+    let instrument_ids = vec!["ES", "NQ"];
+    let arrow_payload = b"arrow-payload-bytes";
+    let timing = BusFrameTiming {
+        target_publish_enter_ns: 95,
+        writer_enter_ns: 100,
+        arrow_encoded_ns: 110,
+        instrument_ids_done_ns: 120,
+        publish_start_ns: 123,
+        publish_done_ns: 456,
+    };
+
+    let encoded =
+        encode_bus_frame_with_timing(&instrument_ids, arrow_payload, Some(timing.clone()))
+            .expect("encode should succeed");
+    let parsed = parse_bus_frame(&encoded).expect("parse should succeed");
+
+    match parsed.kind {
+        BusFrameKind::EnvelopedWithDirectory {
+            instrument_ids: parsed_ids,
+        } => {
+            assert_eq!(parsed_ids, vec!["ES", "NQ"]);
+        }
+        other => panic!("expected enveloped frame, got {:?}", other),
+    }
+    assert_eq!(parsed.timing, Some(timing));
     assert_eq!(parsed.arrow_payload, arrow_payload);
 }
 
@@ -43,6 +75,7 @@ fn enveloped_frame_without_directory_is_distinct() {
         BusFrameKind::EnvelopedWithoutDirectory
     ));
     assert_eq!(parsed.arrow_payload, arrow_payload);
+    assert_eq!(parsed.timing, None);
 }
 
 #[test]
@@ -168,6 +201,28 @@ fn truncated_header_rejected() {
         ZippyError::Io { reason } => {
             assert!(
                 reason.contains("truncated"),
+                "unexpected reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected io error, got {:?}", other),
+    }
+}
+
+#[test]
+fn truncated_timing_metadata_rejected() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&BUS_FRAME_MAGIC);
+    bytes.extend_from_slice(&BUS_FRAME_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&0x0002u16.to_le_bytes());
+    bytes.extend_from_slice(&123i64.to_le_bytes());
+
+    let err = parse_bus_frame(&bytes).expect_err("truncated timing metadata should fail");
+
+    match err {
+        ZippyError::Io { reason } => {
+            assert!(
+                reason.contains("truncated bus frame timing metadata"),
                 "unexpected reason: {}",
                 reason
             );

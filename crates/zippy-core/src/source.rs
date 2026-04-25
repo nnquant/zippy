@@ -1,10 +1,8 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use crate::{Result, SchemaRef, SegmentTableView, ZippyError};
 use arrow::ipc::convert::IpcSchemaEncoder;
-use arrow::record_batch::RecordBatch;
-
-use crate::{Result, SchemaRef, ZippyError};
 
 type SourceStopFn = Box<dyn FnMut() -> Result<()> + Send>;
 
@@ -50,7 +48,7 @@ impl StreamHello {
 
 pub enum SourceEvent {
     Hello(StreamHello),
-    Data(RecordBatch),
+    Data(SegmentTableView),
     Flush,
     Stop,
     Error(String),

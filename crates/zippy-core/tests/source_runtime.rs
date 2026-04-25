@@ -10,8 +10,8 @@ use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use zippy_core::{
     spawn_source_engine_with_publisher, Engine, EngineConfig, EngineMetricsDelta, EngineStatus,
-    OverflowPolicy, Publisher, Result, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
-    StreamHello, ZippyError,
+    OverflowPolicy, Publisher, Result, SegmentTableView, Source, SourceEvent, SourceHandle,
+    SourceMode, SourceSink, StreamHello, ZippyError,
 };
 
 #[derive(Default)]
@@ -90,19 +90,19 @@ impl Engine for OrderedRecordingEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         self.order.lock().unwrap().push("data");
         Ok(vec![batch])
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         self.order.lock().unwrap().push("flush");
-        Ok(vec![test_batch()])
+        Ok(vec![SegmentTableView::from_record_batch(test_batch())])
     }
 
-    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
         self.order.lock().unwrap().push("stop");
-        Ok(vec![test_batch()])
+        Ok(vec![SegmentTableView::from_record_batch(test_batch())])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
@@ -123,19 +123,19 @@ impl Engine for RecordingEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         self.calls.lock().unwrap().data_count += 1;
         Ok(vec![batch])
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         self.calls.lock().unwrap().flush_count += 1;
-        Ok(vec![test_batch()])
+        Ok(vec![SegmentTableView::from_record_batch(test_batch())])
     }
 
-    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
         self.calls.lock().unwrap().stop_count += 1;
-        Ok(vec![test_batch()])
+        Ok(vec![SegmentTableView::from_record_batch(test_batch())])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
@@ -499,15 +499,15 @@ impl Engine for DropTrackingEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         Ok(vec![batch])
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         Ok(Vec::new())
     }
 
-    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
         Ok(Vec::new())
     }
 
@@ -591,7 +591,7 @@ fn pipeline_source_runtime_forwards_flush_into_engine() {
         schema.clone(),
         vec![
             SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
-            SourceEvent::Data(test_batch()),
+            SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
             SourceEvent::Flush,
             SourceEvent::Stop,
         ],
@@ -636,7 +636,7 @@ fn prepared_source_runtime_replays_events_emitted_during_start() {
                     SourceEvent::Hello(
                         StreamHello::new("bars", prepare_schema.clone(), 1).unwrap(),
                     ),
-                    SourceEvent::Data(test_batch()),
+                    SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
                     SourceEvent::Flush,
                     SourceEvent::Stop,
                 ],
@@ -675,7 +675,7 @@ fn prepared_source_runtime_processes_data_before_error_emitted_during_start() {
                     SourceEvent::Hello(
                         StreamHello::new("bars", prepare_schema.clone(), 1).unwrap(),
                     ),
-                    SourceEvent::Data(test_batch()),
+                    SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
                     SourceEvent::Error("prepared-runtime-error".to_string()),
                 ],
             }),
@@ -767,7 +767,7 @@ fn source_runtime_consumer_stop_ends_runtime_without_engine_stop() {
         schema.clone(),
         vec![
             SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
-            SourceEvent::Data(test_batch()),
+            SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
             SourceEvent::Flush,
             SourceEvent::Stop,
         ],
@@ -815,7 +815,7 @@ fn source_runtime_data_event_drives_engine_on_data() {
         schema.clone(),
         vec![
             SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
-            SourceEvent::Data(test_batch()),
+            SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
             SourceEvent::Stop,
         ],
     );
@@ -843,7 +843,9 @@ fn source_runtime_requires_hello_before_data() {
     let source = StaticSource::new(
         SourceMode::Pipeline,
         schema.clone(),
-        vec![SourceEvent::Data(test_batch())],
+        vec![SourceEvent::Data(SegmentTableView::from_record_batch(
+            test_batch(),
+        ))],
     );
     let engine = RecordingEngine::new(schema, calls.clone());
 
@@ -912,7 +914,7 @@ fn source_runtime_pipeline_flush_flushes_publisher_barrier() {
         schema.clone(),
         vec![
             SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
-            SourceEvent::Data(test_batch()),
+            SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
             SourceEvent::Flush,
             SourceEvent::Stop,
         ],
@@ -1124,7 +1126,7 @@ fn source_runtime_consumer_natural_exit_without_stop_is_failed() {
         schema.clone(),
         vec![
             SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
-            SourceEvent::Data(test_batch()),
+            SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
         ],
     );
     let engine = RecordingEngine::new(schema, Arc::new(Mutex::new(RecordedCalls::default())));
@@ -1154,7 +1156,7 @@ fn source_runtime_pipeline_xfast_drains_fast_data_before_source_terminated_failu
         schema.clone(),
         vec![
             SourceEvent::Hello(StreamHello::new("bars", schema.clone(), 1).unwrap()),
-            SourceEvent::Data(test_batch()),
+            SourceEvent::Data(SegmentTableView::from_record_batch(test_batch())),
         ],
     );
     let engine = RecordingEngine::new(schema, calls.clone());

@@ -6,10 +6,11 @@ pub mod logging;
 pub mod master_client;
 pub mod metrics;
 pub mod publisher;
-pub mod spsc_data_queue;
 pub mod queue;
 pub mod runtime;
 pub mod source;
+pub mod spsc_data_queue;
+pub mod table;
 pub mod types;
 pub mod version;
 
@@ -20,10 +21,11 @@ pub use bus_frame::{
 };
 pub use bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
-    GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
-    ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
-    RegisterSourceRequest, RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest,
-    WriterDescriptor, BUS_LAYOUT_VERSION,
+    GetSegmentDescriptorRequest, GetStreamRequest, GetStreamResponse, HeartbeatRequest,
+    ListStreamsRequest, ListStreamsResponse, PublishSegmentDescriptorRequest, ReaderDescriptor,
+    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
+    RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
+    BUS_LAYOUT_VERSION,
 };
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};
@@ -31,12 +33,13 @@ pub use logging::{current_log_snapshot, setup_log, LogConfig, LogSnapshot};
 pub use master_client::{MasterClient, Reader, TimedReadBatch, Writer};
 pub use metrics::{EngineMetrics, EngineMetricsDelta, EngineMetricsSnapshot};
 pub use publisher::Publisher;
-pub use spsc_data_queue::SpscDataQueue;
 pub use queue::BoundedQueue;
 pub use runtime::{
     spawn_engine, spawn_engine_with_publisher, spawn_source_engine_with_publisher, EngineHandle,
 };
 pub use source::{Source, SourceEvent, SourceHandle, SourceMode, SourceSink, StreamHello};
+pub use spsc_data_queue::SpscDataQueue;
+pub use table::{SegmentRowView, SegmentTableView};
 pub use types::{EngineConfig, EngineStatus, LateDataPolicy, OverflowPolicy};
 pub use version::{base_version, python_dev_version, rust_dev_version};
 

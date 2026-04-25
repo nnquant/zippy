@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StringArray, UInt32Array};
-use arrow::compute::take_record_batch;
+use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, EngineMetricsDelta, Result, SchemaRef, ZippyError};
+use zippy_core::{Engine, EngineMetricsDelta, Result, SchemaRef, SegmentTableView, ZippyError};
 use zippy_operators::ReactiveFactor;
+
+use crate::table_view::{project_columns, string_array};
 
 /// Stateful engine that appends reactive factor outputs to each input batch.
 pub struct ReactiveStateEngine {
@@ -111,8 +113,8 @@ impl Engine for ReactiveStateEngine {
         Arc::clone(&self.output_schema)
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
-        if batch.schema().as_ref() != self.input_schema.as_ref() {
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
                     "input batch schema does not match engine input schema engine=[{}]",
@@ -120,14 +122,12 @@ impl Engine for ReactiveStateEngine {
                 ),
             });
         }
+        let mut columns = self.filter_by_id_whitelist(&table)?;
 
-        let batch = self.filter_by_id_whitelist(batch)?;
-
-        if batch.num_rows() == 0 {
+        if columns.first().map_or(0, |column| column.len()) == 0 {
             return Ok(vec![]);
         }
 
-        let mut columns = batch.columns().to_vec();
         let mut current_schema = Arc::clone(&self.input_schema);
 
         for factor in &mut self.factors {
@@ -154,7 +154,7 @@ impl Engine for ReactiveStateEngine {
                 }
             })?;
 
-        Ok(vec![output])
+        Ok(vec![SegmentTableView::from_record_batch(output)])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
@@ -168,34 +168,29 @@ impl Engine for ReactiveStateEngine {
 }
 
 impl ReactiveStateEngine {
-    fn filter_by_id_whitelist(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+    fn filter_by_id_whitelist(&mut self, table: &SegmentTableView) -> Result<Vec<ArrayRef>> {
+        let columns = project_columns(table, &self.input_schema)?;
         let Some(id_filter) = &self.id_filter else {
-            return Ok(batch);
+            return Ok(columns);
         };
         let id_column_index = self
             .id_column_index
             .expect("id column index must exist when id filter is configured");
 
-        if batch.num_rows() == 0 {
-            return Ok(batch);
+        if table.num_rows() == 0 {
+            return Ok(columns);
         }
 
         let id_field = self
             .id_field
             .as_deref()
             .expect("id field must exist when id filter is configured");
-        let id_column = batch
-            .column(id_column_index)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or(ZippyError::SchemaMismatch {
-                reason: format!("id field must be utf8 field=[{}]", id_field),
-            })?;
+        let id_column = string_array(&columns[id_column_index], id_field)?;
 
-        let mut kept_indices = Vec::with_capacity(batch.num_rows());
+        let mut kept_indices = Vec::with_capacity(table.num_rows());
         let mut filtered_rows = 0u64;
 
-        for row_index in 0..batch.num_rows() {
+        for row_index in 0..table.num_rows() {
             if id_column.is_null(row_index) {
                 filtered_rows += 1;
                 continue;
@@ -211,14 +206,19 @@ impl ReactiveStateEngine {
 
         self.pending_filtered_rows += filtered_rows;
 
-        if kept_indices.len() == batch.num_rows() {
-            return Ok(batch);
+        if kept_indices.len() == table.num_rows() {
+            return Ok(columns);
         }
 
         let indices = UInt32Array::from(kept_indices);
-        take_record_batch(&batch, &indices).map_err(|error| ZippyError::Io {
-            reason: format!("failed to filter reactive batch error=[{}]", error),
-        })
+        columns
+            .iter()
+            .map(|column| {
+                take(column.as_ref(), &indices, None).map_err(|error| ZippyError::Io {
+                    reason: format!("failed to filter reactive table view error=[{}]", error),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
     }
 }
 

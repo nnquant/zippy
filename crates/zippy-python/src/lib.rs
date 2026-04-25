@@ -3,10 +3,11 @@
 mod native_source_bridge;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::hint::spin_loop;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -14,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::compute::concat_batches;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -23,11 +24,11 @@ use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
 use tracing::{error, info};
 use zippy_core::{
     current_log_snapshot, python_dev_version, setup_log as setup_core_log,
-    spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine, EngineConfig,
-    EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy, LogConfig,
-    MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
-    Reader as CoreBusReader, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode,
-    SourceSink, StreamHello, Writer as CoreBusWriter, ZippyError,
+    spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle, EngineMetricsSnapshot,
+    EngineStatus, LateDataPolicy, LogConfig, MasterClient as CoreMasterClient, OverflowPolicy,
+    Publisher as CorePublisher, Reader as CoreBusReader, SegmentTableView, Source, SourceEvent,
+    SourceHandle, SourceMode as RustSourceMode, SourceSink, StreamHello, Writer as CoreBusWriter,
+    ZippyError,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
@@ -51,6 +52,10 @@ use zippy_operators::{
     ClipSpec as RustClipSpec, ExpressionSpec as RustExpressionSpec, LogSpec as RustLogSpec,
     TsDelaySpec as RustTsDelaySpec, TsDiffSpec as RustTsDiffSpec, TsEmaSpec as RustTsEmaSpec,
     TsMeanSpec as RustTsMeanSpec, TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
+};
+use zippy_segment_store::{
+    compile_schema as compile_segment_schema, ActiveSegmentReader, ColumnSpec, ColumnType,
+    CompiledSchema, LayoutPlan, PartitionHandle, SegmentStore, SegmentStoreConfig,
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
@@ -107,7 +112,8 @@ fn python_json_dumps(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Strin
 
 fn python_json_loads<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
     let json = PyModule::import_bound(py, "json")?;
-    json.call_method1("loads", (text,)).map_err(|error| py_value_error(error.to_string()))
+    json.call_method1("loads", (text,))
+        .map_err(|error| py_value_error(error.to_string()))
 }
 
 fn send_master_control_request(
@@ -135,12 +141,14 @@ fn send_master_control_request(
             control_endpoint, error
         ))
     })?;
-    stream.shutdown(std::net::Shutdown::Write).map_err(|error| {
-        py_runtime_error(format!(
-            "failed to shutdown control request write path=[{}] error=[{}]",
-            control_endpoint, error
-        ))
-    })?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|error| {
+            py_runtime_error(format!(
+                "failed to shutdown control request write path=[{}] error=[{}]",
+                control_endpoint, error
+            ))
+        })?;
 
     let mut response_line = String::new();
     let mut reader = BufReader::new(stream);
@@ -157,7 +165,9 @@ fn send_master_control_request(
         .map_err(|_| py_runtime_error("invalid control response"))?;
 
     if let Some((key, value)) = response.iter().next() {
-        let key = key.extract::<String>().map_err(|error| py_value_error(error.to_string()))?;
+        let key = key
+            .extract::<String>()
+            .map_err(|error| py_value_error(error.to_string()))?;
         if key == "Error" {
             let error = value
                 .downcast::<PyDict>()
@@ -191,6 +201,7 @@ type RegisteredSource = (
     SourceOwner,
     Option<RemoteSourceConfig>,
     Option<BusSourceConfig>,
+    Option<SegmentSourceConfig>,
     Option<PythonSourceConfig>,
 );
 
@@ -222,6 +233,17 @@ struct BusSourceConfig {
     expected_schema: Arc<Schema>,
     master: SharedMasterClient,
     mode: RustSourceMode,
+    xfast: bool,
+}
+
+#[derive(Clone)]
+struct SegmentSourceConfig {
+    stream_name: String,
+    expected_schema: Arc<Schema>,
+    segment_schema: CompiledSchema,
+    master: SharedMasterClient,
+    mode: RustSourceMode,
+    xfast: bool,
 }
 
 struct PythonSourceConfig {
@@ -296,8 +318,13 @@ impl SourceSinkProxy {
     fn emit_data(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let batches = value_to_record_batches(py, value, self.schema.as_ref())?;
         for batch in batches {
-            py.allow_threads(|| self.sink.emit(SourceEvent::Data(batch)))
-                .map_err(|error| py_runtime_error(error.to_string()))?;
+            py.allow_threads(|| {
+                self.sink
+                    .emit(SourceEvent::Data(SegmentTableView::from_record_batch(
+                        batch,
+                    )))
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
         }
         Ok(())
     }
@@ -718,6 +745,51 @@ fn current_epoch_hour() -> zippy_core::Result<u64> {
             reason: format!("failed to compute archive hour error=[{}]", error),
         })?;
     Ok(duration.as_secs() / 3_600)
+}
+
+fn current_localtime_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after unix epoch")
+        .as_nanos() as i64
+}
+
+fn compile_segment_schema_from_arrow(schema: &Schema) -> PyResult<CompiledSchema> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let name: &'static str = Box::leak(field.name().clone().into_boxed_str());
+            let data_type = match field.data_type() {
+                DataType::Int64 => ColumnType::Int64,
+                DataType::Float64 => ColumnType::Float64,
+                DataType::Utf8 => ColumnType::Utf8,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) => {
+                    let timezone: &'static str = Box::leak(timezone.to_string().into_boxed_str());
+                    ColumnType::TimestampNsTz(timezone)
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                    return Err(py_value_error(
+                        "segment stream timestamp columns must include an explicit timezone",
+                    ));
+                }
+                other => {
+                    return Err(py_value_error(format!(
+                        "unsupported segment stream field type name=[{}] data_type=[{}]",
+                        field.name(),
+                        other
+                    )));
+                }
+            };
+            Ok(if field.is_nullable() {
+                ColumnSpec::nullable(name, data_type)
+            } else {
+                ColumnSpec::new(name, data_type)
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    compile_segment_schema(&columns).map_err(py_value_error)
 }
 
 #[pyclass]
@@ -1364,19 +1436,13 @@ impl MasterClient {
             .ok_or_else(|| py_runtime_error("master client process not registered"))
     }
 
-    fn register_process(&self, app: String) -> PyResult<String> {
-        self.client
-            .lock()
-            .unwrap()
-            .register_process(&app)
+    fn register_process(&self, py: Python<'_>, app: String) -> PyResult<String> {
+        py.allow_threads(|| self.client.lock().unwrap().register_process(&app))
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
-    fn heartbeat(&self) -> PyResult<()> {
-        self.client
-            .lock()
-            .unwrap()
-            .heartbeat()
+    fn heartbeat(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.client.lock().unwrap().heartbeat())
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
@@ -1488,7 +1554,12 @@ impl MasterClient {
         payload.set_item("input_stream", input_stream)?;
         payload.set_item("config", config)?;
         request.set_item("RegisterSink", payload)?;
-        send_master_control_request(py, &self.control_endpoint, request.as_any(), "SinkRegistered")
+        send_master_control_request(
+            py,
+            &self.control_endpoint,
+            request.as_any(),
+            "SinkRegistered",
+        )
     }
 
     #[pyo3(signature = (kind, name, status, metrics=None))]
@@ -1518,6 +1589,41 @@ impl MasterClient {
         )
     }
 
+    fn publish_segment_descriptor(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        descriptor: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let descriptor_text = python_json_dumps(py, descriptor)?;
+        let descriptor = serde_json::from_str::<serde_json::Value>(&descriptor_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .publish_segment_descriptor(&stream_name, descriptor)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn get_segment_descriptor(&self, py: Python<'_>, stream_name: String) -> PyResult<PyObject> {
+        let descriptor = py
+            .allow_threads(|| {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .get_segment_descriptor(&stream_name)
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let Some(descriptor) = descriptor else {
+            return Ok(py.None());
+        };
+        let descriptor_text = serde_json::to_string(&descriptor)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        Ok(python_json_loads(py, &descriptor_text)?.into_py(py))
+    }
+
     fn write_to(&self, stream_name: String) -> PyResult<BusWriter> {
         let schema = self
             .schemas
@@ -1538,20 +1644,22 @@ impl MasterClient {
         })
     }
 
-    #[pyo3(signature = (stream_name, instrument_ids=None))]
+    #[pyo3(signature = (stream_name, instrument_ids=None, xfast=false))]
     fn read_from(
         &self,
         stream_name: String,
         instrument_ids: Option<&Bound<'_, PyAny>>,
+        xfast: bool,
     ) -> PyResult<BusReader> {
         let instrument_ids = parse_instrument_ids(instrument_ids)?;
         let reader = attach_bus_reader_with(
             &self.client,
             &stream_name,
             instrument_ids,
-            |client, stream_name| client.read_from(stream_name),
-            |client, stream_name, instrument_ids| {
-                client.read_from_filtered(stream_name, instrument_ids)
+            xfast,
+            |client, stream_name, xfast| client.read_from_with_xfast(stream_name, xfast),
+            |client, stream_name, instrument_ids, xfast| {
+                client.read_from_filtered_with_xfast(stream_name, instrument_ids, xfast)
             },
         )
         .map_err(|error| py_runtime_error(error.to_string()))?;
@@ -1644,9 +1752,8 @@ impl MasterDaemon {
         let socket_path = prepare_control_endpoint_path(&self.control_endpoint)?;
         let server = self.server.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
-        let join_handle = thread::spawn(move || {
-            server.serve_with_ready(&socket_path, Some(startup_tx))
-        });
+        let join_handle =
+            thread::spawn(move || server.serve_with_ready(&socket_path, Some(startup_tx)));
 
         match startup_rx.recv_timeout(startup_timeout) {
             Ok(Ok(())) => {
@@ -1723,17 +1830,19 @@ struct BusStreamSource {
     expected_schema: Arc<Schema>,
     mode: RustSourceMode,
     master: SharedMasterClient,
+    xfast: bool,
 }
 
 #[pymethods]
 impl BusStreamSource {
     #[new]
-    #[pyo3(signature = (stream_name, expected_schema, master, mode=None))]
+    #[pyo3(signature = (stream_name, expected_schema, master, mode=None, xfast=false))]
     fn new(
         stream_name: String,
         expected_schema: &Bound<'_, PyAny>,
         master: &Bound<'_, PyAny>,
         mode: Option<&Bound<'_, PyAny>>,
+        xfast: bool,
     ) -> PyResult<Self> {
         let expected_schema = Arc::new(
             Schema::from_pyarrow_bound(expected_schema)
@@ -1750,7 +1859,105 @@ impl BusStreamSource {
                 None => RustSourceMode::Pipeline,
             },
             master: Arc::clone(&master.client),
+            xfast,
         })
+    }
+}
+
+#[pyclass]
+struct SegmentStreamSource {
+    stream_name: String,
+    expected_schema: Arc<Schema>,
+    segment_schema: CompiledSchema,
+    mode: RustSourceMode,
+    master: SharedMasterClient,
+    xfast: bool,
+}
+
+#[pymethods]
+impl SegmentStreamSource {
+    #[new]
+    #[pyo3(signature = (stream_name, expected_schema, master, mode=None, xfast=false))]
+    fn new(
+        stream_name: String,
+        expected_schema: &Bound<'_, PyAny>,
+        master: &Bound<'_, PyAny>,
+        mode: Option<&Bound<'_, PyAny>>,
+        xfast: bool,
+    ) -> PyResult<Self> {
+        let expected_schema = Arc::new(
+            Schema::from_pyarrow_bound(expected_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let segment_schema = compile_segment_schema_from_arrow(expected_schema.as_ref())?;
+        let master = master
+            .extract::<PyRef<'_, MasterClient>>()
+            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
+        Ok(Self {
+            stream_name,
+            expected_schema,
+            segment_schema,
+            mode: match mode {
+                Some(mode) => parse_source_mode(mode)?,
+                None => RustSourceMode::Pipeline,
+            },
+            master: Arc::clone(&master.client),
+            xfast,
+        })
+    }
+}
+
+#[pyclass(name = "_SegmentTestWriter")]
+struct SegmentTestWriter {
+    _store: SegmentStore,
+    partition: PartitionHandle,
+}
+
+#[pymethods]
+impl SegmentTestWriter {
+    #[new]
+    #[pyo3(signature = (stream_name, schema, row_capacity=32))]
+    fn new(stream_name: String, schema: &Bound<'_, PyAny>, row_capacity: usize) -> PyResult<Self> {
+        if row_capacity == 0 {
+            return Err(py_value_error("row_capacity must be greater than zero"));
+        }
+
+        let arrow_schema = Schema::from_pyarrow_bound(schema)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let segment_schema = compile_segment_schema_from_arrow(&arrow_schema)?;
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: row_capacity,
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+        let partition = store
+            .open_partition_with_schema(&stream_name, "all", segment_schema)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+
+        Ok(Self {
+            _store: store,
+            partition,
+        })
+    }
+
+    fn descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let envelope = self
+            .partition
+            .active_descriptor_envelope_bytes()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let envelope_text =
+            std::str::from_utf8(&envelope).map_err(|error| py_value_error(error.to_string()))?;
+        Ok(python_json_loads(py, envelope_text)?.into_py(py))
+    }
+
+    fn append_tick(&self, dt: i64, instrument_id: String, last_price: f64) -> PyResult<()> {
+        self.partition
+            .writer()
+            .append_tick_for_test(dt, &instrument_id, last_price)
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn committed_row_count(&self) -> usize {
+        self.partition.active_committed_row_count()
     }
 }
 
@@ -1845,7 +2052,8 @@ struct BusTargetPublisher {
 
 impl CorePublisher for BusTargetPublisher {
     fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
-        self.writer.write(batch.clone())
+        self.writer
+            .write_with_target_publish_enter_ns(batch.clone(), current_localtime_ns())
     }
 
     fn flush(&mut self) -> zippy_core::Result<()> {
@@ -1862,6 +2070,7 @@ struct BusSourceBridge {
     expected_schema: Arc<Schema>,
     mode: RustSourceMode,
     master: SharedMasterClient,
+    xfast: bool,
 }
 
 impl Source for BusSourceBridge {
@@ -1878,7 +2087,11 @@ impl Source for BusSourceBridge {
     }
 
     fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
-        let mut reader = self.master.lock().unwrap().read_from(&self.stream_name)?;
+        let mut reader = self
+            .master
+            .lock()
+            .unwrap()
+            .read_from_with_xfast(&self.stream_name, self.xfast)?;
         let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
         sink.emit(SourceEvent::Hello(hello))?;
 
@@ -1887,7 +2100,9 @@ impl Source for BusSourceBridge {
         let join_handle = thread::spawn(move || {
             while running_flag.load(Ordering::SeqCst) {
                 match reader.read(Some(100)) {
-                    Ok(batch) => sink.emit(SourceEvent::Data(batch))?,
+                    Ok(batch) => sink.emit(SourceEvent::Data(
+                        SegmentTableView::from_record_batch(batch),
+                    ))?,
                     Err(ZippyError::Io { reason }) if reason.contains("reader timed out") => {
                         continue;
                     }
@@ -1911,6 +2126,140 @@ impl Source for BusSourceBridge {
     }
 }
 
+struct SegmentSourceBridge {
+    stream_name: String,
+    expected_schema: Arc<Schema>,
+    segment_schema: CompiledSchema,
+    mode: RustSourceMode,
+    master: SharedMasterClient,
+    xfast: bool,
+}
+
+impl Source for SegmentSourceBridge {
+    fn name(&self) -> &str {
+        &self.stream_name
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.expected_schema)
+    }
+
+    fn mode(&self) -> RustSourceMode {
+        self.mode
+    }
+
+    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
+        const DESCRIPTOR_REFRESH_INTERVAL: Duration = Duration::from_millis(1);
+
+        let descriptor = self
+            .master
+            .lock()
+            .unwrap()
+            .get_segment_descriptor(&self.stream_name)?
+            .ok_or(ZippyError::InvalidState {
+                status: "segment descriptor is not published",
+            })?;
+        let mut descriptor_text = serde_json::to_string(&descriptor).map_err(json_zippy_error)?;
+        let mut reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)?;
+        let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
+        sink.emit(SourceEvent::Hello(hello))?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let running_flag = Arc::clone(&running);
+        let master = Arc::clone(&self.master);
+        let stream_name = self.stream_name.clone();
+        let segment_schema = self.segment_schema.clone();
+        let xfast = self.xfast;
+        let join_handle = thread::spawn(move || {
+            let mut next_descriptor_refresh = Instant::now() + DESCRIPTOR_REFRESH_INTERVAL;
+            while running_flag.load(Ordering::SeqCst) {
+                if Instant::now() >= next_descriptor_refresh {
+                    next_descriptor_refresh = Instant::now() + DESCRIPTOR_REFRESH_INTERVAL;
+                    if let Some(next_descriptor) = master
+                        .lock()
+                        .unwrap()
+                        .get_segment_descriptor(&stream_name)?
+                    {
+                        let next_descriptor_text =
+                            serde_json::to_string(&next_descriptor).map_err(json_zippy_error)?;
+                        if next_descriptor_text != descriptor_text {
+                            let (next_reader, _) =
+                                build_active_segment_reader(&next_descriptor, &segment_schema)?;
+                            reader = next_reader;
+                            descriptor_text = next_descriptor_text;
+                        }
+                    }
+                }
+
+                match reader.read_available().map_err(segment_zippy_error)? {
+                    Some(span) => {
+                        sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
+                    }
+                    None if xfast => spin_loop(),
+                    None => thread::sleep(Duration::from_micros(10)),
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(SourceHandle::new_with_stop(
+            join_handle,
+            Box::new(move || {
+                running.store(false, Ordering::SeqCst);
+                Ok(())
+            }),
+        ))
+    }
+}
+
+fn active_segment_reader_from_descriptor(
+    descriptor: &serde_json::Value,
+    segment_schema: &CompiledSchema,
+) -> zippy_core::Result<ActiveSegmentReader> {
+    Ok(build_active_segment_reader(descriptor, segment_schema)?.0)
+}
+
+fn build_active_segment_reader(
+    descriptor: &serde_json::Value,
+    segment_schema: &CompiledSchema,
+) -> zippy_core::Result<(ActiveSegmentReader, LayoutPlan)> {
+    let row_capacity = descriptor
+        .get("row_capacity")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing row_capacity".to_string(),
+        })?;
+    let row_capacity = usize::try_from(row_capacity).map_err(|_| ZippyError::InvalidConfig {
+        reason: "segment descriptor row_capacity overflows usize".to_string(),
+    })?;
+    let layout = LayoutPlan::for_schema(segment_schema, row_capacity).map_err(|error| {
+        ZippyError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
+    let reader = ActiveSegmentReader::from_descriptor_envelope(
+        &descriptor_envelope,
+        segment_schema.clone(),
+        layout.clone(),
+    )
+    .map_err(segment_zippy_error)?;
+    Ok((reader, layout))
+}
+
+fn json_zippy_error(error: serde_json::Error) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
+    }
+}
+
+fn segment_zippy_error(error: zippy_segment_store::ZippySegmentStoreError) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
+    }
+}
+
 #[pyclass]
 struct ReactiveStateEngine {
     name: String,
@@ -1928,6 +2277,7 @@ struct ReactiveStateEngine {
     engine: Option<RustReactiveStateEngine>,
     remote_source: Option<RemoteSourceConfig>,
     bus_source: Option<BusSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
@@ -1953,6 +2303,7 @@ struct TimeSeriesEngine {
     engine: Option<RustTimeSeriesEngine>,
     remote_source: Option<RemoteSourceConfig>,
     bus_source: Option<BusSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
@@ -1995,6 +2346,7 @@ struct StreamTableEngine {
     engine: Option<RustStreamTableEngine>,
     remote_source: Option<RemoteSourceConfig>,
     bus_source: Option<BusSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
@@ -2047,18 +2399,19 @@ impl ReactiveStateEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, python_source) = register_source(
-            source,
-            DownstreamLink {
-                handle: Arc::clone(&handle),
-                archive: Arc::clone(&archive),
-                write_input: parquet_sink
-                    .as_ref()
-                    .map(|config| config.write_input)
-                    .unwrap_or(false),
-            },
-            schema.as_ref(),
-        )?;
+        let (source_owner, remote_source, bus_source, segment_source, python_source) =
+            register_source(
+                source,
+                DownstreamLink {
+                    handle: Arc::clone(&handle),
+                    archive: Arc::clone(&archive),
+                    write_input: parquet_sink
+                        .as_ref()
+                        .map(|config| config.write_input)
+                        .unwrap_or(false),
+                },
+                schema.as_ref(),
+            )?;
 
         Ok(Self {
             name,
@@ -2076,6 +2429,7 @@ impl ReactiveStateEngine {
             engine: Some(engine),
             remote_source,
             bus_source,
+            segment_source,
             python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
@@ -2090,6 +2444,7 @@ impl ReactiveStateEngine {
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
             self.bus_source.as_ref(),
+            self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
@@ -2200,18 +2555,19 @@ impl StreamTableEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, python_source) = register_source(
-            source,
-            DownstreamLink {
-                handle: Arc::clone(&handle),
-                archive: Arc::clone(&archive),
-                write_input: parquet_sink
-                    .as_ref()
-                    .map(|config| config.write_input)
-                    .unwrap_or(false),
-            },
-            schema.as_ref(),
-        )?;
+        let (source_owner, remote_source, bus_source, segment_source, python_source) =
+            register_source(
+                source,
+                DownstreamLink {
+                    handle: Arc::clone(&handle),
+                    archive: Arc::clone(&archive),
+                    write_input: parquet_sink
+                        .as_ref()
+                        .map(|config| config.write_input)
+                        .unwrap_or(false),
+                },
+                schema.as_ref(),
+            )?;
 
         Ok(Self {
             name,
@@ -2227,6 +2583,7 @@ impl StreamTableEngine {
             engine: Some(engine),
             remote_source,
             bus_source,
+            segment_source,
             python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
@@ -2241,6 +2598,7 @@ impl StreamTableEngine {
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
             self.bus_source.as_ref(),
+            self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
@@ -2380,18 +2738,19 @@ impl TimeSeriesEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, python_source) = register_source(
-            source,
-            DownstreamLink {
-                handle: Arc::clone(&handle),
-                archive: Arc::clone(&archive),
-                write_input: parquet_sink
-                    .as_ref()
-                    .map(|config| config.write_input)
-                    .unwrap_or(false),
-            },
-            schema.as_ref(),
-        )?;
+        let (source_owner, remote_source, bus_source, segment_source, python_source) =
+            register_source(
+                source,
+                DownstreamLink {
+                    handle: Arc::clone(&handle),
+                    archive: Arc::clone(&archive),
+                    write_input: parquet_sink
+                        .as_ref()
+                        .map(|config| config.write_input)
+                        .unwrap_or(false),
+                },
+                schema.as_ref(),
+            )?;
 
         Ok(Self {
             name,
@@ -2412,6 +2771,7 @@ impl TimeSeriesEngine {
             engine: Some(engine),
             remote_source,
             bus_source,
+            segment_source,
             python_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
@@ -2426,6 +2786,7 @@ impl TimeSeriesEngine {
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
             self.bus_source.as_ref(),
+            self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
             &mut self.engine,
@@ -2604,6 +2965,7 @@ impl CrossSectionalEngine {
             self.remote_source.as_ref(),
             None,
             None,
+            None,
             &self.downstreams,
             &mut self.engine,
         )?;
@@ -2713,6 +3075,8 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<BusReader>()?;
     module.add_class::<BusStreamTarget>()?;
     module.add_class::<BusStreamSource>()?;
+    module.add_class::<SegmentStreamSource>()?;
+    module.add_class::<SegmentTestWriter>()?;
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<StreamTableEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
@@ -2828,9 +3192,9 @@ fn parse_instrument_ids(
     };
 
     if instrument_ids.is_instance_of::<PyList>() || instrument_ids.is_instance_of::<PyTuple>() {
-        let values = instrument_ids
-            .extract::<Vec<String>>()
-            .map_err(|_| py_value_error("instrument_ids must be a string or a sequence of strings"))?;
+        let values = instrument_ids.extract::<Vec<String>>().map_err(|_| {
+            py_value_error("instrument_ids must be a string or a sequence of strings")
+        })?;
         if values.is_empty() {
             return Ok(None);
         }
@@ -2853,17 +3217,18 @@ fn attach_bus_reader_with<F, G>(
     client: &SharedMasterClient,
     stream_name: &str,
     instrument_ids: Option<Vec<String>>,
+    xfast: bool,
     read_from: F,
     read_from_filtered: G,
 ) -> zippy_core::Result<CoreBusReader>
 where
-    F: FnOnce(&mut CoreMasterClient, &str) -> zippy_core::Result<CoreBusReader>,
-    G: FnOnce(&mut CoreMasterClient, &str, Vec<String>) -> zippy_core::Result<CoreBusReader>,
+    F: FnOnce(&mut CoreMasterClient, &str, bool) -> zippy_core::Result<CoreBusReader>,
+    G: FnOnce(&mut CoreMasterClient, &str, Vec<String>, bool) -> zippy_core::Result<CoreBusReader>,
 {
     let mut guard = client.lock().unwrap();
     match instrument_ids {
-        None => read_from(&mut guard, stream_name),
-        Some(instrument_ids) => read_from_filtered(&mut guard, stream_name, instrument_ids),
+        None => read_from(&mut guard, stream_name, xfast),
+        Some(instrument_ids) => read_from_filtered(&mut guard, stream_name, instrument_ids, xfast),
     }
 }
 
@@ -2926,7 +3291,7 @@ fn register_source(
     input_schema: &Schema,
 ) -> PyResult<RegisteredSource> {
     let Some(source) = source else {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None, None, None));
     };
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
@@ -2941,7 +3306,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableEngine>>() {
@@ -2956,7 +3321,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
@@ -2971,7 +3336,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok((Some(source.clone().unbind()), None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None, None));
     }
 
     if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
@@ -2988,6 +3353,7 @@ fn register_source(
                 expected_schema: remote_source.expected_schema.clone(),
                 mode: remote_source.mode,
             }),
+            None,
             None,
             None,
         ));
@@ -3008,6 +3374,31 @@ fn register_source(
                 expected_schema: bus_source.expected_schema.clone(),
                 master: Arc::clone(&bus_source.master),
                 mode: bus_source.mode,
+                xfast: bus_source.xfast,
+            }),
+            None,
+            None,
+        ));
+    }
+
+    if let Ok(segment_source) = source.extract::<PyRef<'_, SegmentStreamSource>>() {
+        if segment_source.expected_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+
+        return Ok((
+            Some(source.clone().unbind()),
+            None,
+            None,
+            Some(SegmentSourceConfig {
+                stream_name: segment_source.stream_name.clone(),
+                expected_schema: segment_source.expected_schema.clone(),
+                segment_schema: segment_source.segment_schema.clone(),
+                master: Arc::clone(&segment_source.master),
+                mode: segment_source.mode,
+                xfast: segment_source.xfast,
             }),
             None,
         ));
@@ -3041,6 +3432,7 @@ fn register_source(
             Some(source.clone().unbind()),
             None,
             None,
+            None,
             Some(PythonSourceConfig {
                 owner: source.clone().unbind(),
                 name,
@@ -3051,7 +3443,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, BusStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
@@ -3215,6 +3607,23 @@ fn ensure_runtime_is_not_running(handle: &SharedHandle) -> PyResult<()> {
     Ok(())
 }
 
+fn start_prepared_source_runtime<S, E>(
+    source: Box<S>,
+    config: EngineConfig,
+    publisher: Box<dyn CorePublisher>,
+    engine: &mut Option<E>,
+) -> zippy_core::Result<EngineHandle>
+where
+    S: Source + ?Sized,
+    E: Engine,
+{
+    let prepared = zippy_core::runtime::prepare_source_runtime(source, config)?;
+    let engine = engine
+        .take()
+        .expect("engine must be available after pre-start validation");
+    prepared.spawn_with_publisher(engine, publisher)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_runtime_engine<E: Engine>(
     name: &str,
@@ -3223,6 +3632,7 @@ fn start_runtime_engine<E: Engine>(
     parquet_sink: Option<&ParquetSinkConfig>,
     remote_source: Option<&RemoteSourceConfig>,
     bus_source: Option<&BusSourceConfig>,
+    segment_source: Option<&SegmentSourceConfig>,
     python_source: Option<&PythonSourceConfig>,
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
@@ -3249,13 +3659,12 @@ fn start_runtime_engine<E: Engine>(
     config
         .validate()
         .map_err(|error| py_runtime_error(error.to_string()))?;
-    let engine = match engine.take() {
-        Some(engine) => engine,
-        None => return Err(py_runtime_error("engine already started")),
-    };
+    if engine.is_none() {
+        return Err(py_runtime_error("engine already started"));
+    }
 
-    let handle = match (remote_source, bus_source, python_source) {
-        (Some(remote_source), None, None) => {
+    let handle = match (remote_source, bus_source, segment_source, python_source) {
+        (Some(remote_source), None, None, None) => {
             let source = Box::new(
                 RustZmqSource::connect(
                     &format!("{name}_source"),
@@ -3265,27 +3674,44 @@ fn start_runtime_engine<E: Engine>(
                 )
                 .map_err(|error| py_runtime_error(error.to_string()))?,
             );
-            spawn_source_engine_with_publisher(source, engine, config, publisher)
+            start_prepared_source_runtime(source, config, publisher, engine)
         }
-        (None, Some(bus_source), None) => {
+        (None, Some(bus_source), None, None) => {
             let source = Box::new(BusSourceBridge {
                 stream_name: bus_source.stream_name.clone(),
                 expected_schema: Arc::clone(&bus_source.expected_schema),
                 mode: bus_source.mode,
                 master: Arc::clone(&bus_source.master),
+                xfast: bus_source.xfast,
             });
-            spawn_source_engine_with_publisher(source, engine, config, publisher)
+            start_prepared_source_runtime(source, config, publisher, engine)
         }
-        (None, None, Some(python_source)) => {
+        (None, None, Some(segment_source), None) => {
+            let source = Box::new(SegmentSourceBridge {
+                stream_name: segment_source.stream_name.clone(),
+                expected_schema: Arc::clone(&segment_source.expected_schema),
+                segment_schema: segment_source.segment_schema.clone(),
+                mode: segment_source.mode,
+                master: Arc::clone(&segment_source.master),
+                xfast: segment_source.xfast,
+            });
+            start_prepared_source_runtime(source, config, publisher, engine)
+        }
+        (None, None, None, Some(python_source)) => {
             let source = Box::new(PythonSourceBridge {
                 owner: Python::with_gil(|py| python_source.owner.clone_ref(py)),
                 name: python_source.name.clone(),
                 output_schema: Arc::clone(&python_source.output_schema),
                 mode: python_source.mode,
             });
-            spawn_source_engine_with_publisher(source, engine, config, publisher)
+            start_prepared_source_runtime(source, config, publisher, engine)
         }
-        (None, None, None) => spawn_engine_with_publisher(engine, config, publisher),
+        (None, None, None, None) => {
+            let engine = engine
+                .take()
+                .expect("engine must be available after pre-start validation");
+            spawn_engine_with_publisher(engine, config, publisher)
+        }
         _ => {
             return Err(py_runtime_error(
                 "engine cannot use more than one external source at the same time",
@@ -4232,19 +4658,20 @@ mod tests {
             &client,
             "ticks",
             None,
-            move |_, stream_name| {
+            false,
+            move |_, stream_name, xfast| {
                 unfiltered_read_calls
                     .lock()
                     .unwrap()
-                    .push(format!("read_from:[{}]", stream_name));
+                    .push(format!("read_from:[{}]:[{}]", stream_name, xfast));
                 Err(ZippyError::Io {
                     reason: "stop".to_string(),
                 })
             },
-            move |_, stream_name, instrument_ids| {
+            move |_, stream_name, instrument_ids, xfast| {
                 unfiltered_filtered_calls.lock().unwrap().push(format!(
-                    "read_from_filtered:[{}]:{:?}",
-                    stream_name, instrument_ids
+                    "read_from_filtered:[{}]:{:?}:[{}]",
+                    stream_name, instrument_ids, xfast
                 ));
                 Err(ZippyError::Io {
                     reason: "stop".to_string(),
@@ -4254,7 +4681,7 @@ mod tests {
         assert!(unfiltered_result.is_err());
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &["read_from:[ticks]".to_string()]
+            &["read_from:[ticks]:[false]".to_string()]
         );
 
         calls.lock().unwrap().clear();
@@ -4265,19 +4692,20 @@ mod tests {
             &client,
             "ticks",
             Some(vec!["IF2606".to_string()]),
-            move |_, stream_name| {
+            true,
+            move |_, stream_name, xfast| {
                 filtered_read_calls
                     .lock()
                     .unwrap()
-                    .push(format!("read_from:[{}]", stream_name));
+                    .push(format!("read_from:[{}]:[{}]", stream_name, xfast));
                 Err(ZippyError::Io {
                     reason: "stop".to_string(),
                 })
             },
-            move |_, stream_name, instrument_ids| {
+            move |_, stream_name, instrument_ids, xfast| {
                 filtered_filtered_calls.lock().unwrap().push(format!(
-                    "read_from_filtered:[{}]:{:?}",
-                    stream_name, instrument_ids
+                    "read_from_filtered:[{}]:{:?}:[{}]",
+                    stream_name, instrument_ids, xfast
                 ));
                 Err(ZippyError::Io {
                     reason: "stop".to_string(),
@@ -4287,7 +4715,7 @@ mod tests {
         assert!(filtered_result.is_err());
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &["read_from_filtered:[ticks]:[\"IF2606\"]".to_string()]
+            &["read_from_filtered:[ticks]:[\"IF2606\"]:[true]".to_string()]
         );
     }
 

@@ -7,12 +7,12 @@ use zippy_shm_bridge::{ReadResult, SharedFrameRing};
 const BUFFER_SIZE: usize = 131_072;
 const FRAME_SIZE: usize = 65_536;
 
-fn unique_flink_path(label: &str) -> PathBuf {
+fn unique_mmap_path(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("zippy-shm-bench-{label}-{nanos}.flink"))
+    std::env::temp_dir().join(format!("zippy-shm-bench-{label}-{nanos}.mmap"))
 }
 
 fn payload_of_size(size: usize) -> Vec<u8> {
@@ -24,9 +24,9 @@ fn bench_publish(c: &mut Criterion) {
 
     for size in [256_usize, 4_096, 65_536] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            let flink_path = unique_flink_path("publish");
+            let mmap_path = unique_mmap_path("publish");
             let mut ring =
-                SharedFrameRing::create_or_open(&flink_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
+                SharedFrameRing::create_or_open(&mmap_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
             let payload = payload_of_size(size);
 
             b.iter(|| {
@@ -44,11 +44,11 @@ fn bench_read_ready(c: &mut Criterion) {
 
     for size in [256_usize, 4_096, 65_536] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            let flink_path = unique_flink_path("read-ready");
+            let mmap_path = unique_mmap_path("read-ready");
             let mut writer =
-                SharedFrameRing::create_or_open(&flink_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
+                SharedFrameRing::create_or_open(&mmap_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
             let reader =
-                SharedFrameRing::create_or_open(&flink_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
+                SharedFrameRing::create_or_open(&mmap_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
             let payload = payload_of_size(size);
             let seq = writer.publish(&payload).unwrap();
 
@@ -65,8 +65,8 @@ fn bench_read_ready(c: &mut Criterion) {
 }
 
 fn bench_seek_latest(c: &mut Criterion) {
-    let flink_path = unique_flink_path("seek-latest");
-    let mut ring = SharedFrameRing::create_or_open(&flink_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
+    let mmap_path = unique_mmap_path("seek-latest");
+    let mut ring = SharedFrameRing::create_or_open(&mmap_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
     let payload = payload_of_size(4_096);
     for _ in 0..128 {
         ring.publish(&payload).unwrap();
@@ -81,9 +81,9 @@ fn bench_seek_latest(c: &mut Criterion) {
 }
 
 fn bench_roundtrip(c: &mut Criterion) {
-    let flink_path = unique_flink_path("roundtrip");
-    let mut writer = SharedFrameRing::create_or_open(&flink_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
-    let reader = SharedFrameRing::create_or_open(&flink_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
+    let mmap_path = unique_mmap_path("roundtrip");
+    let mut writer = SharedFrameRing::create_or_open(&mmap_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
+    let reader = SharedFrameRing::create_or_open(&mmap_path, BUFFER_SIZE, FRAME_SIZE).unwrap();
     let payload = payload_of_size(4_096);
 
     c.bench_function("frame_ring_publish_read_roundtrip_4kb", |b| {

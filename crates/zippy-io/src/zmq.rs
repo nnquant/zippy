@@ -12,8 +12,8 @@ mod implementation {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use zippy_core::{
-        Publisher as CorePublisher, Result, SchemaRef, Source, SourceEvent, SourceHandle,
-        SourceMode, SourceSink, StreamHello, ZippyError,
+        Publisher as CorePublisher, Result, SchemaRef, SegmentTableView, Source, SourceEvent,
+        SourceHandle, SourceMode, SourceSink, StreamHello, ZippyError,
     };
 
     const PROTOCOL_VERSION: u16 = 1;
@@ -880,7 +880,9 @@ mod implementation {
                                     .to_string(),
                             });
                         }
-                        sink.emit(SourceEvent::Data(batch))?;
+                        sink.emit(SourceEvent::Data(SegmentTableView::from_record_batch(
+                            batch,
+                        )))?;
                     }
                     MessageKind::Flush => {
                         if accepted_hello.is_none() {

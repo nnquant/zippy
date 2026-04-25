@@ -112,8 +112,12 @@ fn master_bus_perf_smoke_roundtrips_batches() {
 
     let mut writer_client = MasterClient::connect(&socket_path).unwrap();
     let mut reader_client = MasterClient::connect(&socket_path).unwrap();
-    writer_client.register_process("master_bus_perf_writer").unwrap();
-    reader_client.register_process("master_bus_perf_reader").unwrap();
+    writer_client
+        .register_process("master_bus_perf_writer")
+        .unwrap();
+    reader_client
+        .register_process("master_bus_perf_reader")
+        .unwrap();
 
     let stream_name = format!(
         "smoke_ticks_{}",

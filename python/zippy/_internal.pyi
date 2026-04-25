@@ -345,12 +345,21 @@ class MasterClient:
         metrics: object | None = None,
     ) -> None: ...
 
+    def publish_segment_descriptor(
+        self,
+        stream_name: str,
+        descriptor: object,
+    ) -> None: ...
+
+    def get_segment_descriptor(self, stream_name: str) -> dict[str, object] | None: ...
+
     def write_to(self, stream_name: str) -> BusWriter: ...
 
     def read_from(
         self,
         stream_name: str,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+        xfast: bool = False,
     ) -> BusReader: ...
 
     def list_streams(self) -> list[dict[str, object]]: ...
@@ -369,6 +378,18 @@ class BusStreamSource:
         expected_schema: pa.Schema,
         master: MasterClient,
         mode: _SourceModeValue | None = None,
+        xfast: bool = False,
+    ) -> None: ...
+
+
+class SegmentStreamSource:
+    def __init__(
+        self,
+        stream_name: str,
+        expected_schema: pa.Schema,
+        master: MasterClient,
+        mode: _SourceModeValue | None = None,
+        xfast: bool = False,
     ) -> None: ...
 
 

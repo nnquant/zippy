@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use zippy_core::Engine;
+use zippy_core::{Engine, SegmentTableView};
 use zippy_engines::{hash_record_batches, ReactiveStateEngine};
 use zippy_operators::TsEmaSpec;
 
@@ -39,8 +39,18 @@ fn replaying_same_ticks_produces_same_batches() {
     )
     .unwrap();
 
-    let first_batches = first.on_data(batch.clone()).unwrap();
-    let second_batches = second.on_data(batch).unwrap();
+    let first_batches = first
+        .on_data(SegmentTableView::from_record_batch(batch.clone()))
+        .unwrap()
+        .into_iter()
+        .map(|table| table.to_record_batch().unwrap())
+        .collect::<Vec<_>>();
+    let second_batches = second
+        .on_data(SegmentTableView::from_record_batch(batch))
+        .unwrap()
+        .into_iter()
+        .map(|table| table.to_record_batch().unwrap())
+        .collect::<Vec<_>>();
 
     assert_eq!(
         hash_record_batches(&first_batches),

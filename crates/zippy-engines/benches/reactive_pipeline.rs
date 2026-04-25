@@ -4,7 +4,7 @@ use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, Criterion};
-use zippy_core::Engine;
+use zippy_core::{Engine, SegmentTableView};
 use zippy_engines::ReactiveStateEngine;
 use zippy_operators::TsEmaSpec;
 
@@ -32,7 +32,9 @@ fn bench_reactive_pipeline(c: &mut Criterion) {
                     .unwrap()],
             )
             .unwrap();
-            let _ = engine.on_data(batch.clone()).unwrap();
+            let _ = engine
+                .on_data(SegmentTableView::from_record_batch(batch.clone()))
+                .unwrap();
         })
     });
 }

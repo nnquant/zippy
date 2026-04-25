@@ -21,6 +21,8 @@ pub struct StreamRecord {
     pub writer_process_id: Option<String>,
     pub reader_count: usize,
     pub status: String,
+    #[serde(default)]
+    pub active_segment_descriptor: Option<serde_json::Value>,
     reader_process_ids: BTreeMap<String, String>,
 }
 
@@ -94,6 +96,10 @@ pub enum RegistryError {
         reader_id: String,
         process_id: String,
         owner_process_id: Option<String>,
+    },
+    SegmentDescriptorPublisherNotAuthorized {
+        stream_name: String,
+        process_id: String,
     },
     SourceNotFound {
         source_name: String,
@@ -175,6 +181,14 @@ impl fmt::Display for RegistryError {
                 f,
                 "reader not owned stream_name=[{}] reader_id=[{}] process_id=[{}] owner_process_id=[{:?}]",
                 stream_name, reader_id, process_id, owner_process_id
+            ),
+            Self::SegmentDescriptorPublisherNotAuthorized {
+                stream_name,
+                process_id,
+            } => write!(
+                f,
+                "segment descriptor publisher not authorized stream_name=[{}] process_id=[{}]",
+                stream_name, process_id
             ),
             Self::SourceNotFound { source_name } => {
                 write!(f, "source not found source_name=[{}]", source_name)
@@ -284,6 +298,21 @@ impl Registry {
         Ok(())
     }
 
+    pub fn validate_process_alive(&self, process_id: &str) -> Result<(), RegistryError> {
+        let process =
+            self.processes
+                .get(process_id)
+                .ok_or_else(|| RegistryError::ProcessNotFound {
+                    process_id: process_id.to_string(),
+                })?;
+        if process.lease_status != "alive" {
+            return Err(RegistryError::ProcessLeaseExpired {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn claim_expired_process(
         &mut self,
         process_id: &str,
@@ -356,6 +385,7 @@ impl Registry {
             writer_process_id: None,
             reader_count: 0,
             status: "registered".to_string(),
+            active_segment_descriptor: None,
             reader_process_ids: BTreeMap::new(),
         };
         self.streams.insert(stream_name.to_string(), record);
@@ -388,6 +418,28 @@ impl Registry {
 
     pub fn get_stream(&self, stream_name: &str) -> Option<&StreamRecord> {
         self.streams.get(stream_name)
+    }
+
+    pub fn segment_descriptor(
+        &self,
+        stream_name: &str,
+    ) -> Result<Option<serde_json::Value>, RegistryError> {
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        Ok(stream.active_segment_descriptor.clone())
+    }
+
+    pub fn segment_descriptor_for_process(
+        &self,
+        stream_name: &str,
+        process_id: &str,
+    ) -> Result<Option<serde_json::Value>, RegistryError> {
+        self.validate_process_alive(process_id)?;
+        self.segment_descriptor(stream_name)
     }
 
     pub fn get_source(&self, source_name: &str) -> Option<&SourceRecord> {
@@ -567,6 +619,42 @@ impl Registry {
                 })?;
         stream.writer_process_id = Some(process_id.to_string());
         stream.status = "writer_attached".to_string();
+        Ok(())
+    }
+
+    pub fn publish_segment_descriptor(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+        descriptor: serde_json::Value,
+    ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
+        let source_owner = self.sources.values().any(|source| {
+            source.output_stream == stream_name
+                && source.process_id == process_id
+                && source.status != "lost"
+        });
+        if !writer_owner && !source_owner {
+            return Err(RegistryError::SegmentDescriptorPublisherNotAuthorized {
+                stream_name: stream_name.to_string(),
+                process_id: process_id.to_string(),
+            });
+        }
+
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        stream.active_segment_descriptor = Some(descriptor);
         Ok(())
     }
 

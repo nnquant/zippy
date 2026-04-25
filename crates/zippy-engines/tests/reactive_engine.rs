@@ -7,7 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{
     spawn_engine, Engine, EngineConfig, EngineMetricsSnapshot, LateDataPolicy, OverflowPolicy,
-    ZippyError,
+    SegmentTableView, ZippyError,
 };
 use zippy_engines::ReactiveStateEngine;
 use zippy_operators::{CastSpec, ExpressionSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
@@ -19,7 +19,7 @@ fn input_schema() -> Arc<Schema> {
     ]))
 }
 
-fn batch(ids: Vec<&str>, values: Vec<f64>) -> RecordBatch {
+fn record_batch(ids: Vec<&str>, values: Vec<f64>) -> RecordBatch {
     RecordBatch::try_new(
         input_schema(),
         vec![
@@ -30,7 +30,11 @@ fn batch(ids: Vec<&str>, values: Vec<f64>) -> RecordBatch {
     .unwrap()
 }
 
-fn mismatched_batch(ids: Vec<&str>, values: Vec<f64>) -> RecordBatch {
+fn batch(ids: Vec<&str>, values: Vec<f64>) -> SegmentTableView {
+    SegmentTableView::from_record_batch(record_batch(ids, values))
+}
+
+fn mismatched_batch(ids: Vec<&str>, values: Vec<f64>) -> SegmentTableView {
     let schema = Arc::new(
         Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -50,10 +54,12 @@ fn mismatched_batch(ids: Vec<&str>, values: Vec<f64>) -> RecordBatch {
             Arc::new(Float64Array::from(values)) as ArrayRef,
         ],
     )
+    .map(SegmentTableView::from_record_batch)
     .unwrap()
 }
 
-fn float64_values(array: &ArrayRef) -> Vec<Option<f64>> {
+fn float64_values(array: zippy_core::Result<ArrayRef>) -> Vec<Option<f64>> {
+    let array = array.unwrap();
     let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
     (0..values.len())
         .map(|index| (!values.is_null(index)).then(|| values.value(index)))
@@ -72,8 +78,8 @@ fn assert_float_options_eq(left: &[Option<f64>], right: &[Option<f64>]) {
     }
 }
 
-fn column_names(batch: &RecordBatch) -> Vec<String> {
-    batch
+fn column_names(table: &SegmentTableView) -> Vec<String> {
+    table
         .schema()
         .fields()
         .iter()
@@ -121,11 +127,11 @@ fn reactive_engine_appends_factor_columns_in_order() {
         ]
     );
     assert_float_options_eq(
-        &float64_values(output.column(2)),
+        &float64_values(output.column_at(2)),
         vec![Some(10.0), Some(14.0), Some(17.333333333333332)].as_slice(),
     );
     assert_float_options_eq(
-        &float64_values(output.column(3)),
+        &float64_values(output.column_at(3)),
         vec![None, None, Some(0.9)].as_slice(),
     );
 }
@@ -154,19 +160,19 @@ fn reactive_engine_keeps_factor_state_across_on_data_calls() {
     let second = &second_outputs[0];
 
     assert_float_options_eq(
-        &float64_values(first.column(2)),
+        &float64_values(first.column_at(2)),
         vec![Some(10.0), Some(14.0)].as_slice(),
     );
     assert_float_options_eq(
-        &float64_values(first.column(3)),
+        &float64_values(first.column_at(3)),
         vec![None, None].as_slice(),
     );
     assert_float_options_eq(
-        &float64_values(second.column(2)),
+        &float64_values(second.column_at(2)),
         vec![Some(17.333333333333332), Some(22.444444444444443)].as_slice(),
     );
     assert_float_options_eq(
-        &float64_values(second.column(3)),
+        &float64_values(second.column_at(3)),
         vec![Some(0.9), Some(0.5625)].as_slice(),
     );
 }
@@ -261,7 +267,10 @@ fn reactive_engine_expression_factor_can_reference_previous_factor_output() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
-    assert_float_options_eq(&float64_values(output.column(3)), &[Some(20.0), Some(30.0)]);
+    assert_float_options_eq(
+        &float64_values(output.column_at(3)),
+        &[Some(20.0), Some(30.0)],
+    );
 }
 
 #[test]
@@ -290,7 +299,7 @@ fn reactive_engine_filters_rows_by_id_whitelist_before_state_updates() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
-    assert_float_options_eq(&float64_values(output.column(2)), &[Some(10.0)]);
+    assert_float_options_eq(&float64_values(output.column_at(2)), &[Some(10.0)]);
     assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
 }
 
@@ -335,7 +344,10 @@ fn reactive_engine_filtered_rows_do_not_pollute_later_whitelist_state() {
     assert_eq!(whitelist_outputs.len(), 1);
     let output = &whitelist_outputs[0];
     assert_eq!(output.num_rows(), 2);
-    assert_float_options_eq(&float64_values(output.column(2)), &[Some(10.0), Some(14.0)]);
+    assert_float_options_eq(
+        &float64_values(output.column_at(2)),
+        &[Some(10.0), Some(14.0)],
+    );
     assert_eq!(engine.drain_metrics().filtered_rows_total, 2);
 }
 
@@ -366,7 +378,7 @@ fn reactive_engine_never_calls_factors_for_filtered_rows() {
         .unwrap();
     assert_eq!(outputs.len(), 1);
     assert_float_options_eq(
-        &float64_values(outputs[0].column(2)),
+        &float64_values(outputs[0].column_at(2)),
         &[Some(0.0), Some(0.0)],
     );
     assert_eq!(
@@ -416,12 +428,13 @@ fn reactive_engine_runtime_metrics_include_filtered_rows_total() {
             buffer_capacity: 16,
             overflow_policy: OverflowPolicy::Block,
             late_data_policy: LateDataPolicy::Reject,
+            xfast: false,
         },
     )
     .unwrap();
 
     handle
-        .write(batch(vec!["A", "B"], vec![10.0, 20.0]))
+        .write(record_batch(vec!["A", "B"], vec![10.0, 20.0]))
         .unwrap();
     let metrics = wait_for_filtered_rows(&handle, 1);
 

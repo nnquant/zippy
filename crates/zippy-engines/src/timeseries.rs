@@ -1,19 +1,22 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray, UInt32Array,
-};
-use arrow::compute::take;
+use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, EngineMetricsDelta, LateDataPolicy, Result, SchemaRef, ZippyError};
+use zippy_core::{
+    Engine, EngineMetricsDelta, LateDataPolicy, Result, SchemaRef, SegmentTableView, ZippyError,
+};
 use zippy_operators::{AggregationKind, AggregationSpec, ExpressionSpec, ReactiveFactor};
+
+use crate::table_view::{
+    float64_array, record_batch_from_table_rows, string_array, timestamp_ns_array,
+};
 
 const UTC_TIMEZONE: &str = "UTC";
 const VWAP_DENOMINATOR_ZERO_STATUS: &str = "vwap denominator is zero";
 
-/// Aggregate per-id float64 inputs into fixed-width UTC nanosecond windows.
+/// Aggregate per-id float64 inputs into fixed-width nanosecond windows.
 pub struct TimeSeriesEngine {
     name: String,
     input_schema: SchemaRef,
@@ -43,7 +46,7 @@ impl TimeSeriesEngine {
     /// :type input_schema: SchemaRef
     /// :param id_column: Utf8 identifier column name.
     /// :type id_column: &str
-    /// :param dt_column: UTC nanosecond timestamp column name.
+    /// :param dt_column: Timezone-aware nanosecond timestamp column name.
     /// :type dt_column: &str
     /// :param window_ns: Window size in nanoseconds.
     /// :type window_ns: i64
@@ -91,7 +94,7 @@ impl TimeSeriesEngine {
     /// :type input_schema: SchemaRef
     /// :param id_column: Utf8 identifier column name.
     /// :type id_column: &str
-    /// :param dt_column: UTC nanosecond timestamp column name.
+    /// :param dt_column: Timezone-aware nanosecond timestamp column name.
     /// :type dt_column: &str
     /// :param window_ns: Window size in nanoseconds.
     /// :type window_ns: i64
@@ -231,8 +234,8 @@ impl Engine for TimeSeriesEngine {
         Arc::clone(&self.output_schema)
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
-        if batch.schema().as_ref() != self.input_schema.as_ref() {
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
                     "input batch schema does not match engine input schema engine=[{}]",
@@ -241,64 +244,108 @@ impl Engine for TimeSeriesEngine {
             });
         }
 
-        if batch.num_rows() == 0 {
+        if table.num_rows() == 0 {
             return Ok(vec![]);
         }
 
-        let batch = self.filter_by_id_whitelist(batch)?;
+        let id_array = table.column(&self.id_column)?;
+        let ids = checked_id_array(&id_array, &self.id_column)?;
+        let dt_array = table.column(&self.dt_column)?;
+        let dts = checked_dt_array(&dt_array, &self.dt_column)?;
+        let candidate_rows = self.collect_id_filter_rows(ids, table.num_rows());
 
-        if batch.num_rows() == 0 {
+        if candidate_rows.is_empty() {
             return Ok(vec![]);
         }
 
-        let ids = extract_id_array(&batch, &self.id_column)?;
-        let dts = extract_dt_array(&batch, &self.dt_column)?;
         let accepted_rows = match self.late_data_policy {
             LateDataPolicy::Reject => {
-                validate_non_decreasing_dts(ids, dts, &self.last_dt_by_id)?;
-                (0..batch.num_rows())
-                    .map(|row_index| row_index as u32)
-                    .collect::<Vec<_>>()
+                validate_non_decreasing_dts_for_rows(
+                    ids,
+                    dts,
+                    &candidate_rows,
+                    &self.last_dt_by_id,
+                )?;
+                candidate_rows
             }
-            LateDataPolicy::DropWithMetric => {
-                collect_accepted_rows(ids, dts, &self.last_dt_by_id, &mut self.pending_late_rows)
-            }
+            LateDataPolicy::DropWithMetric => collect_accepted_rows_for_rows(
+                ids,
+                dts,
+                &candidate_rows,
+                &self.last_dt_by_id,
+                &mut self.pending_late_rows,
+            ),
         };
 
         if accepted_rows.is_empty() {
             return Ok(vec![]);
         }
 
-        let accepted_batch = filter_record_batch(&batch, &accepted_rows, &self.input_schema)?;
-        let processed_batch = apply_reactive_factors(
-            &accepted_batch,
-            &mut self.pre_factors,
-            &self.pre_schema,
-            "timeseries pre",
-        )?;
-        let processed_ids = extract_id_array(&processed_batch, &self.id_column)?;
-        let processed_dts = extract_dt_array(&processed_batch, &self.dt_column)?;
-        let spec_inputs = self
-            .specs
-            .iter()
-            .map(|spec| {
-                Ok(SpecInputArrays {
-                    primary: extract_value_array(&processed_batch, spec.primary_column())?,
-                    secondary: match spec.secondary_column() {
-                        Some(column) => Some(extract_value_array(&processed_batch, column)?),
-                        None => None,
-                    },
+        let processed_input = if self.pre_factors.is_empty() {
+            ProcessedInput::Table {
+                ids,
+                dts,
+                row_indices: accepted_rows,
+                spec_inputs: self
+                    .specs
+                    .iter()
+                    .map(|spec| {
+                        Ok(SpecInputArrays {
+                            primary: extract_value_array_from_table(&table, spec.primary_column())?,
+                            secondary: match spec.secondary_column() {
+                                Some(column) => {
+                                    Some(extract_value_array_from_table(&table, column)?)
+                                }
+                                None => None,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }
+        } else {
+            let accepted_batch = record_batch_from_table_rows(
+                &table,
+                &self.input_schema,
+                &accepted_rows,
+                "timeseries accepted",
+            )?;
+            let processed_batch = apply_reactive_factors(
+                &accepted_batch,
+                &mut self.pre_factors,
+                &self.pre_schema,
+                "timeseries pre",
+            )?;
+            let row_indices = (0..processed_batch.num_rows()).collect::<Vec<_>>();
+            let spec_inputs = self
+                .specs
+                .iter()
+                .map(|spec| {
+                    Ok(SpecInputArrays {
+                        primary: extract_value_array(&processed_batch, spec.primary_column())?,
+                        secondary: match spec.secondary_column() {
+                            Some(column) => Some(extract_value_array(&processed_batch, column)?),
+                            None => None,
+                        },
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?;
+            ProcessedInput::Batch {
+                ids: extract_id_array(&processed_batch, &self.id_column)?,
+                dts: extract_dt_array(&processed_batch, &self.dt_column)?,
+                id_column: self.id_column.clone(),
+                dt_column: self.dt_column.clone(),
+                row_indices,
+                spec_inputs,
+            }
+        };
 
         let mut completed = Vec::new();
         let mut next_open_windows = self.open_windows.clone();
         let mut next_last_dt_by_id = self.last_dt_by_id.clone();
 
-        for row_index in 0..processed_batch.num_rows() {
-            let id = processed_ids.value(row_index).to_string();
-            let dt = processed_dts.value(row_index);
+        for row_index in processed_input.row_indices() {
+            let id = processed_input.id_value(row_index)?.to_string();
+            let dt = processed_input.dt_value(row_index)?;
             let window_start = align_window_start(dt, self.window_ns);
             let window_end =
                 window_start
@@ -309,20 +356,20 @@ impl Engine for TimeSeriesEngine {
 
             match next_open_windows.remove(&id) {
                 Some(mut open_window) if open_window.window_start == window_start => {
-                    open_window.update(&self.specs, &spec_inputs, row_index);
+                    open_window.update(&self.specs, processed_input.spec_inputs(), row_index)?;
                     next_open_windows.insert(id.clone(), open_window);
                 }
                 Some(open_window) => {
                     completed.push(open_window);
                     let mut next_window =
                         OpenWindow::new(id.clone(), window_start, window_end, self.specs.len());
-                    next_window.update(&self.specs, &spec_inputs, row_index);
+                    next_window.update(&self.specs, processed_input.spec_inputs(), row_index)?;
                     next_open_windows.insert(id.clone(), next_window);
                 }
                 None => {
                     let mut open_window =
                         OpenWindow::new(id.clone(), window_start, window_end, self.specs.len());
-                    open_window.update(&self.specs, &spec_inputs, row_index);
+                    open_window.update(&self.specs, processed_input.spec_inputs(), row_index)?;
                     next_open_windows.insert(id.clone(), open_window);
                 }
             }
@@ -338,11 +385,11 @@ impl Engine for TimeSeriesEngine {
             let output = self.finalize_windows(completed)?;
             self.open_windows = next_open_windows;
             self.last_dt_by_id = next_last_dt_by_id;
-            Ok(vec![output])
+            Ok(vec![SegmentTableView::from_record_batch(output)])
         }
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         if self.open_windows.is_empty() {
             return Ok(vec![]);
         }
@@ -351,7 +398,7 @@ impl Engine for TimeSeriesEngine {
         let output = self.finalize_windows(windows)?;
         self.open_windows.clear();
 
-        Ok(vec![output])
+        Ok(vec![SegmentTableView::from_record_batch(output)])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
@@ -366,20 +413,15 @@ impl Engine for TimeSeriesEngine {
 }
 
 impl TimeSeriesEngine {
-    fn filter_by_id_whitelist(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+    fn collect_id_filter_rows(&mut self, ids: &StringArray, row_count: usize) -> Vec<u32> {
         let Some(id_filter) = &self.id_filter else {
-            return Ok(batch);
+            return (0..row_count).map(|row_index| row_index as u32).collect();
         };
 
-        if batch.num_rows() == 0 {
-            return Ok(batch);
-        }
-
-        let ids = extract_id_array(&batch, &self.id_column)?;
-        let mut kept_rows = Vec::with_capacity(batch.num_rows());
+        let mut kept_rows = Vec::with_capacity(row_count);
         let mut filtered_rows = 0u64;
 
-        for row_index in 0..batch.num_rows() {
+        for row_index in 0..row_count {
             let id = ids.value(row_index);
 
             if id_filter.contains(id) {
@@ -390,7 +432,7 @@ impl TimeSeriesEngine {
         }
 
         self.pending_filtered_rows += filtered_rows;
-        filter_record_batch(&batch, &kept_rows, &self.input_schema)
+        kept_rows
     }
 }
 
@@ -419,11 +461,11 @@ impl OpenWindow {
     fn update(
         &mut self,
         specs: &[Box<dyn AggregationSpec>],
-        spec_inputs: &[SpecInputArrays<'_>],
+        spec_inputs: &[SpecInputArrays],
         row_index: usize,
-    ) {
+    ) -> Result<()> {
         for (spec_index, spec) in specs.iter().enumerate() {
-            let value = spec_inputs[spec_index].primary.value(row_index);
+            let value = spec_inputs[spec_index].primary_value(row_index)?;
 
             match spec.kind() {
                 AggregationKind::First => {
@@ -469,10 +511,7 @@ impl OpenWindow {
                     }
                 }
                 AggregationKind::Vwap => {
-                    let weight = spec_inputs[spec_index]
-                        .secondary
-                        .expect("vwap requires a secondary input column")
-                        .value(row_index);
+                    let weight = spec_inputs[spec_index].secondary_value(row_index)?;
 
                     if self.initialized[spec_index] {
                         self.values[spec_index] += value * weight;
@@ -485,6 +524,7 @@ impl OpenWindow {
                 }
             }
         }
+        Ok(())
     }
 
     fn output_value(&self, spec: &dyn AggregationSpec, spec_index: usize) -> Result<f64> {
@@ -505,9 +545,78 @@ impl OpenWindow {
     }
 }
 
-struct SpecInputArrays<'a> {
-    primary: &'a Float64Array,
-    secondary: Option<&'a Float64Array>,
+struct SpecInputArrays {
+    primary: ArrayRef,
+    secondary: Option<ArrayRef>,
+}
+
+impl SpecInputArrays {
+    fn primary_value(&self, row_index: usize) -> Result<f64> {
+        Ok(checked_value_array(&self.primary, "primary")?.value(row_index))
+    }
+
+    fn secondary_value(&self, row_index: usize) -> Result<f64> {
+        let secondary = self
+            .secondary
+            .as_ref()
+            .ok_or_else(|| ZippyError::InvalidState {
+                status: "vwap requires a secondary input column",
+            })?;
+        Ok(checked_value_array(secondary, "secondary")?.value(row_index))
+    }
+}
+
+enum ProcessedInput<'a> {
+    Table {
+        ids: &'a StringArray,
+        dts: &'a TimestampNanosecondArray,
+        row_indices: Vec<u32>,
+        spec_inputs: Vec<SpecInputArrays>,
+    },
+    Batch {
+        ids: ArrayRef,
+        dts: ArrayRef,
+        id_column: String,
+        dt_column: String,
+        row_indices: Vec<usize>,
+        spec_inputs: Vec<SpecInputArrays>,
+    },
+}
+
+impl<'a> ProcessedInput<'a> {
+    fn row_indices(&self) -> Vec<usize> {
+        match self {
+            Self::Table { row_indices, .. } => row_indices
+                .iter()
+                .map(|row_index| *row_index as usize)
+                .collect(),
+            Self::Batch { row_indices, .. } => row_indices.clone(),
+        }
+    }
+
+    fn id_value(&'a self, row_index: usize) -> Result<&'a str> {
+        match self {
+            Self::Table { ids, .. } => Ok(ids.value(row_index)),
+            Self::Batch { ids, id_column, .. } => {
+                Ok(checked_id_array(ids, id_column)?.value(row_index))
+            }
+        }
+    }
+
+    fn dt_value(&self, row_index: usize) -> Result<i64> {
+        match self {
+            Self::Table { dts, .. } => Ok(dts.value(row_index)),
+            Self::Batch { dts, dt_column, .. } => {
+                Ok(checked_dt_array(dts, dt_column)?.value(row_index))
+            }
+        }
+    }
+
+    fn spec_inputs(&self) -> &[SpecInputArrays] {
+        match self {
+            Self::Table { spec_inputs, .. } | Self::Batch { spec_inputs, .. } => spec_inputs,
+        }
+    }
 }
 
 fn build_expression_factors(
@@ -658,16 +767,17 @@ fn apply_reactive_factors(
     })
 }
 
-fn collect_accepted_rows(
+fn collect_accepted_rows_for_rows(
     ids: &StringArray,
     dts: &TimestampNanosecondArray,
+    row_indices: &[u32],
     last_dt_by_id: &BTreeMap<String, i64>,
     pending_late_rows: &mut u64,
 ) -> Vec<u32> {
-    let mut accepted_rows = Vec::with_capacity(ids.len());
+    let mut accepted_rows = Vec::with_capacity(row_indices.len());
     let mut batch_last_dt_by_id = BTreeMap::new();
 
-    for row_index in 0..ids.len() {
+    for row_index in row_indices.iter().map(|row_index| *row_index as usize) {
         let id = ids.value(row_index);
         let dt = dts.value(row_index);
 
@@ -681,38 +791,6 @@ fn collect_accepted_rows(
     }
 
     accepted_rows
-}
-
-fn filter_record_batch(
-    batch: &RecordBatch,
-    row_indices: &[u32],
-    schema: &SchemaRef,
-) -> Result<RecordBatch> {
-    if row_indices.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::clone(schema)));
-    }
-
-    if row_indices.len() == batch.num_rows() {
-        return Ok(batch.clone());
-    }
-
-    let indices = UInt32Array::from(row_indices.to_vec());
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|column| {
-            take(column.as_ref(), &indices, None).map_err(|error| ZippyError::Io {
-                reason: format!("failed to filter timeseries batch error=[{}]", error),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to build filtered timeseries batch error=[{}]",
-            error
-        ),
-    })
 }
 
 fn is_late_row(
@@ -749,17 +827,19 @@ fn validate_dt_column(schema: &Schema, dt_column: &str) -> Result<()> {
     let field = schema
         .field_with_name(dt_column)
         .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing utc nanosecond dt field field=[{}]", dt_column),
+            reason: format!(
+                "missing timezone-aware nanosecond dt field field=[{}]",
+                dt_column
+            ),
         })?;
 
     if !matches!(
         field.data_type(),
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone))
-            if timezone.as_ref() == UTC_TIMEZONE
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
     ) {
         return Err(ZippyError::SchemaMismatch {
             reason: format!(
-                "dt field must be utc nanosecond timestamp field=[{}]",
+                "dt field must be timezone-aware nanosecond timestamp field=[{}]",
                 dt_column
             ),
         });
@@ -784,20 +864,20 @@ fn validate_value_column(schema: &Schema, column: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_id_array<'a>(batch: &'a RecordBatch, id_column: &str) -> Result<&'a StringArray> {
+fn extract_id_array(batch: &RecordBatch, id_column: &str) -> Result<ArrayRef> {
     let id_index = batch
         .schema()
         .index_of(id_column)
         .map_err(|_| ZippyError::SchemaMismatch {
             reason: format!("missing utf8 id field field=[{}]", id_column),
         })?;
-    let ids = batch
-        .column(id_index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!("id field must be utf8 field=[{}]", id_column),
-        })?;
+    let array = Arc::clone(batch.column(id_index));
+    checked_id_array(&array, id_column)?;
+    Ok(array)
+}
+
+fn checked_id_array<'a>(array: &'a ArrayRef, id_column: &str) -> Result<&'a StringArray> {
+    let ids = string_array(array, id_column)?;
 
     if ids.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {
@@ -808,26 +888,26 @@ fn extract_id_array<'a>(batch: &'a RecordBatch, id_column: &str) -> Result<&'a S
     Ok(ids)
 }
 
-fn extract_dt_array<'a>(
-    batch: &'a RecordBatch,
-    dt_column: &str,
-) -> Result<&'a TimestampNanosecondArray> {
+fn extract_dt_array(batch: &RecordBatch, dt_column: &str) -> Result<ArrayRef> {
     let dt_index = batch
         .schema()
         .index_of(dt_column)
         .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing utc nanosecond dt field field=[{}]", dt_column),
-        })?;
-    let dts = batch
-        .column(dt_index)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
             reason: format!(
-                "dt field must be utc nanosecond timestamp field=[{}]",
+                "missing timezone-aware nanosecond dt field field=[{}]",
                 dt_column
             ),
         })?;
+    let array = Arc::clone(batch.column(dt_index));
+    checked_dt_array(&array, dt_column)?;
+    Ok(array)
+}
+
+fn checked_dt_array<'a>(
+    array: &'a ArrayRef,
+    dt_column: &str,
+) -> Result<&'a TimestampNanosecondArray> {
+    let dts = timestamp_ns_array(array, dt_column)?;
 
     if dts.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {
@@ -838,20 +918,26 @@ fn extract_dt_array<'a>(
     Ok(dts)
 }
 
-fn extract_value_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a Float64Array> {
+fn extract_value_array(batch: &RecordBatch, column: &str) -> Result<ArrayRef> {
     let index = batch
         .schema()
         .index_of(column)
         .map_err(|_| ZippyError::SchemaMismatch {
             reason: format!("missing float64 value field field=[{}]", column),
         })?;
-    let values = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!("value field must be float64 field=[{}]", column),
-        })?;
+    let array = Arc::clone(batch.column(index));
+    checked_value_array(&array, column)?;
+    Ok(array)
+}
+
+fn extract_value_array_from_table(table: &SegmentTableView, column: &str) -> Result<ArrayRef> {
+    let array = table.column(column)?;
+    checked_value_array(&array, column)?;
+    Ok(array)
+}
+
+fn checked_value_array<'a>(array: &'a ArrayRef, column: &str) -> Result<&'a Float64Array> {
+    let values = float64_array(array, column)?;
 
     if values.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {
@@ -862,14 +948,15 @@ fn extract_value_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a F
     Ok(values)
 }
 
-fn validate_non_decreasing_dts(
+fn validate_non_decreasing_dts_for_rows(
     ids: &StringArray,
     dts: &TimestampNanosecondArray,
+    row_indices: &[u32],
     last_dt_by_id: &BTreeMap<String, i64>,
 ) -> Result<()> {
     let mut batch_last_dt_by_id = BTreeMap::new();
 
-    for row_index in 0..ids.len() {
+    for row_index in row_indices.iter().map(|row_index| *row_index as usize) {
         let id = ids.value(row_index);
         let dt = dts.value(row_index);
         let last_dt = batch_last_dt_by_id

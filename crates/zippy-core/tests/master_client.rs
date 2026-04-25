@@ -81,8 +81,8 @@ fn unique_shm_dir(label: &str) -> PathBuf {
 fn unique_shm_name(label: &str) -> (PathBuf, String) {
     let shm_dir = unique_shm_dir(label);
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     (shm_dir, shm_name)
 }
 
@@ -188,6 +188,32 @@ fn spawn_fake_server(
                         }))
                     );
                     ControlResponse::StatusUpdated { kind, name }
+                }
+                ControlRequest::PublishSegmentDescriptor(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    assert_eq!(request.descriptor["magic"], "zippy.segment.active");
+                    ControlResponse::SegmentDescriptorPublished {
+                        stream_name: request.stream_name,
+                    }
+                }
+                ControlRequest::GetSegmentDescriptor(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    ControlResponse::SegmentDescriptorFetched {
+                        stream_name: request.stream_name,
+                        descriptor: Some(serde_json::json!({
+                            "magic": "zippy.segment.active",
+                            "version": 1,
+                            "schema_id": 7,
+                            "row_capacity": 64,
+                            "shm_os_id": "/tmp/zippy-segment",
+                            "payload_offset": 64,
+                            "committed_row_count_offset": 40,
+                            "segment_id": 1,
+                            "generation": 0,
+                        })),
+                    }
                 }
                 ControlRequest::WriteTo(AttachStreamRequest {
                     stream_name,
@@ -783,6 +809,39 @@ fn control_request_serialization_uses_buffer_and_frame_sizes() {
 }
 
 #[test]
+fn master_client_publishes_and_fetches_segment_descriptor() {
+    let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("segment-descriptor");
+    let server = spawn_fake_server(&socket_path, 3, shm_name);
+    wait_for_socket(&socket_path);
+
+    let descriptor = serde_json::json!({
+        "magic": "zippy.segment.active",
+        "version": 1,
+        "schema_id": 7,
+        "row_capacity": 64,
+        "shm_os_id": "/tmp/zippy-segment",
+        "payload_offset": 64,
+        "committed_row_count_offset": 40,
+        "segment_id": 1,
+        "generation": 0,
+    });
+    let bytes = serde_json::to_vec(&descriptor).unwrap();
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client
+        .publish_segment_descriptor_bytes("ticks", &bytes)
+        .unwrap();
+    let fetched = client.get_segment_descriptor("ticks").unwrap();
+
+    assert_eq!(fetched, Some(descriptor));
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
+}
+
+#[test]
 fn attach_stream_request_omits_filter_fields_when_not_set() {
     let request = ControlRequest::ReadFrom(AttachStreamRequest {
         stream_name: "ticks".to_string(),
@@ -884,8 +943,8 @@ fn writer_and_reader_hot_path_do_not_create_seq_ipc_files() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -994,8 +1053,8 @@ fn writer_and_reader_hot_path_do_not_create_seq_ipc_files() {
         shm_dir.display()
     );
     assert!(
-        entry_names.iter().any(|name| name == "ticks.flink"),
-        "shared memory flink should exist path=[{}] entries={entry_names:?}",
+        entry_names.iter().any(|name| name == "ticks.mmap"),
+        "mmap backing file should exist path=[{}] entries={entry_names:?}",
         shm_dir.display()
     );
 
@@ -1014,8 +1073,8 @@ fn filtered_reader_rejects_legacy_frame_payloads() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -1118,8 +1177,8 @@ fn unfiltered_reader_accepts_legacy_frame_payloads() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -1215,8 +1274,8 @@ fn filtered_reader_skips_enveloped_frame_without_directory_until_match() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -1325,8 +1384,8 @@ fn writer_writes_enveloped_frame_without_directory_for_non_instrument_batch() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -1413,6 +1472,17 @@ fn writer_writes_enveloped_frame_without_directory_for_non_instrument_batch() {
     };
     let parsed = parse_bus_frame(&frame.payload).unwrap();
     assert_eq!(parsed.kind, BusFrameKind::EnvelopedWithoutDirectory);
+    let timing = parsed
+        .timing
+        .expect("writer should attach timing metadata to bus frame");
+    assert!(timing.target_publish_enter_ns > 0);
+    assert!(timing.writer_enter_ns >= timing.target_publish_enter_ns);
+    assert!(timing.writer_enter_ns > 0);
+    assert!(timing.arrow_encoded_ns >= timing.writer_enter_ns);
+    assert!(timing.instrument_ids_done_ns >= timing.arrow_encoded_ns);
+    assert!(timing.publish_start_ns >= timing.instrument_ids_done_ns);
+    assert!(timing.publish_start_ns > 0);
+    assert!(timing.publish_done_ns >= timing.publish_start_ns);
     let decoded = encode_arrow_payload(&batch);
     assert_eq!(parsed.arrow_payload, decoded.as_slice());
 
@@ -1432,8 +1502,8 @@ fn writer_rejects_instrument_column_with_wrong_type() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();
@@ -1530,8 +1600,8 @@ fn writer_rejects_instrument_column_with_nulls() {
             .as_nanos()
     ));
     fs::create_dir_all(&shm_dir).unwrap();
-    let flink_path = shm_dir.join("ticks.flink");
-    let shm_name = flink_path.to_string_lossy().into_owned();
+    let mmap_path = shm_dir.join("ticks.mmap");
+    let shm_name = mmap_path.to_string_lossy().into_owned();
     let shm_name_for_server = shm_name.clone();
 
     let socket_path_for_server = socket_path.clone();

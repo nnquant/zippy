@@ -18,6 +18,7 @@ from ._internal import MasterClient
 from ._internal import MasterServer
 from ._internal import run_master_daemon
 from ._internal import BusReader
+from ._internal import SegmentStreamSource
 from ._internal import BusStreamSource
 from ._internal import BusStreamTarget
 from ._internal import BusWriter

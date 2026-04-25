@@ -433,6 +433,7 @@ fn engine_config(config: &PerfConfig) -> EngineConfig {
             OverflowPolicyConfig::DropOldest => OverflowPolicy::DropOldest,
         },
         late_data_policy: LateDataPolicy::Reject,
+        xfast: false,
     }
 }
 

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::prelude::*;
 use zippy_core::{
     spawn_engine, spawn_engine_with_publisher, Engine, EngineConfig, EngineStatus, OverflowPolicy,
-    Publisher, Result, ZippyError,
+    Publisher, Result, SegmentTableView, ZippyError,
 };
 
 const RUNTIME_LOG_CASE_ENV: &str = "ZIPPY_RUNTIME_LOG_CASE";
@@ -36,18 +36,18 @@ impl Engine for FlushEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         Ok(vec![batch])
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         self.flushed = true;
         let batch = RecordBatch::try_new(
             self.schema.clone(),
             vec![Arc::new(Float64Array::from(vec![99.0]))],
         )
         .unwrap();
-        Ok(vec![batch])
+        Ok(vec![SegmentTableView::from_record_batch(batch)])
     }
 }
 
@@ -68,11 +68,11 @@ impl Engine for FailingFlushEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         Ok(vec![batch])
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         Err(ZippyError::Io {
             reason: "flush failure".to_string(),
         })
@@ -96,7 +96,7 @@ impl Engine for FailingDataEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, _batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, _batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         Err(ZippyError::Io {
             reason: "data failure".to_string(),
         })
@@ -139,9 +139,9 @@ impl Engine for BlockingFailingDataEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
-        let prices = batch
-            .column(0)
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        let price_column = batch.column_at(0)?;
+        let prices = price_column
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
@@ -166,9 +166,9 @@ impl Engine for BlockingDataEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
-        let prices = batch
-            .column(0)
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        let price_column = batch.column_at(0)?;
+        let prices = price_column
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();

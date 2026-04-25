@@ -1,0 +1,15 @@
+[package]
+name = "zippy-segment-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+crossbeam-channel.workspace = true
+parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc = "0.2"
+rustix = { version = "0.38", features = ["event", "fs"] }
+thiserror.workspace = true
+tracing.workspace = true

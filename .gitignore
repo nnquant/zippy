@@ -7,6 +7,7 @@ __pycache__/
 .codex
 python/zippy/*.so
 /plugins/zippy-openctp/
+/plugins/zippy-openctp-rereview-*/
 logs/
 /~/
 crates/zippy-master/--no-console-log/

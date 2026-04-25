@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, ZippyError};
+use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::StreamTableEngine;
 
 fn input_schema() -> Arc<Schema> {
@@ -53,16 +53,26 @@ fn empty_input_batch() -> RecordBatch {
 fn stream_table_on_data_passes_batch_through_without_schema_change() {
     let mut engine = StreamTableEngine::new("ticks", input_schema()).unwrap();
     let batch = input_batch();
+    let view = SegmentTableView::from_record_batch(batch.clone());
 
-    let outputs = engine.on_data(batch.clone()).unwrap();
+    let outputs = engine.on_data(view).unwrap();
 
     assert_eq!(engine.output_schema(), batch.schema());
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].schema(), batch.schema());
     assert_eq!(outputs[0].num_rows(), batch.num_rows());
-    assert_eq!(outputs[0].column(0).to_data(), batch.column(0).to_data());
-    assert_eq!(outputs[0].column(1).to_data(), batch.column(1).to_data());
-    assert_eq!(outputs[0].column(2).to_data(), batch.column(2).to_data());
+    assert_eq!(
+        outputs[0].column("instrument_id").unwrap().to_data(),
+        batch.column(0).to_data()
+    );
+    assert_eq!(
+        outputs[0].column("dt").unwrap().to_data(),
+        batch.column(1).to_data()
+    );
+    assert_eq!(
+        outputs[0].column("last_price").unwrap().to_data(),
+        batch.column(2).to_data()
+    );
 }
 
 #[test]
@@ -77,15 +87,25 @@ fn stream_table_flush_and_stop_emit_no_extra_batches() {
 fn stream_table_on_data_passes_empty_batch_through_without_modification() {
     let mut engine = StreamTableEngine::new("ticks", input_schema()).unwrap();
     let batch = empty_input_batch();
+    let view = SegmentTableView::from_record_batch(batch.clone());
 
-    let outputs = engine.on_data(batch.clone()).unwrap();
+    let outputs = engine.on_data(view).unwrap();
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].schema(), batch.schema());
     assert_eq!(outputs[0].num_rows(), 0);
-    assert_eq!(outputs[0].column(0).to_data(), batch.column(0).to_data());
-    assert_eq!(outputs[0].column(1).to_data(), batch.column(1).to_data());
-    assert_eq!(outputs[0].column(2).to_data(), batch.column(2).to_data());
+    assert_eq!(
+        outputs[0].column("instrument_id").unwrap().to_data(),
+        batch.column(0).to_data()
+    );
+    assert_eq!(
+        outputs[0].column("dt").unwrap().to_data(),
+        batch.column(1).to_data()
+    );
+    assert_eq!(
+        outputs[0].column("last_price").unwrap().to_data(),
+        batch.column(2).to_data()
+    );
 }
 
 #[test]
@@ -104,7 +124,9 @@ fn stream_table_rejects_schema_mismatch() {
     )
     .unwrap();
 
-    let error = engine.on_data(batch).unwrap_err();
+    let error = engine
+        .on_data(SegmentTableView::from_record_batch(batch))
+        .unwrap_err();
 
     assert!(matches!(error, ZippyError::SchemaMismatch { .. }));
     assert!(error.to_string().contains("stream table input schema"));

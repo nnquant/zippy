@@ -3,25 +3,29 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, LateDataPolicy, ZippyError};
+use zippy_core::{Engine, LateDataPolicy, SegmentTableView, ZippyError};
 use zippy_engines::CrossSectionalEngine;
 use zippy_operators::{CSDemeanSpec, CSRankSpec, CSZscoreSpec};
 
 const MINUTE_NS: i64 = 60_000_000_000;
 
 fn input_schema() -> Arc<Schema> {
+    input_schema_with_timezone("UTC")
+}
+
+fn input_schema_with_timezone(timezone: &str) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
         Field::new(
             "dt",
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone.into())),
             false,
         ),
         Field::new("ret_1m", DataType::Float64, false),
     ]))
 }
 
-fn batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> RecordBatch {
+fn record_batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> RecordBatch {
     RecordBatch::try_new(
         input_schema(),
         vec![
@@ -33,14 +37,20 @@ fn batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> RecordBatch {
     .unwrap()
 }
 
-fn string_values(array: &ArrayRef) -> Vec<String> {
+fn batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> SegmentTableView {
+    SegmentTableView::from_record_batch(record_batch(symbols, dts, values))
+}
+
+fn string_values(array: zippy_core::Result<ArrayRef>) -> Vec<String> {
+    let array = array.unwrap();
     let values = array.as_any().downcast_ref::<StringArray>().unwrap();
     (0..values.len())
         .map(|index| values.value(index).to_string())
         .collect()
 }
 
-fn timestamp_values(array: &ArrayRef) -> Vec<i64> {
+fn timestamp_values(array: zippy_core::Result<ArrayRef>) -> Vec<i64> {
+    let array = array.unwrap();
     let values = array
         .as_any()
         .downcast_ref::<TimestampNanosecondArray>()
@@ -48,13 +58,14 @@ fn timestamp_values(array: &ArrayRef) -> Vec<i64> {
     (0..values.len()).map(|index| values.value(index)).collect()
 }
 
-fn float_values(array: &ArrayRef) -> Vec<f64> {
+fn float_values(array: zippy_core::Result<ArrayRef>) -> Vec<f64> {
+    let array = array.unwrap();
     let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
     (0..values.len()).map(|index| values.value(index)).collect()
 }
 
-fn column_names(batch: &RecordBatch) -> Vec<String> {
-    batch
+fn column_names(table: &SegmentTableView) -> Vec<String> {
+    table
         .schema()
         .fields()
         .iter()
@@ -98,9 +109,24 @@ fn cross_sectional_engine_keeps_last_row_per_id_within_bucket() {
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(string_values(flushed[0].column(0)), vec!["A", "B"]);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![0, 0]);
-    assert_float_slices_eq(&float_values(flushed[0].column(2)), &[2.0, 1.0]);
+    assert_eq!(string_values(flushed[0].column_at(0)), vec!["A", "B"]);
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![0, 0]);
+    assert_float_slices_eq(&float_values(flushed[0].column_at(2)), &[2.0, 1.0]);
+}
+
+#[test]
+fn cross_sectional_engine_accepts_shanghai_timestamp_input_schema() {
+    let engine = CrossSectionalEngine::new(
+        "cs",
+        input_schema_with_timezone("Asia/Shanghai"),
+        "symbol",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![CSRankSpec::new("ret_1m", "ret_rank").build().unwrap()],
+    );
+
+    assert!(engine.is_ok());
 }
 
 #[test]
@@ -125,16 +151,16 @@ fn cross_sectional_engine_emits_previous_bucket_when_new_bucket_arrives() {
         .unwrap();
 
     assert_eq!(outputs.len(), 1);
-    assert_eq!(string_values(outputs[0].column(0)), vec!["A", "B"]);
-    assert_eq!(timestamp_values(outputs[0].column(1)), vec![0, 0]);
-    assert_float_slices_eq(&float_values(outputs[0].column(2)), &[2.0, 1.0]);
+    assert_eq!(string_values(outputs[0].column_at(0)), vec!["A", "B"]);
+    assert_eq!(timestamp_values(outputs[0].column_at(1)), vec![0, 0]);
+    assert_float_slices_eq(&float_values(outputs[0].column_at(2)), &[2.0, 1.0]);
 
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(string_values(flushed[0].column(0)), vec!["C"]);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![MINUTE_NS]);
-    assert_float_slices_eq(&float_values(flushed[0].column(2)), &[1.0]);
+    assert_eq!(string_values(flushed[0].column_at(0)), vec!["C"]);
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![MINUTE_NS]);
+    assert_float_slices_eq(&float_values(flushed[0].column_at(2)), &[1.0]);
 }
 
 #[test]
@@ -163,19 +189,22 @@ fn cross_sectional_engine_handles_out_of_order_buckets_within_same_batch() {
         .unwrap();
 
     assert_eq!(outputs.len(), 2);
-    assert_eq!(string_values(outputs[0].column(0)), vec!["A"]);
-    assert_eq!(timestamp_values(outputs[0].column(1)), vec![0]);
-    assert_float_slices_eq(&float_values(outputs[0].column(2)), &[1.0]);
-    assert_eq!(string_values(outputs[1].column(0)), vec!["B"]);
-    assert_eq!(timestamp_values(outputs[1].column(1)), vec![MINUTE_NS]);
-    assert_float_slices_eq(&float_values(outputs[1].column(2)), &[1.0]);
+    assert_eq!(string_values(outputs[0].column_at(0)), vec!["A"]);
+    assert_eq!(timestamp_values(outputs[0].column_at(1)), vec![0]);
+    assert_float_slices_eq(&float_values(outputs[0].column_at(2)), &[1.0]);
+    assert_eq!(string_values(outputs[1].column_at(0)), vec!["B"]);
+    assert_eq!(timestamp_values(outputs[1].column_at(1)), vec![MINUTE_NS]);
+    assert_float_slices_eq(&float_values(outputs[1].column_at(2)), &[1.0]);
 
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(string_values(flushed[0].column(0)), vec!["C"]);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![2 * MINUTE_NS]);
-    assert_float_slices_eq(&float_values(flushed[0].column(2)), &[1.0]);
+    assert_eq!(string_values(flushed[0].column_at(0)), vec!["C"]);
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(1)),
+        vec![2 * MINUTE_NS]
+    );
+    assert_float_slices_eq(&float_values(flushed[0].column_at(2)), &[1.0]);
 }
 
 #[test]
@@ -205,12 +234,12 @@ fn cross_sectional_engine_preserves_same_bucket_last_row_after_batch_reordering(
         .unwrap();
 
     assert_eq!(outputs.len(), 1);
-    assert_eq!(string_values(outputs[0].column(0)), vec!["A", "B"]);
+    assert_eq!(string_values(outputs[0].column_at(0)), vec!["A", "B"]);
     assert_eq!(
-        timestamp_values(outputs[0].column(1)),
+        timestamp_values(outputs[0].column_at(1)),
         vec![MINUTE_NS, MINUTE_NS]
     );
-    assert_float_slices_eq(&float_values(outputs[0].column(2)), &[2.0, 1.0]);
+    assert_float_slices_eq(&float_values(outputs[0].column_at(2)), &[2.0, 1.0]);
 }
 
 #[test]
@@ -250,14 +279,14 @@ fn cross_sectional_engine_flush_emits_current_bucket_with_expected_schema() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
-    assert_eq!(string_values(flushed[0].column(0)), vec!["A", "B", "C"]);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![0, 0, 0]);
-    assert_float_slices_eq(&float_values(flushed[0].column(2)), &[1.0, 2.0, 3.0]);
+    assert_eq!(string_values(flushed[0].column_at(0)), vec!["A", "B", "C"]);
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![0, 0, 0]);
+    assert_float_slices_eq(&float_values(flushed[0].column_at(2)), &[1.0, 2.0, 3.0]);
     assert_float_slices_eq(
-        &float_values(flushed[0].column(3)),
+        &float_values(flushed[0].column_at(3)),
         &[-1.224744871391589, 0.0, 1.224744871391589],
     );
-    assert_float_slices_eq(&float_values(flushed[0].column(4)), &[-10.0, 0.0, 10.0]);
+    assert_float_slices_eq(&float_values(flushed[0].column_at(4)), &[-10.0, 0.0, 10.0]);
 }
 
 #[test]
@@ -300,16 +329,19 @@ fn cross_sectional_engine_does_not_backfill_skipped_empty_buckets() {
         .unwrap();
 
     assert_eq!(outputs.len(), 1);
-    assert_eq!(string_values(outputs[0].column(0)), vec!["A"]);
-    assert_eq!(timestamp_values(outputs[0].column(1)), vec![0]);
-    assert_float_slices_eq(&float_values(outputs[0].column(2)), &[1.0]);
+    assert_eq!(string_values(outputs[0].column_at(0)), vec!["A"]);
+    assert_eq!(timestamp_values(outputs[0].column_at(1)), vec![0]);
+    assert_float_slices_eq(&float_values(outputs[0].column_at(2)), &[1.0]);
 
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(string_values(flushed[0].column(0)), vec!["B"]);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![3 * MINUTE_NS]);
-    assert_float_slices_eq(&float_values(flushed[0].column(2)), &[1.0]);
+    assert_eq!(string_values(flushed[0].column_at(0)), vec!["B"]);
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(1)),
+        vec![3 * MINUTE_NS]
+    );
+    assert_float_slices_eq(&float_values(flushed[0].column_at(2)), &[1.0]);
 }
 
 #[test]

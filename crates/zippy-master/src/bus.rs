@@ -185,11 +185,7 @@ impl Bus {
         Ok(true)
     }
 
-    pub fn create_stream(
-        &mut self,
-        stream_name: &str,
-        buffer_size: usize,
-    ) -> Result<(), BusError> {
+    pub fn create_stream(&mut self, stream_name: &str, buffer_size: usize) -> Result<(), BusError> {
         self.create_stream_with_sizes(stream_name, buffer_size, buffer_size)
     }
 
@@ -212,24 +208,22 @@ impl Bus {
 
         let shm_path = self
             .root_dir
-            .join(format!("{}_{}.flink", stream_name, self.instance_id));
-        let shared_ring =
-            SharedFrameRing::create_or_open(&shm_path, buffer_size, frame_size).map_err(
-                |error| match error {
-                    SharedFrameRingError::InvalidConfig {
-                        buffer_size,
-                        frame_size,
-                    } => BusError::InvalidBufferOrFrameSize {
-                            stream_name: stream_name.to_string(),
-                            buffer_size,
-                            frame_size,
-                        },
-                    other => BusError::StorageInitFailed {
-                        stream_name: stream_name.to_string(),
-                        reason: other.to_string(),
-                    },
+            .join(format!("{}_{}.mmap", stream_name, self.instance_id));
+        let shared_ring = SharedFrameRing::create_or_open(&shm_path, buffer_size, frame_size)
+            .map_err(|error| match error {
+                SharedFrameRingError::InvalidConfig {
+                    buffer_size,
+                    frame_size,
+                } => BusError::InvalidBufferOrFrameSize {
+                    stream_name: stream_name.to_string(),
+                    buffer_size,
+                    frame_size,
                 },
-            )?;
+                other => BusError::StorageInitFailed {
+                    stream_name: stream_name.to_string(),
+                    reason: other.to_string(),
+                },
+            })?;
 
         self.streams.insert(
             stream_name.to_string(),

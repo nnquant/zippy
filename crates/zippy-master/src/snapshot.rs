@@ -32,9 +32,10 @@ impl<'de> Deserialize<'de> for SnapshotStreamRecord {
         D: Deserializer<'de>,
     {
         let record = SnapshotStreamRecordV1::deserialize(deserializer)?;
-        let buffer_size = record.buffer_size.or(record.ring_capacity).ok_or_else(|| {
-            serde::de::Error::missing_field("buffer_size")
-        })?;
+        let buffer_size = record
+            .buffer_size
+            .or(record.ring_capacity)
+            .ok_or_else(|| serde::de::Error::missing_field("buffer_size"))?;
         let frame_size = record.frame_size.unwrap_or(buffer_size);
         Ok(Self {
             stream_name: record.stream_name,

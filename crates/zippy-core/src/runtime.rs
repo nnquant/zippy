@@ -11,8 +11,8 @@ use tracing::{debug, error, info};
 use crate::{
     queue::{QueueReceiver, QueueSendError, QueueSender},
     Engine, EngineConfig, EngineMetrics, EngineMetricsSnapshot, EngineStatus, OverflowPolicy,
-    Publisher, Result, Source, SourceEvent, SourceHandle as RuntimeSourceHandle, SourceMode,
-    SourceSink, SpscDataQueue, ZippyError,
+    Publisher, Result, SegmentTableView, Source, SourceEvent, SourceHandle as RuntimeSourceHandle,
+    SourceMode, SourceSink, SpscDataQueue, ZippyError,
 };
 
 fn zippy_debug_stop_enabled() -> bool {
@@ -46,7 +46,7 @@ impl Publisher for NoopPublisher {
 }
 
 enum Command {
-    Data(RecordBatch),
+    Data(SegmentTableView),
     Flush(Sender<Result<Vec<RecordBatch>>>),
     Stop,
     SourceEvent(SourceEvent),
@@ -55,7 +55,7 @@ enum Command {
 }
 
 struct FastDataPath {
-    data_queue: Arc<SpscDataQueue<RecordBatch>>,
+    data_queue: Arc<SpscDataQueue<SegmentTableView>>,
     worker_thread: Mutex<Option<std::thread::Thread>>,
     worker_running: Arc<AtomicBool>,
     xfast: bool,
@@ -120,7 +120,7 @@ struct SourceRuntimeSink {
 impl EngineHandle {
     pub fn write(&self, batch: RecordBatch) -> Result<()> {
         self.ensure_running()?;
-        self.enqueue_command(Command::Data(batch))
+        self.enqueue_command(Command::Data(SegmentTableView::from_record_batch(batch)))
     }
 
     pub fn flush(&self) -> Result<Vec<RecordBatch>> {
@@ -358,13 +358,13 @@ where
         let worker_result = (|| -> Result<()> {
             while let Ok(command) = rx.recv() {
                 match command {
-                    Command::Data(batch) => {
-                        metrics_clone.inc_processed_batch(batch.num_rows());
-                        match engine.on_data(batch) {
+                    Command::Data(table) => {
+                        metrics_clone.inc_processed_batch(table.num_rows());
+                        match engine.on_data(table) {
                             Ok(outputs) => {
                                 metrics_clone.apply_delta(engine.drain_metrics());
                                 metrics_clone.inc_output_batches(outputs.len());
-                                publish_batches(&mut publisher, &metrics_clone, &outputs)?;
+                                publish_tables(&mut publisher, &metrics_clone, &outputs)?;
                             }
                             Err(err) => {
                                 metrics_clone.apply_delta(engine.drain_metrics());
@@ -378,7 +378,7 @@ where
                             metrics_clone.apply_delta(engine.drain_metrics());
                             metrics_clone.inc_output_batches(outputs.len());
                             if let Err(err) =
-                                publish_batches(&mut publisher, &metrics_clone, &outputs)
+                                publish_tables(&mut publisher, &metrics_clone, &outputs)
                                     .and_then(|()| flush_publisher(&mut publisher, &metrics_clone))
                             {
                                 *status_clone.lock().unwrap() = EngineStatus::Failed;
@@ -393,7 +393,8 @@ where
                                     outputs.iter().map(|batch| batch.num_rows()).sum::<usize>(),
                                 "engine flushed"
                             );
-                            let _ = reply_tx.send(Ok(outputs));
+                            let reply = materialize_tables(&outputs);
+                            let _ = reply_tx.send(reply);
                         }
                         Err(err) => {
                             metrics_clone.apply_delta(engine.drain_metrics());
@@ -409,7 +410,7 @@ where
                                 metrics_clone.apply_delta(engine.drain_metrics());
                                 metrics_clone.inc_output_batches(outputs.len());
                                 if let Err(err) =
-                                    publish_batches(&mut publisher, &metrics_clone, &outputs)
+                                    publish_tables(&mut publisher, &metrics_clone, &outputs)
                                         .and_then(|()| {
                                             flush_publisher(&mut publisher, &metrics_clone)
                                         })
@@ -848,7 +849,7 @@ fn runtime_idle_wait(xfast: bool) {
 }
 
 fn wait_for_fast_data_queue_drain(
-    data_queue: &SpscDataQueue<RecordBatch>,
+    data_queue: &SpscDataQueue<SegmentTableView>,
     worker_running: &AtomicBool,
     xfast: bool,
 ) {
@@ -857,7 +858,7 @@ fn wait_for_fast_data_queue_drain(
     }
 }
 
-fn drain_fast_data_queue(data_queue: &SpscDataQueue<RecordBatch>) {
+fn drain_fast_data_queue(data_queue: &SpscDataQueue<SegmentTableView>) {
     while data_queue.try_pop().is_some() {}
 }
 
@@ -866,7 +867,7 @@ fn handle_source_control_command<E, P>(
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
     status: &Arc<Mutex<EngineStatus>>,
-    fast_data_queue: Option<&SpscDataQueue<RecordBatch>>,
+    fast_data_queue: Option<&SpscDataQueue<SegmentTableView>>,
     source_mode: SourceMode,
     source_schema: &Arc<Schema>,
     engine_schema: &Arc<Schema>,
@@ -1061,7 +1062,7 @@ fn drain_fast_data_events<E, P>(
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
     status: &Arc<Mutex<EngineStatus>>,
-    data_queue: &SpscDataQueue<RecordBatch>,
+    data_queue: &SpscDataQueue<SegmentTableView>,
     hello_seen: &mut bool,
 ) -> Result<()>
 where
@@ -1090,19 +1091,19 @@ fn process_data_event<E, P>(
     engine: &mut E,
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
-    batch: RecordBatch,
+    table: SegmentTableView,
 ) -> Result<()>
 where
     E: Engine,
     P: Publisher,
 {
-    metrics.inc_processed_batch(batch.num_rows());
-    let outputs = engine.on_data(batch).inspect_err(|_| {
+    metrics.inc_processed_batch(table.num_rows());
+    let outputs = engine.on_data(table).inspect_err(|_| {
         metrics.apply_delta(engine.drain_metrics());
     })?;
     metrics.apply_delta(engine.drain_metrics());
     metrics.inc_output_batches(outputs.len());
-    publish_batches(publisher, metrics, &outputs)
+    publish_tables(publisher, metrics, &outputs)
 }
 
 fn process_flush_event<E, P>(
@@ -1120,11 +1121,11 @@ where
     })?;
     metrics.apply_delta(engine.drain_metrics());
     metrics.inc_output_batches(outputs.len());
-    publish_batches(publisher, metrics, &outputs)?;
+    publish_tables(publisher, metrics, &outputs)?;
     if flush_publisher_after {
         flush_publisher(publisher, metrics)?;
     }
-    Ok(outputs)
+    materialize_tables(&outputs)
 }
 
 fn process_stop_event<E, P>(
@@ -1141,10 +1142,10 @@ where
     })?;
     metrics.apply_delta(engine.drain_metrics());
     metrics.inc_output_batches(outputs.len());
-    publish_batches(publisher, metrics, &outputs)?;
+    publish_tables(publisher, metrics, &outputs)?;
     flush_publisher(publisher, metrics)?;
     close_publisher(publisher, metrics)?;
-    Ok(outputs)
+    materialize_tables(&outputs)
 }
 
 fn shutdown_source_pipeline<P>(publisher: &mut P, metrics: &Arc<EngineMetrics>) -> Result<()>
@@ -1164,21 +1165,29 @@ where
     Err(err)
 }
 
-fn publish_batches<P>(
+fn publish_tables<P>(
     publisher: &mut P,
     metrics: &EngineMetrics,
-    outputs: &[RecordBatch],
+    outputs: &[SegmentTableView],
 ) -> Result<()>
 where
     P: Publisher,
 {
-    for batch in outputs {
-        publisher.publish(batch).inspect_err(|_| {
+    for table in outputs {
+        let batch = table.to_record_batch()?;
+        publisher.publish(&batch).inspect_err(|_| {
             metrics.inc_publish_errors(1);
         })?;
     }
 
     Ok(())
+}
+
+fn materialize_tables(outputs: &[SegmentTableView]) -> Result<Vec<RecordBatch>> {
+    outputs
+        .iter()
+        .map(SegmentTableView::to_record_batch)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn flush_publisher<P>(publisher: &mut P, metrics: &EngineMetrics) -> Result<()>

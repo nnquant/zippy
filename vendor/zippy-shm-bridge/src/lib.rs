@@ -4,9 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::mem::align_of;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
-
-use shared_memory::{Shmem, ShmemConf, ShmemError};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 const RING_MAGIC: u64 = 0x5a49_5050_595f_5247;
 const RING_LAYOUT_VERSION: u32 = 1;
@@ -115,12 +113,6 @@ impl From<std::io::Error> for SharedFrameRingError {
     }
 }
 
-impl From<ShmemError> for SharedFrameRingError {
-    fn from(value: ShmemError) -> Self {
-        Self::Mapping(value.to_string())
-    }
-}
-
 struct RingHeader {
     buffer_size: usize,
     frame_size: usize,
@@ -161,8 +153,8 @@ struct FileLockGuard {
 }
 
 impl FileLockGuard {
-    fn acquire(flink_path: &Path) -> Result<Self, SharedFrameRingError> {
-        if let Some(parent) = flink_path.parent() {
+    fn acquire(mmap_path: &Path) -> Result<Self, SharedFrameRingError> {
+        if let Some(parent) = mmap_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
@@ -171,7 +163,7 @@ impl FileLockGuard {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(lock_path_for(flink_path))?;
+            .open(lock_path_for(mmap_path))?;
 
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if result != 0 {
@@ -189,17 +181,17 @@ impl Drop for FileLockGuard {
 }
 
 pub struct SharedFrameRing {
-    flink_path: PathBuf,
+    mmap_path: PathBuf,
     buffer_size: usize,
     frame_size: usize,
     total_size: usize,
-    shmem: Shmem,
+    mapping: MappedFile,
 }
 
 impl fmt::Debug for SharedFrameRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedFrameRing")
-            .field("flink_path", &self.flink_path)
+            .field("mmap_path", &self.mmap_path)
             .field("buffer_size", &self.buffer_size)
             .field("frame_size", &self.frame_size)
             .finish_non_exhaustive()
@@ -217,7 +209,7 @@ unsafe impl Sync for SharedFrameRing {}
 
 impl SharedFrameRing {
     pub fn create_or_open(
-        flink_path: impl AsRef<Path>,
+        mmap_path: impl AsRef<Path>,
         buffer_size: usize,
         frame_size: usize,
     ) -> Result<Self, SharedFrameRingError> {
@@ -228,39 +220,20 @@ impl SharedFrameRing {
             });
         }
 
-        let flink_path = flink_path.as_ref().to_path_buf();
+        let mmap_path = mmap_path.as_ref().to_path_buf();
         let total_size = total_size(buffer_size, frame_size)?;
-        let _lock = FileLockGuard::acquire(&flink_path)?;
-        let shmem = match ShmemConf::new()
-            .size(total_size)
-            .flink(&flink_path)
-            .create()
-        {
-            Ok(shmem) => shmem,
-            Err(ShmemError::LinkExists) => ShmemConf::new().flink(&flink_path).open()?,
-            Err(error) => return Err(error.into()),
-        };
-
-        if shmem.len() != total_size {
-            return Err(SharedFrameRingError::Corrupted {
-                reason: format!(
-                    "shared memory size mismatch flink_path=[{}] expected_bytes=[{}] actual_bytes=[{}]",
-                    flink_path.display(),
-                    total_size,
-                    shmem.len()
-                ),
-            });
-        }
+        let _lock = FileLockGuard::acquire(&mmap_path)?;
+        let (mapping, needs_initialize) = MappedFile::create_or_open(&mmap_path, total_size)?;
 
         let mut ring = Self {
-            flink_path,
+            mmap_path,
             buffer_size,
             frame_size,
             total_size,
-            shmem,
+            mapping,
         };
 
-        if ring.shmem.is_owner() {
+        if needs_initialize {
             ring.initialize_layout()?;
         } else {
             ring.validate_layout()?;
@@ -283,6 +256,33 @@ impl SharedFrameRing {
 
         let seq = self.next_seq()?;
         let progress = self.begin_publish(seq, payload)?;
+        self.finish_publish(progress)?;
+        Ok(seq)
+    }
+
+    pub fn publish_with_builder<F>(
+        &mut self,
+        payload_len: usize,
+        build: F,
+    ) -> Result<u64, SharedFrameRingError>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        if payload_len > self.frame_size {
+            return Err(SharedFrameRingError::FrameTooLarge {
+                frame_len: payload_len,
+                frame_size: self.frame_size,
+            });
+        }
+
+        let seq = self.next_seq()?;
+        let progress = self.begin_publish_reserved(seq, payload_len as u32)?;
+        {
+            let offset = payload_offset(self.buffer_size, self.frame_size, progress.slot)?;
+            let bytes = self.mapping_bytes_mut();
+            build(&mut bytes[offset..offset + payload_len]);
+        }
+        self.prepare_publish(progress);
         self.finish_publish(progress)?;
         Ok(seq)
     }
@@ -386,10 +386,7 @@ impl SharedFrameRing {
 
         if layout_version != RING_LAYOUT_VERSION {
             return Err(SharedFrameRingError::Corrupted {
-                reason: format!(
-                    "unsupported ring layout version value=[{}]",
-                    layout_version
-                ),
+                reason: format!("unsupported ring layout version value=[{}]", layout_version),
             });
         }
 
@@ -410,13 +407,13 @@ impl SharedFrameRing {
     }
 
     fn mapping_bytes(&self) -> &[u8] {
-        assert_eq!(self.shmem.len(), self.total_size);
-        unsafe { self.shmem.as_slice() }
+        assert_eq!(self.mapping.len(), self.total_size);
+        self.mapping.as_slice()
     }
 
     fn mapping_bytes_mut(&mut self) -> &mut [u8] {
-        assert_eq!(self.shmem.len(), self.total_size);
-        unsafe { self.shmem.as_slice_mut() }
+        assert_eq!(self.mapping.len(), self.total_size);
+        self.mapping.as_slice_mut()
     }
 
     fn latest_seq(&self) -> &AtomicU64 {
@@ -440,22 +437,34 @@ impl SharedFrameRing {
         seq: u64,
         payload: &[u8],
     ) -> Result<PublishInProgress, SharedFrameRingError> {
-        let slot = slot_index(seq, self.buffer_size);
-        let payload_len = payload.len() as u32;
-        self.frame_state(slot)
-            .store(FrameState::Writing as u8, Ordering::Release);
-
-        let payload_offset = payload_offset(self.buffer_size, self.frame_size, slot)?;
+        let progress = self.begin_publish_reserved(seq, payload.len() as u32)?;
+        let payload_offset = payload_offset(self.buffer_size, self.frame_size, progress.slot)?;
         let bytes = self.mapping_bytes_mut();
         bytes[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-        self.frame_len(slot).store(payload_len, Ordering::Release);
-        self.frame_seq(slot).store(seq, Ordering::Release);
+        self.prepare_publish(progress);
+        Ok(progress)
+    }
 
+    fn begin_publish_reserved(
+        &mut self,
+        seq: u64,
+        payload_len: u32,
+    ) -> Result<PublishInProgress, SharedFrameRingError> {
+        let slot = slot_index(seq, self.buffer_size);
+        self.frame_state(slot)
+            .store(FrameState::Writing as u8, Ordering::Release);
         Ok(PublishInProgress {
             seq,
             slot,
             payload_len,
         })
+    }
+
+    fn prepare_publish(&self, progress: PublishInProgress) {
+        self.frame_len(progress.slot)
+            .store(progress.payload_len, Ordering::Release);
+        self.frame_seq(progress.slot)
+            .store(progress.seq, Ordering::Release);
     }
 
     fn finish_publish(&self, progress: PublishInProgress) -> Result<(), SharedFrameRingError> {
@@ -497,8 +506,12 @@ impl SharedFrameRing {
         Ok(unsafe { (*self.atomic_u32_ptr(frame_header_offset + 8)).load(Ordering::Acquire) })
     }
 
-    fn frame_state_load(&self, frame_header_offset: usize) -> Result<FrameState, SharedFrameRingError> {
-        let value = unsafe { (*self.atomic_u8_ptr(frame_header_offset + 12)).load(Ordering::Acquire) };
+    fn frame_state_load(
+        &self,
+        frame_header_offset: usize,
+    ) -> Result<FrameState, SharedFrameRingError> {
+        let value =
+            unsafe { (*self.atomic_u8_ptr(frame_header_offset + 12)).load(Ordering::Acquire) };
         FrameState::from_u8(value)
     }
 
@@ -536,10 +549,112 @@ impl SharedFrameRing {
 
 impl Drop for SharedFrameRing {
     fn drop(&mut self) {
-        if self.shmem.is_owner() {
-            let _ = fs::remove_file(lock_path_for(&self.flink_path));
+        if self.mapping.is_owner() {
+            let _ = fs::remove_file(&self.mmap_path);
+            let _ = fs::remove_file(lock_path_for(&self.mmap_path));
         }
     }
+}
+
+#[derive(Debug)]
+struct MappedFile {
+    _file: File,
+    ptr: *mut u8,
+    len: usize,
+    owner: bool,
+}
+
+impl MappedFile {
+    fn create_or_open(path: &Path, len: usize) -> Result<(Self, bool), SharedFrameRingError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let existed = path.exists();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let actual_len = file.metadata()?.len();
+        let needs_initialize = !existed || actual_len == 0;
+        if needs_initialize {
+            file.set_len(len as u64)?;
+        } else if actual_len != len as u64 {
+            return Err(SharedFrameRingError::Corrupted {
+                reason: format!(
+                    "shared frame ring file size mismatch path=[{}] expected_bytes=[{}] actual_bytes=[{}]",
+                    path.display(),
+                    len,
+                    actual_len
+                ),
+            });
+        }
+
+        preallocate_file(&file, len)?;
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(SharedFrameRingError::Mapping(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+
+        Ok((
+            Self {
+                _file: file,
+                ptr: ptr.cast::<u8>(),
+                len,
+                owner: needs_initialize,
+            },
+            needs_initialize,
+        ))
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_owner(&self) -> bool {
+        self.owner
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { libc::munmap(self.ptr.cast(), self.len) };
+        }
+    }
+}
+
+fn preallocate_file(file: &File, len: usize) -> Result<(), SharedFrameRingError> {
+    let len = libc::off_t::try_from(len).map_err(|_| SharedFrameRingError::SizeOverflow)?;
+    let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) };
+    if result != 0 {
+        return Err(SharedFrameRingError::Io(std::io::Error::from_raw_os_error(
+            result,
+        )));
+    }
+    Ok(())
 }
 
 fn total_size(buffer_size: usize, frame_size: usize) -> Result<usize, SharedFrameRingError> {
@@ -556,8 +671,8 @@ fn total_size(buffer_size: usize, frame_size: usize) -> Result<usize, SharedFram
         .ok_or(SharedFrameRingError::SizeOverflow)
 }
 
-fn lock_path_for(flink_path: &Path) -> PathBuf {
-    let mut value = OsString::from(flink_path.as_os_str());
+fn lock_path_for(mmap_path: &Path) -> PathBuf {
+    let mut value = OsString::from(mmap_path.as_os_str());
     value.push(".lock");
     PathBuf::from(value)
 }
@@ -622,22 +737,47 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, ReadResult, SharedFrameRing};
+    use super::{total_size, Frame, MappedFile, ReadResult, SharedFrameRing};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn unique_flink_path() -> std::path::PathBuf {
+    fn unique_mmap_path() -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("zippy-shm-bridge-test-{nanos}.flink"))
+        std::env::temp_dir().join(format!("zippy-shm-bridge-test-{nanos}.mmap"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_file_is_preallocated_before_first_touch_to_avoid_sparse_mmap_sigbus() {
+        let mmap_path = unique_mmap_path();
+        let buffer_size = 8;
+        let frame_size = 1024 * 1024;
+        let expected_bytes = total_size(buffer_size, frame_size).unwrap();
+        let (_mapping, needs_initialize) =
+            MappedFile::create_or_open(&mmap_path, expected_bytes).unwrap();
+        let metadata = std::fs::metadata(&mmap_path).unwrap();
+        let allocated_bytes = metadata.blocks() * 512;
+
+        assert!(needs_initialize);
+        assert!(
+            allocated_bytes >= expected_bytes as u64,
+            "backing file should be fully allocated allocated_bytes=[{}] expected_bytes=[{}]",
+            allocated_bytes,
+            expected_bytes
+        );
+        drop(_mapping);
+        let _ = std::fs::remove_file(&mmap_path);
     }
 
     #[test]
     fn second_handle_reads_published_frame() {
-        let flink_path = unique_flink_path();
-        let mut writer = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
-        let reader = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+        let mmap_path = unique_mmap_path();
+        let mut writer = SharedFrameRing::create_or_open(&mmap_path, 4, 64).unwrap();
+        let reader = SharedFrameRing::create_or_open(&mmap_path, 4, 64).unwrap();
 
         let published_seq = writer.publish(b"abc").unwrap();
         assert_eq!(published_seq, 1);
@@ -654,16 +794,16 @@ mod tests {
 
     #[test]
     fn reader_is_pending_before_first_publish() {
-        let flink_path = unique_flink_path();
-        let reader = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+        let mmap_path = unique_mmap_path();
+        let reader = SharedFrameRing::create_or_open(&mmap_path, 4, 64).unwrap();
 
         assert_eq!(reader.read(1).unwrap(), ReadResult::Pending);
     }
 
     #[test]
     fn seek_latest_returns_latest_plus_one() {
-        let flink_path = unique_flink_path();
-        let mut ring = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+        let mmap_path = unique_mmap_path();
+        let mut ring = SharedFrameRing::create_or_open(&mmap_path, 4, 64).unwrap();
 
         assert_eq!(ring.seek_latest().unwrap(), 1);
         ring.publish(b"a").unwrap();
@@ -673,8 +813,8 @@ mod tests {
 
     #[test]
     fn read_reports_lagged_after_overwrite() {
-        let flink_path = unique_flink_path();
-        let mut ring = SharedFrameRing::create_or_open(&flink_path, 2, 64).unwrap();
+        let mmap_path = unique_mmap_path();
+        let mut ring = SharedFrameRing::create_or_open(&mmap_path, 2, 64).unwrap();
 
         ring.publish(b"a").unwrap();
         ring.publish(b"b").unwrap();
@@ -695,9 +835,9 @@ mod tests {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
-        let flink_path = unique_flink_path();
-        let mut writer = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
-        let reader = SharedFrameRing::create_or_open(&flink_path, 4, 64).unwrap();
+        let mmap_path = unique_mmap_path();
+        let mut writer = SharedFrameRing::create_or_open(&mmap_path, 4, 64).unwrap();
+        let reader = SharedFrameRing::create_or_open(&mmap_path, 4, 64).unwrap();
         let ready = Arc::new(Barrier::new(2));
         let proceed = Arc::new(Barrier::new(2));
         let ready_writer = Arc::clone(&ready);
@@ -728,10 +868,13 @@ mod tests {
 
     #[test]
     fn publish_rejects_frame_larger_than_frame_size() {
-        let flink_path = unique_flink_path();
-        let mut ring = SharedFrameRing::create_or_open(&flink_path, 2, 2).unwrap();
+        let mmap_path = unique_mmap_path();
+        let mut ring = SharedFrameRing::create_or_open(&mmap_path, 2, 2).unwrap();
 
         let error = ring.publish(b"abc").unwrap_err();
-        assert_eq!(error.to_string(), "frame too large frame_len=[3] frame_size=[2]");
+        assert_eq!(
+            error.to_string(),
+            "frame too large frame_len=[3] frame_size=[2]"
+        );
     }
 }

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, Result, SchemaRef, ZippyError};
+use zippy_core::{Engine, Result, SchemaRef, SegmentTableView, ZippyError};
 
 /// Pass-through engine for stream table ingestion.
 pub struct StreamTableEngine {
@@ -39,8 +38,8 @@ impl Engine for StreamTableEngine {
         Arc::clone(&self.input_schema)
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
-        if batch.schema().as_ref() != self.input_schema.as_ref() {
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
                     "input batch schema does not match stream table input schema engine=[{}]",
@@ -49,14 +48,14 @@ impl Engine for StreamTableEngine {
             });
         }
 
-        Ok(vec![batch])
+        Ok(vec![table])
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         Ok(vec![])
     }
 
-    fn on_stop(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
         Ok(vec![])
     }
 }

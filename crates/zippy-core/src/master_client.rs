@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
+use std::hint::spin_loop;
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, StringArray};
 use arrow::ipc::reader::StreamReader;
@@ -11,12 +12,16 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_shm_bridge::{ReadResult as SharedReadResult, SharedFrameRing};
 
-use crate::bus_frame::{encode_bus_frame, parse_bus_frame, BusFrameKind};
+use crate::bus_frame::{
+    encode_bus_frame_with_timing, parse_bus_frame, patch_bus_frame_publish_done, BusFrameKind,
+    BusFrameTiming,
+};
 use crate::bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
-    GetStreamRequest, HeartbeatRequest, ListStreamsRequest, ReaderDescriptor,
-    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
-    RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
+    GetSegmentDescriptorRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
+    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
 };
 use crate::{Result, SchemaRef, ZippyError};
 
@@ -39,9 +44,17 @@ pub struct Reader {
     socket_path: PathBuf,
     descriptor: ReaderDescriptor,
     instrument_filter: Option<BTreeSet<String>>,
+    xfast: bool,
     next_read_seq: u64,
     ring: SharedFrameRing,
     closed: bool,
+}
+
+pub struct TimedReadBatch {
+    pub batch: RecordBatch,
+    pub bus_timing: Option<BusFrameTiming>,
+    pub frame_ready_ns: i64,
+    pub read_return_ns: i64,
 }
 
 impl MasterClient {
@@ -226,7 +239,7 @@ impl MasterClient {
     }
 
     pub fn read_from(&mut self, stream_name: &str) -> Result<Reader> {
-        self.attach_reader(stream_name, None)
+        self.attach_reader(stream_name, None, false)
     }
 
     pub fn read_from_filtered(
@@ -237,6 +250,24 @@ impl MasterClient {
         self.attach_reader(
             stream_name,
             normalize_instrument_filter(Some(instrument_ids))?,
+            false,
+        )
+    }
+
+    pub fn read_from_with_xfast(&mut self, stream_name: &str, xfast: bool) -> Result<Reader> {
+        self.attach_reader(stream_name, None, xfast)
+    }
+
+    pub fn read_from_filtered_with_xfast(
+        &mut self,
+        stream_name: &str,
+        instrument_ids: Vec<String>,
+        xfast: bool,
+    ) -> Result<Reader> {
+        self.attach_reader(
+            stream_name,
+            normalize_instrument_filter(Some(instrument_ids))?,
+            xfast,
         )
     }
 
@@ -244,6 +275,7 @@ impl MasterClient {
         &mut self,
         stream_name: &str,
         instrument_ids: Option<Vec<String>>,
+        xfast: bool,
     ) -> Result<Reader> {
         let requested_filter = instrument_filter_request_set(&instrument_ids);
         let process_id = self.require_process_id()?;
@@ -281,6 +313,7 @@ impl MasterClient {
                 Ok(Reader {
                     socket_path: self.socket_path.clone(),
                     instrument_filter: descriptor_filter,
+                    xfast,
                     next_read_seq,
                     ring,
                     descriptor,
@@ -308,6 +341,51 @@ impl MasterClient {
         match response {
             ControlResponse::StreamFetched(response) => Ok(response.stream),
             other => Err(unexpected_response("StreamFetched", other)),
+        }
+    }
+
+    pub fn publish_segment_descriptor(
+        &self,
+        stream_name: &str,
+        descriptor: serde_json::Value,
+    ) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::PublishSegmentDescriptor(
+            PublishSegmentDescriptorRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+                descriptor,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::SegmentDescriptorPublished { .. } => Ok(()),
+            other => Err(unexpected_response("SegmentDescriptorPublished", other)),
+        }
+    }
+
+    pub fn publish_segment_descriptor_bytes(
+        &self,
+        stream_name: &str,
+        descriptor_envelope: &[u8],
+    ) -> Result<()> {
+        let descriptor =
+            serde_json::from_slice::<serde_json::Value>(descriptor_envelope).map_err(json_error)?;
+        self.publish_segment_descriptor(stream_name, descriptor)
+    }
+
+    pub fn get_segment_descriptor(&self, stream_name: &str) -> Result<Option<serde_json::Value>> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::GetSegmentDescriptor(
+            GetSegmentDescriptorRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::SegmentDescriptorFetched { descriptor, .. } => Ok(descriptor),
+            other => Err(unexpected_response("SegmentDescriptorFetched", other)),
         }
     }
 
@@ -345,13 +423,56 @@ impl Writer {
     }
 
     pub fn write(&mut self, batch: RecordBatch) -> Result<()> {
+        let target_publish_enter_ns = sample_localtime_ns();
+        self.write_with_target_publish_enter_ns(batch, target_publish_enter_ns)
+    }
+
+    pub fn write_with_target_publish_enter_ns(
+        &mut self,
+        batch: RecordBatch,
+        target_publish_enter_ns: i64,
+    ) -> Result<()> {
+        let writer_enter_ns = sample_localtime_ns();
         let arrow_payload = encode_batch(&batch)?;
+        let arrow_encoded_ns = sample_localtime_ns();
         let instrument_ids = extract_instrument_ids(&batch)?;
+        let instrument_ids_done_ns = sample_localtime_ns();
+        let publish_start_ns = sample_localtime_ns();
         let frame = match instrument_ids {
-            Some(ids) => encode_bus_frame(&ids, &arrow_payload)?,
-            None => encode_bus_frame::<String>(&[], &arrow_payload)?,
+            Some(ids) => encode_bus_frame_with_timing(
+                &ids,
+                &arrow_payload,
+                Some(BusFrameTiming {
+                    target_publish_enter_ns,
+                    writer_enter_ns,
+                    arrow_encoded_ns,
+                    instrument_ids_done_ns,
+                    publish_start_ns,
+                    publish_done_ns: 0,
+                }),
+            )?,
+            None => encode_bus_frame_with_timing::<String>(
+                &[],
+                &arrow_payload,
+                Some(BusFrameTiming {
+                    target_publish_enter_ns,
+                    writer_enter_ns,
+                    arrow_encoded_ns,
+                    instrument_ids_done_ns,
+                    publish_start_ns,
+                    publish_done_ns: 0,
+                }),
+            )?,
         };
-        let published_seq = self.ring.publish(&frame).map_err(shared_ring_error)?;
+        let published_seq = self
+            .ring
+            .publish_with_builder(frame.len(), |payload| {
+                payload.copy_from_slice(&frame);
+                let publish_done_ns = sample_localtime_ns();
+                patch_bus_frame_publish_done(payload, publish_done_ns)
+                    .expect("timing frame patch should succeed");
+            })
+            .map_err(shared_ring_error)?;
         self.next_write_seq = published_seq + 1;
         Ok(())
     }
@@ -396,6 +517,10 @@ impl Reader {
     }
 
     pub fn read(&mut self, timeout_ms: Option<u64>) -> Result<RecordBatch> {
+        Ok(self.read_with_timing(timeout_ms)?.batch)
+    }
+
+    pub fn read_with_timing(&mut self, timeout_ms: Option<u64>) -> Result<TimedReadBatch> {
         let deadline = timeout_ms.map(|timeout| Instant::now() + Duration::from_millis(timeout));
 
         loop {
@@ -431,9 +556,16 @@ impl Reader {
                         }
                     }
 
+                    let frame_ready_ns = sample_localtime_ns();
                     let batch = decode_batch(parsed.arrow_payload)?;
+                    let read_return_ns = sample_localtime_ns();
                     self.next_read_seq += 1;
-                    return Ok(batch);
+                    return Ok(TimedReadBatch {
+                        batch,
+                        bus_timing: parsed.timing,
+                        frame_ready_ns,
+                        read_return_ns,
+                    });
                 }
                 SharedReadResult::Lagged {
                     oldest_seq,
@@ -465,7 +597,11 @@ impl Reader {
                 }
             }
 
-            thread::sleep(Duration::from_millis(10));
+            if self.xfast {
+                spin_loop();
+            } else {
+                thread::sleep(Duration::from_micros(10));
+            }
         }
     }
 
@@ -502,6 +638,13 @@ impl Drop for Reader {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+fn sample_localtime_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time must be after unix epoch")
+        .as_nanos() as i64
 }
 
 fn send_control_request(socket_path: &Path, request: ControlRequest) -> Result<ControlResponse> {

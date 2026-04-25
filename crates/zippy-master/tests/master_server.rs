@@ -56,6 +56,107 @@ fn registry_stores_process_and_stream_records() {
 }
 
 #[test]
+fn registry_source_owner_publishes_segment_descriptor() {
+    let mut registry = Registry::default();
+    let process_id = registry.register_process("openctp");
+    registry
+        .register_stream("openctp_ticks", 1024, 256)
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &process_id,
+            "openctp_ticks",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    let descriptor = serde_json::json!({
+        "magic": "zippy.segment.active",
+        "version": 1,
+        "schema_id": 7,
+        "row_capacity": 64,
+        "shm_os_id": "/tmp/zippy-segment",
+        "payload_offset": 64,
+        "committed_row_count_offset": 40,
+        "segment_id": 1,
+        "generation": 0,
+    });
+
+    registry
+        .publish_segment_descriptor("openctp_ticks", &process_id, descriptor.clone())
+        .unwrap();
+
+    assert_eq!(
+        registry.segment_descriptor("openctp_ticks").unwrap(),
+        Some(descriptor)
+    );
+}
+
+#[test]
+fn registry_rejects_segment_descriptor_publish_from_lost_source() {
+    let mut registry = Registry::default();
+    let process_id = registry.register_process("openctp");
+    registry
+        .register_stream("openctp_ticks", 1024, 256)
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &process_id,
+            "openctp_ticks",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    registry.force_expire_process(&process_id).unwrap();
+    registry.mark_records_lost_for_process(&process_id);
+
+    let error = registry
+        .publish_segment_descriptor(
+            "openctp_ticks",
+            &process_id,
+            serde_json::json!({"magic": "zippy.segment.active"}),
+        )
+        .unwrap_err();
+
+    assert!(format!("{error}").contains("process lease expired"));
+}
+
+#[test]
+fn registry_segment_descriptor_requires_alive_process() {
+    let mut registry = Registry::default();
+    let source_process_id = registry.register_process("openctp");
+    let reader_process_id = registry.register_process("segment_reader");
+    registry
+        .register_stream("openctp_ticks", 1024, 256)
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &source_process_id,
+            "openctp_ticks",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    registry
+        .publish_segment_descriptor(
+            "openctp_ticks",
+            &source_process_id,
+            serde_json::json!({"magic": "zippy.segment.active"}),
+        )
+        .unwrap();
+    registry.force_expire_process(&reader_process_id).unwrap();
+
+    let error = registry
+        .segment_descriptor_for_process("openctp_ticks", &reader_process_id)
+        .unwrap_err();
+
+    assert!(format!("{error}").contains("process lease expired"));
+}
+
+#[test]
 fn master_restores_registered_streams_from_snapshot_as_restored() {
     let temp = tempfile::tempdir().unwrap();
     let snapshot_path = temp.path().join("master-registry.json");
@@ -196,6 +297,59 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
         "restored"
     );
     assert_eq!(registry.get_sink("factor_sink").unwrap().status, "restored");
+}
+
+#[test]
+fn master_does_not_restore_active_segment_descriptor_from_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path.clone()),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+
+    assert!(send_register_process(&wait_path, "openctp").contains("proc_1"));
+    assert!(send_request(
+        &wait_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
+    )
+    .contains("StreamRegistered"));
+    assert!(send_request(
+        &wait_path,
+        "{\"RegisterSource\":{\"source_name\":\"openctp_md\",\"source_type\":\"openctp\",\"process_id\":\"proc_1\",\"output_stream\":\"openctp_ticks\",\"config\":{}}}\n",
+    )
+    .contains("SourceRegistered"));
+    assert!(send_request(
+        &wait_path,
+        "{\"PublishSegmentDescriptor\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_1\",\"descriptor\":{\"magic\":\"zippy.segment.active\"}}}\n",
+    )
+    .contains("SegmentDescriptorPublished"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+
+    let server = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let reader_process_id = server
+        .registry()
+        .lock()
+        .unwrap()
+        .register_process("segment_reader");
+    let descriptor = server
+        .registry()
+        .lock()
+        .unwrap()
+        .segment_descriptor_for_process("openctp_ticks", &reader_process_id)
+        .unwrap();
+
+    assert!(descriptor.is_none());
+    let _ = fs::remove_file(wait_path);
 }
 
 #[test]
@@ -509,9 +663,13 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
 #[test]
 fn registry_rejects_duplicate_stream_names() {
     let mut registry = Registry::default();
-    registry.register_stream("openctp_ticks", 1024, 256).unwrap();
+    registry
+        .register_stream("openctp_ticks", 1024, 256)
+        .unwrap();
 
-    let error = registry.register_stream("openctp_ticks", 1024, 256).unwrap_err();
+    let error = registry
+        .register_stream("openctp_ticks", 1024, 256)
+        .unwrap_err();
     assert!(format!("{error}").contains("stream already exists"));
 }
 
@@ -760,6 +918,61 @@ fn master_server_registers_stream_and_attaches_reader_writer() {
     assert!(reader_descriptor.shm_name.contains("openctp_ticks"));
     assert_eq!(reader_descriptor.next_read_seq, 1);
     assert_eq!(reader_descriptor.reader_id, "openctp_ticks_reader_1");
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_publishes_and_fetches_segment_descriptor() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    assert!(send_register_process(&socket_path, "openctp").contains("proc_1"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
+    )
+    .contains("StreamRegistered"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterSource\":{\"source_name\":\"openctp_md\",\"source_type\":\"openctp\",\"process_id\":\"proc_1\",\"output_stream\":\"openctp_ticks\",\"config\":{}}}\n",
+    )
+    .contains("SourceRegistered"));
+    assert!(send_register_process(&socket_path, "segment_reader").contains("proc_2"));
+
+    let publish_response = send_request(
+        &socket_path,
+        "{\"PublishSegmentDescriptor\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_1\",\"descriptor\":{\"magic\":\"zippy.segment.active\",\"version\":1,\"schema_id\":7,\"row_capacity\":64,\"shm_os_id\":\"/tmp/zippy-segment\",\"payload_offset\":64,\"committed_row_count_offset\":40,\"segment_id\":1,\"generation\":0}}}\n",
+    );
+    let publish_response: ControlResponse =
+        serde_json::from_str(publish_response.trim_end()).unwrap();
+    match publish_response {
+        ControlResponse::SegmentDescriptorPublished { stream_name } => {
+            assert_eq!(stream_name, "openctp_ticks");
+        }
+        other => panic!("unexpected publish response: {:?}", other),
+    }
+
+    let fetch_response = send_request(
+        &socket_path,
+        "{\"GetSegmentDescriptor\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_2\"}}\n",
+    );
+    let fetch_response: ControlResponse = serde_json::from_str(fetch_response.trim_end()).unwrap();
+    match fetch_response {
+        ControlResponse::SegmentDescriptorFetched {
+            stream_name,
+            descriptor,
+        } => {
+            assert_eq!(stream_name, "openctp_ticks");
+            assert_eq!(
+                descriptor.unwrap()["magic"],
+                serde_json::json!("zippy.segment.active")
+            );
+        }
+        other => panic!("unexpected fetch response: {:?}", other),
+    }
 
     server.shutdown();
     join_handle.join().unwrap();

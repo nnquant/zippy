@@ -4,7 +4,7 @@ use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, Criterion};
-use zippy_core::{Engine, LateDataPolicy};
+use zippy_core::{Engine, LateDataPolicy, SegmentTableView};
 use zippy_engines::TimeSeriesEngine;
 use zippy_operators::{AggFirstSpec, AggLastSpec, AggSumSpec};
 
@@ -55,7 +55,9 @@ fn bench_timeseries_pipeline(c: &mut Criterion) {
                 vec![],
             )
             .unwrap();
-            let _ = engine.on_data(batch.clone()).unwrap();
+            let _ = engine
+                .on_data(SegmentTableView::from_record_batch(batch.clone()))
+                .unwrap();
             let _ = engine.on_flush().unwrap();
         })
     });

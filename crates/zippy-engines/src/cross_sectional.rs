@@ -1,12 +1,16 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, StringArray, TimestampNanosecondArray, UInt32Array};
-use arrow::compute::{concat_batches, take_record_batch};
+use arrow::array::{Array, ArrayRef, StringArray, TimestampNanosecondArray};
+use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, EngineMetricsDelta, LateDataPolicy, Result, SchemaRef, ZippyError};
+use zippy_core::{
+    Engine, EngineMetricsDelta, LateDataPolicy, Result, SchemaRef, SegmentTableView, ZippyError,
+};
 use zippy_operators::CrossSectionalFactor;
+
+use crate::table_view::{record_batch_from_table_rows, string_array, timestamp_ns_array};
 
 const UTC_TIMEZONE: &str = "UTC";
 
@@ -150,8 +154,8 @@ impl Engine for CrossSectionalEngine {
         Arc::clone(&self.output_schema)
     }
 
-    fn on_data(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
-        if batch.schema().as_ref() != self.input_schema.as_ref() {
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
                     "input batch schema does not match engine input schema engine=[{}]",
@@ -159,19 +163,20 @@ impl Engine for CrossSectionalEngine {
                 ),
             });
         }
-
-        if batch.num_rows() == 0 {
+        if table.num_rows() == 0 {
             return Ok(vec![]);
         }
 
-        let ids = extract_id_array(&batch, &self.id_column)?;
-        let dts = extract_dt_array(&batch, &self.dt_column)?;
+        let id_array = table.column(&self.id_column)?;
+        let ids = checked_id_array(&id_array, &self.id_column)?;
+        let dt_array = table.column(&self.dt_column)?;
+        let dts = checked_dt_array(&dt_array, &self.dt_column)?;
         let mut outputs = Vec::new();
         let mut next_current_bucket_start = self.current_bucket_start;
         let mut next_current_rows = self.current_rows.clone();
         let mut next_last_closed_bucket_start = self.last_closed_bucket_start;
         let mut next_pending_late_rows = self.pending_late_rows;
-        let mut row_indices = (0..batch.num_rows()).collect::<Vec<_>>();
+        let mut row_indices = (0..table.num_rows()).collect::<Vec<_>>();
 
         row_indices.sort_by_key(|row_index| {
             (
@@ -184,7 +189,7 @@ impl Engine for CrossSectionalEngine {
             let id = ids.value(row_index).to_string();
             let dt = dts.value(row_index);
             let bucket_start = align_bucket_start(dt, self.trigger_interval);
-            let owned_row = extract_owned_row(&batch, row_index)?;
+            let owned_row = extract_owned_row(&table, &self.input_schema, row_index)?;
 
             match next_current_bucket_start {
                 Some(current_bucket_start) if bucket_start < current_bucket_start => {
@@ -229,10 +234,13 @@ impl Engine for CrossSectionalEngine {
         self.last_closed_bucket_start = next_last_closed_bucket_start;
         self.pending_late_rows = next_pending_late_rows;
 
-        Ok(outputs)
+        Ok(outputs
+            .into_iter()
+            .map(SegmentTableView::from_record_batch)
+            .collect())
     }
 
-    fn on_flush(&mut self) -> Result<Vec<RecordBatch>> {
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         let Some(bucket_start) = self.current_bucket_start else {
             return Ok(vec![]);
         };
@@ -248,7 +256,7 @@ impl Engine for CrossSectionalEngine {
         self.current_bucket_start = None;
         self.current_rows.clear();
 
-        Ok(vec![output])
+        Ok(vec![SegmentTableView::from_record_batch(output)])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
@@ -320,11 +328,13 @@ fn build_bucket_batch<'a>(
     })
 }
 
-fn extract_owned_row(batch: &RecordBatch, row_index: usize) -> Result<OwnedRow> {
-    let indices = UInt32Array::from(vec![row_index as u32]);
-    let batch = take_record_batch(batch, &indices).map_err(|error| ZippyError::Io {
-        reason: format!("failed to extract cross-sectional row error=[{}]", error),
-    })?;
+fn extract_owned_row(
+    table: &SegmentTableView,
+    schema: &SchemaRef,
+    row_index: usize,
+) -> Result<OwnedRow> {
+    let batch =
+        record_batch_from_table_rows(table, schema, &[row_index as u32], "cross-sectional row")?;
 
     Ok(OwnedRow { batch })
 }
@@ -349,17 +359,19 @@ fn validate_dt_column(schema: &Schema, dt_column: &str) -> Result<()> {
     let field = schema
         .field_with_name(dt_column)
         .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing utc nanosecond dt field field=[{}]", dt_column),
+            reason: format!(
+                "missing timezone-aware nanosecond dt field field=[{}]",
+                dt_column
+            ),
         })?;
 
     if !matches!(
         field.data_type(),
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone))
-            if timezone.as_ref() == UTC_TIMEZONE
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
     ) {
         return Err(ZippyError::SchemaMismatch {
             reason: format!(
-                "dt field must be utc nanosecond timestamp field=[{}]",
+                "dt field must be timezone-aware nanosecond timestamp field=[{}]",
                 dt_column
             ),
         });
@@ -368,20 +380,8 @@ fn validate_dt_column(schema: &Schema, dt_column: &str) -> Result<()> {
     Ok(())
 }
 
-fn extract_id_array<'a>(batch: &'a RecordBatch, id_column: &str) -> Result<&'a StringArray> {
-    let id_index = batch
-        .schema()
-        .index_of(id_column)
-        .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing utf8 id field field=[{}]", id_column),
-        })?;
-    let ids = batch
-        .column(id_index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!("id field must be utf8 field=[{}]", id_column),
-        })?;
+fn checked_id_array<'a>(array: &'a ArrayRef, id_column: &str) -> Result<&'a StringArray> {
+    let ids = string_array(array, id_column)?;
 
     if ids.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {
@@ -392,26 +392,11 @@ fn extract_id_array<'a>(batch: &'a RecordBatch, id_column: &str) -> Result<&'a S
     Ok(ids)
 }
 
-fn extract_dt_array<'a>(
-    batch: &'a RecordBatch,
+fn checked_dt_array<'a>(
+    array: &'a ArrayRef,
     dt_column: &str,
 ) -> Result<&'a TimestampNanosecondArray> {
-    let dt_index = batch
-        .schema()
-        .index_of(dt_column)
-        .map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing utc nanosecond dt field field=[{}]", dt_column),
-        })?;
-    let dts = batch
-        .column(dt_index)
-        .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!(
-                "dt field must be utc nanosecond timestamp field=[{}]",
-                dt_column
-            ),
-        })?;
+    let dts = timestamp_ns_array(array, dt_column)?;
 
     if dts.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {

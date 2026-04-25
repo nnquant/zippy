@@ -7,9 +7,10 @@ members = [
     "crates/zippy-python",
     "crates/zippy-perf",
     "crates/zippy-master",
+    "crates/zippy-segment-store",
+    "crates/zippy-operator-runtime",
 ]
 exclude = [
-    "vendor/shared_memory-0.12.4",
     "vendor/zippy-shm-bridge",
 ]
 resolver = "2"

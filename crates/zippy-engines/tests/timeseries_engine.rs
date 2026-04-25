@@ -3,7 +3,9 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{spawn_engine, Engine, EngineConfig, LateDataPolicy, ZippyError};
+use zippy_core::{
+    spawn_engine, Engine, EngineConfig, LateDataPolicy, SegmentTableView, ZippyError,
+};
 use zippy_engines::TimeSeriesEngine;
 use zippy_operators::{
     AggCountSpec, AggFirstSpec, AggLastSpec, AggMaxSpec, AggMinSpec, AggSumSpec, AggVwapSpec,
@@ -13,11 +15,15 @@ use zippy_operators::{
 const MINUTE_NS: i64 = 60_000_000_000;
 
 fn input_schema() -> Arc<Schema> {
+    input_schema_with_timezone("UTC")
+}
+
+fn input_schema_with_timezone(timezone: &str) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new(
             "dt",
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone.into())),
             false,
         ),
         Field::new("value", DataType::Float64, false),
@@ -25,7 +31,7 @@ fn input_schema() -> Arc<Schema> {
     ]))
 }
 
-fn batch(ids: Vec<&str>, dts: Vec<i64>, values: Vec<f64>, weights: Vec<f64>) -> RecordBatch {
+fn record_batch(ids: Vec<&str>, dts: Vec<i64>, values: Vec<f64>, weights: Vec<f64>) -> RecordBatch {
     RecordBatch::try_new(
         input_schema(),
         vec![
@@ -38,14 +44,20 @@ fn batch(ids: Vec<&str>, dts: Vec<i64>, values: Vec<f64>, weights: Vec<f64>) -> 
     .unwrap()
 }
 
-fn string_values(array: &ArrayRef) -> Vec<String> {
+fn batch(ids: Vec<&str>, dts: Vec<i64>, values: Vec<f64>, weights: Vec<f64>) -> SegmentTableView {
+    SegmentTableView::from_record_batch(record_batch(ids, dts, values, weights))
+}
+
+fn string_values(array: zippy_core::Result<ArrayRef>) -> Vec<String> {
+    let array = array.unwrap();
     let values = array.as_any().downcast_ref::<StringArray>().unwrap();
     (0..values.len())
         .map(|index| values.value(index).to_string())
         .collect()
 }
 
-fn timestamp_values(array: &ArrayRef) -> Vec<i64> {
+fn timestamp_values(array: zippy_core::Result<ArrayRef>) -> Vec<i64> {
+    let array = array.unwrap();
     let values = array
         .as_any()
         .downcast_ref::<TimestampNanosecondArray>()
@@ -53,13 +65,14 @@ fn timestamp_values(array: &ArrayRef) -> Vec<i64> {
     (0..values.len()).map(|index| values.value(index)).collect()
 }
 
-fn float_values(array: &ArrayRef) -> Vec<f64> {
+fn float_values(array: zippy_core::Result<ArrayRef>) -> Vec<f64> {
+    let array = array.unwrap();
     let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
     (0..values.len()).map(|index| values.value(index)).collect()
 }
 
-fn column_names(batch: &RecordBatch) -> Vec<String> {
-    batch
+fn column_names(table: &SegmentTableView) -> Vec<String> {
+    table
         .schema()
         .fields()
         .iter()
@@ -151,12 +164,29 @@ fn timeseries_engine_flushes_open_windows() {
         .map(str::to_string)
         .collect::<Vec<_>>()
     );
-    assert_eq!(string_values(output.column(0)), vec!["a".to_string()]);
-    assert_eq!(timestamp_values(output.column(1)), vec![0]);
-    assert_eq!(timestamp_values(output.column(2)), vec![MINUTE_NS]);
-    assert_eq!(float_values(output.column(3)), vec![10.0]);
-    assert_eq!(float_values(output.column(4)), vec![12.0]);
-    assert_eq!(float_values(output.column(5)), vec![22.0]);
+    assert_eq!(string_values(output.column_at(0)), vec!["a".to_string()]);
+    assert_eq!(timestamp_values(output.column_at(1)), vec![0]);
+    assert_eq!(timestamp_values(output.column_at(2)), vec![MINUTE_NS]);
+    assert_eq!(float_values(output.column_at(3)), vec![10.0]);
+    assert_eq!(float_values(output.column_at(4)), vec![12.0]);
+    assert_eq!(float_values(output.column_at(5)), vec![22.0]);
+}
+
+#[test]
+fn timeseries_engine_accepts_shanghai_timestamp_input_schema() {
+    let engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema_with_timezone("Asia/Shanghai"),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        specs(),
+        vec![],
+        vec![],
+    );
+
+    assert!(engine.is_ok());
 }
 
 #[test]
@@ -187,21 +217,24 @@ fn timeseries_engine_emits_completed_window_on_window_transition() {
 
     let completed = &outputs[0];
 
-    assert_eq!(string_values(completed.column(0)), vec!["a".to_string()]);
-    assert_eq!(timestamp_values(completed.column(1)), vec![0]);
-    assert_eq!(timestamp_values(completed.column(2)), vec![MINUTE_NS]);
-    assert_eq!(float_values(completed.column(3)), vec![10.0]);
-    assert_eq!(float_values(completed.column(4)), vec![10.0]);
-    assert_eq!(float_values(completed.column(5)), vec![10.0]);
+    assert_eq!(string_values(completed.column_at(0)), vec!["a".to_string()]);
+    assert_eq!(timestamp_values(completed.column_at(1)), vec![0]);
+    assert_eq!(timestamp_values(completed.column_at(2)), vec![MINUTE_NS]);
+    assert_eq!(float_values(completed.column_at(3)), vec![10.0]);
+    assert_eq!(float_values(completed.column_at(4)), vec![10.0]);
+    assert_eq!(float_values(completed.column_at(5)), vec![10.0]);
 
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![MINUTE_NS]);
-    assert_eq!(timestamp_values(flushed[0].column(2)), vec![2 * MINUTE_NS]);
-    assert_eq!(float_values(flushed[0].column(3)), vec![12.0]);
-    assert_eq!(float_values(flushed[0].column(4)), vec![12.0]);
-    assert_eq!(float_values(flushed[0].column(5)), vec![12.0]);
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![MINUTE_NS]);
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(2)),
+        vec![2 * MINUTE_NS]
+    );
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![12.0]);
+    assert_eq!(float_values(flushed[0].column_at(4)), vec![12.0]);
+    assert_eq!(float_values(flushed[0].column_at(5)), vec![12.0]);
 }
 
 #[test]
@@ -248,11 +281,14 @@ fn timeseries_engine_rejects_late_data_for_same_id() {
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![MINUTE_NS]);
-    assert_eq!(timestamp_values(flushed[0].column(2)), vec![2 * MINUTE_NS]);
-    assert_eq!(float_values(flushed[0].column(3)), vec![12.0]);
-    assert_eq!(float_values(flushed[0].column(4)), vec![12.0]);
-    assert_eq!(float_values(flushed[0].column(5)), vec![12.0]);
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![MINUTE_NS]);
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(2)),
+        vec![2 * MINUTE_NS]
+    );
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![12.0]);
+    assert_eq!(float_values(flushed[0].column_at(4)), vec![12.0]);
+    assert_eq!(float_values(flushed[0].column_at(5)), vec![12.0]);
 }
 
 #[test]
@@ -285,8 +321,11 @@ fn timeseries_engine_id_filter_keeps_only_whitelisted_rows_and_counts_filtered_r
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(string_values(flushed[0].column(0)), vec!["A".to_string()]);
-    assert_eq!(float_values(flushed[0].column(3)), vec![10.0]);
+    assert_eq!(
+        string_values(flushed[0].column_at(0)),
+        vec!["A".to_string()]
+    );
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![10.0]);
     assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
 }
 
@@ -421,16 +460,16 @@ fn timeseries_engine_rejects_late_rows_and_supports_full_v1_aggregations() {
         .map(str::to_string)
         .collect::<Vec<_>>()
     );
-    assert_eq!(string_values(completed.column(0)), vec!["a".to_string()]);
-    assert_eq!(timestamp_values(completed.column(1)), vec![0]);
-    assert_eq!(timestamp_values(completed.column(2)), vec![MINUTE_NS]);
-    assert_eq!(float_values(completed.column(3)), vec![10.0]);
-    assert_eq!(float_values(completed.column(4)), vec![14.0]);
-    assert_eq!(float_values(completed.column(5)), vec![24.0]);
-    assert_eq!(float_values(completed.column(6)), vec![14.0]);
-    assert_eq!(float_values(completed.column(7)), vec![10.0]);
-    assert_eq!(float_values(completed.column(8)), vec![2.0]);
-    assert_eq!(float_values(completed.column(9)), vec![34.0 / 3.0]);
+    assert_eq!(string_values(completed.column_at(0)), vec!["a".to_string()]);
+    assert_eq!(timestamp_values(completed.column_at(1)), vec![0]);
+    assert_eq!(timestamp_values(completed.column_at(2)), vec![MINUTE_NS]);
+    assert_eq!(float_values(completed.column_at(3)), vec![10.0]);
+    assert_eq!(float_values(completed.column_at(4)), vec![14.0]);
+    assert_eq!(float_values(completed.column_at(5)), vec![24.0]);
+    assert_eq!(float_values(completed.column_at(6)), vec![14.0]);
+    assert_eq!(float_values(completed.column_at(7)), vec![10.0]);
+    assert_eq!(float_values(completed.column_at(8)), vec![2.0]);
+    assert_eq!(float_values(completed.column_at(9)), vec![34.0 / 3.0]);
 
     let error = engine
         .on_data(batch(
@@ -452,15 +491,18 @@ fn timeseries_engine_rejects_late_rows_and_supports_full_v1_aggregations() {
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![MINUTE_NS]);
-    assert_eq!(timestamp_values(flushed[0].column(2)), vec![2 * MINUTE_NS]);
-    assert_eq!(float_values(flushed[0].column(3)), vec![20.0]);
-    assert_eq!(float_values(flushed[0].column(4)), vec![20.0]);
-    assert_eq!(float_values(flushed[0].column(5)), vec![20.0]);
-    assert_eq!(float_values(flushed[0].column(6)), vec![20.0]);
-    assert_eq!(float_values(flushed[0].column(7)), vec![20.0]);
-    assert_eq!(float_values(flushed[0].column(8)), vec![1.0]);
-    assert_eq!(float_values(flushed[0].column(9)), vec![20.0]);
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![MINUTE_NS]);
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(2)),
+        vec![2 * MINUTE_NS]
+    );
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![20.0]);
+    assert_eq!(float_values(flushed[0].column_at(4)), vec![20.0]);
+    assert_eq!(float_values(flushed[0].column_at(5)), vec![20.0]);
+    assert_eq!(float_values(flushed[0].column_at(6)), vec![20.0]);
+    assert_eq!(float_values(flushed[0].column_at(7)), vec![20.0]);
+    assert_eq!(float_values(flushed[0].column_at(8)), vec![1.0]);
+    assert_eq!(float_values(flushed[0].column_at(9)), vec![20.0]);
 }
 
 #[test]
@@ -532,21 +574,33 @@ fn timeseries_engine_drop_with_metric_skips_late_rows_and_keeps_valid_rows() {
         .unwrap();
 
     assert_eq!(outputs.len(), 1);
-    assert_eq!(string_values(outputs[0].column(0)), vec!["a".to_string()]);
-    assert_eq!(timestamp_values(outputs[0].column(1)), vec![MINUTE_NS]);
-    assert_eq!(timestamp_values(outputs[0].column(2)), vec![2 * MINUTE_NS]);
-    assert_eq!(float_values(outputs[0].column(3)), vec![20.0]);
-    assert_eq!(float_values(outputs[0].column(4)), vec![22.0]);
-    assert_eq!(float_values(outputs[0].column(5)), vec![42.0]);
+    assert_eq!(
+        string_values(outputs[0].column_at(0)),
+        vec!["a".to_string()]
+    );
+    assert_eq!(timestamp_values(outputs[0].column_at(1)), vec![MINUTE_NS]);
+    assert_eq!(
+        timestamp_values(outputs[0].column_at(2)),
+        vec![2 * MINUTE_NS]
+    );
+    assert_eq!(float_values(outputs[0].column_at(3)), vec![20.0]);
+    assert_eq!(float_values(outputs[0].column_at(4)), vec![22.0]);
+    assert_eq!(float_values(outputs[0].column_at(5)), vec![42.0]);
 
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(timestamp_values(flushed[0].column(1)), vec![2 * MINUTE_NS]);
-    assert_eq!(timestamp_values(flushed[0].column(2)), vec![3 * MINUTE_NS]);
-    assert_eq!(float_values(flushed[0].column(3)), vec![30.0]);
-    assert_eq!(float_values(flushed[0].column(4)), vec![30.0]);
-    assert_eq!(float_values(flushed[0].column(5)), vec![30.0]);
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(1)),
+        vec![2 * MINUTE_NS]
+    );
+    assert_eq!(
+        timestamp_values(flushed[0].column_at(2)),
+        vec![3 * MINUTE_NS]
+    );
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![30.0]);
+    assert_eq!(float_values(flushed[0].column_at(4)), vec![30.0]);
+    assert_eq!(float_values(flushed[0].column_at(5)), vec![30.0]);
 }
 
 #[test]
@@ -570,12 +624,13 @@ fn timeseries_runtime_records_late_rows_metric_for_drop_with_metric() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: LateDataPolicy::DropWithMetric,
+            xfast: false,
         },
     )
     .unwrap();
 
     handle
-        .write(batch(
+        .write(record_batch(
             vec!["a", "a", "a"],
             vec![1_000_000_000, MINUTE_NS + 1_000_000_000, 30_000_000_000],
             vec![10.0, 12.0, 11.0],
@@ -610,12 +665,13 @@ fn timeseries_runtime_records_filtered_rows_metric() {
             buffer_capacity: 16,
             overflow_policy: Default::default(),
             late_data_policy: LateDataPolicy::Reject,
+            xfast: false,
         },
     )
     .unwrap();
 
     handle
-        .write(batch(
+        .write(record_batch(
             vec!["a", "b"],
             vec![1_000_000_000, 2_000_000_000],
             vec![10.0, 99.0],
@@ -664,8 +720,8 @@ fn timeseries_engine_pre_factors_can_generate_columns_for_agg_sum_inputs() {
             .map(str::to_string)
             .collect::<Vec<_>>()
     );
-    assert_eq!(float_values(outputs[0].column(3)), vec![20.0]);
-    assert_eq!(float_values(outputs[0].column(4)), vec![2.0]);
+    assert_eq!(float_values(outputs[0].column_at(3)), vec![20.0]);
+    assert_eq!(float_values(outputs[0].column_at(4)), vec![2.0]);
 }
 
 #[test]
@@ -710,9 +766,9 @@ fn timeseries_engine_post_factors_can_extend_aggregate_outputs() {
         .map(str::to_string)
         .collect::<Vec<_>>()
     );
-    assert_eq!(float_values(outputs[0].column(3)), vec![10.0]);
-    assert_eq!(float_values(outputs[0].column(4)), vec![10.0]);
-    assert_eq!(float_values(outputs[0].column(5)), vec![0.0]);
+    assert_eq!(float_values(outputs[0].column_at(3)), vec![10.0]);
+    assert_eq!(float_values(outputs[0].column_at(4)), vec![10.0]);
+    assert_eq!(float_values(outputs[0].column_at(5)), vec![0.0]);
 }
 
 #[test]
@@ -755,11 +811,8 @@ fn timeseries_engine_pre_factors_reject_ts_expr_nodes() {
 
     match result {
         Err(ZippyError::InvalidConfig { reason }) => {
-            assert!(
-                reason.contains(
-                    "stateful TS_* functions are only supported inside ReactiveStateEngine"
-                )
-            );
+            assert!(reason
+                .contains("stateful TS_* functions are only supported inside ReactiveStateEngine"));
         }
         Ok(_) => panic!("expected pre factor with TS_* expression to be rejected"),
         Err(other) => panic!("unexpected error: {other:?}"),
@@ -782,11 +835,8 @@ fn timeseries_engine_post_factors_reject_ts_expr_nodes() {
 
     match result {
         Err(ZippyError::InvalidConfig { reason }) => {
-            assert!(
-                reason.contains(
-                    "stateful TS_* functions are only supported inside ReactiveStateEngine"
-                )
-            );
+            assert!(reason
+                .contains("stateful TS_* functions are only supported inside ReactiveStateEngine"));
         }
         Ok(_) => panic!("expected post factor with TS_* expression to be rejected"),
         Err(other) => panic!("unexpected error: {other:?}"),
@@ -839,9 +889,9 @@ fn timeseries_engine_flush_runs_post_factors() {
         .map(str::to_string)
         .collect::<Vec<_>>()
     );
-    assert_eq!(float_values(flushed[0].column(3)), vec![10.0]);
-    assert_eq!(float_values(flushed[0].column(4)), vec![12.0]);
-    assert!((float_values(flushed[0].column(5))[0] - 0.2).abs() < 1e-12);
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![10.0]);
+    assert_eq!(float_values(flushed[0].column_at(4)), vec![12.0]);
+    assert!((float_values(flushed[0].column_at(5))[0] - 0.2).abs() < 1e-12);
 }
 
 #[test]
@@ -915,6 +965,6 @@ fn timeseries_engine_drop_with_metric_filters_late_rows_before_pre_factors() {
     let flushed = engine.on_flush().unwrap();
 
     assert_eq!(flushed.len(), 1);
-    assert_eq!(float_values(flushed[0].column(3)), vec![10.0_f64.ln()]);
+    assert_eq!(float_values(flushed[0].column_at(3)), vec![10.0_f64.ln()]);
     assert_eq!(engine.drain_metrics().late_rows_total, 1);
 }

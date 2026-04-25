@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use zippy_core::{Engine, EngineStatus, LateDataPolicy, OverflowPolicy, Result};
+use zippy_core::{Engine, EngineStatus, LateDataPolicy, OverflowPolicy, Result, SegmentTableView};
 
 struct NoopEngine {
     schema: Arc<Schema>,
@@ -21,7 +20,7 @@ impl Engine for NoopEngine {
         self.schema.clone()
     }
 
-    fn on_data(&mut self, _batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+    fn on_data(&mut self, _batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         Ok(vec![])
     }
 }
