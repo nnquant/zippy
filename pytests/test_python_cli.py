@@ -27,6 +27,7 @@ def test_master_run_help() -> None:
     assert result.exit_code == 0
     assert "Run the local zippy-master daemon." in result.output
     assert DEFAULT_CONTROL_ENDPOINT in result.output
+    assert "URI" in result.output
 
 
 def test_cli_root_help() -> None:
@@ -52,7 +53,7 @@ def test_master_run_returns_click_error_when_server_start_fails(monkeypatch: pyt
     monkeypatch.setattr(zippy, "MasterServer", UnexpectedMasterServer)
 
     runner = CliRunner()
-    result = runner.invoke(main, ["master", "run"])
+    result = runner.invoke(main, ["master", "run", "/tmp/zippy-master-fail.sock"])
 
     assert result.exit_code != 0
     assert "failed to bind control socket" in result.output
@@ -97,11 +98,30 @@ def test_master_run_uses_expanded_default_control_endpoint(monkeypatch: pytest.M
     runner = CliRunner()
     result = runner.invoke(main, ["master", "run"])
 
-    expected = str(fake_home / ".zippy" / "master.sock")
+    expected = str(fake_home / ".zippy" / "control_endpoints" / "default" / "master.sock")
     assert result.exit_code == 0
     assert events == [("run_master_daemon", expected)]
     assert result.output == ""
     assert "keyboard interrupt" not in result.output.lower()
+
+
+def test_master_run_accepts_named_logical_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, str]] = []
+
+    def recording_run_master_daemon(control_endpoint: str) -> None:
+        events.append(("run_master_daemon", control_endpoint))
+
+    fake_home = Path("/tmp/zippy-cli-home")
+    monkeypatch.setattr(zippy, "run_master_daemon", recording_run_master_daemon, raising=False)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["master", "run", "sim"])
+
+    expected = str(fake_home / ".zippy" / "control_endpoints" / "sim" / "master.sock")
+    assert result.exit_code == 0
+    assert events == [("run_master_daemon", expected)]
+    assert result.output == ""
 
 
 def test_master_run_accepts_explicit_control_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,6 +146,24 @@ def test_master_run_accepts_explicit_control_endpoint(monkeypatch: pytest.Monkey
     assert events == [("run_master_daemon", "/tmp/custom-master.sock")]
     assert result.output == ""
     assert "keyboard interrupt" not in result.output.lower()
+
+
+def test_master_run_forwards_config_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, str]] = []
+
+    def recording_run_master_daemon(control_endpoint: str, *, config: str | None = None) -> None:
+        events.append((control_endpoint, config or ""))
+
+    monkeypatch.setattr(zippy, "run_master_daemon", recording_run_master_daemon, raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["master", "run", "/tmp/custom-master.sock", "--config", "/tmp/zippy-config.toml"],
+    )
+
+    assert result.exit_code == 0
+    assert events == [("/tmp/custom-master.sock", "/tmp/zippy-config.toml")]
 
 
 def test_master_run_exits_cleanly_on_sigint(tmp_path: Path) -> None:
@@ -184,7 +222,7 @@ def test_stream_ls_lists_registered_streams(tmp_path) -> None:
     )
 
     runner = CliRunner()
-    result = runner.invoke(main, ["stream", "ls", "--control-endpoint", control_endpoint])
+    result = runner.invoke(main, ["stream", "ls", "--uri", control_endpoint])
 
     assert result.exit_code == 0
     assert "openctp_ticks" in result.output
@@ -212,7 +250,7 @@ def test_stream_show_returns_single_stream(tmp_path) -> None:
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["stream", "show", "openctp_ticks", "--control-endpoint", control_endpoint],
+        ["stream", "show", "openctp_ticks", "--uri", control_endpoint],
     )
 
     assert result.exit_code == 0

@@ -9,6 +9,18 @@ use zippy_core::{Result, ZippyError};
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotStreamRecord {
     pub stream_name: String,
+    pub schema: serde_json::Value,
+    pub schema_hash: String,
+    pub data_path: String,
+    pub descriptor_generation: u64,
+    #[serde(default)]
+    pub sealed_segments: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub persisted_files: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub persist_events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub segment_reader_leases: Vec<serde_json::Value>,
     pub buffer_size: usize,
     pub frame_size: usize,
     pub status: String,
@@ -17,6 +29,22 @@ pub struct SnapshotStreamRecord {
 #[derive(Debug, Clone, Deserialize)]
 struct SnapshotStreamRecordV1 {
     stream_name: String,
+    #[serde(default = "default_schema")]
+    schema: serde_json::Value,
+    #[serde(default)]
+    schema_hash: String,
+    #[serde(default = "default_data_path")]
+    data_path: String,
+    #[serde(default)]
+    descriptor_generation: u64,
+    #[serde(default)]
+    sealed_segments: Vec<serde_json::Value>,
+    #[serde(default)]
+    persisted_files: Vec<serde_json::Value>,
+    #[serde(default)]
+    persist_events: Vec<serde_json::Value>,
+    #[serde(default)]
+    segment_reader_leases: Vec<serde_json::Value>,
     #[serde(default)]
     buffer_size: Option<usize>,
     #[serde(default)]
@@ -39,11 +67,30 @@ impl<'de> Deserialize<'de> for SnapshotStreamRecord {
         let frame_size = record.frame_size.unwrap_or(buffer_size);
         Ok(Self {
             stream_name: record.stream_name,
+            schema: record.schema,
+            schema_hash: record.schema_hash,
+            data_path: record.data_path,
+            descriptor_generation: record.descriptor_generation,
+            sealed_segments: record.sealed_segments,
+            persisted_files: record.persisted_files,
+            persist_events: record.persist_events,
+            segment_reader_leases: record.segment_reader_leases,
             buffer_size,
             frame_size,
             status: record.status,
         })
     }
+}
+
+fn default_schema() -> serde_json::Value {
+    serde_json::json!({
+        "fields": [],
+        "metadata": {},
+    })
+}
+
+fn default_data_path() -> String {
+    "segment".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

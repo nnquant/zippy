@@ -128,7 +128,8 @@ impl SealedSegmentHandle {
         self.inner.segment_id
     }
 
-    pub(crate) fn row_count(&self) -> usize {
+    /// 返回 sealed segment 的已提交行数。
+    pub fn row_count(&self) -> usize {
         self.inner.row_count
     }
 

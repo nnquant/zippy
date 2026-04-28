@@ -269,13 +269,6 @@ impl RowSpanView {
     fn arrow_schema(&self) -> SchemaRef {
         build_arrow_schema(self.schema())
     }
-
-    fn schema(&self) -> &CompiledSchema {
-        match &self.backing {
-            RowSpanBacking::Sealed(handle) => handle.schema(),
-            RowSpanBacking::Active(attachment) => attachment.descriptor.schema(),
-        }
-    }
 }
 
 impl SealedSegmentHandle {

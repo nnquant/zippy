@@ -16,8 +16,19 @@ pub struct HeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterStreamRequest {
     pub stream_name: String,
+    #[serde(default = "default_stream_schema")]
+    pub schema: serde_json::Value,
+    #[serde(default)]
+    pub schema_hash: String,
     pub buffer_size: usize,
     pub frame_size: usize,
+}
+
+fn default_stream_schema() -> serde_json::Value {
+    serde_json::json!({
+        "fields": [],
+        "metadata": {},
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +93,20 @@ pub struct DetachReaderRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub stream_name: String,
+    pub schema: serde_json::Value,
+    pub schema_hash: String,
+    pub data_path: String,
+    pub descriptor_generation: u64,
+    #[serde(default)]
+    pub active_segment_descriptor: Option<serde_json::Value>,
+    #[serde(default)]
+    pub sealed_segments: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub persisted_files: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub persist_events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub segment_reader_leases: Vec<serde_json::Value>,
     pub buffer_size: usize,
     pub frame_size: usize,
     pub write_seq: u64,
@@ -99,6 +124,15 @@ pub struct GetStreamRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetConfigRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropTableRequest {
+    pub table_name: String,
+    pub drop_persisted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishSegmentDescriptorRequest {
     pub stream_name: String,
     pub process_id: String,
@@ -106,9 +140,46 @@ pub struct PublishSegmentDescriptorRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishPersistedFileRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub persisted_file: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishPersistEventRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub persist_event: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcquireSegmentReaderLeaseRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub source_segment_id: u64,
+    pub source_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseSegmentReaderLeaseRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub lease_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSegmentDescriptorRequest {
     pub stream_name: String,
     pub process_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitSegmentDescriptorRequest {
+    pub stream_name: String,
+    pub process_id: String,
+    pub after_descriptor_generation: u64,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +190,16 @@ pub struct ListStreamsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetStreamResponse {
     pub stream: StreamInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DropTableResult {
+    pub table_name: String,
+    pub dropped: bool,
+    pub sources_removed: usize,
+    pub engines_removed: usize,
+    pub sinks_removed: usize,
+    pub persisted_files_deleted: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,8 +243,15 @@ pub enum ControlRequest {
     CloseReader(DetachReaderRequest),
     ListStreams(ListStreamsRequest),
     GetStream(GetStreamRequest),
+    GetConfig(GetConfigRequest),
+    DropTable(DropTableRequest),
     PublishSegmentDescriptor(PublishSegmentDescriptorRequest),
+    PublishPersistedFile(PublishPersistedFileRequest),
+    PublishPersistEvent(PublishPersistEventRequest),
+    AcquireSegmentReaderLease(AcquireSegmentReaderLeaseRequest),
+    ReleaseSegmentReaderLease(ReleaseSegmentReaderLeaseRequest),
     GetSegmentDescriptor(GetSegmentDescriptorRequest),
+    WaitSegmentDescriptor(WaitSegmentDescriptorRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,11 +294,34 @@ pub enum ControlResponse {
     },
     StreamsListed(ListStreamsResponse),
     StreamFetched(GetStreamResponse),
+    ConfigFetched {
+        config: serde_json::Value,
+    },
+    TableDropped(DropTableResult),
     SegmentDescriptorPublished {
         stream_name: String,
     },
+    PersistedFilePublished {
+        stream_name: String,
+    },
+    PersistEventPublished {
+        stream_name: String,
+    },
+    SegmentReaderLeaseAcquired {
+        stream_name: String,
+        lease_id: String,
+    },
+    SegmentReaderLeaseReleased {
+        stream_name: String,
+        lease_id: String,
+    },
     SegmentDescriptorFetched {
         stream_name: String,
+        descriptor: Option<serde_json::Value>,
+    },
+    SegmentDescriptorChanged {
+        stream_name: String,
+        descriptor_generation: u64,
         descriptor: Option<serde_json::Value>,
     },
     Error {
@@ -303,10 +414,54 @@ impl fmt::Display for ControlResponse {
                 response.stream.reader_count,
                 response.stream.status
             ),
+            Self::ConfigFetched { config } => write!(
+                f,
+                "config fetched table_row_capacity=[{}] table_persist_enabled=[{}]",
+                config
+                    .pointer("/table/row_capacity")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                config
+                    .pointer("/table/persist/enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            ),
+            Self::TableDropped(result) => write!(
+                f,
+                "table dropped table_name=[{}] dropped=[{}] sources_removed=[{}] engines_removed=[{}] sinks_removed=[{}] persisted_files_deleted=[{}]",
+                result.table_name,
+                result.dropped,
+                result.sources_removed,
+                result.engines_removed,
+                result.sinks_removed,
+                result.persisted_files_deleted
+            ),
             Self::SegmentDescriptorPublished { stream_name } => write!(
                 f,
                 "segment descriptor published stream_name=[{}]",
                 stream_name
+            ),
+            Self::PersistedFilePublished { stream_name } => {
+                write!(f, "persisted file published stream_name=[{}]", stream_name)
+            }
+            Self::PersistEventPublished { stream_name } => {
+                write!(f, "persist event published stream_name=[{}]", stream_name)
+            }
+            Self::SegmentReaderLeaseAcquired {
+                stream_name,
+                lease_id,
+            } => write!(
+                f,
+                "segment reader lease acquired stream_name=[{}] lease_id=[{}]",
+                stream_name, lease_id
+            ),
+            Self::SegmentReaderLeaseReleased {
+                stream_name,
+                lease_id,
+            } => write!(
+                f,
+                "segment reader lease released stream_name=[{}] lease_id=[{}]",
+                stream_name, lease_id
             ),
             Self::SegmentDescriptorFetched {
                 stream_name,
@@ -315,6 +470,17 @@ impl fmt::Display for ControlResponse {
                 f,
                 "segment descriptor fetched stream_name=[{}] has_descriptor=[{}]",
                 stream_name,
+                descriptor.is_some()
+            ),
+            Self::SegmentDescriptorChanged {
+                stream_name,
+                descriptor_generation,
+                descriptor,
+            } => write!(
+                f,
+                "segment descriptor changed stream_name=[{}] descriptor_generation=[{}] has_descriptor=[{}]",
+                stream_name,
+                descriptor_generation,
                 descriptor.is_some()
             ),
             Self::Error { reason } => write!(f, "control error reason=[{}]", reason),

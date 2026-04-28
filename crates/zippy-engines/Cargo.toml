@@ -6,8 +6,11 @@ edition.workspace = true
 [dependencies]
 arrow.workspace = true
 md5 = "0.7"
+parquet.workspace = true
+serde_json.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-operators = { path = "../zippy-operators" }
+zippy-segment-store = { path = "../zippy-segment-store" }
 
 [dev-dependencies]
 criterion = "0.5"

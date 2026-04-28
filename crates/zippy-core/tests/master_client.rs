@@ -10,16 +10,45 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_core::{
-    encode_bus_frame, parse_bus_frame, AttachStreamRequest, BusFrameKind, ControlRequest,
-    ControlResponse, DetachReaderRequest, DetachWriterRequest, HeartbeatRequest, MasterClient,
-    ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
-    RegisterSourceRequest, RegisterStreamRequest, SchemaRef, StreamInfo, UpdateRecordStatusRequest,
-    WriterDescriptor, BUS_LAYOUT_VERSION,
+    canonical_schema_hash, encode_bus_frame, parse_bus_frame, schema_metadata, AttachStreamRequest,
+    BusFrameKind, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
+    HeartbeatRequest, MasterClient, ReaderDescriptor, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    SchemaRef, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
 };
 use zippy_shm_bridge::SharedFrameRing;
 
 fn empty_schema() -> SchemaRef {
     std::sync::Arc::new(Schema::empty())
+}
+
+fn empty_schema_metadata() -> serde_json::Value {
+    schema_metadata(&empty_schema())
+}
+
+fn empty_schema_hash() -> String {
+    canonical_schema_hash(&empty_schema())
+}
+
+fn test_stream_info() -> StreamInfo {
+    StreamInfo {
+        stream_name: "ticks".to_string(),
+        schema: empty_schema_metadata(),
+        schema_hash: empty_schema_hash(),
+        data_path: "segment".to_string(),
+        descriptor_generation: 0,
+        active_segment_descriptor: None,
+        sealed_segments: Vec::new(),
+        persisted_files: Vec::new(),
+        persist_events: Vec::new(),
+        segment_reader_leases: Vec::new(),
+        buffer_size: 1024,
+        frame_size: 256,
+        write_seq: 42,
+        writer_process_id: None,
+        reader_count: 0,
+        status: "registered".to_string(),
+    }
 }
 
 fn instrument_schema() -> SchemaRef {
@@ -130,10 +159,14 @@ fn spawn_fake_server(
                 }
                 ControlRequest::RegisterStream(RegisterStreamRequest {
                     stream_name,
+                    schema,
+                    schema_hash,
                     buffer_size,
                     frame_size,
                 }) => {
                     assert_eq!(stream_name, "ticks");
+                    assert_eq!(schema, empty_schema_metadata());
+                    assert_eq!(schema_hash, empty_schema_hash());
                     assert_eq!(buffer_size, 1024);
                     assert_eq!(frame_size, 256);
                     ControlResponse::StreamRegistered { stream_name }
@@ -197,6 +230,44 @@ fn spawn_fake_server(
                         stream_name: request.stream_name,
                     }
                 }
+                ControlRequest::PublishPersistedFile(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    assert_eq!(request.persisted_file["file_path"], "/data/ticks.parquet");
+                    ControlResponse::PersistedFilePublished {
+                        stream_name: request.stream_name,
+                    }
+                }
+                ControlRequest::PublishPersistEvent(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    assert_eq!(
+                        request.persist_event["persist_event_type"],
+                        "persist_failed"
+                    );
+                    ControlResponse::PersistEventPublished {
+                        stream_name: request.stream_name,
+                    }
+                }
+                ControlRequest::AcquireSegmentReaderLease(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    assert_eq!(request.source_segment_id, 1);
+                    assert_eq!(request.source_generation, 0);
+                    ControlResponse::SegmentReaderLeaseAcquired {
+                        stream_name: request.stream_name,
+                        lease_id: "segment-lease-1".to_string(),
+                    }
+                }
+                ControlRequest::ReleaseSegmentReaderLease(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    assert_eq!(request.lease_id, "segment-lease-1");
+                    ControlResponse::SegmentReaderLeaseReleased {
+                        stream_name: request.stream_name,
+                        lease_id: request.lease_id,
+                    }
+                }
                 ControlRequest::GetSegmentDescriptor(request) => {
                     assert_eq!(request.stream_name, "ticks");
                     assert_eq!(request.process_id, "proc_1");
@@ -212,6 +283,25 @@ fn spawn_fake_server(
                             "committed_row_count_offset": 40,
                             "segment_id": 1,
                             "generation": 0,
+                        })),
+                    }
+                }
+                ControlRequest::WaitSegmentDescriptor(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.process_id, "proc_1");
+                    ControlResponse::SegmentDescriptorChanged {
+                        stream_name: request.stream_name,
+                        descriptor_generation: request.after_descriptor_generation + 1,
+                        descriptor: Some(serde_json::json!({
+                            "magic": "zippy.segment.active",
+                            "version": 1,
+                            "schema_id": 7,
+                            "row_capacity": 64,
+                            "shm_os_id": "/tmp/zippy-segment",
+                            "payload_offset": 64,
+                            "committed_row_count_offset": 40,
+                            "segment_id": 2,
+                            "generation": 1,
                         })),
                     }
                 }
@@ -266,28 +356,42 @@ fn spawn_fake_server(
                 },
                 ControlRequest::ListStreams(_) => {
                     ControlResponse::StreamsListed(zippy_core::ListStreamsResponse {
-                        streams: vec![StreamInfo {
-                            stream_name: "ticks".to_string(),
-                            buffer_size: 1024,
-                            frame_size: 256,
-                            write_seq: 42,
-                            writer_process_id: None,
-                            reader_count: 0,
-                            status: "registered".to_string(),
-                        }],
+                        streams: vec![test_stream_info()],
                     })
                 }
                 ControlRequest::GetStream(_) => {
                     ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
-                        stream: StreamInfo {
-                            stream_name: "ticks".to_string(),
-                            buffer_size: 1024,
-                            frame_size: 256,
-                            write_seq: 42,
-                            writer_process_id: None,
-                            reader_count: 0,
-                            status: "registered".to_string(),
+                        stream: test_stream_info(),
+                    })
+                }
+                ControlRequest::GetConfig(_) => ControlResponse::ConfigFetched {
+                    config: serde_json::json!({
+                        "log": {
+                            "level": "warn",
                         },
+                        "table": {
+                            "row_capacity": 2048,
+                            "persist": {
+                                "enabled": true,
+                                "method": "parquet",
+                                "data_dir": "data",
+                                "partition": {
+                                    "dt_column": null,
+                                    "id_column": null,
+                                    "dt_part": null,
+                                },
+                            },
+                        },
+                    }),
+                },
+                ControlRequest::DropTable(request) => {
+                    ControlResponse::TableDropped(zippy_core::DropTableResult {
+                        table_name: request.table_name,
+                        dropped: true,
+                        sources_removed: 0,
+                        engines_removed: 0,
+                        sinks_removed: 0,
+                        persisted_files_deleted: 0,
                     })
                 }
             };
@@ -300,6 +404,26 @@ fn spawn_fake_server(
 
         let _ = fs::remove_file(&socket_path);
     })
+}
+
+#[test]
+fn master_client_gets_config() {
+    let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("get-config");
+    let server = spawn_fake_server(&socket_path, 1, shm_name);
+    wait_for_socket(&socket_path);
+
+    let client = MasterClient::connect(&socket_path).unwrap();
+    let config = client.get_config().unwrap();
+
+    assert_eq!(config.log.level, "warn");
+    assert_eq!(config.table.row_capacity, 2048);
+    assert!(config.table.persist.enabled);
+    assert_eq!(config.table.persist.method, "parquet");
+    assert_eq!(config.table.persist.data_dir, "data");
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
@@ -797,6 +921,8 @@ fn master_client_registers_control_plane_entities_and_updates_status() {
 fn control_request_serialization_uses_buffer_and_frame_sizes() {
     let request = ControlRequest::RegisterStream(RegisterStreamRequest {
         stream_name: "ticks".to_string(),
+        schema: empty_schema_metadata(),
+        schema_hash: empty_schema_hash(),
         buffer_size: 1024,
         frame_size: 256,
     });
@@ -812,7 +938,7 @@ fn control_request_serialization_uses_buffer_and_frame_sizes() {
 fn master_client_publishes_and_fetches_segment_descriptor() {
     let socket_path = unique_socket_path();
     let (shm_dir, shm_name) = unique_shm_name("segment-descriptor");
-    let server = spawn_fake_server(&socket_path, 3, shm_name);
+    let server = spawn_fake_server(&socket_path, 4, shm_name);
     wait_for_socket(&socket_path);
 
     let descriptor = serde_json::json!({
@@ -832,6 +958,14 @@ fn master_client_publishes_and_fetches_segment_descriptor() {
     client.register_process("local_dc").unwrap();
     client
         .publish_segment_descriptor_bytes("ticks", &bytes)
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": "/data/ticks.parquet",
+            }),
+        )
         .unwrap();
     let fetched = client.get_segment_descriptor("ticks").unwrap();
 
@@ -895,15 +1029,7 @@ fn control_response_display_uses_buffer_and_frame_sizes() {
     let stream_output = format!(
         "{}",
         ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
-            stream: StreamInfo {
-                stream_name: "ticks".to_string(),
-                buffer_size: 1024,
-                frame_size: 256,
-                write_seq: 42,
-                writer_process_id: None,
-                reader_count: 0,
-                status: "registered".to_string(),
-            },
+            stream: test_stream_info(),
         })
     );
     assert!(stream_output.contains("buffer_size=[1024]"));
@@ -914,15 +1040,7 @@ fn control_response_display_uses_buffer_and_frame_sizes() {
 
 #[test]
 fn stream_info_serialization_includes_write_seq() {
-    let stream = StreamInfo {
-        stream_name: "ticks".to_string(),
-        buffer_size: 1024,
-        frame_size: 256,
-        write_seq: 42,
-        writer_process_id: None,
-        reader_count: 0,
-        status: "registered".to_string(),
-    };
+    let stream = test_stream_info();
 
     let json = serde_json::to_string(&stream).unwrap();
 

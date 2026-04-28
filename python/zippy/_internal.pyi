@@ -4,7 +4,12 @@ import pyarrow as pa
 __version__: str
 
 
-def run_master_daemon(control_endpoint: str) -> None: ...
+def run_master_daemon(
+    uri: str | None = None,
+    *,
+    control_endpoint: str | None = None,
+    config: str | None = None,
+) -> None: ...
 
 
 def setup_log(
@@ -267,7 +272,12 @@ class ZmqSource:
 
 
 class MasterServer:
-    def __init__(self, control_endpoint: str) -> None: ...
+    def __init__(
+        self,
+        uri: str | None = None,
+        *,
+        control_endpoint: str | None = None,
+    ) -> None: ...
 
     def start(self, startup_timeout_sec: float = 10.0, /) -> None: ...
 
@@ -293,7 +303,12 @@ class BusReader:
 
 
 class MasterClient:
-    def __init__(self, control_endpoint: str) -> None: ...
+    def __init__(
+        self,
+        uri: str | None = None,
+        *,
+        control_endpoint: str | None = None,
+    ) -> None: ...
 
     def register_process(self, app: str) -> str: ...
 
@@ -351,6 +366,31 @@ class MasterClient:
         descriptor: object,
     ) -> None: ...
 
+    def publish_persisted_file(
+        self,
+        stream_name: str,
+        persisted_file: object,
+    ) -> None: ...
+
+    def publish_persist_event(
+        self,
+        stream_name: str,
+        persist_event: object,
+    ) -> None: ...
+
+    def acquire_segment_reader_lease(
+        self,
+        stream_name: str,
+        source_segment_id: int,
+        source_generation: int,
+    ) -> str: ...
+
+    def release_segment_reader_lease(
+        self,
+        stream_name: str,
+        lease_id: str,
+    ) -> None: ...
+
     def get_segment_descriptor(self, stream_name: str) -> dict[str, object] | None: ...
 
     def write_to(self, stream_name: str) -> BusWriter: ...
@@ -365,6 +405,47 @@ class MasterClient:
     def list_streams(self) -> list[dict[str, object]]: ...
 
     def get_stream(self, stream_name: str) -> dict[str, object]: ...
+
+    def get_config(self) -> dict[str, object]: ...
+
+    def drop_table(
+        self,
+        table_name: str,
+        drop_persisted: bool = True,
+    ) -> dict[str, object]: ...
+
+
+class Query:
+    def __init__(self, source: str, master: MasterClient) -> None: ...
+
+    def tail(self, n: int) -> pa.Table: ...
+
+    def schema(self) -> pa.Schema: ...
+
+    def stream_info(self) -> dict[str, object]: ...
+
+    def snapshot(self) -> dict[str, object]: ...
+
+    def scan_live(self) -> pa.RecordBatchReader: ...
+
+
+class StreamSubscriber:
+    def __init__(
+        self,
+        source: str,
+        master: MasterClient,
+        callback: object,
+        poll_interval_ms: int = 1,
+        xfast: bool = False,
+        row_factory: object | None = None,
+        instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+    ) -> None: ...
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def join(self) -> None: ...
 
 
 class BusStreamTarget:
@@ -442,7 +523,56 @@ class ReactiveStateEngine:
         target: PublisherTarget,
         *,
         id_filter: list[str] | None = None,
-        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | BusStreamSource | None = None,
+        source: ReactiveStateEngine
+        | ReactiveLatestEngine
+        | StreamTableEngine
+        | TimeSeriesEngine
+        | ZmqSource
+        | BusStreamSource
+        | None = None,
+        parquet_sink: ParquetSink | None = None,
+        buffer_capacity: int = 1024,
+        overflow_policy: _OverflowPolicyValue | None = None,
+        archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
+        descriptor_publisher: object | None = None,
+    ) -> None: ...
+
+    def start(self) -> None: ...
+
+    def write(self, value: WriteValue) -> None: ...
+
+    def output_schema(self) -> pa.Schema: ...
+
+    def status(self) -> str: ...
+
+    def metrics(self) -> dict[str, int]: ...
+
+    def config(self) -> dict[str, object]: ...
+
+    def flush(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class ReactiveLatestEngine:
+    def __init__(
+        self,
+        name: str,
+        input_schema: pa.Schema | None = None,
+        by: str | list[str] | None = None,
+        target: PublisherTarget | None = None,
+        *,
+        source: str
+        | ReactiveStateEngine
+        | ReactiveLatestEngine
+        | StreamTableEngine
+        | TimeSeriesEngine
+        | ZmqSource
+        | BusStreamSource
+        | SegmentStreamSource
+        | None = None,
+        master: MasterClient | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -474,12 +604,27 @@ class StreamTableEngine:
         input_schema: pa.Schema,
         target: PublisherTarget,
         *,
-        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | BusStreamSource | None = None,
+        source: ReactiveStateEngine
+        | ReactiveLatestEngine
+        | StreamTableEngine
+        | TimeSeriesEngine
+        | ZmqSource
+        | BusStreamSource
+        | None = None,
         sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
         archive_buffer_capacity: int = 1024,
         xfast: bool = False,
+        descriptor_publisher: object | None = None,
+        row_capacity: int | None = None,
+        retention_segments: int | None = None,
+        retention_guard: object | None = None,
+        dt_column: str | None = None,
+        id_column: str | None = None,
+        dt_part: str | None = None,
+        persist_path: str | None = None,
+        persist_publisher: object | None = None,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -493,6 +638,8 @@ class StreamTableEngine:
     def metrics(self) -> dict[str, int]: ...
 
     def config(self) -> dict[str, object]: ...
+
+    def active_descriptor(self) -> dict[str, object]: ...
 
     def flush(self) -> None: ...
 
@@ -516,7 +663,13 @@ class TimeSeriesEngine:
         pre_factors: list[ExpressionFactor] | None = None,
         post_factors: list[ExpressionFactor] | None = None,
         id_filter: list[str] | None = None,
-        source: ReactiveStateEngine | StreamTableEngine | TimeSeriesEngine | ZmqSource | BusStreamSource | None = None,
+        source: ReactiveStateEngine
+        | ReactiveLatestEngine
+        | StreamTableEngine
+        | TimeSeriesEngine
+        | ZmqSource
+        | BusStreamSource
+        | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,

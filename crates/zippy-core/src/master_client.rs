@@ -17,13 +17,15 @@ use crate::bus_frame::{
     BusFrameTiming,
 };
 use crate::bus_protocol::{
-    AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
+    AcquireSegmentReaderLeaseRequest, AttachStreamRequest, ControlRequest, ControlResponse,
+    DetachReaderRequest, DetachWriterRequest, DropTableRequest, DropTableResult, GetConfigRequest,
     GetSegmentDescriptorRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
-    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
+    PublishPersistEventRequest, PublishPersistedFileRequest, PublishSegmentDescriptorRequest,
+    ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
+    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest, StreamInfo,
+    UpdateRecordStatusRequest, WaitSegmentDescriptorRequest, WriterDescriptor,
 };
-use crate::{Result, SchemaRef, ZippyError};
+use crate::{canonical_schema_hash, schema_metadata, Result, SchemaRef, ZippyConfig, ZippyError};
 
 /// Synchronous control-plane client for zippy-master.
 #[derive(Debug, Clone)]
@@ -55,6 +57,12 @@ pub struct TimedReadBatch {
     pub bus_timing: Option<BusFrameTiming>,
     pub frame_ready_ns: i64,
     pub read_return_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentDescriptorUpdate {
+    pub descriptor_generation: u64,
+    pub descriptor: serde_json::Value,
 }
 
 impl MasterClient {
@@ -98,13 +106,17 @@ impl MasterClient {
     pub fn register_stream(
         &mut self,
         stream_name: &str,
-        _schema: SchemaRef,
+        schema: SchemaRef,
         buffer_size: usize,
         frame_size: usize,
     ) -> Result<()> {
+        let schema_hash = canonical_schema_hash(&schema);
+        let schema = schema_metadata(&schema);
         let response =
             self.send_request(ControlRequest::RegisterStream(RegisterStreamRequest {
                 stream_name: stream_name.to_string(),
+                schema,
+                schema_hash,
                 buffer_size,
                 frame_size,
             }))?;
@@ -344,6 +356,31 @@ impl MasterClient {
         }
     }
 
+    pub fn get_config(&self) -> Result<ZippyConfig> {
+        let response = self.send_request(ControlRequest::GetConfig(GetConfigRequest {}))?;
+
+        match response {
+            ControlResponse::ConfigFetched { config } => {
+                serde_json::from_value(config).map_err(|error| ZippyError::InvalidConfig {
+                    reason: format!("failed to decode zippy config error=[{}]", error),
+                })
+            }
+            other => Err(unexpected_response("ConfigFetched", other)),
+        }
+    }
+
+    pub fn drop_table(&self, table_name: &str, drop_persisted: bool) -> Result<DropTableResult> {
+        let response = self.send_request(ControlRequest::DropTable(DropTableRequest {
+            table_name: table_name.to_string(),
+            drop_persisted,
+        }))?;
+
+        match response {
+            ControlResponse::TableDropped(result) => Ok(result),
+            other => Err(unexpected_response("TableDropped", other)),
+        }
+    }
+
     pub fn publish_segment_descriptor(
         &self,
         stream_name: &str,
@@ -374,6 +411,84 @@ impl MasterClient {
         self.publish_segment_descriptor(stream_name, descriptor)
     }
 
+    pub fn publish_persisted_file(
+        &self,
+        stream_name: &str,
+        persisted_file: serde_json::Value,
+    ) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::PublishPersistedFile(
+            PublishPersistedFileRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+                persisted_file,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::PersistedFilePublished { .. } => Ok(()),
+            other => Err(unexpected_response("PersistedFilePublished", other)),
+        }
+    }
+
+    pub fn publish_persist_event(
+        &self,
+        stream_name: &str,
+        persist_event: serde_json::Value,
+    ) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::PublishPersistEvent(
+            PublishPersistEventRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+                persist_event,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::PersistEventPublished { .. } => Ok(()),
+            other => Err(unexpected_response("PersistEventPublished", other)),
+        }
+    }
+
+    pub fn acquire_segment_reader_lease(
+        &self,
+        stream_name: &str,
+        source_segment_id: u64,
+        source_generation: u64,
+    ) -> Result<String> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::AcquireSegmentReaderLease(
+            AcquireSegmentReaderLeaseRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+                source_segment_id,
+                source_generation,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::SegmentReaderLeaseAcquired { lease_id, .. } => Ok(lease_id),
+            other => Err(unexpected_response("SegmentReaderLeaseAcquired", other)),
+        }
+    }
+
+    pub fn release_segment_reader_lease(&self, stream_name: &str, lease_id: &str) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::ReleaseSegmentReaderLease(
+            ReleaseSegmentReaderLeaseRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+                lease_id: lease_id.to_string(),
+            },
+        ))?;
+
+        match response {
+            ControlResponse::SegmentReaderLeaseReleased { .. } => Ok(()),
+            other => Err(unexpected_response("SegmentReaderLeaseReleased", other)),
+        }
+    }
+
     pub fn get_segment_descriptor(&self, stream_name: &str) -> Result<Option<serde_json::Value>> {
         let process_id = self.require_process_id()?;
         let response = self.send_request(ControlRequest::GetSegmentDescriptor(
@@ -386,6 +501,39 @@ impl MasterClient {
         match response {
             ControlResponse::SegmentDescriptorFetched { descriptor, .. } => Ok(descriptor),
             other => Err(unexpected_response("SegmentDescriptorFetched", other)),
+        }
+    }
+
+    pub fn wait_segment_descriptor(
+        &self,
+        stream_name: &str,
+        after_descriptor_generation: u64,
+        timeout: Duration,
+    ) -> Result<Option<SegmentDescriptorUpdate>> {
+        let process_id = self.require_process_id()?;
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let response = self.send_request(ControlRequest::WaitSegmentDescriptor(
+            WaitSegmentDescriptorRequest {
+                stream_name: stream_name.to_string(),
+                process_id,
+                after_descriptor_generation,
+                timeout_ms,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::SegmentDescriptorChanged {
+                descriptor_generation,
+                descriptor: Some(descriptor),
+                ..
+            } => Ok(Some(SegmentDescriptorUpdate {
+                descriptor_generation,
+                descriptor,
+            })),
+            ControlResponse::SegmentDescriptorChanged {
+                descriptor: None, ..
+            } => Ok(None),
+            other => Err(unexpected_response("SegmentDescriptorChanged", other)),
         }
     }
 

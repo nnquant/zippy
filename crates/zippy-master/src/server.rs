@@ -5,12 +5,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use zippy_core::bus_protocol::{GetStreamResponse, ListStreamsResponse, StreamInfo};
-use zippy_core::{ControlRequest, ControlResponse, Result, ZippyError};
+use zippy_core::bus_protocol::{
+    DropTableResult, GetStreamResponse, ListStreamsResponse, StreamInfo,
+};
+use zippy_core::{ControlRequest, ControlResponse, Result, ZippyConfig, ZippyError};
 
 use crate::bus::{Bus, BusError};
 use crate::registry::Registry;
@@ -21,10 +23,12 @@ use crate::snapshot::{
 
 const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(2);
+const MASTER_ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Debug)]
 pub struct MasterServer {
     registry: Arc<Mutex<Registry>>,
+    descriptor_changed: Arc<Condvar>,
     #[allow(dead_code)]
     bus: Arc<Mutex<Bus>>,
     running: Arc<AtomicBool>,
@@ -32,6 +36,7 @@ pub struct MasterServer {
     snapshot_path: Option<PathBuf>,
     lease_timeout: Duration,
     lease_reaper_interval: Duration,
+    config: ZippyConfig,
 }
 
 impl Default for MasterServer {
@@ -46,15 +51,49 @@ impl MasterServer {
         lease_timeout: Duration,
         lease_reaper_interval: Duration,
     ) -> Self {
+        Self::with_runtime_config_and_config(
+            snapshot_path,
+            lease_timeout,
+            lease_reaper_interval,
+            ZippyConfig::default(),
+        )
+    }
+
+    pub fn with_config(config: ZippyConfig) -> Self {
+        Self::with_runtime_config_and_config(
+            None,
+            DEFAULT_LEASE_TIMEOUT,
+            DEFAULT_LEASE_REAPER_INTERVAL,
+            config,
+        )
+    }
+
+    pub fn with_runtime_config_and_config(
+        snapshot_path: Option<PathBuf>,
+        lease_timeout: Duration,
+        lease_reaper_interval: Duration,
+        config: ZippyConfig,
+    ) -> Self {
         Self {
             registry: Arc::new(Mutex::new(Registry::default())),
+            descriptor_changed: Arc::new(Condvar::new()),
             bus: Arc::new(Mutex::new(Bus::default())),
             running: Arc::new(AtomicBool::new(true)),
             snapshot_lock: Arc::new(Mutex::new(())),
             snapshot_path,
             lease_timeout,
             lease_reaper_interval,
+            config,
         }
+    }
+
+    pub fn runtime_config(&self) -> &ZippyConfig {
+        &self.config
+    }
+
+    pub fn with_runtime_config_values(mut self, config: ZippyConfig) -> Self {
+        self.config = config;
+        self
     }
 
     pub fn is_running(&self) -> bool {
@@ -85,10 +124,26 @@ impl MasterServer {
                 )
                 .map_err(bus_error)?;
                 registry
-                    .ensure_stream(&stream.stream_name, stream.buffer_size, stream.frame_size)
+                    .ensure_stream(
+                        &stream.stream_name,
+                        stream.schema,
+                        &stream.schema_hash,
+                        stream.buffer_size,
+                        stream.frame_size,
+                    )
                     .map_err(registry_error)?;
                 registry
                     .set_stream_status(&stream.stream_name, "restored")
+                    .map_err(registry_error)?;
+                registry
+                    .set_stream_segment_metadata(
+                        &stream.stream_name,
+                        stream.descriptor_generation,
+                        stream.sealed_segments,
+                        stream.persisted_files,
+                        stream.persist_events,
+                        stream.segment_reader_leases,
+                    )
                     .map_err(registry_error)?;
             }
 
@@ -174,6 +229,13 @@ impl MasterServer {
         }
 
         if let Err(error) = remove_stale_socket(socket_path) {
+            let error = ZippyError::Io {
+                reason: format!(
+                    "remove stale control socket failed path=[{}] error=[{}]",
+                    socket_path.display(),
+                    error
+                ),
+            };
             if let Some(ready_tx) = ready_tx {
                 let _ = ready_tx.send(Err(error.to_string()));
             }
@@ -183,6 +245,13 @@ impl MasterServer {
         let listener = match UnixListener::bind(socket_path).map_err(io_error) {
             Ok(listener) => listener,
             Err(error) => {
+                let error = ZippyError::Io {
+                    reason: format!(
+                        "bind control socket failed path=[{}] error=[{}]",
+                        socket_path.display(),
+                        error
+                    ),
+                };
                 if let Some(ready_tx) = ready_tx {
                     let _ = ready_tx.send(Err(error.to_string()));
                 }
@@ -190,6 +259,13 @@ impl MasterServer {
             }
         };
         if let Err(error) = listener.set_nonblocking(true).map_err(io_error) {
+            let error = ZippyError::Io {
+                reason: format!(
+                    "set control socket nonblocking failed path=[{}] error=[{}]",
+                    socket_path.display(),
+                    error
+                ),
+            };
             if let Some(ready_tx) = ready_tx {
                 let _ = ready_tx.send(Err(error.to_string()));
             }
@@ -198,6 +274,13 @@ impl MasterServer {
         let socket_ownership = match SocketOwnership::create(socket_path) {
             Ok(socket_ownership) => socket_ownership,
             Err(error) => {
+                let error = ZippyError::Io {
+                    reason: format!(
+                        "create control socket owner file failed path=[{}] error=[{}]",
+                        socket_path.display(),
+                        error
+                    ),
+                };
                 if let Some(ready_tx) = ready_tx {
                     let _ = ready_tx.send(Err(error.to_string()));
                 }
@@ -240,7 +323,7 @@ impl MasterServer {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(MASTER_ACCEPT_IDLE_SLEEP);
                 }
                 Err(error) => {
                     let error = io_error(error);
@@ -393,6 +476,7 @@ impl MasterServer {
                 if let Err(error) = validate_register_stream_request(
                     &registry,
                     &request.stream_name,
+                    &request.schema_hash,
                     request.buffer_size,
                     request.frame_size,
                 ) {
@@ -420,6 +504,8 @@ impl MasterServer {
                 ) {
                     Ok(bus_created) => match registry.ensure_stream(
                         &request.stream_name,
+                        request.schema.clone(),
+                        &request.schema_hash,
                         request.buffer_size,
                         request.frame_size,
                     ) {
@@ -735,13 +821,17 @@ impl MasterServer {
                 }
             }
             ControlRequest::PublishSegmentDescriptor(request) => {
-                let mut registry = self.registry.lock().unwrap();
-                match registry.publish_segment_descriptor(
-                    &request.stream_name,
-                    &request.process_id,
-                    request.descriptor,
-                ) {
+                let publish_result = {
+                    let mut registry = self.registry.lock().unwrap();
+                    registry.publish_segment_descriptor(
+                        &request.stream_name,
+                        &request.process_id,
+                        request.descriptor,
+                    )
+                };
+                match publish_result {
                     Ok(()) => {
+                        self.descriptor_changed.notify_all();
                         tracing::info!(
                             component = "master_server",
                             event = "publish_segment_descriptor",
@@ -763,6 +853,284 @@ impl MasterServer {
                             process_id = request.process_id.as_str(),
                             error = %error,
                             "failed to publish segment descriptor"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            ControlRequest::PublishPersistedFile(request) => {
+                let mut registry = self.registry.lock().unwrap();
+                let previous_persisted_files = registry
+                    .get_stream(&request.stream_name)
+                    .map(|stream| stream.persisted_files.clone())
+                    .unwrap_or_default();
+                let publish_result = registry.publish_persisted_file(
+                    &request.stream_name,
+                    &request.process_id,
+                    request.persisted_file,
+                );
+                match publish_result {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            let _ = registry.set_stream_persisted_files(
+                                &request.stream_name,
+                                previous_persisted_files,
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "publish_persisted_file",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            "published persisted file"
+                        );
+                        ControlResponse::PersistedFilePublished {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "publish_persisted_file",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            error = %error,
+                            "failed to publish persisted file"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            ControlRequest::PublishPersistEvent(request) => {
+                let mut registry = self.registry.lock().unwrap();
+                let previous_persist_events = registry
+                    .get_stream(&request.stream_name)
+                    .map(|stream| stream.persist_events.clone())
+                    .unwrap_or_default();
+                let publish_result = registry.publish_persist_event(
+                    &request.stream_name,
+                    &request.process_id,
+                    request.persist_event,
+                );
+                match publish_result {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            let _ = registry.set_stream_persist_events(
+                                &request.stream_name,
+                                previous_persist_events,
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "publish_persist_event",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            "published persist event"
+                        );
+                        ControlResponse::PersistEventPublished {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "publish_persist_event",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            error = %error,
+                            "failed to publish persist event"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            ControlRequest::AcquireSegmentReaderLease(request) => {
+                let mut registry = self.registry.lock().unwrap();
+                let acquire_result = registry.acquire_segment_reader_lease(
+                    &request.stream_name,
+                    &request.process_id,
+                    request.source_segment_id,
+                    request.source_generation,
+                );
+                match acquire_result {
+                    Ok(lease_id) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "acquire_segment_reader_lease",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            lease_id = lease_id.as_str(),
+                            "acquired segment reader lease"
+                        );
+                        ControlResponse::SegmentReaderLeaseAcquired {
+                            stream_name: request.stream_name,
+                            lease_id,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "acquire_segment_reader_lease",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            error = %error,
+                            "failed to acquire segment reader lease"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            ControlRequest::ReleaseSegmentReaderLease(request) => {
+                let mut registry = self.registry.lock().unwrap();
+                let release_result = registry.release_segment_reader_lease(
+                    &request.stream_name,
+                    &request.process_id,
+                    &request.lease_id,
+                );
+                match release_result {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "release_segment_reader_lease",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            lease_id = request.lease_id.as_str(),
+                            "released segment reader lease"
+                        );
+                        ControlResponse::SegmentReaderLeaseReleased {
+                            stream_name: request.stream_name,
+                            lease_id: request.lease_id,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "release_segment_reader_lease",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            lease_id = request.lease_id.as_str(),
+                            error = %error,
+                            "failed to release segment reader lease"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            ControlRequest::WaitSegmentDescriptor(request) => {
+                let timeout = Duration::from_millis(request.timeout_ms);
+                let mut registry = self.registry.lock().unwrap();
+                let wait_result = registry.segment_descriptor_update_for_process(
+                    &request.stream_name,
+                    &request.process_id,
+                    request.after_descriptor_generation,
+                );
+                let response_result = match wait_result {
+                    Ok(Some(update)) => Ok(Some(update)),
+                    Ok(None) => {
+                        let (next_registry, _) = self
+                            .descriptor_changed
+                            .wait_timeout_while(registry, timeout, |registry| {
+                                matches!(
+                                    registry.segment_descriptor_update_for_process(
+                                        &request.stream_name,
+                                        &request.process_id,
+                                        request.after_descriptor_generation,
+                                    ),
+                                    Ok(None)
+                                )
+                            })
+                            .unwrap();
+                        registry = next_registry;
+                        registry.segment_descriptor_update_for_process(
+                            &request.stream_name,
+                            &request.process_id,
+                            request.after_descriptor_generation,
+                        )
+                    }
+                    Err(error) => Err(error),
+                };
+
+                match response_result {
+                    Ok(Some((descriptor_generation, descriptor))) => {
+                        tracing::info!(
+                            component = "master_server",
+                            event = "wait_segment_descriptor",
+                            status = "changed",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            descriptor_generation,
+                            "segment descriptor changed"
+                        );
+                        ControlResponse::SegmentDescriptorChanged {
+                            stream_name: request.stream_name,
+                            descriptor_generation,
+                            descriptor: Some(descriptor),
+                        }
+                    }
+                    Ok(None) => ControlResponse::SegmentDescriptorChanged {
+                        stream_name: request.stream_name,
+                        descriptor_generation: request.after_descriptor_generation,
+                        descriptor: None,
+                    },
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "wait_segment_descriptor",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            error = %error,
+                            "failed to wait for segment descriptor"
                         );
                         ControlResponse::Error {
                             reason: error.to_string(),
@@ -1078,6 +1446,80 @@ impl MasterServer {
                     }
                 }
             },
+            ControlRequest::DropTable(request) => {
+                let table_name = request.table_name.clone();
+                let drop_result = {
+                    let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                    let mut bus = self.bus.lock().unwrap();
+                    let mut registry = self.registry.lock().unwrap();
+                    let previous_registry = registry.clone();
+                    let dropped_records = registry.drop_table(&table_name);
+                    let snapshot = Self::snapshot_from_registry(&registry);
+                    if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                        *registry = previous_registry;
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: error.to_string(),
+                            },
+                        );
+                    }
+                    bus.remove_stream(&table_name);
+                    self.descriptor_changed.notify_all();
+                    dropped_records
+                };
+                let persisted_files = drop_result
+                    .stream
+                    .as_ref()
+                    .map(|stream| stream.persisted_files.clone())
+                    .unwrap_or_default();
+                let persisted_files_deleted = if request.drop_persisted {
+                    match delete_persisted_files(&persisted_files) {
+                        Ok(deleted) => deleted,
+                        Err(error) => {
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                    }
+                } else {
+                    0
+                };
+                tracing::info!(
+                    component = "master_server",
+                    event = "drop_table",
+                    status = "success",
+                    table_name = table_name.as_str(),
+                    dropped = drop_result.stream.is_some(),
+                    sources_removed = drop_result.sources.len(),
+                    engines_removed = drop_result.engines.len(),
+                    sinks_removed = drop_result.sinks.len(),
+                    persisted_files_deleted,
+                    "dropped table"
+                );
+                ControlResponse::TableDropped(DropTableResult {
+                    table_name,
+                    dropped: drop_result.stream.is_some(),
+                    sources_removed: drop_result.sources.len(),
+                    engines_removed: drop_result.engines.len(),
+                    sinks_removed: drop_result.sinks.len(),
+                    persisted_files_deleted,
+                })
+            }
+            ControlRequest::GetConfig(_) => {
+                tracing::info!(
+                    component = "master_server",
+                    event = "get_config",
+                    status = "success",
+                    "fetched config"
+                );
+                ControlResponse::ConfigFetched {
+                    config: self.config.to_json_value(),
+                }
+            }
         };
 
         write_control_response(&mut stream, &response)
@@ -1116,38 +1558,42 @@ impl MasterServer {
 
     #[cfg(debug_assertions)]
     fn expire_process_for_test_internal(&self, process_id: &str) -> Result<()> {
-        let mut bus = self.bus.lock().unwrap();
-        let mut registry = self.registry.lock().unwrap();
-        registry
-            .force_expire_process(process_id)
-            .map_err(registry_error)?;
-
-        let stale_streams = registry.streams_for_writer_process(process_id);
-        for stream_name in stale_streams {
-            let writer_id = format!("{stream_name}_writer");
-            match bus.detach_writer(&stream_name, &writer_id) {
-                Ok(()) => {}
-                Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                Err(error) => return Err(bus_error(error)),
-            }
+        let snapshot = {
+            let mut bus = self.bus.lock().unwrap();
+            let mut registry = self.registry.lock().unwrap();
             registry
-                .detach_writer(&stream_name)
+                .force_expire_process(process_id)
                 .map_err(registry_error)?;
-        }
 
-        let stale_readers = registry.readers_for_process(process_id);
-        for (stream_name, reader_id) in stale_readers {
-            match bus.detach_reader(&stream_name, &reader_id) {
-                Ok(()) => {}
-                Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                Err(error) => return Err(bus_error(error)),
+            let stale_streams = registry.streams_for_writer_process(process_id);
+            for stream_name in stale_streams {
+                let writer_id = format!("{stream_name}_writer");
+                match bus.detach_writer(&stream_name, &writer_id) {
+                    Ok(()) => {}
+                    Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                    Err(error) => return Err(bus_error(error)),
+                }
+                registry
+                    .detach_writer(&stream_name)
+                    .map_err(registry_error)?;
             }
-            registry
-                .detach_reader(&stream_name, &reader_id)
-                .map_err(registry_error)?;
-        }
-        registry.mark_records_lost_for_process(process_id);
-        Ok(())
+
+            let stale_readers = registry.readers_for_process(process_id);
+            for (stream_name, reader_id) in stale_readers {
+                match bus.detach_reader(&stream_name, &reader_id) {
+                    Ok(()) => {}
+                    Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                    Err(error) => return Err(bus_error(error)),
+                }
+                registry
+                    .detach_reader(&stream_name, &reader_id)
+                    .map_err(registry_error)?;
+            }
+            registry.remove_segment_reader_leases_for_process(process_id);
+            registry.mark_records_lost_for_process(process_id);
+            Self::snapshot_from_registry(&registry)
+        };
+        self.write_snapshot_from_snapshot(&snapshot)
     }
 
     fn start_lease_reaper(&self) {
@@ -1181,69 +1627,83 @@ impl MasterServer {
     }
 
     fn expire_process_attachments(&self, process_id: &str) -> Result<()> {
-        let mut bus = self.bus.lock().unwrap();
-        let mut registry = self.registry.lock().unwrap();
-        let claimed = registry
-            .claim_expired_process(process_id, self.lease_timeout.as_millis() as u64)
-            .map_err(registry_error)?;
-        if !claimed {
-            return Ok(());
-        }
-
-        tracing::warn!(
-            component = "master",
-            event = "process_lease_expired",
-            status = "expired",
-            process_id = process_id,
-            "process lease expired"
-        );
-
-        let stale_streams = registry.streams_for_writer_process(process_id);
-        for stream_name in stale_streams {
-            let writer_id = format!("{stream_name}_writer");
-            match bus.detach_writer(&stream_name, &writer_id) {
-                Ok(()) => {}
-                Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                Err(error) => return Err(bus_error(error)),
-            }
-            registry
-                .detach_writer(&stream_name)
+        let snapshot = {
+            let mut bus = self.bus.lock().unwrap();
+            let mut registry = self.registry.lock().unwrap();
+            let claimed = registry
+                .claim_expired_process(process_id, self.lease_timeout.as_millis() as u64)
                 .map_err(registry_error)?;
-            tracing::info!(
-                component = "master",
-                event = "writer_reclaimed",
-                status = "success",
-                process_id = process_id,
-                stream_name = stream_name.as_str(),
-                writer_id = writer_id.as_str(),
-                "reclaimed stale writer"
-            );
-        }
-
-        let stale_readers = registry.readers_for_process(process_id);
-        for (stream_name, reader_id) in stale_readers {
-            match bus.detach_reader(&stream_name, &reader_id) {
-                Ok(()) => {}
-                Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                Err(error) => return Err(bus_error(error)),
+            if !claimed {
+                return Ok(());
             }
-            registry
-                .detach_reader(&stream_name, &reader_id)
-                .map_err(registry_error)?;
-            tracing::info!(
+
+            tracing::warn!(
                 component = "master",
-                event = "reader_reclaimed",
-                status = "success",
+                event = "process_lease_expired",
+                status = "expired",
                 process_id = process_id,
-                stream_name = stream_name.as_str(),
-                reader_id = reader_id.as_str(),
-                "reclaimed stale reader"
+                "process lease expired"
             );
-        }
 
-        registry.mark_records_lost_for_process(process_id);
+            let stale_streams = registry.streams_for_writer_process(process_id);
+            for stream_name in stale_streams {
+                let writer_id = format!("{stream_name}_writer");
+                match bus.detach_writer(&stream_name, &writer_id) {
+                    Ok(()) => {}
+                    Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                    Err(error) => return Err(bus_error(error)),
+                }
+                registry
+                    .detach_writer(&stream_name)
+                    .map_err(registry_error)?;
+                tracing::info!(
+                    component = "master",
+                    event = "writer_reclaimed",
+                    status = "success",
+                    process_id = process_id,
+                    stream_name = stream_name.as_str(),
+                    writer_id = writer_id.as_str(),
+                    "reclaimed stale writer"
+                );
+            }
 
-        Ok(())
+            let stale_readers = registry.readers_for_process(process_id);
+            for (stream_name, reader_id) in stale_readers {
+                match bus.detach_reader(&stream_name, &reader_id) {
+                    Ok(()) => {}
+                    Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
+                    Err(error) => return Err(bus_error(error)),
+                }
+                registry
+                    .detach_reader(&stream_name, &reader_id)
+                    .map_err(registry_error)?;
+                tracing::info!(
+                    component = "master",
+                    event = "reader_reclaimed",
+                    status = "success",
+                    process_id = process_id,
+                    stream_name = stream_name.as_str(),
+                    reader_id = reader_id.as_str(),
+                    "reclaimed stale reader"
+                );
+            }
+
+            let removed_segment_reader_leases =
+                registry.remove_segment_reader_leases_for_process(process_id);
+            if removed_segment_reader_leases > 0 {
+                tracing::info!(
+                    component = "master",
+                    event = "segment_reader_lease_reclaimed",
+                    status = "success",
+                    process_id = process_id,
+                    lease_count = removed_segment_reader_leases as u64,
+                    "reclaimed stale segment reader leases"
+                );
+            }
+            registry.mark_records_lost_for_process(process_id);
+            Self::snapshot_from_registry(&registry)
+        };
+        self.write_snapshot_from_snapshot(&snapshot)
     }
 
     fn snapshot_from_registry(registry: &Registry) -> RegistrySnapshot {
@@ -1253,6 +1713,14 @@ impl MasterServer {
                 .into_iter()
                 .map(|stream| SnapshotStreamRecord {
                     stream_name: stream.stream_name,
+                    schema: stream.schema,
+                    schema_hash: stream.schema_hash,
+                    data_path: stream.data_path,
+                    descriptor_generation: stream.descriptor_generation,
+                    sealed_segments: stream.sealed_segments,
+                    persisted_files: stream.persisted_files,
+                    persist_events: stream.persist_events,
+                    segment_reader_leases: stream.segment_reader_leases,
                     buffer_size: stream.buffer_size,
                     frame_size: stream.frame_size,
                     status: stream.status,
@@ -1361,6 +1829,52 @@ fn restore_previous_record(
     }
 }
 
+fn delete_persisted_files(persisted_files: &[serde_json::Value]) -> Result<usize> {
+    let mut deleted = 0;
+    let mut parent_dirs = Vec::new();
+    for persisted_file in persisted_files {
+        let Some(file_path) = persisted_file
+            .get("file_path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let path = PathBuf::from(file_path);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                deleted += 1;
+                if let Some(parent) = path.parent() {
+                    parent_dirs.push(parent.to_path_buf());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ZippyError::Io {
+                    reason: format!(
+                        "failed to delete persisted table file path=[{}] error=[{}]",
+                        path.display(),
+                        error
+                    ),
+                });
+            }
+        }
+    }
+
+    parent_dirs.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    parent_dirs.dedup();
+    for parent in parent_dirs {
+        let _ = fs::remove_dir(parent);
+    }
+
+    Ok(deleted)
+}
+
 fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<()> {
     let payload = serde_json::to_string(response).map_err(|error| ZippyError::Io {
         reason: format!("failed to encode control response error=[{}]", error),
@@ -1374,6 +1888,7 @@ fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -
 fn validate_register_stream_request(
     registry: &Registry,
     stream_name: &str,
+    schema_hash: &str,
     buffer_size: usize,
     frame_size: usize,
 ) -> std::result::Result<(), crate::registry::RegistryError> {
@@ -1393,6 +1908,13 @@ fn validate_register_stream_request(
                 existing_frame_size: existing.frame_size,
                 requested_buffer_size: buffer_size,
                 requested_frame_size: frame_size,
+            });
+        }
+        if existing.schema_hash != schema_hash {
+            return Err(crate::registry::RegistryError::StreamSchemaMismatch {
+                stream_name: stream_name.to_string(),
+                existing_schema_hash: existing.schema_hash.clone(),
+                requested_schema_hash: schema_hash.to_string(),
             });
         }
     }
@@ -1494,6 +2016,15 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
     fn from(stream: crate::registry::StreamRecord) -> Self {
         Self {
             stream_name: stream.stream_name,
+            schema: stream.schema,
+            schema_hash: stream.schema_hash,
+            data_path: stream.data_path,
+            descriptor_generation: stream.descriptor_generation,
+            active_segment_descriptor: stream.active_segment_descriptor,
+            sealed_segments: stream.sealed_segments,
+            persisted_files: stream.persisted_files,
+            persist_events: stream.persist_events,
+            segment_reader_leases: stream.segment_reader_leases,
             buffer_size: stream.buffer_size,
             frame_size: stream.frame_size,
             write_seq: 0,
@@ -1586,4 +2117,14 @@ fn socket_creation_timestamp() -> Result<u128> {
         })?;
 
     Ok(duration.as_nanos())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_loop_idle_sleep_stays_below_control_plane_latency_budget() {
+        assert!(MASTER_ACCEPT_IDLE_SLEEP <= Duration::from_millis(1));
+    }
 }

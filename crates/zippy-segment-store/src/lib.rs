@@ -28,7 +28,7 @@ pub use persistence::{
 pub use schema::{compile_schema, ColumnSpec, ColumnType, CompiledSchema};
 pub use segment::{ActiveSegmentDescriptor, SealedSegmentHandle, SegmentHeader};
 pub use shm::ShmRegion;
-pub use view::RowSpanView;
+pub use view::{RowSpanView, SegmentCellValue};
 
 use thiserror::Error;
 

@@ -6,6 +6,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 import polars as pl
@@ -157,6 +159,607 @@ def test_reactive_engine_accepts_pyarrow_table() -> None:
     engine.write(table)
     engine.flush()
     engine.stop()
+
+
+def test_reactive_latest_engine_accepts_single_and_multi_by() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("exchange_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    single_by = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument",
+        input_schema=schema,
+        by="instrument_id",
+        target=zippy.NullPublisher(),
+    )
+    multi_by = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument_exchange",
+        input_schema=schema,
+        by=["instrument_id", "exchange_id"],
+        target=zippy.NullPublisher(),
+    )
+
+    assert single_by.output_schema() == schema
+    assert single_by.config()["by"] == ["instrument_id"]
+    assert multi_by.config()["by"] == ["instrument_id", "exchange_id"]
+
+    single_by.start()
+    single_by.write(
+        {
+            "instrument_id": ["IF2606", "IH2606", "IF2606"],
+            "exchange_id": ["CFFEX", "CFFEX", "CFFEX"],
+            "last_price": [3912.4, 2740.8, 3913.2],
+        }
+    )
+    single_by.flush()
+    single_by.stop()
+
+
+def test_reactive_latest_engine_infers_schema_from_named_segment_source(
+    tmp_path: Path,
+) -> None:
+    try:
+        server, control_endpoint = start_master_server(tmp_path)
+    except RuntimeError as error:
+        if "Operation not permitted" in str(error):
+            pytest.skip("current sandbox cannot bind zippy master control socket")
+        raise
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("exchange_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    master = zippy.MasterClient(control_endpoint=control_endpoint)
+    master.register_process("reactive_latest_engine")
+    master.register_stream("openctp_ticks", schema, 64, 4096)
+
+    try:
+        engine = zippy.ReactiveLatestEngine(
+            name="latest_by_instrument",
+            source="openctp_ticks",
+            by="instrument_id",
+            target=zippy.NullPublisher(),
+            master=master,
+        )
+
+        assert engine.output_schema() == schema
+        assert engine.config()["by"] == ["instrument_id"]
+        assert engine.config()["source"] == "openctp_ticks"
+        assert engine.config()["source_linked"] is True
+    finally:
+        server.stop()
+
+
+def test_reactive_latest_engine_named_source_requires_master() -> None:
+    with pytest.raises(ValueError, match="master is required when source is a stream name"):
+        zippy.ReactiveLatestEngine(
+            name="latest_by_instrument",
+            source="openctp_ticks",
+            by="instrument_id",
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_session_engine_factory_defaults_target_and_returns_session() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-session-test.sock")
+    session = zippy.Session(name="latest_session", master=master)
+
+    returned = session.engine(
+        zippy.ReactiveLatestEngine,
+        name="latest_by_instrument",
+        input_schema=schema,
+        by="instrument_id",
+    )
+
+    assert returned is session
+    engines = session.engines()
+    assert len(engines) == 1
+    assert engines[0].output_schema() == schema
+    assert engines[0].config()["targets"] == [{"type": "null"}]
+
+
+def test_session_engine_factory_injects_master_for_named_source() -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingEngine:
+        def __init__(self, *, source, master=None, target=None):
+            captured["source"] = source
+            captured["master"] = master
+            captured["target"] = target
+            self._status = "created"
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-session-test.sock")
+    session = zippy.Session(name="latest_session", master=master)
+
+    session.engine(CapturingEngine, source="openctp_ticks")
+
+    assert captured["source"] == "openctp_ticks"
+    assert captured["master"] is master
+    assert isinstance(captured["target"], zippy.NullPublisher)
+
+
+def test_session_named_source_materializes_default_output_table() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def __init__(self):
+            self.registered_streams: list[tuple[str, pa.Schema, int, int]] = []
+            self.registered_sources: list[tuple[str, str, str, dict[str, object]]] = []
+            self.published_descriptors: list[tuple[str, dict[str, object]]] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "retention_segments": None,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(
+            self,
+            stream_name: str,
+            stream_schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            self.registered_streams.append((stream_name, stream_schema, buffer_size, frame_size))
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: dict[str, object],
+        ) -> None:
+            self.registered_sources.append((source_name, source_type, output_stream, config))
+
+        def publish_segment_descriptor(
+            self,
+            stream_name: str,
+            descriptor: dict[str, object],
+        ) -> None:
+            self.published_descriptors.append((stream_name, descriptor))
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    class DummyRuntime:
+        def join(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class CapturingPythonSourceEngine:
+        def __init__(self, *, name, source, master=None, target=None):
+            self.name = name
+            self.source = source
+            self.master = master
+            self.target = target
+            self._status = "created"
+
+        def output_schema(self):
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def _zippy_output_schema(self):
+            return schema
+
+        def _zippy_start(self, sink):
+            return DummyRuntime()
+
+    master = FakeMaster()
+    session = zippy.Session(name="latest_session", master=master)
+
+    session.engine(
+        CapturingPythonSourceEngine,
+        name="ctp_ticks_latest",
+        source="ldc_ctp_ticks",
+    )
+
+    assert master.registered_streams == [("ctp_ticks_latest", schema, 64, 4096)]
+    assert master.registered_sources == [
+        (
+            "latest_session.ctp_ticks_latest.materializer.proc_test",
+            "session_engine_output",
+            "ctp_ticks_latest",
+            {"session": "latest_session"},
+        )
+    ]
+    assert master.published_descriptors[0][0] == "ctp_ticks_latest"
+    assert len(session.engines()) == 1
+
+
+def test_session_engine_output_overrides_default_output_table_name() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def __init__(self):
+            self.registered_streams: list[tuple[str, pa.Schema, int, int]] = []
+            self.registered_sources: list[tuple[str, str, str, dict[str, object]]] = []
+            self.published_descriptors: list[tuple[str, dict[str, object]]] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "retention_segments": None,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(
+            self,
+            stream_name: str,
+            stream_schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            self.registered_streams.append((stream_name, stream_schema, buffer_size, frame_size))
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: dict[str, object],
+        ) -> None:
+            self.registered_sources.append((source_name, source_type, output_stream, config))
+
+        def publish_segment_descriptor(
+            self,
+            stream_name: str,
+            descriptor: dict[str, object],
+        ) -> None:
+            self.published_descriptors.append((stream_name, descriptor))
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    class DummyRuntime:
+        def join(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class CapturingPythonSourceEngine:
+        def __init__(self, *, name, source, master=None, target=None):
+            self.name = name
+            self.source = source
+            self.master = master
+            self.target = target
+            self._status = "created"
+
+        def output_schema(self):
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def _zippy_output_schema(self):
+            return schema
+
+        def _zippy_start(self, sink):
+            return DummyRuntime()
+
+    master = FakeMaster()
+    session = zippy.Session(name="latest_session", master=master)
+
+    session.engine(
+        CapturingPythonSourceEngine,
+        name="latest_engine",
+        source="ldc_ctp_ticks",
+        output="ctp_ticks_latest",
+    )
+
+    engine = session.engines()[0]
+    assert engine.name == "latest_engine"
+    assert master.registered_streams == [("ctp_ticks_latest", schema, 64, 4096)]
+    assert master.registered_sources == [
+        (
+            "latest_session.ctp_ticks_latest.materializer.proc_test",
+            "session_engine_output",
+            "ctp_ticks_latest",
+            {"session": "latest_session"},
+        )
+    ]
+    assert master.published_descriptors[0][0] == "ctp_ticks_latest"
+
+
+def test_session_engine_rejects_output_with_explicit_target() -> None:
+    class CapturingEngine:
+        def __init__(self, *, name, source, master=None, target=None):
+            self._status = "created"
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-session-test.sock")
+    session = zippy.Session(name="latest_session", master=master)
+
+    with pytest.raises(ValueError, match="output cannot be combined with explicit target"):
+        session.engine(
+            CapturingEngine,
+            name="latest_engine",
+            source="ldc_ctp_ticks",
+            output="ctp_ticks_latest",
+            target=zippy.NullPublisher(),
+        )
+
+
+def test_session_engine_persist_false_disables_default_output_persistence(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def register_stream(self, *args) -> None:
+            return None
+
+        def publish_segment_descriptor(self, *args) -> None:
+            return None
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "persist": {
+                        "enabled": True,
+                        "method": "parquet",
+                        "data_dir": "/tmp/zippy-session-persist",
+                        "partition": {},
+                    },
+                },
+            }
+
+    captured_materializer: dict[str, object] = {}
+
+    class CapturingStreamTableEngine:
+        def __init__(self, **kwargs):
+            captured_materializer.update(kwargs)
+            self._status = "created"
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    class CapturingPythonSourceEngine:
+        def __init__(self, *, name, source, master=None, target=None):
+            self._status = "created"
+
+        def output_schema(self):
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def _zippy_output_schema(self):
+            return schema
+
+    monkeypatch.setattr(zippy, "StreamTableEngine", CapturingStreamTableEngine)
+    session = zippy.Session(name="latest_session", master=FakeMaster())
+    session.engine(
+        CapturingPythonSourceEngine,
+        name="ctp_ticks_latest",
+        source="ldc_ctp_ticks",
+        persist=False,
+    )
+
+    assert captured_materializer["name"] == "ctp_ticks_latest"
+    assert captured_materializer["persist_path"] is None
+
+
+def test_session_engine_persist_true_materializes_parquet_output(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def register_stream(self, *args) -> None:
+            return None
+
+        def publish_segment_descriptor(self, *args) -> None:
+            return None
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "persist": {
+                        "enabled": False,
+                        "method": "parquet",
+                        "data_dir": "/tmp/zippy-session-persist",
+                        "partition": {},
+                    },
+                },
+            }
+
+    captured_materializer: dict[str, object] = {}
+
+    class CapturingStreamTableEngine:
+        def __init__(self, **kwargs):
+            captured_materializer.update(kwargs)
+            self._status = "created"
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    class CapturingPythonSourceEngine:
+        def __init__(self, *, name, source, master=None, target=None):
+            self._status = "created"
+
+        def output_schema(self):
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def _zippy_output_schema(self):
+            return schema
+
+    monkeypatch.setattr(zippy, "StreamTableEngine", CapturingStreamTableEngine)
+    session = zippy.Session(name="latest_session", master=FakeMaster())
+    session.engine(
+        CapturingPythonSourceEngine,
+        name="ctp_ticks_latest",
+        source="ldc_ctp_ticks",
+        persist=True,
+    )
+
+    assert captured_materializer["name"] == "ctp_ticks_latest"
+    assert captured_materializer["persist_path"] == "/tmp/zippy-session-persist/ctp_ticks_latest"
+    assert captured_materializer["persist_publisher"] is not None
+
+
+def test_session_run_starts_and_stop_stops_owned_engines() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-session-test.sock")
+    engine = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument",
+        input_schema=schema,
+        by="instrument_id",
+        target=zippy.NullPublisher(),
+    )
+    session = zippy.Session(name="latest_session", master=master).engine(engine)
+
+    session.run()
+    assert engine.status() == "running"
+
+    session.stop()
+    assert engine.status() == "stopped"
+
+
+def test_session_run_keeps_session_alive_until_stop() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    master = zippy.MasterClient(control_endpoint="/tmp/zippy-session-test.sock")
+    engine = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument",
+        input_schema=schema,
+        by="instrument_id",
+        target=zippy.NullPublisher(),
+    )
+    session = zippy.Session(name="latest_session_keepalive", master=master).engine(engine)
+
+    session.run()
+    assert zippy._ACTIVE_SESSIONS["latest_session_keepalive"] is session
+
+    session.stop()
+    assert "latest_session_keepalive" not in zippy._ACTIVE_SESSIONS
 
 
 def test_reactive_engine_accepts_columnar_dict_input() -> None:
@@ -3462,6 +4065,17 @@ def test_master_client_lists_streams(tmp_path: Path) -> None:
 
     assert len(streams) == 1
     assert streams[0]["stream_name"] == "openctp_ticks"
+    assert streams[0]["schema"]["fields"][0]["name"] == "instrument_id"
+    assert streams[0]["schema"]["fields"][0]["segment_type"] == "utf8"
+    assert streams[0]["schema"]["fields"][0]["nullable"] is True
+    assert isinstance(streams[0]["schema_hash"], str)
+    assert streams[0]["data_path"] == "segment"
+    assert streams[0]["descriptor_generation"] == 0
+    assert streams[0]["active_segment_descriptor"] is None
+    assert streams[0]["sealed_segments"] == []
+    assert streams[0]["persisted_files"] == []
+    assert streams[0]["persist_events"] == []
+    assert streams[0]["segment_reader_leases"] == []
     assert streams[0]["buffer_size"] == 64
     assert streams[0]["frame_size"] == 4096
     assert "ring_capacity" not in streams[0]
@@ -3483,12 +4097,62 @@ def test_master_client_gets_stream(tmp_path: Path) -> None:
     stream = client.get_stream("openctp_ticks")
 
     assert stream["stream_name"] == "openctp_ticks"
+    assert stream["schema"]["fields"][0]["name"] == "instrument_id"
+    assert stream["schema"]["fields"][0]["segment_type"] == "utf8"
+    assert stream["schema"]["fields"][0]["nullable"] is True
+    assert isinstance(stream["schema_hash"], str)
+    assert stream["data_path"] == "segment"
+    assert stream["descriptor_generation"] == 0
+    assert stream["active_segment_descriptor"] is None
+    assert stream["sealed_segments"] == []
+    assert stream["persisted_files"] == []
+    assert stream["persist_events"] == []
+    assert stream["segment_reader_leases"] == []
     assert stream["buffer_size"] == 64
     assert stream["frame_size"] == 4096
     assert "ring_capacity" not in stream
     assert stream["writer_process_id"] is None
     assert stream["reader_count"] == 0
     assert stream["status"] == "registered"
+
+    server.stop()
+
+
+def test_master_client_drop_table_removes_stream_and_persisted_files(tmp_path: Path) -> None:
+    try:
+        server, control_endpoint = start_master_server(tmp_path)
+    except RuntimeError as error:
+        if "Operation not permitted" in str(error):
+            pytest.skip("unix socket bind is not permitted in this test environment")
+        raise
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    parquet_file = tmp_path / "tables" / "openctp_ticks" / "part-000001.parquet"
+    parquet_file.parent.mkdir(parents=True)
+    parquet_file.write_bytes(b"persisted rows")
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("drop_table_test")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "openctp", "openctp_ticks", {})
+    client.publish_persisted_file(
+        "openctp_ticks",
+        {
+            "file_path": str(parquet_file),
+            "row_count": 1,
+            "source_segment_id": 1,
+        },
+    )
+
+    result = client.drop_table("openctp_ticks")
+
+    assert result["table_name"] == "openctp_ticks"
+    assert result["dropped"] is True
+    assert result["sources_removed"] == 1
+    assert result["persisted_files_deleted"] == 1
+    assert not parquet_file.exists()
+    assert client.list_streams() == []
+    with pytest.raises(RuntimeError, match="stream not found"):
+        client.get_stream("openctp_ticks")
 
     server.stop()
 
@@ -3519,6 +4183,2227 @@ def test_master_client_publishes_and_gets_segment_descriptor(tmp_path: Path) -> 
     assert fetched == descriptor
 
     server.stop()
+
+
+def test_query_tail_reads_latest_available_active_segment_rows(tmp_path: Path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("query_test")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+
+    writer = zippy._internal._SegmentTestWriter("openctp_ticks", tick_schema, row_capacity=16)
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+    writer.append_tick(1777017601000000000, "IF2606", 4103.0)
+    writer.append_tick(1777017602000000000, "IF2607", 4104.5)
+    client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+
+    query = zippy.read_table(source="openctp_ticks", master=client)
+
+    available = query.tail(10)
+    assert isinstance(available, pa.Table)
+    assert available.schema == tick_schema
+    assert available.num_rows == 3
+    assert available.column("instrument_id").to_pylist() == ["IF2606", "IF2606", "IF2607"]
+    assert available.column("last_price").to_pylist() == [4102.5, 4103.0, 4104.5]
+
+    latest = query.tail(2)
+    assert latest.num_rows == 2
+    assert latest.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
+    assert latest.column("last_price").to_pylist() == [4103.0, 4104.5]
+
+    server.stop()
+
+
+def test_query_tail_reads_retained_sealed_segments_before_active_rows() -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        control_endpoint = str(Path(directory) / "zippy-master.sock")
+        server = zippy.MasterServer(control_endpoint=control_endpoint)
+        try:
+            server.start()
+        except RuntimeError as error:
+            if "Operation not permitted" in str(error):
+                pytest.skip("unix socket bind is not permitted in this test environment")
+            raise
+        pipeline = None
+        try:
+            client = zippy.connect(uri=control_endpoint, app="query_tail_sealed_test")
+            tick_schema = pa.schema(
+                [
+                    ("instrument_id", pa.string()),
+                    ("dt", pa.timestamp("ns", tz="UTC")),
+                    ("last_price", pa.float64()),
+                ]
+            )
+            pipeline = (
+                zippy.Pipeline("query_tail_sealed_test")
+                .stream_table("openctp_ticks", schema=tick_schema, row_capacity=32)
+                .start()
+            )
+            row_count = 100
+            pipeline.write(
+                {
+                    "instrument_id": [f"IF{index:04d}" for index in range(row_count)],
+                    "dt": [
+                        1777017600000000000 + index
+                        for index in range(row_count)
+                    ],
+                    "last_price": [4100.0 + index for index in range(row_count)],
+                }
+            )
+
+            query = zippy.read_table("openctp_ticks")
+            latest = query.tail(row_count)
+            for _ in range(50):
+                if latest.num_rows == row_count:
+                    break
+                time.sleep(0.02)
+                latest = query.tail(row_count)
+
+            stream = client.get_stream("openctp_ticks")
+            descriptor = client.get_segment_descriptor("openctp_ticks")
+            assert len(stream["sealed_segments"]) >= 1
+            assert "sealed_segments" not in descriptor
+            assert latest.num_rows == row_count
+            assert latest.column("last_price").to_pylist() == [
+                4100.0 + index for index in range(row_count)
+            ]
+        finally:
+            if pipeline is not None:
+                pipeline.stop()
+            if reset_default_master is not None:
+                reset_default_master()
+            server.stop()
+
+
+def test_query_scan_live_returns_reader_over_retained_sealed_and_active_rows() -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        control_endpoint = str(Path(directory) / "zippy-master.sock")
+        server = zippy.MasterServer(control_endpoint=control_endpoint)
+        try:
+            server.start()
+        except RuntimeError as error:
+            if "Operation not permitted" in str(error):
+                pytest.skip("unix socket bind is not permitted in this test environment")
+            raise
+        pipeline = None
+        try:
+            zippy.connect(uri=control_endpoint, app="query_scan_live_test")
+            tick_schema = pa.schema(
+                [
+                    ("instrument_id", pa.string()),
+                    ("dt", pa.timestamp("ns", tz="UTC")),
+                    ("last_price", pa.float64()),
+                ]
+            )
+            pipeline = (
+                zippy.Pipeline("query_scan_live_test")
+                .stream_table("openctp_ticks", schema=tick_schema, row_capacity=32)
+                .start()
+            )
+            row_count = 100
+            pipeline.write(
+                {
+                    "instrument_id": [f"IF{index:04d}" for index in range(row_count)],
+                    "dt": [
+                        1777017600000000000 + index
+                        for index in range(row_count)
+                    ],
+                    "last_price": [4100.0 + index for index in range(row_count)],
+                }
+            )
+
+            query = zippy.read_table("openctp_ticks")
+            reader = query.scan_live()
+            assert isinstance(reader, pa.RecordBatchReader)
+
+            table = reader.read_all()
+            for _ in range(50):
+                if table.num_rows == row_count:
+                    break
+                time.sleep(0.02)
+                table = query.scan_live().read_all()
+
+            assert table.schema == tick_schema
+            assert table.num_rows == row_count
+            assert table.column("last_price").to_pylist() == [
+                4100.0 + index for index in range(row_count)
+            ]
+        finally:
+            if pipeline is not None:
+                pipeline.stop()
+            if reset_default_master is not None:
+                reset_default_master()
+            server.stop()
+
+
+def test_query_snapshot_includes_published_files() -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        control_endpoint = str(root / "zippy-master.sock")
+        server = zippy.MasterServer(control_endpoint=control_endpoint)
+        try:
+            server.start()
+        except RuntimeError as error:
+            if "Operation not permitted" in str(error):
+                pytest.skip("unix socket bind is not permitted in this test environment")
+            raise
+
+        try:
+            tick_schema = pa.schema(
+                [
+                    ("instrument_id", pa.string()),
+                    ("dt", pa.timestamp("ns", tz="UTC")),
+                    ("last_price", pa.float64()),
+                ]
+            )
+            persist_path = root / "data" / "ctp_ticks" / "trading_day=20260426"
+            persist_path.mkdir(parents=True)
+            parquet_file = persist_path / "part-000001.parquet"
+            table = pa.table(
+                {
+                    "instrument_id": ["IF2606"],
+                    "dt": [1777017600000000000],
+                    "last_price": [4102.5],
+                },
+                schema=tick_schema,
+            )
+            pq.write_table(table, parquet_file)
+
+            client = zippy.connect(uri=control_endpoint, app="persist_metadata_test")
+            client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+            client.register_source("openctp_md", "persist_test", "openctp_ticks", {})
+            writer = zippy._internal._SegmentTestWriter(
+                "openctp_ticks",
+                tick_schema,
+                row_capacity=16,
+            )
+            writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+            client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+            client.publish_persisted_file(
+                "openctp_ticks",
+                {
+                    "file_path": str(parquet_file),
+                    "row_count": 1,
+                    "min_event_ts": 1777017600000000000,
+                    "max_event_ts": 1777017600000000000,
+                    "source_segment_id": 1,
+                },
+            )
+
+            query = zippy.read_table("openctp_ticks")
+            snapshot = query.snapshot()
+            persisted_files = snapshot["persisted_files"]
+
+            assert len(persisted_files) == 1
+            assert persisted_files[0]["stream_name"] == "openctp_ticks"
+            assert persisted_files[0]["file_path"] == str(parquet_file)
+            assert persisted_files[0]["row_count"] == 1
+            assert isinstance(persisted_files[0]["schema_hash"], str)
+            assert pq.read_table(persisted_files[0]["file_path"]).num_rows == 1
+        finally:
+            if reset_default_master is not None:
+                reset_default_master()
+            server.stop()
+
+
+def test_read_table_function_returns_table_object(monkeypatch) -> None:
+    created: list[tuple[str, object]] = []
+
+    class FakeTable:
+        def __init__(self, source: str, master: object | None = None) -> None:
+            self.source = source
+            self.master = master
+            created.append((source, master))
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "Table", FakeTable)
+
+    table = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    assert isinstance(table, FakeTable)
+    assert table.source == "ctp_ticks"
+    assert table.master is explicit_master
+    assert created == [("ctp_ticks", explicit_master)]
+
+
+def test_connect_sets_default_master_and_init_is_removed(monkeypatch) -> None:
+    created: list[str] = []
+
+    class FakeMasterClient:
+        def __init__(self, control_endpoint: str) -> None:
+            self.control_endpoint = control_endpoint
+            self.registered_apps: list[str] = []
+            created.append(control_endpoint)
+
+        def register_process(self, app: str) -> None:
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            pass
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
+
+    assert not hasattr(zippy, "init")
+
+    try:
+        client = zippy.connect(uri="~/zippy-master.sock", app="market_client")
+
+        assert zippy.master() is client
+        assert client.registered_apps == ["market_client"]
+        assert created == [str(Path("~/zippy-master.sock").expanduser())]
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_default_heartbeat_interval_avoids_hot_control_plane_polling() -> None:
+    assert zippy._DEFAULT_HEARTBEAT_INTERVAL_SEC == 3.0
+
+
+def test_config_returns_master_runtime_config() -> None:
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 2048,
+                    "retention_segments": 4,
+                    "persist": {
+                        "enabled": True,
+                        "method": "parquet",
+                        "data_dir": "data",
+                    },
+                },
+            }
+
+    assert zippy.config(master=FakeMaster()) == {
+        "table": {
+            "row_capacity": 2048,
+            "retention_segments": 4,
+            "persist": {
+                "enabled": True,
+                "method": "parquet",
+                "data_dir": "data",
+            },
+        },
+    }
+
+
+def test_connect_without_uri_uses_default_logical_endpoint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    created: list[str] = []
+
+    class FakeMasterClient:
+        def __init__(self, control_endpoint: str) -> None:
+            self.control_endpoint = control_endpoint
+            created.append(control_endpoint)
+
+        def list_streams(self) -> list[object]:
+            return []
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    try:
+        zippy.connect()
+
+        assert created == [
+            str(tmp_path / ".zippy" / "control_endpoints" / "default" / "master.sock")
+        ]
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_resolve_uri_maps_logical_names_and_explicit_paths(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert zippy._resolve_uri("default") == str(
+        tmp_path / ".zippy" / "control_endpoints" / "default" / "master.sock"
+    )
+    assert zippy._resolve_uri("zippy://sim") == str(
+        tmp_path / ".zippy" / "control_endpoints" / "sim" / "master.sock"
+    )
+    assert zippy._resolve_uri("~/custom/master.sock") == str(
+        tmp_path / "custom" / "master.sock"
+    )
+    assert zippy._resolve_uri("/tmp/custom-master.sock") == "/tmp/custom-master.sock"
+
+
+def test_master_server_accepts_uri_keyword_for_logical_endpoint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    server = zippy.MasterServer(uri="sim")
+
+    assert server.control_endpoint() == str(
+        tmp_path / ".zippy" / "control_endpoints" / "sim" / "master.sock"
+    )
+
+
+def test_connect_starts_background_heartbeat_for_registered_process(monkeypatch) -> None:
+    heartbeat_seen = threading.Event()
+
+    class FakeMasterClient:
+        def __init__(self, control_endpoint: str) -> None:
+            self.control_endpoint = control_endpoint
+            self.registered_apps: list[str] = []
+            self.heartbeat_count = 0
+
+        def register_process(self, app: str) -> None:
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            self.heartbeat_count += 1
+            heartbeat_seen.set()
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
+
+    client = zippy.connect(
+        uri="/tmp/zippy-master.sock",
+        app="market_client",
+        heartbeat_interval_sec=0.01,
+    )
+
+    try:
+        assert heartbeat_seen.wait(timeout=1.0)
+        assert client.registered_apps == ["market_client"]
+        assert client.heartbeat_count >= 1
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_connect_without_app_validates_master_connection(monkeypatch) -> None:
+    created: list[str] = []
+    list_calls: list[str] = []
+
+    class FakeMasterClient:
+        def __init__(self, control_endpoint: str) -> None:
+            self.control_endpoint = control_endpoint
+            created.append(control_endpoint)
+
+        def list_streams(self) -> list[object]:
+            list_calls.append(self.control_endpoint)
+            return []
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
+
+    try:
+        client = zippy.connect(uri="~/zippy-master.sock")
+
+        assert zippy.master() is client
+        assert created == [str(Path("~/zippy-master.sock").expanduser())]
+        assert list_calls == created
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_drop_table_uses_default_master(monkeypatch) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    class FakeMaster:
+        def drop_table(self, table_name: str, drop_persisted: bool = True) -> dict[str, object]:
+            calls.append((table_name, drop_persisted))
+            return {
+                "table_name": table_name,
+                "dropped": True,
+                "persisted_files_deleted": 2,
+            }
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    master = FakeMaster()
+    zippy._set_default_master(master, None, 10.0)
+
+    try:
+        result = zippy.drop_table("ctp_ticks")
+
+        assert result == {
+            "table_name": "ctp_ticks",
+            "dropped": True,
+            "persisted_files_deleted": 2,
+        }
+        assert calls == [("ctp_ticks", True)]
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_drop_table_accepts_explicit_master_and_drop_persisted_flag() -> None:
+    calls: list[tuple[str, bool]] = []
+
+    class FakeMaster:
+        def drop_table(self, table_name: str, drop_persisted: bool = True) -> dict[str, object]:
+            calls.append((table_name, drop_persisted))
+            return {
+                "table_name": table_name,
+                "dropped": True,
+                "persisted_files_deleted": 0,
+            }
+
+    result = zippy.drop_table("ctp_ticks", drop_persisted=False, master=FakeMaster())
+
+    assert result == {
+        "table_name": "ctp_ticks",
+        "dropped": True,
+        "persisted_files_deleted": 0,
+    }
+    assert calls == [("ctp_ticks", False)]
+
+
+def test_query_error_includes_source_and_master_uri(monkeypatch) -> None:
+    class FakeMaster:
+        def control_endpoint(self) -> str:
+            return "/tmp/missing-zippy-master.sock"
+
+    class BrokenNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            raise RuntimeError("io error reason=[No such file or directory]")
+
+    monkeypatch.setattr(zippy, "_NativeQuery", BrokenNativeQuery)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        zippy.read_table("ldc_md_ticks", master=FakeMaster())
+
+    message = str(exc_info.value)
+    assert "source=[ldc_md_ticks]" in message
+    assert "master_uri=[/tmp/missing-zippy-master.sock]" in message
+
+
+def test_query_registers_default_master_process_before_native_query(monkeypatch) -> None:
+    created: list[tuple[str, object]] = []
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.process_id_value: str | None = None
+            self.registered_apps: list[str] = []
+
+        def process_id(self) -> str | None:
+            return self.process_id_value
+
+        def register_process(self, app: str) -> None:
+            self.process_id_value = "proc_1"
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            return None
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            assert master.process_id() == "proc_1"
+            created.append((source, master))
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    master = FakeMaster()
+    zippy._set_default_master(master, None, 10.0)
+
+    try:
+        zippy.read_table("ldc_md_ticks")
+
+        assert master.registered_apps == ["read_table.ldc_md_ticks"]
+        assert created == [("ldc_md_ticks", master)]
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_pipeline_process_registration_starts_default_heartbeat(monkeypatch) -> None:
+    heartbeat_seen = threading.Event()
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.process_id_value: str | None = None
+            self.registered_apps: list[str] = []
+            self.heartbeat_count = 0
+
+        def process_id(self) -> str | None:
+            return self.process_id_value
+
+        def register_process(self, app: str) -> None:
+            self.process_id_value = "proc_1"
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            self.heartbeat_count += 1
+            heartbeat_seen.set()
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+    class FakeStreamTableEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            return None
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    class SchemaSource:
+        def _zippy_output_schema(self) -> pa.Schema:
+            return tick_schema
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+
+    master = FakeMaster()
+    zippy._set_default_master(master, None, 0.01)
+
+    try:
+        zippy.Pipeline("test_ingest").source(SchemaSource()).stream_table("openctp_ticks")
+
+        assert heartbeat_seen.wait(timeout=1.0)
+        assert master.registered_apps == ["test_ingest"]
+        assert master.heartbeat_count >= 1
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 10,
+            xfast: bool = False,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    def on_tick(row: zippy.Row) -> None:
+        return None
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber(
+        source="ctp_ticks",
+        callback=on_tick,
+        master=explicit_master,
+        poll_interval_ms=3,
+        xfast=True,
+    )
+
+    assert created == {
+        "source": "ctp_ticks",
+        "master": explicit_master,
+        "callback": on_tick,
+        "poll_interval_ms": 3,
+        "xfast": True,
+        "row_factory": zippy.Row,
+        "instrument_ids": None,
+    }
+
+
+def test_row_reuses_exact_dict_values_without_copy() -> None:
+    values: dict[str, object] = {
+        "instrument_id": "IF2606",
+        "last_price": 4102.5,
+    }
+
+    row = zippy.Row(values)
+
+    assert row._values is values
+    values["last_price"] = 4103.0
+    assert row["last_price"] == 4103.0
+    assert row.to_dict() == {
+        "instrument_id": "IF2606",
+        "last_price": 4103.0,
+    }
+
+
+def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    explicit_master = object()
+    instrument_ids = ["IF2606", "IF2607"]
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber(
+        "ctp_ticks",
+        callback=lambda row: None,
+        master=explicit_master,
+        instrument_ids=instrument_ids,
+    )
+
+    assert created["instrument_ids"] is instrument_ids
+    assert created["row_factory"] is zippy.Row
+
+
+def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            callback: object,
+            master: object | None = None,
+            *,
+            poll_interval_ms: int | None = None,
+            xfast: bool = False,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["callback"] = callback
+            created["master"] = master
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> "FakeStreamSubscriber":
+            created["started"] = True
+            return self
+
+    callback = lambda row: None
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "StreamSubscriber", FakeStreamSubscriber)
+
+    subscriber = zippy.subscribe(
+        "ctp_ticks",
+        callback=callback,
+        master=explicit_master,
+        instrument_ids=("IF2606", "IF2607"),
+    )
+
+    assert isinstance(subscriber, FakeStreamSubscriber)
+    assert created == {
+        "source": "ctp_ticks",
+        "callback": callback,
+        "master": explicit_master,
+        "poll_interval_ms": 1,
+        "xfast": False,
+        "instrument_ids": ("IF2606", "IF2607"),
+        "started": True,
+    }
+
+
+def test_subscribe_row_mode_defaults_to_low_latency_poll_interval(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber("ctp_ticks", callback=lambda row: None, master=explicit_master)
+
+    assert created["poll_interval_ms"] == 1
+    assert created["row_factory"] is zippy.Row
+    assert created["instrument_ids"] is None
+
+
+def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber(
+        "ctp_ticks",
+        callback=lambda table: None,
+        master=explicit_master,
+        _table_callback=True,
+    )
+
+    assert created["poll_interval_ms"] == 10
+    assert created["row_factory"] is None
+    assert created["instrument_ids"] is None
+
+
+def test_subscribe_registers_default_master_process_before_native_subscriber(
+    monkeypatch,
+) -> None:
+    created: dict[str, object] = {}
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.process_id_value: str | None = None
+            self.registered_apps: list[str] = []
+
+        def process_id(self) -> str | None:
+            return self.process_id_value
+
+        def register_process(self, app: str) -> None:
+            self.process_id_value = "proc_1"
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            return None
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 10,
+            xfast: bool = False,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            assert master.process_id() == "proc_1"
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    master = FakeMaster()
+    zippy._set_default_master(master, None, 10.0)
+
+    try:
+        zippy.StreamSubscriber("ctp_ticks", callback=lambda row: None)
+
+        assert master.registered_apps == ["subscribe.ctp_ticks"]
+        assert created["source"] == "ctp_ticks"
+        assert created["master"] is master
+        assert created["row_factory"] is zippy.Row
+        assert created["instrument_ids"] is None
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_read_from_uses_default_master(monkeypatch) -> None:
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object, bool]] = []
+
+        def read_from(
+            self,
+            stream_name: str,
+            instrument_ids: object = None,
+            xfast: bool = False,
+        ) -> str:
+            self.calls.append((stream_name, instrument_ids, xfast))
+            return "reader"
+
+    fake_master = FakeMaster()
+    monkeypatch.setattr(zippy, "_DEFAULT_MASTER", fake_master)
+
+    reader = zippy.read_from("ctp_ticks", instrument_ids=["IF2606"], xfast=True)
+
+    assert reader == "reader"
+    assert fake_master.calls == [("ctp_ticks", ["IF2606"], True)]
+
+
+def test_read_from_registers_default_master_process_before_reading(monkeypatch) -> None:
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.process_id_value: str | None = None
+            self.registered_apps: list[str] = []
+            self.calls: list[tuple[str, object, bool]] = []
+
+        def process_id(self) -> str | None:
+            return self.process_id_value
+
+        def register_process(self, app: str) -> None:
+            self.process_id_value = "proc_1"
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            return None
+
+        def read_from(
+            self,
+            stream_name: str,
+            instrument_ids: object = None,
+            xfast: bool = False,
+        ) -> str:
+            assert self.process_id() == "proc_1"
+            self.calls.append((stream_name, instrument_ids, xfast))
+            return "reader"
+
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    master = FakeMaster()
+    zippy._set_default_master(master, None, 10.0)
+
+    try:
+        reader = zippy.read_from("ctp_ticks", instrument_ids=["IF2606"], xfast=True)
+
+        assert reader == "reader"
+        assert master.registered_apps == ["read_from.ctp_ticks"]
+        assert master.calls == [("ctp_ticks", ["IF2606"], True)]
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_query_object_exposes_schema_stream_info_and_snapshot(monkeypatch, tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    stream_info = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "descriptor_generation": 2,
+    }
+    parquet_file = tmp_path / "persisted.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4102.5],
+            },
+            schema=schema,
+        ),
+        parquet_file,
+    )
+    persisted_file = {
+        "file_path": str(parquet_file),
+        "row_count": 1,
+    }
+    snapshot = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "active_committed_row_high_watermark": 12,
+        "sealed_segments": [],
+        "persisted_files": [persisted_file],
+        "descriptor_generation": 2,
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def stream_info(self) -> dict[str, object]:
+            return stream_info
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            batch = pa.record_batch(
+                {
+                    "instrument_id": ["IF2606"],
+                    "last_price": [4102.5],
+                },
+                schema=schema,
+            )
+            return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    assert query.schema() == schema
+    assert query.stream_info() == stream_info
+    assert query.snapshot() == snapshot
+    assert query.persisted_files() == [persisted_file]
+    assert query.scan_live().read_all().num_rows == 1
+    assert query.scan_persisted().count_rows() == 1
+
+
+def test_query_tail_backfills_from_persisted_without_duplicate_live_segments(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    older_file = tmp_path / "segment-1.parquet"
+    overlap_file = tmp_path / "segment-2.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2604", "IF2605"],
+                "last_price": [4099.5, 4100.5],
+            },
+            schema=schema,
+        ),
+        older_file,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4101.5],
+            },
+            schema=schema,
+        ),
+        overlap_file,
+    )
+    live_table = pa.table(
+        {
+            "instrument_id": ["IF2606", "IF2607"],
+            "last_price": [4101.5, 4102.5],
+        },
+        schema=schema,
+    )
+    snapshot = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "active_segment_descriptor": {
+            "segment_id": 3,
+            "generation": 0,
+        },
+        "active_committed_row_high_watermark": 1,
+        "sealed_segments": [
+            {
+                "segment_id": 2,
+                "generation": 0,
+            }
+        ],
+        "persisted_files": [
+            {
+                "file_path": str(older_file),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+            },
+            {
+                "file_path": str(overlap_file),
+                "row_count": 1,
+                "source_segment_id": 2,
+                "source_generation": 0,
+            },
+        ],
+        "descriptor_generation": 3,
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def tail(self, n: int) -> pa.Table:
+            assert n == 4
+            return live_table
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    latest = query.tail(4)
+
+    assert latest.column("instrument_id").to_pylist() == [
+        "IF2604",
+        "IF2605",
+        "IF2606",
+        "IF2607",
+    ]
+    assert latest.column("last_price").to_pylist() == [4099.5, 4100.5, 4101.5, 4102.5]
+
+
+def test_query_collect_and_reader_merge_persisted_and_live_without_duplicates(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    older_file = tmp_path / "segment-1.parquet"
+    overlap_file = tmp_path / "segment-2.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2604", "IF2605"],
+                "last_price": [4099.5, 4100.5],
+            },
+            schema=schema,
+        ),
+        older_file,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4101.5],
+            },
+            schema=schema,
+        ),
+        overlap_file,
+    )
+    live_batch = pa.record_batch(
+        {
+            "instrument_id": ["IF2606", "IF2607"],
+            "last_price": [4101.5, 4102.5],
+        },
+        schema=schema,
+    )
+    snapshot = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "active_segment_descriptor": {
+            "segment_id": 3,
+            "generation": 0,
+        },
+        "active_committed_row_high_watermark": 1,
+        "sealed_segments": [
+            {
+                "segment_id": 2,
+                "generation": 0,
+            }
+        ],
+        "persisted_files": [
+            {
+                "file_path": str(older_file),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+            },
+            {
+                "file_path": str(overlap_file),
+                "row_count": 1,
+                "source_segment_id": 2,
+                "source_generation": 0,
+            },
+        ],
+        "descriptor_generation": 3,
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    collected = query.collect()
+    from_reader = query.reader().read_all()
+
+    assert collected.column("instrument_id").to_pylist() == [
+        "IF2604",
+        "IF2605",
+        "IF2606",
+        "IF2607",
+    ]
+    assert from_reader.column("instrument_id").to_pylist() == [
+        "IF2604",
+        "IF2605",
+        "IF2606",
+        "IF2607",
+    ]
+
+
+def test_query_conversion_helpers_use_collect(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    table = pa.table(
+        {
+            "instrument_id": ["IF2606"],
+            "last_price": [4102.5],
+        },
+        schema=schema,
+    )
+    collect_calls = 0
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    def collect() -> pa.Table:
+        nonlocal collect_calls
+        collect_calls += 1
+        return table
+
+    query.collect = collect
+
+    assert query.to_pyarrow() is table
+
+    polars_frame = query.to_polars()
+    assert isinstance(polars_frame, pl.DataFrame)
+    assert polars_frame["instrument_id"].to_list() == ["IF2606"]
+
+    class FakeTable:
+        def to_pandas(self, **kwargs: object) -> tuple[str, dict[str, object]]:
+            return ("pandas", kwargs)
+
+    query.collect = lambda: FakeTable()
+
+    assert query.to_pandas(split_blocks=True) == ("pandas", {"split_blocks": True})
+    assert collect_calls == 2
+
+
+def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("dt", pa.int64()),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("bid_price_1", pa.float64()),
+            ("ask_price_1", pa.float64()),
+        ]
+    )
+    live_batch = pa.record_batch(
+        {
+            "dt": [1, 2, 3, 4],
+            "instrument_id": ["IF2606", "IF2606", "IF2607", "IF2606"],
+            "last_price": [3999.0, 4102.5, 4103.5, 4104.5],
+            "bid_price_1": [3998.0, 4102.0, 4103.0, 4104.0],
+            "ask_price_1": [3999.0, 4102.5, 4103.5, 4104.8],
+        },
+        schema=schema,
+    )
+    snapshot = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "active_segment_descriptor": {
+            "segment_id": 1,
+            "generation": 0,
+        },
+        "active_committed_row_high_watermark": 4,
+        "sealed_segments": [],
+        "persisted_files": [],
+        "descriptor_generation": 1,
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+    filtered = (
+        query.select(
+            [
+                zippy.col("dt"),
+                zippy.col("instrument_id"),
+                (zippy.col("ask_price_1") - zippy.col("bid_price_1")).alias("spread"),
+            ]
+        )
+        .where(
+            (zippy.col("instrument_id") == "IF2606")
+            & (zippy.col("last_price") > 4000.0)
+        )
+        .between(zippy.col("dt"), 2, 4)
+    )
+
+    table = filtered.tail(1)
+    frame = filtered.to_polars()
+
+    assert table.column_names == ["dt", "instrument_id", "spread"]
+    assert table.column("dt").to_pylist() == [4]
+    assert table.column("spread").to_pylist() == pytest.approx([0.8])
+    assert frame["dt"].to_list() == [2, 4]
+    assert frame["spread"].to_list() == pytest.approx([0.5, 0.8])
+    assert query.collect().column_names == [
+        "dt",
+        "instrument_id",
+        "last_price",
+        "bid_price_1",
+        "ask_price_1",
+    ]
+
+
+def test_read_table_replaces_query_api(monkeypatch) -> None:
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    table = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    assert isinstance(table, zippy.Table)
+    assert table.source == "ctp_ticks"
+    assert not hasattr(zippy, "Query")
+    assert not hasattr(zippy, "query")
+    assert "Query" not in zippy.__all__
+    assert "query" not in zippy.__all__
+
+
+def test_archive_compatibility_aliases_are_removed() -> None:
+    assert not hasattr(zippy, "ParquetArchive")
+    assert "ParquetArchive" not in zippy.__all__
+    assert not hasattr(zippy.Table, "archive_files")
+    assert not hasattr(zippy.Table, "scan_archive")
+    assert not hasattr(zippy.MasterClient, "publish_archive_file")
+
+
+def test_connect_sets_default_master_for_query_tail(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("query_test")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+
+    writer = zippy._internal._SegmentTestWriter("openctp_ticks", tick_schema, row_capacity=16)
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+    writer.append_tick(1777017601000000000, "IF2607", 4104.5)
+    client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+
+    latest = zippy.read_table("openctp_ticks").tail(10)
+
+    assert latest.num_rows == 2
+    assert latest.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
+    assert latest.column("last_price").to_pylist() == [4102.5, 4104.5]
+
+    if reset_default_master is not None:
+        reset_default_master()
+    server.stop()
+
+
+def test_subscribe_uses_default_master_and_invokes_callback_with_live_row(
+    tmp_path: Path,
+) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("subscriber_test")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+
+    writer = zippy._internal._SegmentTestWriter("openctp_ticks", tick_schema, row_capacity=16)
+    client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+
+    received: list[zippy.Row] = []
+    ready = threading.Event()
+
+    def on_tick(row: zippy.Row) -> None:
+        received.append(row)
+        ready.set()
+
+    subscriber = zippy.subscribe(
+        source="openctp_ticks",
+        callback=on_tick,
+        poll_interval_ms=1,
+    )
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+
+    try:
+        assert ready.wait(timeout=2.0)
+        assert isinstance(received[-1], zippy.Row)
+        assert received[-1]["instrument_id"] == "IF2606"
+        assert received[-1]["last_price"] == 4102.5
+        assert received[-1].to_dict()["last_price"] == 4102.5
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_subscribe_filters_instrument_ids_before_row_callback(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("subscriber_filter_test")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+
+    writer = zippy._internal._SegmentTestWriter("openctp_ticks", tick_schema, row_capacity=16)
+    client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+
+    received: list[str] = []
+    matched = threading.Event()
+    unexpected = threading.Event()
+
+    def on_tick(row: zippy.Row) -> None:
+        instrument_id = str(row["instrument_id"])
+        received.append(instrument_id)
+        if instrument_id == "IF2606":
+            matched.set()
+        else:
+            unexpected.set()
+
+    subscriber = zippy.subscribe(
+        source="openctp_ticks",
+        callback=on_tick,
+        poll_interval_ms=1,
+        instrument_ids=["IF2606"],
+    )
+
+    try:
+        writer.append_tick(1777017600000000000, "IF2607", 4104.5)
+        assert not unexpected.wait(timeout=0.1)
+
+        writer.append_tick(1777017601000000000, "IF2606", 4102.5)
+        assert matched.wait(timeout=2.0)
+        assert not unexpected.is_set()
+        assert received == ["IF2606"]
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_subscribe_table_uses_default_master_and_invokes_callback_with_live_table(
+    tmp_path: Path,
+) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("subscriber_test")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+
+    writer = zippy._internal._SegmentTestWriter("openctp_ticks", tick_schema, row_capacity=16)
+    client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+
+    received: list[pa.Table] = []
+    ready = threading.Event()
+
+    def on_table(table: pa.Table) -> None:
+        received.append(table)
+        ready.set()
+
+    subscriber = zippy.subscribe_table(
+        source="openctp_ticks",
+        callback=on_table,
+        poll_interval_ms=1,
+    )
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+
+    try:
+        assert ready.wait(timeout=2.0)
+        assert received[-1].schema == tick_schema
+        assert received[-1].column("instrument_id").to_pylist() == ["IF2606"]
+        assert received[-1].column("last_price").to_pylist() == [4102.5]
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_pipeline_stream_table_publishes_descriptor_for_query_tail(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    zippy.connect(uri=control_endpoint)
+    pipeline = (
+        zippy.Pipeline("test_ingest")
+        .stream_table("openctp_ticks", schema=tick_schema)
+        .start()
+    )
+    pipeline.write(
+        {
+            "dt": [1777017600000000000, 1777017601000000000],
+            "instrument_id": ["IF2606", "IF2607"],
+            "last_price": [4102.5, 4104.5],
+        }
+    )
+
+    try:
+        latest = zippy.read_table("openctp_ticks").tail(10)
+        assert latest.num_rows == 2
+        assert latest.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
+        assert latest.column("last_price").to_pylist() == [4102.5, 4104.5]
+    finally:
+        pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_pipeline_source_stream_table_lifecycle_feeds_query_tail(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class OneShotHandle:
+        def __init__(self, sink) -> None:
+            self.sink = sink
+            self.stopped = threading.Event()
+            self.thread = threading.Thread(target=self._run)
+            self.thread.start()
+
+        def _run(self) -> None:
+            self.sink.emit_hello("openctp_ticks")
+            self.sink.emit_data(
+                {
+                    "dt": [1777017600000000000],
+                    "instrument_id": ["IF2606"],
+                    "last_price": [4102.5],
+                }
+            )
+            self.stopped.wait(timeout=5.0)
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+        def join(self) -> None:
+            self.thread.join(timeout=5.0)
+
+    class OneShotSource:
+        def __init__(self) -> None:
+            self.handle: OneShotHandle | None = None
+
+        def _zippy_output_schema(self) -> pa.Schema:
+            return tick_schema
+
+        def _zippy_source_name(self) -> str:
+            return "mock_openctp"
+
+        def _zippy_start(self, sink) -> OneShotHandle:
+            self.handle = OneShotHandle(sink)
+            return self.handle
+
+    zippy.connect(uri=control_endpoint)
+    source = OneShotSource()
+    pipeline = (
+        zippy.Pipeline("test_ingest")
+        .source(source)
+        .stream_table("openctp_ticks", schema=tick_schema)
+        .start()
+    )
+
+    try:
+        deadline = time.time() + 2.0
+        latest = zippy.read_table("openctp_ticks").tail(10)
+        while latest.num_rows == 0 and time.time() < deadline:
+            time.sleep(0.01)
+            latest = zippy.read_table("openctp_ticks").tail(10)
+
+        assert latest.num_rows == 1
+        assert latest.column("instrument_id").to_pylist() == ["IF2606"]
+        assert latest.column("last_price").to_pylist() == [4102.5]
+    finally:
+        pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+    assert source.handle is not None
+    assert source.handle.stopped.is_set()
+
+
+def test_pipeline_stream_table_infers_schema_from_python_source(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class IdleHandle:
+        def __init__(self) -> None:
+            self.stopped = threading.Event()
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+        def join(self) -> None:
+            self.stopped.wait(timeout=5.0)
+
+    class SchemaOnlySource:
+        def _zippy_output_schema(self) -> pa.Schema:
+            return tick_schema
+
+        def _zippy_source_name(self) -> str:
+            return "mock_openctp"
+
+        def _zippy_start(self, sink) -> IdleHandle:
+            sink.emit_hello("openctp_ticks")
+            return IdleHandle()
+
+    zippy.connect(uri=control_endpoint)
+    pipeline = (
+        zippy.Pipeline("test_ingest")
+        .source(SchemaOnlySource())
+        .stream_table("openctp_ticks")
+        .start()
+    )
+
+    try:
+        stream = zippy.master().get_stream("openctp_ticks")
+        assert stream["schema"]["fields"][0]["name"] == "dt"
+        assert stream["schema"]["fields"][1]["name"] == "instrument_id"
+        assert stream["schema"]["fields"][2]["name"] == "last_price"
+    finally:
+        pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_pipeline_source_uses_python_source_control_plane_metadata() -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.source_records: list[tuple[str, str, str, object]] = []
+
+        def process_id(self) -> str | None:
+            return "proc_1"
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            self.source_records.append((source_name, source_type, output_stream, config))
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+    class MetadataSource:
+        def _zippy_output_schema(self) -> pa.Schema:
+            return tick_schema
+
+        def _zippy_source_name(self) -> str:
+            return "openctp_md"
+
+        def _zippy_source_type(self) -> str:
+            return "openctp"
+
+        def _zippy_start(self, sink) -> object:
+            raise RuntimeError("metadata test does not start source")
+
+    master = FakeMaster()
+    zippy.Pipeline("test_ingest", master=master).source(MetadataSource()).stream_table(
+        "openctp_ticks"
+    )
+
+    assert master.source_records == [
+        ("openctp_md", "openctp", "openctp_ticks", {}),
+    ]
+
+
+def test_pipeline_stream_table_persist_publishes_master_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    created: dict[str, object] = {}
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.persisted_files: list[tuple[str, dict[str, object]]] = []
+            self.persist_events: list[tuple[str, dict[str, object]]] = []
+
+        def process_id(self) -> str | None:
+            return "proc_1"
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+        def publish_persisted_file(
+            self,
+            stream_name: str,
+            persisted_file: dict[str, object],
+        ) -> None:
+            self.persisted_files.append((stream_name, persisted_file))
+
+        def publish_persist_event(
+            self,
+            stream_name: str,
+            persist_event: dict[str, object],
+        ) -> None:
+            self.persist_events.append((stream_name, persist_event))
+
+    class FakeStreamTableEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            created["args"] = args
+            created["kwargs"] = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    master = FakeMaster()
+
+    zippy.Pipeline("test_ingest", master=master).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        persist_path=zippy.ParquetPersist(tmp_path / "ctp_ticks"),
+    )
+
+    kwargs = created["kwargs"]
+    assert kwargs["persist_path"] == str(tmp_path / "ctp_ticks")
+    assert callable(kwargs["persist_publisher"])
+    assert callable(kwargs["retention_guard"])
+
+    kwargs["persist_publisher"](
+        json.dumps(
+            {
+                "file_path": str(tmp_path / "ctp_ticks" / "part.parquet"),
+                "row_count": 1,
+            }
+        ).encode("utf-8")
+    )
+
+    assert master.persisted_files == [
+        (
+            "openctp_ticks",
+            {
+                "file_path": str(tmp_path / "ctp_ticks" / "part.parquet"),
+                "row_count": 1,
+            },
+        )
+    ]
+
+    kwargs["persist_publisher"](
+        json.dumps(
+            {
+                "persist_event_type": "persist_failed",
+                "source_segment_id": 1,
+                "error": "publisher failed",
+            }
+        ).encode("utf-8")
+    )
+
+    assert master.persist_events == [
+        (
+            "openctp_ticks",
+            {
+                "persist_event_type": "persist_failed",
+                "source_segment_id": 1,
+                "error": "publisher failed",
+            },
+        )
+    ]
+
+
+def test_pipeline_stream_table_uses_master_config_defaults(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    created: dict[str, object] = {}
+
+    class FakeMaster:
+        def process_id(self) -> str | None:
+            return "proc_1"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "log": {"level": "info"},
+                "table": {
+                    "row_capacity": 2048,
+                    "retention_segments": 4,
+                    "persist": {
+                        "enabled": True,
+                        "method": "parquet",
+                        "data_dir": str(tmp_path),
+                        "partition": {
+                            "dt_column": "dt",
+                            "id_column": "instrument_id",
+                            "dt_part": "%Y%m",
+                        },
+                    },
+                },
+            }
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+        def publish_persisted_file(self, stream_name: str, persisted_file: object) -> None:
+            return None
+
+    class FakeStreamTableEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            created["kwargs"] = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+
+    zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+    )
+
+    kwargs = created["kwargs"]
+    assert kwargs["row_capacity"] == 2048
+    assert kwargs["retention_segments"] == 4
+    assert kwargs["persist_path"] == str(tmp_path / "openctp_ticks")
+    assert kwargs["dt_column"] == "dt"
+    assert kwargs["id_column"] == "instrument_id"
+    assert kwargs["dt_part"] == "%Y%m"
+    assert callable(kwargs["persist_publisher"])
+    assert callable(kwargs["retention_guard"])
+
+
+def test_pipeline_stream_table_explicit_persist_none_overrides_master_default(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    created: dict[str, object] = {}
+
+    class FakeMaster:
+        def process_id(self) -> str | None:
+            return "proc_1"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 2048,
+                    "persist": {
+                        "enabled": True,
+                        "method": "parquet",
+                        "data_dir": str(tmp_path),
+                    },
+                },
+            }
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+    class FakeStreamTableEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            created["kwargs"] = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+
+    zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        persist=None,
+    )
+
+    kwargs = created["kwargs"]
+    assert kwargs["row_capacity"] == 2048
+    assert kwargs["persist_path"] is None
+    assert kwargs["persist_publisher"] is None
+
+
+def test_pipeline_stream_table_rejects_legacy_partition_dt_part_format() -> None:
+    with pytest.raises(ValueError, match="dt_part"):
+        zippy.Pipeline("test_ingest", master=object()).stream_table(
+            "openctp_ticks",
+            schema=pa.schema([("dt", pa.timestamp("ns", tz="UTC"))]),
+            dt_column="dt",
+            dt_part="YYYYMM",
+        )
+
+
+def test_pipeline_stream_table_passes_retention_segments_to_engine(monkeypatch) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    created: dict[str, object] = {}
+
+    class FakeMaster:
+        def process_id(self) -> str | None:
+            return "proc_1"
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+    class FakeStreamTableEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            created["kwargs"] = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+
+    zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        retention_segments=2,
+    )
+
+    assert created["kwargs"]["retention_segments"] == 2
+
+
+def test_stream_table_engine_persists_rollover_parquet_without_master(
+    tmp_path: Path,
+) -> None:
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    engine = zippy.StreamTableEngine(
+        name="openctp_ticks",
+        input_schema=tick_schema,
+        target=zippy.NullPublisher(),
+        row_capacity=2,
+        persist_path=str(tmp_path),
+    )
+
+    engine.start()
+    try:
+        engine.write(
+            {
+                "instrument_id": ["IF2606", "IF2607", "IF2608"],
+                "dt": [
+                    1777017600000000000,
+                    1777017601000000000,
+                    1777017602000000000,
+                ],
+                "last_price": [4102.5, 4104.5, 4108.0],
+            }
+        )
+    finally:
+        engine.stop()
+
+    parquet_files = list(tmp_path.glob("*.parquet"))
+    assert len(parquet_files) == 1
+    archived = pq.read_table(parquet_files[0])
+    assert archived.num_rows == 2
+    assert archived.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
 
 
 def test_master_client_heartbeat_keeps_registered_process_alive(tmp_path: Path) -> None:

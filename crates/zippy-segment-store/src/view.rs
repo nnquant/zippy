@@ -1,14 +1,25 @@
 use std::sync::Arc;
 
 use crate::{
+    layout::ColumnLayout,
     segment::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_GENERATION_OFFSET,
         SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC, SHM_MAGIC_OFFSET,
         SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET,
         SHM_SEGMENT_ID_OFFSET,
     },
-    ActiveSegmentDescriptor, SealedSegmentHandle, ShmRegion,
+    ActiveSegmentDescriptor, ColumnSpec, ColumnType, CompiledSchema, SealedSegmentHandle,
+    ShmRegion, ZippySegmentStoreError,
 };
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SegmentCellValue {
+    Null,
+    Int64(i64),
+    Float64(f64),
+    Utf8(String),
+    TimestampNs(i64),
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum RowSpanBacking {
@@ -122,6 +133,209 @@ impl RowSpanView {
     pub fn end_row(&self) -> usize {
         self.end_row
     }
+
+    /// 返回当前 span 的行数。
+    pub fn row_count(&self) -> usize {
+        self.end_row - self.start_row
+    }
+
+    /// 返回当前 span 的 schema。
+    pub fn schema(&self) -> &CompiledSchema {
+        match &self.backing {
+            RowSpanBacking::Sealed(handle) => handle.schema(),
+            RowSpanBacking::Active(attachment) => attachment.descriptor.schema(),
+        }
+    }
+
+    /// 直接读取 span 内某行某列的标量值，不构造 Arrow array 或 RecordBatch。
+    pub fn cell_value(
+        &self,
+        row_offset: usize,
+        field_name: &str,
+    ) -> Result<SegmentCellValue, ZippySegmentStoreError> {
+        if row_offset >= self.row_count() {
+            return Err(ZippySegmentStoreError::Lifecycle(
+                "row offset out of bounds",
+            ));
+        }
+        let absolute_row = self.start_row + row_offset;
+        let spec = self
+            .schema()
+            .columns()
+            .iter()
+            .find(|spec| spec.name == field_name)
+            .ok_or(ZippySegmentStoreError::Schema("missing column"))?;
+
+        match &self.backing {
+            RowSpanBacking::Sealed(handle) => self.sealed_cell_value(handle, spec, absolute_row),
+            RowSpanBacking::Active(attachment) => {
+                self.active_cell_value(attachment, spec, absolute_row)
+            }
+        }
+    }
+
+    fn sealed_cell_value(
+        &self,
+        handle: &SealedSegmentHandle,
+        spec: &ColumnSpec,
+        row: usize,
+    ) -> Result<SegmentCellValue, ZippySegmentStoreError> {
+        if spec.nullable {
+            let validity = handle
+                .inner
+                .validity
+                .get(spec.name)
+                .ok_or(ZippySegmentStoreError::Schema("missing validity"))?;
+            if !validity[row] {
+                return Ok(SegmentCellValue::Null);
+            }
+        }
+
+        match &spec.data_type {
+            ColumnType::Int64 => handle
+                .inner
+                .i64_columns
+                .get(spec.name)
+                .map(|values| SegmentCellValue::Int64(values[row]))
+                .ok_or(ZippySegmentStoreError::Schema("missing int64 column")),
+            ColumnType::Float64 => handle
+                .inner
+                .f64_columns
+                .get(spec.name)
+                .map(|values| SegmentCellValue::Float64(values[row]))
+                .ok_or(ZippySegmentStoreError::Schema("missing float64 column")),
+            ColumnType::Utf8 => {
+                let values = handle
+                    .inner
+                    .utf8_columns
+                    .get(spec.name)
+                    .ok_or(ZippySegmentStoreError::Schema("missing utf8 column"))?;
+                let start = values.offsets[row] as usize;
+                let end = values.offsets[row + 1] as usize;
+                let value = std::str::from_utf8(&values.values[start..end])
+                    .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
+                Ok(SegmentCellValue::Utf8(value.to_string()))
+            }
+            ColumnType::TimestampNsTz(_) => handle
+                .inner
+                .i64_columns
+                .get(spec.name)
+                .map(|values| SegmentCellValue::TimestampNs(values[row]))
+                .ok_or(ZippySegmentStoreError::Schema("missing timestamp column")),
+        }
+    }
+
+    fn active_cell_value(
+        &self,
+        attachment: &ActiveSegmentAttachment,
+        spec: &ColumnSpec,
+        row: usize,
+    ) -> Result<SegmentCellValue, ZippySegmentStoreError> {
+        let layout = attachment
+            .descriptor
+            .layout()
+            .column(spec.name)
+            .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
+
+        if spec.nullable && !read_active_validity(attachment, layout, row)? {
+            return Ok(SegmentCellValue::Null);
+        }
+
+        match spec.data_type {
+            ColumnType::Int64 => Ok(SegmentCellValue::Int64(read_active_i64(
+                attachment, layout, row,
+            )?)),
+            ColumnType::Float64 => Ok(SegmentCellValue::Float64(read_active_f64(
+                attachment, layout, row,
+            )?)),
+            ColumnType::Utf8 => Ok(SegmentCellValue::Utf8(read_active_utf8(
+                attachment, layout, row,
+            )?)),
+            ColumnType::TimestampNsTz(_) => Ok(SegmentCellValue::TimestampNs(read_active_i64(
+                attachment, layout, row,
+            )?)),
+        }
+    }
+}
+
+fn read_active_validity(
+    attachment: &ActiveSegmentAttachment,
+    layout: &ColumnLayout,
+    row: usize,
+) -> Result<bool, ZippySegmentStoreError> {
+    if layout.validity_len == 0 {
+        return Ok(true);
+    }
+    let byte_index = row / 8;
+    let bit_index = row % 8;
+    let mut byte = [0_u8; 1];
+    attachment.shm_region.read_at(
+        attachment.descriptor.payload_offset() + layout.validity_offset + byte_index,
+        &mut byte,
+    )?;
+    Ok((byte[0] & (1 << bit_index)) != 0)
+}
+
+fn read_active_i64(
+    attachment: &ActiveSegmentAttachment,
+    layout: &ColumnLayout,
+    row: usize,
+) -> Result<i64, ZippySegmentStoreError> {
+    let mut bytes = [0_u8; 8];
+    attachment.shm_region.read_at(
+        attachment.descriptor.payload_offset() + layout.values_offset + (row * 8),
+        &mut bytes,
+    )?;
+    Ok(i64::from_ne_bytes(bytes))
+}
+
+fn read_active_f64(
+    attachment: &ActiveSegmentAttachment,
+    layout: &ColumnLayout,
+    row: usize,
+) -> Result<f64, ZippySegmentStoreError> {
+    let mut bytes = [0_u8; 8];
+    attachment.shm_region.read_at(
+        attachment.descriptor.payload_offset() + layout.values_offset + (row * 8),
+        &mut bytes,
+    )?;
+    Ok(f64::from_ne_bytes(bytes))
+}
+
+fn read_active_utf8(
+    attachment: &ActiveSegmentAttachment,
+    layout: &ColumnLayout,
+    row: usize,
+) -> Result<String, ZippySegmentStoreError> {
+    let start = read_active_u32(attachment, layout.offsets_offset + (row * 4))? as usize;
+    let end = read_active_u32(attachment, layout.offsets_offset + ((row + 1) * 4))? as usize;
+    if start > end || end > layout.values_len {
+        return Err(ZippySegmentStoreError::Shmem(format!(
+            "invalid utf8 offset range start=[{start}] end=[{end}] values_len=[{}]",
+            layout.values_len
+        )));
+    }
+    let len = end - start;
+    let mut bytes = vec![0_u8; len];
+    attachment.shm_region.read_at(
+        attachment.descriptor.payload_offset() + layout.values_offset + start,
+        &mut bytes,
+    )?;
+    std::str::from_utf8(&bytes)
+        .map(str::to_owned)
+        .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))
+}
+
+fn read_active_u32(
+    attachment: &ActiveSegmentAttachment,
+    relative_offset: usize,
+) -> Result<u32, ZippySegmentStoreError> {
+    let mut bytes = [0_u8; 4];
+    attachment.shm_region.read_at(
+        attachment.descriptor.payload_offset() + relative_offset,
+        &mut bytes,
+    )?;
+    Ok(u32::from_ne_bytes(bytes))
 }
 
 fn validate_active_descriptor_header(

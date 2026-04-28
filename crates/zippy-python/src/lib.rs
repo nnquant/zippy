@@ -2,12 +2,12 @@
 
 mod native_source_bridge;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hint::spin_loop;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -15,24 +15,31 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
 use tracing::{error, info};
 use zippy_core::{
-    current_log_snapshot, python_dev_version, setup_log as setup_core_log,
-    spawn_engine_with_publisher, Engine, EngineConfig, EngineHandle, EngineMetricsSnapshot,
-    EngineStatus, LateDataPolicy, LogConfig, MasterClient as CoreMasterClient, OverflowPolicy,
-    Publisher as CorePublisher, Reader as CoreBusReader, SegmentTableView, Source, SourceEvent,
-    SourceHandle, SourceMode as RustSourceMode, SourceSink, StreamHello, Writer as CoreBusWriter,
-    ZippyError,
+    current_log_snapshot, python_dev_version, resolve_control_endpoint_uri,
+    setup_log as setup_core_log, spawn_engine_with_publisher, DropTableResult, Engine,
+    EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy, LogConfig,
+    MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
+    Reader as CoreBusReader, SegmentTableView, Source, SourceEvent, SourceHandle,
+    SourceMode as RustSourceMode, SourceSink, StreamHello, StreamInfo, Writer as CoreBusWriter,
+    ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
-    ReactiveStateEngine as RustReactiveStateEngine, StreamTableEngine as RustStreamTableEngine,
+    ReactiveLatestEngine as RustReactiveLatestEngine,
+    ReactiveStateEngine as RustReactiveStateEngine,
+    StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
+    StreamTableEngine as RustStreamTableEngine, StreamTablePersistConfig,
+    StreamTablePersistPartitionSpec,
+    StreamTablePersistPublisher as RustStreamTablePersistPublisher,
+    StreamTableRetentionGuard as RustStreamTableRetentionGuard,
     TimeSeriesEngine as RustTimeSeriesEngine,
 };
 use zippy_io::{
@@ -54,8 +61,9 @@ use zippy_operators::{
     TsMeanSpec as RustTsMeanSpec, TsReturnSpec as RustTsReturnSpec, TsStdSpec as RustTsStdSpec,
 };
 use zippy_segment_store::{
-    compile_schema as compile_segment_schema, ActiveSegmentReader, ColumnSpec, ColumnType,
-    CompiledSchema, LayoutPlan, PartitionHandle, SegmentStore, SegmentStoreConfig,
+    compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
+    ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, PartitionHandle, RowSpanView,
+    SegmentCellValue, SegmentStore, SegmentStoreConfig,
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
@@ -69,15 +77,17 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
 }
 
 fn resolve_control_endpoint_path(control_endpoint: &str) -> PyResult<PathBuf> {
-    let path = if let Some(relative) = control_endpoint.strip_prefix("~/") {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            py_runtime_error("HOME is not set; cannot expand control endpoint path")
-        })?;
-        Path::new(&home).join(relative)
-    } else {
-        PathBuf::from(control_endpoint)
-    };
-    Ok(path)
+    Ok(resolve_control_endpoint_uri(control_endpoint))
+}
+
+fn resolve_uri_argument(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<String> {
+    match (uri, control_endpoint) {
+        (Some(_), Some(_)) => Err(py_value_error(
+            "only one of uri and control_endpoint may be provided",
+        )),
+        (Some(value), None) | (None, Some(value)) => Ok(value),
+        (None, None) => Ok(DEFAULT_CONTROL_ENDPOINT_URI.to_string()),
+    }
 }
 
 fn prepare_control_endpoint_path(control_endpoint: &str) -> PyResult<PathBuf> {
@@ -114,6 +124,21 @@ fn python_json_loads<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, Py
     let json = PyModule::import_bound(py, "json")?;
     json.call_method1("loads", (text,))
         .map_err(|error| py_value_error(error.to_string()))
+}
+
+fn serde_json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+    let text = serde_json::to_string(value).map_err(|error| py_value_error(error.to_string()))?;
+    Ok(python_json_loads(py, &text)?.into_py(py))
+}
+
+fn serde_json_option_to_py(
+    py: Python<'_>,
+    value: Option<&serde_json::Value>,
+) -> PyResult<PyObject> {
+    match value {
+        Some(value) => serde_json_value_to_py(py, value),
+        None => Ok(py.None()),
+    }
 }
 
 fn send_master_control_request(
@@ -350,6 +375,82 @@ struct PythonSourceBridge {
     name: String,
     output_schema: Arc<Schema>,
     mode: RustSourceMode,
+}
+
+struct PyStreamTableDescriptorPublisher {
+    callback: Py<PyAny>,
+}
+
+impl RustStreamTableDescriptorPublisher for PyStreamTableDescriptorPublisher {
+    fn publish(&self, descriptor_envelope: Vec<u8>) -> zippy_core::Result<()> {
+        Python::with_gil(|py| -> PyResult<()> {
+            let callback = self.callback.bind(py);
+            let payload = PyBytes::new_bound(py, &descriptor_envelope);
+            callback.call1((payload,))?;
+            Ok(())
+        })
+        .map_err(|error| ZippyError::Io {
+            reason: format!("stream table descriptor publisher failed error=[{}]", error),
+        })
+    }
+}
+
+struct PyStreamTablePersistPublisher {
+    callback: Py<PyAny>,
+}
+
+struct PyStreamTableRetentionGuard {
+    callback: Py<PyAny>,
+}
+
+impl RustStreamTablePersistPublisher for PyStreamTablePersistPublisher {
+    fn publish(&self, persisted_file: serde_json::Value) -> zippy_core::Result<()> {
+        let payload = serde_json::to_vec(&persisted_file).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "stream table persist metadata encode failed error=[{}]",
+                error
+            ),
+        })?;
+        Python::with_gil(|py| -> PyResult<()> {
+            let callback = self.callback.bind(py);
+            let payload = PyBytes::new_bound(py, &payload);
+            callback.call1((payload,))?;
+            Ok(())
+        })
+        .map_err(|error| ZippyError::Io {
+            reason: format!("stream table persist publisher failed error=[{}]", error),
+        })
+    }
+
+    fn publish_event(&self, persist_event: serde_json::Value) -> zippy_core::Result<()> {
+        let payload = serde_json::to_vec(&persist_event).map_err(|error| ZippyError::Io {
+            reason: format!("stream table persist event encode failed error=[{}]", error),
+        })?;
+        Python::with_gil(|py| -> PyResult<()> {
+            let callback = self.callback.bind(py);
+            let payload = PyBytes::new_bound(py, &payload);
+            callback.call1((payload,))?;
+            Ok(())
+        })
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "stream table persist event publisher failed error=[{}]",
+                error
+            ),
+        })
+    }
+}
+
+impl RustStreamTableRetentionGuard for PyStreamTableRetentionGuard {
+    fn can_release(&self, segment_id: u64, generation: u64) -> zippy_core::Result<bool> {
+        Python::with_gil(|py| -> PyResult<bool> {
+            let callback = self.callback.bind(py);
+            callback.call1((segment_id, generation))?.extract()
+        })
+        .map_err(|error| ZippyError::Io {
+            reason: format!("stream table retention guard failed error=[{}]", error),
+        })
+    }
 }
 
 impl Source for PythonSourceBridge {
@@ -790,6 +891,156 @@ fn compile_segment_schema_from_arrow(schema: &Schema) -> PyResult<CompiledSchema
         .collect::<PyResult<Vec<_>>>()?;
 
     compile_segment_schema(&columns).map_err(py_value_error)
+}
+
+fn compile_segment_schema_from_stream_metadata(
+    schema: &serde_json::Value,
+) -> PyResult<CompiledSchema> {
+    let fields = schema
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| py_value_error("stream schema metadata missing fields"))?;
+    let columns = fields
+        .iter()
+        .map(|field| {
+            let name = field
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| py_value_error("stream schema field missing name"))?;
+            let data_type = field
+                .get("segment_type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| py_value_error("stream schema field missing segment_type"))?;
+            let nullable = field
+                .get("nullable")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| py_value_error("stream schema field missing nullable"))?;
+            let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+            let timezone = field.get("timezone").and_then(serde_json::Value::as_str);
+            let data_type = parse_segment_schema_metadata_data_type(data_type, timezone)?;
+            Ok(if nullable {
+                ColumnSpec::nullable(name, data_type)
+            } else {
+                ColumnSpec::new(name, data_type)
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+
+    compile_segment_schema(&columns).map_err(py_value_error)
+}
+
+fn arrow_schema_from_stream_metadata(schema: &serde_json::Value) -> PyResult<Schema> {
+    let fields = schema
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| py_value_error("stream schema metadata missing fields"))?;
+    let fields = fields
+        .iter()
+        .map(|field| {
+            let name = field
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| py_value_error("stream schema field missing name"))?;
+            let segment_type = field
+                .get("segment_type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| py_value_error("stream schema field missing segment_type"))?;
+            let nullable = field
+                .get("nullable")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| py_value_error("stream schema field missing nullable"))?;
+            let timezone = field.get("timezone").and_then(serde_json::Value::as_str);
+            let data_type = parse_arrow_schema_metadata_data_type(segment_type, timezone)?;
+            let metadata = string_map_from_json_value(field.get("metadata"))?;
+            Ok(Field::new(name, data_type, nullable).with_metadata(metadata))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let metadata = string_map_from_json_value(schema.get("metadata"))?;
+    Ok(Schema::new_with_metadata(fields, metadata))
+}
+
+fn parse_segment_schema_metadata_data_type(
+    segment_type: &str,
+    timezone: Option<&str>,
+) -> PyResult<ColumnType> {
+    if segment_type == "int64" {
+        return Ok(ColumnType::Int64);
+    }
+    if segment_type == "float64" {
+        return Ok(ColumnType::Float64);
+    }
+    if segment_type == "utf8" {
+        return Ok(ColumnType::Utf8);
+    }
+    if segment_type == "timestamp_ns_tz" {
+        let timezone = timezone.ok_or_else(|| {
+            py_value_error("timestamp_ns_tz stream schema field missing timezone")
+        })?;
+        let timezone: &'static str = Box::leak(timezone.to_string().into_boxed_str());
+        return Ok(ColumnType::TimestampNsTz(timezone));
+    }
+    if segment_type == "timestamp_ns" {
+        return Err(py_value_error(
+            "segment stream timestamp columns must include an explicit timezone",
+        ));
+    }
+
+    Err(py_value_error(format!(
+        "unsupported segment stream field type segment_type=[{}]",
+        segment_type
+    )))
+}
+
+fn parse_arrow_schema_metadata_data_type(
+    segment_type: &str,
+    timezone: Option<&str>,
+) -> PyResult<DataType> {
+    if segment_type == "int64" {
+        return Ok(DataType::Int64);
+    }
+    if segment_type == "float64" {
+        return Ok(DataType::Float64);
+    }
+    if segment_type == "utf8" {
+        return Ok(DataType::Utf8);
+    }
+    if segment_type == "timestamp_ns_tz" {
+        let timezone = timezone.ok_or_else(|| {
+            py_value_error("timestamp_ns_tz stream schema field missing timezone")
+        })?;
+        return Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some(timezone.into()),
+        ));
+    }
+    if segment_type == "timestamp_ns" {
+        return Ok(DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    Err(py_value_error(format!(
+        "unsupported stream field type segment_type=[{}]",
+        segment_type
+    )))
+}
+
+fn string_map_from_json_value(
+    value: Option<&serde_json::Value>,
+) -> PyResult<HashMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| py_value_error("stream schema metadata must be an object"))?;
+    object
+        .iter()
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| py_value_error("stream schema metadata values must be strings"))?;
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect()
 }
 
 #[pyclass]
@@ -1414,8 +1665,9 @@ struct MasterClient {
 #[pymethods]
 impl MasterClient {
     #[new]
-    #[pyo3(signature = (control_endpoint))]
-    fn new(control_endpoint: String) -> PyResult<Self> {
+    #[pyo3(signature = (uri=None, *, control_endpoint=None))]
+    fn new(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<Self> {
+        let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
         let resolved_control_endpoint = resolve_control_endpoint_path(&control_endpoint)?;
         let resolved_control_endpoint = resolved_control_endpoint.display().to_string();
         let client = CoreMasterClient::connect(&resolved_control_endpoint)
@@ -1459,18 +1711,15 @@ impl MasterClient {
             Schema::from_pyarrow_bound(schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        let request = PyDict::new_bound(py);
-        let payload = PyDict::new_bound(py);
-        payload.set_item("stream_name", stream_name.clone())?;
-        payload.set_item("buffer_size", buffer_size)?;
-        payload.set_item("frame_size", frame_size)?;
-        request.set_item("RegisterStream", payload)?;
-        send_master_control_request(
-            py,
-            &self.control_endpoint,
-            request.as_any(),
-            "StreamRegistered",
-        )?;
+        py.allow_threads(|| {
+            self.client.lock().unwrap().register_stream(
+                &stream_name,
+                Arc::clone(&schema),
+                buffer_size,
+                frame_size,
+            )
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))?;
         self.schemas.lock().unwrap().insert(stream_name, schema);
         Ok(())
     }
@@ -1607,6 +1856,74 @@ impl MasterClient {
         .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    fn publish_persisted_file(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        persisted_file: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let persisted_file_text = python_json_dumps(py, persisted_file)?;
+        let persisted_file = serde_json::from_str::<serde_json::Value>(&persisted_file_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .publish_persisted_file(&stream_name, persisted_file)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn publish_persist_event(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        persist_event: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let persist_event_text = python_json_dumps(py, persist_event)?;
+        let persist_event = serde_json::from_str::<serde_json::Value>(&persist_event_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .publish_persist_event(&stream_name, persist_event)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn acquire_segment_reader_lease(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        source_segment_id: u64,
+        source_generation: u64,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            self.client.lock().unwrap().acquire_segment_reader_lease(
+                &stream_name,
+                source_segment_id,
+                source_generation,
+            )
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
+    fn release_segment_reader_lease(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        lease_id: String,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .release_segment_reader_lease(&stream_name, &lease_id)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     fn get_segment_descriptor(&self, py: Python<'_>, stream_name: String) -> PyResult<PyObject> {
         let descriptor = py
             .allow_threads(|| {
@@ -1679,6 +1996,30 @@ impl MasterClient {
         for stream in streams {
             let dict = PyDict::new_bound(py);
             dict.set_item("stream_name", stream.stream_name)?;
+            dict.set_item("schema", serde_json_value_to_py(py, &stream.schema)?)?;
+            dict.set_item("schema_hash", stream.schema_hash)?;
+            dict.set_item("data_path", stream.data_path)?;
+            dict.set_item("descriptor_generation", stream.descriptor_generation)?;
+            dict.set_item(
+                "active_segment_descriptor",
+                serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
+            )?;
+            dict.set_item(
+                "sealed_segments",
+                serde_json_value_to_py(py, &stream.sealed_segments.into())?,
+            )?;
+            dict.set_item(
+                "persisted_files",
+                serde_json_value_to_py(py, &stream.persisted_files.clone().into())?,
+            )?;
+            dict.set_item(
+                "persist_events",
+                serde_json_value_to_py(py, &stream.persist_events.clone().into())?,
+            )?;
+            dict.set_item(
+                "segment_reader_leases",
+                serde_json_value_to_py(py, &stream.segment_reader_leases.clone().into())?,
+            )?;
             dict.set_item("buffer_size", stream.buffer_size)?;
             dict.set_item("frame_size", stream.frame_size)?;
             dict.set_item("writer_process_id", stream.writer_process_id)?;
@@ -1698,12 +2039,65 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         let dict = PyDict::new_bound(py);
         dict.set_item("stream_name", stream.stream_name)?;
+        dict.set_item("schema", serde_json_value_to_py(py, &stream.schema)?)?;
+        dict.set_item("schema_hash", stream.schema_hash)?;
+        dict.set_item("data_path", stream.data_path)?;
+        dict.set_item("descriptor_generation", stream.descriptor_generation)?;
+        dict.set_item(
+            "active_segment_descriptor",
+            serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
+        )?;
+        dict.set_item(
+            "sealed_segments",
+            serde_json_value_to_py(py, &stream.sealed_segments.into())?,
+        )?;
+        dict.set_item(
+            "persisted_files",
+            serde_json_value_to_py(py, &stream.persisted_files.clone().into())?,
+        )?;
+        dict.set_item(
+            "persist_events",
+            serde_json_value_to_py(py, &stream.persist_events.clone().into())?,
+        )?;
+        dict.set_item(
+            "segment_reader_leases",
+            serde_json_value_to_py(py, &stream.segment_reader_leases.clone().into())?,
+        )?;
         dict.set_item("buffer_size", stream.buffer_size)?;
         dict.set_item("frame_size", stream.frame_size)?;
         dict.set_item("writer_process_id", stream.writer_process_id)?;
         dict.set_item("reader_count", stream.reader_count)?;
         dict.set_item("status", stream.status)?;
         Ok(dict.into_py(py))
+    }
+
+    fn get_config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let config = self
+            .client
+            .lock()
+            .unwrap()
+            .get_config()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        serde_json_value_to_py(py, &config.to_json_value())
+    }
+
+    #[pyo3(signature = (table_name, drop_persisted=true))]
+    fn drop_table(
+        &self,
+        py: Python<'_>,
+        table_name: String,
+        drop_persisted: bool,
+    ) -> PyResult<PyObject> {
+        let result = py
+            .allow_threads(|| {
+                self.client
+                    .lock()
+                    .unwrap()
+                    .drop_table(&table_name, drop_persisted)
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        self.schemas.lock().unwrap().remove(&table_name);
+        Ok(drop_table_result_to_pydict(py, &result)?.into_py(py))
     }
 
     fn process_id(&self) -> PyResult<Option<String>> {
@@ -1720,6 +2114,925 @@ impl MasterClient {
     }
 }
 
+fn stream_info_to_pydict<'py>(
+    py: Python<'py>,
+    stream: &StreamInfo,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("stream_name", &stream.stream_name)?;
+    dict.set_item("schema", serde_json_value_to_py(py, &stream.schema)?)?;
+    dict.set_item("schema_hash", &stream.schema_hash)?;
+    dict.set_item("data_path", &stream.data_path)?;
+    dict.set_item("descriptor_generation", stream.descriptor_generation)?;
+    dict.set_item(
+        "active_segment_descriptor",
+        serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
+    )?;
+    dict.set_item(
+        "sealed_segments",
+        serde_json_value_to_py(py, &stream.sealed_segments.clone().into())?,
+    )?;
+    dict.set_item(
+        "persisted_files",
+        serde_json_value_to_py(py, &stream.persisted_files.clone().into())?,
+    )?;
+    dict.set_item(
+        "persist_events",
+        serde_json_value_to_py(py, &stream.persist_events.clone().into())?,
+    )?;
+    dict.set_item(
+        "segment_reader_leases",
+        serde_json_value_to_py(py, &stream.segment_reader_leases.clone().into())?,
+    )?;
+    dict.set_item("buffer_size", stream.buffer_size)?;
+    dict.set_item("frame_size", stream.frame_size)?;
+    dict.set_item("writer_process_id", stream.writer_process_id.clone())?;
+    dict.set_item("reader_count", stream.reader_count)?;
+    dict.set_item("status", &stream.status)?;
+    Ok(dict)
+}
+
+fn drop_table_result_to_pydict<'py>(
+    py: Python<'py>,
+    result: &DropTableResult,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("table_name", &result.table_name)?;
+    dict.set_item("dropped", result.dropped)?;
+    dict.set_item("sources_removed", result.sources_removed)?;
+    dict.set_item("engines_removed", result.engines_removed)?;
+    dict.set_item("sinks_removed", result.sinks_removed)?;
+    dict.set_item("persisted_files_deleted", result.persisted_files_deleted)?;
+    Ok(dict)
+}
+
+#[pyclass]
+struct Query {
+    source: String,
+    master: SharedMasterClient,
+    schema: Arc<Schema>,
+    segment_schema: CompiledSchema,
+}
+
+struct SegmentReaderLeaseGuard {
+    master: SharedMasterClient,
+    source: String,
+    lease_id: Option<String>,
+}
+
+struct SegmentReaderLeaseSet {
+    _leases: Vec<SegmentReaderLeaseGuard>,
+}
+
+impl SegmentReaderLeaseGuard {
+    fn acquire(
+        master: SharedMasterClient,
+        source: impl Into<String>,
+        descriptor: &serde_json::Value,
+    ) -> zippy_core::Result<Self> {
+        let source = source.into();
+        let (segment_id, generation) = descriptor_segment_identity(descriptor)?;
+        let lease_id = master
+            .lock()
+            .unwrap()
+            .acquire_segment_reader_lease(&source, segment_id, generation)?;
+        Ok(Self {
+            master,
+            source,
+            lease_id: Some(lease_id),
+        })
+    }
+}
+
+impl Drop for SegmentReaderLeaseGuard {
+    fn drop(&mut self) {
+        let Some(lease_id) = self.lease_id.take() else {
+            return;
+        };
+        if let Err(error) = self
+            .master
+            .lock()
+            .unwrap()
+            .release_segment_reader_lease(&self.source, &lease_id)
+        {
+            error!(
+                event = "release_segment_reader_lease",
+                source = %self.source,
+                lease_id = %lease_id,
+                error = %error,
+                "failed to release segment reader lease"
+            );
+        }
+    }
+}
+
+impl SegmentReaderLeaseSet {
+    fn acquire_for_descriptors(
+        master: SharedMasterClient,
+        source: &str,
+        active_descriptor: &serde_json::Value,
+        sealed_descriptors: &[serde_json::Value],
+    ) -> zippy_core::Result<Self> {
+        let mut leases = Vec::with_capacity(sealed_descriptors.len() + 1);
+        for descriptor in sealed_descriptors {
+            leases.push(SegmentReaderLeaseGuard::acquire(
+                Arc::clone(&master),
+                source,
+                descriptor,
+            )?);
+        }
+        leases.push(SegmentReaderLeaseGuard::acquire(
+            master,
+            source,
+            active_descriptor,
+        )?);
+        Ok(Self { _leases: leases })
+    }
+
+    fn acquire_for_active(
+        master: SharedMasterClient,
+        source: &str,
+        active_descriptor: &serde_json::Value,
+    ) -> zippy_core::Result<Self> {
+        Ok(Self {
+            _leases: vec![SegmentReaderLeaseGuard::acquire(
+                master,
+                source,
+                active_descriptor,
+            )?],
+        })
+    }
+}
+
+#[pymethods]
+impl Query {
+    #[new]
+    #[pyo3(signature = (source, master))]
+    fn new(py: Python<'_>, source: String, master: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let master = master
+            .extract::<PyRef<'_, MasterClient>>()
+            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
+        let shared_master = Arc::clone(&master.client);
+        let stream = py
+            .allow_threads(|| shared_master.lock().unwrap().get_stream(&source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        if stream.data_path != "segment" {
+            return Err(py_value_error(format!(
+                "query only supports segment streams data_path=[{}]",
+                stream.data_path
+            )));
+        }
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+
+        Ok(Self {
+            source,
+            master: shared_master,
+            schema,
+            segment_schema,
+        })
+    }
+
+    fn tail(&self, py: Python<'_>, n: usize) -> PyResult<PyObject> {
+        let stream = py
+            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Err(py_runtime_error(format!(
+                "segment descriptor is not published source=[{}]",
+                self.source
+            )));
+        };
+        let segment_schema = self.segment_schema.clone();
+        let master = Arc::clone(&self.master);
+        let source = self.source.clone();
+        let batch = py
+            .allow_threads(|| {
+                let _leases = SegmentReaderLeaseSet::acquire_for_descriptors(
+                    master,
+                    &source,
+                    &descriptor,
+                    &stream.sealed_segments,
+                )?;
+                tail_live_segment_record_batch(
+                    &descriptor,
+                    &stream.sealed_segments,
+                    segment_schema,
+                    n,
+                )
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        record_batch_to_pyarrow_table(py, batch)
+    }
+
+    fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn stream_info(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stream = py
+            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        Ok(stream_info_to_pydict(py, &stream)?.into_py(py))
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stream = py
+            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Err(py_runtime_error(format!(
+                "segment descriptor is not published source=[{}]",
+                self.source
+            )));
+        };
+        let segment_schema = self.segment_schema.clone();
+        let master = Arc::clone(&self.master);
+        let source = self.source.clone();
+        let active_committed_row_high_watermark = py
+            .allow_threads(|| {
+                let _leases =
+                    SegmentReaderLeaseSet::acquire_for_active(master, &source, &descriptor)?;
+                active_committed_row_high_watermark(&descriptor, segment_schema)
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let snapshot =
+            query_snapshot_value(&stream, descriptor, active_committed_row_high_watermark)
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+        serde_json_value_to_py(py, &snapshot)
+    }
+
+    fn scan_live(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let stream = py
+            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Err(py_runtime_error(format!(
+                "segment descriptor is not published source=[{}]",
+                self.source
+            )));
+        };
+        let segment_schema = self.segment_schema.clone();
+        let master = Arc::clone(&self.master);
+        let source = self.source.clone();
+        let batches = py
+            .allow_threads(|| {
+                let _leases = SegmentReaderLeaseSet::acquire_for_descriptors(
+                    master,
+                    &source,
+                    &descriptor,
+                    &stream.sealed_segments,
+                )?;
+                let active_committed_row_high_watermark =
+                    active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
+                live_segment_record_batches(
+                    &descriptor,
+                    &stream.sealed_segments,
+                    segment_schema,
+                    active_committed_row_high_watermark,
+                )
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        record_batches_to_pyarrow_record_batch_reader(py, self.schema.as_ref(), batches)
+    }
+}
+
+fn query_snapshot_value(
+    stream: &StreamInfo,
+    descriptor: serde_json::Value,
+    active_committed_row_high_watermark: usize,
+) -> zippy_core::Result<serde_json::Value> {
+    let mut active_segment_descriptor = descriptor;
+    if let Some(object) = active_segment_descriptor.as_object_mut() {
+        object.remove("sealed_segments");
+    }
+
+    Ok(serde_json::json!({
+        "stream_name": stream.stream_name,
+        "schema": stream.schema,
+        "schema_hash": stream.schema_hash,
+        "data_path": stream.data_path,
+        "descriptor_generation": stream.descriptor_generation,
+        "active_segment_descriptor": active_segment_descriptor,
+        "active_committed_row_high_watermark": active_committed_row_high_watermark,
+        "sealed_segments": stream.sealed_segments.clone(),
+        "persisted_files": stream.persisted_files.clone(),
+        "persist_events": stream.persist_events.clone(),
+        "segment_reader_leases": stream.segment_reader_leases.clone(),
+    }))
+}
+
+fn tail_live_segment_record_batch(
+    descriptor: &serde_json::Value,
+    sealed_descriptors: &[serde_json::Value],
+    segment_schema: CompiledSchema,
+    n: usize,
+) -> zippy_core::Result<RecordBatch> {
+    let mut remaining = n;
+    let mut batches_reversed = Vec::new();
+
+    let active_batch = tail_single_descriptor_record_batch(descriptor, segment_schema.clone(), n)?;
+    remaining = remaining.saturating_sub(active_batch.num_rows());
+    batches_reversed.push(active_batch);
+
+    for sealed_descriptor in sealed_descriptors.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let batch = tail_single_descriptor_record_batch(
+            sealed_descriptor,
+            segment_schema.clone(),
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(batch.num_rows());
+        batches_reversed.push(batch);
+    }
+
+    batches_reversed.reverse();
+    concat_tail_batches(batches_reversed)
+}
+
+fn tail_single_descriptor_record_batch(
+    descriptor: &serde_json::Value,
+    segment_schema: CompiledSchema,
+    n: usize,
+) -> zippy_core::Result<RecordBatch> {
+    let (committed, active_descriptor) =
+        active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
+    let start_row = committed.saturating_sub(n);
+    let span = RowSpanView::from_active_descriptor(active_descriptor, start_row, committed)
+        .map_err(|reason| ZippyError::InvalidState { status: reason })?;
+    span.as_record_batch().map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
+}
+
+fn live_segment_record_batches(
+    descriptor: &serde_json::Value,
+    sealed_descriptors: &[serde_json::Value],
+    segment_schema: CompiledSchema,
+    active_committed_row_high_watermark: usize,
+) -> zippy_core::Result<Vec<RecordBatch>> {
+    let mut batches = Vec::with_capacity(sealed_descriptors.len() + 1);
+
+    for sealed_descriptor in sealed_descriptors {
+        let batch = descriptor_record_batch_until(sealed_descriptor, segment_schema.clone(), None)?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+
+    let active_batch = descriptor_record_batch_until(
+        descriptor,
+        segment_schema,
+        Some(active_committed_row_high_watermark),
+    )?;
+    if active_batch.num_rows() > 0 {
+        batches.push(active_batch);
+    }
+
+    Ok(batches)
+}
+
+fn descriptor_record_batch_until(
+    descriptor: &serde_json::Value,
+    segment_schema: CompiledSchema,
+    end_row_limit: Option<usize>,
+) -> zippy_core::Result<RecordBatch> {
+    let (committed, active_descriptor) =
+        active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
+    let end_row = end_row_limit.map_or(committed, |limit| limit.min(committed));
+    let span = RowSpanView::from_active_descriptor(active_descriptor, 0, end_row)
+        .map_err(|reason| ZippyError::InvalidState { status: reason })?;
+    span.as_record_batch().map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
+}
+
+fn active_descriptor_with_committed_row_count(
+    descriptor: &serde_json::Value,
+    segment_schema: CompiledSchema,
+) -> zippy_core::Result<(usize, ActiveSegmentDescriptor)> {
+    let row_capacity = descriptor_row_capacity(descriptor)?;
+    let layout = LayoutPlan::for_schema(&segment_schema, row_capacity).map_err(|error| {
+        ZippyError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
+    let reader = ActiveSegmentReader::from_descriptor_envelope(
+        &descriptor_envelope,
+        segment_schema.clone(),
+        layout.clone(),
+    )
+    .map_err(segment_zippy_error)?;
+    let committed = reader.committed_row_count().map_err(segment_zippy_error)?;
+    let active_descriptor =
+        ActiveSegmentDescriptor::from_envelope_bytes(&descriptor_envelope, segment_schema, layout)
+            .map_err(|reason| ZippyError::InvalidConfig {
+                reason: reason.to_string(),
+            })?;
+    Ok((committed, active_descriptor))
+}
+
+fn active_committed_row_high_watermark(
+    descriptor: &serde_json::Value,
+    segment_schema: CompiledSchema,
+) -> zippy_core::Result<usize> {
+    let row_capacity = descriptor_row_capacity(descriptor)?;
+    let layout = LayoutPlan::for_schema(&segment_schema, row_capacity).map_err(|error| {
+        ZippyError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
+    ActiveSegmentReader::from_descriptor_envelope(&descriptor_envelope, segment_schema, layout)
+        .map_err(segment_zippy_error)?
+        .committed_row_count()
+        .map_err(segment_zippy_error)
+}
+
+fn concat_tail_batches(mut batches: Vec<RecordBatch>) -> zippy_core::Result<RecordBatch> {
+    if batches.len() == 1 {
+        return Ok(batches.remove(0));
+    }
+    let schema = batches
+        .first()
+        .ok_or_else(|| ZippyError::InvalidState {
+            status: "tail produced no record batches",
+        })?
+        .schema();
+    concat_batches(&schema, batches.iter()).map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
+}
+
+fn descriptor_row_capacity(descriptor: &serde_json::Value) -> zippy_core::Result<usize> {
+    let row_capacity = descriptor
+        .get("row_capacity")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing row_capacity".to_string(),
+        })?;
+    usize::try_from(row_capacity).map_err(|_| ZippyError::InvalidConfig {
+        reason: "segment descriptor row_capacity overflows usize".to_string(),
+    })
+}
+
+fn record_batch_to_pyarrow_table(py: Python<'_>, batch: RecordBatch) -> PyResult<PyObject> {
+    let py_batch = batch
+        .to_pyarrow(py)
+        .map_err(|error| py_value_error(error.to_string()))?;
+    let pyarrow = PyModule::import_bound(py, "pyarrow")
+        .map_err(|error| py_runtime_error(format!("failed to import pyarrow error=[{}]", error)))?;
+    let batches = PyList::empty_bound(py);
+    batches.append(py_batch)?;
+    Ok(pyarrow
+        .getattr("Table")?
+        .call_method1("from_batches", (batches,))?
+        .into_py(py))
+}
+
+fn record_batches_to_pyarrow_record_batch_reader(
+    py: Python<'_>,
+    schema: &Schema,
+    batches: Vec<RecordBatch>,
+) -> PyResult<PyObject> {
+    let pyarrow = PyModule::import_bound(py, "pyarrow")
+        .map_err(|error| py_runtime_error(format!("failed to import pyarrow error=[{}]", error)))?;
+    let py_schema = schema
+        .to_pyarrow(py)
+        .map_err(|error| py_value_error(error.to_string()))?;
+    let py_batches = PyList::empty_bound(py);
+    for batch in batches {
+        py_batches.append(
+            batch
+                .to_pyarrow(py)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        )?;
+    }
+    Ok(pyarrow
+        .getattr("RecordBatchReader")?
+        .call_method1("from_batches", (py_schema, py_batches))?
+        .into_py(py))
+}
+
+const SEGMENT_DESCRIPTOR_WATCH_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Debug)]
+struct DescriptorUpdate {
+    text: String,
+    descriptor: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriberReadOutcome {
+    Rows,
+    Empty,
+}
+
+fn descriptor_update_from_value(
+    descriptor: serde_json::Value,
+) -> std::result::Result<DescriptorUpdate, String> {
+    let text = serde_json::to_string(&descriptor).map_err(|error| error.to_string())?;
+    Ok(DescriptorUpdate { text, descriptor })
+}
+
+fn take_descriptor_update_after_poll(
+    read_outcome: SubscriberReadOutcome,
+    descriptor_updates: &Mutex<Option<DescriptorUpdate>>,
+    current_descriptor_text: &str,
+) -> Option<DescriptorUpdate> {
+    if read_outcome != SubscriberReadOutcome::Empty {
+        return None;
+    }
+
+    let mut guard = descriptor_updates.lock().unwrap();
+    match guard.take() {
+        Some(update) if update.text != current_descriptor_text => Some(update),
+        _ => None,
+    }
+}
+
+fn take_descriptor_refresh_error(error_slot: &Mutex<Option<String>>) -> Option<String> {
+    error_slot.lock().unwrap().take()
+}
+
+fn apply_segment_descriptor_update(
+    reader: &mut ActiveSegmentReader,
+    descriptor_text: &mut String,
+    update: DescriptorUpdate,
+    segment_schema: &CompiledSchema,
+    reader_lease: Option<&mut SegmentReaderLeaseGuard>,
+) -> std::result::Result<(), String> {
+    let next_lease = match reader_lease.as_ref() {
+        Some(lease) => Some(
+            SegmentReaderLeaseGuard::acquire(
+                Arc::clone(&lease.master),
+                lease.source.clone(),
+                &update.descriptor,
+            )
+            .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let (next_reader, _) = build_active_segment_reader(&update.descriptor, segment_schema)
+        .map_err(|error| error.to_string())?;
+    *reader = next_reader;
+    *descriptor_text = update.text;
+    if let (Some(reader_lease), Some(next_lease)) = (reader_lease, next_lease) {
+        *reader_lease = next_lease;
+    }
+    Ok(())
+}
+
+fn spawn_segment_descriptor_watcher(
+    running: Arc<AtomicBool>,
+    master: SharedMasterClient,
+    stream_name: String,
+    mut descriptor_generation: u64,
+    descriptor_updates: Arc<Mutex<Option<DescriptorUpdate>>>,
+    descriptor_refresh_error: Arc<Mutex<Option<String>>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            let client = master.lock().unwrap().clone();
+            let update = match client.wait_segment_descriptor(
+                &stream_name,
+                descriptor_generation,
+                SEGMENT_DESCRIPTOR_WATCH_TIMEOUT,
+            ) {
+                Ok(Some(update)) => update,
+                Ok(None) => continue,
+                Err(error) => {
+                    *descriptor_refresh_error.lock().unwrap() = Some(error.to_string());
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            };
+
+            descriptor_generation = update.descriptor_generation;
+            match descriptor_update_from_value(update.descriptor) {
+                Ok(update) => {
+                    *descriptor_updates.lock().unwrap() = Some(update);
+                }
+                Err(error) => {
+                    *descriptor_refresh_error.lock().unwrap() = Some(error);
+                    running.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+    })
+}
+
+#[pyclass]
+struct StreamSubscriber {
+    source: String,
+    master: SharedMasterClient,
+    segment_schema: CompiledSchema,
+    callback: Py<PyAny>,
+    row_factory: Option<Py<PyAny>>,
+    instrument_filter: Option<BTreeSet<String>>,
+    poll_interval: Duration,
+    xfast: bool,
+    running: Arc<AtomicBool>,
+    join_handle: Arc<Mutex<Option<JoinHandle<std::result::Result<(), String>>>>>,
+}
+
+#[pymethods]
+impl StreamSubscriber {
+    #[new]
+    #[pyo3(signature = (source, master, callback, poll_interval_ms=1, xfast=false, row_factory=None, instrument_ids=None))]
+    fn new(
+        py: Python<'_>,
+        source: String,
+        master: &Bound<'_, PyAny>,
+        callback: Py<PyAny>,
+        poll_interval_ms: u64,
+        xfast: bool,
+        row_factory: Option<Py<PyAny>>,
+        instrument_ids: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if poll_interval_ms == 0 && !xfast {
+            return Err(py_value_error(
+                "poll_interval_ms must be greater than zero unless xfast is true",
+            ));
+        }
+        let instrument_filter =
+            parse_instrument_ids(instrument_ids)?.map(|values| values.into_iter().collect());
+        if instrument_filter.is_some() && row_factory.is_none() {
+            return Err(py_value_error(
+                "instrument_ids is only supported by stream row callbacks",
+            ));
+        }
+        let master = master
+            .extract::<PyRef<'_, MasterClient>>()
+            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
+        let shared_master = Arc::clone(&master.client);
+        let stream = py
+            .allow_threads(|| shared_master.lock().unwrap().get_stream(&source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        if stream.data_path != "segment" {
+            return Err(py_value_error(format!(
+                "stream subscriber only supports segment streams data_path=[{}]",
+                stream.data_path
+            )));
+        }
+        let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+
+        Ok(Self {
+            source,
+            master: shared_master,
+            segment_schema,
+            callback,
+            row_factory,
+            instrument_filter,
+            poll_interval: Duration::from_millis(poll_interval_ms),
+            xfast,
+            running: Arc::new(AtomicBool::new(false)),
+            join_handle: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+        let mut guard = self.join_handle.lock().unwrap();
+        if guard.is_some() {
+            return Err(py_runtime_error("stream subscriber is already started"));
+        }
+
+        let stream = py
+            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let descriptor = py
+            .allow_threads(|| {
+                self.master
+                    .lock()
+                    .unwrap()
+                    .get_segment_descriptor(&self.source)
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?
+            .ok_or_else(|| {
+                py_runtime_error(format!(
+                    "segment descriptor is not published source=[{}]",
+                    self.source
+                ))
+            })?;
+        let mut descriptor_text = serde_json::to_string(&descriptor)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let mut reader_lease = py
+            .allow_threads(|| {
+                SegmentReaderLeaseGuard::acquire(
+                    Arc::clone(&self.master),
+                    self.source.clone(),
+                    &descriptor,
+                )
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let mut reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+
+        self.running.store(true, Ordering::SeqCst);
+        let running = Arc::clone(&self.running);
+        let master = Arc::clone(&self.master);
+        let source = self.source.clone();
+        let segment_schema = self.segment_schema.clone();
+        let callback = self.callback.clone_ref(py);
+        let row_factory = self
+            .row_factory
+            .as_ref()
+            .map(|factory| factory.clone_ref(py));
+        let instrument_filter = self.instrument_filter.clone();
+        let poll_interval = self.poll_interval;
+        let xfast = self.xfast;
+
+        *guard = Some(thread::spawn(move || {
+            let descriptor_updates = Arc::new(Mutex::new(None));
+            let descriptor_refresh_error = Arc::new(Mutex::new(None));
+            let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
+                Arc::clone(&running),
+                Arc::clone(&master),
+                source.clone(),
+                stream.descriptor_generation,
+                Arc::clone(&descriptor_updates),
+                Arc::clone(&descriptor_refresh_error),
+            );
+
+            let result = (|| -> std::result::Result<(), String> {
+                while running.load(Ordering::SeqCst) {
+                    if let Some(error) =
+                        take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
+                    {
+                        return Err(error);
+                    }
+
+                    match reader.read_available().map_err(|error| error.to_string())? {
+                        Some(span) => {
+                            let _ = take_descriptor_update_after_poll(
+                                SubscriberReadOutcome::Rows,
+                                descriptor_updates.as_ref(),
+                                &descriptor_text,
+                            );
+                            if let Some(row_factory) = row_factory.as_ref() {
+                                invoke_stream_row_callbacks(
+                                    &callback,
+                                    row_factory,
+                                    span,
+                                    instrument_filter.as_ref(),
+                                )?;
+                            } else {
+                                let batch =
+                                    span.as_record_batch().map_err(|error| error.to_string())?;
+                                invoke_stream_callback(&callback, batch)?;
+                            }
+                        }
+                        None => {
+                            if let Some(update) = take_descriptor_update_after_poll(
+                                SubscriberReadOutcome::Empty,
+                                descriptor_updates.as_ref(),
+                                &descriptor_text,
+                            ) {
+                                apply_segment_descriptor_update(
+                                    &mut reader,
+                                    &mut descriptor_text,
+                                    update,
+                                    &segment_schema,
+                                    Some(&mut reader_lease),
+                                )
+                                .map_err(|error| error.to_string())?;
+                                continue;
+                            }
+
+                            if xfast {
+                                spin_loop();
+                            } else {
+                                thread::sleep(poll_interval);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(error) =
+                    take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
+                {
+                    return Err(error);
+                }
+                Ok(())
+            })();
+
+            running.store(false, Ordering::SeqCst);
+            let _ = descriptor_refresh_handle.join();
+            result
+        }));
+        Ok(())
+    }
+
+    fn stop(&mut self) -> PyResult<()> {
+        self.running.store(false, Ordering::SeqCst);
+        let join_handle = self.join_handle.lock().unwrap().take();
+        if let Some(join_handle) = join_handle {
+            join_stream_subscriber_thread(join_handle)?;
+        }
+        Ok(())
+    }
+
+    fn join(&mut self) -> PyResult<()> {
+        let join_handle = self.join_handle.lock().unwrap().take();
+        if let Some(join_handle) = join_handle {
+            join_stream_subscriber_thread(join_handle)?;
+        }
+        Ok(())
+    }
+}
+
+fn invoke_stream_callback(
+    callback: &Py<PyAny>,
+    batch: RecordBatch,
+) -> std::result::Result<(), String> {
+    Python::with_gil(|py| -> PyResult<()> {
+        let table = record_batch_to_pyarrow_table(py, batch)?;
+        callback.call1(py, (table,))?;
+        Ok(())
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn invoke_stream_row_callbacks(
+    callback: &Py<PyAny>,
+    row_factory: &Py<PyAny>,
+    span: RowSpanView,
+    instrument_filter: Option<&BTreeSet<String>>,
+) -> std::result::Result<(), String> {
+    Python::with_gil(|py| -> PyResult<()> {
+        for row_index in 0..span.row_count() {
+            if !row_matches_instrument_filter(&span, row_index, instrument_filter)? {
+                continue;
+            }
+            let values = row_span_row_to_pydict(py, &span, row_index)?;
+            let row = row_factory.call1(py, (values,))?;
+            callback.call1(py, (row,))?;
+        }
+        Ok(())
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn row_matches_instrument_filter(
+    span: &RowSpanView,
+    row_offset: usize,
+    instrument_filter: Option<&BTreeSet<String>>,
+) -> PyResult<bool> {
+    let Some(instrument_filter) = instrument_filter else {
+        return Ok(true);
+    };
+    let value = span
+        .cell_value(row_offset, "instrument_id")
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    match value {
+        SegmentCellValue::Utf8(instrument_id) => Ok(instrument_filter.contains(&instrument_id)),
+        SegmentCellValue::Null => Ok(false),
+        _ => Err(py_value_error(
+            "instrument_id column must be utf8 when instrument_ids is used",
+        )),
+    }
+}
+
+fn row_span_row_to_pydict<'py>(
+    py: Python<'py>,
+    span: &RowSpanView,
+    row_offset: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let values = PyDict::new_bound(py);
+    for column in span.schema().columns() {
+        let value = span
+            .cell_value(row_offset, column.name)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        values.set_item(column.name, segment_cell_value_to_py(py, value)?)?;
+    }
+    Ok(values)
+}
+
+fn segment_cell_value_to_py(py: Python<'_>, value: SegmentCellValue) -> PyResult<PyObject> {
+    Ok(match value {
+        SegmentCellValue::Null => py.None(),
+        SegmentCellValue::Int64(value) | SegmentCellValue::TimestampNs(value) => value.into_py(py),
+        SegmentCellValue::Float64(value) => value.into_py(py),
+        SegmentCellValue::Utf8(value) => value.into_py(py),
+    })
+}
+
+fn join_stream_subscriber_thread(
+    join_handle: JoinHandle<std::result::Result<(), String>>,
+) -> PyResult<()> {
+    join_handle
+        .join()
+        .map_err(|_| py_runtime_error("stream subscriber thread panicked"))?
+        .map_err(py_runtime_error)
+}
+
 #[pyclass(name = "MasterServer")]
 struct MasterDaemon {
     control_endpoint: String,
@@ -1730,8 +3043,9 @@ struct MasterDaemon {
 #[pymethods]
 impl MasterDaemon {
     #[new]
-    #[pyo3(signature = (control_endpoint))]
-    fn new(control_endpoint: String) -> PyResult<Self> {
+    #[pyo3(signature = (uri=None, *, control_endpoint=None))]
+    fn new(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<Self> {
+        let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
         let resolved_control_endpoint = resolve_control_endpoint_path(&control_endpoint)?
             .display()
             .to_string();
@@ -2149,8 +3463,7 @@ impl Source for SegmentSourceBridge {
     }
 
     fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
-        const DESCRIPTOR_REFRESH_INTERVAL: Duration = Duration::from_millis(1);
-
+        let stream = self.master.lock().unwrap().get_stream(&self.stream_name)?;
         let descriptor = self
             .master
             .lock()
@@ -2160,6 +3473,11 @@ impl Source for SegmentSourceBridge {
                 status: "segment descriptor is not published",
             })?;
         let mut descriptor_text = serde_json::to_string(&descriptor).map_err(json_zippy_error)?;
+        let mut reader_lease = SegmentReaderLeaseGuard::acquire(
+            Arc::clone(&self.master),
+            self.stream_name.clone(),
+            &descriptor,
+        )?;
         let mut reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)?;
         let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
         sink.emit(SourceEvent::Hello(hello))?;
@@ -2171,36 +3489,71 @@ impl Source for SegmentSourceBridge {
         let segment_schema = self.segment_schema.clone();
         let xfast = self.xfast;
         let join_handle = thread::spawn(move || {
-            let mut next_descriptor_refresh = Instant::now() + DESCRIPTOR_REFRESH_INTERVAL;
-            while running_flag.load(Ordering::SeqCst) {
-                if Instant::now() >= next_descriptor_refresh {
-                    next_descriptor_refresh = Instant::now() + DESCRIPTOR_REFRESH_INTERVAL;
-                    if let Some(next_descriptor) = master
-                        .lock()
-                        .unwrap()
-                        .get_segment_descriptor(&stream_name)?
+            let descriptor_updates = Arc::new(Mutex::new(None));
+            let descriptor_refresh_error = Arc::new(Mutex::new(None));
+            let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
+                Arc::clone(&running_flag),
+                Arc::clone(&master),
+                stream_name.clone(),
+                stream.descriptor_generation,
+                Arc::clone(&descriptor_updates),
+                Arc::clone(&descriptor_refresh_error),
+            );
+
+            let result = (|| -> zippy_core::Result<()> {
+                while running_flag.load(Ordering::SeqCst) {
+                    if let Some(error) =
+                        take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
                     {
-                        let next_descriptor_text =
-                            serde_json::to_string(&next_descriptor).map_err(json_zippy_error)?;
-                        if next_descriptor_text != descriptor_text {
-                            let (next_reader, _) =
-                                build_active_segment_reader(&next_descriptor, &segment_schema)?;
-                            reader = next_reader;
-                            descriptor_text = next_descriptor_text;
+                        return Err(string_zippy_error(error));
+                    }
+
+                    match reader.read_available().map_err(segment_zippy_error)? {
+                        Some(span) => {
+                            let _ = take_descriptor_update_after_poll(
+                                SubscriberReadOutcome::Rows,
+                                descriptor_updates.as_ref(),
+                                &descriptor_text,
+                            );
+                            sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
+                        }
+                        None => {
+                            if let Some(update) = take_descriptor_update_after_poll(
+                                SubscriberReadOutcome::Empty,
+                                descriptor_updates.as_ref(),
+                                &descriptor_text,
+                            ) {
+                                apply_segment_descriptor_update(
+                                    &mut reader,
+                                    &mut descriptor_text,
+                                    update,
+                                    &segment_schema,
+                                    Some(&mut reader_lease),
+                                )
+                                .map_err(string_zippy_error)?;
+                                continue;
+                            }
+
+                            if xfast {
+                                spin_loop();
+                            } else {
+                                thread::sleep(Duration::from_micros(10));
+                            }
                         }
                     }
                 }
 
-                match reader.read_available().map_err(segment_zippy_error)? {
-                    Some(span) => {
-                        sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
-                    }
-                    None if xfast => spin_loop(),
-                    None => thread::sleep(Duration::from_micros(10)),
+                if let Some(error) =
+                    take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
+                {
+                    return Err(string_zippy_error(error));
                 }
-            }
+                Ok(())
+            })();
 
-            Ok(())
+            running_flag.store(false, Ordering::SeqCst);
+            let _ = descriptor_refresh_handle.join();
+            result
         });
 
         Ok(SourceHandle::new_with_stop(
@@ -2218,6 +3571,22 @@ fn active_segment_reader_from_descriptor(
     segment_schema: &CompiledSchema,
 ) -> zippy_core::Result<ActiveSegmentReader> {
     Ok(build_active_segment_reader(descriptor, segment_schema)?.0)
+}
+
+fn descriptor_segment_identity(descriptor: &serde_json::Value) -> zippy_core::Result<(u64, u64)> {
+    let segment_id = descriptor
+        .get("segment_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing segment_id".to_string(),
+        })?;
+    let generation = descriptor
+        .get("generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing generation".to_string(),
+        })?;
+    Ok((segment_id, generation))
 }
 
 fn build_active_segment_reader(
@@ -2260,6 +3629,10 @@ fn segment_zippy_error(error: zippy_segment_store::ZippySegmentStoreError) -> Zi
     }
 }
 
+fn string_zippy_error(reason: String) -> ZippyError {
+    ZippyError::Io { reason }
+}
+
 #[pyclass]
 struct ReactiveStateEngine {
     name: String,
@@ -2275,6 +3648,28 @@ struct ReactiveStateEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
+    remote_source: Option<RemoteSourceConfig>,
+    bus_source: Option<BusSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
+    python_source: Option<PythonSourceConfig>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
+}
+
+#[pyclass]
+struct ReactiveLatestEngine {
+    name: String,
+    by: Vec<String>,
+    input_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
+    archive: SharedArchive,
+    handle: SharedHandle,
+    engine: Option<RustReactiveLatestEngine>,
     remote_source: Option<RemoteSourceConfig>,
     bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
@@ -2514,11 +3909,202 @@ impl ReactiveStateEngine {
 }
 
 #[pymethods]
+impl ReactiveLatestEngine {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema=None, by=None, target=None, *, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    fn new(
+        py: Python<'_>,
+        name: String,
+        input_schema: Option<&Bound<'_, PyAny>>,
+        by: Option<&Bound<'_, PyAny>>,
+        target: Option<&Bound<'_, PyAny>>,
+        source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
+        parquet_sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
+        archive_buffer_capacity: usize,
+        xfast: bool,
+    ) -> PyResult<Self> {
+        let by = by.ok_or_else(|| py_value_error("by is required"))?;
+        let target = target.ok_or_else(|| py_value_error("target is required"))?;
+        let by = parse_by_columns(by)?;
+        let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(parquet_sink)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
+        let handle = Arc::new(Mutex::new(None));
+        let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
+
+        let named_source = source.and_then(|source| source.extract::<String>().ok());
+        let (schema, resolved_segment_source) = if let Some(input_schema) = input_schema {
+            (
+                Arc::new(
+                    Schema::from_pyarrow_bound(input_schema)
+                        .map_err(|error| py_value_error(error.to_string()))?,
+                ),
+                None,
+            )
+        } else {
+            let Some(stream_name) = named_source.as_deref() else {
+                return Err(py_value_error(
+                    "input_schema is required unless source is a stream name",
+                ));
+            };
+            let (schema, segment_source) =
+                segment_source_config_from_named_stream(py, stream_name, master, None, xfast)?;
+            (schema, Some(segment_source))
+        };
+
+        let engine = RustReactiveLatestEngine::new(&name, Arc::clone(&schema), by.clone())
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let output_schema = engine.output_schema();
+        let (source_owner, remote_source, bus_source, segment_source, python_source) =
+            if let Some(segment_source) = resolved_segment_source {
+                (None, None, None, Some(segment_source), None)
+            } else if let Some(stream_name) = named_source.as_deref() {
+                let (_, segment_source) = segment_source_config_from_named_stream(
+                    py,
+                    stream_name,
+                    master,
+                    Some(schema.as_ref()),
+                    xfast,
+                )?;
+                (None, None, None, Some(segment_source), None)
+            } else {
+                register_source(
+                    source,
+                    DownstreamLink {
+                        handle: Arc::clone(&handle),
+                        archive: Arc::clone(&archive),
+                        write_input: parquet_sink
+                            .as_ref()
+                            .map(|config| config.write_input)
+                            .unwrap_or(false),
+                    },
+                    schema.as_ref(),
+                )?
+            };
+
+        Ok(Self {
+            name,
+            by,
+            input_schema: schema,
+            output_schema,
+            target,
+            parquet_sink,
+            runtime_options,
+            status,
+            metrics,
+            archive,
+            handle,
+            engine: Some(engine),
+            remote_source,
+            bus_source,
+            segment_source,
+            python_source,
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
+        })
+    }
+
+    fn start(&mut self) -> PyResult<()> {
+        let (handle, archive) = start_runtime_engine(
+            &self.name,
+            &self.runtime_options,
+            &self.target,
+            self.parquet_sink.as_ref(),
+            self.remote_source.as_ref(),
+            self.bus_source.as_ref(),
+            self.segment_source.as_ref(),
+            self.python_source.as_ref(),
+            &self.downstreams,
+            &mut self.engine,
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
+        *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        Ok(())
+    }
+
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
+        let result = write_runtime_input(
+            py,
+            &self.handle,
+            &self.archive,
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.output_schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "reactive_latest",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            self._source_owner.is_some()
+                || self.remote_source.is_some()
+                || self.bus_source.is_some()
+                || self.segment_source.is_some()
+                || self.python_source.is_some(),
+        )?;
+        dict.set_item("by", self.by.clone())?;
+        if let Some(source) = self.segment_source.as_ref() {
+            dict.set_item("source", &source.stream_name)?;
+        }
+        Ok(dict.into_any().unbind())
+    }
+
+    fn flush(&self) -> PyResult<()> {
+        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
+    }
+}
+
+#[pymethods]
 impl StreamTableEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None))]
     fn new(
+        py: Python<'_>,
         name: String,
         input_schema: &Bound<'_, PyAny>,
         target: &Bound<'_, PyAny>,
@@ -2528,13 +4114,71 @@ impl StreamTableEngine {
         overflow_policy: Option<&Bound<'_, PyAny>>,
         archive_buffer_capacity: usize,
         xfast: bool,
+        descriptor_publisher: Option<Py<PyAny>>,
+        row_capacity: Option<usize>,
+        retention_segments: Option<usize>,
+        retention_guard: Option<Py<PyAny>>,
+        dt_column: Option<String>,
+        id_column: Option<String>,
+        dt_part: Option<String>,
+        persist_path: Option<String>,
+        persist_publisher: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        let engine = RustStreamTableEngine::new(&name, Arc::clone(&schema))
-            .map_err(|error| py_value_error(error.to_string()))?;
+        let mut engine = match row_capacity {
+            Some(row_capacity) => RustStreamTableEngine::new_with_row_capacity(
+                &name,
+                Arc::clone(&schema),
+                row_capacity,
+            ),
+            None => RustStreamTableEngine::new(&name, Arc::clone(&schema)),
+        }
+        .map_err(|error| py_value_error(error.to_string()))?;
+        if let Some(retention_segments) = retention_segments {
+            engine = engine.with_retention_segments(retention_segments);
+        }
+        if let Some(callback) = retention_guard {
+            if !callback.bind(py).is_callable() {
+                return Err(PyTypeError::new_err("retention_guard must be callable"));
+            }
+            engine =
+                engine.with_retention_guard(Arc::new(PyStreamTableRetentionGuard { callback }));
+        }
+        if let Some(callback) = descriptor_publisher {
+            if !callback.bind(py).is_callable() {
+                return Err(PyTypeError::new_err(
+                    "descriptor_publisher must be callable",
+                ));
+            }
+            engine = engine
+                .with_descriptor_publisher(Arc::new(PyStreamTableDescriptorPublisher { callback }));
+        }
+        let persist_path_provided = persist_path.is_some();
+        if let Some(path) = persist_path {
+            let mut config = StreamTablePersistConfig::new(PathBuf::from(path));
+            if dt_column.is_some() || id_column.is_some() || dt_part.is_some() {
+                let partition_spec =
+                    StreamTablePersistPartitionSpec::new(dt_column, id_column, dt_part)
+                        .map_err(|error| py_value_error(error.to_string()))?;
+                config = config.with_partition_spec(partition_spec);
+            }
+            engine = engine.with_parquet_persist(config);
+        }
+        if let Some(callback) = persist_publisher {
+            if !persist_path_provided {
+                return Err(PyValueError::new_err(
+                    "persist_path is required when persist_publisher is provided",
+                ));
+            }
+            if !callback.bind(py).is_callable() {
+                return Err(PyTypeError::new_err("persist_publisher must be callable"));
+            }
+            engine =
+                engine.with_persist_publisher(Arc::new(PyStreamTablePersistPublisher { callback }));
+        }
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(sink).map_err(|error| {
@@ -2653,6 +4297,20 @@ impl StreamTableEngine {
         dict.del_item("parquet_sink")?;
         dict.set_item("sink", parquet_sink_to_pyobject(py, &self.parquet_sink)?)?;
         Ok(dict.into_any().unbind())
+    }
+
+    fn active_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            py_runtime_error(
+                "stream table active descriptor is unavailable after the engine has started",
+            )
+        })?;
+        let envelope = engine
+            .active_descriptor_envelope_bytes()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let envelope_text =
+            std::str::from_utf8(&envelope).map_err(|error| py_value_error(error.to_string()))?;
+        Ok(python_json_loads(py, envelope_text)?.into_py(py))
     }
 
     fn flush(&self) -> PyResult<()> {
@@ -3071,6 +4729,8 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ZmqSource>()?;
     module.add_class::<MasterDaemon>()?;
     module.add_class::<MasterClient>()?;
+    module.add_class::<Query>()?;
+    module.add_class::<StreamSubscriber>()?;
     module.add_class::<BusWriter>()?;
     module.add_class::<BusReader>()?;
     module.add_class::<BusStreamTarget>()?;
@@ -3078,6 +4738,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SegmentStreamSource>()?;
     module.add_class::<SegmentTestWriter>()?;
     module.add_class::<ReactiveStateEngine>()?;
+    module.add_class::<ReactiveLatestEngine>()?;
     module.add_class::<StreamTableEngine>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
@@ -3090,10 +4751,20 @@ fn version() -> String {
 }
 
 #[pyfunction]
-fn run_master_daemon(py: Python<'_>, control_endpoint: String) -> PyResult<()> {
+#[pyo3(signature = (uri=None, *, control_endpoint=None, config=None))]
+fn run_master_daemon(
+    py: Python<'_>,
+    uri: Option<String>,
+    control_endpoint: Option<String>,
+    config: Option<String>,
+) -> PyResult<()> {
+    let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
     let control_endpoint = prepare_control_endpoint_path(&control_endpoint)?;
-    let config = MasterDaemonConfig::new(control_endpoint);
-    py.allow_threads(move || run_rust_master_daemon(config))
+    let mut daemon_config = MasterDaemonConfig::new(control_endpoint);
+    if let Some(config) = config {
+        daemon_config = daemon_config.with_config_path(PathBuf::from(config));
+    }
+    py.allow_threads(move || run_rust_master_daemon(daemon_config))
         .map_err(|error| py_runtime_error(error.to_string()))
 }
 
@@ -3182,6 +4853,26 @@ fn parse_id_filter(id_filter: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<
     }
 
     Ok(Some(values))
+}
+
+fn parse_by_columns(by: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if let Ok(value) = by.extract::<String>() {
+        if value.is_empty() {
+            return Err(py_value_error("by must not contain empty column names"));
+        }
+        return Ok(vec![value]);
+    }
+
+    let values = by
+        .extract::<Vec<String>>()
+        .map_err(|_| py_value_error("by must be a string or a sequence of strings"))?;
+    if values.is_empty() {
+        return Err(py_value_error("by must not be empty"));
+    }
+    if values.iter().any(|value| value.is_empty()) {
+        return Err(py_value_error("by must not contain empty column names"));
+    }
+    Ok(values)
 }
 
 fn parse_instrument_ids(
@@ -3285,6 +4976,58 @@ fn parse_parquet_sink(
     }))
 }
 
+fn segment_source_config_from_named_stream(
+    py: Python<'_>,
+    stream_name: &str,
+    master: Option<&Bound<'_, PyAny>>,
+    expected_schema: Option<&Schema>,
+    xfast: bool,
+) -> PyResult<(Arc<Schema>, SegmentSourceConfig)> {
+    if stream_name.is_empty() {
+        return Err(py_value_error("source stream name must not be empty"));
+    }
+
+    let master = master
+        .ok_or_else(|| py_value_error("master is required when source is a stream name"))?
+        .extract::<PyRef<'_, MasterClient>>()
+        .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
+    let shared_master = Arc::clone(&master.client);
+    let stream = py
+        .allow_threads(|| shared_master.lock().unwrap().get_stream(stream_name))
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    if stream.data_path != "segment" {
+        return Err(py_value_error(format!(
+            "source stream must use segment data path data_path=[{}]",
+            stream.data_path
+        )));
+    }
+
+    let stream_schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+    let schema = if let Some(expected_schema) = expected_schema {
+        if stream_schema.as_ref() != expected_schema {
+            return Err(py_value_error(
+                "source stream schema must match downstream input_schema",
+            ));
+        }
+        Arc::new(expected_schema.clone())
+    } else {
+        Arc::clone(&stream_schema)
+    };
+    let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+
+    Ok((
+        Arc::clone(&schema),
+        SegmentSourceConfig {
+            stream_name: stream_name.to_string(),
+            expected_schema: schema,
+            segment_schema,
+            master: shared_master,
+            mode: RustSourceMode::Pipeline,
+            xfast,
+        },
+    ))
+}
+
 fn register_source(
     source: Option<&Bound<'_, PyAny>>,
     downstream: DownstreamLink,
@@ -3295,6 +5038,21 @@ fn register_source(
     };
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream.clone());
+        return Ok((Some(source.clone().unbind()), None, None, None, None));
+    }
+
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveLatestEngine>>() {
         if engine.engine.is_none() {
             return Err(py_runtime_error(
                 "source engine must be linked before it is started",
@@ -3443,7 +5201,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
@@ -3579,6 +5337,10 @@ fn ensure_source_stopped(py: Python<'_>, source_owner: &Option<Py<PyAny>>) -> Py
     let source = source_owner.bind(py);
 
     if let Ok(engine) = source.extract::<PyRef<'_, ReactiveStateEngine>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
+    if let Ok(engine) = source.extract::<PyRef<'_, ReactiveLatestEngine>>() {
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
@@ -4611,6 +6373,209 @@ mod tests {
     fn float_values(array: &ArrayRef) -> Vec<f64> {
         let values = array.as_any().downcast_ref::<Float64Array>().unwrap();
         (0..values.len()).map(|index| values.value(index)).collect()
+    }
+
+    #[test]
+    fn descriptor_update_slot_is_consumed_only_after_empty_segment_poll() {
+        let descriptor_updates = Mutex::new(Some(DescriptorUpdate {
+            text: "next".to_string(),
+            descriptor: serde_json::json!({"generation": 2}),
+        }));
+
+        assert!(take_descriptor_update_after_poll(
+            SubscriberReadOutcome::Rows,
+            &descriptor_updates,
+            "current",
+        )
+        .is_none());
+        assert!(descriptor_updates.lock().unwrap().is_some());
+
+        let update = take_descriptor_update_after_poll(
+            SubscriberReadOutcome::Empty,
+            &descriptor_updates,
+            "current",
+        )
+        .expect("empty segment poll should consume pending descriptor update");
+
+        assert_eq!(update.text, "next");
+        assert!(descriptor_updates.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn descriptor_watcher_uses_long_poll_timeout_instead_of_hot_polling() {
+        assert!(SEGMENT_DESCRIPTOR_WATCH_TIMEOUT >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn stream_row_instrument_filter_skips_non_matching_rows_before_python_conversion() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let row_capacity = 4;
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: row_capacity,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema("ticks", "all", schema.clone())
+            .unwrap();
+        let writer = partition.writer();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2606")?;
+                row.write_f64("last_price", 4102.5)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let envelope = partition.active_descriptor_envelope_bytes().unwrap();
+        let layout = LayoutPlan::for_schema(&schema, row_capacity).unwrap();
+        let descriptor =
+            ActiveSegmentDescriptor::from_envelope_bytes(&envelope, schema, layout).unwrap();
+        let span = RowSpanView::from_active_descriptor(descriptor, 0, 2).unwrap();
+        let instrument_filter = BTreeSet::from(["IF2606".to_string()]);
+
+        assert!(!row_matches_instrument_filter(&span, 0, Some(&instrument_filter)).unwrap());
+        assert!(row_matches_instrument_filter(&span, 1, Some(&instrument_filter)).unwrap());
+        assert!(row_matches_instrument_filter(&span, 0, None).unwrap());
+    }
+
+    #[test]
+    fn live_segment_record_batches_reads_retained_sealed_before_active_boundary() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema("ticks", "all", schema.clone())
+            .unwrap();
+        let writer = partition.writer();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2606")?;
+                row.write_f64("last_price", 4102.5)?;
+                Ok(())
+            })
+            .unwrap();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4103.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let sealed_descriptor =
+            serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+
+        writer.rollover_without_persistence().unwrap();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2608")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2609")?;
+                row.write_f64("last_price", 4105.5)?;
+                Ok(())
+            })
+            .unwrap();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2610")?;
+                row.write_f64("last_price", 4106.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let active_descriptor =
+            serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+
+        let batches =
+            live_segment_record_batches(&active_descriptor, &[sealed_descriptor], schema, 2)
+                .unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            string_values(batches[0].column(0)),
+            vec!["IF2606", "IF2607"]
+        );
+        assert_eq!(
+            string_values(batches[1].column(0)),
+            vec!["IF2608", "IF2609"]
+        );
+        assert_eq!(batches[0].num_rows() + batches[1].num_rows(), 4);
+    }
+
+    #[test]
+    fn query_snapshot_value_separates_active_descriptor_from_retained_sealed_segments() {
+        let stream = StreamInfo {
+            stream_name: "ticks".to_string(),
+            schema: serde_json::json!({"fields": [], "metadata": {}}),
+            schema_hash: "schema_hash".to_string(),
+            data_path: "segment".to_string(),
+            descriptor_generation: 7,
+            active_segment_descriptor: None,
+            sealed_segments: vec![serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 1,
+                "row_capacity": 32,
+                "shm_os_id": "/tmp/zippy-segment-old",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 2,
+                "generation": 1
+            })],
+            persisted_files: Vec::new(),
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: Some("proc_1".to_string()),
+            reader_count: 2,
+            status: "registered".to_string(),
+        };
+        let descriptor = serde_json::json!({
+            "magic": "zippy.segment.active",
+            "version": 1,
+            "schema_id": 1,
+            "row_capacity": 32,
+            "shm_os_id": "/tmp/zippy-segment",
+            "payload_offset": 64,
+            "committed_row_count_offset": 40,
+            "segment_id": 3,
+            "generation": 2
+        });
+
+        let snapshot = query_snapshot_value(&stream, descriptor, 11).unwrap();
+
+        assert_eq!(snapshot["stream_name"], "ticks");
+        assert_eq!(snapshot["schema_hash"], "schema_hash");
+        assert_eq!(snapshot["descriptor_generation"], 7);
+        assert_eq!(snapshot["active_committed_row_high_watermark"], 11);
+        assert_eq!(snapshot["active_segment_descriptor"]["segment_id"], 3);
+        assert!(snapshot["active_segment_descriptor"]
+            .get("sealed_segments")
+            .is_none());
+        assert_eq!(snapshot["sealed_segments"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["persisted_files"].as_array().unwrap().len(), 0);
     }
 
     #[test]

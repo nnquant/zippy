@@ -6,15 +6,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use zippy_core::{MasterClient, SchemaRef};
+use zippy_core::{canonical_schema_hash, MasterClient, SchemaRef, ZippyConfig};
 use zippy_master::bus::Bus;
 use zippy_master::ring::{ReadError, RingWriteError, StreamRing};
 use zippy_master::server::MasterServer;
+use zippy_master::snapshot::SnapshotStore;
 
 fn test_schema() -> SchemaRef {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("instrument_id", DataType::Utf8, false),
         Field::new("mid_price", DataType::Float64, false),
+    ]))
+}
+
+fn incompatible_schema() -> SchemaRef {
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("bid_price", DataType::Float64, false),
     ]))
 }
 
@@ -76,6 +84,61 @@ fn spawn_test_server_with_lease(
     (server, join_handle)
 }
 
+fn spawn_test_server_with_config(
+    socket_path: &Path,
+    config: ZippyConfig,
+) -> (MasterServer, thread::JoinHandle<()>) {
+    let server = MasterServer::with_config(config);
+    let handle_server = server.clone();
+    let socket_path = socket_path.to_path_buf();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || {
+        handle_server.serve(&socket_path).unwrap();
+    });
+    wait_for_socket_ready(&wait_path);
+    (server, join_handle)
+}
+
+fn spawn_test_server_with_snapshot(
+    socket_path: &Path,
+    snapshot_path: PathBuf,
+) -> (MasterServer, thread::JoinHandle<()>) {
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let socket_path = socket_path.to_path_buf();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || {
+        handle_server.serve(&socket_path).unwrap();
+    });
+    wait_for_socket_ready(&wait_path);
+    (server, join_handle)
+}
+
+fn spawn_test_server_with_snapshot_and_lease(
+    socket_path: &Path,
+    snapshot_path: PathBuf,
+    lease_timeout: Duration,
+    lease_reaper_interval: Duration,
+) -> (MasterServer, thread::JoinHandle<()>) {
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path),
+        lease_timeout,
+        lease_reaper_interval,
+    );
+    let handle_server = server.clone();
+    let socket_path = socket_path.to_path_buf();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || {
+        handle_server.serve(&socket_path).unwrap();
+    });
+    wait_for_socket_ready(&wait_path);
+    (server, join_handle)
+}
+
 fn wait_for_socket_ready(socket_path: &Path) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
@@ -116,6 +179,29 @@ fn send_request(socket_path: &Path, payload: &str) -> String {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response
+}
+
+#[test]
+fn master_client_fetches_master_runtime_config() {
+    let socket_path = unique_socket_path();
+    let mut expected_config = ZippyConfig::default();
+    expected_config.log.level = "warn".to_string();
+    expected_config.table.row_capacity = 2048;
+    expected_config.table.retention_segments = Some(6);
+    expected_config.table.persist.enabled = true;
+    expected_config.table.persist.data_dir = "archive-data".to_string();
+    expected_config.table.persist.partition.dt_column = Some("dt".to_string());
+    expected_config.table.persist.partition.id_column = Some("instrument_id".to_string());
+    expected_config.table.persist.partition.dt_part = Some("%Y%m".to_string());
+    let (server, handle) = spawn_test_server_with_config(&socket_path, expected_config.clone());
+
+    let client = MasterClient::connect(&socket_path).unwrap();
+    let config = client.get_config().unwrap();
+
+    assert_eq!(config, expected_config);
+
+    server.shutdown();
+    handle.join().unwrap();
 }
 
 #[test]
@@ -184,6 +270,64 @@ fn writer_and_reader_roundtrip_batches_through_master_bus() {
     assert_eq!(received.num_rows(), batch.num_rows());
     assert_eq!(received.num_columns(), batch.num_columns());
     assert_eq!(format!("{received:?}"), format!("{batch:?}"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_roundtrip_returns_registered_stream_schema_metadata() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let schema = test_schema();
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("catalog_client").unwrap();
+    client
+        .register_stream("ticks", std::sync::Arc::clone(&schema), 64, 4096)
+        .unwrap();
+
+    let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.stream_name, "ticks");
+    assert_eq!(stream.schema_hash, canonical_schema_hash(&schema));
+    assert_eq!(stream.schema["fields"][0]["name"], "instrument_id");
+    assert_eq!(stream.schema["fields"][0]["segment_type"], "utf8");
+    assert_eq!(stream.schema["fields"][0]["nullable"], false);
+    assert_eq!(stream.schema["fields"][1]["name"], "mid_price");
+    assert_eq!(stream.schema["fields"][1]["segment_type"], "float64");
+    assert_eq!(stream.data_path, "segment");
+    assert_eq!(stream.descriptor_generation, 0);
+
+    let listed = client.list_streams().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].schema_hash, stream.schema_hash);
+    assert_eq!(listed[0].schema, stream.schema);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_rejects_same_stream_with_different_schema() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut first = MasterClient::connect(&socket_path).unwrap();
+    let mut second = MasterClient::connect(&socket_path).unwrap();
+    first.register_process("first").unwrap();
+    second.register_process("second").unwrap();
+    first
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+
+    let error = second
+        .register_stream("ticks", incompatible_schema(), 64, 4096)
+        .unwrap_err();
+
+    assert!(format!("{error}").contains("schema mismatch"));
+    assert!(format!("{error}").contains("ticks"));
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -360,6 +504,474 @@ fn lease_reaper_reclaims_expired_reader_attachments() {
         "{\"GetStream\":{\"stream_name\":\"ticks\"}}\n",
     );
     assert!(stream_response.contains("\"reader_count\":0"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn lease_reaper_reclaims_expired_segment_reader_leases() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server_with_lease(
+        &socket_path,
+        Duration::from_millis(50),
+        Duration::from_millis(10),
+    );
+
+    let mut writer = MasterClient::connect(&socket_path).unwrap();
+    writer.register_process("writer").unwrap();
+    writer
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+
+    let mut reader = MasterClient::connect(&socket_path).unwrap();
+    reader.register_process("query_reader").unwrap();
+    let lease_id = reader.acquire_segment_reader_lease("ticks", 1, 0).unwrap();
+    assert_eq!(lease_id, "segment-lease-1");
+    assert_eq!(
+        writer
+            .get_stream("ticks")
+            .unwrap()
+            .segment_reader_leases
+            .len(),
+        1
+    );
+
+    thread::sleep(Duration::from_millis(120));
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let stream = writer.get_stream("ticks").unwrap();
+        if stream.segment_reader_leases.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "expired segment reader lease was not reclaimed leases=[{:?}]",
+                stream.segment_reader_leases
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn lease_reaper_persists_expired_segment_reader_lease_cleanup_to_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+    let (server, join_handle) = spawn_test_server_with_snapshot_and_lease(
+        &socket_path,
+        snapshot_path.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(10),
+    );
+
+    let mut writer = MasterClient::connect(&socket_path).unwrap();
+    writer.register_process("writer").unwrap();
+    writer
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+
+    let mut reader = MasterClient::connect(&socket_path).unwrap();
+    reader.register_process("query_reader").unwrap();
+    reader.acquire_segment_reader_lease("ticks", 1, 0).unwrap();
+    assert_eq!(
+        SnapshotStore::load(&snapshot_path).unwrap().streams[0]
+            .segment_reader_leases
+            .len(),
+        1
+    );
+
+    thread::sleep(Duration::from_millis(120));
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let stream = writer.get_stream("ticks").unwrap();
+        if stream.segment_reader_leases.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "expired segment reader lease was not reclaimed leases=[{:?}]",
+                stream.segment_reader_leases
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert!(snapshot.streams[0].segment_reader_leases.is_empty());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+}
+
+#[test]
+fn master_client_waits_for_segment_descriptor_change() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut writer = MasterClient::connect(&socket_path).unwrap();
+    writer.register_process("writer").unwrap();
+    writer
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    writer
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    writer
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-1",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+            }),
+        )
+        .unwrap();
+
+    let wait_socket_path = socket_path.clone();
+    let wait_handle = thread::spawn(move || {
+        let mut watcher = MasterClient::connect(wait_socket_path).unwrap();
+        watcher.register_process("watcher").unwrap();
+        watcher
+            .wait_segment_descriptor("ticks", 1, Duration::from_secs(2))
+            .unwrap()
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    writer
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-2",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 2,
+                "generation": 1,
+            }),
+        )
+        .unwrap();
+
+    let update = wait_handle
+        .join()
+        .unwrap()
+        .expect("descriptor update should be returned after publish");
+    assert_eq!(update.descriptor_generation, 2);
+    assert_eq!(update.descriptor["segment_id"], 2);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_exposes_sealed_segments_as_stream_metadata() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+
+    client
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-2",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 2,
+                "generation": 1,
+                "sealed_segments": [
+                    {
+                        "magic": "zippy.segment.active",
+                        "version": 1,
+                        "schema_id": 7,
+                        "row_capacity": 64,
+                        "shm_os_id": "/tmp/zippy-segment-1",
+                        "payload_offset": 64,
+                        "committed_row_count_offset": 40,
+                        "segment_id": 1,
+                        "generation": 0
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+
+    let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.active_segment_descriptor.unwrap()["segment_id"], 2);
+    assert_eq!(stream.sealed_segments.len(), 1);
+    assert_eq!(stream.sealed_segments[0]["segment_id"], 1);
+    assert!(stream.persisted_files.is_empty());
+
+    let descriptor = client.get_segment_descriptor("ticks").unwrap().unwrap();
+    assert_eq!(descriptor["segment_id"], 2);
+    assert!(descriptor.get("sealed_segments").is_none());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_publishes_persisted_file_metadata() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("persist_writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+
+    client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": "/data/ctp_ticks/trading_day=20260426/part-000001.parquet",
+                "row_count": 1024,
+                "min_seq": 1,
+                "max_seq": 1024,
+                "min_event_ts": 1777017600000000000i64,
+                "max_event_ts": 1777017660000000000i64,
+                "source_segment_id": 1
+            }),
+        )
+        .unwrap();
+
+    let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.persisted_files.len(), 1);
+    assert_eq!(stream.persisted_files[0]["stream_name"], "ticks");
+    assert_eq!(
+        stream.persisted_files[0]["schema_hash"],
+        canonical_schema_hash(&test_schema())
+    );
+    assert_eq!(stream.persisted_files[0]["row_count"], 1024);
+    assert_eq!(stream.persisted_files[0]["source_segment_id"], 1);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_upserts_persisted_file_metadata_by_persist_file_id() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("persist_writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+
+    let persist_file_id = "ticks:1:0:0";
+    client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "persist_file_id": persist_file_id,
+                "file_path": "/data/ctp_ticks/part-000000.parquet",
+                "row_count": 1024,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "persist_status": "committed"
+            }),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "persist_file_id": persist_file_id,
+                "file_path": "/data/ctp_ticks/part-000000.parquet",
+                "row_count": 1024,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "persist_status": "committed",
+                "retry_attempt": 2
+            }),
+        )
+        .unwrap();
+
+    let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.persisted_files.len(), 1);
+    assert_eq!(
+        stream.persisted_files[0]["persist_file_id"],
+        persist_file_id
+    );
+    assert_eq!(stream.persisted_files[0]["retry_attempt"], 2);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_publishes_persist_event_metadata() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("persist_writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+
+    client
+        .publish_persist_event(
+            "ticks",
+            serde_json::json!({
+                "persist_event_id": "ticks:1:0:failed",
+                "persist_event_type": "persist_failed",
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "attempts": 2,
+                "error": "publisher failed"
+            }),
+        )
+        .unwrap();
+
+    let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.persist_events.len(), 1);
+    assert_eq!(stream.persist_events[0]["stream_name"], "ticks");
+    assert_eq!(
+        stream.persist_events[0]["persist_event_type"],
+        "persist_failed"
+    );
+    assert_eq!(stream.persist_events[0]["source_segment_id"], 1);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_acquires_and_releases_segment_reader_lease() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("segment_reader").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+
+    let lease_id = client.acquire_segment_reader_lease("ticks", 1, 0).unwrap();
+    let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.segment_reader_leases.len(), 1);
+    assert_eq!(stream.segment_reader_leases[0]["lease_id"], lease_id);
+    assert_eq!(stream.segment_reader_leases[0]["source_segment_id"], 1);
+    assert_eq!(stream.segment_reader_leases[0]["source_generation"], 0);
+
+    client
+        .release_segment_reader_lease("ticks", &lease_id)
+        .unwrap();
+    let stream = client.get_stream("ticks").unwrap();
+    assert!(stream.segment_reader_leases.is_empty());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_client_drop_table_removes_catalog_dependencies_and_persisted_files() {
+    let socket_path = unique_socket_path();
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot_path = temp.path().join("master-registry.json");
+    let persist_dir = temp.path().join("tables").join("ticks");
+    fs::create_dir_all(&persist_dir).unwrap();
+    let parquet_file = persist_dir.join("ticks-segment-00000000000000000001.parquet");
+    fs::write(&parquet_file, b"persisted rows").unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_snapshot(&socket_path, snapshot_path.clone());
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("drop_table_test").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    client
+        .register_engine(
+            "tick_factor",
+            "reactive",
+            "ticks",
+            "tick_factors",
+            Vec::new(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+    client
+        .register_sink("tick_sink", "parquet", "ticks", serde_json::json!({}))
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": parquet_file.to_string_lossy(),
+                "row_count": 1,
+                "source_segment_id": 1
+            }),
+        )
+        .unwrap();
+
+    let result = client.drop_table("ticks", true).unwrap();
+
+    assert_eq!(result.table_name, "ticks");
+    assert!(result.dropped);
+    assert_eq!(result.persisted_files_deleted, 1);
+    assert!(!parquet_file.exists());
+    assert!(client
+        .get_stream("ticks")
+        .unwrap_err()
+        .to_string()
+        .contains("stream not found"));
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert!(snapshot.streams.is_empty());
+    assert!(snapshot.sources.is_empty());
+    assert!(snapshot.engines.is_empty());
+    assert!(snapshot.sinks.is_empty());
 
     server.shutdown();
     join_handle.join().unwrap();

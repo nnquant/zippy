@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use zippy_core::MasterClient;
+
 #[test]
 fn master_binary_writes_startup_logs_and_socket() {
     let temp = tempfile::tempdir().unwrap();
@@ -83,6 +85,76 @@ fn master_binary_rejects_multiple_control_endpoints() {
 
     let stderr = read_stderr(&mut child);
     assert!(stderr.contains("multiple control endpoint values"));
+}
+
+#[test]
+fn master_binary_reads_explicit_config_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let log_dir = temp.path().join("logs");
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[log]
+level = "debug"
+
+[table]
+row_capacity = 2048
+retention_segments = 6
+
+[table.persist]
+enabled = true
+data_dir = "persist-data"
+
+[table.persist.partition]
+dt_column = "dt"
+id_column = "instrument_id"
+dt_part = "%Y%m"
+"#,
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_zippy-master");
+
+    let mut child = Command::new(binary)
+        .arg(&socket_path)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--log-dir")
+        .arg(&log_dir)
+        .arg("--no-console-log")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&socket_path);
+    let client = MasterClient::connect(&socket_path).unwrap();
+    let config = client.get_config().unwrap();
+
+    assert_eq!(config.log.level, "debug");
+    assert_eq!(config.table.row_capacity, 2048);
+    assert_eq!(config.table.retention_segments, Some(6));
+    assert!(config.table.persist.enabled);
+    assert_eq!(config.table.persist.method, "parquet");
+    assert_eq!(config.table.persist.data_dir, "persist-data");
+    assert_eq!(
+        config.table.persist.partition.dt_column.as_deref(),
+        Some("dt")
+    );
+    assert_eq!(
+        config.table.persist.partition.id_column.as_deref(),
+        Some("instrument_id")
+    );
+    assert_eq!(
+        config.table.persist.partition.dt_part.as_deref(),
+        Some("%Y%m")
+    );
+
+    let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(status, 0);
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
 }
 
 #[test]

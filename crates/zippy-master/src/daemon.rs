@@ -5,15 +5,16 @@ use std::time::Duration;
 
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use zippy_core::{LogConfig, ZippyError};
+use zippy_core::{LogConfig, ZippyConfig, ZippyError};
 
 use crate::server::MasterServer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterDaemonConfig {
     pub control_endpoint: PathBuf,
+    pub config_path: Option<PathBuf>,
     pub log_dir: PathBuf,
-    pub log_level: String,
+    pub log_level: Option<String>,
     pub console_log: bool,
 }
 
@@ -21,10 +22,16 @@ impl MasterDaemonConfig {
     pub fn new(control_endpoint: impl AsRef<Path>) -> Self {
         Self {
             control_endpoint: control_endpoint.as_ref().to_path_buf(),
+            config_path: None,
             log_dir: PathBuf::from("logs"),
-            log_level: String::from("info"),
+            log_level: None,
             console_log: true,
         }
+    }
+
+    pub fn with_config_path(mut self, config_path: impl AsRef<Path>) -> Self {
+        self.config_path = Some(config_path.as_ref().to_path_buf());
+        self
     }
 
     pub fn with_logging(
@@ -34,7 +41,7 @@ impl MasterDaemonConfig {
         console_log: bool,
     ) -> Self {
         self.log_dir = log_dir.as_ref().to_path_buf();
-        self.log_level = log_level.into();
+        self.log_level = Some(log_level.into());
         self.console_log = console_log;
         self
     }
@@ -43,10 +50,16 @@ impl MasterDaemonConfig {
 pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
     let MasterDaemonConfig {
         control_endpoint,
+        config_path,
         log_dir,
         log_level,
         console_log,
     } = config;
+    let mut runtime_config = load_runtime_config(config_path.as_deref())?;
+    if let Some(log_level) = log_level {
+        runtime_config.log.level = log_level;
+    }
+    let effective_log_level = runtime_config.log.level.clone();
 
     if let Some(parent) = control_endpoint.parent() {
         std::fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
@@ -56,7 +69,7 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
 
     let snapshot = zippy_core::setup_log(LogConfig::new(
         "zippy-master",
-        log_level.clone(),
+        effective_log_level.clone(),
         &log_dir,
         console_log,
         true,
@@ -68,7 +81,11 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         status = "starting",
         control_endpoint = control_endpoint.display().to_string(),
         log_dir = log_dir.display().to_string(),
-        log_level = log_level,
+        log_level = effective_log_level,
+        table_row_capacity = runtime_config.table.row_capacity,
+        table_persist_enabled = runtime_config.table.persist.enabled,
+        table_persist_method = runtime_config.table.persist.method.as_str(),
+        table_persist_data_dir = runtime_config.table.persist.data_dir.as_str(),
         log_file = snapshot
             .file_path
             .as_ref()
@@ -99,7 +116,7 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
                     snapshot_path = snapshot_path.display().to_string(),
                     "loaded registry snapshot"
                 );
-                server
+                server.with_runtime_config_values(runtime_config.clone())
             }
             Err(error) => {
                 tracing::error!(
@@ -114,10 +131,11 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
             }
         }
     } else {
-        MasterServer::with_runtime_config(
+        MasterServer::with_runtime_config_and_config(
             Some(snapshot_path),
             Duration::from_secs(10),
             Duration::from_secs(2),
+            runtime_config,
         )
     };
     install_shutdown_handlers(&control_endpoint, server.clone())?;
@@ -138,6 +156,18 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
     }
 
     server.serve(&control_endpoint)
+}
+
+fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyConfig> {
+    if let Some(path) = config_path {
+        if !path.exists() {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!("config file does not exist path=[{}]", path.display()),
+            });
+        }
+        return ZippyConfig::load_from_path(Some(path));
+    }
+    ZippyConfig::load_default()
 }
 
 fn install_shutdown_handlers(socket_path: &Path, server: MasterServer) -> zippy_core::Result<()> {

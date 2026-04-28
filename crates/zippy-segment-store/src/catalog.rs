@@ -115,6 +115,20 @@ impl SegmentStore {
         self.pin_count_for_key(lease_key)
     }
 
+    /// 返回指定分区和 segment identity 的 pin 数。
+    pub fn pin_count_for_segment(
+        &self,
+        handle: &PartitionHandle,
+        segment_id: u64,
+        generation: u64,
+    ) -> usize {
+        self.pin_count_for_key(LeaseKey {
+            partition_id: handle.partition_id(),
+            segment_id,
+            generation,
+        })
+    }
+
     /// 回收死亡 session。
     pub fn collect_garbage(&self) -> Result<(), ZippySegmentStoreError> {
         let dead_sessions = self
@@ -383,6 +397,10 @@ impl PartitionHandle {
         })
     }
 
+    pub(crate) fn partition_id(&self) -> u64 {
+        self.inner.partition_id
+    }
+
     fn collect_garbage(&self, store: &SegmentStore) {
         let mut state = self.inner.state.lock().unwrap();
         state.retired_segments.retain(|segment_id, retained| {
@@ -540,8 +558,11 @@ impl PartitionWriterHandle {
         })
     }
 
-    /// 创建新的 active segment 并通知 reader。
-    pub fn rollover(&self) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
+    /// 创建新的 active segment，按需入队底层持久化队列，并通知 reader。
+    fn rollover_inner(
+        &self,
+        enqueue_persistence: bool,
+    ) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
         let sealed = {
             let mut state = self.handle.inner.state.lock().unwrap();
             if state.writer.has_open_row() {
@@ -587,17 +608,31 @@ impl PartitionWriterHandle {
             sealed
         };
 
-        self.handle
-            .inner
-            .persistence
-            .enqueue(sealed.clone())
-            .map_err(ZippySegmentStoreError::Writer)?;
+        if enqueue_persistence {
+            self.handle
+                .inner
+                .persistence
+                .enqueue(sealed.clone())
+                .map_err(ZippySegmentStoreError::Writer)?;
+        }
         self.handle
             .inner
             .broadcaster
             .notify_all()
             .map_err(ZippySegmentStoreError::Io)?;
         Ok(sealed)
+    }
+
+    /// 创建新的 active segment 并通知 reader。
+    pub fn rollover(&self) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
+        self.rollover_inner(true)
+    }
+
+    /// 创建新的 active segment 并通知 reader，但不进入底层通用持久化队列。
+    pub fn rollover_without_persistence(
+        &self,
+    ) -> Result<SealedSegmentHandle, ZippySegmentStoreError> {
+        self.rollover_inner(false)
     }
 }
 

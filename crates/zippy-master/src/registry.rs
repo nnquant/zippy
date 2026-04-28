@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,18 @@ pub struct ProcessRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamRecord {
     pub stream_name: String,
+    pub schema: serde_json::Value,
+    pub schema_hash: String,
+    pub data_path: String,
+    pub descriptor_generation: u64,
+    #[serde(default)]
+    pub sealed_segments: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub persisted_files: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub persist_events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub segment_reader_leases: Vec<serde_json::Value>,
     pub buffer_size: usize,
     pub frame_size: usize,
     pub writer_process_id: Option<String>,
@@ -86,6 +98,11 @@ pub enum RegistryError {
         requested_buffer_size: usize,
         requested_frame_size: usize,
     },
+    StreamSchemaMismatch {
+        stream_name: String,
+        existing_schema_hash: String,
+        requested_schema_hash: String,
+    },
     WriterNotOwnedByProcess {
         stream_name: String,
         process_id: String,
@@ -100,6 +117,36 @@ pub enum RegistryError {
     SegmentDescriptorPublisherNotAuthorized {
         stream_name: String,
         process_id: String,
+    },
+    InvalidSegmentDescriptor {
+        stream_name: String,
+        reason: String,
+    },
+    PersistedFilePublisherNotAuthorized {
+        stream_name: String,
+        process_id: String,
+    },
+    PersistEventPublisherNotAuthorized {
+        stream_name: String,
+        process_id: String,
+    },
+    InvalidPersistedFile {
+        stream_name: String,
+        reason: String,
+    },
+    InvalidPersistEvent {
+        stream_name: String,
+        reason: String,
+    },
+    SegmentReaderLeaseNotFound {
+        stream_name: String,
+        lease_id: String,
+    },
+    SegmentReaderLeaseNotOwnedByProcess {
+        stream_name: String,
+        lease_id: String,
+        process_id: String,
+        owner_process_id: Option<String>,
     },
     SourceNotFound {
         source_name: String,
@@ -163,6 +210,15 @@ impl fmt::Display for RegistryError {
                 requested_buffer_size,
                 requested_frame_size
             ),
+            Self::StreamSchemaMismatch {
+                stream_name,
+                existing_schema_hash,
+                requested_schema_hash,
+            } => write!(
+                f,
+                "stream schema mismatch stream_name=[{}] existing_schema_hash=[{}] requested_schema_hash=[{}]",
+                stream_name, existing_schema_hash, requested_schema_hash
+            ),
             Self::WriterNotOwnedByProcess {
                 stream_name,
                 process_id,
@@ -189,6 +245,64 @@ impl fmt::Display for RegistryError {
                 f,
                 "segment descriptor publisher not authorized stream_name=[{}] process_id=[{}]",
                 stream_name, process_id
+            ),
+            Self::InvalidSegmentDescriptor {
+                stream_name,
+                reason,
+            } => write!(
+                f,
+                "invalid segment descriptor stream_name=[{}] reason=[{}]",
+                stream_name, reason
+            ),
+            Self::PersistedFilePublisherNotAuthorized {
+                stream_name,
+                process_id,
+            } => write!(
+                f,
+                "persisted file publisher not authorized stream_name=[{}] process_id=[{}]",
+                stream_name, process_id
+            ),
+            Self::PersistEventPublisherNotAuthorized {
+                stream_name,
+                process_id,
+            } => write!(
+                f,
+                "persist event publisher not authorized stream_name=[{}] process_id=[{}]",
+                stream_name, process_id
+            ),
+            Self::InvalidPersistedFile {
+                stream_name,
+                reason,
+            } => write!(
+                f,
+                "invalid persisted file stream_name=[{}] reason=[{}]",
+                stream_name, reason
+            ),
+            Self::InvalidPersistEvent {
+                stream_name,
+                reason,
+            } => write!(
+                f,
+                "invalid persist event stream_name=[{}] reason=[{}]",
+                stream_name, reason
+            ),
+            Self::SegmentReaderLeaseNotFound {
+                stream_name,
+                lease_id,
+            } => write!(
+                f,
+                "segment reader lease not found stream_name=[{}] lease_id=[{}]",
+                stream_name, lease_id
+            ),
+            Self::SegmentReaderLeaseNotOwnedByProcess {
+                stream_name,
+                lease_id,
+                process_id,
+                owner_process_id,
+            } => write!(
+                f,
+                "segment reader lease not owned stream_name=[{}] lease_id=[{}] process_id=[{}] owner_process_id=[{:?}]",
+                stream_name, lease_id, process_id, owner_process_id
             ),
             Self::SourceNotFound { source_name } => {
                 write!(f, "source not found source_name=[{}]", source_name)
@@ -217,7 +331,7 @@ impl fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Registry {
     processes: BTreeMap<String, ProcessRecord>,
     streams: BTreeMap<String, StreamRecord>,
@@ -225,6 +339,42 @@ pub struct Registry {
     engines: BTreeMap<String, EngineRecord>,
     sinks: BTreeMap<String, SinkRecord>,
     next_process_id: u64,
+    next_segment_reader_lease_id: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct DroppedTableRecords {
+    pub stream: Option<StreamRecord>,
+    pub sources: Vec<SourceRecord>,
+    pub engines: Vec<EngineRecord>,
+    pub sinks: Vec<SinkRecord>,
+}
+
+fn split_active_segment_descriptor(
+    stream_name: &str,
+    mut descriptor: serde_json::Value,
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), RegistryError> {
+    let sealed_segments = match descriptor
+        .as_object_mut()
+        .and_then(|object| object.remove("sealed_segments"))
+    {
+        Some(serde_json::Value::Array(sealed_segments)) => sealed_segments,
+        Some(_) => {
+            return Err(RegistryError::InvalidSegmentDescriptor {
+                stream_name: stream_name.to_string(),
+                reason: "sealed_segments must be an array".to_string(),
+            });
+        }
+        None => Vec::new(),
+    };
+    Ok((descriptor, sealed_segments))
+}
+
+fn persisted_created_at_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 impl Registry {
@@ -238,6 +388,8 @@ impl Registry {
     pub fn ensure_stream(
         &mut self,
         stream_name: &str,
+        schema: serde_json::Value,
+        schema_hash: &str,
         buffer_size: usize,
         frame_size: usize,
     ) -> Result<bool, RegistryError> {
@@ -259,10 +411,17 @@ impl Registry {
                     requested_frame_size: frame_size,
                 });
             }
+            if existing.schema_hash != schema_hash {
+                return Err(RegistryError::StreamSchemaMismatch {
+                    stream_name: stream_name.to_string(),
+                    existing_schema_hash: existing.schema_hash.clone(),
+                    requested_schema_hash: schema_hash.to_string(),
+                });
+            }
             return Ok(false);
         }
 
-        self.register_stream(stream_name, buffer_size, frame_size)?;
+        self.register_stream(stream_name, schema, schema_hash, buffer_size, frame_size)?;
         Ok(true)
     }
 
@@ -361,6 +520,8 @@ impl Registry {
     pub fn register_stream(
         &mut self,
         stream_name: &str,
+        schema: serde_json::Value,
+        schema_hash: &str,
         buffer_size: usize,
         frame_size: usize,
     ) -> Result<(), RegistryError> {
@@ -380,6 +541,14 @@ impl Registry {
 
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
+            schema,
+            schema_hash: schema_hash.to_string(),
+            data_path: "segment".to_string(),
+            descriptor_generation: 0,
+            sealed_segments: Vec::new(),
+            persisted_files: Vec::new(),
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
             buffer_size,
             frame_size,
             writer_process_id: None,
@@ -440,6 +609,28 @@ impl Registry {
     ) -> Result<Option<serde_json::Value>, RegistryError> {
         self.validate_process_alive(process_id)?;
         self.segment_descriptor(stream_name)
+    }
+
+    pub fn segment_descriptor_update_for_process(
+        &self,
+        stream_name: &str,
+        process_id: &str,
+        after_descriptor_generation: u64,
+    ) -> Result<Option<(u64, serde_json::Value)>, RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        if stream.descriptor_generation <= after_descriptor_generation {
+            return Ok(None);
+        }
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Ok(None);
+        };
+        Ok(Some((stream.descriptor_generation, descriptor)))
     }
 
     pub fn get_source(&self, source_name: &str) -> Option<&SourceRecord> {
@@ -557,6 +748,29 @@ impl Registry {
         Ok(())
     }
 
+    pub fn set_stream_segment_metadata(
+        &mut self,
+        stream_name: &str,
+        descriptor_generation: u64,
+        sealed_segments: Vec<serde_json::Value>,
+        persisted_files: Vec<serde_json::Value>,
+        persist_events: Vec<serde_json::Value>,
+        segment_reader_leases: Vec<serde_json::Value>,
+    ) -> Result<(), RegistryError> {
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        stream.descriptor_generation = descriptor_generation;
+        stream.sealed_segments = sealed_segments;
+        stream.persisted_files = persisted_files;
+        stream.persist_events = persist_events;
+        stream.segment_reader_leases = segment_reader_leases;
+        Ok(())
+    }
+
     pub fn set_source_status(
         &mut self,
         source_name: &str,
@@ -648,14 +862,297 @@ impl Registry {
             });
         }
 
+        let (active_descriptor, sealed_segments) =
+            split_active_segment_descriptor(stream_name, descriptor)?;
         let stream =
             self.streams
                 .get_mut(stream_name)
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
-        stream.active_segment_descriptor = Some(descriptor);
+        stream.active_segment_descriptor = Some(active_descriptor);
+        stream.sealed_segments = sealed_segments;
+        stream.descriptor_generation = stream.descriptor_generation.saturating_add(1);
         Ok(())
+    }
+
+    pub fn publish_persisted_file(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+        persisted_file: serde_json::Value,
+    ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
+        let source_owner = self.sources.values().any(|source| {
+            source.output_stream == stream_name
+                && source.process_id == process_id
+                && source.status != "lost"
+        });
+        let sink_owner = self.sinks.values().any(|sink| {
+            sink.input_stream == stream_name
+                && sink.process_id == process_id
+                && sink.status != "lost"
+        });
+        if !writer_owner && !source_owner && !sink_owner {
+            return Err(RegistryError::PersistedFilePublisherNotAuthorized {
+                stream_name: stream_name.to_string(),
+                process_id: process_id.to_string(),
+            });
+        }
+
+        let schema_hash = stream.schema_hash.clone();
+        let mut persisted_file = persisted_file;
+        let Some(object) = persisted_file.as_object_mut() else {
+            return Err(RegistryError::InvalidPersistedFile {
+                stream_name: stream_name.to_string(),
+                reason: "persisted_file must be an object".to_string(),
+            });
+        };
+        let Some(file_path) = object.get("file_path").and_then(serde_json::Value::as_str) else {
+            return Err(RegistryError::InvalidPersistedFile {
+                stream_name: stream_name.to_string(),
+                reason: "persisted_file.file_path must be a string".to_string(),
+            });
+        };
+        if file_path.is_empty() {
+            return Err(RegistryError::InvalidPersistedFile {
+                stream_name: stream_name.to_string(),
+                reason: "persisted_file.file_path must not be empty".to_string(),
+            });
+        }
+        object
+            .entry("stream_name")
+            .or_insert_with(|| serde_json::Value::String(stream_name.to_string()));
+        object
+            .entry("schema_hash")
+            .or_insert_with(|| serde_json::Value::String(schema_hash));
+        object
+            .entry("created_at")
+            .or_insert_with(|| serde_json::Value::from(persisted_created_at_millis()));
+        let persist_file_id = object
+            .get("persist_file_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        if let Some(persist_file_id) = persist_file_id {
+            if let Some(existing) = stream.persisted_files.iter_mut().find(|persisted_file| {
+                persisted_file
+                    .get("persist_file_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(persist_file_id.as_str())
+            }) {
+                *existing = persisted_file;
+                return Ok(());
+            }
+        }
+        stream.persisted_files.push(persisted_file);
+        Ok(())
+    }
+
+    pub fn publish_persist_event(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+        persist_event: serde_json::Value,
+    ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
+        let source_owner = self.sources.values().any(|source| {
+            source.output_stream == stream_name
+                && source.process_id == process_id
+                && source.status != "lost"
+        });
+        let sink_owner = self.sinks.values().any(|sink| {
+            sink.input_stream == stream_name
+                && sink.process_id == process_id
+                && sink.status != "lost"
+        });
+        if !writer_owner && !source_owner && !sink_owner {
+            return Err(RegistryError::PersistEventPublisherNotAuthorized {
+                stream_name: stream_name.to_string(),
+                process_id: process_id.to_string(),
+            });
+        }
+
+        let mut persist_event = persist_event;
+        let Some(object) = persist_event.as_object_mut() else {
+            return Err(RegistryError::InvalidPersistEvent {
+                stream_name: stream_name.to_string(),
+                reason: "persist_event must be an object".to_string(),
+            });
+        };
+        let Some(event_type) = object
+            .get("persist_event_type")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(RegistryError::InvalidPersistEvent {
+                stream_name: stream_name.to_string(),
+                reason: "persist_event.persist_event_type must be a string".to_string(),
+            });
+        };
+        if event_type.is_empty() {
+            return Err(RegistryError::InvalidPersistEvent {
+                stream_name: stream_name.to_string(),
+                reason: "persist_event.persist_event_type must not be empty".to_string(),
+            });
+        }
+        object
+            .entry("stream_name")
+            .or_insert_with(|| serde_json::Value::String(stream_name.to_string()));
+        object
+            .entry("created_at")
+            .or_insert_with(|| serde_json::Value::from(persisted_created_at_millis()));
+        let persist_event_id = object
+            .get("persist_event_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        if let Some(persist_event_id) = persist_event_id {
+            if let Some(existing) = stream.persist_events.iter_mut().find(|event| {
+                event
+                    .get("persist_event_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(persist_event_id.as_str())
+            }) {
+                *existing = persist_event;
+                return Ok(());
+            }
+        }
+        stream.persist_events.push(persist_event);
+        Ok(())
+    }
+
+    pub fn set_stream_persisted_files(
+        &mut self,
+        stream_name: &str,
+        persisted_files: Vec<serde_json::Value>,
+    ) -> Result<(), RegistryError> {
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        stream.persisted_files = persisted_files;
+        Ok(())
+    }
+
+    pub fn set_stream_persist_events(
+        &mut self,
+        stream_name: &str,
+        persist_events: Vec<serde_json::Value>,
+    ) -> Result<(), RegistryError> {
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        stream.persist_events = persist_events;
+        Ok(())
+    }
+
+    pub fn acquire_segment_reader_lease(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+        source_segment_id: u64,
+        source_generation: u64,
+    ) -> Result<String, RegistryError> {
+        self.validate_process_alive(process_id)?;
+        self.next_segment_reader_lease_id = self.next_segment_reader_lease_id.saturating_add(1);
+        let lease_id = format!("segment-lease-{}", self.next_segment_reader_lease_id);
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        stream.segment_reader_leases.push(serde_json::json!({
+            "lease_id": lease_id,
+            "stream_name": stream_name,
+            "process_id": process_id,
+            "source_segment_id": source_segment_id,
+            "source_generation": source_generation,
+            "created_at": persisted_created_at_millis(),
+        }));
+        Ok(lease_id)
+    }
+
+    pub fn release_segment_reader_lease(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+        lease_id: &str,
+    ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        let index = stream
+            .segment_reader_leases
+            .iter()
+            .position(|lease| {
+                lease.get("lease_id").and_then(serde_json::Value::as_str) == Some(lease_id)
+            })
+            .ok_or_else(|| RegistryError::SegmentReaderLeaseNotFound {
+                stream_name: stream_name.to_string(),
+                lease_id: lease_id.to_string(),
+            })?;
+        let owner_process_id = stream.segment_reader_leases[index]
+            .get("process_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if owner_process_id.as_deref() != Some(process_id) {
+            return Err(RegistryError::SegmentReaderLeaseNotOwnedByProcess {
+                stream_name: stream_name.to_string(),
+                lease_id: lease_id.to_string(),
+                process_id: process_id.to_string(),
+                owner_process_id,
+            });
+        }
+        stream.segment_reader_leases.remove(index);
+        Ok(())
+    }
+
+    pub fn remove_segment_reader_leases_for_process(&mut self, process_id: &str) -> usize {
+        let mut removed = 0;
+        for stream in self.streams.values_mut() {
+            let before = stream.segment_reader_leases.len();
+            stream.segment_reader_leases.retain(|lease| {
+                lease.get("process_id").and_then(serde_json::Value::as_str) != Some(process_id)
+            });
+            removed += before.saturating_sub(stream.segment_reader_leases.len());
+        }
+        removed
     }
 
     pub fn validate_writer_owner(
@@ -838,5 +1335,57 @@ impl Registry {
 
     pub fn unregister_stream(&mut self, stream_name: &str) -> Option<StreamRecord> {
         self.streams.remove(stream_name)
+    }
+
+    pub fn drop_table(&mut self, table_name: &str) -> DroppedTableRecords {
+        let stream = self.streams.remove(table_name);
+
+        let source_names = self
+            .sources
+            .values()
+            .filter(|source| source.output_stream == table_name)
+            .map(|source| source.source_name.clone())
+            .collect::<Vec<_>>();
+        let sources = source_names
+            .into_iter()
+            .filter_map(|source_name| self.sources.remove(&source_name))
+            .collect::<Vec<_>>();
+
+        let engine_names = self
+            .engines
+            .values()
+            .filter(|engine| {
+                engine.input_stream == table_name || engine.output_stream == table_name
+            })
+            .map(|engine| engine.engine_name.clone())
+            .collect::<Vec<_>>();
+        let mut engine_sink_names = BTreeSet::new();
+        let mut engines = Vec::new();
+        for engine_name in engine_names {
+            if let Some(engine) = self.engines.remove(&engine_name) {
+                engine_sink_names.extend(engine.sink_names.iter().cloned());
+                engines.push(engine);
+            }
+        }
+
+        let sink_names = self
+            .sinks
+            .values()
+            .filter(|sink| {
+                sink.input_stream == table_name || engine_sink_names.contains(&sink.sink_name)
+            })
+            .map(|sink| sink.sink_name.clone())
+            .collect::<Vec<_>>();
+        let sinks = sink_names
+            .into_iter()
+            .filter_map(|sink_name| self.sinks.remove(&sink_name))
+            .collect::<Vec<_>>();
+
+        DroppedTableRecords {
+            stream,
+            sources,
+            engines,
+            sinks,
+        }
     }
 }

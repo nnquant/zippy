@@ -10,7 +10,7 @@ from typing import NoReturn
 
 import click
 
-DEFAULT_CONTROL_ENDPOINT = "~/.zippy/master.sock"
+DEFAULT_CONTROL_ENDPOINT = "zippy://default"
 
 
 def echo_json(payload: object) -> None:
@@ -25,14 +25,16 @@ def echo_json(payload: object) -> None:
 
 def resolve_control_endpoint(control_endpoint: str) -> str:
     """
-    Expand a user-facing control endpoint path.
+    Resolve a user-facing control endpoint URI.
 
-    :param control_endpoint: Raw CLI control endpoint value.
+    :param control_endpoint: Raw CLI control endpoint URI or explicit path.
     :type control_endpoint: str
-    :returns: Expanded filesystem path.
+    :returns: Resolved Unix socket filesystem path.
     :rtype: str
     """
-    return str(Path(control_endpoint).expanduser())
+    from zippy import _resolve_uri
+
+    return _resolve_uri(control_endpoint)
 
 
 def ensure_control_parent_dir(control_endpoint: str) -> None:

@@ -24,6 +24,24 @@ use serde_json::Value;
 const MASTER_SERVER_LOGGING_CASE_ENV: &str = "ZIPPY_MASTER_SERVER_LOGGING_CASE";
 const MASTER_SERVER_LOGGING_TEMP_ENV: &str = "ZIPPY_MASTER_SERVER_LOGGING_TEMP";
 
+fn test_stream_schema() -> Value {
+    serde_json::json!({
+        "fields": [
+            {
+                "name": "instrument_id",
+                "data_type": "Utf8",
+                "nullable": false,
+                "metadata": {},
+            }
+        ],
+        "metadata": {},
+    })
+}
+
+fn test_stream_schema_hash() -> &'static str {
+    "test-schema-v1"
+}
+
 #[test]
 fn protocol_types_roundtrip_debug_repr() {
     let request = ControlRequest::RegisterProcess(RegisterProcessRequest {
@@ -44,7 +62,13 @@ fn registry_stores_process_and_stream_records() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("local_dc");
     registry
-        .register_stream("openctp_ticks", 1024, 256)
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
         .unwrap();
 
     assert_eq!(registry.processes_len(), 1);
@@ -60,7 +84,13 @@ fn registry_source_owner_publishes_segment_descriptor() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("openctp");
     registry
-        .register_stream("openctp_ticks", 1024, 256)
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
         .unwrap();
     registry
         .register_source(
@@ -98,7 +128,13 @@ fn registry_rejects_segment_descriptor_publish_from_lost_source() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("openctp");
     registry
-        .register_stream("openctp_ticks", 1024, 256)
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
         .unwrap();
     registry
         .register_source(
@@ -129,7 +165,13 @@ fn registry_segment_descriptor_requires_alive_process() {
     let source_process_id = registry.register_process("openctp");
     let reader_process_id = registry.register_process("segment_reader");
     registry
-        .register_stream("openctp_ticks", 1024, 256)
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
         .unwrap();
     registry
         .register_source(
@@ -166,6 +208,14 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
         &RegistrySnapshot {
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
+                schema: test_stream_schema(),
+                schema_hash: test_stream_schema_hash().to_string(),
+                data_path: "segment".to_string(),
+                descriptor_generation: 0,
+                sealed_segments: Vec::new(),
+                persisted_files: Vec::new(),
+                persist_events: Vec::new(),
+                segment_reader_leases: Vec::new(),
                 buffer_size: 1024,
                 frame_size: 256,
                 status: "registered".to_string(),
@@ -237,6 +287,14 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
         &RegistrySnapshot {
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
+                schema: test_stream_schema(),
+                schema_hash: test_stream_schema_hash().to_string(),
+                data_path: "segment".to_string(),
+                descriptor_generation: 0,
+                sealed_segments: Vec::new(),
+                persisted_files: Vec::new(),
+                persist_events: Vec::new(),
+                segment_reader_leases: Vec::new(),
                 buffer_size: 1024,
                 frame_size: 256,
                 status: "registered".to_string(),
@@ -664,11 +722,23 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
 fn registry_rejects_duplicate_stream_names() {
     let mut registry = Registry::default();
     registry
-        .register_stream("openctp_ticks", 1024, 256)
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
         .unwrap();
 
     let error = registry
-        .register_stream("openctp_ticks", 1024, 256)
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
         .unwrap_err();
     assert!(format!("{error}").contains("stream already exists"));
 }
@@ -719,6 +789,8 @@ fn master_server_roundtrips_reader_instrument_filter_over_control_plane() {
         &socket_path,
         ControlRequest::RegisterStream(RegisterStreamRequest {
             stream_name: "ticks".to_string(),
+            schema: test_stream_schema(),
+            schema_hash: test_stream_schema_hash().to_string(),
             buffer_size: 1024,
             frame_size: 256,
         }),

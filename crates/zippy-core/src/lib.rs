@@ -1,5 +1,7 @@
 pub mod bus_frame;
 pub mod bus_protocol;
+pub mod config;
+pub mod endpoint;
 pub mod engine;
 pub mod error;
 pub mod logging;
@@ -8,6 +10,7 @@ pub mod metrics;
 pub mod publisher;
 pub mod queue;
 pub mod runtime;
+pub mod schema;
 pub mod source;
 pub mod spsc_data_queue;
 pub mod table;
@@ -21,11 +24,19 @@ pub use bus_frame::{
 };
 pub use bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
-    GetSegmentDescriptorRequest, GetStreamRequest, GetStreamResponse, HeartbeatRequest,
-    ListStreamsRequest, ListStreamsResponse, PublishSegmentDescriptorRequest, ReaderDescriptor,
-    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
-    RegisterStreamRequest, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor,
-    BUS_LAYOUT_VERSION,
+    DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
+    GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
+    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    StreamInfo, UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
+};
+pub use config::{
+    default_config_path, ZippyConfig, ZippyLogConfig, ZippyTableConfig, ZippyTablePersistConfig,
+    ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL,
+    DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
+};
+pub use endpoint::{
+    default_control_endpoint_path, resolve_control_endpoint_uri, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};
@@ -37,6 +48,7 @@ pub use queue::BoundedQueue;
 pub use runtime::{
     spawn_engine, spawn_engine_with_publisher, spawn_source_engine_with_publisher, EngineHandle,
 };
+pub use schema::{canonical_schema_hash, schema_metadata};
 pub use source::{Source, SourceEvent, SourceHandle, SourceMode, SourceSink, StreamHello};
 pub use spsc_data_queue::SpscDataQueue;
 pub use table::{SegmentRowView, SegmentTableView};

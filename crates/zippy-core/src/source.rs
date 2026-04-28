@@ -1,8 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use crate::{Result, SchemaRef, SegmentTableView, ZippyError};
-use arrow::ipc::convert::IpcSchemaEncoder;
+use crate::{canonical_schema_hash, Result, SchemaRef, SegmentTableView, ZippyError};
 
 type SourceStopFn = Box<dyn FnMut() -> Result<()> + Send>;
 
@@ -156,23 +155,4 @@ pub trait Source: Send + 'static {
     fn output_schema(&self) -> SchemaRef;
     fn mode(&self) -> SourceMode;
     fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> Result<SourceHandle>;
-}
-
-fn canonical_schema_hash(schema: &SchemaRef) -> String {
-    let mut encoder = IpcSchemaEncoder::new();
-    let flatbuffer = encoder.schema_to_fb(schema.as_ref());
-    let hash = fnv1a64(flatbuffer.finished_data());
-    format!("{hash:016x}")
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001b3;
-
-    let mut hash = OFFSET_BASIS;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
