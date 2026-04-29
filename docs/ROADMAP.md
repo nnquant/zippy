@@ -1392,9 +1392,14 @@ engine 内部尽量处理 `SegmentTableView`，只在必要时物化 Arrow。
   `target` 时，Session 会把 engine 输出自动物化为同名 StreamTable，也就是
   `name="ctp_ticks_latest"` 会注册并发布 `ctp_ticks_latest`，使
   `zippy.read_table("ctp_ticks_latest")` 可以直接查询。
-- 推荐显式写法已经推进为 `.engine(..., output="ctp_ticks_latest")`：
-  `name` 表示 engine 实例名，`output` 表示输出 StreamTable 名。未传 `output` 时
-  仍保留 `name` 同名表默认，以兼容当前 REPL 用法。
+- 推荐显式写法已经推进为 `.engine(...).stream_table("ctp_ticks_latest")`：
+  `name` 表示 engine 实例名，`stream_table(...)` 表示将最近一个 engine 输出物化为
+  输出 StreamTable。未传 `stream_table(...)` 或 `output` 时，仍在 `run()` 前按
+  `name` 同名表默认物化，以兼容当前 REPL 用法。
+- `output_stream="ctp_ticks_latest"` 保留为 `.engine(...)` 的快捷兼容参数，但文档主推
+  `.stream_table(...)`；旧的 `output=` 不再支持，避免与 factor 输出列命名混淆。
+  顶层表创建接口后续命名为 `zippy.create_stream_table(...)`，
+  避免与 Session 链式 `.stream_table(...)` 混淆。
 - Session 自动物化同名表时会为当前进程注册一个 `session_engine_output` source，
   让当前进程拥有该表 segment descriptor 发布权限；source 名包含 process_id，
   避免 REPL/重启后与旧 source 记录冲突。
@@ -1471,6 +1476,8 @@ zippy.replay(
 ### 工作项
 
 - 实现 ParquetReplaySource。
+  - 已完成最小 Python source plugin：读取 parquet file/directory，按 batch
+    as-fast-as-possible 发给 `Pipeline.source(...).stream_table(...)`。
 - 支持按 event_ts / seq 回放。
 - 支持 controlled speed：
   - as-fast-as-possible

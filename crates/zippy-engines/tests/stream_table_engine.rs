@@ -10,9 +10,12 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::{
-    StreamTableDescriptorPublisher, StreamTableEngine, StreamTableMaterializer,
-    StreamTablePersistConfig, StreamTablePersistPartitionSpec, StreamTablePersistPublisher,
-    StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableEngine,
+    StreamTableMaterializer, StreamTablePersistConfig, StreamTablePersistPartitionSpec,
+    StreamTablePersistPublisher, StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+};
+use zippy_segment_store::{
+    compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
 };
 
 fn input_schema() -> Arc<Schema> {
@@ -25,6 +28,15 @@ fn input_schema() -> Arc<Schema> {
         )),
         Arc::new(Field::new("last_price", DataType::Float64, false)),
     ]))
+}
+
+fn segment_schema() -> zippy_segment_store::CompiledSchema {
+    compile_schema(&[
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap()
 }
 
 fn input_batch() -> RecordBatch {
@@ -45,6 +57,27 @@ fn input_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn descriptor_batch(descriptor: &[u8], row_capacity: usize, row_count: usize) -> RecordBatch {
+    let schema = segment_schema();
+    let layout = LayoutPlan::for_schema(&schema, row_capacity).unwrap();
+    let descriptor =
+        ActiveSegmentDescriptor::from_envelope_bytes(descriptor, schema, layout).unwrap();
+    RowSpanView::from_active_descriptor(descriptor, 0, row_count)
+        .unwrap()
+        .as_record_batch()
+        .unwrap()
+}
+
+fn descriptor_shm_path(descriptor: &serde_json::Value) -> PathBuf {
+    PathBuf::from(
+        descriptor["shm_os_id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("file:")
+            .unwrap(),
+    )
+}
+
 fn input_batch_with_rows(rows: usize) -> RecordBatch {
     let instruments = (0..rows)
         .map(|index| if index % 2 == 0 { "IF2606" } else { "IH2606" })
@@ -62,6 +95,22 @@ fn input_batch_with_rows(rows: usize) -> RecordBatch {
             Arc::new(StringArray::from(instruments)) as ArrayRef,
             Arc::new(TimestampNanosecondArray::from(timestamps).with_timezone("UTC")) as ArrayRef,
             Arc::new(Float64Array::from(prices)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn latest_update_batch(instrument_ids: Vec<&str>, last_prices: Vec<f64>) -> RecordBatch {
+    let timestamps = (0..instrument_ids.len())
+        .map(|index| 1_710_000_000_000_000_000_i64 + index as i64)
+        .collect::<Vec<_>>();
+
+    RecordBatch::try_new(
+        input_schema(),
+        vec![
+            Arc::new(StringArray::from(instrument_ids)) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(timestamps).with_timezone("UTC")) as ArrayRef,
+            Arc::new(Float64Array::from(last_prices)) as ArrayRef,
         ],
     )
     .unwrap()
@@ -155,6 +204,139 @@ fn stream_table_materializer_writes_batch_into_active_segment() {
         active.column(2).to_data(),
         batch.column(2).to_data(),
         "last_price should be materialized into active segment"
+    );
+}
+
+#[test]
+fn key_value_table_materializer_replaces_active_snapshot_by_key() {
+    let mut materializer =
+        KeyValueTableMaterializer::new("ticks_latest", input_schema(), vec!["instrument_id"])
+            .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606", "IH2606"],
+            vec![4102.5, 2711.0],
+        )))
+        .unwrap();
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606"],
+            vec![4103.5],
+        )))
+        .unwrap();
+
+    let active = materializer.active_record_batch().unwrap();
+    let instrument_ids = active
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let last_prices = active
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    assert_eq!(active.num_rows(), 2);
+    assert_eq!(instrument_ids.value(0), "IF2606");
+    assert_eq!(last_prices.value(0), 4103.5);
+    assert_eq!(instrument_ids.value(1), "IH2606");
+    assert_eq!(last_prices.value(1), 2711.0);
+}
+
+#[test]
+fn key_value_table_materializer_publishes_new_segment_for_snapshot_replace() {
+    let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
+        "ticks_latest",
+        input_schema(),
+        vec!["instrument_id"],
+        8,
+    )
+    .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606", "IH2606"],
+            vec![4102.5, 2711.0],
+        )))
+        .unwrap();
+    let first_descriptor = materializer.active_descriptor_envelope_bytes().unwrap();
+    let first_descriptor_value: serde_json::Value =
+        serde_json::from_slice(&first_descriptor).unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606"],
+            vec![4103.5],
+        )))
+        .unwrap();
+    let second_descriptor = materializer.active_descriptor_envelope_bytes().unwrap();
+    let second_descriptor_value: serde_json::Value =
+        serde_json::from_slice(&second_descriptor).unwrap();
+    let old_snapshot = descriptor_batch(&first_descriptor, 8, 2);
+    let old_prices = old_snapshot
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    assert_ne!(
+        first_descriptor_value["segment_id"],
+        second_descriptor_value["segment_id"]
+    );
+    assert_ne!(
+        first_descriptor_value["shm_os_id"],
+        second_descriptor_value["shm_os_id"]
+    );
+    assert_eq!(old_prices.value(0), 4102.5);
+}
+
+#[test]
+fn key_value_table_materializer_retains_and_releases_all_segments_from_old_snapshot() {
+    let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
+        "ticks_latest",
+        input_schema(),
+        vec!["instrument_id"],
+        1,
+    )
+    .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606", "IH2606"],
+            vec![4102.5, 2711.0],
+        )))
+        .unwrap();
+    let first_descriptor: serde_json::Value =
+        serde_json::from_slice(&materializer.active_descriptor_envelope_bytes().unwrap()).unwrap();
+    let first_sealed_descriptor = first_descriptor["sealed_segments"]
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .clone();
+    let first_sealed_path = descriptor_shm_path(&first_sealed_descriptor);
+    let first_active_path = descriptor_shm_path(&first_descriptor);
+
+    for update_index in 0..10 {
+        materializer
+            .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+                vec!["IF2606", "IH2606"],
+                vec![4103.5 + update_index as f64, 2712.0 + update_index as f64],
+            )))
+            .unwrap();
+    }
+
+    assert!(
+        !first_active_path.exists(),
+        "old active snapshot segment should be released path=[{}]",
+        first_active_path.display()
+    );
+    assert!(
+        !first_sealed_path.exists(),
+        "old sealed snapshot segment should be released path=[{}]",
+        first_sealed_path.display()
     );
 }
 

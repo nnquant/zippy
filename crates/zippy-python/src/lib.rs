@@ -33,6 +33,7 @@ use zippy_core::{
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
+    KeyValueTableMaterializer as RustKeyValueTableMaterializer,
     ReactiveLatestEngine as RustReactiveLatestEngine,
     ReactiveStateEngine as RustReactiveStateEngine,
     StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
@@ -268,6 +269,7 @@ struct SegmentSourceConfig {
     segment_schema: CompiledSchema,
     master: SharedMasterClient,
     mode: RustSourceMode,
+    start_at_tail: bool,
     xfast: bool,
 }
 
@@ -3446,6 +3448,7 @@ struct SegmentSourceBridge {
     segment_schema: CompiledSchema,
     mode: RustSourceMode,
     master: SharedMasterClient,
+    start_at_tail: bool,
     xfast: bool,
 }
 
@@ -3479,6 +3482,9 @@ impl Source for SegmentSourceBridge {
             &descriptor,
         )?;
         let mut reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)?;
+        if self.start_at_tail {
+            reader.seek_to_committed().map_err(segment_zippy_error)?;
+        }
         let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
         sink.emit(SourceEvent::Hello(hello))?;
 
@@ -3739,6 +3745,28 @@ struct StreamTableEngine {
     archive: SharedArchive,
     handle: SharedHandle,
     engine: Option<RustStreamTableEngine>,
+    remote_source: Option<RemoteSourceConfig>,
+    bus_source: Option<BusSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
+    python_source: Option<PythonSourceConfig>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
+}
+
+#[pyclass]
+struct KeyValueTableMaterializer {
+    name: String,
+    by: Vec<String>,
+    input_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
+    archive: SharedArchive,
+    handle: SharedHandle,
+    engine: Option<RustKeyValueTableMaterializer>,
     remote_source: Option<RemoteSourceConfig>,
     bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
@@ -4326,6 +4354,212 @@ impl StreamTableEngine {
 }
 
 #[pymethods]
+impl KeyValueTableMaterializer {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema, by, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_guard=None, replacement_retention_snapshots=None))]
+    fn new(
+        py: Python<'_>,
+        name: String,
+        input_schema: &Bound<'_, PyAny>,
+        by: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        source: Option<&Bound<'_, PyAny>>,
+        sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
+        archive_buffer_capacity: usize,
+        xfast: bool,
+        descriptor_publisher: Option<Py<PyAny>>,
+        row_capacity: Option<usize>,
+        retention_guard: Option<Py<PyAny>>,
+        replacement_retention_snapshots: Option<usize>,
+    ) -> PyResult<Self> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(input_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let by = parse_by_columns(by)?;
+        let mut engine = match row_capacity {
+            Some(row_capacity) => RustKeyValueTableMaterializer::new_with_row_capacity(
+                &name,
+                Arc::clone(&schema),
+                by.clone(),
+                row_capacity,
+            ),
+            None => RustKeyValueTableMaterializer::new(&name, Arc::clone(&schema), by.clone()),
+        }
+        .map_err(|error| py_value_error(error.to_string()))?;
+        if let Some(callback) = descriptor_publisher {
+            if !callback.bind(py).is_callable() {
+                return Err(PyTypeError::new_err(
+                    "descriptor_publisher must be callable",
+                ));
+            }
+            engine = engine
+                .with_descriptor_publisher(Arc::new(PyStreamTableDescriptorPublisher { callback }));
+        }
+        if let Some(callback) = retention_guard {
+            if !callback.bind(py).is_callable() {
+                return Err(PyTypeError::new_err("retention_guard must be callable"));
+            }
+            engine =
+                engine.with_retention_guard(Arc::new(PyStreamTableRetentionGuard { callback }));
+        }
+        if let Some(snapshots) = replacement_retention_snapshots {
+            engine = engine
+                .with_replacement_retention_snapshots(snapshots)
+                .map_err(|error| py_value_error(error.to_string()))?;
+        }
+        let output_schema = engine.output_schema();
+        let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(sink).map_err(|error| {
+            let message = error.to_string();
+            if message.contains("parquet_sink must be zippy.ParquetSink") {
+                PyTypeError::new_err("sink must be zippy.ParquetSink")
+            } else {
+                error
+            }
+        })?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
+        let handle = Arc::new(Mutex::new(None));
+        let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
+        let (source_owner, remote_source, bus_source, segment_source, python_source) =
+            register_source(
+                source,
+                DownstreamLink {
+                    handle: Arc::clone(&handle),
+                    archive: Arc::clone(&archive),
+                    write_input: parquet_sink
+                        .as_ref()
+                        .map(|config| config.write_input)
+                        .unwrap_or(false),
+                },
+                schema.as_ref(),
+            )?;
+
+        Ok(Self {
+            name,
+            by,
+            input_schema: schema,
+            output_schema,
+            target,
+            parquet_sink,
+            runtime_options,
+            status,
+            metrics,
+            archive,
+            handle,
+            engine: Some(engine),
+            remote_source,
+            bus_source,
+            segment_source,
+            python_source,
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
+        })
+    }
+
+    fn start(&mut self) -> PyResult<()> {
+        let (handle, archive) = start_runtime_engine(
+            &self.name,
+            &self.runtime_options,
+            &self.target,
+            self.parquet_sink.as_ref(),
+            self.remote_source.as_ref(),
+            self.bus_source.as_ref(),
+            self.segment_source.as_ref(),
+            self.python_source.as_ref(),
+            &self.downstreams,
+            &mut self.engine,
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
+        *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        Ok(())
+    }
+
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
+        let result = write_runtime_input(
+            py,
+            &self.handle,
+            &self.archive,
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.output_schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "key_value_table",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            self._source_owner.is_some(),
+        )?;
+        dict.del_item("parquet_sink")?;
+        dict.set_item("sink", parquet_sink_to_pyobject(py, &self.parquet_sink)?)?;
+        dict.set_item("by", self.by.clone())?;
+        Ok(dict.into_any().unbind())
+    }
+
+    fn active_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            py_runtime_error(
+                "key-value table active descriptor is unavailable after the engine has started",
+            )
+        })?;
+        let envelope = engine
+            .active_descriptor_envelope_bytes()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let envelope_text =
+            std::str::from_utf8(&envelope).map_err(|error| py_value_error(error.to_string()))?;
+        Ok(python_json_loads(py, envelope_text)?.into_py(py))
+    }
+
+    fn flush(&self) -> PyResult<()> {
+        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
+    }
+}
+
+#[pymethods]
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
@@ -4740,6 +4974,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<ReactiveLatestEngine>()?;
     module.add_class::<StreamTableEngine>()?;
+    module.add_class::<KeyValueTableMaterializer>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
     Ok(())
@@ -5023,6 +5258,7 @@ fn segment_source_config_from_named_stream(
             segment_schema,
             master: shared_master,
             mode: RustSourceMode::Pipeline,
+            start_at_tail: true,
             xfast,
         },
     ))
@@ -5068,6 +5304,21 @@ fn register_source(
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream.clone());
+        return Ok((Some(source.clone().unbind()), None, None, None, None));
+    }
+
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, KeyValueTableMaterializer>>() {
         if engine.engine.is_none() {
             return Err(py_runtime_error(
                 "source engine must be linked before it is started",
@@ -5156,6 +5407,7 @@ fn register_source(
                 segment_schema: segment_source.segment_schema.clone(),
                 master: Arc::clone(&segment_source.master),
                 mode: segment_source.mode,
+                start_at_tail: false,
                 xfast: segment_source.xfast,
             }),
             None,
@@ -5201,7 +5453,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableEngine, TimeSeriesEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableEngine, KeyValueTableMaterializer, TimeSeriesEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
@@ -5455,6 +5707,7 @@ fn start_runtime_engine<E: Engine>(
                 segment_schema: segment_source.segment_schema.clone(),
                 mode: segment_source.mode,
                 master: Arc::clone(&segment_source.master),
+                start_at_tail: segment_source.start_at_tail,
                 xfast: segment_source.xfast,
             });
             start_prepared_source_runtime(source, config, publisher, engine)

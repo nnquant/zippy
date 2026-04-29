@@ -25,6 +25,7 @@ from ._internal import MasterClient
 from ._internal import MasterServer
 from ._internal import run_master_daemon
 from ._internal import BusReader
+from ._internal import KeyValueTableMaterializer as _KeyValueTableMaterializer
 from ._internal import SegmentStreamSource
 from ._internal import BusStreamSource
 from ._internal import BusStreamTarget
@@ -66,6 +67,7 @@ _BUILTIN_CONFIG: dict[str, object] = {
     "table": {
         "row_capacity": 65_536,
         "retention_segments": None,
+        "replacement_retention_snapshots": 8,
         "persist": {
             "enabled": False,
             "method": "parquet",
@@ -816,12 +818,10 @@ def _tail_persisted_rows(snapshot: dict[str, object], n: int):
     if not files:
         return None
 
-    import pyarrow.parquet as pq
-
     tables = []
     row_count = 0
     for item in reversed(sorted(files, key=_persisted_file_order_key)):
-        table = pq.read_table(str(item["file_path"]))
+        table = _read_persisted_parquet_file(item["file_path"])
         if table.num_rows == 0:
             continue
         tables.append(table)
@@ -844,13 +844,17 @@ def _collect_persisted_rows(snapshot: dict[str, object]):
     if not files:
         return None
 
-    import pyarrow.parquet as pq
-
     tables = [
-        pq.read_table(str(item["file_path"]))
+        _read_persisted_parquet_file(item["file_path"])
         for item in sorted(files, key=_persisted_file_order_key)
     ]
     return _concat_query_tables(tables, None)
+
+
+def _read_persisted_parquet_file(file_path: object):
+    import pyarrow.parquet as pq
+
+    return pq.read_table(str(file_path), partitioning=None)
 
 
 def _non_overlapping_persisted_files(
@@ -1178,7 +1182,126 @@ class ParquetPersist:
         return self.path
 
 
+class _ParquetReplayHandle:
+    """Background runtime handle for ``ParquetReplaySource``."""
+
+    def __init__(self, source: "ParquetReplaySource", sink) -> None:
+        self._source = source
+        self._sink = sink
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"zippy-parquet-replay-{source.source_name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Request the replay thread to stop."""
+        self._stop_event.set()
+
+    def join(self) -> None:
+        """Wait for the replay thread to finish."""
+        self._thread.join()
+
+    def _run(self) -> None:
+        try:
+            self._sink.emit_hello(self._source.source_name)
+            for table in self._source._iter_tables():
+                if self._stop_event.is_set():
+                    break
+                self._sink.emit_data(table)
+            self._sink.emit_flush()
+            self._sink.emit_stop()
+        except Exception as error:
+            self._sink.emit_error(str(error))
+
+
+class ParquetReplaySource:
+    """
+    Replay parquet data as a Zippy Python source plugin.
+
+    The first implementation replays parquet as fast as possible and is intended to feed
+    ``Pipeline.source(...).stream_table(...)``.
+
+    :param path: Parquet file or directory.
+    :type path: str | os.PathLike[str]
+    :param schema: Optional output Arrow schema. When omitted, schema is read from parquet.
+    :type schema: pyarrow.Schema | None
+    :param batch_size: Maximum rows emitted per batch.
+    :type batch_size: int
+    :param source_name: Control-plane source name.
+    :type source_name: str | None
+    :param mode: Replay timing mode. Only ``"as_fast_as_possible"`` is currently supported.
+    :type mode: str
+    """
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        schema=None,
+        *,
+        batch_size: int = 65_536,
+        source_name: str | None = None,
+        mode: str = "as_fast_as_possible",
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        if mode != "as_fast_as_possible":
+            raise ValueError("mode must be 'as_fast_as_possible'")
+        self.path = str(Path(path).expanduser())
+        self.schema = schema
+        self.batch_size = int(batch_size)
+        self.source_name = source_name or "parquet_replay"
+        self.mode = mode
+
+    def _zippy_output_schema(self):
+        if self.schema is None:
+            import pyarrow.dataset as ds
+
+            self.schema = ds.dataset(self.path, format="parquet").schema
+        return self.schema
+
+    def _zippy_source_name(self) -> str:
+        return self.source_name
+
+    def _zippy_source_type(self) -> str:
+        return "parquet_replay"
+
+    def _zippy_start(self, sink) -> _ParquetReplayHandle:
+        return _ParquetReplayHandle(self, sink)
+
+    def _iter_tables(self):
+        import pyarrow as pa
+        import pyarrow.dataset as ds
+
+        scanner = ds.dataset(self.path, format="parquet").scanner(batch_size=self.batch_size)
+        expected_schema = self._zippy_output_schema()
+        for batch in scanner.to_batches():
+            if batch.num_rows == 0:
+                continue
+            table = pa.Table.from_batches([batch])
+            if table.schema != expected_schema:
+                table = table.cast(expected_schema)
+            yield table
+
+
 _ACTIVE_SESSIONS: dict[str, object] = {}
+
+
+def _engine_latest_by(engine: object) -> list[str] | None:
+    config_fn = getattr(engine, "config", None)
+    if not callable(config_fn):
+        return None
+    config = config_fn()
+    if not isinstance(config, dict) or config.get("engine_type") != "reactive_latest":
+        return None
+    by = config.get("by")
+    if isinstance(by, str):
+        return [by]
+    if by is None:
+        return None
+    return [str(item) for item in by]
 
 
 class Session:
@@ -1223,6 +1346,8 @@ class Session:
             self.master = _default_master()
         self._engines: list[object] = []
         self._runtime_engines: list[object] = []
+        self._pending_output_tables: dict[int, tuple[str, bool]] = {}
+        self._materialized_engine_ids: set[int] = set()
         self._started = False
         self._needs_master_process = False
 
@@ -1234,9 +1359,8 @@ class Session:
             ``zippy.ReactiveLatestEngine``.
         :type engine: object
         :param kwargs: Constructor arguments when ``engine`` is a class.
-            ``output="table_name"`` materializes engine output into that named stream table.
-            ``persist=True`` persists the automatic output table as parquet;
-            ``persist=False`` keeps it live-only.
+            ``output_stream="name"`` remains a shortcut for ``.stream_table("name")``.
+            Prefer ``.stream_table(..., persist=True|False)`` for new code.
         :type kwargs: object
         :returns: This session for fluent ``.engine(...).run()`` usage.
         :rtype: Session
@@ -1249,11 +1373,12 @@ class Session:
 
         materializers: list[object] = []
         if isinstance(engine, type):
-            engine_obj, materializers = self._build_engine(engine, kwargs)
+            engine_obj, materializers, pending_output = self._build_engine(engine, kwargs)
         else:
             if kwargs:
                 raise TypeError("engine instance does not accept constructor keyword arguments")
             engine_obj = engine
+            pending_output = None
 
         self._validate_engine(engine_obj)
         for materializer in materializers:
@@ -1261,6 +1386,41 @@ class Session:
         self._engines.append(engine_obj)
         self._runtime_engines.extend(materializers)
         self._runtime_engines.append(engine_obj)
+        if materializers:
+            self._materialized_engine_ids.add(id(engine_obj))
+        if pending_output is not None:
+            self._pending_output_tables[id(engine_obj)] = pending_output
+        return self
+
+    def stream_table(self, name: str, *, persist: bool = False) -> "Session":
+        """
+        Materialize the latest engine output into a named stream table.
+
+        :param name: Output stream table name.
+        :type name: str
+        :param persist: Whether to persist the stream table as parquet.
+        :type persist: bool
+        :returns: This session for fluent ``.stream_table(...).run()`` usage.
+        :rtype: Session
+        :raises RuntimeError: If no engine has been added.
+        :raises ValueError: If the latest engine already has an output table.
+        """
+        if not isinstance(name, str):
+            raise TypeError("stream table name must be a string")
+        if not name:
+            raise ValueError("stream table name must not be empty")
+        if not isinstance(persist, bool):
+            raise TypeError("persist must be True or False")
+        if not self._engines:
+            raise RuntimeError("stream_table() requires an engine() before it")
+
+        engine = self._engines[-1]
+        engine_id = id(engine)
+        if engine_id in self._materialized_engine_ids:
+            raise ValueError("latest engine output is already materialized")
+
+        self._pending_output_tables.pop(engine_id, None)
+        self._attach_engine_output_table(engine, name, persist=persist)
         return self
 
     def engines(self) -> tuple[object, ...]:
@@ -1279,6 +1439,7 @@ class Session:
         :returns: This session.
         :rtype: Session
         """
+        self._materialize_pending_output_tables()
         if self._needs_master_process:
             _ensure_master_process(self.master, self.app or self.name)
         for engine in self._runtime_engines:
@@ -1316,20 +1477,22 @@ class Session:
 
     def _build_engine(self, engine_cls: type, kwargs: dict[str, object]):
         explicit_target = "target" in kwargs
-        output = kwargs.pop("output", None)
-        if output is not None and not isinstance(output, str):
-            raise TypeError("output must be a stream table name")
-        if output == "":
-            raise ValueError("output must not be empty")
-        if output is not None and explicit_target:
-            raise ValueError("output cannot be combined with explicit target")
+        if "output" in kwargs:
+            raise TypeError("output is not supported; use output_stream or .stream_table(...)")
+        output_stream = kwargs.pop("output_stream", None)
+        if output_stream is not None and not isinstance(output_stream, str):
+            raise TypeError("output_stream must be a stream table name")
+        if output_stream == "":
+            raise ValueError("output_stream must not be empty")
+        if output_stream is not None and explicit_target:
+            raise ValueError("output_stream cannot be combined with explicit target")
         persist = kwargs.pop("persist", False)
         if not isinstance(persist, bool):
             raise TypeError("persist must be True or False")
         source_is_named_stream = isinstance(kwargs.get("source"), str)
         output_table_name = (
-            output
-            if output is not None
+            output_stream
+            if output_stream is not None
             else (
                 str(kwargs["name"])
                 if source_is_named_stream and not explicit_target and kwargs.get("name")
@@ -1347,15 +1510,41 @@ class Session:
         engine = engine_cls(**kwargs)
 
         materializers: list[object] = []
-        if output_table_name is not None and callable(getattr(engine, "output_schema", None)):
+        pending_output = None
+        if output_stream is not None and callable(getattr(engine, "output_schema", None)):
             materializers.append(
                 self._materialize_engine_output(
                     engine,
-                    output_table_name,
+                    output_stream,
                     persist=persist,
                 )
             )
-        return engine, materializers
+        elif output_table_name is not None:
+            pending_output = (output_table_name, persist)
+        return engine, materializers, pending_output
+
+    def _materialize_pending_output_tables(self) -> None:
+        for engine in list(self._engines):
+            engine_id = id(engine)
+            pending_output = self._pending_output_tables.pop(engine_id, None)
+            if pending_output is None:
+                continue
+            table_name, persist = pending_output
+            if engine_id in self._materialized_engine_ids:
+                continue
+            self._attach_engine_output_table(engine, table_name, persist=persist)
+
+    def _attach_engine_output_table(
+        self,
+        engine: object,
+        table_name: str,
+        *,
+        persist: bool,
+    ) -> None:
+        materializer = self._materialize_engine_output(engine, table_name, persist=persist)
+        engine_index = self._runtime_engines.index(engine)
+        self._runtime_engines.insert(engine_index, materializer)
+        self._materialized_engine_ids.add(id(engine))
 
     def _materialize_engine_output(
         self,
@@ -1363,7 +1552,7 @@ class Session:
         table_name: str,
         *,
         persist: bool,
-    ) -> StreamTableEngine:
+    ) -> object:
         output_schema = engine.output_schema()
         table_options = _resolve_stream_table_options(
             name=table_name,
@@ -1377,28 +1566,46 @@ class Session:
             data_dir=None,
             persist_path=None,
         )
+        latest_by = _engine_latest_by(engine)
+        if latest_by is not None and table_options["persist_path"] is not None:
+            raise ValueError("ReactiveLatestEngine stream_table does not support persist=True")
         _ensure_master_process(self.master, self.app or self.name)
         self.master.register_stream(table_name, output_schema, 64, 4096)
         self._register_materializer_source(table_name)
-        materializer = StreamTableEngine(
-            name=table_name,
-            input_schema=output_schema,
-            source=engine,
-            target=NullPublisher(),
-            descriptor_publisher=self._descriptor_publisher(table_name),
-            row_capacity=table_options["row_capacity"],
-            retention_segments=table_options["retention_segments"],
-            retention_guard=self._retention_guard(table_name),
-            dt_column=table_options["dt_column"],
-            id_column=table_options["id_column"],
-            dt_part=table_options["dt_part"],
-            persist_path=table_options["persist_path"],
-            persist_publisher=(
-                self._persist_publisher(table_name)
-                if table_options["persist_path"] is not None
-                else None
-            ),
-        )
+        if latest_by is not None:
+            materializer = _KeyValueTableMaterializer(
+                name=table_name,
+                input_schema=output_schema,
+                by=latest_by,
+                source=engine,
+                target=NullPublisher(),
+                descriptor_publisher=self._descriptor_publisher(table_name),
+                row_capacity=table_options["row_capacity"],
+                retention_guard=self._retention_guard(table_name),
+                replacement_retention_snapshots=table_options[
+                    "replacement_retention_snapshots"
+                ],
+            )
+        else:
+            materializer = StreamTableEngine(
+                name=table_name,
+                input_schema=output_schema,
+                source=engine,
+                target=NullPublisher(),
+                descriptor_publisher=self._descriptor_publisher(table_name),
+                row_capacity=table_options["row_capacity"],
+                retention_segments=table_options["retention_segments"],
+                retention_guard=self._retention_guard(table_name),
+                dt_column=table_options["dt_column"],
+                id_column=table_options["id_column"],
+                dt_part=table_options["dt_part"],
+                persist_path=table_options["persist_path"],
+                persist_publisher=(
+                    self._persist_publisher(table_name)
+                    if table_options["persist_path"] is not None
+                    else None
+                ),
+            )
         self.master.publish_segment_descriptor(table_name, materializer.active_descriptor())
         self._needs_master_process = True
         return materializer
@@ -1802,6 +2009,11 @@ def _resolve_stream_table_options(
             retention_segments = int(configured_retention_segments)
     if retention_segments is not None and retention_segments < 0:
         raise ValueError("retention_segments must be non-negative")
+    replacement_retention_snapshots = int(
+        table_config.get("replacement_retention_snapshots", 8)
+    )
+    if replacement_retention_snapshots <= 0:
+        raise ValueError("replacement_retention_snapshots must be greater than zero")
 
     if dt_column is None:
         dt_column = _optional_config_string(partition_config.get("dt_column"))
@@ -1815,6 +2027,7 @@ def _resolve_stream_table_options(
         return {
             "row_capacity": row_capacity,
             "retention_segments": retention_segments,
+            "replacement_retention_snapshots": replacement_retention_snapshots,
             "dt_column": dt_column,
             "id_column": id_column,
             "dt_part": dt_part,
@@ -1834,6 +2047,7 @@ def _resolve_stream_table_options(
         return {
             "row_capacity": row_capacity,
             "retention_segments": retention_segments,
+            "replacement_retention_snapshots": replacement_retention_snapshots,
             "dt_column": dt_column,
             "id_column": id_column,
             "dt_part": dt_part,
@@ -1846,6 +2060,7 @@ def _resolve_stream_table_options(
     return {
         "row_capacity": row_capacity,
         "retention_segments": retention_segments,
+        "replacement_retention_snapshots": replacement_retention_snapshots,
         "dt_column": dt_column,
         "id_column": id_column,
         "dt_part": dt_part,
@@ -2144,6 +2359,7 @@ __all__ = [
     "NullPublisher",
     "OverflowPolicy",
     "ParquetPersist",
+    "ParquetReplaySource",
     "ParquetSink",
     "Pipeline",
     "ReactiveLatestEngine",

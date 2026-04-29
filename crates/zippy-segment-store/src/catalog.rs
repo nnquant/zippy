@@ -401,6 +401,18 @@ impl PartitionHandle {
         self.inner.partition_id
     }
 
+    /// Release one retired segment after the owner has decided it is no longer readable.
+    pub fn release_retired_segment(&self, segment_id: u64, generation: u64) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        let Some(retained) = state.retired_segments.get(&segment_id) else {
+            return false;
+        };
+        if retained.generation != generation {
+            return false;
+        }
+        state.retired_segments.remove(&segment_id).is_some()
+    }
+
     fn collect_garbage(&self, store: &SegmentStore) {
         let mut state = self.inner.state.lock().unwrap();
         state.retired_segments.retain(|segment_id, retained| {
@@ -541,6 +553,24 @@ impl PartitionWriterHandle {
             .unwrap()
             .writer
             .committed_row_count()
+    }
+
+    /// 清空当前 active segment 中的已提交行，用于原地重写快照。
+    pub fn clear_rows(&self) -> Result<(), ZippySegmentStoreError> {
+        {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            state
+                .writer
+                .clear_rows()
+                .map_err(ZippySegmentStoreError::Writer)?;
+        }
+
+        self.handle
+            .inner
+            .broadcaster
+            .notify_all()
+            .map_err(ZippySegmentStoreError::Io)?;
+        Ok(())
     }
 
     /// 追加一条测试 tick。

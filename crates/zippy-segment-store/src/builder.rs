@@ -257,6 +257,55 @@ impl ActiveSegmentWriter {
         self.header.committed_row_count.load(Ordering::Acquire)
     }
 
+    /// 清空当前 active segment 中的已提交行，用于原地重写快照。
+    pub fn clear_rows(&mut self) -> Result<(), &'static str> {
+        if self.header.sealed {
+            return Err("segment is sealed");
+        }
+        if self.current_row_open {
+            return Err("open row exists during clear");
+        }
+
+        self.header.committed_row_count.store(0, Ordering::Release);
+        self.shm_region
+            .store_u64_release(SHM_COMMITTED_ROW_COUNT_OFFSET, 0)
+            .map_err(|_| "failed to clear shared memory committed row count")?;
+        self.header.row_count = 0;
+        self.row_cursor = 0;
+        write_u64_header(&mut self.shm_region, SHM_ROW_COUNT_OFFSET, 0)?;
+
+        for (column_name, validity) in self.validity.iter_mut() {
+            validity.fill(false);
+            let Some(column_layout) = self.layout.column(column_name) else {
+                continue;
+            };
+            if column_layout.validity_len == 0 {
+                continue;
+            }
+            let offset = SHM_PAYLOAD_OFFSET + column_layout.validity_offset;
+            let zeros = vec![0_u8; column_layout.validity_len];
+            self.shm_region
+                .write_at(offset, &zeros)
+                .map_err(|_| "failed to clear shared memory validity bytes")?;
+        }
+
+        for (column_name, utf8) in self.utf8_columns.iter_mut() {
+            utf8.offsets.fill(0);
+            utf8.values.clear();
+            let column_layout = self
+                .layout
+                .column(column_name)
+                .ok_or("missing column layout")?;
+            let offset = SHM_PAYLOAD_OFFSET + column_layout.offsets_offset;
+            let zeros = vec![0_u8; column_layout.offsets_len];
+            self.shm_region
+                .write_at(offset, &zeros)
+                .map_err(|_| "failed to clear shared memory utf8 offsets")?;
+        }
+
+        Ok(())
+    }
+
     /// 写入 i64 值的最小占位接口。
     pub fn write_i64(&mut self, column: &str, value: i64) -> Result<(), &'static str> {
         self.ensure_row_open()?;

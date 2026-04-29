@@ -70,6 +70,13 @@ impl ActiveSegmentReader {
         })
     }
 
+    /// 将 cursor 移到当前已提交行尾，后续只读取新提交的行。
+    pub fn seek_to_committed(&mut self) -> Result<usize, ZippySegmentStoreError> {
+        let committed = self.committed_row_count()?;
+        self.cursor = committed;
+        Ok(committed)
+    }
+
     /// 读取当前 active segment 上新增的连续行区间。
     pub fn read_available(&mut self) -> Result<Option<RowSpanView>, ZippySegmentStoreError> {
         let committed = self.committed_row_count()?;

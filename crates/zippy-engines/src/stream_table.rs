@@ -10,8 +10,8 @@ use arrow::{
         Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
         UInt32Array,
     },
-    compute::take,
-    datatypes::{DataType, Fields, TimeUnit},
+    compute::{concat_batches, take},
+    datatypes::{DataType, Fields, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use parquet::arrow::ArrowWriter;
@@ -21,8 +21,11 @@ use zippy_segment_store::{
     SealedSegmentHandle, SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
 
+use crate::table_view::record_batch_from_table_rows;
+
 const STREAM_TABLE_PARTITION: &str = "all";
 pub const DEFAULT_STREAM_TABLE_ROW_CAPACITY: usize = 65_536;
+const DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS: usize = 8;
 type SegmentIdentity = (u64, u64);
 
 /// Materializes an input stream into an active segment-backed stream table.
@@ -32,13 +35,24 @@ pub struct StreamTableMaterializer {
     store: SegmentStore,
     partition: PartitionHandle,
     sealed_segment_descriptors: Vec<serde_json::Value>,
+    replacement_retained_snapshots: Vec<Vec<serde_json::Value>>,
     retention_segments: Option<usize>,
+    replacement_retention_snapshots: usize,
     persisted_segment_identities: BTreeSet<SegmentIdentity>,
     descriptor_publisher: Option<Arc<dyn StreamTableDescriptorPublisher>>,
     persist_config: Option<StreamTablePersistConfig>,
     persist_publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
     retention_guard: Option<Arc<dyn StreamTableRetentionGuard>>,
     persist_worker: Option<StreamTablePersistWorker>,
+}
+
+/// Materializes keyed rows into a replace-style active segment snapshot.
+pub struct KeyValueTableMaterializer {
+    name: String,
+    input_schema: SchemaRef,
+    by: Vec<String>,
+    latest_rows: BTreeMap<Vec<String>, KeyValueOwnedRow>,
+    table: StreamTableMaterializer,
 }
 
 /// Keeps a stream table segment pinned for reader-safe retention tests.
@@ -88,6 +102,11 @@ pub enum StreamTableDateTimePart {
 
 struct PersistPartitionBatch {
     values: PersistPartitionValues,
+    batch: RecordBatch,
+}
+
+#[derive(Clone)]
+struct KeyValueOwnedRow {
     batch: RecordBatch,
 }
 
@@ -555,7 +574,9 @@ impl StreamTableMaterializer {
             store,
             partition,
             sealed_segment_descriptors: Vec::new(),
+            replacement_retained_snapshots: Vec::new(),
             retention_segments: None,
+            replacement_retention_snapshots: DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS,
             persisted_segment_identities: BTreeSet::new(),
             descriptor_publisher: None,
             persist_config: None,
@@ -578,6 +599,17 @@ impl StreamTableMaterializer {
     pub fn with_retention_segments(mut self, retention_segments: usize) -> Self {
         self.retention_segments = Some(retention_segments);
         self
+    }
+
+    /// Limit how many old replacement snapshots are retained for stale readers.
+    pub fn with_replacement_retention_snapshots(mut self, snapshots: usize) -> Result<Self> {
+        if snapshots == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "replacement_retention_snapshots must be greater than zero".to_string(),
+            });
+        }
+        self.replacement_retention_snapshots = snapshots;
+        Ok(self)
     }
 
     /// Enable parquet persistence writes for sealed segments.
@@ -681,6 +713,18 @@ impl StreamTableMaterializer {
             self.publish_active_descriptor()?;
         }
 
+        self.materialize_table_rows(table, true)
+    }
+
+    fn materialize_table_rows(
+        &mut self,
+        table: &SegmentTableView,
+        publish_rollovers: bool,
+    ) -> Result<()> {
+        if table.num_rows() == 0 {
+            return Ok(());
+        }
+
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
             .map(|index| table.column_at(index))
@@ -698,7 +742,9 @@ impl StreamTableMaterializer {
                     self.sealed_segment_descriptors
                         .push(sealed_descriptor.clone());
                     self.apply_retention()?;
-                    self.publish_active_descriptor()?;
+                    if publish_rollovers {
+                        self.publish_active_descriptor()?;
+                    }
                     self.write_materialized_row(&writer, &fields, &columns, row_index)
                         .map_err(segment_error)?;
                     self.enqueue_persist_task(sealed, &sealed_descriptor)?;
@@ -707,6 +753,37 @@ impl StreamTableMaterializer {
             }
         }
 
+        Ok(())
+    }
+
+    fn replace_with_table(&mut self, table: &SegmentTableView) -> Result<()> {
+        self.ensure_persist_healthy()?;
+        if table.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "input batch schema does not match stream table input schema engine=[{}]",
+                    self.name
+                ),
+            });
+        }
+
+        let old_descriptor = self.active_descriptor_value()?;
+        let mut old_snapshot = Vec::with_capacity(self.sealed_segment_descriptors.len() + 1);
+        old_snapshot.extend(self.sealed_segment_descriptors.iter().cloned());
+        old_snapshot.push(old_descriptor);
+        let writer = self.partition.writer();
+        let _sealed = writer
+            .rollover_without_persistence()
+            .map_err(segment_error)?;
+        self.replacement_retained_snapshots.push(old_snapshot);
+        self.sealed_segment_descriptors.clear();
+        self.persisted_segment_identities.clear();
+
+        self.materialize_table_rows(table, false)?;
+        self.publish_active_descriptor()?;
+        if self.apply_retention()? {
+            self.publish_active_descriptor()?;
+        }
         Ok(())
     }
 
@@ -815,11 +892,17 @@ impl StreamTableMaterializer {
 
     fn apply_retention(&mut self) -> Result<bool> {
         self.drain_persist_completions();
-        let Some(retention_segments) = self.retention_segments else {
-            return Ok(false);
+        let published_changed = if let Some(retention_segments) = self.retention_segments {
+            self.trim_published_retained_segments(retention_segments)?
+        } else {
+            false
         };
+        self.trim_replacement_retained_segments()?;
+        Ok(published_changed)
+    }
 
-        let mut changed = false;
+    fn trim_published_retained_segments(&mut self, retention_segments: usize) -> Result<bool> {
+        let mut published_changed = false;
         while self.sealed_segment_descriptors.len() > retention_segments {
             let Some(identity) =
                 descriptor_segment_identity(self.sealed_segment_descriptors.first().unwrap())
@@ -844,12 +927,46 @@ impl StreamTableMaterializer {
                 }
             }
             self.sealed_segment_descriptors.remove(0);
-            changed = true;
+            self.partition
+                .release_retired_segment(identity.0, identity.1);
+            published_changed = true;
         }
-        if changed {
-            self.store.collect_garbage().map_err(segment_error)?;
+        Ok(published_changed)
+    }
+
+    fn trim_replacement_retained_segments(&mut self) -> Result<()> {
+        while self.replacement_retained_snapshots.len() > self.replacement_retention_snapshots {
+            let snapshot = self.replacement_retained_snapshots.first().unwrap();
+            let identities = snapshot
+                .iter()
+                .map(descriptor_segment_identity)
+                .collect::<Option<Vec<_>>>();
+            let Some(identities) = identities else {
+                break;
+            };
+            let has_pinned_segment = identities.iter().any(|identity| {
+                self.store
+                    .pin_count_for_segment(&self.partition, identity.0, identity.1)
+                    > 0
+            });
+            if has_pinned_segment {
+                break;
+            }
+            if let Some(guard) = &self.retention_guard {
+                for identity in &identities {
+                    if !guard.can_release(identity.0, identity.1)? {
+                        return Ok(());
+                    }
+                }
+            }
+
+            self.replacement_retained_snapshots.remove(0);
+            for identity in identities {
+                self.partition
+                    .release_retired_segment(identity.0, identity.1);
+            }
         }
-        Ok(changed)
+        Ok(())
     }
 
     fn drain_persist_completions(&mut self) {
@@ -888,6 +1005,260 @@ impl StreamTableMaterializer {
         }
         Ok(())
     }
+}
+
+impl KeyValueTableMaterializer {
+    /// Create a new key-value table materializer.
+    ///
+    /// :param name: Stream table name.
+    /// :type name: impl Into<String>
+    /// :param input_schema: Input schema consumed and materialized by the table.
+    /// :type input_schema: SchemaRef
+    /// :param by: UTF8 key columns identifying rows to replace.
+    /// :type by: Vec<impl Into<String>>
+    /// :returns: Initialized key-value table materializer.
+    /// :rtype: Result<KeyValueTableMaterializer>
+    pub fn new(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        by: Vec<impl Into<String>>,
+    ) -> Result<Self> {
+        Self::new_with_row_capacity(name, input_schema, by, DEFAULT_STREAM_TABLE_ROW_CAPACITY)
+    }
+
+    /// Create a new key-value table materializer with explicit row capacity.
+    ///
+    /// :param name: Stream table name.
+    /// :type name: impl Into<String>
+    /// :param input_schema: Input schema consumed and materialized by the table.
+    /// :type input_schema: SchemaRef
+    /// :param by: UTF8 key columns identifying rows to replace.
+    /// :type by: Vec<impl Into<String>>
+    /// :param row_capacity: Active segment row capacity before rollover.
+    /// :type row_capacity: usize
+    /// :returns: Initialized key-value table materializer.
+    /// :rtype: Result<KeyValueTableMaterializer>
+    pub fn new_with_row_capacity(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        by: Vec<impl Into<String>>,
+        row_capacity: usize,
+    ) -> Result<Self> {
+        let name = name.into();
+        let by = by.into_iter().map(Into::into).collect::<Vec<_>>();
+        validate_latest_by_columns(input_schema.as_ref(), &by)?;
+        let table = StreamTableMaterializer::new_with_row_capacity(
+            name.clone(),
+            Arc::clone(&input_schema),
+            row_capacity,
+        )?;
+
+        Ok(Self {
+            name,
+            input_schema,
+            by,
+            latest_rows: BTreeMap::new(),
+            table,
+        })
+    }
+
+    /// Attach a publisher used when the active snapshot descriptor changes.
+    pub fn with_descriptor_publisher(
+        mut self,
+        publisher: Arc<dyn StreamTableDescriptorPublisher>,
+    ) -> Self {
+        self.table = self.table.with_descriptor_publisher(publisher);
+        self
+    }
+
+    /// Attach a guard used before releasing old replacement snapshots.
+    pub fn with_retention_guard(mut self, guard: Arc<dyn StreamTableRetentionGuard>) -> Self {
+        self.table = self.table.with_retention_guard(guard);
+        self
+    }
+
+    /// Limit how many old replacement snapshots are retained for stale readers.
+    pub fn with_replacement_retention_snapshots(mut self, snapshots: usize) -> Result<Self> {
+        self.table = self.table.with_replacement_retention_snapshots(snapshots)?;
+        Ok(self)
+    }
+
+    /// Return the grouping columns used to identify latest rows.
+    pub fn by(&self) -> &[String] {
+        &self.by
+    }
+
+    /// Return the active segment committed row count.
+    pub fn active_committed_row_count(&self) -> usize {
+        self.table.active_committed_row_count()
+    }
+
+    /// Export the active segment descriptor envelope for cross-process readers.
+    pub fn active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
+        self.table.active_descriptor_envelope_bytes()
+    }
+
+    /// Return a debug Arrow snapshot of the active key-value table segment.
+    pub fn active_record_batch(&self) -> Result<RecordBatch> {
+        self.table.active_record_batch()
+    }
+
+    fn update_latest_rows(&mut self, table: &SegmentTableView) -> Result<()> {
+        let by_arrays = self
+            .by
+            .iter()
+            .map(|field| table.column(field))
+            .collect::<Result<Vec<_>>>()?;
+        let by_columns = by_arrays
+            .iter()
+            .zip(&self.by)
+            .map(|(column, field)| latest_string_array(column, field))
+            .collect::<Result<Vec<_>>>()?;
+
+        for row_index in 0..table.num_rows() {
+            let key = latest_build_key(&by_columns, &self.by, row_index)?;
+            let row = latest_extract_owned_row(table, &self.input_schema, row_index)?;
+            self.latest_rows.insert(key, row);
+        }
+
+        Ok(())
+    }
+
+    fn build_snapshot_batch(&self) -> Result<RecordBatch> {
+        if self.latest_rows.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.input_schema)));
+        }
+
+        concat_batches(
+            &self.input_schema,
+            self.latest_rows.values().map(|row| &row.batch),
+        )
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to build key-value table snapshot batch error=[{}]",
+                error
+            ),
+        })
+    }
+}
+
+impl Engine for KeyValueTableMaterializer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn input_schema(&self) -> SchemaRef {
+        Arc::clone(&self.input_schema)
+    }
+
+    fn output_schema(&self) -> SchemaRef {
+        Arc::clone(&self.input_schema)
+    }
+
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        if table.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "input batch schema does not match key-value table input schema engine=[{}]",
+                    self.name
+                ),
+            });
+        }
+        if table.num_rows() == 0 {
+            return Ok(vec![]);
+        }
+
+        self.update_latest_rows(&table)?;
+        let snapshot = self.build_snapshot_batch()?;
+        let view = SegmentTableView::from_record_batch(snapshot);
+        self.table.replace_with_table(&view)?;
+        Ok(vec![view])
+    }
+
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
+        self.table.on_flush()?;
+        if self.latest_rows.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![SegmentTableView::from_record_batch(
+            self.build_snapshot_batch()?,
+        )])
+    }
+
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
+        self.table.on_stop()?;
+        self.on_flush()
+    }
+}
+
+fn validate_latest_by_columns(schema: &Schema, by: &[String]) -> Result<()> {
+    if by.is_empty() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "key-value table materializer requires at least one by column".to_string(),
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    for field_name in by {
+        if !seen.insert(field_name) {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!("duplicate key-value table by column field=[{}]", field_name),
+            });
+        }
+        let field = schema
+            .field_with_name(field_name)
+            .map_err(|_| ZippyError::SchemaMismatch {
+                reason: format!("missing key-value table by field field=[{}]", field_name),
+            })?;
+        if field.data_type() != &DataType::Utf8 {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "key-value table by field must be utf8 field=[{}]",
+                    field_name
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn latest_string_array<'a>(array: &'a ArrayRef, field: &str) -> Result<&'a StringArray> {
+    array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ZippyError::SchemaMismatch {
+            reason: format!("key-value table by field must be utf8 field=[{}]", field),
+        })
+}
+
+fn latest_build_key(
+    columns: &[&StringArray],
+    fields: &[String],
+    row_index: usize,
+) -> Result<Vec<String>> {
+    columns
+        .iter()
+        .zip(fields)
+        .map(|(column, field)| {
+            if column.is_null(row_index) {
+                return Err(ZippyError::SchemaMismatch {
+                    reason: format!("key-value table by field contains null field=[{}]", field),
+                });
+            }
+            Ok(column.value(row_index).to_string())
+        })
+        .collect()
+}
+
+fn latest_extract_owned_row(
+    table: &SegmentTableView,
+    schema: &SchemaRef,
+    row_index: usize,
+) -> Result<KeyValueOwnedRow> {
+    let batch =
+        record_batch_from_table_rows(table, schema, &[row_index as u32], "key-value table")?;
+    Ok(KeyValueOwnedRow { batch })
 }
 
 fn write_sealed_segment_parquet(

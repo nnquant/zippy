@@ -646,6 +646,52 @@ class StreamTableEngine:
     def stop(self) -> None: ...
 
 
+class KeyValueTableMaterializer:
+    def __init__(
+        self,
+        name: str,
+        input_schema: pa.Schema,
+        by: str | list[str],
+        target: PublisherTarget,
+        *,
+        source: ReactiveStateEngine
+        | ReactiveLatestEngine
+        | StreamTableEngine
+        | KeyValueTableMaterializer
+        | TimeSeriesEngine
+        | ZmqSource
+        | BusStreamSource
+        | None = None,
+        sink: ParquetSink | None = None,
+        buffer_capacity: int = 1024,
+        overflow_policy: _OverflowPolicyValue | None = None,
+        archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
+        descriptor_publisher: object | None = None,
+        row_capacity: int | None = None,
+        retention_guard: object | None = None,
+        replacement_retention_snapshots: int | None = None,
+    ) -> None: ...
+
+    def start(self) -> None: ...
+
+    def write(self, value: WriteValue) -> None: ...
+
+    def output_schema(self) -> pa.Schema: ...
+
+    def status(self) -> str: ...
+
+    def metrics(self) -> dict[str, int]: ...
+
+    def config(self) -> dict[str, object]: ...
+
+    def active_descriptor(self) -> dict[str, object]: ...
+
+    def flush(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
 class TimeSeriesEngine:
     def __init__(
         self,
