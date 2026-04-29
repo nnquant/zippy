@@ -31,6 +31,7 @@ uv run zippy stream ls --uri default
 - `04_subscribe/`：行级订阅和表级批量订阅。
 - `05_engines/`：`Session` 编排、`ReactiveLatestEngine`、时序和截面引擎。
 - `06_replay/`：从 persisted table / Parquet 回放到 StreamTable，并驱动下游 Engine。
+- `07_ops/`：运行时表状态、master 元数据和运维观察入口。
 
 ## 推荐学习顺序
 
@@ -42,6 +43,7 @@ uv run zippy stream ls --uri default
 6. 用 `06_replay/01_parquet_replay_to_stream_table.py` 做不开盘环境下的回放测试。
 7. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
 8. 用 `06_replay/03_replay_to_reactive_latest_engine.py` 验证 replay stream 驱动下游 Engine。
+9. 用 `07_ops/01_table_observability.py` 查看 master 中的表状态。
 
 ## API 分层
 
@@ -51,6 +53,7 @@ uv run zippy stream ls --uri default
 - `zp.Pipeline(...).stream_table(...)`：把一个 source 或手动写入的数据物化成 StreamTable。
 - `zp.Session(...).engine(...).stream_table(...).run()`：编排下游 Engine，并把输出注册成可查询表。
 - `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
+- `zp.list_tables()` / `zp.table_info("table_name")`：查看 master 中的表状态和元数据。
 - `zp.subscribe(...)`：按行接收 `zp.Row`。
 - `zp.subscribe_table(...)`：按批接收 `pyarrow.Table`。
 - `zp.replay(...)`：把已持久化的 Zippy 表回放到 callback 或 named StreamTable。

@@ -346,6 +346,55 @@ def config(master: MasterClient | None = None) -> dict[str, object]:
     return _master_config(master or _default_master())
 
 
+def list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
+    """
+    List tables registered in the connected Zippy master.
+
+    This is the user-facing wrapper over the master stream registry. It returns the
+    same metadata shape as :meth:`MasterClient.list_streams`, but avoids forcing Python
+    users to manage a ``MasterClient`` in common monitoring code.
+
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Registered table metadata entries.
+    :rtype: list[dict[str, object]]
+    :raises RuntimeError: If ``zippy.connect()`` has not been called or master rejects the request.
+    :example:
+
+        >>> zippy.connect()
+        >>> zippy.list_tables()
+    """
+    return list((master or _default_master()).list_streams())
+
+
+def table_info(
+    table_name: str,
+    *,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Return master metadata for one registered Zippy table.
+
+    :param table_name: Named table to inspect.
+    :type table_name: str
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Table metadata including schema, status, descriptors, and persist state.
+    :rtype: dict[str, object]
+    :raises ValueError: If ``table_name`` is empty.
+    :raises RuntimeError: If the table does not exist or master rejects the request.
+    :example:
+
+        >>> zippy.connect()
+        >>> zippy.table_info("ctp_ticks")
+    """
+    if not isinstance(table_name, str):
+        raise TypeError("table_name must be a string")
+    if not table_name:
+        raise ValueError("table_name must not be empty")
+    return (master or _default_master()).get_stream(table_name)
+
+
 def drop_table(
     table_name: str,
     *,
@@ -3311,11 +3360,13 @@ __all__ = [
     "connect",
     "drop_table",
     "log_info",
+    "list_tables",
     "master",
     "read_table",
     "read_from",
     "replay",
     "subscribe",
     "subscribe_table",
+    "table_info",
     "version",
 ]

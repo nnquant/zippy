@@ -5150,6 +5150,33 @@ def test_master_client_gets_stream(tmp_path: Path) -> None:
     server.stop()
 
 
+def test_top_level_table_observability_uses_default_master(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    try:
+        client = zippy.connect(uri=control_endpoint, app="table_observability_test")
+        client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+
+        tables = zippy.list_tables()
+        table = zippy.table_info("openctp_ticks")
+
+        assert [item["stream_name"] for item in tables] == ["openctp_ticks"]
+        assert table["stream_name"] == "openctp_ticks"
+        assert table["schema"]["fields"][0]["name"] == "instrument_id"
+        assert table["status"] == "registered"
+        assert table["descriptor_generation"] == 0
+        assert table["persisted_files"] == []
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_master_client_drop_table_removes_stream_and_persisted_files(tmp_path: Path) -> None:
     try:
         server, control_endpoint = start_master_server(tmp_path)

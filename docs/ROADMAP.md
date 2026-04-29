@@ -1652,6 +1652,14 @@ last append timestamp
 last persist timestamp
 ```
 
+当前进展：
+
+- 已完成 Python 高层可观测入口：
+  - `zippy.list_tables()`：列出 master 中注册的 table / stream 元数据。
+  - `zippy.table_info(table_name)`：查看单张表的 schema、status、descriptor、
+    sealed/persisted 状态和 reader leases。
+- 已补充 `examples/07_ops/01_table_observability.py` 运维示例。
+
 ### 错误信息原则
 
 所有错误必须包含足够定位信息：
