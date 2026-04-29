@@ -5,7 +5,7 @@ use zippy_core::bus_protocol::{
 };
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
-use zippy_master::registry::Registry;
+use zippy_master::registry::{Registry, RegistryError};
 use zippy_master::server::MasterServer;
 use zippy_master::snapshot::{RegistrySnapshot, SnapshotStore, SnapshotStreamRecord};
 use zippy_master::snapshot::{SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord};
@@ -121,6 +121,95 @@ fn registry_source_owner_publishes_segment_descriptor() {
         registry.segment_descriptor("openctp_ticks").unwrap(),
         Some(descriptor)
     );
+}
+
+#[test]
+fn registry_register_source_rebinds_same_definition_to_new_process() {
+    let mut registry = Registry::default();
+    let old_process_id = registry.register_process("openctp");
+    let new_process_id = registry.register_process("openctp");
+    let config = serde_json::json!({"front": "sim"});
+    registry
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &old_process_id,
+            "openctp_ticks",
+            config.clone(),
+        )
+        .unwrap();
+    registry.force_expire_process(&old_process_id).unwrap();
+    registry.mark_records_lost_for_process(&old_process_id);
+
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &new_process_id,
+            "openctp_ticks",
+            config,
+        )
+        .unwrap();
+
+    let source = registry.get_source("openctp_md").unwrap();
+    assert_eq!(registry.sources_len(), 1);
+    assert_eq!(source.process_id, new_process_id);
+    assert_eq!(source.status, "registered");
+}
+
+#[test]
+fn registry_register_source_rejects_rebind_while_owner_is_alive() {
+    let mut registry = Registry::default();
+    let old_process_id = registry.register_process("openctp");
+    let new_process_id = registry.register_process("openctp");
+    let config = serde_json::json!({"front": "sim"});
+    registry
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &old_process_id,
+            "openctp_ticks",
+            config.clone(),
+        )
+        .unwrap();
+
+    let error = registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &new_process_id,
+            "openctp_ticks",
+            config,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RegistryError::SourceAlreadyExists {
+            source_name: "openctp_md".to_string()
+        }
+    );
+    let source = registry.get_source("openctp_md").unwrap();
+    assert_eq!(source.process_id, old_process_id);
+    assert_eq!(source.status, "registered");
 }
 
 #[test]

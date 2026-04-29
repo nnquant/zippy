@@ -653,10 +653,28 @@ impl Registry {
         output_stream: &str,
         config: serde_json::Value,
     ) -> Result<(), RegistryError> {
-        if self.sources.contains_key(source_name) {
-            return Err(RegistryError::SourceAlreadyExists {
-                source_name: source_name.to_string(),
-            });
+        if let Some(existing) = self.sources.get(source_name) {
+            if existing.source_type != source_type
+                || existing.output_stream != output_stream
+                || existing.config != config
+            {
+                return Err(RegistryError::SourceAlreadyExists {
+                    source_name: source_name.to_string(),
+                });
+            }
+            if existing.process_id != process_id && self.process_is_alive(&existing.process_id) {
+                return Err(RegistryError::SourceAlreadyExists {
+                    source_name: source_name.to_string(),
+                });
+            }
+        }
+        if let Some(existing) = self.sources.get_mut(source_name) {
+            if existing.process_id != process_id {
+                existing.process_id = process_id.to_string();
+                existing.metrics = serde_json::json!({});
+            }
+            existing.status = "registered".to_string();
+            return Ok(());
         }
         self.sources.insert(
             source_name.to_string(),
@@ -671,6 +689,13 @@ impl Registry {
             },
         );
         Ok(())
+    }
+
+    fn process_is_alive(&self, process_id: &str) -> bool {
+        self.processes
+            .get(process_id)
+            .map(|process| process.lease_status == "alive")
+            .unwrap_or(false)
     }
 
     #[allow(clippy::too_many_arguments)]
