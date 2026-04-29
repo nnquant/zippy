@@ -645,6 +645,59 @@ impl MasterServer {
                     },
                 }
             }
+            ControlRequest::UnregisterSource(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                let mut registry = self.registry.lock().unwrap();
+                match registry
+                    .unregister_source_for_process(&request.source_name, &request.process_id)
+                {
+                    Ok(source) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            let _ = registry.register_source(
+                                &source.source_name,
+                                &source.source_type,
+                                &source.process_id,
+                                &source.output_stream,
+                                source.config,
+                            );
+                            let _ = registry.set_source_status(
+                                &source.source_name,
+                                &source.status,
+                                Some(source.metrics),
+                            );
+                            tracing::error!(
+                                component = "master_server",
+                                event = "snapshot_write_failure",
+                                status = "error",
+                                source_name = request.source_name.as_str(),
+                                error = %error,
+                                "failed to persist source unregister snapshot"
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "unregister_source",
+                            status = "success",
+                            source_name = request.source_name.as_str(),
+                            process_id = request.process_id.as_str(),
+                            "unregistered source"
+                        );
+                        ControlResponse::SourceUnregistered {
+                            source_name: request.source_name,
+                        }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        reason: error.to_string(),
+                    },
+                }
+            }
             ControlRequest::RegisterEngine(request) => {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();

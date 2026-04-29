@@ -334,6 +334,8 @@ class MasterClient:
         config: object,
     ) -> None: ...
 
+    def unregister_source(self, source_name: str) -> None: ...
+
     def register_engine(
         self,
         engine_name: str,

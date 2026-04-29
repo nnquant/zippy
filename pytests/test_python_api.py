@@ -416,6 +416,117 @@ def test_session_named_source_materializes_default_output_table() -> None:
     assert len(session.engines()) == 1
 
 
+def test_session_stop_unregisters_materializer_source() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def __init__(self):
+            self.registered_sources: list[str] = []
+            self.unregistered_sources: list[str] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "retention_segments": None,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(
+            self,
+            stream_name: str,
+            stream_schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: dict[str, object],
+        ) -> None:
+            self.registered_sources.append(source_name)
+
+        def unregister_source(self, source_name: str) -> None:
+            self.unregistered_sources.append(source_name)
+
+        def publish_segment_descriptor(
+            self,
+            stream_name: str,
+            descriptor: dict[str, object],
+        ) -> None:
+            return None
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    class DummyRuntime:
+        def join(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class CapturingPythonSourceEngine:
+        def __init__(self, *, name, source, master=None, target=None):
+            self.name = name
+            self.source = source
+            self.master = master
+            self.target = target
+            self._status = "created"
+
+        def output_schema(self):
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def _zippy_output_schema(self):
+            return schema
+
+        def _zippy_start(self, sink):
+            return DummyRuntime()
+
+    master = FakeMaster()
+    session = zippy.Session(name="latest_session", master=master)
+    session.engine(
+        CapturingPythonSourceEngine,
+        name="ctp_ticks_latest",
+        source="ldc_ctp_ticks",
+    )
+
+    session.run()
+    session.stop()
+
+    assert master.registered_sources == [
+        "latest_session.ctp_ticks_latest.materializer.proc_test",
+    ]
+    assert master.unregistered_sources == [
+        "latest_session.ctp_ticks_latest.materializer.proc_test",
+    ]
+
+
 def test_session_engine_output_overrides_default_output_table_name() -> None:
     schema = pa.schema(
         [

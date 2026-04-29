@@ -213,6 +213,51 @@ fn registry_register_source_rejects_rebind_while_owner_is_alive() {
 }
 
 #[test]
+fn registry_unregister_source_requires_owner_process() {
+    let mut registry = Registry::default();
+    let owner_process_id = registry.register_process("openctp");
+    let other_process_id = registry.register_process("other");
+    let config = serde_json::json!({"front": "sim"});
+    registry
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md",
+            "openctp",
+            &owner_process_id,
+            "openctp_ticks",
+            config,
+        )
+        .unwrap();
+
+    let error = registry
+        .unregister_source_for_process("openctp_md", &other_process_id)
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RegistryError::SourceNotOwnedByProcess {
+            source_name: "openctp_md".to_string(),
+            process_id: other_process_id,
+            owner_process_id: Some(owner_process_id.clone()),
+        }
+    );
+    assert!(registry.get_source("openctp_md").is_some());
+
+    registry
+        .unregister_source_for_process("openctp_md", &owner_process_id)
+        .unwrap();
+    assert!(registry.get_source("openctp_md").is_none());
+}
+
+#[test]
 fn registry_rejects_segment_descriptor_publish_from_lost_source() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("openctp");

@@ -14,7 +14,8 @@ use zippy_core::{
     BusFrameKind, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
     HeartbeatRequest, MasterClient, ReaderDescriptor, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    SchemaRef, StreamInfo, UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
+    SchemaRef, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WriterDescriptor,
+    BUS_LAYOUT_VERSION,
 };
 use zippy_shm_bridge::SharedFrameRing;
 
@@ -180,6 +181,14 @@ fn spawn_fake_server(
                     assert_eq!(source_type, "openctp");
                     assert_eq!(output_stream, "openctp_ticks");
                     ControlResponse::SourceRegistered { source_name }
+                }
+                ControlRequest::UnregisterSource(UnregisterSourceRequest {
+                    source_name,
+                    process_id,
+                }) => {
+                    assert_eq!(source_name, "openctp_md");
+                    assert_eq!(process_id, "proc_1");
+                    ControlResponse::SourceUnregistered { source_name }
                 }
                 ControlRequest::RegisterEngine(RegisterEngineRequest {
                     engine_name,
@@ -912,6 +921,31 @@ fn master_client_registers_control_plane_entities_and_updates_status() {
             })),
         )
         .unwrap();
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
+}
+
+#[test]
+fn master_client_unregisters_source_for_registered_process() {
+    let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("unregister-source");
+    let server = spawn_fake_server(&socket_path, 3, shm_name);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client
+        .register_source(
+            "openctp_md",
+            "openctp",
+            "openctp_ticks",
+            serde_json::json!({
+                "front": "tcp://127.0.0.1:12345",
+            }),
+        )
+        .unwrap();
+    client.unregister_source("openctp_md").unwrap();
 
     server.join().unwrap();
     let _ = fs::remove_dir_all(shm_dir);

@@ -41,6 +41,12 @@ pub struct RegisterSourceRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterSourceRequest {
+    pub source_name: String,
+    pub process_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterEngineRequest {
     pub engine_name: String,
     pub engine_type: String,
@@ -234,6 +240,7 @@ pub enum ControlRequest {
     Heartbeat(HeartbeatRequest),
     RegisterStream(RegisterStreamRequest),
     RegisterSource(RegisterSourceRequest),
+    UnregisterSource(UnregisterSourceRequest),
     RegisterEngine(RegisterEngineRequest),
     RegisterSink(RegisterSinkRequest),
     UpdateStatus(UpdateRecordStatusRequest),
@@ -266,6 +273,9 @@ pub enum ControlResponse {
         stream_name: String,
     },
     SourceRegistered {
+        source_name: String,
+    },
+    SourceUnregistered {
         source_name: String,
     },
     EngineRegistered {
@@ -343,6 +353,9 @@ impl fmt::Display for ControlResponse {
             }
             Self::SourceRegistered { source_name } => {
                 write!(f, "source registered source_name=[{}]", source_name)
+            }
+            Self::SourceUnregistered { source_name } => {
+                write!(f, "source unregistered source_name=[{}]", source_name)
             }
             Self::EngineRegistered { engine_name } => {
                 write!(f, "engine registered engine_name=[{}]", engine_name)

@@ -148,6 +148,11 @@ pub enum RegistryError {
         process_id: String,
         owner_process_id: Option<String>,
     },
+    SourceNotOwnedByProcess {
+        source_name: String,
+        process_id: String,
+        owner_process_id: Option<String>,
+    },
     SourceNotFound {
         source_name: String,
     },
@@ -303,6 +308,15 @@ impl fmt::Display for RegistryError {
                 f,
                 "segment reader lease not owned stream_name=[{}] lease_id=[{}] process_id=[{}] owner_process_id=[{:?}]",
                 stream_name, lease_id, process_id, owner_process_id
+            ),
+            Self::SourceNotOwnedByProcess {
+                source_name,
+                process_id,
+                owner_process_id,
+            } => write!(
+                f,
+                "source not owned source_name=[{}] process_id=[{}] owner_process_id=[{:?}]",
+                source_name, process_id, owner_process_id
             ),
             Self::SourceNotFound { source_name } => {
                 write!(f, "source not found source_name=[{}]", source_name)
@@ -1348,6 +1362,31 @@ impl Registry {
 
     pub fn unregister_source(&mut self, source_name: &str) -> Option<SourceRecord> {
         self.sources.remove(source_name)
+    }
+
+    pub fn unregister_source_for_process(
+        &mut self,
+        source_name: &str,
+        process_id: &str,
+    ) -> Result<SourceRecord, RegistryError> {
+        let source =
+            self.sources
+                .get(source_name)
+                .ok_or_else(|| RegistryError::SourceNotFound {
+                    source_name: source_name.to_string(),
+                })?;
+        if source.process_id != process_id {
+            return Err(RegistryError::SourceNotOwnedByProcess {
+                source_name: source_name.to_string(),
+                process_id: process_id.to_string(),
+                owner_process_id: Some(source.process_id.clone()),
+            });
+        }
+        self.sources
+            .remove(source_name)
+            .ok_or_else(|| RegistryError::SourceNotFound {
+                source_name: source_name.to_string(),
+            })
     }
 
     pub fn unregister_engine(&mut self, engine_name: &str) -> Option<EngineRecord> {

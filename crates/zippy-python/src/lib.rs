@@ -1752,6 +1752,11 @@ impl MasterClient {
         )
     }
 
+    fn unregister_source(&self, py: Python<'_>, source_name: String) -> PyResult<()> {
+        py.allow_threads(|| self.client.lock().unwrap().unregister_source(&source_name))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     #[pyo3(signature = (engine_name, engine_type, input_stream, output_stream, sink_names, config))]
     #[allow(clippy::too_many_arguments)]
     fn register_engine(

@@ -28,7 +28,8 @@ pub use bus_protocol::{
     GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
     PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    StreamInfo, UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
+    StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WriterDescriptor,
+    BUS_LAYOUT_VERSION,
 };
 pub use config::{
     default_config_path, ZippyConfig, ZippyLogConfig, ZippyTableConfig, ZippyTablePersistConfig,

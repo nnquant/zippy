@@ -1466,6 +1466,7 @@ class Session:
         self._runtime_engines: list[object] = []
         self._pending_output_tables: dict[int, tuple[str, bool]] = {}
         self._materialized_engine_ids: set[int] = set()
+        self._materializer_source_names: list[str] = []
         self._started = False
         self._needs_master_process = False
 
@@ -1579,13 +1580,25 @@ class Session:
 
     def stop(self) -> None:
         """Stop all running engines in reverse order."""
+        first_error: BaseException | None = None
         for engine in reversed(self._runtime_engines):
             if self._engine_status(engine) in {"created", "stopped"}:
                 continue
-            engine.stop()
+            try:
+                engine.stop()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            self._unregister_materializer_sources()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         self._started = False
         if _ACTIVE_SESSIONS.get(self.name) is self:
             _ACTIVE_SESSIONS.pop(self.name, None)
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> "Session":
         return self.start()
@@ -1745,6 +1758,28 @@ class Session:
             table_name,
             {"session": self.name},
         )
+        if source_name not in self._materializer_source_names:
+            self._materializer_source_names.append(source_name)
+
+    def _unregister_materializer_sources(self) -> None:
+        unregister_source = getattr(self.master, "unregister_source", None)
+        if unregister_source is None:
+            self._materializer_source_names.clear()
+            return
+
+        first_error: BaseException | None = None
+        for source_name in reversed(self._materializer_source_names):
+            try:
+                unregister_source(source_name)
+            except RuntimeError as error:
+                if "source not found" not in str(error):
+                    first_error = first_error or error
+            except BaseException as error:
+                first_error = first_error or error
+        if first_error is None:
+            self._materializer_source_names.clear()
+            return
+        raise first_error
 
     def _descriptor_publisher(self, stream_name: str):
         def publish(payload) -> None:

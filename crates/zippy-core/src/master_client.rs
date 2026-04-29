@@ -23,7 +23,8 @@ use crate::bus_protocol::{
     PublishPersistEventRequest, PublishPersistedFileRequest, PublishSegmentDescriptorRequest,
     ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
     RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest, StreamInfo,
-    UpdateRecordStatusRequest, WaitSegmentDescriptorRequest, WriterDescriptor,
+    UnregisterSourceRequest, UpdateRecordStatusRequest, WaitSegmentDescriptorRequest,
+    WriterDescriptor,
 };
 use crate::{canonical_schema_hash, schema_metadata, Result, SchemaRef, ZippyConfig, ZippyError};
 
@@ -147,6 +148,20 @@ impl MasterClient {
         match response {
             ControlResponse::SourceRegistered { .. } => Ok(()),
             other => Err(unexpected_response("SourceRegistered", other)),
+        }
+    }
+
+    pub fn unregister_source(&mut self, source_name: &str) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response =
+            self.send_request(ControlRequest::UnregisterSource(UnregisterSourceRequest {
+                source_name: source_name.to_string(),
+                process_id,
+            }))?;
+
+        match response {
+            ControlResponse::SourceUnregistered { .. } => Ok(()),
+            other => Err(unexpected_response("SourceUnregistered", other)),
         }
     }
 
