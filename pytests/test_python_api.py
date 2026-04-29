@@ -1,4 +1,5 @@
 import json
+import importlib.util
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -5175,6 +5176,27 @@ def test_top_level_table_observability_uses_default_master(tmp_path: Path) -> No
         if reset_default_master is not None:
             reset_default_master()
         server.stop()
+
+
+def test_table_perf_probe_summarizes_latency_samples() -> None:
+    module_path = WORKSPACE_ROOT / "examples" / "07_ops" / "02_table_perf_probe.py"
+    spec = importlib.util.spec_from_file_location("table_perf_probe_example", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    summary = module.summarize_samples_ms([3.0, 1.0, 4.0, 2.0])
+
+    assert summary == {
+        "count": 4,
+        "min": 1.0,
+        "avg": 2.5,
+        "p50": 2.0,
+        "p95": 4.0,
+        "p99": 4.0,
+        "max": 4.0,
+    }
 
 
 def test_master_client_drop_table_removes_stream_and_persisted_files(tmp_path: Path) -> None:

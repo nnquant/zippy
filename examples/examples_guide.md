@@ -44,6 +44,7 @@ uv run zippy stream ls --uri default
 7. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
 8. 用 `06_replay/03_replay_to_reactive_latest_engine.py` 验证 replay stream 驱动下游 Engine。
 9. 用 `07_ops/01_table_observability.py` 查看 master 中的表状态。
+10. 用 `07_ops/02_table_perf_probe.py` 记录 `tail(n)` 延迟和可选 replay 吞吐。
 
 ## API 分层
 
