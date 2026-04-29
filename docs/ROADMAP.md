@@ -1478,6 +1478,9 @@ zippy.replay(
 - 实现 ParquetReplaySource。
   - 已完成最小 Python source plugin：读取 parquet file/directory，按 batch
     as-fast-as-possible 发给 `Pipeline.source(...).stream_table(...)`。
+  - 已完成 replay source 生命周期修正：自然回放结束后只 flush 并保持 source idle，
+    输出 StreamTable 生命周期由 `Pipeline.stop()` 控制，避免 replay 表刚生成即释放
+    active mmap。
 - 支持按 event_ts / seq 回放。
 - 支持 controlled speed：
   - as-fast-as-possible
@@ -1486,6 +1489,10 @@ zippy.replay(
 - replay 输出仍然是 named stream。
 - replay 输出可以接 downstream engine。
 - 定义 live vs replay 比对工具。
+  - 已完成 `zippy.compare_replay(left, right, by=[...])` 基础版，支持 table name、
+    `zippy.Table`、`pyarrow.Table`、RecordBatchReader 和 PyArrow Dataset 输入。
+  - 已完成 replay e2e 测试：persisted parquet -> ParquetReplaySource ->
+    replay named stream -> Table.collect -> compare_replay。
 
 ### 验收标准
 

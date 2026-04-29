@@ -40,6 +40,7 @@ uv run zippy stream ls --uri default
 4. 用 `04_subscribe/` 里的脚本观察实时增量回调。
 5. 用 `05_engines/01_reactive_latest_session.py` 把上游表聚合成最新快照表。
 6. 用 `06_replay/01_parquet_replay_to_stream_table.py` 做不开盘环境下的回放测试。
+7. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
 
 ## API 分层
 
@@ -51,6 +52,7 @@ uv run zippy stream ls --uri default
 - `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
 - `zp.subscribe(...)`：按行接收 `zp.Row`。
 - `zp.subscribe_table(...)`：按批接收 `pyarrow.Table`。
+- `zp.compare_replay(...)`：把 live persisted 数据和 replay 输出按 key 对齐比较。
 - `zp.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
 
 `StreamTableEngine`、`SegmentStreamSource` 等底层对象仍然可以使用，但示例默认不直接暴露这些细节。
@@ -62,4 +64,3 @@ uv run zippy stream ls --uri default
 - 持久化示例使用 `persist="parquet"`；不需要落盘时传 `persist=None` 或使用高层
   `Session.stream_table(..., persist=False)`。
 - 多数脚本提供 `--drop-existing`，便于重复运行。生产环境不要随意使用这个参数。
-

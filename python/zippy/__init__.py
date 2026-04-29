@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 import threading
@@ -810,6 +811,122 @@ def read_table(source: str, master: MasterClient | None = None) -> Table:
     return Table(source=source, master=master)
 
 
+def compare_replay(
+    left,
+    right,
+    *,
+    by: str | list[str] | tuple[str, ...] | None = None,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Compare two live/replay query results after normalizing them to Arrow tables.
+
+    ``left`` and ``right`` can be table names, :class:`Table` objects,
+    ``pyarrow.Table`` instances, ``pyarrow.RecordBatchReader`` objects, or
+    PyArrow datasets.
+
+    :param left: Expected live or persisted data.
+    :type left: object
+    :param right: Replay output data.
+    :type right: object
+    :param by: Optional key columns used to sort both sides before comparison.
+    :type by: str | list[str] | tuple[str, ...] | None
+    :param master: Optional master used when either side is a table name.
+    :type master: MasterClient | None
+    :returns: Replay comparison summary.
+    :rtype: dict[str, object]
+    """
+    left_table = _sort_replay_table(_coerce_replay_table(left, master), by)
+    right_table = _sort_replay_table(_coerce_replay_table(right, master), by)
+
+    schema_equal = _schemas_equal(left_table.schema, right_table.schema)
+    data_equal = schema_equal and _tables_equal(left_table, right_table)
+    if data_equal:
+        missing_rows, extra_rows = 0, 0
+    else:
+        missing_rows, extra_rows = _replay_row_deltas(left_table, right_table)
+    mismatch_rows = max(missing_rows, extra_rows)
+    return {
+        "equal": bool(schema_equal and data_equal and mismatch_rows == 0),
+        "left_rows": left_table.num_rows,
+        "right_rows": right_table.num_rows,
+        "schema_equal": schema_equal,
+        "missing_rows": missing_rows,
+        "extra_rows": extra_rows,
+        "mismatch_rows": mismatch_rows,
+    }
+
+
+def _coerce_replay_table(value, master: MasterClient | None):
+    import pyarrow as pa
+
+    if isinstance(value, str):
+        return read_table(value, master=master).collect()
+    if isinstance(value, Table):
+        return value.collect()
+    if isinstance(value, pa.Table):
+        return value
+    if isinstance(value, pa.RecordBatch):
+        return pa.Table.from_batches([value])
+
+    read_all = getattr(value, "read_all", None)
+    if callable(read_all):
+        return read_all()
+
+    to_table = getattr(value, "to_table", None)
+    if callable(to_table):
+        return to_table()
+
+    raise TypeError("replay comparison input must be a table name or Arrow-compatible object")
+
+
+def _sort_replay_table(table, by: str | list[str] | tuple[str, ...] | None):
+    if by is None:
+        return table
+    keys = [by] if isinstance(by, str) else [str(item) for item in by]
+    missing = [name for name in keys if name not in table.column_names]
+    if missing:
+        raise ValueError(f"replay comparison key columns are missing columns=[{missing}]")
+    return table.sort_by([(name, "ascending") for name in keys])
+
+
+def _schemas_equal(left, right) -> bool:
+    try:
+        return bool(left.equals(right, check_metadata=False))
+    except TypeError:
+        return bool(left == right)
+
+
+def _tables_equal(left, right) -> bool:
+    try:
+        return bool(left.equals(right, check_metadata=False))
+    except TypeError:
+        return bool(left.equals(right))
+
+
+def _replay_row_deltas(left, right) -> tuple[int, int]:
+    if left.column_names != right.column_names:
+        return left.num_rows, right.num_rows
+    left_rows = _table_row_counter(left)
+    right_rows = _table_row_counter(right)
+    missing = left_rows - right_rows
+    extra = right_rows - left_rows
+    return sum(missing.values()), sum(extra.values())
+
+
+def _table_row_counter(table) -> Counter:
+    return Counter(_arrow_row_bytes(table, row_index) for row_index in range(table.num_rows))
+
+
+def _arrow_row_bytes(table, row_index: int) -> bytes:
+    import pyarrow as pa
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table.slice(row_index, 1))
+    return sink.getvalue().to_pybytes()
+
+
 def _tail_persisted_rows(snapshot: dict[str, object], n: int):
     if n <= 0:
         return None
@@ -1212,6 +1329,7 @@ class _ParquetReplayHandle:
                     break
                 self._sink.emit_data(table)
             self._sink.emit_flush()
+            self._stop_event.wait()
             self._sink.emit_stop()
         except Exception as error:
             self._sink.emit_error(str(error))
@@ -2405,6 +2523,7 @@ __all__ = [
     "ZmqSubscriber",
     "__version__",
     "col",
+    "compare_replay",
     "config",
     "connect",
     "drop_table",
