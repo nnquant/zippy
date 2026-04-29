@@ -4,6 +4,7 @@ from collections import Counter
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 from ._internal import AbsSpec
@@ -1306,6 +1307,9 @@ class _ParquetReplayHandle:
         self._source = source
         self._sink = sink
         self._stop_event = threading.Event()
+        self._replay_done_event = threading.Event()
+        self._stopped_event = threading.Event()
+        self._error: Exception | None = None
         self._thread = threading.Thread(
             target=self._run,
             name=f"zippy-parquet-replay-{source.source_name}",
@@ -1321,57 +1325,200 @@ class _ParquetReplayHandle:
         """Wait for the replay thread to finish."""
         self._thread.join()
 
+    def wait_replay(self, timeout: float | None = None) -> bool:
+        """Wait until all replay rows have been emitted and flushed."""
+        completed = self._replay_done_event.wait(timeout)
+        if completed and self._error is not None:
+            raise RuntimeError(f"parquet replay failed reason=[{self._error}]")
+        return completed
+
     def _run(self) -> None:
         try:
             self._sink.emit_hello(self._source.source_name)
+            rate_limiter = _ReplayRateLimiter(self._source.replay_rate)
             for table in self._source._iter_tables():
                 if self._stop_event.is_set():
                     break
-                self._sink.emit_data(table)
+                if rate_limiter.enabled:
+                    for row_index in range(table.num_rows):
+                        if self._stop_event.is_set():
+                            break
+                        rate_limiter.wait_before_emit()
+                        self._sink.emit_data(table.slice(row_index, 1))
+                else:
+                    self._sink.emit_data(table)
             self._sink.emit_flush()
+            self._replay_done_event.set()
             self._stop_event.wait()
-            self._sink.emit_stop()
+            try:
+                self._sink.emit_stop()
+            except RuntimeError as error:
+                if "status=[stopped]" not in str(error):
+                    raise
         except Exception as error:
-            self._sink.emit_error(str(error))
+            self._error = error
+            self._replay_done_event.set()
+            try:
+                self._sink.emit_error(str(error))
+            except RuntimeError as emit_error:
+                if "status=[stopped]" not in str(emit_error):
+                    raise
+            finally:
+                self._stopped_event.set()
+        else:
+            self._stopped_event.set()
+
+
+def _normalize_parquet_replay_paths(value: object) -> str | list[str]:
+    if isinstance(value, (str, os.PathLike)):
+        return str(Path(value).expanduser())
+
+    try:
+        paths = [str(Path(item).expanduser()) for item in value]  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError("parquet replay source must be a path or a sequence of paths") from error
+    if not paths:
+        raise ValueError("parquet replay source path list must not be empty")
+    return paths
+
+
+def _iter_arrow_rows(table):
+    for row_index in range(table.num_rows):
+        values = {}
+        for column_name in table.column_names:
+            values[column_name] = _arrow_scalar_to_python(table[column_name][row_index])
+        yield Row(values)
+
+
+def _arrow_scalar_to_python(value):
+    try:
+        return value.as_py()
+    except ValueError:
+        scalar_value = getattr(value, "value", None)
+        if scalar_value is not None:
+            return scalar_value
+        raise
+
+
+def _normalize_replay_timing(mode: str, replay_rate: object) -> tuple[str, float | None]:
+    if replay_rate is not None:
+        try:
+            rate = float(replay_rate)
+        except (TypeError, ValueError) as error:
+            raise TypeError("replay_rate must be numeric rows per second") from error
+        if rate <= 0.0:
+            raise ValueError("replay_rate must be greater than zero")
+        if mode not in {"as_fast_as_possible", "fixed_rate"}:
+            raise ValueError("mode must be 'as_fast_as_possible' or 'fixed_rate'")
+        return "fixed_rate", rate
+
+    if mode == "fixed_rate":
+        raise ValueError("replay_rate is required when mode is 'fixed_rate'")
+    if mode != "as_fast_as_possible":
+        raise ValueError("mode must be 'as_fast_as_possible' or 'fixed_rate'")
+    return mode, None
+
+
+class _ReplayRateLimiter:
+    def __init__(self, replay_rate: float | None) -> None:
+        self.replay_rate = replay_rate
+        self.enabled = replay_rate is not None
+        self._start_time: float | None = None
+        self._emitted_rows = 0
+
+    def wait_before_emit(self) -> None:
+        if self.replay_rate is None:
+            return
+        if self._start_time is None:
+            self._start_time = time.monotonic()
+            self._emitted_rows = 1
+            return
+
+        target_time = self._start_time + (self._emitted_rows / self.replay_rate)
+        delay = target_time - time.monotonic()
+        if delay > 0.0:
+            time.sleep(delay)
+        self._emitted_rows += 1
+
+
+def _filter_replay_table(table, time_column: str | None, start: object, end: object):
+    if start is None and end is None:
+        return table
+    if time_column is None:
+        raise ValueError("time_column is required when start or end is provided")
+    if time_column not in table.column_names:
+        raise ValueError(f"time_column not found column=[{time_column}]")
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    values = table[time_column]
+    mask = None
+    if start is not None:
+        start_scalar = pa.scalar(start, type=values.type)
+        mask = pc.greater_equal(values, start_scalar)
+    if end is not None:
+        end_scalar = pa.scalar(end, type=values.type)
+        end_mask = pc.less_equal(values, end_scalar)
+        mask = end_mask if mask is None else pc.and_(mask, end_mask)
+    return table.filter(mask)
 
 
 class ParquetReplaySource:
     """
-    Replay parquet data as a Zippy Python source plugin.
+    Replay parquet data as a low-level Zippy Python source plugin.
 
-    The first implementation replays parquet as fast as possible and is intended to feed
-    ``Pipeline.source(...).stream_table(...)``.
+    Most users should prefer :class:`ParquetReplayEngine` for explicit parquet paths, or
+    :class:`TableReplayEngine` / :func:`replay` for persisted Zippy table names. Use this
+    class directly only when custom pipeline wiring is required.
 
-    :param path: Parquet file or directory.
-    :type path: str | os.PathLike[str]
+    :param path: Parquet file, directory, or explicit file list.
+    :type path: str | os.PathLike[str] | list[str | os.PathLike[str]]
     :param schema: Optional output Arrow schema. When omitted, schema is read from parquet.
     :type schema: pyarrow.Schema | None
     :param batch_size: Maximum rows emitted per batch.
     :type batch_size: int
     :param source_name: Control-plane source name.
     :type source_name: str | None
-    :param mode: Replay timing mode. Only ``"as_fast_as_possible"`` is currently supported.
+    :param mode: Replay timing mode. Use ``"as_fast_as_possible"`` or ``"fixed_rate"``.
     :type mode: str
+    :param replay_rate: Fixed replay rate in rows per second. When provided, fixed-rate replay
+        is enabled.
+    :type replay_rate: float | None
+    :param time_column: Column used for inclusive ``start`` / ``end`` filtering.
+    :type time_column: str | None
+    :param start: Optional inclusive lower bound for ``time_column``.
+    :type start: object
+    :param end: Optional inclusive upper bound for ``time_column``.
+    :type end: object
     """
 
     def __init__(
         self,
-        path: str | os.PathLike[str],
+        path,
         schema=None,
         *,
         batch_size: int = 65_536,
         source_name: str | None = None,
         mode: str = "as_fast_as_possible",
+        replay_rate: float | None = None,
+        time_column: str | None = "dt",
+        start: object = None,
+        end: object = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
-        if mode != "as_fast_as_possible":
-            raise ValueError("mode must be 'as_fast_as_possible'")
-        self.path = str(Path(path).expanduser())
+        mode, replay_rate = _normalize_replay_timing(mode, replay_rate)
+        self.path = _normalize_parquet_replay_paths(path)
         self.schema = schema
         self.batch_size = int(batch_size)
         self.source_name = source_name or "parquet_replay"
         self.mode = mode
+        self.replay_rate = replay_rate
+        self.time_column = time_column
+        self.start_bound = start
+        self.end_bound = end
+        self._last_handle: _ParquetReplayHandle | None = None
 
     def _zippy_output_schema(self):
         if self.schema is None:
@@ -1387,7 +1534,23 @@ class ParquetReplaySource:
         return "parquet_replay"
 
     def _zippy_start(self, sink) -> _ParquetReplayHandle:
-        return _ParquetReplayHandle(self, sink)
+        handle = _ParquetReplayHandle(self, sink)
+        self._last_handle = handle
+        return handle
+
+    def wait_replay(self, timeout: float | None = None) -> bool:
+        """
+        Wait until the active replay handle has emitted and flushed all rows.
+
+        :param timeout: Maximum seconds to wait. ``None`` waits indefinitely.
+        :type timeout: float | None
+        :returns: ``True`` when replay completed, ``False`` on timeout.
+        :rtype: bool
+        :raises RuntimeError: If the replay thread failed.
+        """
+        if self._last_handle is None:
+            raise RuntimeError("parquet replay source is not started")
+        return self._last_handle.wait_replay(timeout)
 
     def _iter_tables(self):
         import pyarrow as pa
@@ -1401,7 +1564,561 @@ class ParquetReplaySource:
             table = pa.Table.from_batches([batch])
             if table.schema != expected_schema:
                 table = table.cast(expected_schema)
+            table = _filter_replay_table(
+                table,
+                self.time_column,
+                self.start_bound,
+                self.end_bound,
+            )
+            if table.num_rows == 0:
+                continue
             yield table
+
+
+class _CallbackReplayHandle:
+    """Background handle for direct row-callback replay."""
+
+    def __init__(self, source: ParquetReplaySource, callback) -> None:
+        self._source = source
+        self._callback = callback
+        self._stop_event = threading.Event()
+        self._done_event = threading.Event()
+        self._error: Exception | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"zippy-callback-replay-{source.source_name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Request callback replay to stop."""
+        self._stop_event.set()
+
+    def join(self) -> None:
+        """Wait for callback replay to stop."""
+        self._thread.join()
+
+    def wait_replay(self, timeout: float | None = None) -> bool:
+        """Wait until callback replay completes."""
+        completed = self._done_event.wait(timeout)
+        if completed and self._error is not None:
+            raise RuntimeError(f"callback replay failed reason=[{self._error}]")
+        return completed
+
+    def _run(self) -> None:
+        try:
+            rate_limiter = _ReplayRateLimiter(self._source.replay_rate)
+            for table in self._source._iter_tables():
+                if self._stop_event.is_set():
+                    break
+                for row in _iter_arrow_rows(table):
+                    if self._stop_event.is_set():
+                        break
+                    rate_limiter.wait_before_emit()
+                    self._callback(row)
+        except Exception as error:
+            self._error = error
+        finally:
+            self._done_event.set()
+
+
+class ParquetReplayEngine:
+    """
+    Replay parquet data either into callbacks or into a named Zippy stream table.
+
+    This class is the explicit path-based replay API. Most user-facing replay should
+    use :class:`TableReplayEngine`, which starts from a persisted Zippy table name.
+
+    ``start`` and ``end`` are inclusive bounds over ``time_column``. They are applied
+    before rows are emitted, so both callback replay and stream replay see the same
+    filtered row set. ``replay_rate`` enables fixed-rate replay in rows per second.
+    """
+
+    def __init__(
+        self,
+        source,
+        *,
+        output_stream: str | None = None,
+        callback=None,
+        schema=None,
+        master: MasterClient | None = None,
+        name: str | None = None,
+        source_name: str | None = None,
+        batch_size: int = 65_536,
+        mode: str = "as_fast_as_possible",
+        replay_rate: float | None = None,
+        buffer_size: int = 64,
+        frame_size: int = 4096,
+        row_capacity: int | None = None,
+        retention_segments: int | None = None,
+        dt_column: str | None = None,
+        id_column: str | None = None,
+        dt_part: str | None = None,
+        persist=None,
+        data_dir: str | os.PathLike[str] | None = None,
+        persist_path: ParquetPersist | str | os.PathLike[str] | None = None,
+        time_column: str | None = "dt",
+        start: object = None,
+        end: object = None,
+    ) -> None:
+        if (output_stream is None) == (callback is None):
+            raise ValueError("exactly one of output_stream or callback is required")
+        if output_stream is not None and not isinstance(output_stream, str):
+            raise TypeError("output_stream must be a string")
+        if output_stream == "":
+            raise ValueError("output_stream must not be empty")
+        if callback is not None and not callable(callback):
+            raise TypeError("callback must be callable")
+        self.source = _normalize_parquet_replay_paths(source)
+        self.output_stream = output_stream
+        self.callback = callback
+        self.schema = schema
+        self.master = master
+        self.name = name or f"replay_{output_stream or 'callback'}"
+        self.source_name = source_name
+        self.batch_size = batch_size
+        self.mode, self.replay_rate = _normalize_replay_timing(mode, replay_rate)
+        self.buffer_size = buffer_size
+        self.frame_size = frame_size
+        self.row_capacity = row_capacity
+        self.retention_segments = retention_segments
+        self.dt_column = dt_column
+        self.id_column = id_column
+        self.dt_part = dt_part
+        self.persist = persist
+        self.data_dir = data_dir
+        self.persist_path = persist_path
+        self.time_column = time_column
+        self.start_bound = start
+        self.end_bound = end
+        self._source: ParquetReplaySource | None = None
+        self._pipeline: Pipeline | None = None
+        self._callback_handle: _CallbackReplayHandle | None = None
+        self._status = "created"
+
+    def start(self) -> "ParquetReplayEngine":
+        """Start replay without waiting for completion."""
+        if self._status == "running":
+            return self
+        if self._status in {"completed", "stopped"}:
+            raise RuntimeError("replay engine cannot be restarted after completion")
+        if self._status == "created":
+            self.init()
+
+        if self.callback is not None:
+            if self._source is None:
+                raise RuntimeError("replay source is not initialized")
+            self._callback_handle = _CallbackReplayHandle(self._source, self.callback)
+            self._status = "running"
+            return self
+
+        if self._pipeline is None:
+            raise RuntimeError("replay pipeline is not initialized")
+        self._pipeline.start()
+        self._status = "running"
+        return self
+
+    def init(self) -> "ParquetReplayEngine":
+        """
+        Prepare replay resources without emitting data.
+
+        For ``output_stream`` replay this registers the stream and publishes its initial
+        descriptor so downstream subscribers can attach before :meth:`run` starts replay.
+        """
+        if self._status in {"initialized", "running"}:
+            return self
+        if self._status in {"completed", "stopped"}:
+            raise RuntimeError("replay engine cannot be initialized after completion")
+
+        source_name = self.source_name or self._default_source_name()
+        source = ParquetReplaySource(
+            self.source,
+            schema=self.schema,
+            batch_size=self.batch_size,
+            source_name=source_name,
+            mode=self.mode,
+            replay_rate=self.replay_rate,
+            time_column=self.time_column,
+            start=self.start_bound,
+            end=self.end_bound,
+        )
+        self._source = source
+        if self.callback is not None:
+            self._status = "initialized"
+            return self
+
+        master = self.master or _default_master()
+        self.master = master
+        _ensure_master_process(master, self.name)
+        pipeline = (
+            Pipeline(self.name, master=master)
+            .source(source)
+            .stream_table(
+                self.output_stream,
+                schema=self.schema,
+                buffer_size=self.buffer_size,
+                frame_size=self.frame_size,
+                row_capacity=self.row_capacity,
+                retention_segments=self.retention_segments,
+                dt_column=self.dt_column,
+                id_column=self.id_column,
+                dt_part=self.dt_part,
+                persist=self.persist,
+                data_dir=self.data_dir,
+                persist_path=self.persist_path,
+            )
+        )
+        self._pipeline = pipeline
+        self._status = "initialized"
+        return self
+
+    def run(
+        self,
+        *,
+        wait: bool = True,
+        timeout: float | None = None,
+    ) -> "ParquetReplayEngine":
+        """Start replay and optionally wait until all rows are emitted."""
+        self.start()
+        if wait:
+            self.wait(timeout=timeout)
+        return self
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait until replay rows have been emitted."""
+        if self._callback_handle is not None:
+            completed = self._callback_handle.wait_replay(timeout)
+            if completed:
+                self._status = "completed"
+            elif not completed:
+                raise TimeoutError("callback replay did not finish")
+            return True
+
+        if self._source is None:
+            raise RuntimeError("replay engine is not started")
+        completed = self._source.wait_replay(timeout)
+        if not completed:
+            raise TimeoutError(
+                f"table replay did not finish output_stream=[{self.output_stream}]"
+            )
+        return True
+
+    def stop(self) -> None:
+        """Stop replay and release runtime resources."""
+        if self._callback_handle is not None:
+            self._callback_handle.stop()
+            self._callback_handle.join()
+        if self._pipeline is not None:
+            self._pipeline.stop()
+        if self._status != "completed":
+            self._status = "stopped"
+
+    def status(self) -> str:
+        """Return lifecycle status."""
+        return self._status
+
+    def output_schema(self):
+        """Return the replay output Arrow schema."""
+        if self._source is not None:
+            return self._source._zippy_output_schema()
+        return ParquetReplaySource(
+            self.source,
+            schema=self.schema,
+            batch_size=self.batch_size,
+            source_name=self.source_name,
+            mode=self.mode,
+            replay_rate=self.replay_rate,
+            time_column=self.time_column,
+            start=self.start_bound,
+            end=self.end_bound,
+        )._zippy_output_schema()
+
+    def table(self) -> Table:
+        """Open the replay output as a queryable Zippy table."""
+        if self.output_stream is None:
+            raise RuntimeError("callback replay does not create an output stream")
+        if self.master is None:
+            self.master = _default_master()
+        return read_table(self.output_stream, master=self.master)
+
+    def __enter__(self) -> "ParquetReplayEngine":
+        return self.init()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.stop()
+
+    def _default_source_name(self) -> str:
+        if self.master is not None:
+            get_process_id = getattr(self.master, "process_id", None)
+            if callable(get_process_id):
+                process_id = get_process_id()
+                if process_id:
+                    suffix = process_id
+                    return f"{self.name}.{self.output_stream or 'callback'}.source.{suffix}"
+        return f"{self.name}.{self.output_stream or 'callback'}.source.{id(self)}"
+
+
+class TableReplayEngine:
+    """
+    Replay persisted data from a named Zippy table.
+
+    ``TableReplayEngine`` accepts a table name, resolves its registered parquet
+    ``persisted_files`` from master, then replays those files either to row callbacks
+    or to another named stream table.
+
+    ``start`` and ``end`` are inclusive bounds over ``time_column``. Use
+    ``time_column="dt"`` for event-time windows, or a sequence column for deterministic
+    sequence-range replay. ``replay_rate`` enables fixed-rate replay in rows per second.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        *,
+        output_stream: str | None = None,
+        callback=None,
+        schema=None,
+        master: MasterClient | None = None,
+        name: str | None = None,
+        source_name: str | None = None,
+        batch_size: int = 65_536,
+        mode: str = "as_fast_as_possible",
+        replay_rate: float | None = None,
+        buffer_size: int = 64,
+        frame_size: int = 4096,
+        row_capacity: int | None = None,
+        retention_segments: int | None = None,
+        dt_column: str | None = None,
+        id_column: str | None = None,
+        dt_part: str | None = None,
+        persist=None,
+        data_dir: str | os.PathLike[str] | None = None,
+        persist_path: ParquetPersist | str | os.PathLike[str] | None = None,
+        time_column: str | None = "dt",
+        start: object = None,
+        end: object = None,
+    ) -> None:
+        if not isinstance(source, str):
+            raise TypeError("source must be a persisted Zippy table name")
+        if not source:
+            raise ValueError("source table name must not be empty")
+        if (output_stream is None) == (callback is None):
+            raise ValueError("exactly one of output_stream or callback is required")
+        self.source = source
+        self.output_stream = output_stream
+        self.callback = callback
+        self.schema = schema
+        self.master = master or _default_master()
+        self.name = name or f"replay_{output_stream or source}"
+        self.source_name = source_name
+        self.batch_size = batch_size
+        self.mode, self.replay_rate = _normalize_replay_timing(mode, replay_rate)
+        self.buffer_size = buffer_size
+        self.frame_size = frame_size
+        self.row_capacity = row_capacity
+        self.retention_segments = retention_segments
+        self.dt_column = dt_column
+        self.id_column = id_column
+        self.dt_part = dt_part
+        self.persist = persist
+        self.data_dir = data_dir
+        self.persist_path = persist_path
+        self.time_column = time_column
+        self.start_bound = start
+        self.end_bound = end
+        self._delegate: ParquetReplayEngine | None = None
+
+    def start(self) -> "TableReplayEngine":
+        """Start replay without waiting for completion."""
+        if self._delegate is not None and self._delegate.status() == "running":
+            return self
+        if self._delegate is None:
+            self.init()
+        elif self._delegate.status() != "initialized":
+            raise RuntimeError("table replay engine cannot be restarted after completion")
+
+        if self._delegate is None:
+            raise RuntimeError("table replay engine is not initialized")
+        self._delegate.start()
+        return self
+
+    def init(self) -> "TableReplayEngine":
+        """
+        Prepare replay resources without emitting data.
+
+        For ``output_stream`` replay this makes the output stream visible to master so a
+        downstream subscriber can attach before replay starts.
+        """
+        if self._delegate is not None:
+            if self._delegate.status() in {"initialized", "running"}:
+                return self
+            raise RuntimeError("table replay engine cannot be initialized after completion")
+        paths, schema = self._resolve_persisted_paths_and_schema()
+        self._delegate = ParquetReplayEngine(
+            paths,
+            output_stream=self.output_stream,
+            callback=self.callback,
+            schema=schema,
+            master=self.master,
+            name=self.name,
+            source_name=self.source_name,
+            batch_size=self.batch_size,
+            mode=self.mode,
+            replay_rate=self.replay_rate,
+            buffer_size=self.buffer_size,
+            frame_size=self.frame_size,
+            row_capacity=self.row_capacity,
+            retention_segments=self.retention_segments,
+            dt_column=self.dt_column,
+            id_column=self.id_column,
+            dt_part=self.dt_part,
+            persist=self.persist,
+            data_dir=self.data_dir,
+            persist_path=self.persist_path,
+            time_column=self.time_column,
+            start=self.start_bound,
+            end=self.end_bound,
+        ).init()
+        return self
+
+    def run(
+        self,
+        *,
+        wait: bool = True,
+        timeout: float | None = None,
+    ) -> "TableReplayEngine":
+        """Start replay and optionally wait until all rows are emitted."""
+        self.start()
+        if wait:
+            self.wait(timeout=timeout)
+        return self
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait until replay rows have been emitted."""
+        if self._delegate is None:
+            raise RuntimeError("table replay engine is not started")
+        return self._delegate.wait(timeout=timeout)
+
+    def stop(self) -> None:
+        """Stop replay and release runtime resources."""
+        if self._delegate is not None:
+            self._delegate.stop()
+
+    def status(self) -> str:
+        """Return lifecycle status."""
+        if self._delegate is None:
+            return "created"
+        return self._delegate.status()
+
+    def output_schema(self):
+        """Return replay output schema."""
+        if self._delegate is not None:
+            return self._delegate.output_schema()
+        return self.schema or read_table(self.source, master=self.master).schema()
+
+    def table(self) -> Table:
+        """Open the replay output as a queryable Zippy table."""
+        if self.output_stream is None:
+            raise RuntimeError("callback replay does not create an output stream")
+        return read_table(self.output_stream, master=self.master)
+
+    def __enter__(self) -> "TableReplayEngine":
+        return self.init()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.stop()
+
+    def _resolve_persisted_paths_and_schema(self) -> tuple[list[str], object]:
+        table = read_table(self.source, master=self.master)
+        persisted_files = table.persisted_files()
+        paths = [
+            str(item["file_path"])
+            for item in sorted(persisted_files, key=_persisted_file_order_key)
+            if item.get("file_path")
+        ]
+        if not paths:
+            raise RuntimeError(f"persisted files are not registered source=[{self.source}]")
+        return paths, self.schema or table.schema()
+
+
+def replay(
+    source: str,
+    *,
+    output_stream: str | None = None,
+    callback=None,
+    schema=None,
+    master: MasterClient | None = None,
+    name: str | None = None,
+    source_name: str | None = None,
+    batch_size: int = 65_536,
+    mode: str = "as_fast_as_possible",
+    replay_rate: float | None = None,
+    buffer_size: int = 64,
+    frame_size: int = 4096,
+    row_capacity: int | None = None,
+    retention_segments: int | None = None,
+    dt_column: str | None = None,
+    id_column: str | None = None,
+    dt_part: str | None = None,
+    persist=None,
+    data_dir: str | os.PathLike[str] | None = None,
+    persist_path: ParquetPersist | str | os.PathLike[str] | None = None,
+    time_column: str | None = "dt",
+    start: object = None,
+    end: object = None,
+    wait: bool = True,
+    timeout: float | None = None,
+) -> TableReplayEngine:
+    """
+    Replay persisted data from a named Zippy table.
+
+    :param source: Persisted Zippy table name.
+    :type source: str
+    :param output_stream: Optional replay output stream table.
+    :type output_stream: str | None
+    :param callback: Optional row callback receiving :class:`Row`.
+    :type callback: callable | None
+    :param replay_rate: Fixed replay rate in rows per second. When provided, fixed-rate replay
+        is enabled.
+    :type replay_rate: float | None
+    :param time_column: Column used for inclusive ``start`` / ``end`` filtering.
+    :type time_column: str | None
+    :param start: Optional inclusive lower bound for ``time_column``.
+    :type start: object
+    :param end: Optional inclusive upper bound for ``time_column``.
+    :type end: object
+    :param wait: Whether to wait until replay rows are emitted before returning.
+    :type wait: bool
+    :returns: Table replay engine.
+    :rtype: TableReplayEngine
+    """
+    engine = TableReplayEngine(
+        source,
+        output_stream=output_stream,
+        callback=callback,
+        schema=schema,
+        master=master,
+        name=name,
+        source_name=source_name,
+        batch_size=batch_size,
+        mode=mode,
+        replay_rate=replay_rate,
+        buffer_size=buffer_size,
+        frame_size=frame_size,
+        row_capacity=row_capacity,
+        retention_segments=retention_segments,
+        dt_column=dt_column,
+        id_column=id_column,
+        dt_part=dt_part,
+        persist=persist,
+        data_dir=data_dir,
+        persist_path=persist_path,
+        time_column=time_column,
+        start=start,
+        end=end,
+    )
+    return engine.run(wait=wait, timeout=timeout)
 
 
 _ACTIVE_SESSIONS: dict[str, object] = {}
@@ -1873,6 +2590,7 @@ class Pipeline:
         self._stream_name: str | None = None
         self._schema = None
         self._engine: StreamTableEngine | None = None
+        self._registered_source_name: str | None = None
         self._started = False
 
     def source(
@@ -1968,12 +2686,14 @@ class Pipeline:
         self._stream_name = name
         self._schema = schema
         self.master.register_stream(name, schema, buffer_size, frame_size)
+        source_name = self._source_name or f"{self.name}.{name}"
         self.master.register_source(
-            self._source_name or f"{self.name}.{name}",
+            source_name,
             self._source_type,
             name,
             {},
         )
+        self._registered_source_name = source_name
         self._engine = StreamTableEngine(
             name=name,
             input_schema=schema,
@@ -2026,9 +2746,35 @@ class Pipeline:
 
     def stop(self) -> None:
         """Stop the owned stream table engine."""
+        first_error: BaseException | None = None
         if self._started and self._engine is not None:
-            self._engine.stop()
-            self._started = False
+            try:
+                self._engine.stop()
+            except BaseException as error:
+                first_error = error
+        self._started = False
+        try:
+            self._unregister_registered_source()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def _unregister_registered_source(self) -> None:
+        source_name = self._registered_source_name
+        if source_name is None:
+            return
+        unregister_source = getattr(self.master, "unregister_source", None)
+        if unregister_source is None:
+            self._registered_source_name = None
+            return
+        try:
+            unregister_source(source_name)
+        except RuntimeError as error:
+            if "source not found" not in str(error):
+                raise
+        self._registered_source_name = None
 
     def _ensure_process(self) -> None:
         _ensure_master_process(self.master, self.name)
@@ -2512,6 +3258,7 @@ __all__ = [
     "NullPublisher",
     "OverflowPolicy",
     "ParquetPersist",
+    "ParquetReplayEngine",
     "ParquetReplaySource",
     "ParquetSink",
     "Pipeline",
@@ -2522,6 +3269,7 @@ __all__ = [
     "SourceMode",
     "StreamSubscriber",
     "Table",
+    "TableReplayEngine",
     "StreamTableEngine",
     "TimeSeriesEngine",
     "TsDelaySpec",
@@ -2566,6 +3314,7 @@ __all__ = [
     "master",
     "read_table",
     "read_from",
+    "replay",
     "subscribe",
     "subscribe_table",
     "version",

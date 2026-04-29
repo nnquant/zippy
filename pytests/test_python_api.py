@@ -1089,6 +1089,587 @@ def test_parquet_replay_source_emits_parquet_batches(tmp_path: Path) -> None:
     assert sink.stopped is True
 
 
+def test_replay_function_replays_persisted_table_to_named_stream(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    live_pipeline = None
+    replay_engine = None
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    try:
+        zippy.connect(uri=control_endpoint, app="table_replay_test")
+        live_pipeline = (
+            zippy.Pipeline("live_ingest_for_replay")
+            .stream_table(
+                "live_ticks",
+                schema=schema,
+                row_capacity=2,
+                persist="parquet",
+                data_dir=tmp_path / "persisted",
+            )
+            .start()
+        )
+        live_pipeline.write(
+            {
+                "instrument_id": ["IF2606", "IH2606", "IF2606"],
+                "dt": [1777017600000000000, 1777017600000001000, 1777017600000002000],
+                "last_price": [3898.0, 2675.0, 3898.5],
+            }
+        )
+
+        live_query = zippy.read_table("live_ticks")
+        for _ in range(50):
+            persisted_files = live_query.persisted_files()
+            persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+            if persisted_rows == 2:
+                break
+            time.sleep(0.02)
+        expected = live_query.scan_persisted().to_table()
+        assert expected.num_rows == 2
+
+        replay_engine = zippy.replay(
+            "live_ticks",
+            output_stream="replay_ticks",
+            batch_size=2,
+            row_capacity=16,
+            persist=None,
+        )
+
+        replayed = zippy.read_table("replay_ticks").collect()
+
+        assert isinstance(replay_engine, zippy.TableReplayEngine)
+        assert replay_engine.status() == "running"
+        assert replay_engine.output_stream == "replay_ticks"
+        assert replay_engine.output_schema() == schema
+        assert replayed == expected
+    finally:
+        if replay_engine is not None:
+            replay_engine.stop()
+        if live_pipeline is not None:
+            live_pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_replay_function_replays_persisted_table_to_callback(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    live_pipeline = None
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    received: list[dict[str, object]] = []
+
+    def on_row(row: zippy.Row) -> None:
+        received.append(row.to_dict())
+
+    try:
+        zippy.connect(uri=control_endpoint, app="table_replay_callback_test")
+        live_pipeline = (
+            zippy.Pipeline("live_ingest_for_callback_replay")
+            .stream_table(
+                "callback_live_ticks",
+                schema=schema,
+                row_capacity=2,
+                persist="parquet",
+                data_dir=tmp_path / "persisted",
+            )
+            .start()
+        )
+        live_pipeline.write(
+            {
+                "instrument_id": ["IF2606", "IH2606", "IF2606"],
+                "dt": [1777017600000000000, 1777017600000001000, 1777017600000002000],
+                "last_price": [3898.0, 2675.0, 3898.5],
+            }
+        )
+
+        query = zippy.read_table("callback_live_ticks")
+        for _ in range(50):
+            persisted_files = query.persisted_files()
+            persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+            if persisted_rows == 2:
+                break
+            time.sleep(0.02)
+
+        expected = query.scan_persisted().to_table().to_pylist()
+        replay_engine = zippy.replay("callback_live_ticks", callback=on_row)
+
+        assert isinstance(replay_engine, zippy.TableReplayEngine)
+        assert replay_engine.status() == "completed"
+        assert received == expected
+    finally:
+        if live_pipeline is not None:
+            live_pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_replay_function_filters_persisted_table_by_time_window(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    live_pipeline = None
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    received: list[dict[str, object]] = []
+
+    def on_row(row: zippy.Row) -> None:
+        received.append(row.to_dict())
+
+    try:
+        zippy.connect(uri=control_endpoint, app="table_replay_window_test")
+        live_pipeline = (
+            zippy.Pipeline("live_ingest_for_window_replay")
+            .stream_table(
+                "window_live_ticks",
+                schema=schema,
+                row_capacity=2,
+                persist="parquet",
+                data_dir=tmp_path / "persisted",
+            )
+            .start()
+        )
+        live_pipeline.write(
+            {
+                "instrument_id": ["IF2606", "IH2606", "IF2606", "IH2606", "IC2606"],
+                "dt": [
+                    1777017600000000000,
+                    1777017600000001000,
+                    1777017600000002000,
+                    1777017600000003000,
+                    1777017600000004000,
+                ],
+                "last_price": [3898.0, 2675.0, 3898.5, 2675.5, 6123.0],
+            }
+        )
+
+        query = zippy.read_table("window_live_ticks")
+        for _ in range(50):
+            persisted_files = query.persisted_files()
+            persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+            if persisted_rows == 4:
+                break
+            time.sleep(0.02)
+        expected = query.scan_persisted().to_table().slice(1, 2).to_pylist()
+
+        replay_engine = zippy.replay(
+            "window_live_ticks",
+            callback=on_row,
+            start=1777017600000001000,
+            end=1777017600000002000,
+        )
+
+        assert isinstance(replay_engine, zippy.TableReplayEngine)
+        assert replay_engine.status() == "completed"
+        assert received == expected
+    finally:
+        if live_pipeline is not None:
+            live_pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_table_replay_init_allows_subscribe_before_run(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    live_pipeline = None
+    replay_engine = None
+    subscriber = None
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    received: list[dict[str, object]] = []
+    replay_done = threading.Event()
+
+    def on_row(row: zippy.Row) -> None:
+        received.append(row.to_dict())
+        if len(received) >= 2:
+            replay_done.set()
+
+    try:
+        zippy.connect(uri=control_endpoint, app="table_replay_init_test")
+        live_pipeline = (
+            zippy.Pipeline("live_ingest_for_replay_init")
+            .stream_table(
+                "init_live_ticks",
+                schema=schema,
+                row_capacity=2,
+                persist="parquet",
+                data_dir=tmp_path / "persisted",
+            )
+            .start()
+        )
+        live_pipeline.write(
+            {
+                "instrument_id": ["IF2606", "IH2606", "IF2606"],
+                "dt": [1777017600000000000, 1777017600000001000, 1777017600000002000],
+                "last_price": [3898.0, 2675.0, 3898.5],
+            }
+        )
+
+        query = zippy.read_table("init_live_ticks")
+        for _ in range(50):
+            persisted_files = query.persisted_files()
+            persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+            if persisted_rows == 2:
+                break
+            time.sleep(0.02)
+        expected = [
+            {
+                "instrument_id": "IF2606",
+                "dt": 1777017600000000000,
+                "last_price": 3898.0,
+            },
+            {
+                "instrument_id": "IH2606",
+                "dt": 1777017600000001000,
+                "last_price": 2675.0,
+            },
+        ]
+
+        replay_engine = zippy.TableReplayEngine(
+            "init_live_ticks",
+            output_stream="init_replay_ticks",
+            batch_size=1,
+            row_capacity=16,
+        )
+        replay_engine.init()
+        assert replay_engine.status() == "initialized"
+
+        subscriber = zippy.subscribe(
+            "init_replay_ticks",
+            callback=on_row,
+            poll_interval_ms=1,
+        )
+        replay_engine.run()
+
+        assert replay_done.wait(timeout=2.0)
+        assert received == expected
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        if replay_engine is not None:
+            replay_engine.stop()
+        if live_pipeline is not None:
+            live_pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_replay_output_stream_drives_reactive_latest_engine(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    live_pipeline = None
+    replay_engine = None
+    latest_session = None
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    try:
+        zippy.connect(uri=control_endpoint, app="replay_downstream_engine_test")
+        live_pipeline = (
+            zippy.Pipeline("live_ingest_for_replay_downstream")
+            .stream_table(
+                "downstream_live_ticks",
+                schema=tick_schema,
+                row_capacity=2,
+                persist="parquet",
+                data_dir=tmp_path / "persisted",
+            )
+            .start()
+        )
+        live_pipeline.write(
+            {
+                "instrument_id": ["IF2606", "IH2606", "IF2606", "IH2606", "IC2606"],
+                "dt": [
+                    1777017600000000000,
+                    1777017600000001000,
+                    1777017600000002000,
+                    1777017600000003000,
+                    1777017600000004000,
+                ],
+                "last_price": [3898.0, 2675.0, 3899.0, 2676.0, 6123.0],
+            }
+        )
+
+        live_query = zippy.read_table("downstream_live_ticks")
+        for _ in range(50):
+            persisted_files = live_query.persisted_files()
+            persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+            if persisted_rows == 4:
+                break
+            time.sleep(0.02)
+        assert live_query.scan_persisted().to_table().num_rows == 4
+
+        replay_engine = zippy.TableReplayEngine(
+            "downstream_live_ticks",
+            output_stream="replay_downstream_ticks",
+            batch_size=1,
+            row_capacity=16,
+            persist=None,
+        ).init()
+        latest_session = (
+            zippy.Session("replay_latest_session", master=zippy._DEFAULT_MASTER)
+            .engine(
+                zippy.ReactiveLatestEngine,
+                name="replay_latest_by_instrument",
+                source="replay_downstream_ticks",
+                by="instrument_id",
+            )
+            .stream_table("replay_downstream_latest", persist=False)
+            .run()
+        )
+
+        replay_engine.run()
+
+        latest = zippy.read_table("replay_downstream_latest").tail(10)
+        deadline = time.time() + 2.0
+        while (
+            latest.num_rows != 2
+            or latest.column("last_price").to_pylist() != [3899.0, 2676.0]
+        ) and time.time() < deadline:
+            time.sleep(0.02)
+            latest = zippy.read_table("replay_downstream_latest").tail(10)
+
+        assert latest.num_rows == 2
+        assert latest.column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
+        assert latest.column("last_price").to_pylist() == [3899.0, 2676.0]
+    finally:
+        if latest_session is not None:
+            latest_session.stop()
+        if replay_engine is not None:
+            replay_engine.stop()
+        if live_pipeline is not None:
+            live_pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_parquet_replay_engine_replays_path_to_named_stream(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    table = pa.table(
+        {
+            "instrument_id": ["IF2606", "IH2606", "IF2606"],
+            "dt": [1777017600000000000, 1777017600000001000, 1777017600000002000],
+            "last_price": [3898.0, 2675.0, 3898.5],
+        },
+        schema=schema,
+    )
+    parquet_path = tmp_path / "ticks.parquet"
+    pq.write_table(table, parquet_path)
+
+    server, control_endpoint = start_master_server(tmp_path)
+    replay_engine = None
+    try:
+        zippy.connect(uri=control_endpoint, app="parquet_replay_engine_test")
+        replay_engine = zippy.ParquetReplayEngine(
+            parquet_path,
+            output_stream="parquet_replay_ticks",
+            schema=schema,
+            batch_size=2,
+            row_capacity=16,
+            persist=None,
+        ).run()
+
+        replayed = zippy.read_table("parquet_replay_ticks").collect()
+
+        assert isinstance(replay_engine, zippy.ParquetReplayEngine)
+        assert replay_engine.status() == "running"
+        assert replay_engine.output_stream == "parquet_replay_ticks"
+        assert replayed == table
+    finally:
+        if replay_engine is not None:
+            replay_engine.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_parquet_replay_engine_callback_respects_replay_rate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 100.0
+            self.sleeps: list[float] = []
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, delay: float) -> None:
+            self.sleeps.append(delay)
+            self.now += delay
+
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    table = pa.table(
+        {
+            "instrument_id": ["IF2606", "IH2606", "IC2606"],
+            "dt": [1777017600000000000, 1777017600000001000, 1777017600000002000],
+            "last_price": [3898.0, 2675.0, 6123.0],
+        },
+        schema=schema,
+    )
+    parquet_path = tmp_path / "ticks.parquet"
+    pq.write_table(table, parquet_path)
+    fake_clock = FakeClock()
+    callback_times: list[float] = []
+
+    def on_row(row: zippy.Row) -> None:
+        callback_times.append(fake_clock.monotonic())
+
+    monkeypatch.setattr(zippy, "time", fake_clock, raising=False)
+
+    replay_engine = zippy.ParquetReplayEngine(
+        parquet_path,
+        callback=on_row,
+        schema=schema,
+        batch_size=2,
+        replay_rate=10,
+    ).run()
+
+    assert replay_engine.status() == "completed"
+    assert callback_times == pytest.approx([100.0, 100.1, 100.2])
+    assert fake_clock.sleeps == pytest.approx([0.1, 0.1])
+
+
+def test_pipeline_stop_unregisters_registered_source(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.registered_sources: list[str] = []
+            self.unregistered_sources: list[str] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def register_process(self, app: str) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(
+            self,
+            stream_name: str,
+            stream_schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: dict[str, object],
+        ) -> None:
+            self.registered_sources.append(source_name)
+
+        def unregister_source(self, source_name: str) -> None:
+            self.unregistered_sources.append(source_name)
+
+        def publish_segment_descriptor(
+            self,
+            stream_name: str,
+            descriptor: dict[str, object],
+        ) -> None:
+            return None
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    master = FakeMaster()
+    source = zippy.ParquetReplaySource(
+        tmp_path / "ticks.parquet",
+        schema=schema,
+        source_name="replay_source",
+    )
+    pipeline = (
+        zippy.Pipeline("replay_pipeline", master=master)
+        .source(source)
+        .stream_table("replay_ticks", schema=schema, persist=None)
+    )
+
+    pipeline.stop()
+
+    assert master.registered_sources == ["replay_source"]
+    assert master.unregistered_sources == ["replay_source"]
+
+
 def test_compare_replay_sorts_by_keys_and_reports_equal() -> None:
     schema = pa.schema(
         [
@@ -1134,7 +1715,7 @@ def test_parquet_replay_e2e_matches_persisted_table_snapshot(tmp_path: Path) -> 
 
     server, control_endpoint = start_master_server(tmp_path)
     live_pipeline = None
-    replay_pipeline = None
+    replay_engine = None
     try:
         zippy.connect(uri=control_endpoint, app="parquet_replay_e2e_test")
         tick_schema = pa.schema(
@@ -1180,18 +1761,11 @@ def test_parquet_replay_e2e_matches_persisted_table_snapshot(tmp_path: Path) -> 
         persisted = live_query.scan_persisted().to_table()
         assert persisted.num_rows == 4
 
-        replay_pipeline = (
-            zippy.Pipeline("replay_ingest")
-            .source(
-                zippy.ParquetReplaySource(
-                    tmp_path / "persisted" / "live_ticks",
-                    schema=tick_schema,
-                    batch_size=2,
-                    source_name="live_ticks_replay",
-                )
-            )
-            .stream_table("replay_ticks", schema=tick_schema, row_capacity=16)
-            .start()
+        replay_engine = zippy.replay(
+            "live_ticks",
+            output_stream="replay_ticks",
+            batch_size=2,
+            row_capacity=16,
         )
 
         replayed = zippy.read_table("replay_ticks").collect()
@@ -1211,8 +1785,8 @@ def test_parquet_replay_e2e_matches_persisted_table_snapshot(tmp_path: Path) -> 
         assert comparison["left_rows"] == 4
         assert comparison["right_rows"] == 4
     finally:
-        if replay_pipeline is not None:
-            replay_pipeline.stop()
+        if replay_engine is not None:
+            replay_engine.stop()
         if live_pipeline is not None:
             live_pipeline.stop()
         if reset_default_master is not None:

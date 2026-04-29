@@ -30,7 +30,7 @@ uv run zippy stream ls --uri default
 - `03_query/`：`read_table()`、`tail()`、`collect()`、表达式查询和 DataFrame 转换。
 - `04_subscribe/`：行级订阅和表级批量订阅。
 - `05_engines/`：`Session` 编排、`ReactiveLatestEngine`、时序和截面引擎。
-- `06_replay/`：从 Parquet 回放到 StreamTable，用于不开盘时做系统测试。
+- `06_replay/`：从 persisted table / Parquet 回放到 StreamTable，并驱动下游 Engine。
 
 ## 推荐学习顺序
 
@@ -41,6 +41,7 @@ uv run zippy stream ls --uri default
 5. 用 `05_engines/01_reactive_latest_session.py` 把上游表聚合成最新快照表。
 6. 用 `06_replay/01_parquet_replay_to_stream_table.py` 做不开盘环境下的回放测试。
 7. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
+8. 用 `06_replay/03_replay_to_reactive_latest_engine.py` 验证 replay stream 驱动下游 Engine。
 
 ## API 分层
 
@@ -52,10 +53,15 @@ uv run zippy stream ls --uri default
 - `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
 - `zp.subscribe(...)`：按行接收 `zp.Row`。
 - `zp.subscribe_table(...)`：按批接收 `pyarrow.Table`。
+- `zp.replay(...)`：把已持久化的 Zippy 表回放到 callback 或 named StreamTable。
+  可用 `start` / `end` / `time_column` 做闭区间回放，用 `replay_rate` 指定固定
+  rows/sec；下游需要先订阅时，使用 `zp.TableReplayEngine(...).init()` 建立输出流后再
+  `run()`。
 - `zp.compare_replay(...)`：把 live persisted 数据和 replay 输出按 key 对齐比较。
 - `zp.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
 
-`StreamTableEngine`、`SegmentStreamSource` 等底层对象仍然可以使用，但示例默认不直接暴露这些细节。
+`ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、`StreamTableEngine`、
+`SegmentStreamSource` 等底层对象仍然可以使用，但示例默认不直接暴露这些细节。
 
 ## 运行约定
 

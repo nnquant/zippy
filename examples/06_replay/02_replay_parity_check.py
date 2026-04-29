@@ -4,7 +4,7 @@
 这个脚本假设：
 
 1. live 表已经开启 parquet persist，并且 master 能看到 persisted_files。
-2. replay 表已经由 ParquetReplaySource 回放生成。
+2. replay 表已经由 zp.replay(...) 或 TableReplayEngine 回放生成。
 
 :example:
 

@@ -1455,23 +1455,55 @@ per-factor stream vs factor pack stream。
 
 ```python
 zippy.replay(
-    source_persisted="data/ctp_ticks",
-    output_stream="replay.ctp_ticks.20260426",
-    start="2026-04-26 09:00:00",
-    end="2026-04-26 15:00:00",
+    source="ctp_ticks",
+    callback=on_tick,
+    start=1777017600000000000,
+    end=1777017660000000000,
+    time_column="dt",
+    replay_rate=1_000,
 )
 ```
 
-或：
+或回放到新的 named stream：
 
 ```python
-(
-    zippy.Pipeline("replay_ctp_ticks")
-    .source(zippy.ParquetReplaySource("data/ctp_ticks", start=..., end=...))
-    .stream_table("replay.ctp_ticks", schema=TickSchema)
-    .run()
+zippy.replay(
+    source="ctp_ticks",
+    output_stream="replay.ctp_ticks.20260426",
 )
 ```
+
+若下游需要先订阅 replay output，再开始回放：
+
+```python
+replay = zippy.TableReplayEngine("ctp_ticks", output_stream="replay.ctp_ticks")
+replay.init()
+subscriber = zippy.subscribe("replay.ctp_ticks", callback=on_tick)
+replay.run()
+```
+
+显式 parquet 路径使用独立的 `ParquetReplayEngine`：
+
+```python
+zippy.ParquetReplayEngine(
+    "data/ctp_ticks",
+    output_stream="replay.ctp_ticks.raw",
+    schema=TickSchema,
+).run()
+```
+
+当前 API 分层收敛为：
+
+- `zippy.replay(...)`：用户默认入口，接收已 persist 的 Zippy table name，创建并启动
+  `TableReplayEngine`。
+- `TableReplayEngine`：顶层 table replay 编排对象，从 master 查询 persisted files，
+  支持 `callback` 或 `output_stream` 两种互斥模式。
+  - `init()` 只注册/准备 output stream，不读取或发出历史数据，用于让下游先
+    `subscribe()`。
+  - `run()` 若尚未 `init()` 会自动初始化，然后开始 replay。
+- `ParquetReplayEngine`：显式 parquet file/directory/list 路径回放入口，同样支持
+  `callback` 或 `output_stream`。
+- `ParquetReplaySource`：底层 source plugin，仅在需要自定义 `Pipeline` 接线时直接使用。
 
 ### 工作项
 
@@ -1481,17 +1513,31 @@ zippy.replay(
   - 已完成 replay source 生命周期修正：自然回放结束后只 flush 并保持 source idle，
     输出 StreamTable 生命周期由 `Pipeline.stop()` 控制，避免 replay 表刚生成即释放
     active mmap。
+- 实现 TableReplayEngine、ParquetReplayEngine 与 `zippy.replay(...)` 高层入口。
+  - 已完成 `zippy.replay(table_name, callback=...)`：从 persisted table 逐行回放
+    `zippy.Row`。
+  - 已完成 `zippy.replay(table_name, output_stream=..., wait=True)`：默认启动 replay，
+    等待 persisted rows flush 完成后返回运行中的 `TableReplayEngine`。
+  - `TableReplayEngine.table()` 可以直接返回 queryable `Table`。
+  - 已完成 `TableReplayEngine.init()` 启动屏障：下游可以先 subscribe output stream，
+    再调用 `run()` 开始回放。
 - 支持按 event_ts / seq 回放。
+  - 已完成基础闭区间过滤：`start` / `end` / `time_column` 会在 replay 读取 parquet batch
+    后、发往 callback 或 output stream 前生效。
+  - `time_column="dt"` 覆盖 event-time replay；传入序号列名即可覆盖 seq 范围 replay。
 - 支持 controlled speed：
-  - as-fast-as-possible
-  - original timing
-  - fixed rate
+  - 已完成默认 as-fast-as-possible。
+  - 已完成 fixed-rate：`replay_rate` 表示 rows/sec，callback replay 和 named stream replay
+    都按行节流。
+  - 不实现 original timing，避免把历史事件时间与当前 wall-clock 调度混在同一套 API。
 - replay 输出仍然是 named stream。
 - replay 输出可以接 downstream engine。
+  - 已完成 replay -> ReactiveLatestEngine -> latest table e2e 测试，验证下游可以在
+    `TableReplayEngine.init()` 后先启动，再消费 replay stream。
 - 定义 live vs replay 比对工具。
   - 已完成 `zippy.compare_replay(left, right, by=[...])` 基础版，支持 table name、
     `zippy.Table`、`pyarrow.Table`、RecordBatchReader 和 PyArrow Dataset 输入。
-  - 已完成 replay e2e 测试：persisted parquet -> ParquetReplaySource ->
+  - 已完成 replay e2e 测试：persisted table -> TableReplayEngine ->
     replay named stream -> Table.collect -> compare_replay。
 
 ### 验收标准
@@ -1567,8 +1613,8 @@ master 或 error event 可观察。
 #### 17.7 Replay e2e
 
 ```text
-persisted parquet
-  -> ParquetReplaySource
+persisted table
+  -> TableReplayEngine
   -> replay named stream
   -> Table tail
 ```
@@ -1781,7 +1827,9 @@ output persist
 包含：
 
 ```text
-ParquetReplaySource
+TableReplayEngine
+ParquetReplayEngine
+callback replay
 replay named stream
 replay -> downstream engine
 live/replay comparison helper
@@ -1903,11 +1951,9 @@ q.tail(1000)
 ### 场景六：replay
 
 ```python
-(
-    zippy.Pipeline("replay")
-    .source(zippy.ParquetReplaySource("data/ctp_ticks"))
-    .stream_table("replay.ctp_ticks", schema=TickSchema)
-    .run()
+replay = zippy.replay(
+    "ctp_ticks",
+    output_stream="replay.ctp_ticks",
 )
 ```
 

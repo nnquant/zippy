@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -74,10 +73,14 @@ def main() -> None:
     :returns: None
     :rtype: None
     """
-    parser = argparse.ArgumentParser(description="ParquetReplaySource 示例")
+    parser = argparse.ArgumentParser(description="ParquetReplayEngine 示例")
     parser.add_argument("--uri", default="default", help="master URI")
     parser.add_argument("--table", default="replay_ticks", help="输出 StreamTable")
     parser.add_argument("--root", default=str(DEFAULT_ROOT), help="示例数据目录")
+    parser.add_argument("--time-column", default="dt", help="时间窗口过滤列")
+    parser.add_argument("--start-ns", type=int, default=None, help="闭区间开始时间，单位 ns")
+    parser.add_argument("--end-ns", type=int, default=None, help="闭区间结束时间，单位 ns")
+    parser.add_argument("--replay-rate", type=float, default=None, help="固定回放速率，单位 rows/sec")
     parser.add_argument("--drop-existing", action="store_true", help="运行前删除同名表")
     args = parser.parse_args()
 
@@ -92,33 +95,28 @@ def main() -> None:
         except RuntimeError:
             pass
 
-    source = zp.ParquetReplaySource(
+    replay = zp.ParquetReplayEngine(
         parquet_path,
+        output_stream=args.table,
         schema=tick_schema(),
+        name="example_parquet_replay",
         batch_size=2,
-        source_name="example_parquet_replay_source",
-    )
-    pipeline = (
-        zp.Pipeline("example_parquet_replay")
-        .source(source)
-        .stream_table(
-            args.table,
-            dt_column="dt",
-            id_column="instrument_id",
-            dt_part="%Y%m",
-            persist=None,
-        )
-    )
+        dt_column="dt",
+        id_column="instrument_id",
+        dt_part="%Y%m",
+        persist=None,
+        time_column=args.time_column,
+        start=args.start_ns,
+        end=args.end_ns,
+        replay_rate=args.replay_rate,
+    ).run()
 
     try:
-        pipeline.start()
-        # 当前回放模式是 as_fast_as_possible，等待后台 source 线程发完小文件即可。
-        time.sleep(0.5)
-        print(zp.read_table(args.table).tail(10))
+        # ParquetReplayEngine 默认等待 parquet 数据完成回放；engine 仍保持运行，方便继续查询。
+        print(replay.table().tail(10))
     finally:
-        pipeline.stop()
+        replay.stop()
 
 
 if __name__ == "__main__":
     main()
-
