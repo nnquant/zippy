@@ -5434,6 +5434,89 @@ def test_query_scan_live_returns_reader_over_retained_sealed_and_active_rows() -
             server.stop()
 
 
+def test_stream_table_e2e_ingest_rollover_persist_and_query(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    pipeline = None
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    row_count = 10
+    expected_instruments = [f"IF{2600 + index}" for index in range(row_count)]
+    expected_prices = [4100.0 + index for index in range(row_count)]
+
+    try:
+        zippy.connect(uri=control_endpoint, app="stream_table_e2e_test")
+        pipeline = (
+            zippy.Pipeline("stream_table_e2e_test")
+            .stream_table(
+                "e2e_ticks",
+                schema=schema,
+                row_capacity=4,
+                retention_segments=1,
+                persist="parquet",
+                data_dir=tmp_path / "persisted",
+            )
+            .start()
+        )
+        pipeline.write(
+            {
+                "instrument_id": expected_instruments,
+                "dt": [1777017600000000000 + index for index in range(row_count)],
+                "last_price": expected_prices,
+            }
+        )
+
+        query = zippy.read_table("e2e_ticks")
+        persisted_files = []
+        persisted_rows = 0
+        for _ in range(50):
+            persisted_files = query.persisted_files()
+            persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+            if persisted_rows == 8:
+                break
+            time.sleep(0.02)
+        pipeline.flush()
+        persisted_files = query.persisted_files()
+        persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
+
+        latest = query.tail(row_count)
+        for _ in range(50):
+            if latest.num_rows == row_count:
+                break
+            time.sleep(0.02)
+            latest = query.tail(row_count)
+
+        stream = zippy.table_info("e2e_ticks")
+        persisted = query.scan_persisted().to_table()
+        collected = query.collect()
+
+        assert len(stream["sealed_segments"]) == 1
+        assert persisted_rows == 8
+        assert len(persisted_files) == 2
+        assert all(Path(item["file_path"]).exists() for item in persisted_files)
+        assert persisted.num_rows == 8
+        assert persisted.column("last_price").to_pylist() == expected_prices[:8]
+        assert latest.num_rows == row_count
+        assert latest.column("instrument_id").to_pylist() == expected_instruments
+        assert latest.column("last_price").to_pylist() == expected_prices
+        assert collected.num_rows == row_count
+        assert collected.column("last_price").to_pylist() == expected_prices
+    finally:
+        if pipeline is not None:
+            pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_query_snapshot_includes_published_files() -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:

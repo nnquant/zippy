@@ -1,6 +1,6 @@
 # Zippy Roadmap
 
-> 更新时间：2026-04-28
+> 更新时间：2026-04-30
 > 目标：把 Zippy 从底层实时数据通道演进为「量化实时行情与因子计算基础设施」。
 > 本文重点覆盖 **named stream、StreamTable、Table、persist/replay、Pipeline 生命周期、可靠性与性能验收**。
 > 因子系统的具体建模方式暂不在本文中定稿，仅保留必要的接入点和演进边界。
@@ -1593,6 +1593,18 @@ sealed segment flush parquet；
 retention 清理 sealed segment；
 Table.scan_persisted() 可查询历史数据。
 ```
+
+当前进展：
+
+- 已完成 `test_stream_table_e2e_ingest_rollover_persist_and_query` 合并 smoke：
+  - 覆盖 `MasterServer -> Pipeline.write -> StreamTable -> read_table().tail()`。
+  - 使用小 `row_capacity` 强制 rollover，验证 active + sealed + persisted parquet
+    拼接后不重不漏。
+  - 验证 `retention_segments` 在 persist commit 后释放旧 sealed segment，
+    `Table.scan_persisted()` 可以读取 sealed parquet 历史数据。
+- 已修复 Python `flush()` 持 GIL 等待 runtime 的死锁风险；flush 期间 runtime
+  worker 需要通过 Python publisher 回调 master，因此等待 runtime/archive flush 时必须
+  释放 GIL。
 
 #### 17.5 Writer crash
 

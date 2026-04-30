@@ -3929,8 +3929,9 @@ impl ReactiveStateEngine {
         Ok(dict.into_any().unbind())
     }
 
-    fn flush(&self) -> PyResult<()> {
-        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
         result
     }
@@ -4119,8 +4120,9 @@ impl ReactiveLatestEngine {
         Ok(dict.into_any().unbind())
     }
 
-    fn flush(&self) -> PyResult<()> {
-        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
         result
     }
@@ -4346,8 +4348,9 @@ impl StreamTableEngine {
         Ok(python_json_loads(py, envelope_text)?.into_py(py))
     }
 
-    fn flush(&self) -> PyResult<()> {
-        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
         result
     }
@@ -4552,8 +4555,9 @@ impl KeyValueTableMaterializer {
         Ok(python_json_loads(py, envelope_text)?.into_py(py))
     }
 
-    fn flush(&self) -> PyResult<()> {
-        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
         result
     }
@@ -4743,8 +4747,9 @@ impl TimeSeriesEngine {
         Ok(dict.into_any().unbind())
     }
 
-    fn flush(&self) -> PyResult<()> {
-        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
         result
     }
@@ -4920,8 +4925,9 @@ impl CrossSectionalEngine {
         Ok(dict.into_any().unbind())
     }
 
-    fn flush(&self) -> PyResult<()> {
-        let result = flush_runtime_engine(&self.handle, &self.archive, &self.status, &self.metrics);
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
         result
     }
@@ -5797,20 +5803,19 @@ fn write_runtime_input(
 }
 
 fn flush_runtime_engine(
+    py: Python<'_>,
     handle: &SharedHandle,
     archive: &SharedArchive,
     status: &SharedStatus,
     metrics: &SharedMetrics,
 ) -> PyResult<()> {
     with_handle(handle, |runtime| {
-        runtime
-            .flush()
+        py.allow_threads(|| runtime.flush())
             .map(|_| ())
             .map_err(|error| py_runtime_error(error.to_string()))
     })?;
     if let Some(archive) = archive.lock().unwrap().as_ref().cloned() {
-        archive
-            .flush()
+        py.allow_threads(|| archive.flush())
             .map_err(|error| py_runtime_error(error.to_string()))?;
     }
     sync_runtime_state(handle, status, metrics);
