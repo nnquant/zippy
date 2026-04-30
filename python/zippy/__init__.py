@@ -346,7 +346,7 @@ def config(master: MasterClient | None = None) -> dict[str, object]:
     return _master_config(master or _default_master())
 
 
-def list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
+def _list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
     """
     List tables registered in the connected Zippy master.
 
@@ -362,12 +362,12 @@ def list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
     :example:
 
         >>> zippy.connect()
-        >>> zippy.list_tables()
+        >>> zippy.ops.list_tables()
     """
     return list((master or _default_master()).list_streams())
 
 
-def table_info(
+def _table_info(
     table_name: str,
     *,
     master: MasterClient | None = None,
@@ -386,7 +386,7 @@ def table_info(
     :example:
 
         >>> zippy.connect()
-        >>> zippy.table_info("ctp_ticks")
+        >>> zippy.ops.table_info("ctp_ticks")
     """
     if not isinstance(table_name, str):
         raise TypeError("table_name must be a string")
@@ -395,7 +395,151 @@ def table_info(
     return (master or _default_master()).get_stream(table_name)
 
 
-def drop_table(
+def _table_alerts(
+    table_name: str,
+    *,
+    master: MasterClient | None = None,
+) -> list[dict[str, object]]:
+    """
+    Return metadata-derived health alerts for one Zippy table.
+
+    This function does not scan data files or attach live segments. It only interprets
+    master catalog metadata such as stream status, active descriptor state, and persist
+    lifecycle events.
+
+    :param table_name: Named table to inspect.
+    :type table_name: str
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Health alerts ordered by control-plane importance.
+    :rtype: list[dict[str, object]]
+    :raises ValueError: If ``table_name`` is empty.
+    :raises RuntimeError: If the table does not exist or master rejects the request.
+    """
+    return _build_table_alerts(_table_info(table_name, master=master))
+
+
+def _table_health(
+    table_name: str,
+    *,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Return a compact health summary for one Zippy table.
+
+    ``status`` is ``"error"`` when any error alert exists, ``"warning"`` when only
+    warning alerts exist, and ``"ok"`` when no alerts are present.
+
+    :param table_name: Named table to inspect.
+    :type table_name: str
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Table health summary with alerts.
+    :rtype: dict[str, object]
+    :raises ValueError: If ``table_name`` is empty.
+    :raises RuntimeError: If the table does not exist or master rejects the request.
+    """
+    return _table_health_from_info(_table_info(table_name, master=master), table_name)
+
+
+def _table_health_from_info(
+    info: dict[str, object],
+    fallback_table_name: str | None = None,
+) -> dict[str, object]:
+    table_name = info.get("stream_name", fallback_table_name)
+    alerts = _build_table_alerts(info)
+    return {
+        "table_name": table_name,
+        "status": _table_health_status(alerts),
+        "stream_status": info.get("status"),
+        "descriptor_generation": info.get("descriptor_generation"),
+        "alert_count": len(alerts),
+        "alerts": alerts,
+    }
+
+
+def _build_table_alerts(info: dict[str, object]) -> list[dict[str, object]]:
+    table_name = str(info.get("stream_name") or "")
+    stream_status = str(info.get("status") or "unknown")
+    alerts: list[dict[str, object]] = []
+
+    if stream_status == "stale":
+        alerts.append(
+            {
+                "severity": "error",
+                "kind": "stream_stale",
+                "table_name": table_name,
+                "stream_status": stream_status,
+                "message": f"stream is stale table_name=[{table_name}]",
+            }
+        )
+    elif stream_status in {"error", "failed"}:
+        alerts.append(
+            {
+                "severity": "error",
+                "kind": "stream_error",
+                "table_name": table_name,
+                "stream_status": stream_status,
+                "message": (
+                    f"stream is in error status table_name=[{table_name}] "
+                    f"status=[{stream_status}]"
+                ),
+            }
+        )
+
+    if info.get("active_segment_descriptor") is None:
+        alerts.append(
+            {
+                "severity": "warning",
+                "kind": "active_descriptor_missing",
+                "table_name": table_name,
+                "stream_status": stream_status,
+                "message": (
+                    "active segment descriptor is not published "
+                    f"table_name=[{table_name}] status=[{stream_status}]"
+                ),
+            }
+        )
+
+    for event in info.get("persist_events", []) or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("persist_event_type") != "persist_failed":
+            continue
+        alert = {
+            "severity": "error",
+            "kind": "persist_failed",
+            "table_name": table_name,
+            "message": _persist_failed_alert_message(table_name, event),
+        }
+        alert.update(event)
+        alerts.append(alert)
+
+    return alerts
+
+
+def _persist_failed_alert_message(table_name: str, event: dict[str, object]) -> str:
+    segment_id = event.get("source_segment_id")
+    generation = event.get("source_generation")
+    attempts = event.get("attempts")
+    error = event.get("error")
+    return (
+        f"persist failed table_name=[{table_name}] "
+        f"source_segment_id=[{segment_id}] source_generation=[{generation}] "
+        f"attempts=[{attempts}] error=[{error}]"
+    )
+
+
+def _table_health_status(alerts: list[dict[str, object]]) -> str:
+    severities = {str(alert.get("severity")) for alert in alerts}
+    if "error" in severities:
+        return "error"
+    if "warning" in severities:
+        return "warning"
+    return "ok"
+
+
+def _drop_table(
     table_name: str,
     *,
     drop_persisted: bool = True,
@@ -416,11 +560,109 @@ def drop_table(
     :example:
 
         >>> zippy.connect()
-        >>> zippy.drop_table("ctp_ticks")
+        >>> zippy.ops.drop_table("ctp_ticks")
     """
     if not table_name:
         raise ValueError("table_name must not be empty")
     return (master or _default_master()).drop_table(table_name, drop_persisted)
+
+
+class Ops:
+    """
+    Namespace for low-frequency Zippy operations.
+
+    These methods intentionally live under ``zippy.ops`` so the top-level API remains
+    focused on high-frequency user workflows such as ``read_table`` and ``subscribe``.
+    """
+
+    def list_tables(self, master: MasterClient | None = None) -> list[dict[str, object]]:
+        """
+        List tables registered in the connected Zippy master.
+
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Registered table metadata entries.
+        :rtype: list[dict[str, object]]
+        """
+        return _list_tables(master=master)
+
+    def table_info(
+        self,
+        table_name: str,
+        *,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Return master metadata for one registered Zippy table.
+
+        :param table_name: Named table to inspect.
+        :type table_name: str
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Table metadata including schema, status, descriptors, and persist state.
+        :rtype: dict[str, object]
+        """
+        return _table_info(table_name, master=master)
+
+    def table_alerts(
+        self,
+        table_name: str,
+        *,
+        master: MasterClient | None = None,
+    ) -> list[dict[str, object]]:
+        """
+        Return metadata-derived health alerts for one Zippy table.
+
+        :param table_name: Named table to inspect.
+        :type table_name: str
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Health alerts ordered by control-plane importance.
+        :rtype: list[dict[str, object]]
+        """
+        return _table_alerts(table_name, master=master)
+
+    def table_health(
+        self,
+        table_name: str,
+        *,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Return a compact health summary for one Zippy table.
+
+        :param table_name: Named table to inspect.
+        :type table_name: str
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Table health summary with alerts.
+        :rtype: dict[str, object]
+        """
+        return _table_health(table_name, master=master)
+
+    def drop_table(
+        self,
+        table_name: str,
+        *,
+        drop_persisted: bool = True,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Drop a named Zippy table from master.
+
+        :param table_name: Named table to remove.
+        :type table_name: str
+        :param drop_persisted: Whether to delete persisted parquet files registered for the table.
+        :type drop_persisted: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Drop summary returned by master.
+        :rtype: dict[str, object]
+        """
+        return _drop_table(table_name, drop_persisted=drop_persisted, master=master)
+
+
+ops = Ops()
 
 
 def _default_master() -> MasterClient:
@@ -481,6 +723,66 @@ def _validate_heartbeat_interval(interval_sec: float) -> float:
     if not interval > 0:
         raise ValueError("heartbeat_interval_sec must be positive")
     return interval
+
+
+def _parse_timeout_seconds(timeout: float | str | None) -> float | None:
+    if timeout is None:
+        return None
+    if isinstance(timeout, str):
+        text = timeout.strip().lower()
+        if text.endswith("ms"):
+            value = float(text[:-2])
+            seconds = value / 1000.0
+        elif text.endswith("s"):
+            seconds = float(text[:-1])
+        elif text.endswith("m"):
+            seconds = float(text[:-1]) * 60.0
+        else:
+            seconds = float(text)
+    else:
+        seconds = float(timeout)
+    if seconds < 0:
+        raise ValueError("timeout must be non-negative")
+    return seconds
+
+
+def _wait_for_table_ready(
+    source: str,
+    master: MasterClient,
+    timeout: float | str | None,
+) -> None:
+    timeout_sec = _parse_timeout_seconds(timeout)
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+    last_error: BaseException | None = None
+
+    while True:
+        try:
+            stream = master.get_stream(source)
+        except RuntimeError as error:
+            if "stream not found" not in str(error):
+                raise
+            last_error = error
+        else:
+            if stream.get("data_path") != "segment":
+                return
+            if stream.get("status") != "stale" and stream.get("active_segment_descriptor"):
+                return
+            last_error = RuntimeError(
+                "table is not ready "
+                f"source=[{source}] status=[{stream.get('status')}]"
+            )
+
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for table source=[{source}] "
+                    f"master_uri=[{_master_uri_for_error(master)}]"
+                ) from last_error
+            sleep_sec = min(0.01, remaining)
+        else:
+            sleep_sec = 0.01
+        time.sleep(sleep_sec)
 
 
 def _set_default_master(
@@ -567,14 +869,27 @@ class Table:
     :param master: Optional explicit master client. When omitted, the connection created by
         ``zippy.connect()`` is used.
     :type master: MasterClient | None
+    :param wait: When true, wait until the table exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :raises RuntimeError: If no explicit master is supplied and ``zippy.connect()`` was not called.
     """
 
-    def __init__(self, source: str, master: MasterClient | None = None) -> None:
+    def __init__(
+        self,
+        source: str,
+        master: MasterClient | None = None,
+        *,
+        wait: bool = False,
+        timeout: float | str | None = None,
+    ) -> None:
         selected_master = master or _default_master()
         self.source = source
         try:
             _ensure_master_process(selected_master, f"read_table.{source}")
+            if wait:
+                _wait_for_table_ready(source, selected_master, timeout)
             self._inner = _NativeQuery(source=source, master=selected_master)
             self._select_exprs: list[object] | None = None
             self._where_expr: object | None = None
@@ -637,6 +952,33 @@ class Table:
         :rtype: dict[str, object]
         """
         return self._inner.stream_info()
+
+    def info(self) -> dict[str, object]:
+        """
+        Return current control-plane metadata for this table.
+
+        :returns: Stream metadata from master.
+        :rtype: dict[str, object]
+        """
+        return self.stream_info()
+
+    def alerts(self) -> list[dict[str, object]]:
+        """
+        Return metadata-derived health alerts for this table.
+
+        :returns: Health alerts ordered by control-plane importance.
+        :rtype: list[dict[str, object]]
+        """
+        return _build_table_alerts(self.info())
+
+    def health(self) -> dict[str, object]:
+        """
+        Return a compact health summary for this table.
+
+        :returns: Table health summary with alerts.
+        :rtype: dict[str, object]
+        """
+        return _table_health_from_info(self.info(), self.source)
 
     def snapshot(self) -> dict[str, object]:
         """
@@ -847,7 +1189,13 @@ class Table:
             )
         return frame.collect().to_arrow()
 
-def read_table(source: str, master: MasterClient | None = None) -> Table:
+def read_table(
+    source: str,
+    master: MasterClient | None = None,
+    *,
+    wait: bool = False,
+    timeout: float | str | None = None,
+) -> Table:
     """
     Open a named Zippy table.
 
@@ -855,10 +1203,15 @@ def read_table(source: str, master: MasterClient | None = None) -> Table:
     :type source: str
     :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
     :type master: MasterClient | None
+    :param wait: When true, wait until the table exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"500ms"``,
+        ``"30s"`` or ``"2m"``. ``None`` waits indefinitely.
+    :type timeout: float | str | None
     :returns: Table object for further operations such as ``tail``.
     :rtype: Table
     """
-    return Table(source=source, master=master)
+    return Table(source=source, master=master, wait=wait, timeout=timeout)
 
 
 def compare_replay(
@@ -1188,6 +1541,10 @@ class StreamSubscriber:
     """
     Subscribe to a named stream and invoke a local Python callback with rows.
 
+    Live subscriptions are best-effort: a running subscriber can attach to a
+    restarted writer and continue receiving new rows, but rows missed while the
+    writer or reader is unavailable are not automatically backfilled.
+
     :param source: Named stream to subscribe to.
     :type source: str
     :param callback: Function called once for each incremental ``zippy.Row``.
@@ -1200,6 +1557,10 @@ class StreamSubscriber:
     :type xfast: bool
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
+    :param wait: When true, wait until the stream exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :raises RuntimeError: If no explicit master is supplied and ``zippy.connect()`` was not called.
     """
 
@@ -1212,10 +1573,14 @@ class StreamSubscriber:
         poll_interval_ms: int | None = None,
         xfast: bool = False,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+        wait: bool = False,
+        timeout: float | str | None = None,
         _table_callback: bool = False,
     ) -> None:
         selected_master = master or _default_master()
         _ensure_master_process(selected_master, f"subscribe.{source}")
+        if wait:
+            _wait_for_table_ready(source, selected_master, timeout)
         if _table_callback and instrument_ids is not None:
             raise ValueError("instrument_ids is only supported by subscribe row callbacks")
         if poll_interval_ms is None:
@@ -1258,6 +1623,15 @@ class StreamSubscriber:
         """
         self._inner.join()
 
+    def metrics(self) -> dict[str, object]:
+        """
+        Return runtime counters for this subscriber.
+
+        :returns: Subscriber counters such as delivered rows and descriptor updates.
+        :rtype: dict[str, object]
+        """
+        return self._inner.metrics()
+
 
 def subscribe(
     source: str,
@@ -1267,9 +1641,15 @@ def subscribe(
     poll_interval_ms: int = 1,
     xfast: bool = False,
     instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+    wait: bool = False,
+    timeout: float | str | None = None,
 ) -> StreamSubscriber:
     """
     Subscribe to a stream using the default master connection.
+
+    This is a best-effort live subscription. It can resume on new writer
+    descriptors, but does not automatically backfill rows missed during writer
+    downtime.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -1283,6 +1663,10 @@ def subscribe(
     :type xfast: bool
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
+    :param wait: When true, wait until the stream exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
@@ -1293,6 +1677,8 @@ def subscribe(
         poll_interval_ms=poll_interval_ms,
         xfast=xfast,
         instrument_ids=instrument_ids,
+        wait=wait,
+        timeout=timeout,
     )
     return subscriber.start()
 
@@ -1304,9 +1690,15 @@ def subscribe_table(
     *,
     poll_interval_ms: int = 10,
     xfast: bool = False,
+    wait: bool = False,
+    timeout: float | str | None = None,
 ) -> StreamSubscriber:
     """
     Subscribe to a stream using incremental ``pyarrow.Table`` callbacks.
+
+    This is a best-effort live subscription. It can resume on new writer
+    descriptors, but does not automatically backfill rows missed during writer
+    downtime.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -1318,6 +1710,10 @@ def subscribe_table(
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param wait: When true, wait until the stream exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
@@ -1327,6 +1723,8 @@ def subscribe_table(
         master=master,
         poll_interval_ms=poll_interval_ms,
         xfast=xfast,
+        wait=wait,
+        timeout=timeout,
         _table_callback=True,
     )
     return subscriber.start()
@@ -3358,15 +3756,13 @@ __all__ = [
     "compare_replay",
     "config",
     "connect",
-    "drop_table",
     "log_info",
-    "list_tables",
     "master",
+    "ops",
     "read_table",
     "read_from",
     "replay",
     "subscribe",
     "subscribe_table",
-    "table_info",
     "version",
 ]

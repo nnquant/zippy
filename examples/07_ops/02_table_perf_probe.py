@@ -79,9 +79,9 @@ def summarize_samples_ms(samples_ms: list[float]) -> dict[str, float | int | Non
 
 def table_storage_summary(table_info: dict[str, object]) -> dict[str, object]:
     """
-    Summarize storage-related metadata from ``zippy.table_info``.
+    Summarize storage-related metadata from ``zippy.ops.table_info``.
 
-    :param table_info: Metadata returned by ``zippy.table_info``.
+    :param table_info: Metadata returned by ``zippy.ops.table_info``.
     :type table_info: dict[str, object]
     :returns: Storage summary.
     :rtype: dict[str, object]
@@ -204,7 +204,7 @@ def main() -> None:
     args = parser.parse_args()
 
     zp.connect(uri=args.uri, app="example_table_perf_probe")
-    info = zp.table_info(args.table)
+    info = zp.ops.table_info(args.table)
     report: dict[str, object] = {
         "table": args.table,
         "observed_at_unix_ns": time.time_ns(),

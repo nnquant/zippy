@@ -33,11 +33,11 @@ def main() -> None:
 
     zp.connect(uri=args.uri, app="example_table_observability")
 
-    tables = zp.list_tables()
+    tables = zp.ops.list_tables()
     print(json.dumps(tables, ensure_ascii=False, indent=2))
 
     if args.table is not None:
-        table = zp.table_info(args.table)
+        table = zp.ops.table_info(args.table)
         print(json.dumps(table, ensure_ascii=False, indent=2))
 
 

@@ -12,8 +12,8 @@ use crate::{
     segment::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_GENERATION_OFFSET,
         SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC, SHM_MAGIC_OFFSET,
-        SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET,
-        SHM_SEGMENT_ID_OFFSET,
+        SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET,
+        SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET,
     },
     ColumnType, CompiledSchema, LayoutPlan, SealedSegmentHandle, SegmentHeader, ShmRegion,
 };
@@ -132,6 +132,9 @@ impl ActiveSegmentWriter {
         shm_region
             .write_at(SHM_SEALED_OFFSET, &[0_u8])
             .map_err(|_| "failed to initialize shared memory sealed flag")?;
+        shm_region
+            .store_u32_release(SHM_NOTIFY_SEQ_OFFSET, 0)
+            .map_err(|_| "failed to initialize shared memory notify sequence")?;
         write_u32_header(&mut shm_region, SHM_MAGIC_OFFSET, SHM_MAGIC)?;
         write_u32_header(
             &mut shm_region,
@@ -219,6 +222,7 @@ impl ActiveSegmentWriter {
         self.shm_region
             .store_u64_release(SHM_COMMITTED_ROW_COUNT_OFFSET, self.row_cursor as u64)
             .map_err(|_| "failed to publish shared memory committed row count")?;
+        self.notify_readers()?;
         Ok(())
     }
 
@@ -273,6 +277,7 @@ impl ActiveSegmentWriter {
         self.header.row_count = 0;
         self.row_cursor = 0;
         write_u64_header(&mut self.shm_region, SHM_ROW_COUNT_OFFSET, 0)?;
+        self.notify_readers()?;
 
         for (column_name, validity) in self.validity.iter_mut() {
             validity.fill(false);
@@ -473,6 +478,7 @@ impl ActiveSegmentWriter {
             .write_at(SHM_SEALED_OFFSET, &[1_u8])
             .map_err(|_| "failed to mark shared memory segment as sealed")?;
         self.header.sealed = true;
+        self.notify_readers()?;
         Ok(sealed)
     }
 
@@ -487,6 +493,16 @@ impl ActiveSegmentWriter {
         if self.row_cursor >= self.layout.row_capacity() {
             return Err("segment is full");
         }
+        Ok(())
+    }
+
+    fn notify_readers(&self) -> Result<(), &'static str> {
+        self.shm_region
+            .fetch_add_u32_release(SHM_NOTIFY_SEQ_OFFSET, 1)
+            .map_err(|_| "failed to increment shared memory notify sequence")?;
+        self.shm_region
+            .wake_u32(SHM_NOTIFY_SEQ_OFFSET)
+            .map_err(|_| "failed to wake shared memory readers")?;
         Ok(())
     }
 

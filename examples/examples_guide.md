@@ -40,11 +40,16 @@ uv run zippy stream ls --uri default
 3. 运行 `03_query/02_query_expressions_and_dataframe.py` 熟悉表达式过滤和格式转换。
 4. 用 `04_subscribe/` 里的脚本观察实时增量回调。
 5. 用 `05_engines/01_reactive_latest_session.py` 把上游表聚合成最新快照表。
-6. 用 `06_replay/01_parquet_replay_to_stream_table.py` 做不开盘环境下的回放测试。
-7. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
-8. 用 `06_replay/03_replay_to_reactive_latest_engine.py` 验证 replay stream 驱动下游 Engine。
-9. 用 `07_ops/01_table_observability.py` 查看 master 中的表状态。
-10. 用 `07_ops/02_table_perf_probe.py` 记录 `tail(n)` 延迟和可选 replay 吞吐。
+6. 用 `05_engines/03_named_stream_timeseries_session.py` 从 named StreamTable 直接生成 1m bar。
+7. 用 `05_engines/04_named_stream_cross_sectional_session.py` 从 named StreamTable 直接计算截面排名。
+8. 用 `06_replay/01_parquet_replay_to_stream_table.py` 做不开盘环境下的回放测试。
+9. 用 `06_replay/02_replay_parity_check.py` 比较 live persisted 数据和 replay 输出。
+10. 用 `06_replay/03_replay_to_reactive_latest_engine.py` 验证 replay stream 驱动下游 Engine。
+11. 用 `07_ops/01_table_observability.py` 查看 master 中的表状态。
+12. 用 `07_ops/02_table_perf_probe.py` 记录 `tail(n)` 延迟和可选 replay 吞吐。
+13. 用 `07_ops/03_subscribe_latency_probe.py` 记录 subscriber 行级延迟和 rollover 后首行延迟。
+14. 用 `07_ops/04_consumer_wait_for_table.py` 验证 consumer 先启动、producer 后注册表的场景。
+15. 用 `07_ops/05_table_health_check.py` 检查 stale stream、persist 失败等健康告警。
 
 ## API 分层
 
@@ -54,15 +59,21 @@ uv run zippy stream ls --uri default
 - `zp.Pipeline(...).stream_table(...)`：把一个 source 或手动写入的数据物化成 StreamTable。
 - `zp.Session(...).engine(...).stream_table(...).run()`：编排下游 Engine，并把输出注册成可查询表。
 - `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
-- `zp.list_tables()` / `zp.table_info("table_name")`：查看 master 中的表状态和元数据。
+  若监控或策略进程需要先于 producer 启动，可用
+  `zp.read_table("table_name", wait=True, timeout="30s")` 等待表注册。
+- `zp.read_table("table_name").info()` / `.health()` / `.alerts()`：查看单张表的低频诊断信息。
+- `zp.ops.list_tables()` / `zp.ops.table_info("table_name")`：查看 master 中的表状态和元数据。
+- `zp.ops.table_health("table_name")` / `zp.ops.table_alerts("table_name")`：基于 master
+  元数据汇总表健康状态和告警。
 - `zp.subscribe(...)`：按行接收 `zp.Row`。
 - `zp.subscribe_table(...)`：按批接收 `pyarrow.Table`。
+  这两个订阅接口也支持 `wait=True`，用于 consumer 先启动、producer 后注册 stream 的场景。
 - `zp.replay(...)`：把已持久化的 Zippy 表回放到 callback 或 named StreamTable。
   可用 `start` / `end` / `time_column` 做闭区间回放，用 `replay_rate` 指定固定
   rows/sec；下游需要先订阅时，使用 `zp.TableReplayEngine(...).init()` 建立输出流后再
   `run()`。
 - `zp.compare_replay(...)`：把 live persisted 数据和 replay 输出按 key 对齐比较。
-- `zp.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
+- `zp.ops.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
 
 `ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、`StreamTableEngine`、
 `SegmentStreamSource` 等底层对象仍然可以使用，但示例默认不直接暴露这些细节。

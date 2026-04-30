@@ -900,6 +900,11 @@ impl Registry {
                 process_id: process_id.to_string(),
             });
         }
+        let next_status = if writer_owner {
+            "writer_attached"
+        } else {
+            "registered"
+        };
 
         let (active_descriptor, sealed_segments) =
             split_active_segment_descriptor(stream_name, descriptor)?;
@@ -912,6 +917,7 @@ impl Registry {
         stream.active_segment_descriptor = Some(active_descriptor);
         stream.sealed_segments = sealed_segments;
         stream.descriptor_generation = stream.descriptor_generation.saturating_add(1);
+        stream.status = next_status.to_string();
         Ok(())
     }
 

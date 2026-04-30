@@ -3,12 +3,13 @@
 mod native_source_bridge;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::fs;
 use std::hint::spin_loop;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -64,7 +65,7 @@ use zippy_operators::{
 use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, PartitionHandle, RowSpanView,
-    SegmentCellValue, SegmentStore, SegmentStoreConfig,
+    SegmentCellValue, SegmentControlSnapshot, SegmentStore, SegmentStoreConfig,
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
@@ -2361,16 +2362,15 @@ impl Query {
         let segment_schema = self.segment_schema.clone();
         let master = Arc::clone(&self.master);
         let source = self.source.clone();
-        let active_committed_row_high_watermark = py
+        let active_segment_control = py
             .allow_threads(|| {
                 let _leases =
                     SegmentReaderLeaseSet::acquire_for_active(master, &source, &descriptor)?;
-                active_committed_row_high_watermark(&descriptor, segment_schema)
+                active_segment_control_snapshot(&descriptor, segment_schema)
             })
             .map_err(|error| py_runtime_error(error.to_string()))?;
-        let snapshot =
-            query_snapshot_value(&stream, descriptor, active_committed_row_high_watermark)
-                .map_err(|error| py_runtime_error(error.to_string()))?;
+        let snapshot = query_snapshot_value(&stream, descriptor, active_segment_control)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
         serde_json_value_to_py(py, &snapshot)
     }
 
@@ -2423,12 +2423,18 @@ fn ensure_stream_live_readable(stream: &StreamInfo) -> PyResult<()> {
 fn query_snapshot_value(
     stream: &StreamInfo,
     descriptor: serde_json::Value,
-    active_committed_row_high_watermark: usize,
+    active_segment_control: serde_json::Value,
 ) -> zippy_core::Result<serde_json::Value> {
     let mut active_segment_descriptor = descriptor;
     if let Some(object) = active_segment_descriptor.as_object_mut() {
         object.remove("sealed_segments");
     }
+    let active_committed_row_high_watermark = active_segment_control
+        .get("committed_row_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(ZippyError::InvalidState {
+            status: "active segment control missing committed_row_count",
+        })?;
 
     Ok(serde_json::json!({
         "stream_name": stream.stream_name,
@@ -2437,6 +2443,7 @@ fn query_snapshot_value(
         "data_path": stream.data_path,
         "descriptor_generation": stream.descriptor_generation,
         "active_segment_descriptor": active_segment_descriptor,
+        "active_segment_control": active_segment_control,
         "active_committed_row_high_watermark": active_committed_row_high_watermark,
         "sealed_segments": stream.sealed_segments.clone(),
         "persisted_files": stream.persisted_files.clone(),
@@ -2575,13 +2582,49 @@ fn active_committed_row_high_watermark(
         .map_err(segment_zippy_error)
 }
 
+fn active_segment_control_snapshot(
+    descriptor: &serde_json::Value,
+    segment_schema: CompiledSchema,
+) -> zippy_core::Result<serde_json::Value> {
+    let row_capacity = descriptor_row_capacity(descriptor)?;
+    let layout = LayoutPlan::for_schema(&segment_schema, row_capacity).map_err(|error| {
+        ZippyError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
+    let snapshot =
+        ActiveSegmentReader::from_descriptor_envelope(&descriptor_envelope, segment_schema, layout)
+            .map_err(segment_zippy_error)?
+            .control_snapshot()
+            .map_err(segment_zippy_error)?;
+    Ok(segment_control_snapshot_to_json(snapshot))
+}
+
+fn segment_control_snapshot_to_json(snapshot: SegmentControlSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "magic": snapshot.magic,
+        "layout_version": snapshot.layout_version,
+        "schema_id": snapshot.schema_id,
+        "segment_id": snapshot.segment_id,
+        "generation": snapshot.generation,
+        "capacity_rows": snapshot.capacity_rows,
+        "row_count": snapshot.row_count,
+        "committed_row_count": snapshot.committed_row_count,
+        "notify_seq": snapshot.notify_seq,
+        "sealed": snapshot.sealed,
+        "payload_offset": snapshot.payload_offset,
+        "committed_row_count_offset": snapshot.committed_row_count_offset,
+    })
+}
+
 fn concat_tail_batches(mut batches: Vec<RecordBatch>) -> zippy_core::Result<RecordBatch> {
     if batches.len() == 1 {
         return Ok(batches.remove(0));
     }
     let schema = batches
         .first()
-        .ok_or_else(|| ZippyError::InvalidState {
+        .ok_or(ZippyError::InvalidState {
             status: "tail produced no record batches",
         })?
         .schema();
@@ -2644,9 +2687,41 @@ const SEGMENT_DESCRIPTOR_WATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug)]
 struct DescriptorUpdate {
+    descriptor_generation: u64,
     text: String,
     descriptor: serde_json::Value,
 }
+
+#[derive(Default)]
+struct SubscriberMetrics {
+    rows_delivered_total: AtomicU64,
+    batches_delivered_total: AtomicU64,
+    descriptor_updates_total: AtomicU64,
+    current_descriptor_generation: AtomicU64,
+    last_descriptor_update_ns: AtomicU64,
+}
+
+impl SubscriberMetrics {
+    fn record_descriptor_update(&self, descriptor_generation: u64) {
+        self.descriptor_updates_total.fetch_add(1, Ordering::SeqCst);
+        self.current_descriptor_generation
+            .store(descriptor_generation, Ordering::SeqCst);
+        self.last_descriptor_update_ns
+            .store(current_localtime_ns() as u64, Ordering::SeqCst);
+    }
+
+    fn record_rows_delivered(&self, row_count: usize) {
+        self.rows_delivered_total
+            .fetch_add(row_count as u64, Ordering::SeqCst);
+    }
+
+    fn record_batch_delivered(&self, row_count: usize) {
+        self.batches_delivered_total.fetch_add(1, Ordering::SeqCst);
+        self.record_rows_delivered(row_count);
+    }
+}
+
+type SubscriberJoinHandle = Arc<Mutex<Option<JoinHandle<std::result::Result<(), String>>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubscriberReadOutcome {
@@ -2655,10 +2730,15 @@ enum SubscriberReadOutcome {
 }
 
 fn descriptor_update_from_value(
+    descriptor_generation: u64,
     descriptor: serde_json::Value,
 ) -> std::result::Result<DescriptorUpdate, String> {
     let text = serde_json::to_string(&descriptor).map_err(|error| error.to_string())?;
-    Ok(DescriptorUpdate { text, descriptor })
+    Ok(DescriptorUpdate {
+        descriptor_generation,
+        text,
+        descriptor,
+    })
 }
 
 fn take_descriptor_update_after_poll(
@@ -2709,6 +2789,122 @@ fn apply_segment_descriptor_update(
     Ok(())
 }
 
+enum SegmentReaderDriverEvent {
+    Rows(RowSpanView),
+    DescriptorUpdated(u64),
+    Idle,
+}
+
+impl fmt::Debug for SegmentReaderDriverEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rows(_) => formatter.write_str("Rows(..)"),
+            Self::DescriptorUpdated(generation) => formatter
+                .debug_tuple("DescriptorUpdated")
+                .field(generation)
+                .finish(),
+            Self::Idle => formatter.write_str("Idle"),
+        }
+    }
+}
+
+struct SegmentReaderDriver {
+    reader: ActiveSegmentReader,
+    descriptor_text: String,
+    reader_lease: Option<SegmentReaderLeaseGuard>,
+    segment_schema: CompiledSchema,
+    descriptor_updates: Arc<Mutex<Option<DescriptorUpdate>>>,
+    descriptor_refresh_error: Arc<Mutex<Option<String>>>,
+    xfast: bool,
+    idle_wait: Duration,
+}
+
+impl SegmentReaderDriver {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        reader: ActiveSegmentReader,
+        descriptor_text: String,
+        reader_lease: Option<SegmentReaderLeaseGuard>,
+        segment_schema: CompiledSchema,
+        descriptor_updates: Arc<Mutex<Option<DescriptorUpdate>>>,
+        descriptor_refresh_error: Arc<Mutex<Option<String>>>,
+        xfast: bool,
+        idle_wait: Duration,
+    ) -> Self {
+        Self {
+            reader,
+            descriptor_text,
+            reader_lease,
+            segment_schema,
+            descriptor_updates,
+            descriptor_refresh_error,
+            xfast,
+            idle_wait,
+        }
+    }
+
+    fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
+        if let Some(error) = take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref()) {
+            return Err(error);
+        }
+
+        let observed_notification_seq = self
+            .reader
+            .notification_sequence()
+            .map_err(|error| error.to_string())?;
+        match self
+            .reader
+            .read_available()
+            .map_err(|error| error.to_string())?
+        {
+            Some(span) => {
+                let _ = take_descriptor_update_after_poll(
+                    SubscriberReadOutcome::Rows,
+                    self.descriptor_updates.as_ref(),
+                    &self.descriptor_text,
+                );
+                Ok(SegmentReaderDriverEvent::Rows(span))
+            }
+            None => {
+                if let Some(update) = take_descriptor_update_after_poll(
+                    SubscriberReadOutcome::Empty,
+                    self.descriptor_updates.as_ref(),
+                    &self.descriptor_text,
+                ) {
+                    let descriptor_generation = update.descriptor_generation;
+                    apply_segment_descriptor_update(
+                        &mut self.reader,
+                        &mut self.descriptor_text,
+                        update,
+                        &self.segment_schema,
+                        self.reader_lease.as_mut(),
+                    )?;
+                    return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                        descriptor_generation,
+                    ));
+                }
+
+                if self.xfast {
+                    spin_loop();
+                } else {
+                    let _ = self
+                        .reader
+                        .wait_for_notification_after(observed_notification_seq, self.idle_wait)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(SegmentReaderDriverEvent::Idle)
+            }
+        }
+    }
+
+    fn finish(&self) -> std::result::Result<(), String> {
+        if let Some(error) = take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref()) {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 fn spawn_segment_descriptor_watcher(
     running: Arc<AtomicBool>,
     master: SharedMasterClient,
@@ -2735,7 +2931,7 @@ fn spawn_segment_descriptor_watcher(
             };
 
             descriptor_generation = update.descriptor_generation;
-            match descriptor_update_from_value(update.descriptor) {
+            match descriptor_update_from_value(update.descriptor_generation, update.descriptor) {
                 Ok(update) => {
                     *descriptor_updates.lock().unwrap() = Some(update);
                 }
@@ -2760,13 +2956,15 @@ struct StreamSubscriber {
     poll_interval: Duration,
     xfast: bool,
     running: Arc<AtomicBool>,
-    join_handle: Arc<Mutex<Option<JoinHandle<std::result::Result<(), String>>>>>,
+    metrics: Arc<SubscriberMetrics>,
+    join_handle: SubscriberJoinHandle,
 }
 
 #[pymethods]
 impl StreamSubscriber {
     #[new]
     #[pyo3(signature = (source, master, callback, poll_interval_ms=1, xfast=false, row_factory=None, instrument_ids=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         source: String,
@@ -2814,6 +3012,7 @@ impl StreamSubscriber {
             poll_interval: Duration::from_millis(poll_interval_ms),
             xfast,
             running: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(SubscriberMetrics::default()),
             join_handle: Arc::new(Mutex::new(None)),
         })
     }
@@ -2841,9 +3040,9 @@ impl StreamSubscriber {
                     self.source
                 ))
             })?;
-        let mut descriptor_text = serde_json::to_string(&descriptor)
+        let descriptor_text = serde_json::to_string(&descriptor)
             .map_err(|error| py_value_error(error.to_string()))?;
-        let mut reader_lease = py
+        let reader_lease = py
             .allow_threads(|| {
                 SegmentReaderLeaseGuard::acquire(
                     Arc::clone(&self.master),
@@ -2852,11 +3051,15 @@ impl StreamSubscriber {
                 )
             })
             .map_err(|error| py_runtime_error(error.to_string()))?;
-        let mut reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)
+        let reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)
             .map_err(|error| py_runtime_error(error.to_string()))?;
 
+        self.metrics
+            .current_descriptor_generation
+            .store(stream.descriptor_generation, Ordering::SeqCst);
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let metrics = Arc::clone(&self.metrics);
         let master = Arc::clone(&self.master);
         let source = self.source.clone();
         let segment_schema = self.segment_schema.clone();
@@ -2881,66 +3084,45 @@ impl StreamSubscriber {
                 Arc::clone(&descriptor_refresh_error),
             );
 
+            let mut driver = SegmentReaderDriver::new(
+                reader,
+                descriptor_text,
+                Some(reader_lease),
+                segment_schema,
+                Arc::clone(&descriptor_updates),
+                Arc::clone(&descriptor_refresh_error),
+                xfast,
+                poll_interval,
+            );
+
             let result = (|| -> std::result::Result<(), String> {
                 while running.load(Ordering::SeqCst) {
-                    if let Some(error) =
-                        take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
-                    {
-                        return Err(error);
-                    }
-
-                    match reader.read_available().map_err(|error| error.to_string())? {
-                        Some(span) => {
-                            let _ = take_descriptor_update_after_poll(
-                                SubscriberReadOutcome::Rows,
-                                descriptor_updates.as_ref(),
-                                &descriptor_text,
-                            );
+                    match driver.poll_next()? {
+                        SegmentReaderDriverEvent::Rows(span) => {
                             if let Some(row_factory) = row_factory.as_ref() {
-                                invoke_stream_row_callbacks(
+                                let delivered_rows = invoke_stream_row_callbacks(
                                     &callback,
                                     row_factory,
                                     span,
                                     instrument_filter.as_ref(),
                                 )?;
+                                metrics.record_rows_delivered(delivered_rows);
                             } else {
                                 let batch =
                                     span.as_record_batch().map_err(|error| error.to_string())?;
+                                let row_count = batch.num_rows();
                                 invoke_stream_callback(&callback, batch)?;
+                                metrics.record_batch_delivered(row_count);
                             }
                         }
-                        None => {
-                            if let Some(update) = take_descriptor_update_after_poll(
-                                SubscriberReadOutcome::Empty,
-                                descriptor_updates.as_ref(),
-                                &descriptor_text,
-                            ) {
-                                apply_segment_descriptor_update(
-                                    &mut reader,
-                                    &mut descriptor_text,
-                                    update,
-                                    &segment_schema,
-                                    Some(&mut reader_lease),
-                                )
-                                .map_err(|error| error.to_string())?;
-                                continue;
-                            }
-
-                            if xfast {
-                                spin_loop();
-                            } else {
-                                thread::sleep(poll_interval);
-                            }
+                        SegmentReaderDriverEvent::DescriptorUpdated(descriptor_generation) => {
+                            metrics.record_descriptor_update(descriptor_generation);
                         }
+                        SegmentReaderDriverEvent::Idle => {}
                     }
                 }
 
-                if let Some(error) =
-                    take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
-                {
-                    return Err(error);
-                }
-                Ok(())
+                driver.finish()
             })();
 
             running.store(false, Ordering::SeqCst);
@@ -2966,6 +3148,37 @@ impl StreamSubscriber {
         }
         Ok(())
     }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("source", &self.source)?;
+        dict.set_item("running", self.running.load(Ordering::SeqCst))?;
+        dict.set_item(
+            "rows_delivered_total",
+            self.metrics.rows_delivered_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "batches_delivered_total",
+            self.metrics.batches_delivered_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "descriptor_updates_total",
+            self.metrics.descriptor_updates_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "current_descriptor_generation",
+            self.metrics
+                .current_descriptor_generation
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "last_descriptor_update_ns",
+            self.metrics
+                .last_descriptor_update_ns
+                .load(Ordering::SeqCst),
+        )?;
+        Ok(dict.into_py(py))
+    }
 }
 
 fn invoke_stream_callback(
@@ -2985,8 +3198,9 @@ fn invoke_stream_row_callbacks(
     row_factory: &Py<PyAny>,
     span: RowSpanView,
     instrument_filter: Option<&BTreeSet<String>>,
-) -> std::result::Result<(), String> {
-    Python::with_gil(|py| -> PyResult<()> {
+) -> std::result::Result<usize, String> {
+    Python::with_gil(|py| -> PyResult<usize> {
+        let mut delivered_rows = 0usize;
         for row_index in 0..span.row_count() {
             if !row_matches_instrument_filter(&span, row_index, instrument_filter)? {
                 continue;
@@ -2994,8 +3208,9 @@ fn invoke_stream_row_callbacks(
             let values = row_span_row_to_pydict(py, &span, row_index)?;
             let row = row_factory.call1(py, (values,))?;
             callback.call1(py, (row,))?;
+            delivered_rows += 1;
         }
-        Ok(())
+        Ok(delivered_rows)
     })
     .map_err(|error| error.to_string())
 }
@@ -3493,8 +3708,8 @@ impl Source for SegmentSourceBridge {
             .ok_or(ZippyError::InvalidState {
                 status: "segment descriptor is not published",
             })?;
-        let mut descriptor_text = serde_json::to_string(&descriptor).map_err(json_zippy_error)?;
-        let mut reader_lease = SegmentReaderLeaseGuard::acquire(
+        let descriptor_text = serde_json::to_string(&descriptor).map_err(json_zippy_error)?;
+        let reader_lease = SegmentReaderLeaseGuard::acquire(
             Arc::clone(&self.master),
             self.stream_name.clone(),
             &descriptor,
@@ -3524,55 +3739,29 @@ impl Source for SegmentSourceBridge {
                 Arc::clone(&descriptor_refresh_error),
             );
 
+            let mut driver = SegmentReaderDriver::new(
+                reader,
+                descriptor_text,
+                Some(reader_lease),
+                segment_schema,
+                Arc::clone(&descriptor_updates),
+                Arc::clone(&descriptor_refresh_error),
+                xfast,
+                Duration::from_millis(1),
+            );
+
             let result = (|| -> zippy_core::Result<()> {
                 while running_flag.load(Ordering::SeqCst) {
-                    if let Some(error) =
-                        take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
-                    {
-                        return Err(string_zippy_error(error));
-                    }
-
-                    match reader.read_available().map_err(segment_zippy_error)? {
-                        Some(span) => {
-                            let _ = take_descriptor_update_after_poll(
-                                SubscriberReadOutcome::Rows,
-                                descriptor_updates.as_ref(),
-                                &descriptor_text,
-                            );
+                    match driver.poll_next().map_err(string_zippy_error)? {
+                        SegmentReaderDriverEvent::Rows(span) => {
                             sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
                         }
-                        None => {
-                            if let Some(update) = take_descriptor_update_after_poll(
-                                SubscriberReadOutcome::Empty,
-                                descriptor_updates.as_ref(),
-                                &descriptor_text,
-                            ) {
-                                apply_segment_descriptor_update(
-                                    &mut reader,
-                                    &mut descriptor_text,
-                                    update,
-                                    &segment_schema,
-                                    Some(&mut reader_lease),
-                                )
-                                .map_err(string_zippy_error)?;
-                                continue;
-                            }
-
-                            if xfast {
-                                spin_loop();
-                            } else {
-                                thread::sleep(Duration::from_micros(10));
-                            }
-                        }
+                        SegmentReaderDriverEvent::DescriptorUpdated(_) => {}
+                        SegmentReaderDriverEvent::Idle => {}
                     }
                 }
 
-                if let Some(error) =
-                    take_descriptor_refresh_error(descriptor_refresh_error.as_ref())
-                {
-                    return Err(string_zippy_error(error));
-                }
-                Ok(())
+                driver.finish().map_err(string_zippy_error)
             })();
 
             running_flag.store(false, Ordering::SeqCst);
@@ -3746,6 +3935,7 @@ struct CrossSectionalEngine {
     handle: SharedHandle,
     engine: Option<RustCrossSectionalEngine>,
     remote_source: Option<RemoteSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
     downstreams: Vec<DownstreamLink>,
     _source_owner: Option<Py<PyAny>>,
 }
@@ -3797,7 +3987,7 @@ struct KeyValueTableMaterializer {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -3807,6 +3997,7 @@ impl ReactiveStateEngine {
         target: &Bound<'_, PyAny>,
         id_filter: Option<&Bound<'_, PyAny>>,
         source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
@@ -3842,7 +4033,9 @@ impl ReactiveStateEngine {
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
         let (source_owner, remote_source, bus_source, segment_source, python_source) =
             register_source(
+                py,
                 source,
+                master,
                 DownstreamLink {
                     handle: Arc::clone(&handle),
                     archive: Arc::clone(&archive),
@@ -3852,6 +4045,7 @@ impl ReactiveStateEngine {
                         .unwrap_or(false),
                 },
                 schema.as_ref(),
+                xfast,
             )?;
 
         Ok(Self {
@@ -3935,7 +4129,13 @@ impl ReactiveStateEngine {
             &self.target,
             &self.parquet_sink,
             &self.runtime_options,
-            self._source_owner.is_some(),
+            engine_has_source(
+                &self._source_owner,
+                &self.remote_source,
+                &self.bus_source,
+                &self.segment_source,
+                &self.python_source,
+            ),
         )?;
         dict.set_item("id_column", &self.id_column)?;
         dict.set_item("id_filter", self.id_filter.clone())?;
@@ -4027,7 +4227,9 @@ impl ReactiveLatestEngine {
                 (None, None, None, Some(segment_source), None)
             } else {
                 register_source(
+                    py,
                     source,
+                    master,
                     DownstreamLink {
                         handle: Arc::clone(&handle),
                         archive: Arc::clone(&archive),
@@ -4037,6 +4239,7 @@ impl ReactiveLatestEngine {
                             .unwrap_or(false),
                     },
                     schema.as_ref(),
+                    xfast,
                 )?
             };
 
@@ -4120,11 +4323,13 @@ impl ReactiveLatestEngine {
             &self.target,
             &self.parquet_sink,
             &self.runtime_options,
-            self._source_owner.is_some()
-                || self.remote_source.is_some()
-                || self.bus_source.is_some()
-                || self.segment_source.is_some()
-                || self.python_source.is_some(),
+            engine_has_source(
+                &self._source_owner,
+                &self.remote_source,
+                &self.bus_source,
+                &self.segment_source,
+                &self.python_source,
+            ),
         )?;
         dict.set_item("by", self.by.clone())?;
         if let Some(source) = self.segment_source.as_ref() {
@@ -4150,13 +4355,14 @@ impl ReactiveLatestEngine {
 impl StreamTableEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None))]
     fn new(
         py: Python<'_>,
         name: String,
         input_schema: &Bound<'_, PyAny>,
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
         sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
@@ -4249,7 +4455,9 @@ impl StreamTableEngine {
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
         let (source_owner, remote_source, bus_source, segment_source, python_source) =
             register_source(
+                py,
                 source,
+                master,
                 DownstreamLink {
                     handle: Arc::clone(&handle),
                     archive: Arc::clone(&archive),
@@ -4259,6 +4467,7 @@ impl StreamTableEngine {
                         .unwrap_or(false),
                 },
                 schema.as_ref(),
+                xfast,
             )?;
 
         Ok(Self {
@@ -4340,7 +4549,13 @@ impl StreamTableEngine {
             &self.target,
             &self.parquet_sink,
             &self.runtime_options,
-            self._source_owner.is_some(),
+            engine_has_source(
+                &self._source_owner,
+                &self.remote_source,
+                &self.bus_source,
+                &self.segment_source,
+                &self.python_source,
+            ),
         )?;
         dict.del_item("parquet_sink")?;
         dict.set_item("sink", parquet_sink_to_pyobject(py, &self.parquet_sink)?)?;
@@ -4378,7 +4593,7 @@ impl StreamTableEngine {
 impl KeyValueTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, by, target, *, source=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_guard=None, replacement_retention_snapshots=None))]
+    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_guard=None, replacement_retention_snapshots=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4386,6 +4601,7 @@ impl KeyValueTableMaterializer {
         by: &Bound<'_, PyAny>,
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
         sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
@@ -4454,7 +4670,9 @@ impl KeyValueTableMaterializer {
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
         let (source_owner, remote_source, bus_source, segment_source, python_source) =
             register_source(
+                py,
                 source,
+                master,
                 DownstreamLink {
                     handle: Arc::clone(&handle),
                     archive: Arc::clone(&archive),
@@ -4464,6 +4682,7 @@ impl KeyValueTableMaterializer {
                         .unwrap_or(false),
                 },
                 schema.as_ref(),
+                xfast,
             )?;
 
         Ok(Self {
@@ -4546,7 +4765,13 @@ impl KeyValueTableMaterializer {
             &self.target,
             &self.parquet_sink,
             &self.runtime_options,
-            self._source_owner.is_some(),
+            engine_has_source(
+                &self._source_owner,
+                &self.remote_source,
+                &self.bus_source,
+                &self.segment_source,
+                &self.python_source,
+            ),
         )?;
         dict.del_item("parquet_sink")?;
         dict.set_item("sink", parquet_sink_to_pyobject(py, &self.parquet_sink)?)?;
@@ -4585,7 +4810,7 @@ impl KeyValueTableMaterializer {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4602,6 +4827,7 @@ impl TimeSeriesEngine {
         post_factors: Option<Vec<Py<PyAny>>>,
         id_filter: Option<&Bound<'_, PyAny>>,
         source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
@@ -4654,7 +4880,9 @@ impl TimeSeriesEngine {
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
         let (source_owner, remote_source, bus_source, segment_source, python_source) =
             register_source(
+                py,
                 source,
+                master,
                 DownstreamLink {
                     handle: Arc::clone(&handle),
                     archive: Arc::clone(&archive),
@@ -4664,6 +4892,7 @@ impl TimeSeriesEngine {
                         .unwrap_or(false),
                 },
                 schema.as_ref(),
+                xfast,
             )?;
 
         Ok(Self {
@@ -4750,7 +4979,13 @@ impl TimeSeriesEngine {
             &self.target,
             &self.parquet_sink,
             &self.runtime_options,
-            self._source_owner.is_some(),
+            engine_has_source(
+                &self._source_owner,
+                &self.remote_source,
+                &self.bus_source,
+                &self.segment_source,
+                &self.python_source,
+            ),
         )?;
         dict.set_item("id_column", &self.id_column)?;
         dict.set_item("id_filter", self.id_filter.clone())?;
@@ -4777,7 +5012,7 @@ impl TimeSeriesEngine {
 impl CrossSectionalEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4789,6 +5024,7 @@ impl CrossSectionalEngine {
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
@@ -4836,8 +5072,10 @@ impl CrossSectionalEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source) = register_timeseries_source(
+        let (source_owner, remote_source, segment_source) = register_timeseries_source(
+            py,
             source,
+            master,
             DownstreamLink {
                 handle: Arc::clone(&handle),
                 archive: Arc::clone(&archive),
@@ -4847,6 +5085,7 @@ impl CrossSectionalEngine {
                     .unwrap_or(false),
             },
             schema.as_ref(),
+            xfast,
         )?;
 
         Ok(Self {
@@ -4866,6 +5105,7 @@ impl CrossSectionalEngine {
             handle,
             engine: Some(engine),
             remote_source,
+            segment_source,
             downstreams: Vec::new(),
             _source_owner: source_owner,
         })
@@ -4879,7 +5119,7 @@ impl CrossSectionalEngine {
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
             None,
-            None,
+            self.segment_source.as_ref(),
             None,
             &self.downstreams,
             &mut self.engine,
@@ -4929,7 +5169,9 @@ impl CrossSectionalEngine {
             &self.target,
             &self.parquet_sink,
             &self.runtime_options,
-            self._source_owner.is_some(),
+            self._source_owner.is_some()
+                || self.remote_source.is_some()
+                || self.segment_source.is_some(),
         )?;
         dict.set_item("id_column", &self.id_column)?;
         dict.set_item("dt_column", &self.dt_column)?;
@@ -5289,13 +5531,27 @@ fn segment_source_config_from_named_stream(
 }
 
 fn register_source(
+    py: Python<'_>,
     source: Option<&Bound<'_, PyAny>>,
+    master: Option<&Bound<'_, PyAny>>,
     downstream: DownstreamLink,
     input_schema: &Schema,
+    xfast: bool,
 ) -> PyResult<RegisteredSource> {
     let Some(source) = source else {
         return Ok((None, None, None, None, None));
     };
+
+    if let Ok(stream_name) = source.extract::<String>() {
+        let (_, segment_source) = segment_source_config_from_named_stream(
+            py,
+            &stream_name,
+            master,
+            Some(input_schema),
+            xfast,
+        )?;
+        return Ok((None, None, None, Some(segment_source), None));
+    }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
         if engine.engine.is_none() {
@@ -5358,6 +5614,21 @@ fn register_source(
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream);
+        return Ok((Some(source.clone().unbind()), None, None, None, None));
+    }
+
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, CrossSectionalEngine>>() {
         if engine.engine.is_none() {
             return Err(py_runtime_error(
                 "source engine must be linked before it is started",
@@ -5477,18 +5748,36 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableEngine, KeyValueTableMaterializer, TimeSeriesEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableEngine, KeyValueTableMaterializer, TimeSeriesEngine, CrossSectionalEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
 fn register_timeseries_source(
+    py: Python<'_>,
     source: Option<&Bound<'_, PyAny>>,
+    master: Option<&Bound<'_, PyAny>>,
     downstream: DownstreamLink,
     input_schema: &Schema,
-) -> PyResult<(Option<Py<PyAny>>, Option<RemoteSourceConfig>)> {
+    xfast: bool,
+) -> PyResult<(
+    SourceOwner,
+    Option<RemoteSourceConfig>,
+    Option<SegmentSourceConfig>,
+)> {
     let Some(source) = source else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
+
+    if let Ok(stream_name) = source.extract::<String>() {
+        let (_, segment_source) = segment_source_config_from_named_stream(
+            py,
+            &stream_name,
+            master,
+            Some(input_schema),
+            xfast,
+        )?;
+        return Ok((None, None, Some(segment_source)));
+    }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
         if engine.engine.is_none() {
@@ -5502,7 +5791,7 @@ fn register_timeseries_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok((Some(source.clone().unbind()), None));
+        return Ok((Some(source.clone().unbind()), None, None));
     }
 
     if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
@@ -5519,11 +5808,12 @@ fn register_timeseries_source(
                 expected_schema: remote_source.expected_schema.clone(),
                 mode: remote_source.mode,
             }),
+            None,
         ));
     }
 
     Err(PyTypeError::new_err(
-        "source must be TimeSeriesEngine or ZmqSource for CrossSectionalEngine",
+        "source must be a named segment stream, TimeSeriesEngine, or ZmqSource for CrossSectionalEngine",
     ))
 }
 
@@ -6051,6 +6341,20 @@ fn engine_base_config_dict<'py>(
     dict.set_item("targets", target_configs_to_pylist(py, targets)?)?;
     dict.set_item("parquet_sink", parquet_sink_to_pyobject(py, parquet_sink)?)?;
     Ok(dict)
+}
+
+fn engine_has_source(
+    source_owner: &SourceOwner,
+    remote_source: &Option<RemoteSourceConfig>,
+    bus_source: &Option<BusSourceConfig>,
+    segment_source: &Option<SegmentSourceConfig>,
+    python_source: &Option<PythonSourceConfig>,
+) -> bool {
+    source_owner.is_some()
+        || remote_source.is_some()
+        || bus_source.is_some()
+        || segment_source.is_some()
+        || python_source.is_some()
 }
 
 fn target_configs_to_pylist(py: Python<'_>, targets: &[TargetConfig]) -> PyResult<PyObject> {
@@ -6654,6 +6958,7 @@ mod tests {
     #[test]
     fn descriptor_update_slot_is_consumed_only_after_empty_segment_poll() {
         let descriptor_updates = Mutex::new(Some(DescriptorUpdate {
+            descriptor_generation: 2,
             text: "next".to_string(),
             descriptor: serde_json::json!({"generation": 2}),
         }));
@@ -6680,6 +6985,83 @@ mod tests {
     #[test]
     fn descriptor_watcher_uses_long_poll_timeout_instead_of_hot_polling() {
         assert!(SEGMENT_DESCRIPTOR_WATCH_TIMEOUT >= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn segment_reader_driver_switches_descriptor_only_after_draining_current_rows() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema("ticks", "current", schema.clone())
+            .unwrap();
+        current_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2606")?;
+                row.write_f64("last_price", 4102.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let current_descriptor: serde_json::Value = serde_json::from_slice(
+            &current_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let next_partition = store
+            .open_partition_with_schema("ticks", "next", schema.clone())
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let next_descriptor: serde_json::Value =
+            serde_json::from_slice(&next_partition.active_descriptor_envelope_bytes().unwrap())
+                .unwrap();
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(Mutex::new(Some(
+            descriptor_update_from_value(2, next_descriptor).unwrap(),
+        )));
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            reader,
+            serde_json::to_string(&current_descriptor).unwrap(),
+            None,
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected current rows before descriptor switch got [{other:?}]"),
+        }
+        assert!(descriptor_updates.lock().unwrap().is_some());
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 2),
+            other => panic!("expected descriptor update after current rows got [{other:?}]"),
+        }
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected rows from next descriptor got [{other:?}]"),
+        }
     }
 
     #[test]
@@ -6840,12 +7222,21 @@ mod tests {
             "generation": 2
         });
 
-        let snapshot = query_snapshot_value(&stream, descriptor, 11).unwrap();
+        let active_segment_control = serde_json::json!({
+            "committed_row_count": 11,
+            "segment_id": 3,
+            "generation": 2,
+        });
+        let snapshot = query_snapshot_value(&stream, descriptor, active_segment_control).unwrap();
 
         assert_eq!(snapshot["stream_name"], "ticks");
         assert_eq!(snapshot["schema_hash"], "schema_hash");
         assert_eq!(snapshot["descriptor_generation"], 7);
         assert_eq!(snapshot["active_committed_row_high_watermark"], 11);
+        assert_eq!(
+            snapshot["active_segment_control"]["committed_row_count"],
+            11
+        );
         assert_eq!(snapshot["active_segment_descriptor"]["segment_id"], 3);
         assert!(snapshot["active_segment_descriptor"]
             .get("sealed_segments")

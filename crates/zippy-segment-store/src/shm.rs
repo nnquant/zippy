@@ -3,7 +3,7 @@ use std::{
     fs::{self, File, OpenOptions},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -82,6 +82,11 @@ impl ShmRegion {
         self.inner.len()
     }
 
+    /// 返回该 region 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// 从指定偏移读取字节。
     pub fn read_at(
         &self,
@@ -133,6 +138,99 @@ impl ShmRegion {
         Ok(atomic.load(Ordering::Acquire))
     }
 
+    /// 以 release 语义向共享内存中的 4 字节对齐位置写入 `u32`。
+    pub fn store_u32_release(
+        &self,
+        offset: usize,
+        value: u32,
+    ) -> Result<(), ZippySegmentStoreError> {
+        self.checked_atomic_u32_offset(offset)?;
+        // SAFETY:
+        // - `checked_atomic_u32_offset` 保证该地址在 mapping 内且满足 `AtomicU32` 对齐。
+        let atomic = unsafe { &*(self.inner.as_ptr().add(offset).cast::<AtomicU32>()) };
+        atomic.store(value, Ordering::Release);
+        Ok(())
+    }
+
+    /// 以 acquire 语义从共享内存中的 4 字节对齐位置读取 `u32`。
+    pub fn load_u32_acquire(&self, offset: usize) -> Result<u32, ZippySegmentStoreError> {
+        self.checked_atomic_u32_offset(offset)?;
+        // SAFETY:
+        // - `checked_atomic_u32_offset` 保证该地址在 mapping 内且满足 `AtomicU32` 对齐。
+        let atomic = unsafe { &*(self.inner.as_ptr().add(offset).cast::<AtomicU32>()) };
+        Ok(atomic.load(Ordering::Acquire))
+    }
+
+    /// 以 release 语义递增共享内存中的 `u32`。
+    pub fn fetch_add_u32_release(
+        &self,
+        offset: usize,
+        value: u32,
+    ) -> Result<u32, ZippySegmentStoreError> {
+        self.checked_atomic_u32_offset(offset)?;
+        // SAFETY:
+        // - `checked_atomic_u32_offset` 保证该地址在 mapping 内且满足 `AtomicU32` 对齐。
+        let atomic = unsafe { &*(self.inner.as_ptr().add(offset).cast::<AtomicU32>()) };
+        Ok(atomic.fetch_add(value, Ordering::Release))
+    }
+
+    /// 在 Linux futex 上等待共享 `u32` 发生变化。
+    pub fn wait_u32_changed(
+        &self,
+        offset: usize,
+        observed: u32,
+        timeout: std::time::Duration,
+    ) -> Result<bool, ZippySegmentStoreError> {
+        self.checked_atomic_u32_offset(offset)?;
+        if self.load_u32_acquire(offset)? != observed {
+            return Ok(true);
+        }
+
+        let timeout = duration_to_timespec(timeout)?;
+        let ptr = unsafe { self.inner.as_ptr().add(offset).cast::<libc::c_int>() };
+        let observed = i32::from_ne_bytes(observed.to_ne_bytes());
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                ptr,
+                libc::FUTEX_WAIT,
+                observed,
+                &timeout as *const libc::timespec,
+            )
+        };
+        if result == 0 {
+            return Ok(true);
+        }
+
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ETIMEDOUT) => Ok(false),
+            Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(true),
+            _ => Err(ZippySegmentStoreError::Shmem(format!(
+                "failed to wait on shared memory futex error=[{}]",
+                error
+            ))),
+        }
+    }
+
+    /// 唤醒等待共享 `u32` 的 Linux futex reader。
+    pub fn wake_u32(&self, offset: usize) -> Result<usize, ZippySegmentStoreError> {
+        self.checked_atomic_u32_offset(offset)?;
+        let ptr = unsafe { self.inner.as_ptr().add(offset).cast::<libc::c_int>() };
+        let result =
+            unsafe { libc::syscall(libc::SYS_futex, ptr, libc::FUTEX_WAKE, libc::c_int::MAX) };
+        if result >= 0 {
+            return usize::try_from(result).map_err(|_| {
+                ZippySegmentStoreError::Shmem("futex wake result overflows usize".to_string())
+            });
+        }
+
+        Err(ZippySegmentStoreError::Shmem(format!(
+            "failed to wake shared memory futex error=[{}]",
+            std::io::Error::last_os_error()
+        )))
+    }
+
     fn checked_range(&self, offset: usize, len: usize) -> Result<(), ZippySegmentStoreError> {
         let end = offset.checked_add(len).ok_or_else(|| {
             ZippySegmentStoreError::Shmem("shared memory range overflow".to_string())
@@ -156,6 +254,27 @@ impl ShmRegion {
         }
         Ok(())
     }
+
+    fn checked_atomic_u32_offset(&self, offset: usize) -> Result<(), ZippySegmentStoreError> {
+        self.checked_range(offset, std::mem::size_of::<u32>())?;
+        if offset % std::mem::align_of::<AtomicU32>() != 0 {
+            return Err(ZippySegmentStoreError::Shmem(format!(
+                "shared memory atomic u32 offset is not aligned offset=[{offset}] align=[{}]",
+                std::mem::align_of::<AtomicU32>()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn duration_to_timespec(
+    timeout: std::time::Duration,
+) -> Result<libc::timespec, ZippySegmentStoreError> {
+    let tv_sec = libc::time_t::try_from(timeout.as_secs()).map_err(|_| {
+        ZippySegmentStoreError::Shmem("futex timeout seconds overflow time_t".to_string())
+    })?;
+    let tv_nsec = libc::c_long::from(timeout.subsec_nanos());
+    Ok(libc::timespec { tv_sec, tv_nsec })
 }
 
 const FILE_OS_ID_PREFIX: &str = "file:";

@@ -26,7 +26,9 @@ pub use persistence::{
     PersistenceWorkerShutdownReport,
 };
 pub use schema::{compile_schema, ColumnSpec, ColumnType, CompiledSchema};
-pub use segment::{ActiveSegmentDescriptor, SealedSegmentHandle, SegmentHeader};
+pub use segment::{
+    ActiveSegmentDescriptor, SealedSegmentHandle, SegmentControlSnapshot, SegmentHeader,
+};
 pub use shm::ShmRegion;
 pub use view::{RowSpanView, SegmentCellValue};
 

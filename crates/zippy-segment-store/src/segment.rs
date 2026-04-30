@@ -14,9 +14,27 @@ pub(crate) const SHM_CAPACITY_ROWS_OFFSET: usize = 24;
 pub(crate) const SHM_ROW_COUNT_OFFSET: usize = 32;
 pub(crate) const SHM_COMMITTED_ROW_COUNT_OFFSET: usize = 40;
 pub(crate) const SHM_SEALED_OFFSET: usize = 48;
+pub(crate) const SHM_NOTIFY_SEQ_OFFSET: usize = 52;
 pub(crate) const SHM_MAGIC_OFFSET: usize = 56;
 pub(crate) const SHM_LAYOUT_VERSION_OFFSET: usize = 60;
 pub(crate) const SHM_PAYLOAD_OFFSET: usize = 64;
+
+/// Active segment mmap header 的只读快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentControlSnapshot {
+    pub magic: u32,
+    pub layout_version: u32,
+    pub schema_id: u64,
+    pub segment_id: u64,
+    pub generation: u64,
+    pub capacity_rows: usize,
+    pub row_count: usize,
+    pub committed_row_count: usize,
+    pub notify_seq: u32,
+    pub sealed: bool,
+    pub payload_offset: usize,
+    pub committed_row_count_offset: usize,
+}
 
 /// Active segment 头部元数据。
 #[derive(Debug)]

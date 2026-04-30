@@ -77,7 +77,7 @@ def main() -> None:
 
     if args.drop_existing:
         try:
-            zp.drop_table(args.table, drop_persisted=True)
+            zp.ops.drop_table(args.table, drop_persisted=True)
         except RuntimeError:
             # 表不存在时忽略，示例脚本保持可重复运行。
             pass
@@ -103,4 +103,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

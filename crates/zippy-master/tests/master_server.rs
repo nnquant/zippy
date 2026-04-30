@@ -149,6 +149,10 @@ fn registry_register_source_rebinds_same_definition_to_new_process() {
         .unwrap();
     registry.force_expire_process(&old_process_id).unwrap();
     registry.mark_records_lost_for_process(&old_process_id);
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().status,
+        "stale"
+    );
 
     registry
         .register_source(
@@ -164,6 +168,29 @@ fn registry_register_source_rebinds_same_definition_to_new_process() {
     assert_eq!(registry.sources_len(), 1);
     assert_eq!(source.process_id, new_process_id);
     assert_eq!(source.status, "registered");
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().status,
+        "stale"
+    );
+
+    let descriptor = serde_json::json!({
+        "magic": "zippy.segment.active",
+        "version": 1,
+        "schema_id": 7,
+        "row_capacity": 64,
+        "shm_os_id": "/tmp/zippy-segment-restarted",
+        "payload_offset": 64,
+        "committed_row_count_offset": 40,
+        "segment_id": 1,
+        "generation": 0,
+    });
+    registry
+        .publish_segment_descriptor("openctp_ticks", &new_process_id, descriptor)
+        .unwrap();
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().status,
+        "registered"
+    );
 }
 
 #[test]
