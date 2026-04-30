@@ -2304,6 +2304,7 @@ impl Query {
         let stream = py
             .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
             .map_err(|error| py_runtime_error(error.to_string()))?;
+        ensure_stream_live_readable(&stream)?;
         let Some(descriptor) = stream.active_segment_descriptor.clone() else {
             return Err(py_runtime_error(format!(
                 "segment descriptor is not published source=[{}]",
@@ -2350,6 +2351,7 @@ impl Query {
         let stream = py
             .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
             .map_err(|error| py_runtime_error(error.to_string()))?;
+        ensure_stream_live_readable(&stream)?;
         let Some(descriptor) = stream.active_segment_descriptor.clone() else {
             return Err(py_runtime_error(format!(
                 "segment descriptor is not published source=[{}]",
@@ -2376,6 +2378,7 @@ impl Query {
         let stream = py
             .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
             .map_err(|error| py_runtime_error(error.to_string()))?;
+        ensure_stream_live_readable(&stream)?;
         let Some(descriptor) = stream.active_segment_descriptor.clone() else {
             return Err(py_runtime_error(format!(
                 "segment descriptor is not published source=[{}]",
@@ -2405,6 +2408,16 @@ impl Query {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         record_batches_to_pyarrow_record_batch_reader(py, self.schema.as_ref(), batches)
     }
+}
+
+fn ensure_stream_live_readable(stream: &StreamInfo) -> PyResult<()> {
+    if stream.status == "stale" {
+        return Err(py_runtime_error(format!(
+            "stream is stale source=[{}] status=[{}]",
+            stream.stream_name, stream.status
+        )));
+    }
+    Ok(())
 }
 
 fn query_snapshot_value(

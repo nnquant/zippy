@@ -1614,6 +1614,16 @@ master 标记 stream STALE；
 reader 查询或订阅时得到明确状态。
 ```
 
+当前进展：
+
+- 已完成 `test_stream_table_e2e_writer_expiration_marks_stream_stale_and_blocks_live_reads`：
+  - 覆盖 segment descriptor writer process lease 过期后，master 将 source 标记为
+    `lost`，并将对应 output stream 标记为 `stale`。
+  - stale stream 保留最后的 active segment descriptor 作为诊断信息，但 live query
+    不再继续 attach 旧 descriptor。
+  - `read_table(...).tail()` 在 stale 状态下返回明确的 `stream is stale` 错误，
+    避免退化成底层 mmap 缺失或读到过期数据。
+
 #### 17.6 Persist failure
 
 ```text

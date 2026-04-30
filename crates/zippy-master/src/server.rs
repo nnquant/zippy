@@ -1629,6 +1629,9 @@ impl MasterServer {
                 registry
                     .detach_writer(&stream_name)
                     .map_err(registry_error)?;
+                registry
+                    .set_stream_status(&stream_name, "stale")
+                    .map_err(registry_error)?;
             }
 
             let stale_readers = registry.readers_for_process(process_id);
@@ -1708,6 +1711,9 @@ impl MasterServer {
                 }
                 registry
                     .detach_writer(&stream_name)
+                    .map_err(registry_error)?;
+                registry
+                    .set_stream_status(&stream_name, "stale")
                     .map_err(registry_error)?;
                 tracing::info!(
                     component = "master",

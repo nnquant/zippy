@@ -1343,9 +1343,16 @@ impl Registry {
     }
 
     pub fn mark_records_lost_for_process(&mut self, process_id: &str) {
+        let mut lost_output_streams = Vec::new();
         for source in self.sources.values_mut() {
             if source.process_id == process_id {
                 source.status = "lost".to_string();
+                lost_output_streams.push(source.output_stream.clone());
+            }
+        }
+        for stream_name in lost_output_streams {
+            if let Some(stream) = self.streams.get_mut(&stream_name) {
+                stream.status = "stale".to_string();
             }
         }
         for engine in self.engines.values_mut() {

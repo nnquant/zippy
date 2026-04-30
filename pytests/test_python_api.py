@@ -4982,6 +4982,15 @@ def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
     return server, control_endpoint
 
 
+def expire_process_for_test(control_endpoint: str, process_id: str) -> dict[str, object]:
+    request = json.dumps({"ExpireProcessForTest": {"process_id": process_id}}) + "\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(control_endpoint)
+        client.sendall(request.encode("utf-8"))
+        response = client.makefile("r", encoding="utf-8").readline()
+    return json.loads(response)
+
+
 def test_master_client_roundtrips_batches_through_master_bus_direct_reader(
     tmp_path: Path,
 ) -> None:
@@ -5593,6 +5602,50 @@ def test_stream_table_e2e_persist_failure_is_queryable_and_blocks_retention(
                     raise
         if reset_default_master is not None:
             reset_default_master()
+        server.stop()
+
+
+def test_stream_table_e2e_writer_expiration_marks_stream_stale_and_blocks_live_reads(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    try:
+        schema = pa.schema(
+            [
+                ("instrument_id", pa.string()),
+                ("dt", pa.timestamp("ns", tz="UTC")),
+                ("last_price", pa.float64()),
+            ]
+        )
+
+        writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
+        writer_process_id = writer_client.register_process("segment_writer")
+        writer_client.register_stream("stale_ticks", schema, 64, 4096)
+        writer_client.register_source("stale_source", "segment_test", "stale_ticks", {})
+        writer = zippy._internal._SegmentTestWriter(
+            "stale_ticks",
+            schema,
+            row_capacity=16,
+        )
+        writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+        writer_client.publish_segment_descriptor("stale_ticks", writer.descriptor())
+
+        reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
+        reader_client.register_process("query_reader")
+        query = zippy.read_table("stale_ticks", master=reader_client)
+        assert query.tail(1).column("instrument_id").to_pylist() == ["IF2606"]
+
+        response = expire_process_for_test(control_endpoint, writer_process_id)
+        assert response == {"HeartbeatAccepted": {"process_id": writer_process_id}}
+
+        stream = writer_client.get_stream("stale_ticks")
+        assert stream["status"] == "stale"
+        assert stream["writer_process_id"] is None
+        assert stream["active_segment_descriptor"] is not None
+
+        with pytest.raises(RuntimeError, match="stream is stale"):
+            query.tail(1)
+    finally:
         server.stop()
 
 
