@@ -5517,6 +5517,85 @@ def test_stream_table_e2e_ingest_rollover_persist_and_query(tmp_path: Path) -> N
         server.stop()
 
 
+def test_stream_table_e2e_persist_failure_is_queryable_and_blocks_retention(
+    tmp_path: Path,
+) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    pipeline = None
+    bad_data_dir = tmp_path / "not_a_directory"
+    bad_data_dir.write_text("blocks persist directory creation", encoding="utf-8")
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    try:
+        zippy.connect(uri=control_endpoint, app="stream_table_persist_failure_test")
+        pipeline = (
+            zippy.Pipeline("stream_table_persist_failure_test")
+            .stream_table(
+                "persist_failure_ticks",
+                schema=schema,
+                row_capacity=2,
+                retention_segments=0,
+                persist="parquet",
+                data_dir=bad_data_dir,
+            )
+            .start()
+        )
+        pipeline.write(
+            {
+                "instrument_id": ["IF2606", "IF2607", "IF2608"],
+                "dt": [
+                    1777017600000000000,
+                    1777017600000000001,
+                    1777017600000000002,
+                ],
+                "last_price": [4100.0, 4101.0, 4102.0],
+            }
+        )
+
+        query = zippy.read_table("persist_failure_ticks")
+        events = []
+        for _ in range(100):
+            events = query.persist_events()
+            if events:
+                break
+            time.sleep(0.02)
+
+        with pytest.raises(RuntimeError, match="stream table persist failed"):
+            pipeline.flush()
+
+        stream = zippy.table_info("persist_failure_ticks")
+        events = query.persist_events()
+        assert query.persisted_files() == []
+        assert len(events) == 1
+        assert events[0]["stream_name"] == "persist_failure_ticks"
+        assert events[0]["persist_event_type"] == "persist_failed"
+        assert events[0]["source_segment_id"] == 1
+        assert events[0]["source_generation"] == 0
+        assert events[0]["attempts"] == 3
+        assert "Not a directory" in events[0]["error"]
+        assert len(stream["sealed_segments"]) == 1
+    finally:
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except RuntimeError as error:
+                if "stream table persist failed" not in str(error):
+                    raise
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_query_snapshot_includes_published_files() -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
@@ -6359,11 +6438,6 @@ def test_query_object_exposes_schema_stream_info_and_snapshot(monkeypatch, tmp_p
             ("last_price", pa.float64()),
         ]
     )
-    stream_info = {
-        "stream_name": "ctp_ticks",
-        "schema_hash": "abc",
-        "descriptor_generation": 2,
-    }
     parquet_file = tmp_path / "persisted.parquet"
     pq.write_table(
         pa.table(
@@ -6378,6 +6452,12 @@ def test_query_object_exposes_schema_stream_info_and_snapshot(monkeypatch, tmp_p
     persisted_file = {
         "file_path": str(parquet_file),
         "row_count": 1,
+    }
+    stream_info = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "descriptor_generation": 2,
+        "persisted_files": [persisted_file],
     }
     snapshot = {
         "stream_name": "ctp_ticks",

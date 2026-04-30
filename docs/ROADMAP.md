@@ -1622,6 +1622,16 @@ parquet 写入失败；
 master 或 error event 可观察。
 ```
 
+当前进展：
+
+- 已完成 `test_stream_table_e2e_persist_failure_is_queryable_and_blocks_retention`：
+  - 用不可创建目录的 `data_dir` 触发真实 parquet persist 失败。
+  - 验证 master 可查询 `persist_failed` event，且没有错误登记 persisted file。
+  - 验证失败 segment 不会被 `retention_segments=0` 裁剪，避免历史空洞。
+- `Table.persisted_files()`、`Table.persist_events()`、`Table.segment_reader_leases()`
+  已改为 metadata-only 查询，不再依赖 live segment snapshot；因此 stream 进入失败或
+  segment 不可 attach 时，故障 metadata 仍然可观察。
+
 #### 17.7 Replay e2e
 
 ```text

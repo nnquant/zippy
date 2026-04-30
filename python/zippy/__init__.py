@@ -773,30 +773,30 @@ class Table:
 
     def persisted_files(self) -> list[dict[str, object]]:
         """
-        Return persisted file metadata from a fixed query snapshot.
+        Return persisted file metadata from master stream metadata.
 
         :returns: Persisted file metadata entries.
         :rtype: list[dict[str, object]]
         """
-        return list(self.snapshot().get("persisted_files", []))
+        return list(self.stream_info().get("persisted_files", []))
 
     def persist_events(self) -> list[dict[str, object]]:
         """
-        Return persist lifecycle events from a fixed query snapshot.
+        Return persist lifecycle events from master stream metadata.
 
         :returns: Persist lifecycle event metadata entries.
         :rtype: list[dict[str, object]]
         """
-        return list(self.snapshot().get("persist_events", []))
+        return list(self.stream_info().get("persist_events", []))
 
     def segment_reader_leases(self) -> list[dict[str, object]]:
         """
-        Return currently registered segment reader leases from a fixed query snapshot.
+        Return currently registered segment reader leases from master stream metadata.
 
         :returns: Segment reader lease metadata entries.
         :rtype: list[dict[str, object]]
         """
-        return list(self.snapshot().get("segment_reader_leases", []))
+        return list(self.stream_info().get("segment_reader_leases", []))
 
     def scan_persisted(self):
         """
