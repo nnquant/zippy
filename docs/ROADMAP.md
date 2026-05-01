@@ -1427,6 +1427,28 @@ CPU usage under idle / low-rate / high-rate ingest
 - 输出 `slowest_rows`，保留最慢样本的 seq 和 rollover 标记，便于定位长尾来源。
 - 支持 `--discard-first-rows`，允许从统计中排除首条写入/attach 样本。
 
+2026-05-01 本机 smoke：
+
+```text
+uv run python examples/07_ops/03_subscribe_latency_probe.py \
+  --uri zippy://m65-probe \
+  --table subscribe_latency_probe_steady \
+  --drop-existing \
+  --rows 128 \
+  --interval-ms 1 \
+  --row-capacity 32 \
+  --poll-interval-ms 20 \
+  --idle-spin-checks 64 \
+  --warmup-ms 50 \
+  --discard-first-rows 1 \
+  --slowest-rows 5
+```
+
+结果：`measured_rows=127`，`latency_ms min=0.640 avg=1.199 p50=0.880
+p95=3.945 p99=6.787 max=7.802`，rollover 首行 `max=7.802ms`。最慢样本为
+`seq=32/64/96` 三个 rollover 首行，没有再出现固定 50ms 量化长尾。该结果是当前
+WSL2/本机调度环境下的烟测，不作为生产机器最终性能上限。
+
 ### 验收标准
 
 - rollover 后第一批数据不再出现固定 50ms 量化长尾。
