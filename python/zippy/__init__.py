@@ -662,6 +662,259 @@ def _compact_table(
     }
 
 
+def _compact_tables(
+    table_names: object = None,
+    *,
+    min_files: int = 2,
+    delete_sources: bool = True,
+    continue_on_error: bool = False,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Compact persisted parquet files for multiple tables.
+
+    :param table_names: Table name, iterable of table names, or ``None`` to discover
+        persisted tables from master.
+    :type table_names: object
+    :param min_files: Minimum files in one partition group before compaction.
+    :type min_files: int
+    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :type delete_sources: bool
+    :param continue_on_error: Whether to keep compacting other tables after one table fails.
+    :type continue_on_error: bool
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Multi-table compaction summary.
+    :rtype: dict[str, object]
+    """
+    if min_files < 2:
+        raise ValueError("min_files must be at least 2")
+
+    master_client = master or _default_master()
+    resolved_table_names = _resolve_compaction_table_names(table_names, master_client)
+    table_results: list[dict[str, object]] = []
+    table_errors: list[dict[str, str]] = []
+
+    for table_name in resolved_table_names:
+        try:
+            table_results.append(
+                _compact_table(
+                    table_name,
+                    min_files=min_files,
+                    delete_sources=delete_sources,
+                    master=master_client,
+                )
+            )
+        except Exception as error:
+            if not continue_on_error:
+                raise
+            table_errors.append({"table_name": table_name, "error": str(error)})
+
+    return {
+        "tables_scanned": len(resolved_table_names),
+        "tables_compacted": sum(
+            1 for result in table_results if int(result.get("groups_compacted", 0)) > 0
+        ),
+        "groups_compacted": sum(
+            int(result.get("groups_compacted", 0)) for result in table_results
+        ),
+        "files_compacted": sum(
+            int(result.get("files_compacted", 0)) for result in table_results
+        ),
+        "rows_compacted": sum(
+            int(result.get("rows_compacted", 0)) for result in table_results
+        ),
+        "table_results": table_results,
+        "table_errors": table_errors,
+    }
+
+
+def _resolve_compaction_table_names(
+    table_names: object,
+    master: MasterClient,
+) -> list[str]:
+    if table_names is None:
+        list_streams = getattr(master, "list_streams", None)
+        if list_streams is None:
+            raise RuntimeError("master does not support list_streams")
+        names = [
+            str(item["stream_name"])
+            for item in list_streams()
+            if item.get("stream_name") and item.get("persisted_files")
+        ]
+        return sorted(dict.fromkeys(names))
+
+    if isinstance(table_names, str):
+        names = [table_names]
+    else:
+        try:
+            names = [str(item) for item in table_names]  # type: ignore[operator]
+        except TypeError as error:
+            raise TypeError("table_names must be a table name or iterable of table names") from error
+
+    names = [name for name in names if name]
+    if not names:
+        raise ValueError("table_names must not be empty")
+    return list(dict.fromkeys(names))
+
+
+class _CompactionWorker:
+    """
+    Background worker for low-frequency persisted parquet compaction.
+
+    The worker is intentionally separate from StreamTable writers. Writers publish
+    persisted metadata; this worker periodically reads master catalog state and
+    performs metadata-replacing compaction through ops APIs.
+
+    :param table_names: Optional table name or iterable of table names. ``None`` means
+        discover persisted tables from master on every iteration.
+    :type table_names: object
+    :param interval_sec: Seconds between compaction passes.
+    :type interval_sec: float
+    :param min_files: Minimum files in one partition group before compaction.
+    :type min_files: int
+    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :type delete_sources: bool
+    :param master: Master client used for catalog operations.
+    :type master: MasterClient
+    """
+
+    def __init__(
+        self,
+        table_names: object = None,
+        *,
+        interval_sec: float = 60.0,
+        min_files: int = 4,
+        delete_sources: bool = True,
+        master: MasterClient,
+    ) -> None:
+        interval = float(interval_sec)
+        if interval <= 0:
+            raise ValueError("interval_sec must be positive")
+        if min_files < 2:
+            raise ValueError("min_files must be at least 2")
+
+        self.table_names = _freeze_compaction_table_names(table_names)
+        self.interval_sec = interval
+        self.min_files = int(min_files)
+        self.delete_sources = bool(delete_sources)
+        self.master = master
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._reports: list[dict[str, object]] = []
+        self._errors: list[dict[str, str]] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="zippy-compaction-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """
+        Request the compaction worker to stop.
+
+        :returns: None
+        :rtype: None
+        """
+        self._stop_event.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        """
+        Wait until the worker thread exits.
+
+        :param timeout: Optional maximum seconds to wait.
+        :type timeout: float | None
+        :returns: None
+        :rtype: None
+        """
+        self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        """
+        Return whether the worker thread is alive.
+
+        :returns: True if the thread is alive.
+        :rtype: bool
+        """
+        return self._thread.is_alive()
+
+    def latest_report(self) -> dict[str, object] | None:
+        """
+        Return the latest successful compaction pass report.
+
+        :returns: Latest report, or ``None`` before the first pass completes.
+        :rtype: dict[str, object] | None
+        """
+        with self._lock:
+            if not self._reports:
+                return None
+            return dict(self._reports[-1])
+
+    def reports(self) -> list[dict[str, object]]:
+        """
+        Return all successful compaction pass reports recorded by this worker.
+
+        :returns: Report list snapshot.
+        :rtype: list[dict[str, object]]
+        """
+        with self._lock:
+            return [dict(report) for report in self._reports]
+
+    def errors(self) -> list[dict[str, str]]:
+        """
+        Return unexpected worker-level errors.
+
+        Per-table compaction errors are stored inside each report's ``table_errors``.
+
+        :returns: Error list snapshot.
+        :rtype: list[dict[str, str]]
+        """
+        with self._lock:
+            return [dict(error) for error in self._errors]
+
+    def run_once(self) -> dict[str, object]:
+        """
+        Run one compaction pass synchronously.
+
+        :returns: Compaction pass report.
+        :rtype: dict[str, object]
+        """
+        return _compact_tables(
+            self.table_names,
+            min_files=self.min_files,
+            delete_sources=self.delete_sources,
+            continue_on_error=True,
+            master=self.master,
+        )
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                report = self.run_once()
+            except Exception as error:
+                with self._lock:
+                    self._errors.append({"error": str(error)})
+            else:
+                with self._lock:
+                    self._reports.append(report)
+
+            if self._stop_event.wait(self.interval_sec):
+                break
+
+
+def _freeze_compaction_table_names(table_names: object) -> object:
+    if table_names is None or isinstance(table_names, str):
+        return table_names
+    try:
+        names = tuple(str(item) for item in table_names)  # type: ignore[operator]
+    except TypeError as error:
+        raise TypeError("table_names must be a table name or iterable of table names") from error
+    if not names:
+        raise ValueError("table_names must not be empty")
+    return names
+
+
 def _persisted_compaction_groups(
     stream: dict[str, object],
     persisted_files: list[dict[str, object]],
@@ -905,6 +1158,78 @@ class Ops:
             min_files=min_files,
             delete_sources=delete_sources,
             master=master,
+        )
+
+    def compact_tables(
+        self,
+        table_names: object = None,
+        *,
+        min_files: int = 2,
+        delete_sources: bool = True,
+        continue_on_error: bool = False,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Compact small persisted parquet files for multiple tables.
+
+        :param table_names: Table name, iterable of table names, or ``None`` to discover
+            persisted tables from master.
+        :type table_names: object
+        :param min_files: Minimum files in one partition group before compaction.
+        :type min_files: int
+        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :type delete_sources: bool
+        :param continue_on_error: Whether to keep compacting other tables after one table fails.
+        :type continue_on_error: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Multi-table compaction summary.
+        :rtype: dict[str, object]
+        """
+        return _compact_tables(
+            table_names,
+            min_files=min_files,
+            delete_sources=delete_sources,
+            continue_on_error=continue_on_error,
+            master=master,
+        )
+
+    def start_compaction_worker(
+        self,
+        table_names: object = None,
+        *,
+        interval_sec: float = 60.0,
+        min_files: int = 4,
+        delete_sources: bool = True,
+        master: MasterClient | None = None,
+    ):
+        """
+        Start a background worker that periodically compacts persisted parquet files.
+
+        This worker is an ops-side runtime helper. StreamTable writers remain responsible
+        only for writing persisted files and publishing metadata; compaction reads master
+        catalog state and replaces persisted metadata through the control plane.
+
+        :param table_names: Table name, iterable of table names, or ``None`` to discover
+            persisted tables from master on every pass.
+        :type table_names: object
+        :param interval_sec: Seconds between compaction passes.
+        :type interval_sec: float
+        :param min_files: Minimum files in one partition group before compaction.
+        :type min_files: int
+        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :type delete_sources: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Background compaction worker handle.
+        :rtype: object
+        """
+        return _CompactionWorker(
+            table_names,
+            interval_sec=interval_sec,
+            min_files=min_files,
+            delete_sources=delete_sources,
+            master=master or _default_master(),
         )
 
 

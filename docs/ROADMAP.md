@@ -1124,10 +1124,17 @@ created_at
   `replace_persisted_files` 原子替换 persisted metadata；`zippy.ops.compact_table()`
   会按 partition 分组把多个小 parquet 合并成 compacted parquet，成功替换 metadata
   后再删除源文件。该能力属于低频 ops，不进入写入或订阅热路径。
+- 已完成第一版后台 compaction worker：
+  `zippy.ops.compact_tables()` 可批量扫描 persisted tables；
+  `zippy.ops.start_compaction_worker()` 可在独立 ops 线程里周期性触发 compaction。
+  当前实现不把 compaction 放到 StreamTable 写入方，写入方只负责 sealed segment
+  persist 和 metadata 发布；compaction 的长期方向是由 master catalog 统一调度，
+  实际 parquet IO/CPU 由 master 管理的后台 worker 或独立 ops worker 执行。
 
 剩余重点：
 
-- compaction 调度策略、文件大小阈值和后台任务化仍需后续完善。
+- master-native compaction scheduler、文件大小阈值、并发限流和 compaction 状态
+  可观测性仍需后续完善。
 
 ### 验收标准
 

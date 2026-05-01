@@ -5271,6 +5271,9 @@ def test_low_frequency_table_ops_are_not_top_level_exports() -> None:
         "table_alerts",
         "table_health",
         "drop_table",
+        "compact_table",
+        "compact_tables",
+        "start_compaction_worker",
     ):
         assert name not in zippy.__all__
         assert not hasattr(zippy, name)
@@ -5315,6 +5318,103 @@ def test_ops_namespace_exposes_table_observability_methods() -> None:
         "dropped": True,
     }
     assert master.dropped == [("ctp_ticks", False)]
+
+
+def test_ops_compact_tables_discovers_persisted_tables(monkeypatch) -> None:
+    class FakeMaster:
+        def list_streams(self) -> list[dict[str, object]]:
+            return [
+                {"stream_name": "b_ticks", "persisted_files": [{"file_path": "b.parquet"}]},
+                {"stream_name": "a_ticks", "persisted_files": [{"file_path": "a.parquet"}]},
+                {"stream_name": "live_only_ticks", "persisted_files": []},
+            ]
+
+    calls: list[tuple[str, int, bool, object]] = []
+
+    def fake_compact_table(
+        table_name: str,
+        *,
+        min_files: int,
+        delete_sources: bool,
+        master: object,
+    ) -> dict[str, object]:
+        calls.append((table_name, min_files, delete_sources, master))
+        return {
+            "table_name": table_name,
+            "groups_compacted": 1 if table_name == "a_ticks" else 0,
+            "files_compacted": 2 if table_name == "a_ticks" else 0,
+            "rows_compacted": 10 if table_name == "a_ticks" else 0,
+        }
+
+    master = FakeMaster()
+    monkeypatch.setattr(zippy, "_compact_table", fake_compact_table)
+
+    result = zippy.ops.compact_tables(
+        master=master,
+        min_files=3,
+        delete_sources=False,
+    )
+
+    assert [call[0] for call in calls] == ["a_ticks", "b_ticks"]
+    assert all(call[1] == 3 for call in calls)
+    assert all(call[2] is False for call in calls)
+    assert all(call[3] is master for call in calls)
+    assert result["tables_scanned"] == 2
+    assert result["tables_compacted"] == 1
+    assert result["groups_compacted"] == 1
+    assert result["files_compacted"] == 2
+    assert result["rows_compacted"] == 10
+    assert result["table_errors"] == []
+
+
+def test_ops_start_compaction_worker_runs_background_pass(monkeypatch) -> None:
+    class FakeMaster:
+        pass
+
+    calls: list[tuple[object, int, bool, bool, object]] = []
+
+    def fake_compact_tables(
+        table_names: object = None,
+        *,
+        min_files: int,
+        delete_sources: bool,
+        continue_on_error: bool,
+        master: object,
+    ) -> dict[str, object]:
+        calls.append((table_names, min_files, delete_sources, continue_on_error, master))
+        return {
+            "tables_scanned": 1,
+            "tables_compacted": 0,
+            "groups_compacted": 0,
+            "files_compacted": 0,
+            "rows_compacted": 0,
+            "table_results": [],
+            "table_errors": [],
+        }
+
+    master = FakeMaster()
+    monkeypatch.setattr(zippy, "_compact_tables", fake_compact_tables)
+
+    worker = zippy.ops.start_compaction_worker(
+        "ctp_ticks",
+        master=master,
+        interval_sec=0.01,
+        min_files=3,
+        delete_sources=False,
+    )
+    try:
+        deadline = time.time() + 1.0
+        while worker.latest_report() is None and time.time() < deadline:
+            time.sleep(0.01)
+    finally:
+        worker.stop()
+        worker.join(timeout=1.0)
+
+    assert calls
+    assert calls[0] == ("ctp_ticks", 3, False, True, master)
+    assert worker.latest_report()["tables_scanned"] == 1
+    assert worker.errors() == []
+    assert not worker.is_alive()
 
 
 def test_table_object_exposes_low_frequency_observability_methods() -> None:
