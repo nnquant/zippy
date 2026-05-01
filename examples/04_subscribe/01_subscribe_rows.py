@@ -27,6 +27,8 @@ def main() -> None:
     parser.add_argument("--instrument", action="append", default=[], help="可重复传入合约过滤")
     parser.add_argument("--max-rows", type=int, default=10, help="最多接收多少行")
     parser.add_argument("--timeout-sec", type=float, default=30.0, help="最长等待时间")
+    parser.add_argument("--wait-stream", action="store_true", help="stream 尚未创建时等待 producer")
+    parser.add_argument("--wait-timeout", default="30s", help="等待 stream 创建的超时时间")
     parser.add_argument("--xfast", action="store_true", help="低延迟 spin 读取")
     args = parser.parse_args()
 
@@ -55,6 +57,8 @@ def main() -> None:
         callback=on_row,
         instrument_ids=args.instrument or None,
         xfast=args.xfast,
+        wait=args.wait_stream,
+        timeout=args.wait_timeout,
     )
     try:
         done.wait(args.timeout_sec)
@@ -64,4 +68,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

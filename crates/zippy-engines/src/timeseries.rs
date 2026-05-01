@@ -556,12 +556,9 @@ impl SpecInputArrays {
     }
 
     fn secondary_value(&self, row_index: usize) -> Result<f64> {
-        let secondary = self
-            .secondary
-            .as_ref()
-            .ok_or_else(|| ZippyError::InvalidState {
-                status: "vwap requires a secondary input column",
-            })?;
+        let secondary = self.secondary.as_ref().ok_or(ZippyError::InvalidState {
+            status: "vwap requires a secondary input column",
+        })?;
         Ok(checked_value_array(secondary, "secondary")?.value(row_index))
     }
 }

@@ -295,6 +295,8 @@ impl PartitionHandle {
             layout,
             1,
             0,
+            store_id,
+            1,
             persistence_key,
         )
         .map_err(ZippySegmentStoreError::Writer)?;
@@ -534,6 +536,93 @@ impl PartitionWriterHandle {
         Ok(())
     }
 
+    /// 在同一个分区锁内连续写入多行，并只发布一次 committed prefix。
+    pub fn write_rows<F>(
+        &self,
+        row_count: usize,
+        mut write: F,
+    ) -> Result<usize, ZippySegmentStoreError>
+    where
+        F: FnMut(&mut PartitionRowWriter<'_>, usize) -> Result<(), ZippySegmentStoreError>,
+    {
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        let written = {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            if state.writer.has_open_row() {
+                return Err(ZippySegmentStoreError::Writer("row already open"));
+            }
+
+            let rows_to_write = row_count.min(state.writer.remaining_row_capacity());
+            if rows_to_write == 0 {
+                return Err(ZippySegmentStoreError::Writer("segment is full"));
+            }
+
+            let mut written = 0;
+            for index in 0..rows_to_write {
+                state
+                    .writer
+                    .begin_row()
+                    .map_err(ZippySegmentStoreError::Writer)?;
+
+                let write_result = {
+                    let mut row_writer = PartitionRowWriter {
+                        writer: &mut state.writer,
+                    };
+                    write(&mut row_writer, index)
+                };
+                match write_result {
+                    Ok(()) => {
+                        if let Err(error) = state.writer.finish_open_row() {
+                            if state.writer.has_open_row() {
+                                let _ = state.writer.abort_row();
+                            }
+                            if written > 0 {
+                                state
+                                    .writer
+                                    .publish_committed_prefix()
+                                    .map_err(ZippySegmentStoreError::Writer)?;
+                                return Ok(written);
+                            }
+                            return Err(ZippySegmentStoreError::Writer(error));
+                        }
+                        written += 1;
+                    }
+                    Err(error) => {
+                        if state.writer.has_open_row() {
+                            let _ = state.writer.abort_row();
+                        }
+                        if written > 0 {
+                            state
+                                .writer
+                                .publish_committed_prefix()
+                                .map_err(ZippySegmentStoreError::Writer)?;
+                            return Ok(written);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            state
+                .writer
+                .publish_committed_prefix()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            written
+        };
+
+        if written > 0 {
+            self.handle
+                .inner
+                .broadcaster
+                .notify_all()
+                .map_err(ZippySegmentStoreError::Io)?;
+        }
+        Ok(written)
+    }
+
     /// 返回当前 active segment 的调试快照。
     pub fn debug_snapshot_record_batch(&self) -> Result<RecordBatch, ZippySegmentStoreError> {
         self.handle.debug_snapshot_record_batch()
@@ -571,6 +660,31 @@ impl PartitionWriterHandle {
             .notify_all()
             .map_err(ZippySegmentStoreError::Io)?;
         Ok(())
+    }
+
+    /// 从 segment 行视图直接追加多行，并只通知一次外部订阅者。
+    pub fn append_row_span(
+        &self,
+        span: &RowSpanView,
+        start_offset: usize,
+        max_rows: usize,
+    ) -> Result<usize, ZippySegmentStoreError> {
+        let copied = {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            state
+                .writer
+                .append_row_span(span, start_offset, max_rows)
+                .map_err(ZippySegmentStoreError::Writer)?
+        };
+
+        if copied > 0 {
+            self.handle
+                .inner
+                .broadcaster
+                .notify_all()
+                .map_err(ZippySegmentStoreError::Io)?;
+        }
+        Ok(copied)
     }
 
     /// 追加一条测试 tick。
@@ -616,6 +730,8 @@ impl PartitionWriterHandle {
                 layout,
                 next_segment_id,
                 next_generation,
+                self.handle.inner.store_id,
+                next_generation.saturating_add(1),
                 persistence_key,
             )
             .map_err(ZippySegmentStoreError::Writer)?;

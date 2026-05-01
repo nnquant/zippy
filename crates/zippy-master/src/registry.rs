@@ -391,6 +391,41 @@ fn persisted_created_at_millis() -> u64 {
         .unwrap_or_default()
 }
 
+fn normalize_persisted_file(
+    stream_name: &str,
+    schema_hash: &str,
+    mut persisted_file: serde_json::Value,
+) -> Result<serde_json::Value, RegistryError> {
+    let Some(object) = persisted_file.as_object_mut() else {
+        return Err(RegistryError::InvalidPersistedFile {
+            stream_name: stream_name.to_string(),
+            reason: "persisted_file must be an object".to_string(),
+        });
+    };
+    let Some(file_path) = object.get("file_path").and_then(serde_json::Value::as_str) else {
+        return Err(RegistryError::InvalidPersistedFile {
+            stream_name: stream_name.to_string(),
+            reason: "persisted_file.file_path must be a string".to_string(),
+        });
+    };
+    if file_path.is_empty() {
+        return Err(RegistryError::InvalidPersistedFile {
+            stream_name: stream_name.to_string(),
+            reason: "persisted_file.file_path must not be empty".to_string(),
+        });
+    }
+    object
+        .entry("stream_name")
+        .or_insert_with(|| serde_json::Value::String(stream_name.to_string()));
+    object
+        .entry("schema_hash")
+        .or_insert_with(|| serde_json::Value::String(schema_hash.to_string()));
+    object
+        .entry("created_at")
+        .or_insert_with(|| serde_json::Value::from(persisted_created_at_millis()));
+    Ok(persisted_file)
+}
+
 impl Registry {
     fn now_epoch_millis() -> u64 {
         SystemTime::now()
@@ -900,6 +935,11 @@ impl Registry {
                 process_id: process_id.to_string(),
             });
         }
+        let next_status = if writer_owner {
+            "writer_attached"
+        } else {
+            "registered"
+        };
 
         let (active_descriptor, sealed_segments) =
             split_active_segment_descriptor(stream_name, descriptor)?;
@@ -912,6 +952,7 @@ impl Registry {
         stream.active_segment_descriptor = Some(active_descriptor);
         stream.sealed_segments = sealed_segments;
         stream.descriptor_generation = stream.descriptor_generation.saturating_add(1);
+        stream.status = next_status.to_string();
         Ok(())
     }
 
@@ -947,35 +988,10 @@ impl Registry {
         }
 
         let schema_hash = stream.schema_hash.clone();
-        let mut persisted_file = persisted_file;
-        let Some(object) = persisted_file.as_object_mut() else {
-            return Err(RegistryError::InvalidPersistedFile {
-                stream_name: stream_name.to_string(),
-                reason: "persisted_file must be an object".to_string(),
-            });
-        };
-        let Some(file_path) = object.get("file_path").and_then(serde_json::Value::as_str) else {
-            return Err(RegistryError::InvalidPersistedFile {
-                stream_name: stream_name.to_string(),
-                reason: "persisted_file.file_path must be a string".to_string(),
-            });
-        };
-        if file_path.is_empty() {
-            return Err(RegistryError::InvalidPersistedFile {
-                stream_name: stream_name.to_string(),
-                reason: "persisted_file.file_path must not be empty".to_string(),
-            });
-        }
-        object
-            .entry("stream_name")
-            .or_insert_with(|| serde_json::Value::String(stream_name.to_string()));
-        object
-            .entry("schema_hash")
-            .or_insert_with(|| serde_json::Value::String(schema_hash));
-        object
-            .entry("created_at")
-            .or_insert_with(|| serde_json::Value::from(persisted_created_at_millis()));
-        let persist_file_id = object
+        let persisted_file = normalize_persisted_file(stream_name, &schema_hash, persisted_file)?;
+        let persist_file_id = persisted_file
+            .as_object()
+            .expect("normalized persisted file is an object")
             .get("persist_file_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
@@ -998,6 +1014,35 @@ impl Registry {
             }
         }
         stream.persisted_files.push(persisted_file);
+        Ok(())
+    }
+
+    pub fn replace_persisted_files(
+        &mut self,
+        stream_name: &str,
+        persisted_files: Vec<serde_json::Value>,
+    ) -> Result<(), RegistryError> {
+        let schema_hash = self
+            .streams
+            .get(stream_name)
+            .ok_or_else(|| RegistryError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            })?
+            .schema_hash
+            .clone();
+        let normalized_files = persisted_files
+            .into_iter()
+            .map(|persisted_file| {
+                normalize_persisted_file(stream_name, &schema_hash, persisted_file)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        stream.persisted_files = normalized_files;
         Ok(())
     }
 

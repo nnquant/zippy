@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import json
 import os
 import threading
@@ -346,7 +347,7 @@ def config(master: MasterClient | None = None) -> dict[str, object]:
     return _master_config(master or _default_master())
 
 
-def list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
+def _list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
     """
     List tables registered in the connected Zippy master.
 
@@ -362,12 +363,12 @@ def list_tables(master: MasterClient | None = None) -> list[dict[str, object]]:
     :example:
 
         >>> zippy.connect()
-        >>> zippy.list_tables()
+        >>> zippy.ops.list_tables()
     """
     return list((master or _default_master()).list_streams())
 
 
-def table_info(
+def _table_info(
     table_name: str,
     *,
     master: MasterClient | None = None,
@@ -386,7 +387,7 @@ def table_info(
     :example:
 
         >>> zippy.connect()
-        >>> zippy.table_info("ctp_ticks")
+        >>> zippy.ops.table_info("ctp_ticks")
     """
     if not isinstance(table_name, str):
         raise TypeError("table_name must be a string")
@@ -395,7 +396,151 @@ def table_info(
     return (master or _default_master()).get_stream(table_name)
 
 
-def drop_table(
+def _table_alerts(
+    table_name: str,
+    *,
+    master: MasterClient | None = None,
+) -> list[dict[str, object]]:
+    """
+    Return metadata-derived health alerts for one Zippy table.
+
+    This function does not scan data files or attach live segments. It only interprets
+    master catalog metadata such as stream status, active descriptor state, and persist
+    lifecycle events.
+
+    :param table_name: Named table to inspect.
+    :type table_name: str
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Health alerts ordered by control-plane importance.
+    :rtype: list[dict[str, object]]
+    :raises ValueError: If ``table_name`` is empty.
+    :raises RuntimeError: If the table does not exist or master rejects the request.
+    """
+    return _build_table_alerts(_table_info(table_name, master=master))
+
+
+def _table_health(
+    table_name: str,
+    *,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Return a compact health summary for one Zippy table.
+
+    ``status`` is ``"error"`` when any error alert exists, ``"warning"`` when only
+    warning alerts exist, and ``"ok"`` when no alerts are present.
+
+    :param table_name: Named table to inspect.
+    :type table_name: str
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Table health summary with alerts.
+    :rtype: dict[str, object]
+    :raises ValueError: If ``table_name`` is empty.
+    :raises RuntimeError: If the table does not exist or master rejects the request.
+    """
+    return _table_health_from_info(_table_info(table_name, master=master), table_name)
+
+
+def _table_health_from_info(
+    info: dict[str, object],
+    fallback_table_name: str | None = None,
+) -> dict[str, object]:
+    table_name = info.get("stream_name", fallback_table_name)
+    alerts = _build_table_alerts(info)
+    return {
+        "table_name": table_name,
+        "status": _table_health_status(alerts),
+        "stream_status": info.get("status"),
+        "descriptor_generation": info.get("descriptor_generation"),
+        "alert_count": len(alerts),
+        "alerts": alerts,
+    }
+
+
+def _build_table_alerts(info: dict[str, object]) -> list[dict[str, object]]:
+    table_name = str(info.get("stream_name") or "")
+    stream_status = str(info.get("status") or "unknown")
+    alerts: list[dict[str, object]] = []
+
+    if stream_status == "stale":
+        alerts.append(
+            {
+                "severity": "error",
+                "kind": "stream_stale",
+                "table_name": table_name,
+                "stream_status": stream_status,
+                "message": f"stream is stale table_name=[{table_name}]",
+            }
+        )
+    elif stream_status in {"error", "failed"}:
+        alerts.append(
+            {
+                "severity": "error",
+                "kind": "stream_error",
+                "table_name": table_name,
+                "stream_status": stream_status,
+                "message": (
+                    f"stream is in error status table_name=[{table_name}] "
+                    f"status=[{stream_status}]"
+                ),
+            }
+        )
+
+    if info.get("active_segment_descriptor") is None:
+        alerts.append(
+            {
+                "severity": "warning",
+                "kind": "active_descriptor_missing",
+                "table_name": table_name,
+                "stream_status": stream_status,
+                "message": (
+                    "active segment descriptor is not published "
+                    f"table_name=[{table_name}] status=[{stream_status}]"
+                ),
+            }
+        )
+
+    for event in info.get("persist_events", []) or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("persist_event_type") != "persist_failed":
+            continue
+        alert = {
+            "severity": "error",
+            "kind": "persist_failed",
+            "table_name": table_name,
+            "message": _persist_failed_alert_message(table_name, event),
+        }
+        alert.update(event)
+        alerts.append(alert)
+
+    return alerts
+
+
+def _persist_failed_alert_message(table_name: str, event: dict[str, object]) -> str:
+    segment_id = event.get("source_segment_id")
+    generation = event.get("source_generation")
+    attempts = event.get("attempts")
+    error = event.get("error")
+    return (
+        f"persist failed table_name=[{table_name}] "
+        f"source_segment_id=[{segment_id}] source_generation=[{generation}] "
+        f"attempts=[{attempts}] error=[{error}]"
+    )
+
+
+def _table_health_status(alerts: list[dict[str, object]]) -> str:
+    severities = {str(alert.get("severity")) for alert in alerts}
+    if "error" in severities:
+        return "error"
+    if "warning" in severities:
+        return "warning"
+    return "ok"
+
+
+def _drop_table(
     table_name: str,
     *,
     drop_persisted: bool = True,
@@ -416,11 +561,679 @@ def drop_table(
     :example:
 
         >>> zippy.connect()
-        >>> zippy.drop_table("ctp_ticks")
+        >>> zippy.ops.drop_table("ctp_ticks")
     """
     if not table_name:
         raise ValueError("table_name must not be empty")
     return (master or _default_master()).drop_table(table_name, drop_persisted)
+
+
+def _compact_table(
+    table_name: str,
+    *,
+    min_files: int = 2,
+    delete_sources: bool = True,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Compact small persisted parquet files for a named table.
+
+    :param table_name: Named table to compact.
+    :type table_name: str
+    :param min_files: Minimum files in one partition group before compaction.
+    :type min_files: int
+    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :type delete_sources: bool
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Compaction summary.
+    :rtype: dict[str, object]
+    :raises ValueError: If ``table_name`` is empty or ``min_files`` is smaller than two.
+    :raises RuntimeError: If master does not support persisted metadata replacement.
+    """
+    if not table_name:
+        raise ValueError("table_name must not be empty")
+    if min_files < 2:
+        raise ValueError("min_files must be at least 2")
+
+    master_client = master or _default_master()
+    replace_persisted_files = getattr(master_client, "replace_persisted_files", None)
+    if replace_persisted_files is None:
+        raise RuntimeError("master does not support replace_persisted_files")
+
+    stream = master_client.get_stream(table_name)
+    persisted_files = [
+        dict(item)
+        for item in stream.get("persisted_files", []) or []
+        if isinstance(item, dict) and item.get("file_path")
+    ]
+    groups = _persisted_compaction_groups(stream, persisted_files)
+    compacted_files: list[dict[str, object]] = []
+    compacted_source_keys: set[tuple[str, str]] = set()
+    source_paths: list[Path] = []
+
+    for group_files in groups.values():
+        if len(group_files) < min_files:
+            continue
+        compacted_file = _compact_persisted_file_group(table_name, stream, group_files)
+        compacted_files.append(compacted_file)
+        for item in group_files:
+            compacted_source_keys.add(_persisted_file_compaction_key(item))
+            source_paths.append(Path(str(item["file_path"])))
+
+    if not compacted_files:
+        return {
+            "table_name": table_name,
+            "groups_compacted": 0,
+            "files_compacted": 0,
+            "rows_compacted": 0,
+            "compacted_files": [],
+            "source_files_deleted": 0,
+            "source_file_delete_errors": [],
+        }
+
+    next_files = [
+        item
+        for item in persisted_files
+        if _persisted_file_compaction_key(item) not in compacted_source_keys
+    ]
+    next_files.extend(compacted_files)
+    next_files.sort(key=_persisted_file_order_key)
+    replace_persisted_files(table_name, next_files)
+
+    deleted = 0
+    delete_errors: list[dict[str, str]] = []
+    if delete_sources:
+        for path in source_paths:
+            try:
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except OSError as error:
+                delete_errors.append({"file_path": str(path), "error": str(error)})
+
+    return {
+        "table_name": table_name,
+        "groups_compacted": len(compacted_files),
+        "files_compacted": len(compacted_source_keys),
+        "rows_compacted": sum(int(item.get("row_count", 0)) for item in compacted_files),
+        "compacted_files": compacted_files,
+        "source_files_deleted": deleted,
+        "source_file_delete_errors": delete_errors,
+    }
+
+
+def _compact_tables(
+    table_names: object = None,
+    *,
+    min_files: int = 2,
+    delete_sources: bool = True,
+    continue_on_error: bool = False,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Compact persisted parquet files for multiple tables.
+
+    :param table_names: Table name, iterable of table names, or ``None`` to discover
+        persisted tables from master.
+    :type table_names: object
+    :param min_files: Minimum files in one partition group before compaction.
+    :type min_files: int
+    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :type delete_sources: bool
+    :param continue_on_error: Whether to keep compacting other tables after one table fails.
+    :type continue_on_error: bool
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Multi-table compaction summary.
+    :rtype: dict[str, object]
+    """
+    if min_files < 2:
+        raise ValueError("min_files must be at least 2")
+
+    master_client = master or _default_master()
+    resolved_table_names = _resolve_compaction_table_names(table_names, master_client)
+    table_results: list[dict[str, object]] = []
+    table_errors: list[dict[str, str]] = []
+
+    for table_name in resolved_table_names:
+        try:
+            table_results.append(
+                _compact_table(
+                    table_name,
+                    min_files=min_files,
+                    delete_sources=delete_sources,
+                    master=master_client,
+                )
+            )
+        except Exception as error:
+            if not continue_on_error:
+                raise
+            table_errors.append({"table_name": table_name, "error": str(error)})
+
+    return {
+        "tables_scanned": len(resolved_table_names),
+        "tables_compacted": sum(
+            1 for result in table_results if int(result.get("groups_compacted", 0)) > 0
+        ),
+        "groups_compacted": sum(
+            int(result.get("groups_compacted", 0)) for result in table_results
+        ),
+        "files_compacted": sum(
+            int(result.get("files_compacted", 0)) for result in table_results
+        ),
+        "rows_compacted": sum(
+            int(result.get("rows_compacted", 0)) for result in table_results
+        ),
+        "table_results": table_results,
+        "table_errors": table_errors,
+    }
+
+
+def _resolve_compaction_table_names(
+    table_names: object,
+    master: MasterClient,
+) -> list[str]:
+    if table_names is None:
+        list_streams = getattr(master, "list_streams", None)
+        if list_streams is None:
+            raise RuntimeError("master does not support list_streams")
+        names = [
+            str(item["stream_name"])
+            for item in list_streams()
+            if item.get("stream_name") and item.get("persisted_files")
+        ]
+        return sorted(dict.fromkeys(names))
+
+    if isinstance(table_names, str):
+        names = [table_names]
+    else:
+        try:
+            names = [str(item) for item in table_names]  # type: ignore[operator]
+        except TypeError as error:
+            raise TypeError("table_names must be a table name or iterable of table names") from error
+
+    names = [name for name in names if name]
+    if not names:
+        raise ValueError("table_names must not be empty")
+    return list(dict.fromkeys(names))
+
+
+class _CompactionWorker:
+    """
+    Background worker for low-frequency persisted parquet compaction.
+
+    The worker is intentionally separate from StreamTable writers. Writers publish
+    persisted metadata; this worker periodically reads master catalog state and
+    performs metadata-replacing compaction through ops APIs.
+
+    :param table_names: Optional table name or iterable of table names. ``None`` means
+        discover persisted tables from master on every iteration.
+    :type table_names: object
+    :param interval_sec: Seconds between compaction passes.
+    :type interval_sec: float
+    :param min_files: Minimum files in one partition group before compaction.
+    :type min_files: int
+    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :type delete_sources: bool
+    :param master: Master client used for catalog operations.
+    :type master: MasterClient
+    """
+
+    def __init__(
+        self,
+        table_names: object = None,
+        *,
+        interval_sec: float = 60.0,
+        min_files: int = 4,
+        delete_sources: bool = True,
+        master: MasterClient,
+    ) -> None:
+        interval = float(interval_sec)
+        if interval <= 0:
+            raise ValueError("interval_sec must be positive")
+        if min_files < 2:
+            raise ValueError("min_files must be at least 2")
+
+        self.table_names = _freeze_compaction_table_names(table_names)
+        self.interval_sec = interval
+        self.min_files = int(min_files)
+        self.delete_sources = bool(delete_sources)
+        self.master = master
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._reports: list[dict[str, object]] = []
+        self._errors: list[dict[str, str]] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="zippy-compaction-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """
+        Request the compaction worker to stop.
+
+        :returns: None
+        :rtype: None
+        """
+        self._stop_event.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        """
+        Wait until the worker thread exits.
+
+        :param timeout: Optional maximum seconds to wait.
+        :type timeout: float | None
+        :returns: None
+        :rtype: None
+        """
+        self._thread.join(timeout=timeout)
+
+    def is_alive(self) -> bool:
+        """
+        Return whether the worker thread is alive.
+
+        :returns: True if the thread is alive.
+        :rtype: bool
+        """
+        return self._thread.is_alive()
+
+    def latest_report(self) -> dict[str, object] | None:
+        """
+        Return the latest successful compaction pass report.
+
+        :returns: Latest report, or ``None`` before the first pass completes.
+        :rtype: dict[str, object] | None
+        """
+        with self._lock:
+            if not self._reports:
+                return None
+            return dict(self._reports[-1])
+
+    def reports(self) -> list[dict[str, object]]:
+        """
+        Return all successful compaction pass reports recorded by this worker.
+
+        :returns: Report list snapshot.
+        :rtype: list[dict[str, object]]
+        """
+        with self._lock:
+            return [dict(report) for report in self._reports]
+
+    def errors(self) -> list[dict[str, str]]:
+        """
+        Return unexpected worker-level errors.
+
+        Per-table compaction errors are stored inside each report's ``table_errors``.
+
+        :returns: Error list snapshot.
+        :rtype: list[dict[str, str]]
+        """
+        with self._lock:
+            return [dict(error) for error in self._errors]
+
+    def run_once(self) -> dict[str, object]:
+        """
+        Run one compaction pass synchronously.
+
+        :returns: Compaction pass report.
+        :rtype: dict[str, object]
+        """
+        return _compact_tables(
+            self.table_names,
+            min_files=self.min_files,
+            delete_sources=self.delete_sources,
+            continue_on_error=True,
+            master=self.master,
+        )
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                report = self.run_once()
+            except Exception as error:
+                with self._lock:
+                    self._errors.append({"error": str(error)})
+            else:
+                with self._lock:
+                    self._reports.append(report)
+
+            if self._stop_event.wait(self.interval_sec):
+                break
+
+
+def _freeze_compaction_table_names(table_names: object) -> object:
+    if table_names is None or isinstance(table_names, str):
+        return table_names
+    try:
+        names = tuple(str(item) for item in table_names)  # type: ignore[operator]
+    except TypeError as error:
+        raise TypeError("table_names must be a table name or iterable of table names") from error
+    if not names:
+        raise ValueError("table_names must not be empty")
+    return names
+
+
+def _persisted_compaction_groups(
+    stream: dict[str, object],
+    persisted_files: list[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    groups: dict[str, list[dict[str, object]]] = {}
+    live_identities = _live_segment_identities(stream)
+    for item in persisted_files:
+        identities = _persisted_segment_identities(item)
+        if identities and identities & live_identities:
+            continue
+        path = Path(str(item["file_path"]))
+        if not path.exists():
+            continue
+        key = _persisted_compaction_group_key(item, path)
+        groups.setdefault(key, []).append(item)
+    for group_files in groups.values():
+        group_files.sort(key=_persisted_file_order_key)
+    return groups
+
+
+def _persisted_compaction_group_key(item: dict[str, object], path: Path) -> str:
+    partition_path = item.get("partition_path")
+    if partition_path:
+        return f"partition_path:{partition_path}"
+    partition = item.get("partition")
+    if isinstance(partition, dict) and partition:
+        return f"partition:{json.dumps(partition, sort_keys=True, separators=(',', ':'))}"
+    return f"parent:{path.parent}"
+
+
+def _compact_persisted_file_group(
+    table_name: str,
+    stream: dict[str, object],
+    group_files: list[dict[str, object]],
+) -> dict[str, object]:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tables = [_read_persisted_parquet_file(item["file_path"]) for item in group_files]
+    table = pa.concat_tables([table for table in tables if table.num_rows > 0])
+    first_file = group_files[0]
+    target_dir = Path(str(first_file["file_path"])).parent
+    target_path = target_dir / _compacted_parquet_file_name(table_name, group_files)
+    temp_path = target_path.with_name(
+        f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    pq.write_table(table, temp_path)
+    os.replace(temp_path, target_path)
+    return _compacted_persisted_file_metadata(
+        table_name,
+        stream,
+        group_files,
+        target_path,
+        table.num_rows,
+    )
+
+
+def _compacted_parquet_file_name(
+    table_name: str,
+    group_files: list[dict[str, object]],
+) -> str:
+    digest = hashlib.sha1(
+        "|".join(str(item.get("persist_file_id") or item.get("file_path")) for item in group_files)
+        .encode("utf-8")
+    ).hexdigest()[:16]
+    return f"compact-{_safe_file_token(table_name)}-{digest}.parquet"
+
+
+def _compacted_persisted_file_metadata(
+    table_name: str,
+    stream: dict[str, object],
+    group_files: list[dict[str, object]],
+    target_path: Path,
+    row_count: int,
+) -> dict[str, object]:
+    first_file = group_files[0]
+    source_segments = [
+        {
+            "source_segment_id": identity[0],
+            "source_generation": identity[1],
+        }
+        for item in group_files
+        for identity in sorted(_persisted_segment_identities(item))
+    ]
+    digest = hashlib.sha1(
+        "|".join(str(item.get("persist_file_id") or item.get("file_path")) for item in group_files)
+        .encode("utf-8")
+    ).hexdigest()[:16]
+    metadata: dict[str, object] = {
+        "persist_file_id": f"compact:{table_name}:{digest}",
+        "stream_name": table_name,
+        "schema_hash": stream.get("schema_hash"),
+        "file_path": str(target_path),
+        "row_count": row_count,
+        "created_at": int(time.time() * 1000),
+        "compacted": True,
+        "compacted_file_count": len(group_files),
+        "compacted_source_file_ids": [
+            item.get("persist_file_id") or item.get("file_path") for item in group_files
+        ],
+    }
+    if source_segments:
+        metadata["source_segments"] = source_segments
+        metadata["source_segment_id"] = source_segments[0]["source_segment_id"]
+        metadata["source_generation"] = source_segments[0]["source_generation"]
+    for key in ("partition", "partition_path", "partition_spec"):
+        if key in first_file:
+            metadata[key] = first_file[key]
+    return metadata
+
+
+def _persisted_file_compaction_key(item: dict[str, object]) -> tuple[str, str]:
+    persist_file_id = item.get("persist_file_id")
+    if persist_file_id:
+        return ("id", str(persist_file_id))
+    return ("path", str(item.get("file_path", "")))
+
+
+def _safe_file_token(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+class Ops:
+    """
+    Namespace for low-frequency Zippy operations.
+
+    These methods intentionally live under ``zippy.ops`` so the top-level API remains
+    focused on high-frequency user workflows such as ``read_table`` and ``subscribe``.
+    """
+
+    def list_tables(self, master: MasterClient | None = None) -> list[dict[str, object]]:
+        """
+        List tables registered in the connected Zippy master.
+
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Registered table metadata entries.
+        :rtype: list[dict[str, object]]
+        """
+        return _list_tables(master=master)
+
+    def table_info(
+        self,
+        table_name: str,
+        *,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Return master metadata for one registered Zippy table.
+
+        :param table_name: Named table to inspect.
+        :type table_name: str
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Table metadata including schema, status, descriptors, and persist state.
+        :rtype: dict[str, object]
+        """
+        return _table_info(table_name, master=master)
+
+    def table_alerts(
+        self,
+        table_name: str,
+        *,
+        master: MasterClient | None = None,
+    ) -> list[dict[str, object]]:
+        """
+        Return metadata-derived health alerts for one Zippy table.
+
+        :param table_name: Named table to inspect.
+        :type table_name: str
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Health alerts ordered by control-plane importance.
+        :rtype: list[dict[str, object]]
+        """
+        return _table_alerts(table_name, master=master)
+
+    def table_health(
+        self,
+        table_name: str,
+        *,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Return a compact health summary for one Zippy table.
+
+        :param table_name: Named table to inspect.
+        :type table_name: str
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Table health summary with alerts.
+        :rtype: dict[str, object]
+        """
+        return _table_health(table_name, master=master)
+
+    def drop_table(
+        self,
+        table_name: str,
+        *,
+        drop_persisted: bool = True,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Drop a named Zippy table from master.
+
+        :param table_name: Named table to remove.
+        :type table_name: str
+        :param drop_persisted: Whether to delete persisted parquet files registered for the table.
+        :type drop_persisted: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Drop summary returned by master.
+        :rtype: dict[str, object]
+        """
+        return _drop_table(table_name, drop_persisted=drop_persisted, master=master)
+
+    def compact_table(
+        self,
+        table_name: str,
+        *,
+        min_files: int = 2,
+        delete_sources: bool = True,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Compact small persisted parquet files for one table.
+
+        :param table_name: Named table to compact.
+        :type table_name: str
+        :param min_files: Minimum files in one partition group before compaction.
+        :type min_files: int
+        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :type delete_sources: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Compaction summary.
+        :rtype: dict[str, object]
+        """
+        return _compact_table(
+            table_name,
+            min_files=min_files,
+            delete_sources=delete_sources,
+            master=master,
+        )
+
+    def compact_tables(
+        self,
+        table_names: object = None,
+        *,
+        min_files: int = 2,
+        delete_sources: bool = True,
+        continue_on_error: bool = False,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Compact small persisted parquet files for multiple tables.
+
+        :param table_names: Table name, iterable of table names, or ``None`` to discover
+            persisted tables from master.
+        :type table_names: object
+        :param min_files: Minimum files in one partition group before compaction.
+        :type min_files: int
+        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :type delete_sources: bool
+        :param continue_on_error: Whether to keep compacting other tables after one table fails.
+        :type continue_on_error: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Multi-table compaction summary.
+        :rtype: dict[str, object]
+        """
+        return _compact_tables(
+            table_names,
+            min_files=min_files,
+            delete_sources=delete_sources,
+            continue_on_error=continue_on_error,
+            master=master,
+        )
+
+    def start_compaction_worker(
+        self,
+        table_names: object = None,
+        *,
+        interval_sec: float = 60.0,
+        min_files: int = 4,
+        delete_sources: bool = True,
+        master: MasterClient | None = None,
+    ):
+        """
+        Start a background worker that periodically compacts persisted parquet files.
+
+        This worker is an ops-side runtime helper. StreamTable writers remain responsible
+        only for writing persisted files and publishing metadata; compaction reads master
+        catalog state and replaces persisted metadata through the control plane.
+
+        :param table_names: Table name, iterable of table names, or ``None`` to discover
+            persisted tables from master on every pass.
+        :type table_names: object
+        :param interval_sec: Seconds between compaction passes.
+        :type interval_sec: float
+        :param min_files: Minimum files in one partition group before compaction.
+        :type min_files: int
+        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :type delete_sources: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Background compaction worker handle.
+        :rtype: object
+        """
+        return _CompactionWorker(
+            table_names,
+            interval_sec=interval_sec,
+            min_files=min_files,
+            delete_sources=delete_sources,
+            master=master or _default_master(),
+        )
+
+
+ops = Ops()
 
 
 def _default_master() -> MasterClient:
@@ -481,6 +1294,66 @@ def _validate_heartbeat_interval(interval_sec: float) -> float:
     if not interval > 0:
         raise ValueError("heartbeat_interval_sec must be positive")
     return interval
+
+
+def _parse_timeout_seconds(timeout: float | str | None) -> float | None:
+    if timeout is None:
+        return None
+    if isinstance(timeout, str):
+        text = timeout.strip().lower()
+        if text.endswith("ms"):
+            value = float(text[:-2])
+            seconds = value / 1000.0
+        elif text.endswith("s"):
+            seconds = float(text[:-1])
+        elif text.endswith("m"):
+            seconds = float(text[:-1]) * 60.0
+        else:
+            seconds = float(text)
+    else:
+        seconds = float(timeout)
+    if seconds < 0:
+        raise ValueError("timeout must be non-negative")
+    return seconds
+
+
+def _wait_for_table_ready(
+    source: str,
+    master: MasterClient,
+    timeout: float | str | None,
+) -> None:
+    timeout_sec = _parse_timeout_seconds(timeout)
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+    last_error: BaseException | None = None
+
+    while True:
+        try:
+            stream = master.get_stream(source)
+        except RuntimeError as error:
+            if "stream not found" not in str(error):
+                raise
+            last_error = error
+        else:
+            if stream.get("data_path") != "segment":
+                return
+            if stream.get("status") != "stale" and stream.get("active_segment_descriptor"):
+                return
+            last_error = RuntimeError(
+                "table is not ready "
+                f"source=[{source}] status=[{stream.get('status')}]"
+            )
+
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for table source=[{source}] "
+                    f"master_uri=[{_master_uri_for_error(master)}]"
+                ) from last_error
+            sleep_sec = min(0.01, remaining)
+        else:
+            sleep_sec = 0.01
+        time.sleep(sleep_sec)
 
 
 def _set_default_master(
@@ -567,14 +1440,27 @@ class Table:
     :param master: Optional explicit master client. When omitted, the connection created by
         ``zippy.connect()`` is used.
     :type master: MasterClient | None
+    :param wait: When true, wait until the table exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :raises RuntimeError: If no explicit master is supplied and ``zippy.connect()`` was not called.
     """
 
-    def __init__(self, source: str, master: MasterClient | None = None) -> None:
+    def __init__(
+        self,
+        source: str,
+        master: MasterClient | None = None,
+        *,
+        wait: bool = False,
+        timeout: float | str | None = None,
+    ) -> None:
         selected_master = master or _default_master()
         self.source = source
         try:
             _ensure_master_process(selected_master, f"read_table.{source}")
+            if wait:
+                _wait_for_table_ready(source, selected_master, timeout)
             self._inner = _NativeQuery(source=source, master=selected_master)
             self._select_exprs: list[object] | None = None
             self._where_expr: object | None = None
@@ -637,6 +1523,33 @@ class Table:
         :rtype: dict[str, object]
         """
         return self._inner.stream_info()
+
+    def info(self) -> dict[str, object]:
+        """
+        Return current control-plane metadata for this table.
+
+        :returns: Stream metadata from master.
+        :rtype: dict[str, object]
+        """
+        return self.stream_info()
+
+    def alerts(self) -> list[dict[str, object]]:
+        """
+        Return metadata-derived health alerts for this table.
+
+        :returns: Health alerts ordered by control-plane importance.
+        :rtype: list[dict[str, object]]
+        """
+        return _build_table_alerts(self.info())
+
+    def health(self) -> dict[str, object]:
+        """
+        Return a compact health summary for this table.
+
+        :returns: Table health summary with alerts.
+        :rtype: dict[str, object]
+        """
+        return _table_health_from_info(self.info(), self.source)
 
     def snapshot(self) -> dict[str, object]:
         """
@@ -847,7 +1760,13 @@ class Table:
             )
         return frame.collect().to_arrow()
 
-def read_table(source: str, master: MasterClient | None = None) -> Table:
+def read_table(
+    source: str,
+    master: MasterClient | None = None,
+    *,
+    wait: bool = False,
+    timeout: float | str | None = None,
+) -> Table:
     """
     Open a named Zippy table.
 
@@ -855,10 +1774,15 @@ def read_table(source: str, master: MasterClient | None = None) -> Table:
     :type source: str
     :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
     :type master: MasterClient | None
+    :param wait: When true, wait until the table exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"500ms"``,
+        ``"30s"`` or ``"2m"``. ``None`` waits indefinitely.
+    :type timeout: float | str | None
     :returns: Table object for further operations such as ``tail``.
     :rtype: Table
     """
-    return Table(source=source, master=master)
+    return Table(source=source, master=master, wait=wait, timeout=timeout)
 
 
 def compare_replay(
@@ -1033,8 +1957,24 @@ def _non_overlapping_persisted_files(
         for item in snapshot.get("persisted_files", [])
         if isinstance(item, dict)
         and item.get("file_path")
-        and _persisted_segment_identity(item) not in live_identities
+        and not (_persisted_segment_identities(item) & live_identities)
     ]
+
+
+def _persisted_segment_identities(value: dict[str, object]) -> set[tuple[int, int]]:
+    source_segments = value.get("source_segments")
+    if isinstance(source_segments, list):
+        identities = {
+            identity
+            for item in source_segments
+            if isinstance(item, dict)
+            for identity in [_persisted_segment_identity(item)]
+            if identity is not None
+        }
+        if identities:
+            return identities
+    identity = _persisted_segment_identity(value)
+    return {identity} if identity is not None else set()
 
 
 def _concat_query_tables(tables: list[object | None], schema: object | None):
@@ -1188,6 +2128,10 @@ class StreamSubscriber:
     """
     Subscribe to a named stream and invoke a local Python callback with rows.
 
+    Live subscriptions are best-effort: a running subscriber can attach to a
+    restarted writer and continue receiving new rows, but rows missed while the
+    writer or reader is unavailable are not automatically backfilled.
+
     :param source: Named stream to subscribe to.
     :type source: str
     :param callback: Function called once for each incremental ``zippy.Row``.
@@ -1198,8 +2142,14 @@ class StreamSubscriber:
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
+    :type idle_spin_checks: int
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
+    :param wait: When true, wait until the stream exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :raises RuntimeError: If no explicit master is supplied and ``zippy.connect()`` was not called.
     """
 
@@ -1211,11 +2161,16 @@ class StreamSubscriber:
         *,
         poll_interval_ms: int | None = None,
         xfast: bool = False,
+        idle_spin_checks: int = 64,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+        wait: bool = False,
+        timeout: float | str | None = None,
         _table_callback: bool = False,
     ) -> None:
         selected_master = master or _default_master()
         _ensure_master_process(selected_master, f"subscribe.{source}")
+        if wait:
+            _wait_for_table_ready(source, selected_master, timeout)
         if _table_callback and instrument_ids is not None:
             raise ValueError("instrument_ids is only supported by subscribe row callbacks")
         if poll_interval_ms is None:
@@ -1228,6 +2183,7 @@ class StreamSubscriber:
             callback=callback,
             poll_interval_ms=effective_poll_interval_ms,
             xfast=xfast,
+            idle_spin_checks=idle_spin_checks,
             row_factory=None if _table_callback else Row,
             instrument_ids=instrument_ids,
         )
@@ -1258,6 +2214,15 @@ class StreamSubscriber:
         """
         self._inner.join()
 
+    def metrics(self) -> dict[str, object]:
+        """
+        Return runtime counters for this subscriber.
+
+        :returns: Subscriber counters such as delivered rows and descriptor updates.
+        :rtype: dict[str, object]
+        """
+        return self._inner.metrics()
+
 
 def subscribe(
     source: str,
@@ -1266,10 +2231,17 @@ def subscribe(
     *,
     poll_interval_ms: int = 1,
     xfast: bool = False,
+    idle_spin_checks: int = 64,
     instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+    wait: bool = False,
+    timeout: float | str | None = None,
 ) -> StreamSubscriber:
     """
     Subscribe to a stream using the default master connection.
+
+    This is a best-effort live subscription. It can resume on new writer
+    descriptors, but does not automatically backfill rows missed during writer
+    downtime.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -1281,8 +2253,14 @@ def subscribe(
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
+    :type idle_spin_checks: int
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
+    :param wait: When true, wait until the stream exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
@@ -1292,7 +2270,10 @@ def subscribe(
         master=master,
         poll_interval_ms=poll_interval_ms,
         xfast=xfast,
+        idle_spin_checks=idle_spin_checks,
         instrument_ids=instrument_ids,
+        wait=wait,
+        timeout=timeout,
     )
     return subscriber.start()
 
@@ -1304,9 +2285,16 @@ def subscribe_table(
     *,
     poll_interval_ms: int = 10,
     xfast: bool = False,
+    idle_spin_checks: int = 64,
+    wait: bool = False,
+    timeout: float | str | None = None,
 ) -> StreamSubscriber:
     """
     Subscribe to a stream using incremental ``pyarrow.Table`` callbacks.
+
+    This is a best-effort live subscription. It can resume on new writer
+    descriptors, but does not automatically backfill rows missed during writer
+    downtime.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -1318,6 +2306,12 @@ def subscribe_table(
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
+    :type idle_spin_checks: int
+    :param wait: When true, wait until the stream exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
@@ -1327,6 +2321,9 @@ def subscribe_table(
         master=master,
         poll_interval_ms=poll_interval_ms,
         xfast=xfast,
+        idle_spin_checks=idle_spin_checks,
+        wait=wait,
+        timeout=timeout,
         _table_callback=True,
     )
     return subscriber.start()
@@ -2778,6 +3775,28 @@ class Pipeline:
             self._started = True
         return self
 
+    def run_forever(self, *, poll_interval_sec: float = 1.0) -> "Pipeline":
+        """
+        Start the pipeline and block until interrupted.
+
+        :param poll_interval_sec: Sleep interval used by the foreground wait loop.
+        :type poll_interval_sec: float
+        :returns: This pipeline after graceful shutdown.
+        :rtype: Pipeline
+        :raises ValueError: If ``poll_interval_sec`` is not positive.
+        """
+        if poll_interval_sec <= 0:
+            raise ValueError("poll_interval_sec must be positive")
+
+        self.start()
+        try:
+            while True:
+                time.sleep(poll_interval_sec)
+        except KeyboardInterrupt:
+            return self
+        finally:
+            self.stop()
+
     def write(self, value) -> None:
         """
         Write data into the owned stream table.
@@ -3358,15 +4377,13 @@ __all__ = [
     "compare_replay",
     "config",
     "connect",
-    "drop_table",
     "log_info",
-    "list_tables",
     "master",
+    "ops",
     "read_table",
     "read_from",
     "replay",
     "subscribe",
     "subscribe_table",
-    "table_info",
     "version",
 ]

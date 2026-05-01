@@ -1,9 +1,14 @@
 use arrow::record_batch::RecordBatch;
 
-use crate::Result;
+use crate::{Result, SegmentTableView};
 
 pub trait Publisher: Send + 'static {
     fn publish(&mut self, batch: &RecordBatch) -> Result<()>;
+
+    fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
+        let batch = table.to_record_batch()?;
+        self.publish(&batch)
+    }
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
@@ -20,6 +25,10 @@ where
 {
     fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
         (**self).publish(batch)
+    }
+
+    fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
+        (**self).publish_table(table)
     }
 
     fn flush(&mut self) -> Result<()> {

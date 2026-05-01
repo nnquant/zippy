@@ -1102,6 +1102,11 @@ created_at
   `persist_events`，Python `Table.persist_events()` 可查询这些生命周期事件。
 - 后台 persist 失败会被记录，并在后续 `flush`、`stop` 或新的 `on_data` 中返回错误，
   不再只停留在测试辅助状态里。
+- 已完成 metadata-derived health API：
+  `zippy.read_table(table_name).alerts()` / `.health()` 与
+  `zippy.ops.table_alerts(table_name)` / `zippy.ops.table_health(table_name)` 会基于 master
+  catalog 汇总 `stale` stream、active descriptor 未发布、`persist_failed` 等告警；
+  persist 失败 e2e 已验证 health 结果能直接暴露 `persist_failed` error alert。
 - `drop_table(table_name, drop_persisted=True)` 已能清理 master catalog、segment descriptor
   和已登记 persisted parquet 文件。
 - StreamTable retention 已接入 reader lease 防护：本进程内仍被 pin 的 sealed mmap
@@ -1115,11 +1120,21 @@ created_at
   底层 lease。
 - master lease reaper 已清理过期 process 持有的 `segment_reader_leases`，并同步写入
   snapshot，避免 master 重启后 stale lease 复活并永久阻止 retention。
+- Persist/Retention 已完成第一版 partition compaction：master 控制面支持
+  `replace_persisted_files` 原子替换 persisted metadata；`zippy.ops.compact_table()`
+  会按 partition 分组把多个小 parquet 合并成 compacted parquet，成功替换 metadata
+  后再删除源文件。该能力属于低频 ops，不进入写入或订阅热路径。
+- 已完成第一版后台 compaction worker：
+  `zippy.ops.compact_tables()` 可批量扫描 persisted tables；
+  `zippy.ops.start_compaction_worker()` 可在独立 ops 线程里周期性触发 compaction。
+  当前实现不把 compaction 放到 StreamTable 写入方，写入方只负责 sealed segment
+  persist 和 metadata 发布；compaction 的长期方向是由 master catalog 统一调度，
+  实际 parquet IO/CPU 由 master 管理的后台 worker 或独立 ops worker 执行。
 
 剩余重点：
 
-- persist 失败后的告警还需要补齐。
-- partitioned parquet 小文件数量需要后续 compaction 策略。
+- master-native compaction scheduler、文件大小阈值、并发限流和 compaction 状态
+  可观测性仍需后续完善。
 
 ### 验收标准
 
@@ -1203,6 +1218,12 @@ stop；
 - Pipeline 内部处理 resource cleanup。
 - 保留底层组件 API，但 examples 推荐 Pipeline。
 
+当前已落地：
+
+- `Pipeline.run_forever(poll_interval_sec=...)` 已作为前台生命周期入口：
+  启动 pipeline 后阻塞等待，收到 `KeyboardInterrupt` 时自动调用 `stop()` 做 graceful
+  shutdown，适合 OpenCTP/source -> StreamTable 这类长期运行进程。
+
 ### 验收标准
 
 - OpenCTP/mock source -> StreamTable 最小代码不需要手动 publisher。
@@ -1278,6 +1299,43 @@ checksum 或 layout guard
 
 读端 attach 时必须校验 magic、version、schema/layout、segment_id 和 writer_epoch。
 
+当前增量已经把现有 active segment mmap header 显式暴露为
+`active_segment_control` / `SegmentControlSnapshot`：
+
+```text
+magic / layout_version
+schema_id
+segment_id / generation
+writer_epoch / descriptor_generation
+capacity_rows
+row_count / committed_row_count
+notify_seq
+waiter_count
+sealed
+payload_offset / committed_row_count_offset
+```
+
+这一步是 correctness baseline，不改变用户 API 的订阅方式；后续 wakeup primitive
+复用同一份 control snapshot 做 attach 校验和运行观测。
+已完成增量：writer 在 commit、clear_rows 和 rollover seal 时递增 `notify_seq`，读端可
+通过 `ActiveSegmentReader.notification_sequence()` 观察该序号。
+已完成增量：mmap header layout v2 已写入 `writer_epoch` 与
+`descriptor_generation`，descriptor envelope 升级为 v2；`ActiveSegmentReader`
+在 attach/update descriptor 时会校验 magic、layout version、schema/layout、
+segment identity、writer epoch 和 descriptor generation，不再允许篡改或 stale
+descriptor 静默进入读路径。`Table.snapshot()["active_segment_control"]` 也会暴露
+这两个字段，便于诊断 writer restart 与 rollover 边界。
+注意：control block 中的 `descriptor_generation` 是 active segment 本地 generation，
+用于 envelope/header 自校验；master catalog 的 `descriptor_generation` 仍是控制面
+metadata version，metadata-only 更新可能只推进 master generation。最终 rollover
+协议需要继续收敛两者的命名和映射关系。
+已完成增量：active segment header 预留到 128 字节，保证 payload 起点按 64B
+cacheline 对齐，避免 control fields 与列式 payload 共享同一 cacheline。
+已完成增量：mmap header layout v3 新增 `waiter_count`。reader 只有准备进入
+futex 阻塞等待时才登记 waiter；writer 每次 commit/rollover 仍递增 `notify_seq`，
+但只有 `waiter_count > 0` 时才执行 `FUTEX_WAKE` syscall。这样无 reader、xfast
+reader 或高频持续有数据的场景不会在写入热路径上为无等待者唤醒付出 syscall 成本。
+
 #### 14.3 wakeup primitive
 
 定义 Linux 优先的低延迟唤醒机制，例如 futex 或 eventfd。目标不是永久 spin，而是让
@@ -1285,6 +1343,23 @@ reader 在无数据时可阻塞，在写入和 rollover 时被快速唤醒。
 
 需要保留明确的 timeout / health check 路径，用于检测 writer crash、lease expired、
 control block 损坏和 resource cleanup。
+
+已完成增量：active segment mmap header 的 `notify_seq` 接入 Linux futex。
+`ActiveSegmentReader.wait_for_notification_after(observed, timeout)` 可以在无数据时
+阻塞等待 writer commit 或 rollover seal；`zippy.subscribe()` 和 `SegmentStreamSource`
+在非 xfast 模式下已使用该 mmap wakeup，timeout 仅作为 health check。
+已完成增量：`ActiveSegmentReader.is_sealed()` 可直接读取 mmap header 中的 sealed
+flag，subscriber 空轮询热路径不再为判断 rollover 构造完整 `SegmentControlSnapshot`。
+已完成增量：`SegmentReaderDriver` 在非 `xfast` 模式下改为 hybrid idle wait：
+先做短暂 spin 检查 `notify_seq`，仍无更新时才进入 futex 阻塞等待。这样低频 tick
+到达窗口内可以避开一次 futex wait syscall；持续空闲时仍会阻塞，不会退化成永久
+busy spin。`StreamSubscriber.metrics()` 已暴露 `mmap_spin_checks_total`、
+`mmap_futex_waits_total`、`mmap_futex_notifications_total` 和
+`mmap_futex_timeouts_total`，用于观察低延迟路径是否真的进入 spin/futex。
+已完成增量：`zippy.subscribe()` / `zippy.subscribe_table()` / `StreamSubscriber`
+暴露 `idle_spin_checks`，用于调节非 xfast 模式下进入 futex wait 前的短 spin 次数。
+默认值保持保守；实盘可以根据 CPU 预算和延迟目标增减该值，传 `0` 可直接退回
+纯 futex wait。
 
 #### 14.4 rollover protocol
 
@@ -1300,12 +1375,30 @@ reader 验证 generation 后切换 active segment。
 ```
 
 协议必须保证 reader 不会静默读到已释放 segment，也不会在 rollover 边界丢第一批数据。
+行情 live subscriber 暂定为 best-effort 语义：writer 停机、进程重启或 reader 本身
+不可用期间允许丢失增量行情，不在 M6.5 内实现 checkpoint、exactly-once 或自动
+persisted replay backfill。
+
+已完成增量：`SegmentReaderDriver` 在读空当前 active segment 后会先检查 mmap
+control block 的 `sealed` 状态。若旧段已 sealed 且新 descriptor 尚未到达，reader
+不再继续阻塞等待旧段 futex，而是等待 descriptor watcher 写入 update slot 的 condvar；
+watcher 收到 master long-poll update 或错误都会唤醒 reader。这样 rollover 后的 attach
+延迟由新 descriptor 到达驱动，不再被旧段上的 `poll_interval_ms` 量化。
 
 #### 14.5 subscriber / engine 接入
 
 `zippy.subscribe()`、`zippy.subscribe_table()` 和后续 downstream engine 应共享同一套
 segment-native reader。行回调、表回调、engine 输入都只是消费视图方式不同，不应维护
 三套切段发现逻辑。
+
+subscriber 接口语义：
+
+```text
+正常运行时尽快交付 live rows；
+writer restart 后自动 attach 新 active segment 并继续交付新 rows；
+不承诺补齐 restart 窗口里的历史 rows；
+若业务需要完整历史，应通过 Table.collect()/replay/persisted query 显式补数。
+```
 
 #### 14.6 benchmark 与回归
 
@@ -1321,12 +1414,49 @@ writer crash / stale descriptor detection latency
 CPU usage under idle / low-rate / high-rate ingest
 ```
 
+已补充轻量探针 `examples/07_ops/03_subscribe_latency_probe.py`：
+
+- 创建临时 StreamTable 并在启动 subscriber 后按固定间隔写入 tick；
+- 统计写入侧 `pipeline.write()` append latency，并单独汇总 rollover append latency；
+- 统计行级 callback 延迟 min/avg/p50/p95/p99/max；
+- 单独统计 rollover 后首行延迟，用于观察是否仍存在固定 50ms 量化长尾；
+- 输出 `StreamSubscriber.metrics()` 和 `active_segment_control`，方便把延迟与
+  descriptor generation / notify_seq 对齐。
+- 支持 `--idle-spin-checks`，可在 probe 中直接对比纯 futex wait 与
+  hybrid spin-before-futex 策略的延迟和 CPU 取舍。
+- 支持 `--warmup-ms`，将 subscriber 启动/attach 噪声与稳态 IPC 延迟拆开观测。
+- 输出 `slowest_rows`，保留最慢样本的 seq 和 rollover 标记，便于定位长尾来源。
+- 支持 `--discard-first-rows`，允许从统计中排除首条写入/attach 样本。
+
+2026-05-01 本机 smoke：
+
+```text
+uv run python examples/07_ops/03_subscribe_latency_probe.py \
+  --uri zippy://m65-probe \
+  --table subscribe_latency_probe_steady \
+  --drop-existing \
+  --rows 128 \
+  --interval-ms 1 \
+  --row-capacity 32 \
+  --poll-interval-ms 20 \
+  --idle-spin-checks 64 \
+  --warmup-ms 50 \
+  --discard-first-rows 1 \
+  --slowest-rows 5
+```
+
+结果：`measured_rows=127`，`latency_ms min=0.640 avg=1.199 p50=0.880
+p95=3.945 p99=6.787 max=7.802`，rollover 首行 `max=7.802ms`。最慢样本为
+`seq=32/64/96` 三个 rollover 首行，没有再出现固定 50ms 量化长尾。该结果是当前
+WSL2/本机调度环境下的烟测，不作为生产机器最终性能上限。
+
 ### 验收标准
 
 - rollover 后第一批数据不再出现固定 50ms 量化长尾。
 - subscriber 稳态读取不需要周期性控制面 descriptor polling。
 - reader attach stale descriptor 能得到明确错误或自动切换。
 - writer crash 后 reader 不会静默读取脏数据。
+- writer crash / restart 窗口内的 live 行情缺口暂不自动补偿。
 - mmap control block 资源能随 stream retention / persist / lease 明确清理。
 - M7 下游 engine 可以复用同一套 segment-native reader。
 
@@ -1385,6 +1515,25 @@ engine 内部尽量处理 `SegmentTableView`，只在必要时物化 Arrow。
 - `ReactiveLatestEngine` 支持 `source="ctp_ticks"` 形式从 master 查询 stream metadata，
   自动推导 `input_schema` 并 attach segment source；显式传 `input_schema` 时会校验 master
   中的 schema 一致。
+- M7 第一阶段已把 `zippy.subscribe()` 与 `SegmentStreamSource` 使用的 reader loop
+  收敛到内部 `SegmentReaderDriver`：read_available、descriptor update、reader lease
+  切换、mmap futex wakeup 与 timeout health check 只保留一套逻辑；后续 downstream
+  engine 继续通过 `SegmentStreamSource` 复用这条 segment-native 输入路径。
+- M7 第二阶段已把 named segment stream 接入通用 source 注册路径：
+  `ReactiveStateEngine`、`StreamTableEngine`、`KeyValueTableMaterializer`、
+  `TimeSeriesEngine` 可以在给定 `input_schema` 时直接使用 `source="table_name",
+  master=...`；`CrossSectionalEngine` 也支持直接消费 named segment stream。
+  `Session.engine(..., source="table_name")` 会继续自动注入共享 master。
+- 已补充真实链路 e2e：
+  `Pipeline.stream_table("named_ticks") -> TimeSeriesEngine(source="named_ticks") ->
+  Session.stream_table("named_bars") -> read_table("named_bars")`，验证下游 Engine
+  可以直接消费 named segment stream 并物化输出表。
+- 已补充 CrossSectionalEngine 真实链路 e2e：
+  `Pipeline.stream_table("named_returns") -> CrossSectionalEngine(source="named_returns") ->
+  Session.stream_table("named_return_ranks") -> read_table("named_return_ranks")`，验证截面
+  Engine 也能直接消费 named segment stream，并把输出作为普通 named table 查询。
+- 已补充示例 `examples/05_engines/03_named_stream_timeseries_session.py`，展示
+  named StreamTable 直接驱动 TimeSeriesEngine 的用户写法。
 - `Session.engine(...).run()` 已作为轻量 Python 编排层起步：Session 注入共享 master、
   默认 `NullPublisher()`，并统一管理多个 engine 的 `start/stop` 生命周期。后续需要在
   Session 上继续补 `to_table`、callback 输出和更完整的命名 output stream 管理。
@@ -1577,6 +1726,21 @@ producer 后启动并注册 ctp_ticks；
 Table 自动继续。
 ```
 
+当前进展：
+
+- 已完成 `zippy.read_table(name, wait=True, timeout=...)`：
+  - consumer 可先调用 `read_table(..., wait=True)` 等待 named table 出现在 master catalog；
+  - 等待条件是 stream 存在、data path 为 segment 且 active segment descriptor 已发布；
+  - `timeout` 支持秒数或 `"20ms"`、`"30s"`、`"2m"` 这类字符串；
+  - 已补充 e2e：reader 线程先启动，producer 后创建 `Pipeline.stream_table(...)` 并写入，
+    reader 返回的 `Table.tail(1)` 能读到 late producer 写入的数据。
+- 已完成 `zippy.subscribe(..., wait=True, timeout=...)` 和
+  `zippy.subscribe_table(..., wait=True, timeout=...)`：
+  - push consumer 也可以先于 producer 启动；
+  - 等待逻辑与 `read_table(wait=True)` 一致，只等待 stream 和 active descriptor 出现，
+    不做历史补数；
+  - 已补充 row callback 与 table callback 两条 late producer e2e。
+
 #### 17.3 Rollover e2e
 
 ```text
@@ -1671,8 +1835,11 @@ rollover latency
 
 - 已补充 `examples/07_ops/02_table_perf_probe.py` 轻量性能探针：
   - 记录 `read_table(table).tail(n)` latency 的 min/avg/p50/p95/p99/max。
+  - 记录 `read_table(table).scan_live()` latency 与 active scan throughput。
   - 记录 active/sealed/persisted 基础存储状态和 `/dev/shm` 使用量。
   - 可选 `--include-replay` 测量 persisted callback replay throughput。
+- `examples/07_ops/03_subscribe_latency_probe.py` 同时记录 append latency 与 rollover
+  append latency，补齐写入侧 p50/p95/p99 观测。
 
 ### 可观测指标
 
@@ -1694,10 +1861,17 @@ last persist timestamp
 当前进展：
 
 - 已完成 Python 高层可观测入口：
-  - `zippy.list_tables()`：列出 master 中注册的 table / stream 元数据。
-  - `zippy.table_info(table_name)`：查看单张表的 schema、status、descriptor、
+  - `zippy.read_table(table_name).info()` / `.alerts()` / `.health()`：单表对象视角的
+    低频诊断能力。
+  - `zippy.ops.list_tables()`：列出 master 中注册的 table / stream 元数据。
+  - `zippy.ops.table_info(table_name)`：查看单张表的 schema、status、descriptor、
     sealed/persisted 状态和 reader leases。
+  - `zippy.ops.table_alerts(table_name)`：返回结构化 health alerts，例如 `stream_stale`、
+    `active_descriptor_missing` 和 `persist_failed`。
+  - `zippy.ops.table_health(table_name)`：返回 `ok | warning | error` 的 compact summary，
+    便于 REPL、监控脚本和运维巡检直接消费。
 - 已补充 `examples/07_ops/01_table_observability.py` 运维示例。
+- 已补充 `examples/07_ops/05_table_health_check.py` 健康检查示例。
 
 ### 错误信息原则
 
@@ -1734,8 +1908,25 @@ persist_path
 已完成订阅基础：zippy.subscribe_table(source, callback) 回调增量 pyarrow.Table；
 已完成订阅稳定性基础：subscriber descriptor watcher 使用 master long-poll，
   已消除固定 50ms descriptor polling 长尾；
+已完成订阅恢复基础：上游 writer 进程过期后，同名 source 重新注册并发布新
+  segment descriptor 时，stream 会从 stale 恢复为可读，已启动 subscriber 可继续
+  接收新 writer 的增量数据；该语义是 best-effort live resume，不承诺补齐 writer
+  停机窗口里的行情缺口；
+已完成订阅可观测基础：StreamSubscriber.metrics() 暴露 delivered rows、descriptor
+  updates、current descriptor generation 和 last descriptor update timestamp，
+  用作后续 M6.5 control block / wakeup 协议的 correctness baseline；
+已完成 M6.5 第一阶段：ActiveSegmentReader.control_snapshot() 从 mmap header 读取
+  SegmentControlSnapshot，Table.snapshot() 暴露 active_segment_control；writer 在
+  commit、clear_rows、rollover seal 时递增 notify_seq 并通过 Linux futex wakeup
+  唤醒 reader；zippy.subscribe()/SegmentStreamSource 非 xfast 模式已经改为
+  mmap wakeup + timeout health check；
+已完成 M6.5 latency baseline：`examples/07_ops/03_subscribe_latency_probe.py`
+  可记录 subscriber 行级延迟和 rollover 后首行延迟，并输出 subscriber metrics 与
+  active segment control snapshot；
 已完成 Pipeline 基础：Pipeline.stream_table(...) 自动注册 stream/source、发布 active descriptor、托管 start/write/stop；
 已完成 Pipeline 基础：Pipeline.source(...) 支持 Python source schema 推断、source name/type 元数据、stop 托管；
+已完成 Pipeline 前台运行入口：Pipeline.run_forever(poll_interval_sec=...) 会 start 后阻塞，
+  并在 KeyboardInterrupt 时自动 stop，适合长期运行的 ingest 进程；
 已完成 TableSnapshot 增量：master StreamInfo 暴露 active_segment_descriptor、
   sealed_segments、persisted_files，Table.snapshot()/tail() 基于该边界读取；
 已完成 Table live scan 基础：Table.scan_live() 返回 pyarrow.RecordBatchReader，
@@ -1752,6 +1943,12 @@ persist_path
   Table.select()/where()/between() 记录 TablePlan，用户 API 不直接绑定 Polars；
   v0 在 Python 层把 TablePlan 编译到 Polars LazyFrame 执行，后续可下推到
   Rust/DataFusion/DuckDB/segment reader；
+已完成 consumer-before-producer 基础：zippy.read_table(name, wait=True, timeout=...)
+  会等待 named table 注册并发布 active segment descriptor，适合 REPL、监控进程或策略进程
+  先启动后等待 producer 注册的场景；
+已完成 push consumer-before-producer 基础：zippy.subscribe(..., wait=True, timeout=...)
+  与 zippy.subscribe_table(..., wait=True, timeout=...) 使用同一等待逻辑，适合监控和策略
+  回调进程先启动后等待 producer 注册的场景；
 已完成 Persist metadata 基础：master 可登记 persisted file metadata，
   Table.persisted_files()/scan_persisted() 可把 parquet 文件交给 PyArrow Dataset；
 已完成 StreamTable persist worker 基础：StreamTable rollover 后只把 sealed segment
@@ -1760,9 +1957,29 @@ persist_path
 已完成全局配置基础：master 默认读取 ~/.zippy/config.toml，也支持 -c/--config；
   ZIPPY_TABLE_* 环境变量可覆盖配置，MasterClient.get_config()/zippy.config() 可读取
   master 下发配置，Pipeline.stream_table() 默认使用 table row_capacity/persist 配置；
-待完成长期低延迟 IPC：M6.5 将切段发现、watermark 和 reader wakeup 下沉到
-  segment-native control block；
-待完成 Persist/Retention：persist 告警、partition compaction；
+已完成长期低延迟 IPC 增量：descriptor_generation / writer_epoch 已下沉到
+  segment-native control block，并在 reader attach/update descriptor 时校验；
+已完成长期低延迟 IPC 增量：rollover descriptor attach 协议已避免旧 sealed segment
+  上的 futex/poll interval 等待，改为 descriptor update condvar 唤醒；
+已完成长期低延迟 IPC 增量：control block layout v3 增加 `waiter_count`，writer
+  仅在存在阻塞 reader 时执行 futex wake，降低无 reader/xfast reader 场景下的写入
+  syscall 成本；
+已完成长期低延迟 IPC 增量：subscriber/SegmentStreamSource 的共享 reader driver
+  在非 xfast 模式下使用 short spin + futex wait 的 hybrid idle wait，降低低频
+  tick 场景中“刚空读就阻塞”的 syscall 概率，并通过 subscriber metrics 暴露等待
+  路径计数；
+已完成长期低延迟 IPC 增量：Python 订阅 API 暴露 `idle_spin_checks`，允许用户在
+  非 xfast 模式下按机器和行情节奏调节 spin-before-futex 策略；
+已完成长期低延迟 IPC 增量：subscriber latency probe 支持 `--idle-spin-checks`，
+  压测报告会回显参数并输出底层等待路径 metrics，便于实盘机器做参数扫描；
+已完成 M6.5 benchmark 增量：subscriber latency probe 支持 `--warmup-ms`，
+  避免把订阅线程启动和首轮 attach 抖动混入稳态 callback 延迟统计；
+已完成 M6.5 benchmark 增量：subscriber latency probe 输出 `slowest_rows`，
+  用于把 max/p99 长尾定位到具体 seq 与 rollover 边界；
+已完成 M6.5 benchmark 增量：subscriber latency probe 支持
+  `--discard-first-rows`，用于从稳态统计中排除首条写入/attach 启动成本；
+已完成 Persist/Retention 增量：partition compaction 第一版，支持手动
+  `zippy.ops.compact_table()` 合并小 parquet 并原子替换 persisted metadata；
 已完成 Persist/Retention 安全闭环：persist commit gating、reader lease、mmap GC、stale lease cleanup；
 待完成用户闭环：OpenCTP/native source 的真实长跑生命周期和错误传播验收。
 ```
@@ -1832,6 +2049,15 @@ reader wakeup
 stale descriptor detection
 resource cleanup
 latency benchmark baseline
+```
+
+非目标：
+
+```text
+live subscriber exactly-once
+自动 checkpoint resume
+自动 persisted replay backfill
+停机窗口内行情缺口自动补偿
 ```
 
 最小 demo：

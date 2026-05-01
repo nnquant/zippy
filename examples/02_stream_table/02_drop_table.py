@@ -31,10 +31,9 @@ def main() -> None:
     args = parser.parse_args()
 
     zp.connect(uri=args.uri, app="example_drop_table")
-    result = zp.drop_table(args.table, drop_persisted=not args.keep_persisted)
+    result = zp.ops.drop_table(args.table, drop_persisted=not args.keep_persisted)
     print(result)
 
 
 if __name__ == "__main__":
     main()
-

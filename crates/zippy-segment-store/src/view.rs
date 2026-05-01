@@ -3,10 +3,10 @@ use std::sync::Arc;
 use crate::{
     layout::ColumnLayout,
     segment::{
-        SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_GENERATION_OFFSET,
-        SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC, SHM_MAGIC_OFFSET,
-        SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET,
-        SHM_SEGMENT_ID_OFFSET,
+        SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
+        SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
+        SHM_MAGIC_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET,
+        SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WRITER_EPOCH_OFFSET,
     },
     ActiveSegmentDescriptor, ColumnSpec, ColumnType, CompiledSchema, SealedSegmentHandle,
     ShmRegion, ZippySegmentStoreError,
@@ -373,6 +373,16 @@ fn validate_active_descriptor_header(
     let generation = read_u64_header(shm_region, SHM_GENERATION_OFFSET)?;
     if generation != descriptor.generation() {
         return Err("active segment generation mismatch");
+    }
+
+    let writer_epoch = read_u64_header(shm_region, SHM_WRITER_EPOCH_OFFSET)?;
+    if writer_epoch != descriptor.writer_epoch() {
+        return Err("active segment writer epoch mismatch");
+    }
+
+    let descriptor_generation = read_u64_header(shm_region, SHM_DESCRIPTOR_GENERATION_OFFSET)?;
+    if descriptor_generation != descriptor.descriptor_generation() {
+        return Err("active segment descriptor generation mismatch");
     }
 
     let capacity = read_usize_header(shm_region, SHM_CAPACITY_ROWS_OFFSET)?;

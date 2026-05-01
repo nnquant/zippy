@@ -374,6 +374,12 @@ class MasterClient:
         persisted_file: object,
     ) -> None: ...
 
+    def replace_persisted_files(
+        self,
+        stream_name: str,
+        persisted_files: list[dict[str, object]],
+    ) -> None: ...
+
     def publish_persist_event(
         self,
         stream_name: str,
@@ -439,6 +445,7 @@ class StreamSubscriber:
         callback: object,
         poll_interval_ms: int = 1,
         xfast: bool = False,
+        idle_spin_checks: int = 64,
         row_factory: object | None = None,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
     ) -> None: ...
@@ -448,6 +455,8 @@ class StreamSubscriber:
     def stop(self) -> None: ...
 
     def join(self) -> None: ...
+
+    def metrics(self) -> dict[str, object]: ...
 
 
 class BusStreamTarget:
@@ -525,13 +534,17 @@ class ReactiveStateEngine:
         target: PublisherTarget,
         *,
         id_filter: list[str] | None = None,
-        source: ReactiveStateEngine
+        source: str
+        | ReactiveStateEngine
         | ReactiveLatestEngine
         | StreamTableEngine
         | TimeSeriesEngine
+        | CrossSectionalEngine
         | ZmqSource
         | BusStreamSource
+        | SegmentStreamSource
         | None = None,
+        master: MasterClient | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -606,13 +619,16 @@ class StreamTableEngine:
         input_schema: pa.Schema,
         target: PublisherTarget,
         *,
-        source: ReactiveStateEngine
+        source: str
+        | ReactiveStateEngine
         | ReactiveLatestEngine
         | StreamTableEngine
         | TimeSeriesEngine
         | ZmqSource
         | BusStreamSource
+        | SegmentStreamSource
         | None = None,
+        master: MasterClient | None = None,
         sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -656,14 +672,18 @@ class KeyValueTableMaterializer:
         by: str | list[str],
         target: PublisherTarget,
         *,
-        source: ReactiveStateEngine
+        source: str
+        | ReactiveStateEngine
         | ReactiveLatestEngine
         | StreamTableEngine
         | KeyValueTableMaterializer
         | TimeSeriesEngine
+        | CrossSectionalEngine
         | ZmqSource
         | BusStreamSource
+        | SegmentStreamSource
         | None = None,
+        master: MasterClient | None = None,
         sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -711,13 +731,16 @@ class TimeSeriesEngine:
         pre_factors: list[ExpressionFactor] | None = None,
         post_factors: list[ExpressionFactor] | None = None,
         id_filter: list[str] | None = None,
-        source: ReactiveStateEngine
+        source: str
+        | ReactiveStateEngine
         | ReactiveLatestEngine
         | StreamTableEngine
         | TimeSeriesEngine
         | ZmqSource
         | BusStreamSource
+        | SegmentStreamSource
         | None = None,
+        master: MasterClient | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
@@ -754,7 +777,8 @@ class CrossSectionalEngine:
         factors: list[CrossSectionalFactor],
         target: PublisherTarget,
         *,
-        source: TimeSeriesEngine | ZmqSource | None = None,
+        source: str | TimeSeriesEngine | ZmqSource | None = None,
+        master: MasterClient | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,

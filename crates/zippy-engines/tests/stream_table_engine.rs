@@ -16,6 +16,7 @@ use zippy_engines::{
 };
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
+    SegmentStore, SegmentStoreConfig,
 };
 
 fn input_schema() -> Arc<Schema> {
@@ -98,6 +99,33 @@ fn input_batch_with_rows(rows: usize) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+fn segment_table_view_with_rows(rows: usize) -> SegmentTableView {
+    let store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: rows.max(1),
+    })
+    .unwrap();
+    let handle = store
+        .open_partition_with_schema("ticks", "source", segment_schema())
+        .unwrap();
+    let writer = handle.writer();
+    for row_index in 0..rows {
+        let instrument_id = if row_index % 2 == 0 {
+            "IF2606"
+        } else {
+            "IH2606"
+        };
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", instrument_id)?;
+                row.write_i64("dt", 1_710_000_000_000_000_000_i64 + row_index as i64)?;
+                row.write_f64("last_price", 3912.4 + row_index as f64)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    SegmentTableView::from_row_span(handle.active_row_span(0, rows).unwrap())
 }
 
 fn latest_update_batch(instrument_ids: Vec<&str>, last_prices: Vec<f64>) -> RecordBatch {
@@ -205,6 +233,42 @@ fn stream_table_materializer_writes_batch_into_active_segment() {
         batch.column(2).to_data(),
         "last_price should be materialized into active segment"
     );
+}
+
+#[test]
+fn stream_table_materializer_writes_segment_view_into_active_segment() {
+    let mut materializer = StreamTableMaterializer::new("ticks", input_schema()).unwrap();
+    let view = segment_table_view_with_rows(2);
+
+    let outputs = materializer.on_data(view).unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(materializer.active_committed_row_count(), 2);
+
+    let active = materializer.active_record_batch().unwrap();
+    let instrument_ids = active
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let timestamps = active
+        .column(1)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    let prices = active
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    assert_eq!(active.num_rows(), 2);
+    assert_eq!(instrument_ids.value(0), "IF2606");
+    assert_eq!(instrument_ids.value(1), "IH2606");
+    assert_eq!(timestamps.value(0), 1_710_000_000_000_000_000_i64);
+    assert_eq!(timestamps.value(1), 1_710_000_000_000_000_001_i64);
+    assert_eq!(prices.value(0), 3912.4);
+    assert_eq!(prices.value(1), 3913.4);
 }
 
 #[test]
@@ -351,7 +415,7 @@ fn stream_table_materializer_exports_active_descriptor_envelope() {
     let descriptor: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
 
     assert_eq!(descriptor["magic"], "zippy.segment.active");
-    assert_eq!(descriptor["version"], 1);
+    assert_eq!(descriptor["version"], 2);
     assert_eq!(descriptor["segment_id"], 1);
     assert_eq!(descriptor["generation"], 0);
     assert!(descriptor["schema_id"].as_u64().unwrap() > 0);
@@ -364,12 +428,10 @@ fn stream_table_default_row_capacity_is_large_enough_for_live_ingest() {
 
     let envelope = materializer.active_descriptor_envelope_bytes().unwrap();
     let descriptor: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+    let row_capacity = descriptor["row_capacity"].as_u64().unwrap() as usize;
 
-    assert_eq!(
-        descriptor["row_capacity"].as_u64().unwrap() as usize,
-        DEFAULT_STREAM_TABLE_ROW_CAPACITY
-    );
-    assert!(DEFAULT_STREAM_TABLE_ROW_CAPACITY >= 65_536);
+    assert_eq!(row_capacity, DEFAULT_STREAM_TABLE_ROW_CAPACITY);
+    assert!(row_capacity >= 65_536);
 }
 
 #[derive(Default)]
@@ -632,6 +694,41 @@ fn stream_table_materializer_rolls_over_full_active_segment_and_publishes_descri
     let descriptor: serde_json::Value = serde_json::from_slice(&envelopes[0]).unwrap();
     assert_eq!(descriptor["segment_id"], 2);
     assert_eq!(descriptor["generation"], 1);
+}
+
+#[test]
+fn stream_table_materializer_rolls_over_segment_view_input() {
+    let publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 2)
+            .unwrap()
+            .with_descriptor_publisher(publisher.clone());
+
+    materializer
+        .on_data(segment_table_view_with_rows(5))
+        .unwrap();
+
+    assert_eq!(materializer.active_committed_row_count(), 1);
+    let active = materializer.active_record_batch().unwrap();
+    let instrument_ids = active
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prices = active
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(instrument_ids.value(0), "IF2606");
+    assert_eq!(prices.value(0), 3916.4);
+
+    let envelopes = publisher.envelopes.lock().unwrap();
+    assert_eq!(envelopes.len(), 2);
+    let descriptor: serde_json::Value = serde_json::from_slice(envelopes.last().unwrap()).unwrap();
+    assert_eq!(descriptor["segment_id"], 3);
+    assert_eq!(descriptor["generation"], 2);
+    assert_eq!(descriptor["sealed_segments"].as_array().unwrap().len(), 2);
 }
 
 #[test]

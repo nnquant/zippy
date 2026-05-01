@@ -77,11 +77,23 @@ def summarize_samples_ms(samples_ms: list[float]) -> dict[str, float | int | Non
     }
 
 
+def summarize_numeric_samples(samples: list[float]) -> dict[str, float | int | None]:
+    """
+    Summarize generic numeric samples.
+
+    :param samples: Numeric samples.
+    :type samples: list[float]
+    :returns: Summary with count, min, avg, p50, p95, p99, and max.
+    :rtype: dict[str, float | int | None]
+    """
+    return summarize_samples_ms(samples)
+
+
 def table_storage_summary(table_info: dict[str, object]) -> dict[str, object]:
     """
-    Summarize storage-related metadata from ``zippy.table_info``.
+    Summarize storage-related metadata from ``zippy.ops.table_info``.
 
-    :param table_info: Metadata returned by ``zippy.table_info``.
+    :param table_info: Metadata returned by ``zippy.ops.table_info``.
     :type table_info: dict[str, object]
     :returns: Storage summary.
     :rtype: dict[str, object]
@@ -162,6 +174,51 @@ def measure_tail_latency(table_name: str, tail_n: int, iterations: int) -> dict[
     }
 
 
+def measure_scan_live_throughput(table_name: str, iterations: int) -> dict[str, object]:
+    """
+    Measure ``read_table(...).scan_live()`` throughput.
+
+    :param table_name: Zippy table name.
+    :type table_name: str
+    :param iterations: Number of repeated scans.
+    :type iterations: int
+    :returns: Scan throughput report.
+    :rtype: dict[str, object]
+    :raises ValueError: If ``iterations`` is invalid.
+    """
+    if iterations <= 0:
+        raise ValueError("iterations must be greater than zero")
+
+    table = zp.read_table(table_name)
+    samples_ms: list[float] = []
+    throughput_samples: list[float] = []
+    last_batches = 0
+    last_rows = 0
+
+    for _ in range(iterations):
+        started_ns = time.perf_counter_ns()
+        rows = 0
+        batches = 0
+        for batch in table.scan_live():
+            batches += 1
+            rows += batch.num_rows
+        elapsed_ns = time.perf_counter_ns() - started_ns
+        elapsed_ms = elapsed_ns / 1_000_000.0
+        elapsed_sec = elapsed_ns / 1_000_000_000.0
+        samples_ms.append(elapsed_ms)
+        throughput_samples.append(rows / elapsed_sec if elapsed_sec > 0.0 else 0.0)
+        last_batches = batches
+        last_rows = rows
+
+    return {
+        "iterations": iterations,
+        "last_batches": last_batches,
+        "last_rows": last_rows,
+        "latency_ms": summarize_samples_ms(samples_ms),
+        "throughput_rows_per_sec": summarize_numeric_samples(throughput_samples),
+    }
+
+
 def measure_replay_throughput(table_name: str) -> dict[str, object]:
     """
     Measure callback replay throughput over persisted rows.
@@ -200,16 +257,18 @@ def main() -> None:
     parser.add_argument("--table", required=True, help="要测量的表名")
     parser.add_argument("--tail-n", type=int, default=1000, help="tail 请求行数")
     parser.add_argument("--iterations", type=int, default=20, help="tail 重复测量次数")
+    parser.add_argument("--scan-iterations", type=int, default=5, help="scan_live 重复测量次数")
     parser.add_argument("--include-replay", action="store_true", help="额外测量 persisted replay 吞吐")
     args = parser.parse_args()
 
     zp.connect(uri=args.uri, app="example_table_perf_probe")
-    info = zp.table_info(args.table)
+    info = zp.ops.table_info(args.table)
     report: dict[str, object] = {
         "table": args.table,
         "observed_at_unix_ns": time.time_ns(),
         "storage": table_storage_summary(info),
         "tail": measure_tail_latency(args.table, args.tail_n, args.iterations),
+        "scan_live": measure_scan_live_throughput(args.table, args.scan_iterations),
         "dev_shm": dev_shm_usage(),
     }
 

@@ -26,6 +26,10 @@ impl SegmentRowView {
         self.span.end_row() - self.span.start_row()
     }
 
+    pub fn row_span(&self) -> &RowSpanView {
+        &self.span
+    }
+
     pub fn column(&self, name: &str) -> Result<ArrayRef> {
         self.span.column(name).map_err(arrow_zippy_error)
     }
@@ -77,6 +81,13 @@ impl SegmentTableView {
         match self {
             Self::Segment(row_view) => row_view.num_rows(),
             Self::Memory(batch) => batch.num_rows(),
+        }
+    }
+
+    pub fn as_segment_row_view(&self) -> Option<&SegmentRowView> {
+        match self {
+            Self::Segment(row_view) => Some(row_view),
+            Self::Memory(_) => None,
         }
     }
 

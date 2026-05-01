@@ -28,6 +28,8 @@ def main() -> None:
     parser.add_argument("--stream", default="demo_ticks", help="订阅的 stream/table 名")
     parser.add_argument("--max-rows", type=int, default=100, help="累计接收多少行后退出")
     parser.add_argument("--timeout-sec", type=float, default=30.0, help="最长等待时间")
+    parser.add_argument("--wait-stream", action="store_true", help="stream 尚未创建时等待 producer")
+    parser.add_argument("--wait-timeout", default="30s", help="等待 stream 创建的超时时间")
     args = parser.parse_args()
 
     zp.connect(uri=args.uri, app="example_subscribe_table")
@@ -49,7 +51,12 @@ def main() -> None:
         if received >= args.max_rows:
             done.set()
 
-    subscriber = zp.subscribe_table(args.stream, callback=on_table)
+    subscriber = zp.subscribe_table(
+        args.stream,
+        callback=on_table,
+        wait=args.wait_stream,
+        timeout=args.wait_timeout,
+    )
     try:
         done.wait(args.timeout_sec)
     finally:
@@ -58,4 +65,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

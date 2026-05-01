@@ -10,12 +10,14 @@ use crate::{
     segment::ActiveSegmentDescriptor,
     segment::{SealedSegmentData, SealedUtf8Column},
     segment::{
-        SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_GENERATION_OFFSET,
-        SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC, SHM_MAGIC_OFFSET,
-        SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET,
-        SHM_SEGMENT_ID_OFFSET,
+        SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
+        SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
+        SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET,
+        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WAITER_COUNT_OFFSET,
+        SHM_WRITER_EPOCH_OFFSET,
     },
-    ColumnType, CompiledSchema, LayoutPlan, SealedSegmentHandle, SegmentHeader, ShmRegion,
+    ColumnType, CompiledSchema, LayoutPlan, RowSpanView, SealedSegmentHandle, SegmentCellValue,
+    SegmentHeader, ShmRegion,
 };
 
 /// Active segment 在共享内存中的最小布局信息。
@@ -61,6 +63,8 @@ impl ActiveSegmentWriter {
             layout,
             segment_id,
             generation,
+            0,
+            generation.saturating_add(1),
             format!("segment-{segment_id}-generation-{generation}"),
         )
     }
@@ -80,6 +84,8 @@ impl ActiveSegmentWriter {
         layout: LayoutPlan,
         segment_id: u64,
         generation: u64,
+        writer_epoch: u64,
+        descriptor_generation: u64,
         persistence_key: String,
     ) -> Result<Self, &'static str> {
         let mut i64_columns = HashMap::new();
@@ -120,6 +126,12 @@ impl ActiveSegmentWriter {
         write_u64_header(&mut shm_region, SHM_SCHEMA_ID_OFFSET, schema.schema_id())?;
         write_u64_header(&mut shm_region, SHM_SEGMENT_ID_OFFSET, segment_id)?;
         write_u64_header(&mut shm_region, SHM_GENERATION_OFFSET, generation)?;
+        write_u64_header(&mut shm_region, SHM_WRITER_EPOCH_OFFSET, writer_epoch)?;
+        write_u64_header(
+            &mut shm_region,
+            SHM_DESCRIPTOR_GENERATION_OFFSET,
+            descriptor_generation,
+        )?;
         write_u64_header(
             &mut shm_region,
             SHM_CAPACITY_ROWS_OFFSET,
@@ -132,6 +144,12 @@ impl ActiveSegmentWriter {
         shm_region
             .write_at(SHM_SEALED_OFFSET, &[0_u8])
             .map_err(|_| "failed to initialize shared memory sealed flag")?;
+        shm_region
+            .store_u32_release(SHM_NOTIFY_SEQ_OFFSET, 0)
+            .map_err(|_| "failed to initialize shared memory notify sequence")?;
+        shm_region
+            .store_u32_release(SHM_WAITER_COUNT_OFFSET, 0)
+            .map_err(|_| "failed to initialize shared memory waiter count")?;
         write_u32_header(&mut shm_region, SHM_MAGIC_OFFSET, SHM_MAGIC)?;
         write_u32_header(
             &mut shm_region,
@@ -144,6 +162,8 @@ impl ActiveSegmentWriter {
                 schema_id: schema.schema_id(),
                 segment_id,
                 generation,
+                writer_epoch,
+                descriptor_generation,
                 capacity_rows: layout.row_capacity(),
                 row_count: 0,
                 committed_row_count: Arc::new(AtomicUsize::new(0)),
@@ -185,6 +205,11 @@ impl ActiveSegmentWriter {
 
     /// 提交当前行，使 reader 可见 committed prefix。
     pub fn commit_row(&mut self) -> Result<(), &'static str> {
+        self.finish_open_row()?;
+        self.publish_committed_prefix()
+    }
+
+    pub(crate) fn finish_open_row(&mut self) -> Result<(), &'static str> {
         if !self.current_row_open {
             return Err("row is not open");
         }
@@ -208,6 +233,10 @@ impl ActiveSegmentWriter {
         self.header.row_count += 1;
         self.row_cursor += 1;
         self.current_row_open = false;
+        Ok(())
+    }
+
+    pub(crate) fn publish_committed_prefix(&mut self) -> Result<(), &'static str> {
         self.header
             .committed_row_count
             .store(self.row_cursor, Ordering::Release);
@@ -219,6 +248,7 @@ impl ActiveSegmentWriter {
         self.shm_region
             .store_u64_release(SHM_COMMITTED_ROW_COUNT_OFFSET, self.row_cursor as u64)
             .map_err(|_| "failed to publish shared memory committed row count")?;
+        self.notify_readers()?;
         Ok(())
     }
 
@@ -273,6 +303,7 @@ impl ActiveSegmentWriter {
         self.header.row_count = 0;
         self.row_cursor = 0;
         write_u64_header(&mut self.shm_region, SHM_ROW_COUNT_OFFSET, 0)?;
+        self.notify_readers()?;
 
         for (column_name, validity) in self.validity.iter_mut() {
             validity.fill(false);
@@ -436,6 +467,60 @@ impl ActiveSegmentWriter {
         self.commit_row()
     }
 
+    /// 从 segment 行视图直接追加多行，避免先物化成 Arrow batch。
+    pub fn append_row_span(
+        &mut self,
+        span: &RowSpanView,
+        start_offset: usize,
+        max_rows: usize,
+    ) -> Result<usize, &'static str> {
+        if self.header.sealed {
+            return Err("segment is sealed");
+        }
+        if self.current_row_open {
+            return Err("row already open");
+        }
+        if start_offset > span.row_count() {
+            return Err("row span start offset out of bounds");
+        }
+        if max_rows == 0 {
+            return Ok(0);
+        }
+
+        let source_remaining = span.row_count() - start_offset;
+        let target_remaining = self.layout.row_capacity().saturating_sub(self.row_cursor);
+        let rows_to_copy = source_remaining.min(max_rows).min(target_remaining);
+        if rows_to_copy == 0 {
+            return Err("segment is full");
+        }
+
+        let columns = self.schema.columns().to_vec();
+        let mut copied = 0;
+        for row_offset in start_offset..start_offset + rows_to_copy {
+            self.begin_row()?;
+            let row_result = self.write_row_span_row(span, row_offset, &columns);
+            match row_result {
+                Ok(()) => {
+                    self.finish_open_row()?;
+                    copied += 1;
+                }
+                Err(error) => {
+                    if self.current_row_open {
+                        let _ = self.abort_row();
+                    }
+                    if copied > 0 {
+                        self.publish_committed_prefix()?;
+                        return Ok(copied);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        self.publish_committed_prefix()?;
+        Ok(copied)
+    }
+
     /// 导出测试用 sealed snapshot。
     pub fn sealed_handle_for_test(&self) -> Result<SealedSegmentHandle, &'static str> {
         Ok(self.snapshot_sealed_handle())
@@ -451,6 +536,8 @@ impl ActiveSegmentWriter {
             committed_row_count_offset: SHM_COMMITTED_ROW_COUNT_OFFSET,
             segment_id: self.header.segment_id,
             generation: self.header.generation,
+            writer_epoch: self.header.writer_epoch,
+            descriptor_generation: self.header.descriptor_generation,
         }
     }
 
@@ -473,6 +560,7 @@ impl ActiveSegmentWriter {
             .write_at(SHM_SEALED_OFFSET, &[1_u8])
             .map_err(|_| "failed to mark shared memory segment as sealed")?;
         self.header.sealed = true;
+        self.notify_readers()?;
         Ok(sealed)
     }
 
@@ -490,6 +578,22 @@ impl ActiveSegmentWriter {
         Ok(())
     }
 
+    fn notify_readers(&self) -> Result<(), &'static str> {
+        self.shm_region
+            .fetch_add_u32_release(SHM_NOTIFY_SEQ_OFFSET, 1)
+            .map_err(|_| "failed to increment shared memory notify sequence")?;
+        let waiter_count = self
+            .shm_region
+            .load_u32_acquire(SHM_WAITER_COUNT_OFFSET)
+            .map_err(|_| "failed to read shared memory waiter count")?;
+        if waiter_count > 0 {
+            self.shm_region
+                .wake_u32(SHM_NOTIFY_SEQ_OFFSET)
+                .map_err(|_| "failed to wake shared memory readers")?;
+        }
+        Ok(())
+    }
+
     fn column_type(&self, column: &str) -> Result<&ColumnType, &'static str> {
         self.schema
             .columns()
@@ -501,6 +605,36 @@ impl ActiveSegmentWriter {
 
     pub(crate) fn has_open_row(&self) -> bool {
         self.current_row_open
+    }
+
+    pub(crate) fn remaining_row_capacity(&self) -> usize {
+        self.layout.row_capacity().saturating_sub(self.row_cursor)
+    }
+
+    fn write_row_span_row(
+        &mut self,
+        span: &RowSpanView,
+        row_offset: usize,
+        columns: &[crate::ColumnSpec],
+    ) -> Result<(), &'static str> {
+        for spec in columns {
+            match span
+                .cell_value(row_offset, spec.name)
+                .map_err(|_| "failed to read row span cell")?
+            {
+                SegmentCellValue::Null => {
+                    if !spec.nullable {
+                        return Err("non-nullable column received null");
+                    }
+                    self.mark_invalid(spec.name)?;
+                }
+                SegmentCellValue::Int64(value) => self.write_i64(spec.name, value)?,
+                SegmentCellValue::Float64(value) => self.write_f64(spec.name, value)?,
+                SegmentCellValue::Utf8(value) => self.write_utf8(spec.name, &value)?,
+                SegmentCellValue::TimestampNs(value) => self.write_i64(spec.name, value)?,
+            }
+        }
+        Ok(())
     }
 
     fn snapshot_sealed_handle(&self) -> SealedSegmentHandle {

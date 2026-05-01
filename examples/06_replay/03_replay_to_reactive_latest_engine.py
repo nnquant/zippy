@@ -91,7 +91,7 @@ def main() -> None:
     if args.drop_existing:
         for table_name in (args.latest_table, args.replay_stream, args.live_table):
             try:
-                zp.drop_table(table_name, drop_persisted=True)
+                zp.ops.drop_table(table_name, drop_persisted=True)
             except RuntimeError:
                 pass
 
