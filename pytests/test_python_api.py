@@ -5868,6 +5868,8 @@ def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> Non
     assert report["warmup_ms"] == 0.0
     assert report["discard_first_rows"] == 1
     assert report["measured_rows"] == 19
+    assert report["append_latency_ms"]["count"] == 20
+    assert report["rollover_append_latency_ms"]["count"] == 2
     assert report["latency_ms"]["count"] == 19
     assert len(report["slowest_rows"]) == 3
     assert min(row["seq"] for row in report["slowest_rows"]) >= 1

@@ -179,6 +179,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     latencies_ms: list[float] = []
     rollover_first_latencies_ms: list[float] = []
     latency_samples: list[dict[str, Any]] = []
+    append_latencies_ms: list[float] = []
+    rollover_append_latencies_ms: list[float] = []
     received_rows = 0
 
     def on_row(row: zp.Row) -> None:
@@ -228,7 +230,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             time.sleep(args.warmup_ms / 1000.0)
 
         for seq in range(args.rows):
-            pipeline.write(make_tick(seq, time.time_ns()))
+            tick = make_tick(seq, time.time_ns())
+            append_started_ns = time.perf_counter_ns()
+            pipeline.write(tick)
+            append_latency_ms = (time.perf_counter_ns() - append_started_ns) / 1_000_000.0
+            append_latencies_ms.append(append_latency_ms)
+            if seq > 0 and seq % args.row_capacity == 0:
+                rollover_append_latencies_ms.append(append_latency_ms)
             if args.interval_ms > 0.0:
                 time.sleep(args.interval_ms / 1000.0)
 
@@ -255,6 +263,8 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "warmup_ms": args.warmup_ms,
             "discard_first_rows": args.discard_first_rows,
             "measured_rows": len(all_latencies),
+            "append_latency_ms": summarize_samples_ms(append_latencies_ms),
+            "rollover_append_latency_ms": summarize_samples_ms(rollover_append_latencies_ms),
             "latency_ms": summarize_samples_ms(all_latencies),
             "slowest_rows": slowest_latency_rows(row_samples, args.slowest_rows),
             "rollover_first_row_latency_ms": summarize_samples_ms(rollover_latencies),

@@ -1417,6 +1417,7 @@ CPU usage under idle / low-rate / high-rate ingest
 已补充轻量探针 `examples/07_ops/03_subscribe_latency_probe.py`：
 
 - 创建临时 StreamTable 并在启动 subscriber 后按固定间隔写入 tick；
+- 统计写入侧 `pipeline.write()` append latency，并单独汇总 rollover append latency；
 - 统计行级 callback 延迟 min/avg/p50/p95/p99/max；
 - 单独统计 rollover 后首行延迟，用于观察是否仍存在固定 50ms 量化长尾；
 - 输出 `StreamSubscriber.metrics()` 和 `active_segment_control`，方便把延迟与
@@ -1837,6 +1838,8 @@ rollover latency
   - 记录 `read_table(table).scan_live()` latency 与 active scan throughput。
   - 记录 active/sealed/persisted 基础存储状态和 `/dev/shm` 使用量。
   - 可选 `--include-replay` 测量 persisted callback replay throughput。
+- `examples/07_ops/03_subscribe_latency_probe.py` 同时记录 append latency 与 rollover
+  append latency，补齐写入侧 p50/p95/p99 观测。
 
 ### 可观测指标
 
