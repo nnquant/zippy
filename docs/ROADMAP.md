@@ -1423,6 +1423,9 @@ CPU usage under idle / low-rate / high-rate ingest
   descriptor generation / notify_seq 对齐。
 - 支持 `--idle-spin-checks`，可在 probe 中直接对比纯 futex wait 与
   hybrid spin-before-futex 策略的延迟和 CPU 取舍。
+- 支持 `--warmup-ms`，将 subscriber 启动/attach 噪声与稳态 IPC 延迟拆开观测。
+- 输出 `slowest_rows`，保留最慢样本的 seq 和 rollover 标记，便于定位长尾来源。
+- 支持 `--discard-first-rows`，允许从统计中排除首条写入/attach 样本。
 
 ### 验收标准
 
@@ -1943,6 +1946,12 @@ persist_path
   非 xfast 模式下按机器和行情节奏调节 spin-before-futex 策略；
 已完成长期低延迟 IPC 增量：subscriber latency probe 支持 `--idle-spin-checks`，
   压测报告会回显参数并输出底层等待路径 metrics，便于实盘机器做参数扫描；
+已完成 M6.5 benchmark 增量：subscriber latency probe 支持 `--warmup-ms`，
+  避免把订阅线程启动和首轮 attach 抖动混入稳态 callback 延迟统计；
+已完成 M6.5 benchmark 增量：subscriber latency probe 输出 `slowest_rows`，
+  用于把 max/p99 长尾定位到具体 seq 与 rollover 边界；
+已完成 M6.5 benchmark 增量：subscriber latency probe 支持
+  `--discard-first-rows`，用于从稳态统计中排除首条写入/attach 启动成本；
 已完成 Persist/Retention 增量：partition compaction 第一版，支持手动
   `zippy.ops.compact_table()` 合并小 parquet 并原子替换 persisted metadata；
 已完成 Persist/Retention 安全闭环：persist commit gating、reader lease、mmap GC、stale lease cleanup；

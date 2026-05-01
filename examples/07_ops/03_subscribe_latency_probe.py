@@ -100,6 +100,29 @@ def summarize_samples_ms(samples_ms: list[float]) -> dict[str, float | int | Non
     }
 
 
+def slowest_latency_rows(samples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """
+    返回延迟最高的若干行样本。
+
+    :param samples: 行级延迟样本，每项至少包含 ``latency_ms``。
+    :type samples: list[dict[str, typing.Any]]
+    :param limit: 返回行数上限；小于等于 0 时返回空列表。
+    :type limit: int
+    :returns: 按 ``latency_ms`` 从高到低排序的样本副本。
+    :rtype: list[dict[str, typing.Any]]
+    """
+    if limit <= 0:
+        return []
+    return [
+        dict(sample)
+        for sample in sorted(
+            samples,
+            key=lambda sample: float(sample["latency_ms"]),
+            reverse=True,
+        )[:limit]
+    ]
+
+
 def make_tick(seq: int, localtime_ns: int) -> pl.DataFrame:
     """
     构造单行 tick。
@@ -155,6 +178,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     lock = threading.Lock()
     latencies_ms: list[float] = []
     rollover_first_latencies_ms: list[float] = []
+    latency_samples: list[dict[str, Any]] = []
     received_rows = 0
 
     def on_row(row: zp.Row) -> None:
@@ -172,11 +196,21 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         seq = int(values["seq"])
         localtime_ns = int(values["localtime_ns"])
         latency_ms = (callback_started_ns - localtime_ns) / 1_000_000.0
+        rollover_first_row = seq > 0 and seq % args.row_capacity == 0
+        measured = seq >= args.discard_first_rows
 
         with lock:
-            latencies_ms.append(latency_ms)
-            if seq > 0 and seq % args.row_capacity == 0:
-                rollover_first_latencies_ms.append(latency_ms)
+            if measured:
+                latencies_ms.append(latency_ms)
+                latency_samples.append(
+                    {
+                        "seq": seq,
+                        "latency_ms": latency_ms,
+                        "rollover_first_row": rollover_first_row,
+                    }
+                )
+                if rollover_first_row:
+                    rollover_first_latencies_ms.append(latency_ms)
             received_rows += 1
             if received_rows >= args.rows:
                 done.set()
@@ -190,6 +224,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         idle_spin_checks=args.idle_spin_checks,
     )
     try:
+        if args.warmup_ms > 0.0:
+            time.sleep(args.warmup_ms / 1000.0)
+
         for seq in range(args.rows):
             pipeline.write(make_tick(seq, time.time_ns()))
             if args.interval_ms > 0.0:
@@ -205,6 +242,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         with lock:
             all_latencies = list(latencies_ms)
             rollover_latencies = list(rollover_first_latencies_ms)
+            row_samples = [dict(sample) for sample in latency_samples]
 
         return {
             "table": args.table,
@@ -214,7 +252,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "xfast": args.xfast,
             "poll_interval_ms": args.poll_interval_ms,
             "idle_spin_checks": args.idle_spin_checks,
+            "warmup_ms": args.warmup_ms,
+            "discard_first_rows": args.discard_first_rows,
+            "measured_rows": len(all_latencies),
             "latency_ms": summarize_samples_ms(all_latencies),
+            "slowest_rows": slowest_latency_rows(row_samples, args.slowest_rows),
             "rollover_first_row_latency_ms": summarize_samples_ms(rollover_latencies),
             "subscriber_metrics": subscriber.metrics(),
             "active_segment_control": snapshot.get("active_segment_control"),
@@ -246,6 +288,24 @@ def main() -> None:
         default=64,
         help="非 xfast 模式进入 futex wait 前的短自旋检查次数；0 表示纯 futex wait",
     )
+    parser.add_argument(
+        "--warmup-ms",
+        type=float,
+        default=20.0,
+        help="subscriber 启动后、正式写入前的预热等待时间，用于隔离启动噪声",
+    )
+    parser.add_argument(
+        "--discard-first-rows",
+        type=int,
+        default=0,
+        help="从延迟统计中丢弃前 N 条行样本，用于排除首条写入/attach 噪声",
+    )
+    parser.add_argument(
+        "--slowest-rows",
+        type=int,
+        default=5,
+        help="报告中保留的最慢行样本数量，便于定位长尾 seq",
+    )
     parser.add_argument("--timeout-sec", type=float, default=10.0, help="等待接收完成的超时时间")
     parser.add_argument("--xfast", action="store_true", help="使用 spin loop 模式")
     parser.add_argument(
@@ -261,6 +321,14 @@ def main() -> None:
         raise ValueError("row_capacity must be greater than zero")
     if args.idle_spin_checks < 0:
         raise ValueError("idle_spin_checks must be greater than or equal to zero")
+    if args.warmup_ms < 0.0:
+        raise ValueError("warmup_ms must be greater than or equal to zero")
+    if args.discard_first_rows < 0:
+        raise ValueError("discard_first_rows must be greater than or equal to zero")
+    if args.discard_first_rows >= args.rows:
+        raise ValueError("discard_first_rows must be less than rows")
+    if args.slowest_rows < 0:
+        raise ValueError("slowest_rows must be greater than or equal to zero")
     if args.poll_interval_ms <= 0 and not args.xfast:
         raise ValueError("poll_interval_ms must be greater than zero unless xfast is true")
 

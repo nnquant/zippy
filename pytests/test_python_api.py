@@ -5769,6 +5769,14 @@ def test_subscribe_latency_probe_summarizes_latency_samples() -> None:
 
     summary = module.summarize_samples_ms([0.9, 0.1, 0.4, 0.2])
     tick = module.make_tick(3, 1777017600000000000)
+    slowest_rows = module.slowest_latency_rows(
+        [
+            {"seq": 1, "latency_ms": 0.2, "rollover_first_row": False},
+            {"seq": 2, "latency_ms": 3.0, "rollover_first_row": False},
+            {"seq": 3, "latency_ms": 1.4, "rollover_first_row": True},
+        ],
+        limit=2,
+    )
 
     assert summary == {
         "count": 4,
@@ -5782,6 +5790,10 @@ def test_subscribe_latency_probe_summarizes_latency_samples() -> None:
     assert tick["seq"].to_list() == [3]
     assert tick["instrument_id"].to_list() == ["IF2606"]
     assert tick["localtime_ns"].to_list() == [1777017600000000000]
+    assert slowest_rows == [
+        {"seq": 2, "latency_ms": 3.0, "rollover_first_row": False},
+        {"seq": 3, "latency_ms": 1.4, "rollover_first_row": True},
+    ]
 
 
 def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> None:
@@ -5805,6 +5817,9 @@ def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> Non
         row_capacity=8,
         poll_interval_ms=1,
         idle_spin_checks=7,
+        warmup_ms=0.0,
+        discard_first_rows=1,
+        slowest_rows=3,
         timeout_sec=5.0,
         xfast=False,
         drop_existing=True,
@@ -5819,7 +5834,13 @@ def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> Non
 
     assert report["rows"] == 20
     assert report["idle_spin_checks"] == 7
-    assert report["latency_ms"]["count"] == 20
+    assert report["warmup_ms"] == 0.0
+    assert report["discard_first_rows"] == 1
+    assert report["measured_rows"] == 19
+    assert report["latency_ms"]["count"] == 19
+    assert len(report["slowest_rows"]) == 3
+    assert min(row["seq"] for row in report["slowest_rows"]) >= 1
+    assert report["slowest_rows"][0]["latency_ms"] >= report["slowest_rows"][1]["latency_ms"]
     assert report["rollover_first_row_latency_ms"]["count"] == 2
     assert report["subscriber_metrics"]["rows_delivered_total"] == 20
     assert report["subscriber_metrics"]["idle_spin_checks"] == 7
