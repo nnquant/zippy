@@ -1120,10 +1120,14 @@ created_at
   底层 lease。
 - master lease reaper 已清理过期 process 持有的 `segment_reader_leases`，并同步写入
   snapshot，避免 master 重启后 stale lease 复活并永久阻止 retention。
+- Persist/Retention 已完成第一版 partition compaction：master 控制面支持
+  `replace_persisted_files` 原子替换 persisted metadata；`zippy.ops.compact_table()`
+  会按 partition 分组把多个小 parquet 合并成 compacted parquet，成功替换 metadata
+  后再删除源文件。该能力属于低频 ops，不进入写入或订阅热路径。
 
 剩余重点：
 
-- partitioned parquet 小文件数量需要后续 compaction 策略。
+- compaction 调度策略、文件大小阈值和后台任务化仍需后续完善。
 
 ### 验收标准
 
@@ -1207,6 +1211,12 @@ stop；
 - Pipeline 内部处理 resource cleanup。
 - 保留底层组件 API，但 examples 推荐 Pipeline。
 
+当前已落地：
+
+- `Pipeline.run_forever(poll_interval_sec=...)` 已作为前台生命周期入口：
+  启动 pipeline 后阻塞等待，收到 `KeyboardInterrupt` 时自动调用 `stop()` 做 graceful
+  shutdown，适合 OpenCTP/source -> StreamTable 这类长期运行进程。
+
 ### 验收标准
 
 - OpenCTP/mock source -> StreamTable 最小代码不需要手动 publisher。
@@ -1289,6 +1299,7 @@ checksum 或 layout guard
 magic / layout_version
 schema_id
 segment_id / generation
+writer_epoch / descriptor_generation
 capacity_rows
 row_count / committed_row_count
 notify_seq
@@ -1300,6 +1311,18 @@ payload_offset / committed_row_count_offset
 复用同一份 control snapshot 做 attach 校验和运行观测。
 已完成增量：writer 在 commit、clear_rows 和 rollover seal 时递增 `notify_seq`，读端可
 通过 `ActiveSegmentReader.notification_sequence()` 观察该序号。
+已完成增量：mmap header layout v2 已写入 `writer_epoch` 与
+`descriptor_generation`，descriptor envelope 升级为 v2；`ActiveSegmentReader`
+在 attach/update descriptor 时会校验 magic、layout version、schema/layout、
+segment identity、writer epoch 和 descriptor generation，不再允许篡改或 stale
+descriptor 静默进入读路径。`Table.snapshot()["active_segment_control"]` 也会暴露
+这两个字段，便于诊断 writer restart 与 rollover 边界。
+注意：control block 中的 `descriptor_generation` 是 active segment 本地 generation，
+用于 envelope/header 自校验；master catalog 的 `descriptor_generation` 仍是控制面
+metadata version，metadata-only 更新可能只推进 master generation。最终 rollover
+协议需要继续收敛两者的命名和映射关系。
+已完成增量：active segment header 预留到 128 字节，保证 payload 起点按 64B
+cacheline 对齐，避免 control fields 与列式 payload 共享同一 cacheline。
 
 #### 14.3 wakeup primitive
 
@@ -1313,6 +1336,8 @@ control block 损坏和 resource cleanup。
 `ActiveSegmentReader.wait_for_notification_after(observed, timeout)` 可以在无数据时
 阻塞等待 writer commit 或 rollover seal；`zippy.subscribe()` 和 `SegmentStreamSource`
 在非 xfast 模式下已使用该 mmap wakeup，timeout 仅作为 health check。
+已完成增量：`ActiveSegmentReader.is_sealed()` 可直接读取 mmap header 中的 sealed
+flag，subscriber 空轮询热路径不再为判断 rollover 构造完整 `SegmentControlSnapshot`。
 
 #### 14.4 rollover protocol
 
@@ -1331,6 +1356,12 @@ reader 验证 generation 后切换 active segment。
 行情 live subscriber 暂定为 best-effort 语义：writer 停机、进程重启或 reader 本身
 不可用期间允许丢失增量行情，不在 M6.5 内实现 checkpoint、exactly-once 或自动
 persisted replay backfill。
+
+已完成增量：`SegmentReaderDriver` 在读空当前 active segment 后会先检查 mmap
+control block 的 `sealed` 状态。若旧段已 sealed 且新 descriptor 尚未到达，reader
+不再继续阻塞等待旧段 futex，而是等待 descriptor watcher 写入 update slot 的 condvar；
+watcher 收到 master long-poll update 或错误都会唤醒 reader。这样 rollover 后的 attach
+延迟由新 descriptor 到达驱动，不再被旧段上的 `poll_interval_ms` 量化。
 
 #### 14.5 subscriber / engine 接入
 
@@ -1841,6 +1872,8 @@ persist_path
   active segment control snapshot；
 已完成 Pipeline 基础：Pipeline.stream_table(...) 自动注册 stream/source、发布 active descriptor、托管 start/write/stop；
 已完成 Pipeline 基础：Pipeline.source(...) 支持 Python source schema 推断、source name/type 元数据、stop 托管；
+已完成 Pipeline 前台运行入口：Pipeline.run_forever(poll_interval_sec=...) 会 start 后阻塞，
+  并在 KeyboardInterrupt 时自动 stop，适合长期运行的 ingest 进程；
 已完成 TableSnapshot 增量：master StreamInfo 暴露 active_segment_descriptor、
   sealed_segments、persisted_files，Table.snapshot()/tail() 基于该边界读取；
 已完成 Table live scan 基础：Table.scan_live() 返回 pyarrow.RecordBatchReader，
@@ -1871,9 +1904,12 @@ persist_path
 已完成全局配置基础：master 默认读取 ~/.zippy/config.toml，也支持 -c/--config；
   ZIPPY_TABLE_* 环境变量可覆盖配置，MasterClient.get_config()/zippy.config() 可读取
   master 下发配置，Pipeline.stream_table() 默认使用 table row_capacity/persist 配置；
-待完成长期低延迟 IPC 后续项：descriptor_generation / writer_epoch 完整下沉到
-  segment-native control block、rollover descriptor attach 的最终协议；
-待完成 Persist/Retention：partition compaction；
+已完成长期低延迟 IPC 增量：descriptor_generation / writer_epoch 已下沉到
+  segment-native control block，并在 reader attach/update descriptor 时校验；
+已完成长期低延迟 IPC 增量：rollover descriptor attach 协议已避免旧 sealed segment
+  上的 futex/poll interval 等待，改为 descriptor update condvar 唤醒；
+已完成 Persist/Retention 增量：partition compaction 第一版，支持手动
+  `zippy.ops.compact_table()` 合并小 parquet 并原子替换 persisted metadata；
 已完成 Persist/Retention 安全闭环：persist commit gating、reader lease、mmap GC、stale lease cleanup；
 待完成用户闭环：OpenCTP/native source 的真实长跑生命周期和错误传播验收。
 ```

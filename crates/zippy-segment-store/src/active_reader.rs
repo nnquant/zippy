@@ -2,10 +2,10 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     segment::{
-        SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_GENERATION_OFFSET,
-        SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC, SHM_MAGIC_OFFSET,
-        SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET,
-        SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET,
+        SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
+        SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
+        SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET,
+        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WRITER_EPOCH_OFFSET,
     },
     ActiveSegmentDescriptor, CompiledSchema, LayoutPlan, RowSpanView, SegmentControlSnapshot,
     ShmRegion, ZippySegmentStoreError,
@@ -34,12 +34,14 @@ impl ActiveSegmentReader {
         let (descriptor, shm_region) =
             attach_descriptor_envelope(descriptor_envelope, schema, layout)?;
         let active_identity = (descriptor.segment_id(), descriptor.generation());
-        Ok(Self {
+        let reader = Self {
             descriptor,
             shm_region,
             cursor: 0,
             active_identity,
-        })
+        };
+        reader.control_snapshot()?;
+        Ok(reader)
     }
 
     /// 用新的 descriptor envelope 更新 reader。
@@ -58,6 +60,7 @@ impl ActiveSegmentReader {
         if active_identity != self.active_identity {
             self.cursor = 0;
         }
+        read_control_snapshot(&descriptor, &shm_region)?;
         self.descriptor = descriptor;
         self.shm_region = shm_region;
         self.active_identity = active_identity;
@@ -79,6 +82,11 @@ impl ActiveSegmentReader {
     /// 读取并校验当前 active segment 的 mmap control/header 快照。
     pub fn control_snapshot(&self) -> Result<SegmentControlSnapshot, ZippySegmentStoreError> {
         read_control_snapshot(&self.descriptor, &self.shm_region)
+    }
+
+    /// 轻量读取当前 active segment 是否已被 seal。
+    pub fn is_sealed(&self) -> Result<bool, ZippySegmentStoreError> {
+        read_sealed_flag(&self.shm_region)
     }
 
     /// 返回当前 notify sequence，用于后续 futex 等待。
@@ -171,6 +179,20 @@ fn read_control_snapshot(
         ));
     }
 
+    let writer_epoch = read_u64_header(shm_region, SHM_WRITER_EPOCH_OFFSET)?;
+    if writer_epoch != descriptor.writer_epoch() {
+        return Err(ZippySegmentStoreError::Layout(
+            "active segment writer epoch mismatch",
+        ));
+    }
+
+    let descriptor_generation = read_u64_header(shm_region, SHM_DESCRIPTOR_GENERATION_OFFSET)?;
+    if descriptor_generation != descriptor.descriptor_generation() {
+        return Err(ZippySegmentStoreError::Layout(
+            "active segment descriptor generation mismatch",
+        ));
+    }
+
     let capacity_rows = read_usize_header(shm_region, SHM_CAPACITY_ROWS_OFFSET)?;
     if capacity_rows != descriptor.layout().row_capacity() {
         return Err(ZippySegmentStoreError::Layout(
@@ -199,19 +221,7 @@ fn read_control_snapshot(
 
     let notify_seq = shm_region.load_u32_acquire(SHM_NOTIFY_SEQ_OFFSET)?;
 
-    let mut sealed = [0_u8; 1];
-    shm_region
-        .read_at(SHM_SEALED_OFFSET, &mut sealed)
-        .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
-    let sealed = match sealed[0] {
-        0 => false,
-        1 => true,
-        _ => {
-            return Err(ZippySegmentStoreError::Layout(
-                "active segment sealed flag is invalid",
-            ));
-        }
-    };
+    let sealed = read_sealed_flag(shm_region)?;
 
     Ok(SegmentControlSnapshot {
         magic,
@@ -219,6 +229,8 @@ fn read_control_snapshot(
         schema_id,
         segment_id,
         generation,
+        writer_epoch,
+        descriptor_generation,
         capacity_rows,
         row_count,
         committed_row_count,
@@ -226,6 +238,22 @@ fn read_control_snapshot(
         sealed,
         payload_offset: descriptor.payload_offset(),
         committed_row_count_offset: descriptor.committed_row_count_offset(),
+    })
+}
+
+fn read_sealed_flag(shm_region: &ShmRegion) -> Result<bool, ZippySegmentStoreError> {
+    let mut bytes = [0_u8; 1];
+    shm_region
+        .read_at(SHM_SEALED_OFFSET, &mut bytes)
+        .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
+    Ok(match bytes[0] {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(ZippySegmentStoreError::Layout(
+                "active segment sealed flag is invalid",
+            ));
+        }
     })
 }
 

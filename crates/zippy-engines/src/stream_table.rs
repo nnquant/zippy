@@ -15,7 +15,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use parquet::arrow::ArrowWriter;
-use zippy_core::{Engine, Result, SchemaRef, SegmentTableView, ZippyError};
+use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
     compile_schema, ColumnSpec, ColumnType, PartitionHandle, PartitionWriterHandle, ReaderSession,
     SealedSegmentHandle, SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
@@ -724,6 +724,9 @@ impl StreamTableMaterializer {
         if table.num_rows() == 0 {
             return Ok(());
         }
+        if let Some(row_view) = table.as_segment_row_view() {
+            return self.materialize_segment_rows(row_view, publish_rollovers);
+        }
 
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
@@ -747,6 +750,44 @@ impl StreamTableMaterializer {
                     }
                     self.write_materialized_row(&writer, &fields, &columns, row_index)
                         .map_err(segment_error)?;
+                    self.enqueue_persist_task(sealed, &sealed_descriptor)?;
+                }
+                Err(error) => return Err(segment_error(error)),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn materialize_segment_rows(
+        &mut self,
+        row_view: &SegmentRowView,
+        publish_rollovers: bool,
+    ) -> Result<()> {
+        let writer = self.partition.writer();
+        let total_rows = row_view.num_rows();
+        let mut copied = 0;
+        while copied < total_rows {
+            match writer.append_row_span(row_view.row_span(), copied, total_rows - copied) {
+                Ok(rows) if rows > 0 => {
+                    copied += rows;
+                }
+                Ok(_) => {
+                    return Err(ZippyError::Io {
+                        reason: "stream table segment append made no progress".to_string(),
+                    });
+                }
+                Err(ZippySegmentStoreError::Writer("segment is full")) => {
+                    let sealed_descriptor = self.active_descriptor_value()?;
+                    let sealed = writer
+                        .rollover_without_persistence()
+                        .map_err(segment_error)?;
+                    self.sealed_segment_descriptors
+                        .push(sealed_descriptor.clone());
+                    self.apply_retention()?;
+                    if publish_rollovers {
+                        self.publish_active_descriptor()?;
+                    }
                     self.enqueue_persist_task(sealed, &sealed_descriptor)?;
                 }
                 Err(error) => return Err(segment_error(error)),
@@ -1382,7 +1423,7 @@ fn write_record_batch_parquet(target_path: &Path, batch: &RecordBatch) -> Result
                 error
             ),
         })?;
-    writer.write(&batch).map_err(|error| ZippyError::Io {
+    writer.write(batch).map_err(|error| ZippyError::Io {
         reason: format!(
             "failed to write stream table persist batch error=[{}]",
             error
@@ -1394,7 +1435,7 @@ fn write_record_batch_parquet(target_path: &Path, batch: &RecordBatch) -> Result
             error
         ),
     })?;
-    fs::rename(&temp_path, &target_path).map_err(|error| {
+    fs::rename(&temp_path, target_path).map_err(|error| {
         let _ = fs::remove_file(&temp_path);
         ZippyError::Io {
             reason: format!(

@@ -6,7 +6,7 @@ use crate::{
 };
 
 const ACTIVE_DESCRIPTOR_ENVELOPE_MAGIC: &str = "zippy.segment.active";
-const ACTIVE_DESCRIPTOR_ENVELOPE_VERSION: u32 = 1;
+const ACTIVE_DESCRIPTOR_ENVELOPE_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ActiveSegmentDescriptorEnvelope {
@@ -19,6 +19,8 @@ struct ActiveSegmentDescriptorEnvelope {
     committed_row_count_offset: usize,
     segment_id: u64,
     generation: u64,
+    writer_epoch: u64,
+    descriptor_generation: u64,
 }
 
 impl ActiveSegmentDescriptor {
@@ -34,6 +36,8 @@ impl ActiveSegmentDescriptor {
             committed_row_count_offset: self.committed_row_count_offset(),
             segment_id: self.segment_id(),
             generation: self.generation(),
+            writer_epoch: self.writer_epoch(),
+            descriptor_generation: self.descriptor_generation(),
         };
 
         serde_json::to_vec(&envelope).map_err(|_| "failed to encode active segment descriptor")
@@ -75,6 +79,8 @@ impl ActiveSegmentDescriptor {
             committed_row_count_offset: envelope.committed_row_count_offset,
             segment_id: envelope.segment_id,
             generation: envelope.generation,
+            writer_epoch: envelope.writer_epoch,
+            descriptor_generation: envelope.descriptor_generation,
         })
     }
 }

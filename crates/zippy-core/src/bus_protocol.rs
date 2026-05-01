@@ -153,6 +153,12 @@ pub struct PublishPersistedFileRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplacePersistedFilesRequest {
+    pub stream_name: String,
+    pub persisted_files: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishPersistEventRequest {
     pub stream_name: String,
     pub process_id: String,
@@ -254,6 +260,7 @@ pub enum ControlRequest {
     DropTable(DropTableRequest),
     PublishSegmentDescriptor(PublishSegmentDescriptorRequest),
     PublishPersistedFile(PublishPersistedFileRequest),
+    ReplacePersistedFiles(ReplacePersistedFilesRequest),
     PublishPersistEvent(PublishPersistEventRequest),
     AcquireSegmentReaderLease(AcquireSegmentReaderLeaseRequest),
     ReleaseSegmentReaderLease(ReleaseSegmentReaderLeaseRequest),
@@ -312,6 +319,9 @@ pub enum ControlResponse {
         stream_name: String,
     },
     PersistedFilePublished {
+        stream_name: String,
+    },
+    PersistedFilesReplaced {
         stream_name: String,
     },
     PersistEventPublished {
@@ -456,6 +466,9 @@ impl fmt::Display for ControlResponse {
             ),
             Self::PersistedFilePublished { stream_name } => {
                 write!(f, "persisted file published stream_name=[{}]", stream_name)
+            }
+            Self::PersistedFilesReplaced { stream_name } => {
+                write!(f, "persisted files replaced stream_name=[{}]", stream_name)
             }
             Self::PersistEventPublished { stream_name } => {
                 write!(f, "persist event published stream_name=[{}]", stream_name)

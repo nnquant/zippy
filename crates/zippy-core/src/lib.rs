@@ -26,10 +26,10 @@ pub use bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
     DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
     GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
-    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WriterDescriptor,
-    BUS_LAYOUT_VERSION,
+    PublishPersistedFileRequest, PublishSegmentDescriptorRequest, ReaderDescriptor,
+    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
+    RegisterStreamRequest, ReplacePersistedFilesRequest, StreamInfo, UnregisterSourceRequest,
+    UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
 };
 pub use config::{
     default_config_path, ZippyConfig, ZippyLogConfig, ZippyTableConfig, ZippyTablePersistConfig,

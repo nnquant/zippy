@@ -12,7 +12,7 @@ const SHM_ROW_COUNT_OFFSET: usize = 32;
 const SHM_COMMITTED_ROW_COUNT_OFFSET: usize = 40;
 const SHM_MAGIC_OFFSET: usize = 56;
 const SHM_LAYOUT_VERSION_OFFSET: usize = 60;
-const SHM_PAYLOAD_OFFSET: usize = 64;
+const SHM_PAYLOAD_OFFSET: usize = 128;
 
 #[test]
 fn row_span_converts_to_record_batch_for_debug_export() {
@@ -44,7 +44,7 @@ fn row_span_converts_to_record_batch_for_debug_export() {
         .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
     assert_eq!(dt.value(0), 2);
-    assert_eq!(dt.timezone().as_deref(), Some("Asia/Shanghai"));
+    assert_eq!(dt.timezone(), Some("Asia/Shanghai"));
 
     let instrument = batch
         .column(1)
@@ -115,7 +115,7 @@ fn debug_snapshot_helper_returns_expected_batch() {
         .downcast_ref::<TimestampNanosecondArray>()
         .unwrap();
     assert_eq!(dt.value(0), 2);
-    assert_eq!(dt.timezone().as_deref(), Some("Asia/Shanghai"));
+    assert_eq!(dt.timezone(), Some("Asia/Shanghai"));
 
     let instrument = batch
         .column(1)
@@ -231,7 +231,7 @@ fn active_descriptor_envelope_rejects_version_mismatch() {
     writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
     let bytes = writer.active_descriptor().to_envelope_bytes().unwrap();
     let text = String::from_utf8(bytes).unwrap();
-    let changed = text.replace("\"version\":1", "\"version\":0");
+    let changed = text.replace("\"version\":2", "\"version\":0");
     assert_ne!(text, changed);
 
     let err = ActiveSegmentDescriptor::from_envelope_bytes(changed.as_bytes(), schema, layout)

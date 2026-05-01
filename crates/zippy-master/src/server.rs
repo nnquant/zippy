@@ -967,6 +967,55 @@ impl MasterServer {
                     }
                 }
             }
+            ControlRequest::ReplacePersistedFiles(request) => {
+                let mut registry = self.registry.lock().unwrap();
+                let previous_persisted_files = registry
+                    .get_stream(&request.stream_name)
+                    .map(|stream| stream.persisted_files.clone())
+                    .unwrap_or_default();
+                let replace_result =
+                    registry.replace_persisted_files(&request.stream_name, request.persisted_files);
+                match replace_result {
+                    Ok(()) => {
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            let _ = registry.set_stream_persisted_files(
+                                &request.stream_name,
+                                previous_persisted_files,
+                            );
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                        tracing::info!(
+                            component = "master_server",
+                            event = "replace_persisted_files",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            "replaced persisted files"
+                        );
+                        ControlResponse::PersistedFilesReplaced {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "replace_persisted_files",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            error = %error,
+                            "failed to replace persisted files"
+                        );
+                        ControlResponse::Error {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
             ControlRequest::PublishPersistEvent(request) => {
                 let mut registry = self.registry.lock().unwrap();
                 let previous_persist_events = registry

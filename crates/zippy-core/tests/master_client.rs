@@ -247,6 +247,16 @@ fn spawn_fake_server(
                         stream_name: request.stream_name,
                     }
                 }
+                ControlRequest::ReplacePersistedFiles(request) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(
+                        request.persisted_files[0]["file_path"],
+                        "/data/compact.parquet"
+                    );
+                    ControlResponse::PersistedFilesReplaced {
+                        stream_name: request.stream_name,
+                    }
+                }
                 ControlRequest::PublishPersistEvent(request) => {
                     assert_eq!(request.stream_name, "ticks");
                     assert_eq!(request.process_id, "proc_1");
@@ -972,7 +982,7 @@ fn control_request_serialization_uses_buffer_and_frame_sizes() {
 fn master_client_publishes_and_fetches_segment_descriptor() {
     let socket_path = unique_socket_path();
     let (shm_dir, shm_name) = unique_shm_name("segment-descriptor");
-    let server = spawn_fake_server(&socket_path, 4, shm_name);
+    let server = spawn_fake_server(&socket_path, 5, shm_name);
     wait_for_socket(&socket_path);
 
     let descriptor = serde_json::json!({
@@ -999,6 +1009,14 @@ fn master_client_publishes_and_fetches_segment_descriptor() {
             serde_json::json!({
                 "file_path": "/data/ticks.parquet",
             }),
+        )
+        .unwrap();
+    client
+        .replace_persisted_files(
+            "ticks",
+            vec![serde_json::json!({
+                "file_path": "/data/compact.parquet",
+            })],
         )
         .unwrap();
     let fetched = client.get_segment_descriptor("ticks").unwrap();

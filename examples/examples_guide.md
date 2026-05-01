@@ -74,6 +74,8 @@ uv run zippy stream ls --uri default
   `run()`。
 - `zp.compare_replay(...)`：把 live persisted 数据和 replay 输出按 key 对齐比较。
 - `zp.ops.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
+- `zp.ops.compact_table(...)`：低频合并 persisted parquet 小文件，按 partition 分组
+  生成 compacted parquet，并替换 master 中的 persisted metadata。
 
 `ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、`StreamTableEngine`、
 `SegmentStreamSource` 等底层对象仍然可以使用，但示例默认不直接暴露这些细节。

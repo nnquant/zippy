@@ -7,6 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 #[cfg(feature = "zmq-publisher")]
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use zippy_core::SegmentTableView;
 #[cfg(not(feature = "zmq-publisher"))]
 use zippy_core::ZippyError;
 #[cfg(not(feature = "zmq-publisher"))]
@@ -27,6 +28,24 @@ fn null_publisher_accepts_arrow_batches() {
 
     let mut publisher = NullPublisher::default();
     publisher.publish(&batch).unwrap();
+    publisher.flush().unwrap();
+
+    assert_eq!(publisher.published_batches(), 1);
+}
+
+#[test]
+fn null_publisher_accepts_segment_table_views() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "price",
+        DataType::Float64,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![1.0]))]).unwrap();
+    let table = SegmentTableView::from_record_batch(batch);
+
+    let mut publisher = NullPublisher::default();
+    publisher.publish_table(&table).unwrap();
     publisher.flush().unwrap();
 
     assert_eq!(publisher.published_batches(), 1);

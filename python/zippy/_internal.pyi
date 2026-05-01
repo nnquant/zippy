@@ -374,6 +374,12 @@ class MasterClient:
         persisted_file: object,
     ) -> None: ...
 
+    def replace_persisted_files(
+        self,
+        stream_name: str,
+        persisted_files: list[dict[str, object]],
+    ) -> None: ...
+
     def publish_persist_event(
         self,
         stream_name: str,

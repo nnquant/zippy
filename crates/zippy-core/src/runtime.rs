@@ -246,25 +246,19 @@ impl EngineHandle {
         match &self.fast_data_path {
             Some(path) => {
                 let _emit_guard = path.emit_lock.lock().unwrap();
-                match self.source_handle.as_ref() {
-                    Some(source_handle) => {
-                        zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
-                        source_handle.stop()?;
-                        zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
-                    }
-                    None => {}
+                if let Some(source_handle) = self.source_handle.as_ref() {
+                    zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
+                    source_handle.stop()?;
+                    zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
                 }
                 wait_for_fast_data_drain(path.as_ref());
                 self.enqueue_command(Command::Stop)
             }
             None => {
-                match self.source_handle.as_ref() {
-                    Some(source_handle) => {
-                        zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
-                        source_handle.stop()?;
-                        zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
-                    }
-                    None => {}
+                if let Some(source_handle) = self.source_handle.as_ref() {
+                    zippy_debug_stop_log("engine_handle.stop calling source_handle.stop");
+                    source_handle.stop()?;
+                    zippy_debug_stop_log("engine_handle.stop source_handle.stop returned");
                 }
                 self.enqueue_command(Command::Stop)
             }
@@ -862,6 +856,7 @@ fn drain_fast_data_queue(data_queue: &SpscDataQueue<SegmentTableView>) {
     while data_queue.try_pop().is_some() {}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_source_control_command<E, P>(
     engine: &mut E,
     publisher: &mut P,
@@ -1174,8 +1169,7 @@ where
     P: Publisher,
 {
     for table in outputs {
-        let batch = table.to_record_batch()?;
-        publisher.publish(&batch).inspect_err(|_| {
+        publisher.publish_table(table).inspect_err(|_| {
             metrics.inc_publish_errors(1);
         })?;
     }

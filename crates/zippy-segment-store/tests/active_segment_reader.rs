@@ -113,23 +113,77 @@ fn active_segment_reader_exposes_control_snapshot_from_mmap_header() {
     writer.append_tick_for_test(2, "IF2607", 4113.0).unwrap();
 
     let envelope = partition.active_descriptor_envelope_bytes().unwrap();
+    let descriptor: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
     let reader =
         ActiveSegmentReader::from_descriptor_envelope(&envelope, schema.clone(), layout).unwrap();
 
     let snapshot = reader.control_snapshot().unwrap();
 
     assert_eq!(snapshot.magic, 0x5448_535A);
-    assert_eq!(snapshot.layout_version, 1);
+    assert_eq!(snapshot.layout_version, 2);
     assert_eq!(snapshot.schema_id, schema.schema_id());
     assert_eq!(snapshot.segment_id, 1);
     assert_eq!(snapshot.generation, 0);
+    assert_eq!(
+        snapshot.writer_epoch,
+        descriptor["writer_epoch"].as_u64().unwrap()
+    );
+    assert_eq!(
+        snapshot.descriptor_generation,
+        descriptor["descriptor_generation"].as_u64().unwrap()
+    );
     assert_eq!(snapshot.capacity_rows, 32);
     assert_eq!(snapshot.row_count, 2);
     assert_eq!(snapshot.committed_row_count, 2);
     assert_eq!(snapshot.notify_seq, 2);
     assert!(!snapshot.sealed);
-    assert_eq!(snapshot.payload_offset, 64);
+    assert_eq!(snapshot.payload_offset, 128);
+    assert_eq!(snapshot.payload_offset % 64, 0);
     assert_eq!(snapshot.committed_row_count_offset, 40);
+}
+
+#[test]
+fn active_segment_reader_rejects_writer_epoch_mismatch() {
+    let schema = tick_schema();
+    let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let partition = store
+        .open_partition_with_schema("openctp_ticks", "all", schema.clone())
+        .unwrap();
+    let mut descriptor: serde_json::Value =
+        serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+    descriptor["writer_epoch"] = serde_json::json!(999_999_u64);
+    let envelope = serde_json::to_vec(&descriptor).unwrap();
+
+    let result = ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout);
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("writer epoch mismatch"));
+}
+
+#[test]
+fn active_segment_reader_rejects_descriptor_generation_mismatch() {
+    let schema = tick_schema();
+    let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let partition = store
+        .open_partition_with_schema("openctp_ticks", "all", schema.clone())
+        .unwrap();
+    let mut descriptor: serde_json::Value =
+        serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+    descriptor["descriptor_generation"] = serde_json::json!(999_999_u64);
+    let envelope = serde_json::to_vec(&descriptor).unwrap();
+
+    let result = ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout);
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("descriptor generation mismatch"));
 }
 
 #[test]
@@ -179,16 +233,20 @@ fn active_segment_reader_waits_on_mmap_notification_for_rollover() {
         let notified = reader
             .wait_for_notification_after(observed, Duration::from_secs(1))
             .unwrap();
-        (notified, reader.control_snapshot().unwrap())
+        (
+            notified,
+            reader.is_sealed().unwrap(),
+            reader.notification_sequence().unwrap(),
+        )
     });
     receiver.recv_timeout(Duration::from_secs(1)).unwrap();
 
     writer.rollover().unwrap();
 
-    let (notified, snapshot) = waiter.join().unwrap();
+    let (notified, sealed, notify_seq) = waiter.join().unwrap();
     assert!(notified);
-    assert!(snapshot.sealed);
-    assert!(snapshot.notify_seq > observed);
+    assert!(sealed);
+    assert!(notify_seq > observed);
 }
 
 #[test]

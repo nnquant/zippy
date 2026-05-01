@@ -22,9 +22,9 @@ use crate::bus_protocol::{
     GetSegmentDescriptorRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
     PublishPersistEventRequest, PublishPersistedFileRequest, PublishSegmentDescriptorRequest,
     ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
-    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest, StreamInfo,
-    UnregisterSourceRequest, UpdateRecordStatusRequest, WaitSegmentDescriptorRequest,
-    WriterDescriptor,
+    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest,
+    ReplacePersistedFilesRequest, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest,
+    WaitSegmentDescriptorRequest, WriterDescriptor,
 };
 use crate::{canonical_schema_hash, schema_metadata, Result, SchemaRef, ZippyConfig, ZippyError};
 
@@ -443,6 +443,24 @@ impl MasterClient {
         match response {
             ControlResponse::PersistedFilePublished { .. } => Ok(()),
             other => Err(unexpected_response("PersistedFilePublished", other)),
+        }
+    }
+
+    pub fn replace_persisted_files(
+        &self,
+        stream_name: &str,
+        persisted_files: Vec<serde_json::Value>,
+    ) -> Result<()> {
+        let response = self.send_request(ControlRequest::ReplacePersistedFiles(
+            ReplacePersistedFilesRequest {
+                stream_name: stream_name.to_string(),
+                persisted_files,
+            },
+        ))?;
+
+        match response {
+            ControlResponse::PersistedFilesReplaced { .. } => Ok(()),
+            other => Err(unexpected_response("PersistedFilesReplaced", other)),
         }
     }
 

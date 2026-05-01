@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import json
 import os
 import threading
@@ -567,6 +568,222 @@ def _drop_table(
     return (master or _default_master()).drop_table(table_name, drop_persisted)
 
 
+def _compact_table(
+    table_name: str,
+    *,
+    min_files: int = 2,
+    delete_sources: bool = True,
+    master: MasterClient | None = None,
+) -> dict[str, object]:
+    """
+    Compact small persisted parquet files for a named table.
+
+    :param table_name: Named table to compact.
+    :type table_name: str
+    :param min_files: Minimum files in one partition group before compaction.
+    :type min_files: int
+    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :type delete_sources: bool
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :returns: Compaction summary.
+    :rtype: dict[str, object]
+    :raises ValueError: If ``table_name`` is empty or ``min_files`` is smaller than two.
+    :raises RuntimeError: If master does not support persisted metadata replacement.
+    """
+    if not table_name:
+        raise ValueError("table_name must not be empty")
+    if min_files < 2:
+        raise ValueError("min_files must be at least 2")
+
+    master_client = master or _default_master()
+    replace_persisted_files = getattr(master_client, "replace_persisted_files", None)
+    if replace_persisted_files is None:
+        raise RuntimeError("master does not support replace_persisted_files")
+
+    stream = master_client.get_stream(table_name)
+    persisted_files = [
+        dict(item)
+        for item in stream.get("persisted_files", []) or []
+        if isinstance(item, dict) and item.get("file_path")
+    ]
+    groups = _persisted_compaction_groups(stream, persisted_files)
+    compacted_files: list[dict[str, object]] = []
+    compacted_source_keys: set[tuple[str, str]] = set()
+    source_paths: list[Path] = []
+
+    for group_files in groups.values():
+        if len(group_files) < min_files:
+            continue
+        compacted_file = _compact_persisted_file_group(table_name, stream, group_files)
+        compacted_files.append(compacted_file)
+        for item in group_files:
+            compacted_source_keys.add(_persisted_file_compaction_key(item))
+            source_paths.append(Path(str(item["file_path"])))
+
+    if not compacted_files:
+        return {
+            "table_name": table_name,
+            "groups_compacted": 0,
+            "files_compacted": 0,
+            "rows_compacted": 0,
+            "compacted_files": [],
+            "source_files_deleted": 0,
+            "source_file_delete_errors": [],
+        }
+
+    next_files = [
+        item
+        for item in persisted_files
+        if _persisted_file_compaction_key(item) not in compacted_source_keys
+    ]
+    next_files.extend(compacted_files)
+    next_files.sort(key=_persisted_file_order_key)
+    replace_persisted_files(table_name, next_files)
+
+    deleted = 0
+    delete_errors: list[dict[str, str]] = []
+    if delete_sources:
+        for path in source_paths:
+            try:
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except OSError as error:
+                delete_errors.append({"file_path": str(path), "error": str(error)})
+
+    return {
+        "table_name": table_name,
+        "groups_compacted": len(compacted_files),
+        "files_compacted": len(compacted_source_keys),
+        "rows_compacted": sum(int(item.get("row_count", 0)) for item in compacted_files),
+        "compacted_files": compacted_files,
+        "source_files_deleted": deleted,
+        "source_file_delete_errors": delete_errors,
+    }
+
+
+def _persisted_compaction_groups(
+    stream: dict[str, object],
+    persisted_files: list[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
+    groups: dict[str, list[dict[str, object]]] = {}
+    live_identities = _live_segment_identities(stream)
+    for item in persisted_files:
+        identities = _persisted_segment_identities(item)
+        if identities and identities & live_identities:
+            continue
+        path = Path(str(item["file_path"]))
+        if not path.exists():
+            continue
+        key = _persisted_compaction_group_key(item, path)
+        groups.setdefault(key, []).append(item)
+    for group_files in groups.values():
+        group_files.sort(key=_persisted_file_order_key)
+    return groups
+
+
+def _persisted_compaction_group_key(item: dict[str, object], path: Path) -> str:
+    partition_path = item.get("partition_path")
+    if partition_path:
+        return f"partition_path:{partition_path}"
+    partition = item.get("partition")
+    if isinstance(partition, dict) and partition:
+        return f"partition:{json.dumps(partition, sort_keys=True, separators=(',', ':'))}"
+    return f"parent:{path.parent}"
+
+
+def _compact_persisted_file_group(
+    table_name: str,
+    stream: dict[str, object],
+    group_files: list[dict[str, object]],
+) -> dict[str, object]:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tables = [_read_persisted_parquet_file(item["file_path"]) for item in group_files]
+    table = pa.concat_tables([table for table in tables if table.num_rows > 0])
+    first_file = group_files[0]
+    target_dir = Path(str(first_file["file_path"])).parent
+    target_path = target_dir / _compacted_parquet_file_name(table_name, group_files)
+    temp_path = target_path.with_name(
+        f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    pq.write_table(table, temp_path)
+    os.replace(temp_path, target_path)
+    return _compacted_persisted_file_metadata(
+        table_name,
+        stream,
+        group_files,
+        target_path,
+        table.num_rows,
+    )
+
+
+def _compacted_parquet_file_name(
+    table_name: str,
+    group_files: list[dict[str, object]],
+) -> str:
+    digest = hashlib.sha1(
+        "|".join(str(item.get("persist_file_id") or item.get("file_path")) for item in group_files)
+        .encode("utf-8")
+    ).hexdigest()[:16]
+    return f"compact-{_safe_file_token(table_name)}-{digest}.parquet"
+
+
+def _compacted_persisted_file_metadata(
+    table_name: str,
+    stream: dict[str, object],
+    group_files: list[dict[str, object]],
+    target_path: Path,
+    row_count: int,
+) -> dict[str, object]:
+    first_file = group_files[0]
+    source_segments = [
+        {
+            "source_segment_id": identity[0],
+            "source_generation": identity[1],
+        }
+        for item in group_files
+        for identity in sorted(_persisted_segment_identities(item))
+    ]
+    digest = hashlib.sha1(
+        "|".join(str(item.get("persist_file_id") or item.get("file_path")) for item in group_files)
+        .encode("utf-8")
+    ).hexdigest()[:16]
+    metadata: dict[str, object] = {
+        "persist_file_id": f"compact:{table_name}:{digest}",
+        "stream_name": table_name,
+        "schema_hash": stream.get("schema_hash"),
+        "file_path": str(target_path),
+        "row_count": row_count,
+        "created_at": int(time.time() * 1000),
+        "compacted": True,
+        "compacted_file_count": len(group_files),
+        "compacted_source_file_ids": [
+            item.get("persist_file_id") or item.get("file_path") for item in group_files
+        ],
+    }
+    if source_segments:
+        metadata["source_segments"] = source_segments
+        metadata["source_segment_id"] = source_segments[0]["source_segment_id"]
+        metadata["source_generation"] = source_segments[0]["source_generation"]
+    for key in ("partition", "partition_path", "partition_spec"):
+        if key in first_file:
+            metadata[key] = first_file[key]
+    return metadata
+
+
+def _persisted_file_compaction_key(item: dict[str, object]) -> tuple[str, str]:
+    persist_file_id = item.get("persist_file_id")
+    if persist_file_id:
+        return ("id", str(persist_file_id))
+    return ("path", str(item.get("file_path", "")))
+
+
+def _safe_file_token(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
 class Ops:
     """
     Namespace for low-frequency Zippy operations.
@@ -660,6 +877,35 @@ class Ops:
         :rtype: dict[str, object]
         """
         return _drop_table(table_name, drop_persisted=drop_persisted, master=master)
+
+    def compact_table(
+        self,
+        table_name: str,
+        *,
+        min_files: int = 2,
+        delete_sources: bool = True,
+        master: MasterClient | None = None,
+    ) -> dict[str, object]:
+        """
+        Compact small persisted parquet files for one table.
+
+        :param table_name: Named table to compact.
+        :type table_name: str
+        :param min_files: Minimum files in one partition group before compaction.
+        :type min_files: int
+        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :type delete_sources: bool
+        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+        :type master: MasterClient | None
+        :returns: Compaction summary.
+        :rtype: dict[str, object]
+        """
+        return _compact_table(
+            table_name,
+            min_files=min_files,
+            delete_sources=delete_sources,
+            master=master,
+        )
 
 
 ops = Ops()
@@ -1386,8 +1632,24 @@ def _non_overlapping_persisted_files(
         for item in snapshot.get("persisted_files", [])
         if isinstance(item, dict)
         and item.get("file_path")
-        and _persisted_segment_identity(item) not in live_identities
+        and not (_persisted_segment_identities(item) & live_identities)
     ]
+
+
+def _persisted_segment_identities(value: dict[str, object]) -> set[tuple[int, int]]:
+    source_segments = value.get("source_segments")
+    if isinstance(source_segments, list):
+        identities = {
+            identity
+            for item in source_segments
+            if isinstance(item, dict)
+            for identity in [_persisted_segment_identity(item)]
+            if identity is not None
+        }
+        if identities:
+            return identities
+    identity = _persisted_segment_identity(value)
+    return {identity} if identity is not None else set()
 
 
 def _concat_query_tables(tables: list[object | None], schema: object | None):
@@ -3175,6 +3437,28 @@ class Pipeline:
             engine.start()
             self._started = True
         return self
+
+    def run_forever(self, *, poll_interval_sec: float = 1.0) -> "Pipeline":
+        """
+        Start the pipeline and block until interrupted.
+
+        :param poll_interval_sec: Sleep interval used by the foreground wait loop.
+        :type poll_interval_sec: float
+        :returns: This pipeline after graceful shutdown.
+        :rtype: Pipeline
+        :raises ValueError: If ``poll_interval_sec`` is not positive.
+        """
+        if poll_interval_sec <= 0:
+            raise ValueError("poll_interval_sec must be positive")
+
+        self.start()
+        try:
+            while True:
+                time.sleep(poll_interval_sec)
+        except KeyboardInterrupt:
+            return self
+        finally:
+            self.stop()
 
     def write(self, value) -> None:
         """

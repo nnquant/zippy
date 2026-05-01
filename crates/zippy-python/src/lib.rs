@@ -11,7 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1882,6 +1882,24 @@ impl MasterClient {
         .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    fn replace_persisted_files(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        persisted_files: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let persisted_files_text = python_json_dumps(py, persisted_files)?;
+        let persisted_files = serde_json::from_str::<Vec<serde_json::Value>>(&persisted_files_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .replace_persisted_files(&stream_name, persisted_files)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     fn publish_persist_event(
         &self,
         py: Python<'_>,
@@ -2608,6 +2626,8 @@ fn segment_control_snapshot_to_json(snapshot: SegmentControlSnapshot) -> serde_j
         "schema_id": snapshot.schema_id,
         "segment_id": snapshot.segment_id,
         "generation": snapshot.generation,
+        "writer_epoch": snapshot.writer_epoch,
+        "descriptor_generation": snapshot.descriptor_generation,
         "capacity_rows": snapshot.capacity_rows,
         "row_count": snapshot.row_count,
         "committed_row_count": snapshot.committed_row_count,
@@ -2692,6 +2712,71 @@ struct DescriptorUpdate {
     descriptor: serde_json::Value,
 }
 
+#[derive(Debug, Default)]
+struct DescriptorUpdateSlot {
+    update: Mutex<Option<DescriptorUpdate>>,
+    changed: Condvar,
+}
+
+impl DescriptorUpdateSlot {
+    fn set(&self, update: DescriptorUpdate) {
+        *self.update.lock().unwrap() = Some(update);
+        self.changed.notify_all();
+    }
+
+    fn notify(&self) {
+        self.changed.notify_all();
+    }
+
+    fn take_after_poll(
+        &self,
+        read_outcome: SubscriberReadOutcome,
+        current_descriptor_text: &str,
+    ) -> Option<DescriptorUpdate> {
+        if read_outcome != SubscriberReadOutcome::Empty {
+            return None;
+        }
+
+        let mut guard = self.update.lock().unwrap();
+        Self::take_distinct_update(&mut guard, current_descriptor_text)
+    }
+
+    fn wait_for_update_after(
+        &self,
+        current_descriptor_text: &str,
+        timeout: Duration,
+    ) -> Option<DescriptorUpdate> {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.update.lock().unwrap();
+        loop {
+            if let Some(update) = Self::take_distinct_update(&mut guard, current_descriptor_text) {
+                return Some(update);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, wait_result) = self.changed.wait_timeout(guard, remaining).unwrap();
+            guard = next_guard;
+            if wait_result.timed_out() {
+                return Self::take_distinct_update(&mut guard, current_descriptor_text);
+            }
+        }
+    }
+
+    fn take_distinct_update(
+        guard: &mut Option<DescriptorUpdate>,
+        current_descriptor_text: &str,
+    ) -> Option<DescriptorUpdate> {
+        match guard.take() {
+            Some(update) if update.text != current_descriptor_text => Some(update),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct SubscriberMetrics {
     rows_delivered_total: AtomicU64,
@@ -2743,18 +2828,10 @@ fn descriptor_update_from_value(
 
 fn take_descriptor_update_after_poll(
     read_outcome: SubscriberReadOutcome,
-    descriptor_updates: &Mutex<Option<DescriptorUpdate>>,
+    descriptor_updates: &DescriptorUpdateSlot,
     current_descriptor_text: &str,
 ) -> Option<DescriptorUpdate> {
-    if read_outcome != SubscriberReadOutcome::Empty {
-        return None;
-    }
-
-    let mut guard = descriptor_updates.lock().unwrap();
-    match guard.take() {
-        Some(update) if update.text != current_descriptor_text => Some(update),
-        _ => None,
-    }
+    descriptor_updates.take_after_poll(read_outcome, current_descriptor_text)
 }
 
 fn take_descriptor_refresh_error(error_slot: &Mutex<Option<String>>) -> Option<String> {
@@ -2813,7 +2890,7 @@ struct SegmentReaderDriver {
     descriptor_text: String,
     reader_lease: Option<SegmentReaderLeaseGuard>,
     segment_schema: CompiledSchema,
-    descriptor_updates: Arc<Mutex<Option<DescriptorUpdate>>>,
+    descriptor_updates: Arc<DescriptorUpdateSlot>,
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
     xfast: bool,
     idle_wait: Duration,
@@ -2826,7 +2903,7 @@ impl SegmentReaderDriver {
         descriptor_text: String,
         reader_lease: Option<SegmentReaderLeaseGuard>,
         segment_schema: CompiledSchema,
-        descriptor_updates: Arc<Mutex<Option<DescriptorUpdate>>>,
+        descriptor_updates: Arc<DescriptorUpdateSlot>,
         descriptor_refresh_error: Arc<Mutex<Option<String>>>,
         xfast: bool,
         idle_wait: Duration,
@@ -2884,6 +2961,36 @@ impl SegmentReaderDriver {
                     ));
                 }
 
+                let sealed = self.reader.is_sealed().map_err(|error| error.to_string())?;
+                if sealed {
+                    let update = if self.xfast {
+                        spin_loop();
+                        None
+                    } else {
+                        self.descriptor_updates
+                            .wait_for_update_after(&self.descriptor_text, self.idle_wait)
+                    };
+                    if let Some(error) =
+                        take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref())
+                    {
+                        return Err(error);
+                    }
+                    if let Some(update) = update {
+                        let descriptor_generation = update.descriptor_generation;
+                        apply_segment_descriptor_update(
+                            &mut self.reader,
+                            &mut self.descriptor_text,
+                            update,
+                            &self.segment_schema,
+                            self.reader_lease.as_mut(),
+                        )?;
+                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                            descriptor_generation,
+                        ));
+                    }
+                    return Ok(SegmentReaderDriverEvent::Idle);
+                }
+
                 if self.xfast {
                     spin_loop();
                 } else {
@@ -2910,7 +3017,7 @@ fn spawn_segment_descriptor_watcher(
     master: SharedMasterClient,
     stream_name: String,
     mut descriptor_generation: u64,
-    descriptor_updates: Arc<Mutex<Option<DescriptorUpdate>>>,
+    descriptor_updates: Arc<DescriptorUpdateSlot>,
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -2925,6 +3032,7 @@ fn spawn_segment_descriptor_watcher(
                 Ok(None) => continue,
                 Err(error) => {
                     *descriptor_refresh_error.lock().unwrap() = Some(error.to_string());
+                    descriptor_updates.notify();
                     running.store(false, Ordering::SeqCst);
                     break;
                 }
@@ -2933,10 +3041,11 @@ fn spawn_segment_descriptor_watcher(
             descriptor_generation = update.descriptor_generation;
             match descriptor_update_from_value(update.descriptor_generation, update.descriptor) {
                 Ok(update) => {
-                    *descriptor_updates.lock().unwrap() = Some(update);
+                    descriptor_updates.set(update);
                 }
                 Err(error) => {
                     *descriptor_refresh_error.lock().unwrap() = Some(error);
+                    descriptor_updates.notify();
                     running.store(false, Ordering::SeqCst);
                     break;
                 }
@@ -3073,7 +3182,7 @@ impl StreamSubscriber {
         let xfast = self.xfast;
 
         *guard = Some(thread::spawn(move || {
-            let descriptor_updates = Arc::new(Mutex::new(None));
+            let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
             let descriptor_refresh_error = Arc::new(Mutex::new(None));
             let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
                 Arc::clone(&running),
@@ -3508,6 +3617,14 @@ impl SegmentTestWriter {
     fn committed_row_count(&self) -> usize {
         self.partition.active_committed_row_count()
     }
+
+    fn rollover(&self) -> PyResult<()> {
+        self.partition
+            .writer()
+            .rollover_without_persistence()
+            .map(|_| ())
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
 }
 
 #[pyclass]
@@ -3728,7 +3845,7 @@ impl Source for SegmentSourceBridge {
         let segment_schema = self.segment_schema.clone();
         let xfast = self.xfast;
         let join_handle = thread::spawn(move || {
-            let descriptor_updates = Arc::new(Mutex::new(None));
+            let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
             let descriptor_refresh_error = Arc::new(Mutex::new(None));
             let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
                 Arc::clone(&running_flag),
@@ -6957,11 +7074,12 @@ mod tests {
 
     #[test]
     fn descriptor_update_slot_is_consumed_only_after_empty_segment_poll() {
-        let descriptor_updates = Mutex::new(Some(DescriptorUpdate {
+        let descriptor_updates = DescriptorUpdateSlot::default();
+        descriptor_updates.set(DescriptorUpdate {
             descriptor_generation: 2,
             text: "next".to_string(),
             descriptor: serde_json::json!({"generation": 2}),
-        }));
+        });
 
         assert!(take_descriptor_update_after_poll(
             SubscriberReadOutcome::Rows,
@@ -6969,7 +7087,7 @@ mod tests {
             "current",
         )
         .is_none());
-        assert!(descriptor_updates.lock().unwrap().is_some());
+        assert!(descriptor_updates.update.lock().unwrap().is_some());
 
         let update = take_descriptor_update_after_poll(
             SubscriberReadOutcome::Empty,
@@ -6979,7 +7097,7 @@ mod tests {
         .expect("empty segment poll should consume pending descriptor update");
 
         assert_eq!(update.text, "next");
-        assert!(descriptor_updates.lock().unwrap().is_none());
+        assert!(descriptor_updates.update.lock().unwrap().is_none());
     }
 
     #[test]
@@ -7032,9 +7150,8 @@ mod tests {
                 .unwrap();
 
         let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
-        let descriptor_updates = Arc::new(Mutex::new(Some(
-            descriptor_update_from_value(2, next_descriptor).unwrap(),
-        )));
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        descriptor_updates.set(descriptor_update_from_value(2, next_descriptor).unwrap());
         let descriptor_refresh_error = Arc::new(Mutex::new(None));
         let mut driver = SegmentReaderDriver::new(
             reader,
@@ -7051,7 +7168,7 @@ mod tests {
             SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
             other => panic!("expected current rows before descriptor switch got [{other:?}]"),
         }
-        assert!(descriptor_updates.lock().unwrap().is_some());
+        assert!(descriptor_updates.update.lock().unwrap().is_some());
 
         match driver.poll_next().unwrap() {
             SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 2),

@@ -6,7 +6,7 @@ use std::{
 use crate::{CompiledSchema, LayoutPlan};
 
 pub(crate) const SHM_MAGIC: u32 = 0x5448_535A;
-pub(crate) const SHM_LAYOUT_VERSION: u32 = 1;
+pub(crate) const SHM_LAYOUT_VERSION: u32 = 2;
 pub(crate) const SHM_SCHEMA_ID_OFFSET: usize = 0;
 pub(crate) const SHM_SEGMENT_ID_OFFSET: usize = 8;
 pub(crate) const SHM_GENERATION_OFFSET: usize = 16;
@@ -17,7 +17,9 @@ pub(crate) const SHM_SEALED_OFFSET: usize = 48;
 pub(crate) const SHM_NOTIFY_SEQ_OFFSET: usize = 52;
 pub(crate) const SHM_MAGIC_OFFSET: usize = 56;
 pub(crate) const SHM_LAYOUT_VERSION_OFFSET: usize = 60;
-pub(crate) const SHM_PAYLOAD_OFFSET: usize = 64;
+pub(crate) const SHM_WRITER_EPOCH_OFFSET: usize = 64;
+pub(crate) const SHM_DESCRIPTOR_GENERATION_OFFSET: usize = 72;
+pub(crate) const SHM_PAYLOAD_OFFSET: usize = 128;
 
 /// Active segment mmap header 的只读快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +29,8 @@ pub struct SegmentControlSnapshot {
     pub schema_id: u64,
     pub segment_id: u64,
     pub generation: u64,
+    pub writer_epoch: u64,
+    pub descriptor_generation: u64,
     pub capacity_rows: usize,
     pub row_count: usize,
     pub committed_row_count: usize,
@@ -42,6 +46,8 @@ pub struct SegmentHeader {
     pub schema_id: u64,
     pub segment_id: u64,
     pub generation: u64,
+    pub writer_epoch: u64,
+    pub descriptor_generation: u64,
     pub capacity_rows: usize,
     pub row_count: usize,
     pub committed_row_count: Arc<AtomicUsize>,
@@ -83,6 +89,8 @@ pub struct ActiveSegmentDescriptor {
     pub(crate) committed_row_count_offset: usize,
     pub(crate) segment_id: u64,
     pub(crate) generation: u64,
+    pub(crate) writer_epoch: u64,
+    pub(crate) descriptor_generation: u64,
 }
 
 impl ActiveSegmentDescriptor {
@@ -121,6 +129,16 @@ impl ActiveSegmentDescriptor {
         self.generation
     }
 
+    /// 返回 writer epoch。
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+
+    /// 返回 descriptor generation。
+    pub fn descriptor_generation(&self) -> u64 {
+        self.descriptor_generation
+    }
+
     /// 返回篡改 committed row count offset 后的描述符，仅用于测试。
     pub fn with_committed_row_count_offset_for_test(mut self, offset: usize) -> Self {
         self.committed_row_count_offset = offset;
@@ -130,6 +148,18 @@ impl ActiveSegmentDescriptor {
     /// 返回篡改 payload offset 后的描述符，仅用于测试。
     pub fn with_payload_offset_for_test(mut self, offset: usize) -> Self {
         self.payload_offset = offset;
+        self
+    }
+
+    /// 返回篡改 writer epoch 后的描述符，仅用于测试。
+    pub fn with_writer_epoch_for_test(mut self, writer_epoch: u64) -> Self {
+        self.writer_epoch = writer_epoch;
+        self
+    }
+
+    /// 返回篡改 descriptor generation 后的描述符，仅用于测试。
+    pub fn with_descriptor_generation_for_test(mut self, descriptor_generation: u64) -> Self {
+        self.descriptor_generation = descriptor_generation;
         self
     }
 }
