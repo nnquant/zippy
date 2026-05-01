@@ -2632,6 +2632,7 @@ fn segment_control_snapshot_to_json(snapshot: SegmentControlSnapshot) -> serde_j
         "row_count": snapshot.row_count,
         "committed_row_count": snapshot.committed_row_count,
         "notify_seq": snapshot.notify_seq,
+        "waiter_count": snapshot.waiter_count,
         "sealed": snapshot.sealed,
         "payload_offset": snapshot.payload_offset,
         "committed_row_count_offset": snapshot.committed_row_count_offset,

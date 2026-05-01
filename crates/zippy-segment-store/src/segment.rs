@@ -6,7 +6,7 @@ use std::{
 use crate::{CompiledSchema, LayoutPlan};
 
 pub(crate) const SHM_MAGIC: u32 = 0x5448_535A;
-pub(crate) const SHM_LAYOUT_VERSION: u32 = 2;
+pub(crate) const SHM_LAYOUT_VERSION: u32 = 3;
 pub(crate) const SHM_SCHEMA_ID_OFFSET: usize = 0;
 pub(crate) const SHM_SEGMENT_ID_OFFSET: usize = 8;
 pub(crate) const SHM_GENERATION_OFFSET: usize = 16;
@@ -19,6 +19,7 @@ pub(crate) const SHM_MAGIC_OFFSET: usize = 56;
 pub(crate) const SHM_LAYOUT_VERSION_OFFSET: usize = 60;
 pub(crate) const SHM_WRITER_EPOCH_OFFSET: usize = 64;
 pub(crate) const SHM_DESCRIPTOR_GENERATION_OFFSET: usize = 72;
+pub(crate) const SHM_WAITER_COUNT_OFFSET: usize = 80;
 pub(crate) const SHM_PAYLOAD_OFFSET: usize = 128;
 
 /// Active segment mmap header 的只读快照。
@@ -35,6 +36,7 @@ pub struct SegmentControlSnapshot {
     pub row_count: usize,
     pub committed_row_count: usize,
     pub notify_seq: u32,
+    pub waiter_count: u32,
     pub sealed: bool,
     pub payload_offset: usize,
     pub committed_row_count_offset: usize,

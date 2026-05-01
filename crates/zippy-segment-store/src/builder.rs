@@ -13,7 +13,8 @@ use crate::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
         SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
         SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET,
-        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WRITER_EPOCH_OFFSET,
+        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WAITER_COUNT_OFFSET,
+        SHM_WRITER_EPOCH_OFFSET,
     },
     ColumnType, CompiledSchema, LayoutPlan, RowSpanView, SealedSegmentHandle, SegmentCellValue,
     SegmentHeader, ShmRegion,
@@ -146,6 +147,9 @@ impl ActiveSegmentWriter {
         shm_region
             .store_u32_release(SHM_NOTIFY_SEQ_OFFSET, 0)
             .map_err(|_| "failed to initialize shared memory notify sequence")?;
+        shm_region
+            .store_u32_release(SHM_WAITER_COUNT_OFFSET, 0)
+            .map_err(|_| "failed to initialize shared memory waiter count")?;
         write_u32_header(&mut shm_region, SHM_MAGIC_OFFSET, SHM_MAGIC)?;
         write_u32_header(
             &mut shm_region,
@@ -578,9 +582,15 @@ impl ActiveSegmentWriter {
         self.shm_region
             .fetch_add_u32_release(SHM_NOTIFY_SEQ_OFFSET, 1)
             .map_err(|_| "failed to increment shared memory notify sequence")?;
-        self.shm_region
-            .wake_u32(SHM_NOTIFY_SEQ_OFFSET)
-            .map_err(|_| "failed to wake shared memory readers")?;
+        let waiter_count = self
+            .shm_region
+            .load_u32_acquire(SHM_WAITER_COUNT_OFFSET)
+            .map_err(|_| "failed to read shared memory waiter count")?;
+        if waiter_count > 0 {
+            self.shm_region
+                .wake_u32(SHM_NOTIFY_SEQ_OFFSET)
+                .map_err(|_| "failed to wake shared memory readers")?;
+        }
         Ok(())
     }
 

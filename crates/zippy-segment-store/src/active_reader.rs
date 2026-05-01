@@ -5,7 +5,8 @@ use crate::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
         SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
         SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET,
-        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WRITER_EPOCH_OFFSET,
+        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WAITER_COUNT_OFFSET,
+        SHM_WRITER_EPOCH_OFFSET,
     },
     ActiveSegmentDescriptor, CompiledSchema, LayoutPlan, RowSpanView, SegmentControlSnapshot,
     ShmRegion, ZippySegmentStoreError,
@@ -100,8 +101,23 @@ impl ActiveSegmentReader {
         observed: u32,
         timeout: Duration,
     ) -> Result<bool, ZippySegmentStoreError> {
+        if self.notification_sequence()? != observed {
+            return Ok(true);
+        }
+
         self.shm_region
-            .wait_u32_changed(SHM_NOTIFY_SEQ_OFFSET, observed, timeout)
+            .fetch_add_u32_release(SHM_WAITER_COUNT_OFFSET, 1)?;
+        let wait_result =
+            self.shm_region
+                .wait_u32_changed(SHM_NOTIFY_SEQ_OFFSET, observed, timeout);
+        let decrement_result = self
+            .shm_region
+            .fetch_sub_u32_release(SHM_WAITER_COUNT_OFFSET, 1);
+        match (wait_result, decrement_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(notified), Ok(_)) => Ok(notified),
+        }
     }
 
     /// 将 cursor 移到当前已提交行尾，后续只读取新提交的行。
@@ -220,6 +236,7 @@ fn read_control_snapshot(
     }
 
     let notify_seq = shm_region.load_u32_acquire(SHM_NOTIFY_SEQ_OFFSET)?;
+    let waiter_count = shm_region.load_u32_acquire(SHM_WAITER_COUNT_OFFSET)?;
 
     let sealed = read_sealed_flag(shm_region)?;
 
@@ -235,6 +252,7 @@ fn read_control_snapshot(
         row_count,
         committed_row_count,
         notify_seq,
+        waiter_count,
         sealed,
         payload_offset: descriptor.payload_offset(),
         committed_row_count_offset: descriptor.committed_row_count_offset(),

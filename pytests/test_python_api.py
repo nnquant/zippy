@@ -7820,6 +7820,7 @@ def test_connect_sets_default_master_for_query_tail(tmp_path: Path) -> None:
     assert snapshot["active_segment_control"]["row_count"] == 2
     assert snapshot["active_segment_control"]["committed_row_count"] == 2
     assert snapshot["active_segment_control"]["notify_seq"] == 2
+    assert snapshot["active_segment_control"]["waiter_count"] == 0
     assert snapshot["active_segment_control"]["sealed"] is False
 
     if reset_default_master is not None:

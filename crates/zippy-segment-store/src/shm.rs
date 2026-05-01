@@ -174,6 +174,19 @@ impl ShmRegion {
         Ok(atomic.fetch_add(value, Ordering::Release))
     }
 
+    /// 以 release 语义递减共享内存中的 `u32`。
+    pub fn fetch_sub_u32_release(
+        &self,
+        offset: usize,
+        value: u32,
+    ) -> Result<u32, ZippySegmentStoreError> {
+        self.checked_atomic_u32_offset(offset)?;
+        // SAFETY:
+        // - `checked_atomic_u32_offset` 保证该地址在 mapping 内且满足 `AtomicU32` 对齐。
+        let atomic = unsafe { &*(self.inner.as_ptr().add(offset).cast::<AtomicU32>()) };
+        Ok(atomic.fetch_sub(value, Ordering::Release))
+    }
+
     /// 在 Linux futex 上等待共享 `u32` 发生变化。
     pub fn wait_u32_changed(
         &self,
