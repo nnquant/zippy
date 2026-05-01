@@ -187,6 +187,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         callback=on_row,
         poll_interval_ms=args.poll_interval_ms,
         xfast=args.xfast,
+        idle_spin_checks=args.idle_spin_checks,
     )
     try:
         for seq in range(args.rows):
@@ -212,6 +213,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "row_capacity": args.row_capacity,
             "xfast": args.xfast,
             "poll_interval_ms": args.poll_interval_ms,
+            "idle_spin_checks": args.idle_spin_checks,
             "latency_ms": summarize_samples_ms(all_latencies),
             "rollover_first_row_latency_ms": summarize_samples_ms(rollover_latencies),
             "subscriber_metrics": subscriber.metrics(),
@@ -238,6 +240,12 @@ def main() -> None:
     parser.add_argument(
         "--poll-interval-ms", type=int, default=1, help="subscriber health check 间隔"
     )
+    parser.add_argument(
+        "--idle-spin-checks",
+        type=int,
+        default=64,
+        help="非 xfast 模式进入 futex wait 前的短自旋检查次数；0 表示纯 futex wait",
+    )
     parser.add_argument("--timeout-sec", type=float, default=10.0, help="等待接收完成的超时时间")
     parser.add_argument("--xfast", action="store_true", help="使用 spin loop 模式")
     parser.add_argument(
@@ -251,6 +259,8 @@ def main() -> None:
         raise ValueError("rows must be greater than zero")
     if args.row_capacity <= 0:
         raise ValueError("row_capacity must be greater than zero")
+    if args.idle_spin_checks < 0:
+        raise ValueError("idle_spin_checks must be greater than or equal to zero")
     if args.poll_interval_ms <= 0 and not args.xfast:
         raise ValueError("poll_interval_ms must be greater than zero unless xfast is true")
 

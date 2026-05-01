@@ -1421,6 +1421,8 @@ CPU usage under idle / low-rate / high-rate ingest
 - 单独统计 rollover 后首行延迟，用于观察是否仍存在固定 50ms 量化长尾；
 - 输出 `StreamSubscriber.metrics()` 和 `active_segment_control`，方便把延迟与
   descriptor generation / notify_seq 对齐。
+- 支持 `--idle-spin-checks`，可在 probe 中直接对比纯 futex wait 与
+  hybrid spin-before-futex 策略的延迟和 CPU 取舍。
 
 ### 验收标准
 
@@ -1939,6 +1941,8 @@ persist_path
   路径计数；
 已完成长期低延迟 IPC 增量：Python 订阅 API 暴露 `idle_spin_checks`，允许用户在
   非 xfast 模式下按机器和行情节奏调节 spin-before-futex 策略；
+已完成长期低延迟 IPC 增量：subscriber latency probe 支持 `--idle-spin-checks`，
+  压测报告会回显参数并输出底层等待路径 metrics，便于实盘机器做参数扫描；
 已完成 Persist/Retention 增量：partition compaction 第一版，支持手动
   `zippy.ops.compact_table()` 合并小 parquet 并原子替换 persisted metadata；
 已完成 Persist/Retention 安全闭环：persist commit gating、reader lease、mmap GC、stale lease cleanup；

@@ -5804,6 +5804,7 @@ def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> Non
         interval_ms=0.0,
         row_capacity=8,
         poll_interval_ms=1,
+        idle_spin_checks=7,
         timeout_sec=5.0,
         xfast=False,
         drop_existing=True,
@@ -5817,9 +5818,11 @@ def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> Non
         server.stop()
 
     assert report["rows"] == 20
+    assert report["idle_spin_checks"] == 7
     assert report["latency_ms"]["count"] == 20
     assert report["rollover_first_row_latency_ms"]["count"] == 2
     assert report["subscriber_metrics"]["rows_delivered_total"] == 20
+    assert report["subscriber_metrics"]["idle_spin_checks"] == 7
     assert report["active_segment_control"]["committed_row_count"] == 4
 
 
