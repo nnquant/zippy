@@ -1834,6 +1834,7 @@ rollover latency
 
 - 已补充 `examples/07_ops/02_table_perf_probe.py` 轻量性能探针：
   - 记录 `read_table(table).tail(n)` latency 的 min/avg/p50/p95/p99/max。
+  - 记录 `read_table(table).scan_live()` latency 与 active scan throughput。
   - 记录 active/sealed/persisted 基础存储状态和 `/dev/shm` 使用量。
   - 可选 `--include-replay` 测量 persisted callback replay throughput。
 

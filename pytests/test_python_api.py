@@ -5759,6 +5759,37 @@ def test_table_perf_probe_summarizes_latency_samples() -> None:
     }
 
 
+def test_table_perf_probe_measures_scan_live_throughput(monkeypatch) -> None:
+    module_path = WORKSPACE_ROOT / "examples" / "07_ops" / "02_table_perf_probe.py"
+    spec = importlib.util.spec_from_file_location("table_perf_probe_example", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    schema = pa.schema([("seq", pa.int64())])
+    batches = [
+        pa.record_batch([pa.array([1, 2, 3], type=pa.int64())], schema=schema),
+        pa.record_batch([pa.array([4, 5], type=pa.int64())], schema=schema),
+    ]
+
+    class FakeTable:
+        def scan_live(self):
+            return pa.RecordBatchReader.from_batches(schema, batches)
+
+    monkeypatch.setattr(module.zp, "read_table", lambda table_name: FakeTable())
+    timestamps = iter([1_000_000_000, 1_005_000_000])
+    monkeypatch.setattr(module.time, "perf_counter_ns", lambda: next(timestamps))
+
+    report = module.measure_scan_live_throughput("ticks", iterations=1)
+
+    assert report["iterations"] == 1
+    assert report["last_batches"] == 2
+    assert report["last_rows"] == 5
+    assert report["latency_ms"]["avg"] == 5.0
+    assert report["throughput_rows_per_sec"]["avg"] == 1000.0
+
+
 def test_subscribe_latency_probe_summarizes_latency_samples() -> None:
     module_path = WORKSPACE_ROOT / "examples" / "07_ops" / "03_subscribe_latency_probe.py"
     spec = importlib.util.spec_from_file_location("subscribe_latency_probe_example", module_path)
