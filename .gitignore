@@ -12,5 +12,9 @@ logs/
 /~/
 crates/zippy-master/--no-console-log/
 
-docs/superpowers
+# Local planning artifacts.
+/docs/superpowers/
+/docs/ROADMAP.md
+/ROADMAP
+/ROADMAP.md
 .worktrees/
