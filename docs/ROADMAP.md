@@ -1350,6 +1350,12 @@ control block 损坏和 resource cleanup。
 在非 xfast 模式下已使用该 mmap wakeup，timeout 仅作为 health check。
 已完成增量：`ActiveSegmentReader.is_sealed()` 可直接读取 mmap header 中的 sealed
 flag，subscriber 空轮询热路径不再为判断 rollover 构造完整 `SegmentControlSnapshot`。
+已完成增量：`SegmentReaderDriver` 在非 `xfast` 模式下改为 hybrid idle wait：
+先做短暂 spin 检查 `notify_seq`，仍无更新时才进入 futex 阻塞等待。这样低频 tick
+到达窗口内可以避开一次 futex wait syscall；持续空闲时仍会阻塞，不会退化成永久
+busy spin。`StreamSubscriber.metrics()` 已暴露 `mmap_spin_checks_total`、
+`mmap_futex_waits_total`、`mmap_futex_notifications_total` 和
+`mmap_futex_timeouts_total`，用于观察低延迟路径是否真的进入 spin/futex。
 
 #### 14.4 rollover protocol
 
@@ -1923,6 +1929,10 @@ persist_path
 已完成长期低延迟 IPC 增量：control block layout v3 增加 `waiter_count`，writer
   仅在存在阻塞 reader 时执行 futex wake，降低无 reader/xfast reader 场景下的写入
   syscall 成本；
+已完成长期低延迟 IPC 增量：subscriber/SegmentStreamSource 的共享 reader driver
+  在非 xfast 模式下使用 short spin + futex wait 的 hybrid idle wait，降低低频
+  tick 场景中“刚空读就阻塞”的 syscall 概率，并通过 subscriber metrics 暴露等待
+  路径计数；
 已完成 Persist/Retention 增量：partition compaction 第一版，支持手动
   `zippy.ops.compact_table()` 合并小 parquet 并原子替换 persisted metadata；
 已完成 Persist/Retention 安全闭环：persist commit gating、reader lease、mmap GC、stale lease cleanup；

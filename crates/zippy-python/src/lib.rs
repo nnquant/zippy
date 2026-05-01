@@ -2705,6 +2705,7 @@ fn record_batches_to_pyarrow_record_batch_reader(
 }
 
 const SEGMENT_DESCRIPTOR_WATCH_TIMEOUT: Duration = Duration::from_millis(500);
+const SEGMENT_READER_IDLE_SPIN_CHECKS: u32 = 64;
 
 #[derive(Clone, Debug)]
 struct DescriptorUpdate {
@@ -2785,6 +2786,10 @@ struct SubscriberMetrics {
     descriptor_updates_total: AtomicU64,
     current_descriptor_generation: AtomicU64,
     last_descriptor_update_ns: AtomicU64,
+    mmap_spin_checks_total: AtomicU64,
+    mmap_futex_waits_total: AtomicU64,
+    mmap_futex_notifications_total: AtomicU64,
+    mmap_futex_timeouts_total: AtomicU64,
 }
 
 impl SubscriberMetrics {
@@ -2804,6 +2809,21 @@ impl SubscriberMetrics {
     fn record_batch_delivered(&self, row_count: usize) {
         self.batches_delivered_total.fetch_add(1, Ordering::SeqCst);
         self.record_rows_delivered(row_count);
+    }
+
+    fn record_mmap_spin_check(&self) {
+        self.mmap_spin_checks_total.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_mmap_futex_wait(&self, notified: bool) {
+        self.mmap_futex_waits_total.fetch_add(1, Ordering::SeqCst);
+        if notified {
+            self.mmap_futex_notifications_total
+                .fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.mmap_futex_timeouts_total
+                .fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -2895,6 +2915,7 @@ struct SegmentReaderDriver {
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
     xfast: bool,
     idle_wait: Duration,
+    metrics: Option<Arc<SubscriberMetrics>>,
 }
 
 impl SegmentReaderDriver {
@@ -2908,6 +2929,7 @@ impl SegmentReaderDriver {
         descriptor_refresh_error: Arc<Mutex<Option<String>>>,
         xfast: bool,
         idle_wait: Duration,
+        metrics: Option<Arc<SubscriberMetrics>>,
     ) -> Self {
         Self {
             reader,
@@ -2918,6 +2940,7 @@ impl SegmentReaderDriver {
             descriptor_refresh_error,
             xfast,
             idle_wait,
+            metrics,
         }
     }
 
@@ -2995,14 +3018,37 @@ impl SegmentReaderDriver {
                 if self.xfast {
                     spin_loop();
                 } else {
-                    let _ = self
-                        .reader
-                        .wait_for_notification_after(observed_notification_seq, self.idle_wait)
-                        .map_err(|error| error.to_string())?;
+                    self.wait_for_mmap_notification_after(observed_notification_seq)?;
                 }
                 Ok(SegmentReaderDriverEvent::Idle)
             }
         }
+    }
+
+    fn wait_for_mmap_notification_after(&self, observed: u32) -> std::result::Result<bool, String> {
+        for _ in 0..SEGMENT_READER_IDLE_SPIN_CHECKS {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.record_mmap_spin_check();
+            }
+            spin_loop();
+            if self
+                .reader
+                .notification_sequence()
+                .map_err(|error| error.to_string())?
+                != observed
+            {
+                return Ok(true);
+            }
+        }
+
+        let notified = self
+            .reader
+            .wait_for_notification_after(observed, self.idle_wait)
+            .map_err(|error| error.to_string())?;
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_mmap_futex_wait(notified);
+        }
+        Ok(notified)
     }
 
     fn finish(&self) -> std::result::Result<(), String> {
@@ -3203,6 +3249,7 @@ impl StreamSubscriber {
                 Arc::clone(&descriptor_refresh_error),
                 xfast,
                 poll_interval,
+                Some(Arc::clone(&metrics)),
             );
 
             let result = (|| -> std::result::Result<(), String> {
@@ -3285,6 +3332,26 @@ impl StreamSubscriber {
             "last_descriptor_update_ns",
             self.metrics
                 .last_descriptor_update_ns
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "mmap_spin_checks_total",
+            self.metrics.mmap_spin_checks_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "mmap_futex_waits_total",
+            self.metrics.mmap_futex_waits_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "mmap_futex_notifications_total",
+            self.metrics
+                .mmap_futex_notifications_total
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "mmap_futex_timeouts_total",
+            self.metrics
+                .mmap_futex_timeouts_total
                 .load(Ordering::SeqCst),
         )?;
         Ok(dict.into_py(py))
@@ -3866,6 +3933,7 @@ impl Source for SegmentSourceBridge {
                 Arc::clone(&descriptor_refresh_error),
                 xfast,
                 Duration::from_millis(1),
+                None,
             );
 
             let result = (|| -> zippy_core::Result<()> {
@@ -7163,6 +7231,7 @@ mod tests {
             Arc::clone(&descriptor_refresh_error),
             false,
             Duration::from_millis(1),
+            None,
         );
 
         match driver.poll_next().unwrap() {

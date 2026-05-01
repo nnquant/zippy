@@ -7971,6 +7971,55 @@ def test_subscribe_resumes_after_writer_process_restart(tmp_path: Path) -> None:
         server.stop()
 
 
+def test_subscriber_metrics_expose_hybrid_mmap_wait_counters(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("hybrid_wait_writer")
+    client.register_stream("hybrid_wait_ticks", tick_schema, 64, 4096)
+    client.register_source("hybrid_wait_source", "segment_test", "hybrid_wait_ticks", {})
+    writer = zippy._internal._SegmentTestWriter(
+        "hybrid_wait_ticks",
+        tick_schema,
+        row_capacity=16,
+    )
+    client.publish_segment_descriptor("hybrid_wait_ticks", writer.descriptor())
+
+    subscriber = zippy.subscribe(
+        source="hybrid_wait_ticks",
+        callback=lambda row: None,
+        poll_interval_ms=20,
+    )
+
+    try:
+        deadline = time.time() + 1.0
+        metrics = subscriber.metrics()
+        while metrics.get("mmap_futex_waits_total", 0) == 0 and time.time() < deadline:
+            time.sleep(0.01)
+            metrics = subscriber.metrics()
+
+        assert metrics["mmap_spin_checks_total"] > 0
+        assert metrics["mmap_futex_waits_total"] > 0
+        assert metrics["mmap_futex_notifications_total"] >= 0
+        assert metrics["mmap_futex_timeouts_total"] >= 0
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_subscribe_switches_from_sealed_segment_when_descriptor_arrives(
     tmp_path: Path,
 ) -> None:
