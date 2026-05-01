@@ -2142,6 +2142,8 @@ class StreamSubscriber:
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
+    :type idle_spin_checks: int
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
     :param wait: When true, wait until the stream exists and has an active segment descriptor.
@@ -2159,6 +2161,7 @@ class StreamSubscriber:
         *,
         poll_interval_ms: int | None = None,
         xfast: bool = False,
+        idle_spin_checks: int = 64,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
         wait: bool = False,
         timeout: float | str | None = None,
@@ -2180,6 +2183,7 @@ class StreamSubscriber:
             callback=callback,
             poll_interval_ms=effective_poll_interval_ms,
             xfast=xfast,
+            idle_spin_checks=idle_spin_checks,
             row_factory=None if _table_callback else Row,
             instrument_ids=instrument_ids,
         )
@@ -2227,6 +2231,7 @@ def subscribe(
     *,
     poll_interval_ms: int = 1,
     xfast: bool = False,
+    idle_spin_checks: int = 64,
     instrument_ids: list[str] | tuple[str, ...] | str | None = None,
     wait: bool = False,
     timeout: float | str | None = None,
@@ -2248,6 +2253,8 @@ def subscribe(
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
+    :type idle_spin_checks: int
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
     :param wait: When true, wait until the stream exists and has an active segment descriptor.
@@ -2263,6 +2270,7 @@ def subscribe(
         master=master,
         poll_interval_ms=poll_interval_ms,
         xfast=xfast,
+        idle_spin_checks=idle_spin_checks,
         instrument_ids=instrument_ids,
         wait=wait,
         timeout=timeout,
@@ -2277,6 +2285,7 @@ def subscribe_table(
     *,
     poll_interval_ms: int = 10,
     xfast: bool = False,
+    idle_spin_checks: int = 64,
     wait: bool = False,
     timeout: float | str | None = None,
 ) -> StreamSubscriber:
@@ -2297,6 +2306,8 @@ def subscribe_table(
     :type poll_interval_ms: int
     :param xfast: Spin instead of sleeping when no new rows are available.
     :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
+    :type idle_spin_checks: int
     :param wait: When true, wait until the stream exists and has an active segment descriptor.
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
@@ -2310,6 +2321,7 @@ def subscribe_table(
         master=master,
         poll_interval_ms=poll_interval_ms,
         xfast=xfast,
+        idle_spin_checks=idle_spin_checks,
         wait=wait,
         timeout=timeout,
         _table_callback=True,

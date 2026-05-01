@@ -445,6 +445,7 @@ class StreamSubscriber:
         callback: object,
         poll_interval_ms: int = 1,
         xfast: bool = False,
+        idle_spin_checks: int = 64,
         row_factory: object | None = None,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
     ) -> None: ...

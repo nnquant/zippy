@@ -1356,6 +1356,10 @@ flag，subscriber 空轮询热路径不再为判断 rollover 构造完整 `Segme
 busy spin。`StreamSubscriber.metrics()` 已暴露 `mmap_spin_checks_total`、
 `mmap_futex_waits_total`、`mmap_futex_notifications_total` 和
 `mmap_futex_timeouts_total`，用于观察低延迟路径是否真的进入 spin/futex。
+已完成增量：`zippy.subscribe()` / `zippy.subscribe_table()` / `StreamSubscriber`
+暴露 `idle_spin_checks`，用于调节非 xfast 模式下进入 futex wait 前的短 spin 次数。
+默认值保持保守；实盘可以根据 CPU 预算和延迟目标增减该值，传 `0` 可直接退回
+纯 futex wait。
 
 #### 14.4 rollover protocol
 
@@ -1933,6 +1937,8 @@ persist_path
   在非 xfast 模式下使用 short spin + futex wait 的 hybrid idle wait，降低低频
   tick 场景中“刚空读就阻塞”的 syscall 概率，并通过 subscriber metrics 暴露等待
   路径计数；
+已完成长期低延迟 IPC 增量：Python 订阅 API 暴露 `idle_spin_checks`，允许用户在
+  非 xfast 模式下按机器和行情节奏调节 spin-before-futex 策略；
 已完成 Persist/Retention 增量：partition compaction 第一版，支持手动
   `zippy.ops.compact_table()` 合并小 parquet 并原子替换 persisted metadata；
 已完成 Persist/Retention 安全闭环：persist commit gating、reader lease、mmap GC、stale lease cleanup；

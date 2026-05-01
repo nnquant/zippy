@@ -2915,6 +2915,7 @@ struct SegmentReaderDriver {
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
     xfast: bool,
     idle_wait: Duration,
+    idle_spin_checks: u32,
     metrics: Option<Arc<SubscriberMetrics>>,
 }
 
@@ -2929,6 +2930,7 @@ impl SegmentReaderDriver {
         descriptor_refresh_error: Arc<Mutex<Option<String>>>,
         xfast: bool,
         idle_wait: Duration,
+        idle_spin_checks: u32,
         metrics: Option<Arc<SubscriberMetrics>>,
     ) -> Self {
         Self {
@@ -2940,6 +2942,7 @@ impl SegmentReaderDriver {
             descriptor_refresh_error,
             xfast,
             idle_wait,
+            idle_spin_checks,
             metrics,
         }
     }
@@ -3026,7 +3029,7 @@ impl SegmentReaderDriver {
     }
 
     fn wait_for_mmap_notification_after(&self, observed: u32) -> std::result::Result<bool, String> {
-        for _ in 0..SEGMENT_READER_IDLE_SPIN_CHECKS {
+        for _ in 0..self.idle_spin_checks {
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics.record_mmap_spin_check();
             }
@@ -3111,6 +3114,7 @@ struct StreamSubscriber {
     instrument_filter: Option<BTreeSet<String>>,
     poll_interval: Duration,
     xfast: bool,
+    idle_spin_checks: u32,
     running: Arc<AtomicBool>,
     metrics: Arc<SubscriberMetrics>,
     join_handle: SubscriberJoinHandle,
@@ -3119,7 +3123,7 @@ struct StreamSubscriber {
 #[pymethods]
 impl StreamSubscriber {
     #[new]
-    #[pyo3(signature = (source, master, callback, poll_interval_ms=1, xfast=false, row_factory=None, instrument_ids=None))]
+    #[pyo3(signature = (source, master, callback, poll_interval_ms=1, xfast=false, idle_spin_checks=SEGMENT_READER_IDLE_SPIN_CHECKS, row_factory=None, instrument_ids=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -3128,6 +3132,7 @@ impl StreamSubscriber {
         callback: Py<PyAny>,
         poll_interval_ms: u64,
         xfast: bool,
+        idle_spin_checks: u32,
         row_factory: Option<Py<PyAny>>,
         instrument_ids: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
@@ -3167,6 +3172,7 @@ impl StreamSubscriber {
             instrument_filter,
             poll_interval: Duration::from_millis(poll_interval_ms),
             xfast,
+            idle_spin_checks,
             running: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(SubscriberMetrics::default()),
             join_handle: Arc::new(Mutex::new(None)),
@@ -3227,6 +3233,7 @@ impl StreamSubscriber {
         let instrument_filter = self.instrument_filter.clone();
         let poll_interval = self.poll_interval;
         let xfast = self.xfast;
+        let idle_spin_checks = self.idle_spin_checks;
 
         *guard = Some(thread::spawn(move || {
             let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
@@ -3249,6 +3256,7 @@ impl StreamSubscriber {
                 Arc::clone(&descriptor_refresh_error),
                 xfast,
                 poll_interval,
+                idle_spin_checks,
                 Some(Arc::clone(&metrics)),
             );
 
@@ -3310,6 +3318,7 @@ impl StreamSubscriber {
         let dict = PyDict::new_bound(py);
         dict.set_item("source", &self.source)?;
         dict.set_item("running", self.running.load(Ordering::SeqCst))?;
+        dict.set_item("idle_spin_checks", self.idle_spin_checks)?;
         dict.set_item(
             "rows_delivered_total",
             self.metrics.rows_delivered_total.load(Ordering::SeqCst),
@@ -3933,6 +3942,7 @@ impl Source for SegmentSourceBridge {
                 Arc::clone(&descriptor_refresh_error),
                 xfast,
                 Duration::from_millis(1),
+                SEGMENT_READER_IDLE_SPIN_CHECKS,
                 None,
             );
 
@@ -7231,6 +7241,7 @@ mod tests {
             Arc::clone(&descriptor_refresh_error),
             false,
             Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
             None,
         );
 

@@ -6910,6 +6910,7 @@ def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> Non
             callback: object,
             poll_interval_ms: int = 10,
             xfast: bool = False,
+            idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
         ) -> None:
@@ -6918,6 +6919,7 @@ def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> Non
             created["callback"] = callback
             created["poll_interval_ms"] = poll_interval_ms
             created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
 
@@ -6944,6 +6946,7 @@ def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> Non
         "callback": on_tick,
         "poll_interval_ms": 3,
         "xfast": True,
+        "idle_spin_checks": 64,
         "row_factory": zippy.Row,
         "instrument_ids": None,
     }
@@ -6977,6 +6980,7 @@ def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> N
             callback: object,
             poll_interval_ms: int = 1,
             xfast: bool = False,
+            idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
         ) -> None:
@@ -6985,6 +6989,7 @@ def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> N
             created["callback"] = callback
             created["poll_interval_ms"] = poll_interval_ms
             created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
 
@@ -7018,6 +7023,7 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
             *,
             poll_interval_ms: int | None = None,
             xfast: bool = False,
+            idle_spin_checks: int = 64,
             instrument_ids: object | None = None,
             wait: bool = False,
             timeout: float | str | None = None,
@@ -7027,6 +7033,7 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
             created["master"] = master
             created["poll_interval_ms"] = poll_interval_ms
             created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
             created["instrument_ids"] = instrument_ids
             created["wait"] = wait
             created["timeout"] = timeout
@@ -7053,11 +7060,55 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
         "master": explicit_master,
         "poll_interval_ms": 1,
         "xfast": False,
+        "idle_spin_checks": 64,
         "instrument_ids": ("IF2606", "IF2607"),
         "wait": False,
         "timeout": None,
         "started": True,
     }
+
+
+def test_subscribe_passes_idle_spin_checks_to_native(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            idle_spin_checks: int = 64,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber(
+        "ctp_ticks",
+        callback=lambda row: None,
+        master=explicit_master,
+        poll_interval_ms=5,
+        idle_spin_checks=256,
+    )
+
+    assert created["poll_interval_ms"] == 5
+    assert created["idle_spin_checks"] == 256
+    assert created["row_factory"] is zippy.Row
 
 
 def test_subscribe_row_mode_defaults_to_low_latency_poll_interval(monkeypatch) -> None:
@@ -7071,6 +7122,7 @@ def test_subscribe_row_mode_defaults_to_low_latency_poll_interval(monkeypatch) -
             callback: object,
             poll_interval_ms: int = 1,
             xfast: bool = False,
+            idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
         ) -> None:
@@ -7079,6 +7131,7 @@ def test_subscribe_row_mode_defaults_to_low_latency_poll_interval(monkeypatch) -
             created["callback"] = callback
             created["poll_interval_ms"] = poll_interval_ms
             created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
 
@@ -7091,6 +7144,7 @@ def test_subscribe_row_mode_defaults_to_low_latency_poll_interval(monkeypatch) -
     zippy.StreamSubscriber("ctp_ticks", callback=lambda row: None, master=explicit_master)
 
     assert created["poll_interval_ms"] == 1
+    assert created["idle_spin_checks"] == 64
     assert created["row_factory"] is zippy.Row
     assert created["instrument_ids"] is None
 
@@ -7106,6 +7160,7 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
             callback: object,
             poll_interval_ms: int = 1,
             xfast: bool = False,
+            idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
         ) -> None:
@@ -7114,6 +7169,7 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
             created["callback"] = callback
             created["poll_interval_ms"] = poll_interval_ms
             created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
 
@@ -7131,6 +7187,7 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
     )
 
     assert created["poll_interval_ms"] == 10
+    assert created["idle_spin_checks"] == 64
     assert created["row_factory"] is None
     assert created["instrument_ids"] is None
 
@@ -7163,6 +7220,7 @@ def test_subscribe_registers_default_master_process_before_native_subscriber(
             callback: object,
             poll_interval_ms: int = 10,
             xfast: bool = False,
+            idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
         ) -> None:
@@ -7172,6 +7230,7 @@ def test_subscribe_registers_default_master_process_before_native_subscriber(
             created["callback"] = callback
             created["poll_interval_ms"] = poll_interval_ms
             created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
 
@@ -8000,6 +8059,7 @@ def test_subscriber_metrics_expose_hybrid_mmap_wait_counters(tmp_path: Path) -> 
         source="hybrid_wait_ticks",
         callback=lambda row: None,
         poll_interval_ms=20,
+        idle_spin_checks=8,
     )
 
     try:
@@ -8009,6 +8069,7 @@ def test_subscriber_metrics_expose_hybrid_mmap_wait_counters(tmp_path: Path) -> 
             time.sleep(0.01)
             metrics = subscriber.metrics()
 
+        assert metrics["idle_spin_checks"] == 8
         assert metrics["mmap_spin_checks_total"] > 0
         assert metrics["mmap_futex_waits_total"] > 0
         assert metrics["mmap_futex_notifications_total"] >= 0
