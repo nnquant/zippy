@@ -1,6 +1,7 @@
 pub mod bus_frame;
 pub mod bus_protocol;
 pub mod config;
+pub mod control_transport;
 pub mod endpoint;
 pub mod engine;
 pub mod error;
@@ -36,8 +37,11 @@ pub use config::{
     ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL,
     DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
 };
+pub use control_transport::{connect_control_endpoint, send_control_line_request, ControlStream};
 pub use endpoint::{
-    default_control_endpoint_path, resolve_control_endpoint_uri, DEFAULT_CONTROL_ENDPOINT_URI,
+    default_control_endpoint, default_control_endpoint_path, resolve_control_endpoint,
+    resolve_control_endpoint_uri, resolve_control_endpoint_with_home, ControlEndpoint,
+    ControlEndpointKind, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};

@@ -1,8 +1,108 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use crate::{Result, ZippyError};
+
 pub const DEFAULT_CONTROL_ENDPOINT_URI: &str = "zippy://default";
+pub const DEFAULT_WINDOWS_CONTROL_ADDR: &str = "127.0.0.1:17690";
 
 const CONTROL_ENDPOINT_ROOT: &str = ".zippy/control_endpoints";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlEndpointKind {
+    Unix,
+    Tcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlEndpoint {
+    Unix(PathBuf),
+    Tcp(SocketAddr),
+}
+
+impl From<PathBuf> for ControlEndpoint {
+    fn from(path: PathBuf) -> Self {
+        Self::Unix(path)
+    }
+}
+
+impl From<SocketAddr> for ControlEndpoint {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Tcp(addr)
+    }
+}
+
+impl ControlEndpoint {
+    pub fn kind(&self) -> ControlEndpointKind {
+        match self {
+            Self::Unix(_) => ControlEndpointKind::Unix,
+            Self::Tcp(_) => ControlEndpointKind::Tcp,
+        }
+    }
+
+    pub fn display_string(&self) -> String {
+        match self {
+            Self::Unix(path) => path.display().to_string(),
+            Self::Tcp(addr) => format!("tcp://{addr}"),
+        }
+    }
+
+    pub fn snapshot_dir(&self) -> PathBuf {
+        match self {
+            Self::Unix(path) => path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            Self::Tcp(addr) => home_dir()
+                .join(CONTROL_ENDPOINT_ROOT)
+                .join(format!("tcp-{}", addr.port())),
+        }
+    }
+
+    pub fn unix_path(&self) -> Option<&Path> {
+        match self {
+            Self::Unix(path) => Some(path.as_path()),
+            Self::Tcp(_) => None,
+        }
+    }
+}
+
+pub fn default_control_endpoint() -> ControlEndpoint {
+    resolve_control_endpoint(DEFAULT_CONTROL_ENDPOINT_URI)
+        .expect("default control endpoint must be valid")
+}
+
+pub fn resolve_control_endpoint(uri: impl AsRef<str>) -> Result<ControlEndpoint> {
+    resolve_control_endpoint_with_home(uri.as_ref(), &home_dir())
+}
+
+pub fn resolve_control_endpoint_with_home(uri: &str, home: &Path) -> Result<ControlEndpoint> {
+    if let Some(addr) = uri.strip_prefix("tcp://") {
+        return parse_tcp_endpoint(uri, addr);
+    }
+
+    #[cfg(unix)]
+    {
+        Ok(ControlEndpoint::Unix(
+            resolve_control_endpoint_uri_with_home(uri, home),
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        if uri.starts_with("unix://") || uri.starts_with("file://") || looks_like_path(uri) {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "unix control endpoint is not supported on this platform uri=[{uri}]"
+                ),
+            });
+        }
+        parse_tcp_endpoint(
+            &format!("tcp://{DEFAULT_WINDOWS_CONTROL_ADDR}"),
+            DEFAULT_WINDOWS_CONTROL_ADDR,
+        )
+    }
+}
 
 pub fn default_control_endpoint_path() -> PathBuf {
     resolve_control_endpoint_uri(DEFAULT_CONTROL_ENDPOINT_URI)
@@ -59,6 +159,20 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn parse_tcp_endpoint(original_uri: &str, addr: &str) -> Result<ControlEndpoint> {
+    let socket_addr = addr
+        .parse::<SocketAddr>()
+        .map_err(|error| ZippyError::InvalidConfig {
+            reason: format!("invalid tcp control endpoint uri=[{original_uri}] error=[{error}]"),
+        })?;
+    if !socket_addr.ip().is_loopback() {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!("tcp control endpoint must bind loopback address uri=[{original_uri}]"),
+        });
+    }
+    Ok(ControlEndpoint::Tcp(socket_addr))
 }
 
 #[cfg(test)]

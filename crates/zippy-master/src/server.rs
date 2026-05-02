@@ -1,5 +1,6 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -12,7 +13,9 @@ use std::time::Duration;
 use zippy_core::bus_protocol::{
     DropTableResult, GetStreamResponse, ListStreamsResponse, StreamInfo,
 };
-use zippy_core::{ControlRequest, ControlResponse, Result, ZippyConfig, ZippyError};
+use zippy_core::{
+    ControlEndpoint, ControlRequest, ControlResponse, Result, ZippyConfig, ZippyError,
+};
 
 use crate::bus::{Bus, BusError};
 use crate::registry::Registry;
@@ -202,6 +205,17 @@ impl MasterServer {
         self.serve_with_ready(socket_path, None)
     }
 
+    pub fn serve_endpoint_with_ready(
+        &self,
+        endpoint: &ControlEndpoint,
+        ready_tx: Option<SyncSender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
+        match endpoint {
+            ControlEndpoint::Unix(path) => self.serve_with_ready(path, ready_tx),
+            ControlEndpoint::Tcp(addr) => self.serve_tcp_with_ready(addr, ready_tx),
+        }
+    }
+
     pub fn serve_with_ready(
         &self,
         socket_path: &Path,
@@ -311,7 +325,7 @@ impl MasterServer {
                 Ok((stream, _)) => {
                     let server = self.clone();
                     thread::spawn(move || {
-                        if let Err(error) = server.handle_stream(stream) {
+                        if let Err(error) = server.handle_unix_stream(stream) {
                             tracing::warn!(
                                 component = "master",
                                 event = "control_connection_error",
@@ -404,13 +418,142 @@ impl MasterServer {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    fn handle_stream(&self, mut stream: UnixStream) -> Result<()> {
+    fn serve_tcp_with_ready(
+        &self,
+        addr: &SocketAddr,
+        ready_tx: Option<SyncSender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
+        if !self.is_running() {
+            if let Some(ready_tx) = ready_tx {
+                let _ = ready_tx.send(Err(String::from(
+                    "master daemon stopped before it became ready",
+                )));
+            }
+            return Ok(());
+        }
+
+        let listener = match TcpListener::bind(addr).map_err(io_error) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let error = ZippyError::Io {
+                    reason: format!(
+                        "bind tcp control endpoint failed addr=[{}] error=[{}]",
+                        addr, error
+                    ),
+                };
+                if let Some(ready_tx) = ready_tx {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = listener.set_nonblocking(true).map_err(io_error) {
+            let error = ZippyError::Io {
+                reason: format!(
+                    "set tcp control endpoint nonblocking failed addr=[{}] error=[{}]",
+                    addr, error
+                ),
+            };
+            if let Some(ready_tx) = ready_tx {
+                let _ = ready_tx.send(Err(error.to_string()));
+            }
+            return Err(error);
+        }
+
+        if let Some(ready_tx) = ready_tx {
+            let _ = ready_tx.send(Ok(()));
+        }
+
+        tracing::info!(
+            component = "master",
+            event = "master_listening",
+            status = "ready",
+            control_endpoint = format!("tcp://{addr}"),
+            "master listening"
+        );
+
+        self.start_lease_reaper();
+
+        let accept_result = loop {
+            if !self.running.load(Ordering::SeqCst) {
+                break Ok(());
+            }
+
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let server = self.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = server.handle_tcp_stream(stream) {
+                            tracing::warn!(
+                                component = "master",
+                                event = "control_connection_error",
+                                status = "error",
+                                error = %error,
+                                "control connection failed"
+                            );
+                        }
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(MASTER_ACCEPT_IDLE_SLEEP);
+                }
+                Err(error) => {
+                    let error = io_error(error);
+                    tracing::error!(
+                        component = "master",
+                        event = "master_accept_error",
+                        status = "error",
+                        error = %error,
+                        "accept loop failed"
+                    );
+                    break Err(error);
+                }
+            }
+        };
+
+        drop(listener);
+        let snapshot_flush_result = self.write_snapshot();
+
+        match (accept_result, snapshot_flush_result) {
+            (Ok(()), Ok(())) => {
+                tracing::info!(
+                    component = "master",
+                    event = "master_stopped",
+                    status = "stopped",
+                    control_endpoint = format!("tcp://{addr}"),
+                    "master stopped"
+                );
+                Ok(())
+            }
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    fn handle_unix_stream(&self, stream: UnixStream) -> Result<()> {
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
             .map_err(io_error)?;
+        self.handle_stream(stream)
+    }
+
+    fn handle_tcp_stream(&self, stream: TcpStream) -> Result<()> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(io_error)?;
+        stream.set_nodelay(true).map_err(io_error)?;
+        self.handle_stream(stream)
+    }
+
+    fn handle_stream<S>(&self, mut stream: S) -> Result<()>
+    where
+        S: Read + Write,
+    {
         let mut request_line = String::new();
-        let mut reader = BufReader::new(stream.try_clone().map_err(io_error)?);
-        reader.read_line(&mut request_line).map_err(io_error)?;
+        {
+            let mut reader = BufReader::new(&mut stream);
+            reader.read_line(&mut request_line).map_err(io_error)?;
+        }
 
         if let Some(response) = self.try_handle_test_control_request(&request_line)? {
             return write_control_response(&mut stream, &response);
@@ -1983,7 +2126,7 @@ fn delete_persisted_files(persisted_files: &[serde_json::Value]) -> Result<usize
     Ok(deleted)
 }
 
-fn write_control_response(stream: &mut UnixStream, response: &ControlResponse) -> Result<()> {
+fn write_control_response(stream: &mut impl Write, response: &ControlResponse) -> Result<()> {
     let payload = serde_json::to_string(response).map_err(|error| ZippyError::Io {
         reason: format!("failed to encode control response error=[{}]", error),
     })?;

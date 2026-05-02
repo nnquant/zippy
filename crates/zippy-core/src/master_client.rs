@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
 use std::hint::spin_loop;
-use std::io::{BufRead, BufReader, Cursor, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::io::Cursor;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,17 +25,20 @@ use crate::bus_protocol::{
     ReplacePersistedFilesRequest, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest,
     WaitSegmentDescriptorRequest, WriterDescriptor,
 };
-use crate::{canonical_schema_hash, schema_metadata, Result, SchemaRef, ZippyConfig, ZippyError};
+use crate::{
+    canonical_schema_hash, resolve_control_endpoint, schema_metadata, send_control_line_request,
+    ControlEndpoint, Result, SchemaRef, ZippyConfig, ZippyError,
+};
 
 /// Synchronous control-plane client for zippy-master.
 #[derive(Debug, Clone)]
 pub struct MasterClient {
-    socket_path: PathBuf,
+    endpoint: ControlEndpoint,
     process_id: Option<String>,
 }
 
 pub struct Writer {
-    socket_path: PathBuf,
+    endpoint: ControlEndpoint,
     descriptor: WriterDescriptor,
     next_write_seq: u64,
     ring: SharedFrameRing,
@@ -44,7 +46,7 @@ pub struct Writer {
 }
 
 pub struct Reader {
-    socket_path: PathBuf,
+    endpoint: ControlEndpoint,
     descriptor: ReaderDescriptor,
     instrument_filter: Option<BTreeSet<String>>,
     xfast: bool,
@@ -68,10 +70,22 @@ pub struct SegmentDescriptorUpdate {
 
 impl MasterClient {
     pub fn connect(socket_path: impl Into<PathBuf>) -> Result<Self> {
+        Self::connect_endpoint(ControlEndpoint::Unix(socket_path.into()))
+    }
+
+    pub fn connect_uri(uri: impl AsRef<str>) -> Result<Self> {
+        Self::connect_endpoint(resolve_control_endpoint(uri.as_ref())?)
+    }
+
+    pub fn connect_endpoint(endpoint: ControlEndpoint) -> Result<Self> {
         Ok(Self {
-            socket_path: socket_path.into(),
+            endpoint,
             process_id: None,
         })
+    }
+
+    pub fn endpoint(&self) -> &ControlEndpoint {
+        &self.endpoint
     }
 
     pub fn process_id(&self) -> Option<&str> {
@@ -254,7 +268,7 @@ impl MasterClient {
                     .next_write_seq
                     .max(ring.next_seq().map_err(shared_ring_error)?);
                 Ok(Writer {
-                    socket_path: self.socket_path.clone(),
+                    endpoint: self.endpoint.clone(),
                     next_write_seq,
                     ring,
                     descriptor,
@@ -338,7 +352,7 @@ impl MasterClient {
                     }
                 }
                 Ok(Reader {
-                    socket_path: self.socket_path.clone(),
+                    endpoint: self.endpoint.clone(),
                     instrument_filter: descriptor_filter,
                     xfast,
                     next_read_seq,
@@ -577,24 +591,7 @@ impl MasterClient {
     }
 
     fn send_request(&self, request: ControlRequest) -> Result<ControlResponse> {
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(io_error)?;
-        let payload = serde_json::to_string(&request).map_err(json_error)?;
-        stream.write_all(payload.as_bytes()).map_err(io_error)?;
-        stream.write_all(b"\n").map_err(io_error)?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .map_err(io_error)?;
-
-        let mut response_line = String::new();
-        let mut reader = BufReader::new(stream);
-        reader.read_line(&mut response_line).map_err(io_error)?;
-        let response: ControlResponse =
-            serde_json::from_str(response_line.trim_end()).map_err(json_error)?;
-
-        match response {
-            ControlResponse::Error { reason } => Err(ZippyError::Io { reason }),
-            other => Ok(other),
-        }
+        send_control_line_request(&self.endpoint, request)
     }
 }
 
@@ -668,7 +665,7 @@ impl Writer {
         }
 
         let response = send_control_request(
-            &self.socket_path,
+            &self.endpoint,
             ControlRequest::CloseWriter(DetachWriterRequest {
                 stream_name: self.descriptor.stream_name.clone(),
                 process_id: self.descriptor.process_id.clone(),
@@ -797,7 +794,7 @@ impl Reader {
         }
 
         let response = send_control_request(
-            &self.socket_path,
+            &self.endpoint,
             ControlRequest::CloseReader(DetachReaderRequest {
                 stream_name: self.descriptor.stream_name.clone(),
                 process_id: self.descriptor.process_id.clone(),
@@ -828,25 +825,11 @@ fn sample_localtime_ns() -> i64 {
         .as_nanos() as i64
 }
 
-fn send_control_request(socket_path: &Path, request: ControlRequest) -> Result<ControlResponse> {
-    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
-    let payload = serde_json::to_string(&request).map_err(json_error)?;
-    stream.write_all(payload.as_bytes()).map_err(io_error)?;
-    stream.write_all(b"\n").map_err(io_error)?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(io_error)?;
-
-    let mut response_line = String::new();
-    let mut reader = BufReader::new(stream);
-    reader.read_line(&mut response_line).map_err(io_error)?;
-    let response: ControlResponse =
-        serde_json::from_str(response_line.trim_end()).map_err(json_error)?;
-
-    match response {
-        ControlResponse::Error { reason } => Err(ZippyError::Io { reason }),
-        other => Ok(other),
-    }
+fn send_control_request(
+    endpoint: &ControlEndpoint,
+    request: ControlRequest,
+) -> Result<ControlResponse> {
+    send_control_line_request(endpoint, request)
 }
 
 fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
@@ -970,12 +953,6 @@ fn extract_instrument_ids(batch: &RecordBatch) -> Result<Option<Vec<String>>> {
     }
 
     Ok(Some(unique_instrument_ids.into_iter().collect()))
-}
-
-fn io_error(error: std::io::Error) -> ZippyError {
-    ZippyError::Io {
-        reason: error.to_string(),
-    }
 }
 
 fn json_error(error: serde_json::Error) -> ZippyError {

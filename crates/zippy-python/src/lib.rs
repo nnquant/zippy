@@ -6,8 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::hint::spin_loop;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
@@ -24,13 +22,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
 use tracing::{error, info};
 use zippy_core::{
-    current_log_snapshot, python_dev_version, resolve_control_endpoint_uri,
-    setup_log as setup_core_log, spawn_engine_with_publisher, DropTableResult, Engine,
-    EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy, LogConfig,
-    MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
-    Reader as CoreBusReader, SegmentTableView, Source, SourceEvent, SourceHandle,
-    SourceMode as RustSourceMode, SourceSink, StreamHello, StreamInfo, Writer as CoreBusWriter,
-    ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
+    current_log_snapshot, python_dev_version, resolve_control_endpoint, send_control_line_request,
+    setup_log as setup_core_log, spawn_engine_with_publisher, ControlEndpoint, ControlRequest,
+    DropTableResult, Engine, EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus,
+    LateDataPolicy, LogConfig, MasterClient as CoreMasterClient, OverflowPolicy,
+    Publisher as CorePublisher, Reader as CoreBusReader, SegmentTableView, Source, SourceEvent,
+    SourceHandle, SourceMode as RustSourceMode, SourceSink, StreamHello, StreamInfo,
+    Writer as CoreBusWriter, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
@@ -79,8 +77,8 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
     PyRuntimeError::new_err(message.into())
 }
 
-fn resolve_control_endpoint_path(control_endpoint: &str) -> PyResult<PathBuf> {
-    Ok(resolve_control_endpoint_uri(control_endpoint))
+fn resolve_control_endpoint_value(control_endpoint: &str) -> PyResult<ControlEndpoint> {
+    resolve_control_endpoint(control_endpoint).map_err(|error| py_runtime_error(error.to_string()))
 }
 
 fn resolve_uri_argument(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<String> {
@@ -93,18 +91,20 @@ fn resolve_uri_argument(uri: Option<String>, control_endpoint: Option<String>) -
     }
 }
 
-fn prepare_control_endpoint_path(control_endpoint: &str) -> PyResult<PathBuf> {
-    let path = resolve_control_endpoint_path(control_endpoint)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            py_runtime_error(format!(
-                "failed to create control endpoint parent path=[{}] error=[{}]",
-                parent.display(),
-                error
-            ))
-        })?;
+fn prepare_control_endpoint(control_endpoint: &str) -> PyResult<ControlEndpoint> {
+    let endpoint = resolve_control_endpoint_value(control_endpoint)?;
+    if let Some(path) = endpoint.unix_path() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                py_runtime_error(format!(
+                    "failed to create control endpoint parent path=[{}] error=[{}]",
+                    parent.display(),
+                    error
+                ))
+            })?;
+        }
     }
-    Ok(path)
+    Ok(endpoint)
 }
 
 fn parse_startup_timeout(startup_timeout_sec: f64) -> PyResult<Duration> {
@@ -151,43 +151,15 @@ fn send_master_control_request(
     expected_response_key: &str,
 ) -> PyResult<()> {
     let payload = python_json_dumps(py, request)?;
-    let mut stream = UnixStream::connect(control_endpoint).map_err(|error| {
-        py_runtime_error(format!(
-            "failed to connect control endpoint path=[{}] error=[{}]",
-            control_endpoint, error
-        ))
-    })?;
-    stream.write_all(payload.as_bytes()).map_err(|error| {
-        py_runtime_error(format!(
-            "failed to write control request path=[{}] error=[{}]",
-            control_endpoint, error
-        ))
-    })?;
-    stream.write_all(b"\n").map_err(|error| {
-        py_runtime_error(format!(
-            "failed to write control request terminator path=[{}] error=[{}]",
-            control_endpoint, error
-        ))
-    })?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|error| {
-            py_runtime_error(format!(
-                "failed to shutdown control request write path=[{}] error=[{}]",
-                control_endpoint, error
-            ))
-        })?;
-
-    let mut response_line = String::new();
-    let mut reader = BufReader::new(stream);
-    reader.read_line(&mut response_line).map_err(|error| {
-        py_runtime_error(format!(
-            "failed to read control response path=[{}] error=[{}]",
-            control_endpoint, error
-        ))
-    })?;
-
-    let response = python_json_loads(py, response_line.trim_end())?;
+    let endpoint = resolve_control_endpoint_value(control_endpoint)?;
+    let request = serde_json::from_str::<ControlRequest>(&payload)
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    let response = py
+        .allow_threads(|| send_control_line_request(&endpoint, request))
+        .map_err(|error| py_runtime_error(error.to_string()))?;
+    let response_text =
+        serde_json::to_string(&response).map_err(|error| py_runtime_error(error.to_string()))?;
+    let response = python_json_loads(py, &response_text)?;
     let response = response
         .downcast::<PyDict>()
         .map_err(|_| py_runtime_error("invalid control response"))?;
@@ -1678,12 +1650,12 @@ impl MasterClient {
     #[pyo3(signature = (uri=None, *, control_endpoint=None))]
     fn new(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<Self> {
         let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
-        let resolved_control_endpoint = resolve_control_endpoint_path(&control_endpoint)?;
-        let resolved_control_endpoint = resolved_control_endpoint.display().to_string();
-        let client = CoreMasterClient::connect(&resolved_control_endpoint)
+        let resolved_control_endpoint = resolve_control_endpoint_value(&control_endpoint)?;
+        let resolved_control_endpoint_display = resolved_control_endpoint.display_string();
+        let client = CoreMasterClient::connect_endpoint(resolved_control_endpoint)
             .map_err(|error| py_runtime_error(error.to_string()))?;
         Ok(Self {
-            control_endpoint: resolved_control_endpoint,
+            control_endpoint: resolved_control_endpoint_display,
             client: Arc::new(Mutex::new(client)),
             schemas: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -3532,9 +3504,8 @@ impl MasterDaemon {
     #[pyo3(signature = (uri=None, *, control_endpoint=None))]
     fn new(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<Self> {
         let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
-        let resolved_control_endpoint = resolve_control_endpoint_path(&control_endpoint)?
-            .display()
-            .to_string();
+        let resolved_control_endpoint = resolve_control_endpoint_value(&control_endpoint)?;
+        let resolved_control_endpoint = resolved_control_endpoint.display_string();
         Ok(Self {
             control_endpoint: resolved_control_endpoint,
             server: RustMasterServer::default(),
@@ -3549,11 +3520,11 @@ impl MasterDaemon {
             return Err(py_runtime_error("master daemon already started"));
         }
         let startup_timeout = parse_startup_timeout(startup_timeout_sec)?;
-        let socket_path = prepare_control_endpoint_path(&self.control_endpoint)?;
+        let endpoint = prepare_control_endpoint(&self.control_endpoint)?;
         let server = self.server.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let join_handle =
-            thread::spawn(move || server.serve_with_ready(&socket_path, Some(startup_tx)));
+            thread::spawn(move || server.serve_endpoint_with_ready(&endpoint, Some(startup_tx)));
 
         match startup_rx.recv_timeout(startup_timeout) {
             Ok(Ok(())) => {
@@ -5525,7 +5496,7 @@ fn run_master_daemon(
     config: Option<String>,
 ) -> PyResult<()> {
     let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
-    let control_endpoint = prepare_control_endpoint_path(&control_endpoint)?;
+    let control_endpoint = prepare_control_endpoint(&control_endpoint)?;
     let mut daemon_config = MasterDaemonConfig::new(control_endpoint);
     if let Some(config) = config {
         daemon_config = daemon_config.with_config_path(PathBuf::from(config));

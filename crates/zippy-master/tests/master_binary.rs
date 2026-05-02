@@ -1,11 +1,12 @@
 use std::fs;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use zippy_core::MasterClient;
+use zippy_core::{ControlEndpoint, MasterClient};
 
 #[test]
 fn master_binary_writes_startup_logs_and_socket() {
@@ -150,6 +151,38 @@ dt_part = "%Y%m"
         config.table.persist.partition.dt_part.as_deref(),
         Some("%Y%m")
     );
+
+    let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(status, 0);
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
+}
+
+#[test]
+fn master_binary_serves_tcp_control_endpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let addr = unused_loopback_addr();
+    let log_dir = temp.path().join("logs");
+    let binary = env!("CARGO_BIN_EXE_zippy-master");
+
+    let mut child = Command::new(binary)
+        .arg(format!("tcp://{addr}"))
+        .arg("--log-dir")
+        .arg(&log_dir)
+        .arg("--log-level")
+        .arg("info")
+        .arg("--no-console-log")
+        .env("HOME", temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_log_contains(&log_dir, "\"event\":\"master_listening\"");
+    let mut client = MasterClient::connect_endpoint(ControlEndpoint::Tcp(addr)).unwrap();
+    let process_id = client.register_process("tcp_binary").unwrap();
+
+    assert!(process_id.starts_with("proc_"));
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);
@@ -393,6 +426,11 @@ fn wait_for_exit(
 
     let _ = child.kill();
     None
+}
+
+fn unused_loopback_addr() -> SocketAddr {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    listener.local_addr().unwrap()
 }
 
 fn read_stderr(child: &mut std::process::Child) -> String {

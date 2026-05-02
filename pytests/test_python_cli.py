@@ -11,7 +11,7 @@ import time
 
 import zippy
 from zippy.cli import main
-from zippy.cli_common import DEFAULT_CONTROL_ENDPOINT
+from zippy.cli_common import DEFAULT_CONTROL_ENDPOINT, ensure_control_parent_dir
 
 
 def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
@@ -146,6 +146,29 @@ def test_master_run_accepts_explicit_control_endpoint(monkeypatch: pytest.Monkey
     assert events == [("run_master_daemon", "/tmp/custom-master.sock")]
     assert result.output == ""
     assert "keyboard interrupt" not in result.output.lower()
+
+
+def test_control_parent_dir_skips_tcp_uri(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    ensure_control_parent_dir("tcp://127.0.0.1:17690")
+
+    assert not (tmp_path / "tcp:").exists()
+
+
+def test_master_run_accepts_tcp_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    def recording_run_master_daemon(control_endpoint: str) -> None:
+        events.append(control_endpoint)
+
+    monkeypatch.setattr(zippy, "run_master_daemon", recording_run_master_daemon, raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["master", "run", "tcp://127.0.0.1:17690"])
+
+    assert result.exit_code == 0
+    assert events == ["tcp://127.0.0.1:17690"]
 
 
 def test_master_run_forwards_config_path(monkeypatch: pytest.MonkeyPatch) -> None:

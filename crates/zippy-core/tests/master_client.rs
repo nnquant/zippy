@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -11,8 +12,8 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_core::{
     canonical_schema_hash, encode_bus_frame, parse_bus_frame, schema_metadata, AttachStreamRequest,
-    BusFrameKind, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
-    HeartbeatRequest, MasterClient, ReaderDescriptor, RegisterEngineRequest,
+    BusFrameKind, ControlEndpoint, ControlRequest, ControlResponse, DetachReaderRequest,
+    DetachWriterRequest, HeartbeatRequest, MasterClient, ReaderDescriptor, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
     SchemaRef, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WriterDescriptor,
     BUS_LAYOUT_VERSION,
@@ -66,6 +67,32 @@ fn non_instrument_schema() -> SchemaRef {
         DataType::Float64,
         false,
     )]))
+}
+
+#[test]
+fn master_client_register_process_over_tcp() {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut line).unwrap();
+        let request = serde_json::from_str::<ControlRequest>(line.trim_end()).unwrap();
+        assert!(matches!(request, ControlRequest::RegisterProcess(_)));
+        let response = serde_json::to_string(&ControlResponse::ProcessRegistered {
+            process_id: "proc_tcp".to_string(),
+        })
+        .unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+
+    let mut client = MasterClient::connect_endpoint(endpoint).unwrap();
+    let process_id = client.register_process("tcp_client").unwrap();
+
+    assert_eq!(process_id, "proc_tcp");
+    handle.join().unwrap();
 }
 
 fn invalid_instrument_type_schema() -> SchemaRef {

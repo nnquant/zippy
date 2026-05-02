@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
-use zippy_core::{LogConfig, ZippyConfig, ZippyError};
+use zippy_core::{ControlEndpoint, LogConfig, ZippyConfig, ZippyError};
 
 use crate::server::MasterServer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterDaemonConfig {
-    pub control_endpoint: PathBuf,
+    pub control_endpoint: ControlEndpoint,
     pub config_path: Option<PathBuf>,
     pub log_dir: PathBuf,
     pub log_level: Option<String>,
@@ -19,9 +19,9 @@ pub struct MasterDaemonConfig {
 }
 
 impl MasterDaemonConfig {
-    pub fn new(control_endpoint: impl AsRef<Path>) -> Self {
+    pub fn new(control_endpoint: impl Into<ControlEndpoint>) -> Self {
         Self {
-            control_endpoint: control_endpoint.as_ref().to_path_buf(),
+            control_endpoint: control_endpoint.into(),
             config_path: None,
             log_dir: PathBuf::from("logs"),
             log_level: None,
@@ -61,11 +61,14 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
     }
     let effective_log_level = runtime_config.log.level.clone();
 
-    if let Some(parent) = control_endpoint.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
-            reason: error.to_string(),
-        })?;
+    if let Some(path) = control_endpoint.unix_path() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
+                reason: error.to_string(),
+            })?;
+        }
     }
+    let control_endpoint_display = control_endpoint.display_string();
 
     let snapshot = zippy_core::setup_log(LogConfig::new(
         "zippy-master",
@@ -79,7 +82,7 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         component = "master",
         event = "master_start",
         status = "starting",
-        control_endpoint = control_endpoint.display().to_string(),
+        control_endpoint = control_endpoint_display.as_str(),
         log_dir = log_dir.display().to_string(),
         log_level = effective_log_level,
         table_row_capacity = runtime_config.table.row_capacity,
@@ -94,10 +97,11 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         "starting zippy master"
     );
 
-    let snapshot_path = control_endpoint
-        .parent()
-        .map(|parent| parent.join("master-registry.json"))
-        .unwrap_or_else(|| PathBuf::from("master-registry.json"));
+    let snapshot_dir = control_endpoint.snapshot_dir();
+    std::fs::create_dir_all(&snapshot_dir).map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })?;
+    let snapshot_path = snapshot_dir.join("master-registry.json");
 
     let server = if snapshot_path.exists() {
         tracing::info!(
@@ -149,13 +153,13 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
             component = "master",
             event = "master_stopped",
             status = "stopped",
-            control_endpoint = control_endpoint.display().to_string(),
+            control_endpoint = control_endpoint_display.as_str(),
             "master stopped"
         );
         return Ok(());
     }
 
-    server.serve(&control_endpoint)
+    server.serve_endpoint_with_ready(&control_endpoint, None)
 }
 
 fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyConfig> {
@@ -170,12 +174,15 @@ fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyCo
     ZippyConfig::load_default()
 }
 
-fn install_shutdown_handlers(socket_path: &Path, server: MasterServer) -> zippy_core::Result<()> {
+fn install_shutdown_handlers(
+    control_endpoint: &ControlEndpoint,
+    server: MasterServer,
+) -> zippy_core::Result<()> {
     let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| ZippyError::Io {
         reason: format!("failed to install signal handler error=[{}]", error),
     })?;
     let shutdown_logged = Arc::new(AtomicBool::new(false));
-    let control_endpoint = socket_path.display().to_string();
+    let control_endpoint = control_endpoint.display_string();
     let control_endpoint_for_thread = control_endpoint.clone();
     let shutdown_logged_for_thread = Arc::clone(&shutdown_logged);
 

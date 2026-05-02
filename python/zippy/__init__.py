@@ -1248,6 +1248,12 @@ def _master_uri_for_error(master: MasterClient) -> str:
 
 
 def _resolve_uri(uri: str) -> str:
+    if uri.startswith("tcp://"):
+        return uri
+    if os.name == "nt" and not _looks_like_uri_path(uri):
+        if uri.startswith("zippy://"):
+            return uri
+        return f"zippy://{uri or 'default'}"
     if uri.startswith("unix://"):
         return _resolve_uri_path(uri.removeprefix("unix://"))
     if uri.startswith("file://"):
@@ -1275,7 +1281,7 @@ def _logical_control_endpoint_path(name: str) -> str:
 
 
 def _home_dir() -> Path:
-    return Path(os.environ.get("HOME") or "/tmp")
+    return Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or "/tmp")
 
 
 def _looks_like_uri_path(uri: str) -> bool:

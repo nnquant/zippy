@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use zippy_core::{default_control_endpoint_path, resolve_control_endpoint_uri, ZippyError};
+use zippy_core::{default_control_endpoint, resolve_control_endpoint, ControlEndpoint, ZippyError};
 use zippy_master::daemon::{run_master_daemon, MasterDaemonConfig};
 
 fn main() -> zippy_core::Result<()> {
@@ -20,7 +20,7 @@ fn main() -> zippy_core::Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MasterArgs {
-    control_endpoint: PathBuf,
+    control_endpoint: ControlEndpoint,
     config_path: Option<PathBuf>,
     log_dir: PathBuf,
     log_level: Option<String>,
@@ -61,13 +61,13 @@ impl MasterArgs {
                             reason: format!("multiple control endpoint values value=[{}]", value),
                         });
                     }
-                    control_endpoint = Some(resolve_control_endpoint_uri(value));
+                    control_endpoint = Some(resolve_control_endpoint(value)?);
                 }
             }
         }
 
         Ok(Self {
-            control_endpoint: control_endpoint.unwrap_or_else(default_control_endpoint_path),
+            control_endpoint: control_endpoint.unwrap_or_else(default_control_endpoint),
             config_path,
             log_dir,
             log_level,
