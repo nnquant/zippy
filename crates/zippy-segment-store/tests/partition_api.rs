@@ -1,4 +1,4 @@
-use arrow::array::{Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
     SegmentStore, SegmentStoreConfig, ShmRegion, ZippySegmentStoreError,
@@ -183,6 +183,248 @@ fn partition_writer_appends_row_span_without_arrow_batch_bridge() {
     assert_eq!(last_price.value(1), 4124.5);
     assert_eq!(volume.value(0), 7);
     assert_eq!(volume.value(1), 11);
+}
+
+#[test]
+fn partition_writer_writes_columnar_rows_in_one_committed_prefix() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::nullable("exchange_id", ColumnType::Utf8),
+        ColumnSpec::nullable("last_price", ColumnType::Float64),
+        ColumnSpec::nullable("volume", ColumnType::Int64),
+    ])
+    .unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 8,
+    })
+    .unwrap();
+    let handle = store
+        .open_partition_with_schema("ticks", "columnar", schema)
+        .unwrap();
+    let writer = handle.writer();
+
+    let written = writer
+        .write_columnar_rows(3, |columns, rows| {
+            assert_eq!(rows, 3);
+            columns.write_i64_values("dt", &[1, 2, 3])?;
+            columns.write_utf8_values("instrument_id", &["IF2606", "IF2607", "IF2608"])?;
+            columns.write_utf8_repeated("exchange_id", "CFFEX", rows)?;
+            columns.write_f64_values("last_price", &[4112.5, 4113.5, 4114.5])?;
+            columns.write_i64_values("volume", &[7, 11, 13])?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(written, 3);
+    let batch = writer.debug_snapshot_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 3);
+
+    let dt = batch
+        .column_by_name("dt")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    let instrument = batch
+        .column_by_name("instrument_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let exchange = batch
+        .column_by_name("exchange_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let last_price = batch
+        .column_by_name("last_price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let volume = batch
+        .column_by_name("volume")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(dt.value(0), 1);
+    assert_eq!(dt.value(2), 3);
+    assert_eq!(instrument.value(0), "IF2606");
+    assert_eq!(instrument.value(2), "IF2608");
+    assert_eq!(exchange.value(0), "CFFEX");
+    assert_eq!(exchange.value(2), "CFFEX");
+    assert!(exchange.is_valid(0));
+    assert!(last_price.is_valid(1));
+    assert_eq!(last_price.value(1), 4113.5);
+    assert_eq!(volume.value(2), 13);
+}
+
+#[test]
+fn active_row_span_exposes_borrowed_utf8_cell_values_for_hot_filters() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let handle = store
+        .open_partition_with_schema("ticks", "source", schema)
+        .unwrap();
+    let writer = handle.writer();
+    writer
+        .write_row(|row| {
+            row.write_i64("dt", 1)?;
+            row.write_utf8("instrument_id", "rb2501")?;
+            row.write_f64("last_price", 4123.5)?;
+            Ok(())
+        })
+        .unwrap();
+    writer
+        .write_row(|row| {
+            row.write_i64("dt", 2)?;
+            row.write_utf8("instrument_id", "rb2502")?;
+            row.write_f64("last_price", 4124.5)?;
+            Ok(())
+        })
+        .unwrap();
+
+    let span = handle.active_row_span(0, 2).unwrap();
+
+    assert_eq!(
+        span.utf8_cell_value(0, "instrument_id").unwrap(),
+        Some("rb2501")
+    );
+    assert_eq!(
+        span.utf8_cell_value(1, "instrument_id").unwrap(),
+        Some("rb2502")
+    );
+    assert!(matches!(
+        span.utf8_cell_value(0, "missing").unwrap_err(),
+        ZippySegmentStoreError::Schema("missing column")
+    ));
+}
+
+#[test]
+fn partition_writer_appends_active_row_span_with_nullable_columns_and_offset() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::nullable("exchange_id", ColumnType::Utf8),
+        ColumnSpec::nullable("last_price", ColumnType::Float64),
+        ColumnSpec::nullable("volume", ColumnType::Int64),
+    ])
+    .unwrap();
+    let source_store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 8,
+    })
+    .unwrap();
+    let source_handle = source_store
+        .open_partition_with_schema("ticks", "source", schema.clone())
+        .unwrap();
+    let source_writer = source_handle.writer();
+    source_writer
+        .write_row(|row| {
+            row.write_i64("dt", 1)?;
+            row.write_utf8("instrument_id", "skip")?;
+            row.write_utf8("exchange_id", "SHFE")?;
+            row.write_f64("last_price", 1.0)?;
+            row.write_i64("volume", 1)?;
+            Ok(())
+        })
+        .unwrap();
+    source_writer
+        .write_row(|row| {
+            row.write_i64("dt", 2)?;
+            row.write_utf8("instrument_id", "rb2501")?;
+            row.write_f64("last_price", 4123.5)?;
+            Ok(())
+        })
+        .unwrap();
+    source_writer
+        .write_row(|row| {
+            row.write_i64("dt", 3)?;
+            row.write_utf8("instrument_id", "rb2502")?;
+            row.write_utf8("exchange_id", "SHFE")?;
+            row.write_i64("volume", 11)?;
+            Ok(())
+        })
+        .unwrap();
+    let span = source_handle.active_row_span(0, 3).unwrap();
+
+    let target_store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 8,
+    })
+    .unwrap();
+    let target_handle = target_store
+        .open_partition_with_schema("ticks", "target", schema)
+        .unwrap();
+    target_handle
+        .writer()
+        .write_row(|row| {
+            row.write_i64("dt", 0)?;
+            row.write_utf8("instrument_id", "prefix")?;
+            row.write_utf8("exchange_id", "DCE")?;
+            row.write_f64("last_price", 0.5)?;
+            row.write_i64("volume", 99)?;
+            Ok(())
+        })
+        .unwrap();
+    let copied = target_handle.writer().append_row_span(&span, 1, 2).unwrap();
+
+    assert_eq!(copied, 2);
+    let batch = target_handle.debug_snapshot_record_batch().unwrap();
+    let dt = batch
+        .column_by_name("dt")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    let instrument = batch
+        .column_by_name("instrument_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let exchange = batch
+        .column_by_name("exchange_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let last_price = batch
+        .column_by_name("last_price")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let volume = batch
+        .column_by_name("volume")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(dt.value(0), 0);
+    assert_eq!(dt.value(1), 2);
+    assert_eq!(dt.value(2), 3);
+    assert_eq!(instrument.value(0), "prefix");
+    assert_eq!(instrument.value(1), "rb2501");
+    assert_eq!(instrument.value(2), "rb2502");
+    assert_eq!(exchange.value(0), "DCE");
+    assert!(exchange.is_null(1));
+    assert_eq!(exchange.value(2), "SHFE");
+    assert_eq!(last_price.value(0), 0.5);
+    assert_eq!(last_price.value(1), 4123.5);
+    assert!(last_price.is_null(2));
+    assert_eq!(volume.value(0), 99);
+    assert!(volume.is_null(1));
+    assert_eq!(volume.value(2), 11);
 }
 
 #[test]

@@ -102,6 +102,15 @@ impl ShmRegion {
         Ok(())
     }
 
+    pub(crate) fn slice_at(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<&[u8], ZippySegmentStoreError> {
+        self.checked_range(offset, len)?;
+        Ok(&self.inner.as_slice()[offset..offset + len])
+    }
+
     /// 向指定偏移写入字节。
     pub fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), ZippySegmentStoreError> {
         self.checked_range(offset, bytes.len())?;

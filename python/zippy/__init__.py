@@ -39,7 +39,7 @@ from ._internal import Query as _NativeQuery
 from ._internal import ReactiveLatestEngine
 from ._internal import ReactiveStateEngine
 from ._internal import StreamSubscriber as _NativeStreamSubscriber
-from ._internal import StreamTableEngine
+from ._internal import StreamTableMaterializer as _StreamTableMaterializer
 from ._internal import TimeSeriesEngine
 from ._internal import TsDelaySpec
 from ._internal import TsDiffSpec
@@ -3481,7 +3481,7 @@ class Session:
                 ],
             )
         else:
-            materializer = StreamTableEngine(
+            materializer = _StreamTableMaterializer(
                 name=table_name,
                 input_schema=output_schema,
                 source=engine,
@@ -3618,7 +3618,7 @@ class Pipeline:
     """
     Own a simple Python-defined Zippy data pipeline.
 
-    The first implementation focuses on one ``StreamTableEngine`` sink and hides
+    The first implementation focuses on one stream table materializer sink and hides
     stream/source registration plus active descriptor publication.
 
     :param name: Pipeline/process name.
@@ -3635,7 +3635,7 @@ class Pipeline:
         self._source_type = "pipeline"
         self._stream_name: str | None = None
         self._schema = None
-        self._engine: StreamTableEngine | None = None
+        self._engine: _StreamTableMaterializer | None = None
         self._registered_source_name: str | None = None
         self._started = False
 
@@ -3649,7 +3649,7 @@ class Pipeline:
         """
         Attach a source object to the pipeline.
 
-        :param source: Source object accepted by ``StreamTableEngine``.
+        :param source: Source object accepted by stream table materializer.
         :type source: object
         :param name: Optional control-plane source name.
         :type name: str | None
@@ -3740,7 +3740,7 @@ class Pipeline:
             {},
         )
         self._registered_source_name = source_name
-        self._engine = StreamTableEngine(
+        self._engine = _StreamTableMaterializer(
             name=name,
             input_schema=schema,
             source=self._source,
@@ -3757,6 +3757,10 @@ class Pipeline:
                 self._persist_publisher(name)
                 if table_options["persist_path"] is not None
                 else None
+            ),
+            descriptor_forwarding=(
+                table_options["persist_path"] is None
+                and table_options["retention_segments"] is None
             ),
         )
         self.master.publish_segment_descriptor(name, self._engine.active_descriptor())
@@ -3801,7 +3805,7 @@ class Pipeline:
         """
         Write data into the owned stream table.
 
-        :param value: Value accepted by ``StreamTableEngine.write``.
+        :param value: Value accepted by the owned stream table materializer.
         :type value: object
         """
         if not self._started:
@@ -3915,7 +3919,7 @@ class Pipeline:
 
         return can_release
 
-    def _require_engine(self) -> StreamTableEngine:
+    def _require_engine(self) -> _StreamTableMaterializer:
         if self._engine is None:
             raise RuntimeError("pipeline stream_table() must be configured before start/write")
         return self._engine
@@ -4338,8 +4342,7 @@ __all__ = [
     "StreamSubscriber",
     "Table",
     "TableReplayEngine",
-    "StreamTableEngine",
-    "TimeSeriesEngine",
+        "TimeSeriesEngine",
     "TsDelaySpec",
     "TsDiffSpec",
     "TsEmaSpec",

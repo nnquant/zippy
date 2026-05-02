@@ -16,8 +16,9 @@ use crate::{
         SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WAITER_COUNT_OFFSET,
         SHM_WRITER_EPOCH_OFFSET,
     },
-    ColumnType, CompiledSchema, LayoutPlan, RowSpanView, SealedSegmentHandle, SegmentCellValue,
-    SegmentHeader, ShmRegion,
+    view::{ActiveSegmentAttachment, RowSpanBacking},
+    ColumnLayout, ColumnType, CompiledSchema, LayoutPlan, RowSpanView, SealedSegmentHandle,
+    SegmentCellValue, SegmentHeader, ShmRegion,
 };
 
 /// Active segment 在共享内存中的最小布局信息。
@@ -494,6 +495,10 @@ impl ActiveSegmentWriter {
             return Err("segment is full");
         }
 
+        if let Some(copied) = self.try_append_active_row_span(span, start_offset, rows_to_copy)? {
+            return Ok(copied);
+        }
+
         let columns = self.schema.columns().to_vec();
         let mut copied = 0;
         for row_offset in start_offset..start_offset + rows_to_copy {
@@ -607,8 +612,580 @@ impl ActiveSegmentWriter {
         self.current_row_open
     }
 
+    pub(crate) fn row_cursor(&self) -> usize {
+        self.row_cursor
+    }
+
     pub(crate) fn remaining_row_capacity(&self) -> usize {
         self.layout.row_capacity().saturating_sub(self.row_cursor)
+    }
+
+    pub(crate) fn write_i64_values_at(
+        &mut self,
+        column: &str,
+        start_row: usize,
+        values: &[i64],
+    ) -> Result<(), &'static str> {
+        match self.column_type(column)? {
+            ColumnType::Int64 | ColumnType::TimestampNsTz(_) => {
+                let end_row = start_row
+                    .checked_add(values.len())
+                    .ok_or("columnar row range overflow")?;
+                if end_row > self.layout.row_capacity() {
+                    return Err("columnar row range exceeds segment capacity");
+                }
+                let buffer = self
+                    .i64_columns
+                    .get_mut(column)
+                    .ok_or("missing i64 column")?;
+                buffer[start_row..end_row].copy_from_slice(values);
+
+                let column_layout = self.layout.column(column).ok_or("missing column layout")?;
+                self.shm_region
+                    .write_at(
+                        SHM_PAYLOAD_OFFSET + column_layout.values_offset + (start_row * 8),
+                        i64_values_as_bytes(values),
+                    )
+                    .map_err(|_| "failed to mirror i64 column batch into shared memory")?;
+                self.mark_valid_range(column, start_row, values.len())
+            }
+            _ => Err("column type mismatch"),
+        }
+    }
+
+    pub(crate) fn write_f64_values_at(
+        &mut self,
+        column: &str,
+        start_row: usize,
+        values: &[f64],
+    ) -> Result<(), &'static str> {
+        match self.column_type(column)? {
+            ColumnType::Float64 => {
+                let end_row = start_row
+                    .checked_add(values.len())
+                    .ok_or("columnar row range overflow")?;
+                if end_row > self.layout.row_capacity() {
+                    return Err("columnar row range exceeds segment capacity");
+                }
+                let buffer = self
+                    .f64_columns
+                    .get_mut(column)
+                    .ok_or("missing f64 column")?;
+                buffer[start_row..end_row].copy_from_slice(values);
+
+                let column_layout = self.layout.column(column).ok_or("missing column layout")?;
+                self.shm_region
+                    .write_at(
+                        SHM_PAYLOAD_OFFSET + column_layout.values_offset + (start_row * 8),
+                        f64_values_as_bytes(values),
+                    )
+                    .map_err(|_| "failed to mirror f64 column batch into shared memory")?;
+                self.mark_valid_range(column, start_row, values.len())
+            }
+            _ => Err("column type mismatch"),
+        }
+    }
+
+    pub(crate) fn write_utf8_values_at(
+        &mut self,
+        column: &str,
+        start_row: usize,
+        values: &[&str],
+    ) -> Result<(), &'static str> {
+        match self.column_type(column)? {
+            ColumnType::Utf8 => {
+                let end_row = start_row
+                    .checked_add(values.len())
+                    .ok_or("columnar row range overflow")?;
+                if end_row > self.layout.row_capacity() {
+                    return Err("columnar row range exceeds segment capacity");
+                }
+                let column_layout = self.layout.column(column).ok_or("missing column layout")?;
+                let utf8 = self
+                    .utf8_columns
+                    .get_mut(column)
+                    .ok_or("missing utf8 column")?;
+                let target_value_start = utf8.values.len();
+                if utf8.offsets[start_row] as usize != target_value_start {
+                    return Err("target utf8 offset mismatch");
+                }
+
+                let value_bytes_len = values
+                    .iter()
+                    .try_fold(0usize, |acc, value| acc.checked_add(value.len()))
+                    .ok_or("utf8 values overflow")?;
+                let target_value_end = target_value_start
+                    .checked_add(value_bytes_len)
+                    .ok_or("utf8 values overflow")?;
+                if target_value_end > utf8.values_capacity {
+                    return Err("utf8 values exceed layout capacity");
+                }
+
+                let mut value_bytes = Vec::with_capacity(value_bytes_len);
+                let mut offset_bytes = Vec::with_capacity((values.len() + 1) * 4);
+                let mut cursor = target_value_start;
+                let start_offset = u32::try_from(cursor).map_err(|_| "utf8 values overflow")?;
+                utf8.offsets[start_row] = start_offset;
+                offset_bytes.extend_from_slice(&start_offset.to_ne_bytes());
+                for (index, value) in values.iter().enumerate() {
+                    value_bytes.extend_from_slice(value.as_bytes());
+                    cursor = cursor
+                        .checked_add(value.len())
+                        .ok_or("utf8 values overflow")?;
+                    let offset = u32::try_from(cursor).map_err(|_| "utf8 values overflow")?;
+                    utf8.offsets[start_row + index + 1] = offset;
+                    offset_bytes.extend_from_slice(&offset.to_ne_bytes());
+                }
+                utf8.values.extend_from_slice(&value_bytes);
+                if !value_bytes.is_empty() {
+                    self.shm_region
+                        .write_at(
+                            SHM_PAYLOAD_OFFSET + column_layout.values_offset + target_value_start,
+                            &value_bytes,
+                        )
+                        .map_err(|_| "failed to mirror utf8 column batch into shared memory")?;
+                }
+                self.shm_region
+                    .write_at(
+                        SHM_PAYLOAD_OFFSET + column_layout.offsets_offset + (start_row * 4),
+                        &offset_bytes,
+                    )
+                    .map_err(|_| "failed to mirror utf8 offset batch into shared memory")?;
+                self.mark_valid_range(column, start_row, values.len())
+            }
+            _ => Err("column type mismatch"),
+        }
+    }
+
+    pub(crate) fn write_utf8_repeated_at(
+        &mut self,
+        column: &str,
+        start_row: usize,
+        value: &str,
+        row_count: usize,
+    ) -> Result<(), &'static str> {
+        if row_count == 0 {
+            return Ok(());
+        }
+        match self.column_type(column)? {
+            ColumnType::Utf8 => {
+                let end_row = start_row
+                    .checked_add(row_count)
+                    .ok_or("columnar row range overflow")?;
+                if end_row > self.layout.row_capacity() {
+                    return Err("columnar row range exceeds segment capacity");
+                }
+                let column_layout = self.layout.column(column).ok_or("missing column layout")?;
+                let utf8 = self
+                    .utf8_columns
+                    .get_mut(column)
+                    .ok_or("missing utf8 column")?;
+                let target_value_start = utf8.values.len();
+                if utf8.offsets[start_row] as usize != target_value_start {
+                    return Err("target utf8 offset mismatch");
+                }
+
+                let value_bytes_len = value
+                    .len()
+                    .checked_mul(row_count)
+                    .ok_or("utf8 values overflow")?;
+                let target_value_end = target_value_start
+                    .checked_add(value_bytes_len)
+                    .ok_or("utf8 values overflow")?;
+                if target_value_end > utf8.values_capacity {
+                    return Err("utf8 values exceed layout capacity");
+                }
+
+                let mut repeated_bytes = Vec::with_capacity(value_bytes_len);
+                let mut offset_bytes = Vec::with_capacity((row_count + 1) * 4);
+                let mut cursor = target_value_start;
+                let start_offset = u32::try_from(cursor).map_err(|_| "utf8 values overflow")?;
+                utf8.offsets[start_row] = start_offset;
+                offset_bytes.extend_from_slice(&start_offset.to_ne_bytes());
+                for index in 0..row_count {
+                    repeated_bytes.extend_from_slice(value.as_bytes());
+                    cursor = cursor
+                        .checked_add(value.len())
+                        .ok_or("utf8 values overflow")?;
+                    let offset = u32::try_from(cursor).map_err(|_| "utf8 values overflow")?;
+                    utf8.offsets[start_row + index + 1] = offset;
+                    offset_bytes.extend_from_slice(&offset.to_ne_bytes());
+                }
+                utf8.values.extend_from_slice(&repeated_bytes);
+                if !repeated_bytes.is_empty() {
+                    self.shm_region
+                        .write_at(
+                            SHM_PAYLOAD_OFFSET + column_layout.values_offset + target_value_start,
+                            &repeated_bytes,
+                        )
+                        .map_err(|_| "failed to mirror utf8 column batch into shared memory")?;
+                }
+                self.shm_region
+                    .write_at(
+                        SHM_PAYLOAD_OFFSET + column_layout.offsets_offset + (start_row * 4),
+                        &offset_bytes,
+                    )
+                    .map_err(|_| "failed to mirror utf8 offset batch into shared memory")?;
+                self.mark_valid_range(column, start_row, row_count)
+            }
+            _ => Err("column type mismatch"),
+        }
+    }
+
+    pub(crate) fn finish_columnar_rows(&mut self, row_count: usize) -> Result<(), &'static str> {
+        if self.current_row_open {
+            return Err("row already open");
+        }
+        let end_row = self
+            .row_cursor
+            .checked_add(row_count)
+            .ok_or("columnar row range overflow")?;
+        if end_row > self.layout.row_capacity() {
+            return Err("columnar row range exceeds segment capacity");
+        }
+        self.header.row_count += row_count;
+        self.row_cursor = end_row;
+        self.publish_committed_prefix()
+    }
+
+    fn try_append_active_row_span(
+        &mut self,
+        span: &RowSpanView,
+        start_offset: usize,
+        rows_to_copy: usize,
+    ) -> Result<Option<usize>, &'static str> {
+        let RowSpanBacking::Active(attachment) = &span.backing else {
+            return Ok(None);
+        };
+        if self.schema.schema_id() != span.schema().schema_id()
+            || self.schema.columns() != span.schema().columns()
+        {
+            return Ok(None);
+        }
+        if rows_to_copy == 0 {
+            return Ok(Some(0));
+        }
+        if !self.active_row_span_utf8_ranges_fit(
+            attachment,
+            span.start_row + start_offset,
+            rows_to_copy,
+        )? {
+            return Ok(None);
+        }
+
+        let source_start_row = span.start_row + start_offset;
+        let target_start_row = self.row_cursor;
+        let columns = self.schema.columns().to_vec();
+        for spec in &columns {
+            let source_layout = attachment
+                .descriptor
+                .layout()
+                .column(spec.name)
+                .ok_or("missing source column layout")?;
+            let target_layout = self
+                .layout
+                .column(spec.name)
+                .ok_or("missing target column layout")?
+                .clone();
+            match spec.data_type {
+                ColumnType::Int64 | ColumnType::TimestampNsTz(_) => {
+                    self.copy_active_i64_column(
+                        attachment,
+                        source_layout,
+                        &target_layout,
+                        spec.name,
+                        source_start_row,
+                        target_start_row,
+                        rows_to_copy,
+                    )?;
+                }
+                ColumnType::Float64 => {
+                    self.copy_active_f64_column(
+                        attachment,
+                        source_layout,
+                        &target_layout,
+                        spec.name,
+                        source_start_row,
+                        target_start_row,
+                        rows_to_copy,
+                    )?;
+                }
+                ColumnType::Utf8 => {
+                    self.copy_active_utf8_column(
+                        attachment,
+                        source_layout,
+                        &target_layout,
+                        spec.name,
+                        source_start_row,
+                        target_start_row,
+                        rows_to_copy,
+                    )?;
+                }
+            }
+            if spec.nullable {
+                self.copy_active_validity_column(
+                    attachment,
+                    source_layout,
+                    &target_layout,
+                    spec.name,
+                    source_start_row,
+                    target_start_row,
+                    rows_to_copy,
+                )?;
+            }
+        }
+
+        self.header.row_count += rows_to_copy;
+        self.row_cursor += rows_to_copy;
+        self.publish_committed_prefix()?;
+        Ok(Some(rows_to_copy))
+    }
+
+    fn active_row_span_utf8_ranges_fit(
+        &self,
+        attachment: &ActiveSegmentAttachment,
+        source_start_row: usize,
+        rows_to_copy: usize,
+    ) -> Result<bool, &'static str> {
+        for spec in self.schema.columns() {
+            if !matches!(spec.data_type, ColumnType::Utf8) {
+                continue;
+            }
+            let source_layout = attachment
+                .descriptor
+                .layout()
+                .column(spec.name)
+                .ok_or("missing source column layout")?;
+            let source_value_start = read_active_u32(
+                attachment,
+                source_layout.offsets_offset + (source_start_row * 4),
+            )? as usize;
+            let source_value_end = read_active_u32(
+                attachment,
+                source_layout.offsets_offset + ((source_start_row + rows_to_copy) * 4),
+            )? as usize;
+            if source_value_start > source_value_end || source_value_end > source_layout.values_len
+            {
+                return Err("invalid source utf8 offset range");
+            }
+            let source_value_len = source_value_end - source_value_start;
+            let target_utf8 = self
+                .utf8_columns
+                .get(spec.name)
+                .ok_or("missing target utf8 column")?;
+            if target_utf8.values.len().saturating_add(source_value_len)
+                > target_utf8.values_capacity
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_active_i64_column(
+        &mut self,
+        attachment: &ActiveSegmentAttachment,
+        source_layout: &ColumnLayout,
+        target_layout: &ColumnLayout,
+        column: &'static str,
+        source_start_row: usize,
+        target_start_row: usize,
+        rows_to_copy: usize,
+    ) -> Result<(), &'static str> {
+        let byte_len = rows_to_copy
+            .checked_mul(8)
+            .ok_or("active row span byte length overflow")?;
+        let mut bytes = vec![0_u8; byte_len];
+        attachment
+            .shm_region
+            .read_at(
+                attachment.descriptor.payload_offset()
+                    + source_layout.values_offset
+                    + (source_start_row * 8),
+                &mut bytes,
+            )
+            .map_err(|_| "failed to read active source i64 column")?;
+        self.shm_region
+            .write_at(
+                SHM_PAYLOAD_OFFSET + target_layout.values_offset + (target_start_row * 8),
+                &bytes,
+            )
+            .map_err(|_| "failed to mirror active i64 column into shared memory")?;
+
+        let values = self
+            .i64_columns
+            .get_mut(column)
+            .ok_or("missing target i64 column")?;
+        for (index, chunk) in bytes.chunks_exact(8).enumerate() {
+            let mut value = [0_u8; 8];
+            value.copy_from_slice(chunk);
+            values[target_start_row + index] = i64::from_ne_bytes(value);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_active_f64_column(
+        &mut self,
+        attachment: &ActiveSegmentAttachment,
+        source_layout: &ColumnLayout,
+        target_layout: &ColumnLayout,
+        column: &'static str,
+        source_start_row: usize,
+        target_start_row: usize,
+        rows_to_copy: usize,
+    ) -> Result<(), &'static str> {
+        let byte_len = rows_to_copy
+            .checked_mul(8)
+            .ok_or("active row span byte length overflow")?;
+        let mut bytes = vec![0_u8; byte_len];
+        attachment
+            .shm_region
+            .read_at(
+                attachment.descriptor.payload_offset()
+                    + source_layout.values_offset
+                    + (source_start_row * 8),
+                &mut bytes,
+            )
+            .map_err(|_| "failed to read active source f64 column")?;
+        self.shm_region
+            .write_at(
+                SHM_PAYLOAD_OFFSET + target_layout.values_offset + (target_start_row * 8),
+                &bytes,
+            )
+            .map_err(|_| "failed to mirror active f64 column into shared memory")?;
+
+        let values = self
+            .f64_columns
+            .get_mut(column)
+            .ok_or("missing target f64 column")?;
+        for (index, chunk) in bytes.chunks_exact(8).enumerate() {
+            let mut value = [0_u8; 8];
+            value.copy_from_slice(chunk);
+            values[target_start_row + index] = f64::from_ne_bytes(value);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_active_utf8_column(
+        &mut self,
+        attachment: &ActiveSegmentAttachment,
+        source_layout: &ColumnLayout,
+        target_layout: &ColumnLayout,
+        column: &'static str,
+        source_start_row: usize,
+        target_start_row: usize,
+        rows_to_copy: usize,
+    ) -> Result<(), &'static str> {
+        let source_value_start = read_active_u32(
+            attachment,
+            source_layout.offsets_offset + (source_start_row * 4),
+        )? as usize;
+        let source_value_end = read_active_u32(
+            attachment,
+            source_layout.offsets_offset + ((source_start_row + rows_to_copy) * 4),
+        )? as usize;
+        if source_value_start > source_value_end || source_value_end > source_layout.values_len {
+            return Err("invalid source utf8 offset range");
+        }
+        let source_value_len = source_value_end - source_value_start;
+        let mut value_bytes = vec![0_u8; source_value_len];
+        attachment
+            .shm_region
+            .read_at(
+                attachment.descriptor.payload_offset()
+                    + source_layout.values_offset
+                    + source_value_start,
+                &mut value_bytes,
+            )
+            .map_err(|_| "failed to read active source utf8 values")?;
+
+        let utf8 = self
+            .utf8_columns
+            .get_mut(column)
+            .ok_or("missing target utf8 column")?;
+        let target_value_start = utf8.values.len();
+        if utf8.offsets[target_start_row] as usize != target_value_start {
+            return Err("target utf8 offset mismatch");
+        }
+        let target_value_end = target_value_start
+            .checked_add(source_value_len)
+            .ok_or("utf8 values overflow")?;
+        if target_value_end > utf8.values_capacity {
+            return Err("utf8 values exceed layout capacity");
+        }
+
+        utf8.values.extend_from_slice(&value_bytes);
+        if !value_bytes.is_empty() {
+            self.shm_region
+                .write_at(
+                    SHM_PAYLOAD_OFFSET + target_layout.values_offset + target_value_start,
+                    &value_bytes,
+                )
+                .map_err(|_| "failed to mirror active utf8 values into shared memory")?;
+        }
+
+        let mut offset_bytes = Vec::with_capacity((rows_to_copy + 1) * 4);
+        for index in 0..=rows_to_copy {
+            let source_offset = read_active_u32(
+                attachment,
+                source_layout.offsets_offset + ((source_start_row + index) * 4),
+            )? as usize;
+            if source_offset < source_value_start || source_offset > source_value_end {
+                return Err("invalid source utf8 offset range");
+            }
+            let rebased = target_value_start + (source_offset - source_value_start);
+            let rebased = u32::try_from(rebased).map_err(|_| "utf8 values overflow")?;
+            utf8.offsets[target_start_row + index] = rebased;
+            offset_bytes.extend_from_slice(&rebased.to_ne_bytes());
+        }
+        self.shm_region
+            .write_at(
+                SHM_PAYLOAD_OFFSET + target_layout.offsets_offset + (target_start_row * 4),
+                &offset_bytes,
+            )
+            .map_err(|_| "failed to mirror active utf8 offsets into shared memory")?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_active_validity_column(
+        &mut self,
+        attachment: &ActiveSegmentAttachment,
+        source_layout: &ColumnLayout,
+        target_layout: &ColumnLayout,
+        column: &'static str,
+        source_start_row: usize,
+        target_start_row: usize,
+        rows_to_copy: usize,
+    ) -> Result<(), &'static str> {
+        if target_layout.validity_len == 0 {
+            return Ok(());
+        }
+        let mut bits = Vec::with_capacity(rows_to_copy);
+        for index in 0..rows_to_copy {
+            bits.push(read_active_validity(
+                attachment,
+                source_layout,
+                source_start_row + index,
+            )?);
+        }
+        if let Some(validity) = self.validity.get_mut(column) {
+            for (index, is_valid) in bits.iter().copied().enumerate() {
+                validity[target_start_row + index] = is_valid;
+            }
+        }
+        for (index, is_valid) in bits.into_iter().enumerate() {
+            write_validity_bit(
+                &mut self.shm_region,
+                target_layout,
+                target_start_row + index,
+                is_valid,
+            )?;
+        }
+        Ok(())
     }
 
     fn write_row_span_row(
@@ -706,6 +1283,90 @@ impl ActiveSegmentWriter {
         Ok(())
     }
 
+    fn mark_valid_range(
+        &mut self,
+        column: &str,
+        start_row: usize,
+        row_count: usize,
+    ) -> Result<(), &'static str> {
+        if row_count == 0 {
+            return Ok(());
+        }
+        let Some(validity) = self.validity.get_mut(column) else {
+            return Ok(());
+        };
+        let end_row = start_row
+            .checked_add(row_count)
+            .ok_or("validity row range overflow")?;
+        if end_row > validity.len() {
+            return Err("validity row range exceeds segment capacity");
+        }
+        validity[start_row..end_row].fill(true);
+        let Some(column_layout) = self.layout.column(column) else {
+            return Ok(());
+        };
+        if column_layout.validity_len == 0 {
+            return Ok(());
+        }
+        let first_byte = start_row / 8;
+        let last_byte = (end_row - 1) / 8;
+        let validity_offset = SHM_PAYLOAD_OFFSET + column_layout.validity_offset;
+        if first_byte == last_byte {
+            let mask = validity_range_mask(start_row % 8, ((end_row - 1) % 8) + 1);
+            let offset = validity_offset + first_byte;
+            let mut byte = [0_u8; 1];
+            self.shm_region
+                .read_at(offset, &mut byte)
+                .map_err(|_| "failed to read shared memory validity byte")?;
+            byte[0] |= mask;
+            self.shm_region
+                .write_at(offset, &byte)
+                .map_err(|_| "failed to write shared memory validity byte")?;
+            return Ok(());
+        }
+
+        let mut full_start = first_byte;
+        if start_row % 8 != 0 {
+            let mask = validity_range_mask(start_row % 8, 8);
+            let offset = validity_offset + first_byte;
+            let mut byte = [0_u8; 1];
+            self.shm_region
+                .read_at(offset, &mut byte)
+                .map_err(|_| "failed to read shared memory validity byte")?;
+            byte[0] |= mask;
+            self.shm_region
+                .write_at(offset, &byte)
+                .map_err(|_| "failed to write shared memory validity byte")?;
+            full_start += 1;
+        }
+
+        let mut full_end = last_byte + 1;
+        if end_row % 8 != 0 {
+            full_end = last_byte;
+        }
+        if full_start < full_end {
+            write_full_validity_bytes(
+                &mut self.shm_region,
+                validity_offset + full_start,
+                full_end - full_start,
+            )?;
+        }
+
+        if end_row % 8 != 0 {
+            let mask = validity_range_mask(0, end_row % 8);
+            let offset = validity_offset + last_byte;
+            let mut byte = [0_u8; 1];
+            self.shm_region
+                .read_at(offset, &mut byte)
+                .map_err(|_| "failed to read shared memory validity byte")?;
+            byte[0] |= mask;
+            self.shm_region
+                .write_at(offset, &byte)
+                .map_err(|_| "failed to write shared memory validity byte")?;
+        }
+        Ok(())
+    }
+
     fn mark_invalid(&mut self, column: &str) -> Result<(), &'static str> {
         if let Some(validity) = self.validity.get_mut(column) {
             validity[self.row_cursor] = false;
@@ -741,6 +1402,65 @@ fn write_u64_header(
         .map_err(|_| "failed to write shared memory header")
 }
 
+fn read_active_u32(
+    attachment: &ActiveSegmentAttachment,
+    relative_offset: usize,
+) -> Result<u32, &'static str> {
+    let mut bytes = [0_u8; 4];
+    attachment
+        .shm_region
+        .read_at(
+            attachment.descriptor.payload_offset() + relative_offset,
+            &mut bytes,
+        )
+        .map_err(|_| "failed to read active source u32")?;
+    Ok(u32::from_ne_bytes(bytes))
+}
+
+fn read_active_validity(
+    attachment: &ActiveSegmentAttachment,
+    layout: &ColumnLayout,
+    row: usize,
+) -> Result<bool, &'static str> {
+    if layout.validity_len == 0 {
+        return Ok(true);
+    }
+    let byte_index = row / 8;
+    let bit_index = row % 8;
+    let mut byte = [0_u8; 1];
+    attachment
+        .shm_region
+        .read_at(
+            attachment.descriptor.payload_offset() + layout.validity_offset + byte_index,
+            &mut byte,
+        )
+        .map_err(|_| "failed to read active source validity byte")?;
+    Ok((byte[0] & (1 << bit_index)) != 0)
+}
+
+fn write_validity_bit(
+    shm_region: &mut ShmRegion,
+    layout: &ColumnLayout,
+    row: usize,
+    is_valid: bool,
+) -> Result<(), &'static str> {
+    let byte_index = row / 8;
+    let bit_index = row % 8;
+    let offset = SHM_PAYLOAD_OFFSET + layout.validity_offset + byte_index;
+    let mut byte = [0_u8; 1];
+    shm_region
+        .read_at(offset, &mut byte)
+        .map_err(|_| "failed to read shared memory validity byte")?;
+    if is_valid {
+        byte[0] |= 1 << bit_index;
+    } else {
+        byte[0] &= !(1 << bit_index);
+    }
+    shm_region
+        .write_at(offset, &byte)
+        .map_err(|_| "failed to write shared memory validity byte")
+}
+
 fn write_u32_header(
     shm_region: &mut ShmRegion,
     offset: usize,
@@ -749,4 +1469,45 @@ fn write_u32_header(
     shm_region
         .write_at(offset, &value.to_ne_bytes())
         .map_err(|_| "failed to write shared memory header")
+}
+
+fn i64_values_as_bytes(values: &[i64]) -> &[u8] {
+    // SAFETY: i64 is a plain fixed-width value. The shared memory layout stores
+    // native-endian primitive values, matching the row-wise writer above.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+fn f64_values_as_bytes(values: &[f64]) -> &[u8] {
+    // SAFETY: f64 is a plain fixed-width value. The shared memory layout stores
+    // native-endian primitive values, matching the row-wise writer above.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+fn validity_range_mask(start_bit: usize, end_bit_exclusive: usize) -> u8 {
+    let mut mask = 0_u8;
+    for bit in start_bit..end_bit_exclusive {
+        mask |= 1 << bit;
+    }
+    mask
+}
+
+fn write_full_validity_bytes(
+    shm_region: &mut ShmRegion,
+    mut offset: usize,
+    mut len: usize,
+) -> Result<(), &'static str> {
+    const FULL_VALIDITY_BYTES: [u8; 4096] = [0xff; 4096];
+    while len > 0 {
+        let chunk_len = len.min(FULL_VALIDITY_BYTES.len());
+        shm_region
+            .write_at(offset, &FULL_VALIDITY_BYTES[..chunk_len])
+            .map_err(|_| "failed to write shared memory validity byte")?;
+        offset += chunk_len;
+        len -= chunk_len;
+    }
+    Ok(())
 }

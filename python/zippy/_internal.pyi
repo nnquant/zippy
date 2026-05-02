@@ -537,7 +537,7 @@ class ReactiveStateEngine:
         source: str
         | ReactiveStateEngine
         | ReactiveLatestEngine
-        | StreamTableEngine
+        | StreamTableMaterializer
         | TimeSeriesEngine
         | CrossSectionalEngine
         | ZmqSource
@@ -581,7 +581,7 @@ class ReactiveLatestEngine:
         source: str
         | ReactiveStateEngine
         | ReactiveLatestEngine
-        | StreamTableEngine
+        | StreamTableMaterializer
         | TimeSeriesEngine
         | ZmqSource
         | BusStreamSource
@@ -612,7 +612,7 @@ class ReactiveLatestEngine:
     def stop(self) -> None: ...
 
 
-class StreamTableEngine:
+class StreamTableMaterializer:
     def __init__(
         self,
         name: str,
@@ -622,7 +622,7 @@ class StreamTableEngine:
         source: str
         | ReactiveStateEngine
         | ReactiveLatestEngine
-        | StreamTableEngine
+        | StreamTableMaterializer
         | TimeSeriesEngine
         | ZmqSource
         | BusStreamSource
@@ -643,6 +643,7 @@ class StreamTableEngine:
         dt_part: str | None = None,
         persist_path: str | None = None,
         persist_publisher: object | None = None,
+        descriptor_forwarding: bool = False,
     ) -> None: ...
 
     def start(self) -> None: ...
@@ -675,7 +676,7 @@ class KeyValueTableMaterializer:
         source: str
         | ReactiveStateEngine
         | ReactiveLatestEngine
-        | StreamTableEngine
+        | StreamTableMaterializer
         | KeyValueTableMaterializer
         | TimeSeriesEngine
         | CrossSectionalEngine
@@ -734,7 +735,7 @@ class TimeSeriesEngine:
         source: str
         | ReactiveStateEngine
         | ReactiveLatestEngine
-        | StreamTableEngine
+        | StreamTableMaterializer
         | TimeSeriesEngine
         | ZmqSource
         | BusStreamSource

@@ -10,9 +10,9 @@ pub use cross_sectional::CrossSectionalEngine;
 pub use reactive::ReactiveStateEngine;
 pub use reactive_latest::ReactiveLatestEngine;
 pub use stream_table::{
-    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableEngine,
-    StreamTableMaterializer, StreamTablePersistConfig, StreamTablePersistPartitionSpec,
-    StreamTablePersistPublisher, StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,
+    StreamTablePersistConfig, StreamTablePersistPartitionSpec, StreamTablePersistPublisher,
+    StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
 pub use testing::hash_record_batches;
 pub use timeseries::TimeSeriesEngine;

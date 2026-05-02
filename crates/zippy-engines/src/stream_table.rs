@@ -40,6 +40,8 @@ pub struct StreamTableMaterializer {
     replacement_retention_snapshots: usize,
     persisted_segment_identities: BTreeSet<SegmentIdentity>,
     descriptor_publisher: Option<Arc<dyn StreamTableDescriptorPublisher>>,
+    descriptor_forwarding: bool,
+    forwarded_active_descriptor: Option<serde_json::Value>,
     persist_config: Option<StreamTablePersistConfig>,
     persist_publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
     retention_guard: Option<Arc<dyn StreamTableRetentionGuard>>,
@@ -60,9 +62,6 @@ pub struct StreamTableSegmentLease {
     _session: ReaderSession,
     _lease: SegmentLease,
 }
-
-/// Backward-compatible name for the stream table materializer.
-pub type StreamTableEngine = StreamTableMaterializer;
 
 /// Publishes active segment descriptor updates after stream table rollover.
 pub trait StreamTableDescriptorPublisher: Send + Sync {
@@ -579,6 +578,8 @@ impl StreamTableMaterializer {
             replacement_retention_snapshots: DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS,
             persisted_segment_identities: BTreeSet::new(),
             descriptor_publisher: None,
+            descriptor_forwarding: false,
+            forwarded_active_descriptor: None,
             persist_config: None,
             persist_publisher: None,
             retention_guard: None,
@@ -592,6 +593,12 @@ impl StreamTableMaterializer {
         publisher: Arc<dyn StreamTableDescriptorPublisher>,
     ) -> Self {
         self.descriptor_publisher = Some(publisher);
+        self
+    }
+
+    /// Allow zero-copy publication of upstream active segment descriptors.
+    pub fn with_descriptor_forwarding(mut self, enabled: bool) -> Self {
+        self.descriptor_forwarding = enabled;
         self
     }
 
@@ -640,7 +647,11 @@ impl StreamTableMaterializer {
 
     /// Export the active segment descriptor envelope for cross-process readers.
     pub fn active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
-        let mut descriptor = self.active_descriptor_value()?;
+        let mut descriptor = self
+            .forwarded_active_descriptor
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| self.active_descriptor_value())?;
         descriptor["sealed_segments"] =
             serde_json::Value::Array(self.sealed_segment_descriptors.clone());
         serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
@@ -728,6 +739,7 @@ impl StreamTableMaterializer {
             return self.materialize_segment_rows(row_view, publish_rollovers);
         }
 
+        self.forwarded_active_descriptor = None;
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
             .map(|index| table.column_at(index))
@@ -764,6 +776,11 @@ impl StreamTableMaterializer {
         row_view: &SegmentRowView,
         publish_rollovers: bool,
     ) -> Result<()> {
+        if self.try_forward_segment_descriptor(row_view)? {
+            return Ok(());
+        }
+
+        self.forwarded_active_descriptor = None;
         let writer = self.partition.writer();
         let total_rows = row_view.num_rows();
         let mut copied = 0;
@@ -797,6 +814,50 @@ impl StreamTableMaterializer {
         Ok(())
     }
 
+    fn try_forward_segment_descriptor(&mut self, row_view: &SegmentRowView) -> Result<bool> {
+        if !self.descriptor_forwarding
+            || self.descriptor_publisher.is_none()
+            || self.persist_config.is_some()
+            || self.retention_segments.is_some()
+            || !self.sealed_segment_descriptors.is_empty()
+            || self.active_committed_row_count() != 0
+        {
+            return Ok(false);
+        }
+
+        let Some(envelope) = row_view
+            .row_span()
+            .active_descriptor_envelope_bytes()
+            .map_err(|reason| ZippyError::Io {
+                reason: reason.to_string(),
+            })?
+        else {
+            return Ok(false);
+        };
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&envelope).map_err(|error| ZippyError::Io {
+                reason: error.to_string(),
+            })?;
+        descriptor["sealed_segments"] = serde_json::Value::Array(Vec::new());
+
+        if self
+            .forwarded_active_descriptor
+            .as_ref()
+            .is_some_and(|current| current == &descriptor)
+        {
+            return Ok(true);
+        }
+
+        let payload = serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
+            reason: error.to_string(),
+        })?;
+        if let Some(publisher) = &self.descriptor_publisher {
+            publisher.publish(payload)?;
+        }
+        self.forwarded_active_descriptor = Some(descriptor);
+        Ok(true)
+    }
+
     fn replace_with_table(&mut self, table: &SegmentTableView) -> Result<()> {
         self.ensure_persist_healthy()?;
         if table.schema().as_ref() != self.input_schema.as_ref() {
@@ -816,6 +877,7 @@ impl StreamTableMaterializer {
         let _sealed = writer
             .rollover_without_persistence()
             .map_err(segment_error)?;
+        self.forwarded_active_descriptor = None;
         self.replacement_retained_snapshots.push(old_snapshot);
         self.sealed_segment_descriptors.clear();
         self.persisted_segment_identities.clear();

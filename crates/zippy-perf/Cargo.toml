@@ -13,6 +13,7 @@ zippy-core = { path = "../zippy-core" }
 zippy-engines = { path = "../zippy-engines" }
 zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
 zippy-operators = { path = "../zippy-operators" }
+zippy-segment-store = { path = "../zippy-segment-store" }
 
 [lints]
 workspace = true

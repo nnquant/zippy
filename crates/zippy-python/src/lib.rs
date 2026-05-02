@@ -38,7 +38,7 @@ use zippy_engines::{
     ReactiveLatestEngine as RustReactiveLatestEngine,
     ReactiveStateEngine as RustReactiveStateEngine,
     StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
-    StreamTableEngine as RustStreamTableEngine, StreamTablePersistConfig,
+    StreamTableMaterializer as RustStreamTableMaterializer, StreamTablePersistConfig,
     StreamTablePersistPartitionSpec,
     StreamTablePersistPublisher as RustStreamTablePersistPublisher,
     StreamTableRetentionGuard as RustStreamTableRetentionGuard,
@@ -66,6 +66,7 @@ use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, PartitionHandle, RowSpanView,
     SegmentCellValue, SegmentControlSnapshot, SegmentStore, SegmentStoreConfig,
+    ZippySegmentStoreError,
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
@@ -472,11 +473,17 @@ impl Source for PythonSourceBridge {
     fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
         let owner = Python::with_gil(|py| self.owner.clone_ref(py));
         let schema = Arc::clone(&self.output_schema);
+        let segment_schema =
+            compile_segment_schema_from_arrow(schema.as_ref()).map_err(map_python_source_error)?;
         let runtime_handle = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
             let owner_bound = owner.bind(py);
             if owner_bound.hasattr("_zippy_start_native")? {
-                let capsule =
-                    create_native_source_sink_capsule(py, Arc::clone(&sink), Arc::clone(&schema))?;
+                let capsule = create_native_source_sink_capsule(
+                    py,
+                    Arc::clone(&sink),
+                    Arc::clone(&schema),
+                    segment_schema,
+                )?;
                 owner_bound
                     .call_method1("_zippy_start_native", (capsule,))
                     .map(|value| value.unbind())
@@ -3385,22 +3392,54 @@ fn invoke_stream_row_callbacks(
     span: RowSpanView,
     instrument_filter: Option<&BTreeSet<String>>,
 ) -> std::result::Result<usize, String> {
-    Python::with_gil(|py| -> PyResult<usize> {
-        let mut delivered_rows = 0usize;
-        for row_index in 0..span.row_count() {
-            if !row_matches_instrument_filter(&span, row_index, instrument_filter)? {
-                continue;
+    if let Some(instrument_filter) = instrument_filter {
+        let matching_rows = matching_instrument_row_indices(&span, instrument_filter)?;
+        return Python::with_gil(|py| -> PyResult<usize> {
+            for row_index in matching_rows.iter().copied() {
+                let values = row_span_row_to_pydict(py, &span, row_index)?;
+                let row = row_factory.call1(py, (values,))?;
+                callback.call1(py, (row,))?;
             }
+            Ok(matching_rows.len())
+        })
+        .map_err(|error| error.to_string());
+    }
+
+    Python::with_gil(|py| -> PyResult<usize> {
+        for row_index in 0..span.row_count() {
             let values = row_span_row_to_pydict(py, &span, row_index)?;
             let row = row_factory.call1(py, (values,))?;
             callback.call1(py, (row,))?;
-            delivered_rows += 1;
         }
-        Ok(delivered_rows)
+        Ok(span.row_count())
     })
     .map_err(|error| error.to_string())
 }
 
+fn matching_instrument_row_indices(
+    span: &RowSpanView,
+    instrument_filter: &BTreeSet<String>,
+) -> std::result::Result<Vec<usize>, String> {
+    let instrument_column_index = span
+        .column_index("instrument_id")
+        .map_err(instrument_filter_error_message)?;
+    let mut matching_rows = Vec::new();
+    for row_index in 0..span.row_count() {
+        if row_matches_instrument_filter_at(
+            span,
+            row_index,
+            instrument_column_index,
+            instrument_filter,
+        )
+        .map_err(instrument_filter_error_message)?
+        {
+            matching_rows.push(row_index);
+        }
+    }
+    Ok(matching_rows)
+}
+
+#[cfg(test)]
 fn row_matches_instrument_filter(
     span: &RowSpanView,
     row_offset: usize,
@@ -3409,15 +3448,41 @@ fn row_matches_instrument_filter(
     let Some(instrument_filter) = instrument_filter else {
         return Ok(true);
     };
-    let value = span
-        .cell_value(row_offset, "instrument_id")
+    let instrument_column_index = span
+        .column_index("instrument_id")
         .map_err(|error| py_runtime_error(error.to_string()))?;
-    match value {
-        SegmentCellValue::Utf8(instrument_id) => Ok(instrument_filter.contains(&instrument_id)),
-        SegmentCellValue::Null => Ok(false),
-        _ => Err(py_value_error(
-            "instrument_id column must be utf8 when instrument_ids is used",
-        )),
+    row_matches_instrument_filter_at(span, row_offset, instrument_column_index, instrument_filter)
+        .map_err(instrument_filter_py_error)
+}
+
+fn row_matches_instrument_filter_at(
+    span: &RowSpanView,
+    row_offset: usize,
+    instrument_column_index: usize,
+    instrument_filter: &BTreeSet<String>,
+) -> std::result::Result<bool, ZippySegmentStoreError> {
+    match span.utf8_cell_value_at(row_offset, instrument_column_index)? {
+        Some(instrument_id) => Ok(instrument_filter.contains(instrument_id)),
+        None => Ok(false),
+    }
+}
+
+fn instrument_filter_error_message(error: ZippySegmentStoreError) -> String {
+    match error {
+        ZippySegmentStoreError::Schema("column is not utf8") => {
+            "instrument_id column must be utf8 when instrument_ids is used".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn instrument_filter_py_error(error: ZippySegmentStoreError) -> PyErr {
+    match error {
+        ZippySegmentStoreError::Schema("column is not utf8") => {
+            py_value_error("instrument_id column must be utf8 when instrument_ids is used")
+        }
+        other => py_runtime_error(other.to_string()),
     }
 }
 
@@ -4137,7 +4202,7 @@ struct CrossSectionalEngine {
 }
 
 #[pyclass]
-struct StreamTableEngine {
+struct StreamTableMaterializer {
     name: String,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
@@ -4148,7 +4213,7 @@ struct StreamTableEngine {
     metrics: SharedMetrics,
     archive: SharedArchive,
     handle: SharedHandle,
-    engine: Option<RustStreamTableEngine>,
+    engine: Option<RustStreamTableMaterializer>,
     remote_source: Option<RemoteSourceConfig>,
     bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
@@ -4548,10 +4613,10 @@ impl ReactiveLatestEngine {
 }
 
 #[pymethods]
-impl StreamTableEngine {
+impl StreamTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4573,18 +4638,19 @@ impl StreamTableEngine {
         dt_part: Option<String>,
         persist_path: Option<String>,
         persist_publisher: Option<Py<PyAny>>,
+        descriptor_forwarding: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let mut engine = match row_capacity {
-            Some(row_capacity) => RustStreamTableEngine::new_with_row_capacity(
+            Some(row_capacity) => RustStreamTableMaterializer::new_with_row_capacity(
                 &name,
                 Arc::clone(&schema),
                 row_capacity,
             ),
-            None => RustStreamTableEngine::new(&name, Arc::clone(&schema)),
+            None => RustStreamTableMaterializer::new(&name, Arc::clone(&schema)),
         }
         .map_err(|error| py_value_error(error.to_string()))?;
         if let Some(retention_segments) = retention_segments {
@@ -4605,6 +4671,9 @@ impl StreamTableEngine {
             }
             engine = engine
                 .with_descriptor_publisher(Arc::new(PyStreamTableDescriptorPublisher { callback }));
+        }
+        if descriptor_forwarding {
+            engine = engine.with_descriptor_forwarding(true);
         }
         let persist_path_provided = persist_path.is_some();
         if let Some(path) = persist_path {
@@ -5435,7 +5504,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SegmentTestWriter>()?;
     module.add_class::<ReactiveStateEngine>()?;
     module.add_class::<ReactiveLatestEngine>()?;
-    module.add_class::<StreamTableEngine>()?;
+    module.add_class::<StreamTableMaterializer>()?;
     module.add_class::<KeyValueTableMaterializer>()?;
     module.add_class::<TimeSeriesEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
@@ -5779,7 +5848,7 @@ fn register_source(
         return Ok((Some(source.clone().unbind()), None, None, None, None));
     }
 
-    if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableEngine>>() {
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableMaterializer>>() {
         if engine.engine.is_none() {
             return Err(py_runtime_error(
                 "source engine must be linked before it is started",
@@ -5944,7 +6013,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableEngine, KeyValueTableMaterializer, TimeSeriesEngine, CrossSectionalEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableMaterializer, KeyValueTableMaterializer, TimeSeriesEngine, CrossSectionalEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
@@ -6106,7 +6175,7 @@ fn ensure_source_stopped(py: Python<'_>, source_owner: &Option<Py<PyAny>>) -> Py
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
-    if let Ok(engine) = source.extract::<PyRef<'_, StreamTableEngine>>() {
+    if let Ok(engine) = source.extract::<PyRef<'_, StreamTableMaterializer>>() {
         return ensure_runtime_is_not_running(&engine.handle);
     }
 

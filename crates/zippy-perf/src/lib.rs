@@ -12,11 +12,16 @@ use serde::{Deserialize, Serialize};
 use zippy_core::{
     spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine, EngineConfig,
     EngineMetricsSnapshot, EngineStatus, LateDataPolicy, OverflowPolicy, Publisher, Result,
-    SchemaRef, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
+    SchemaRef, SegmentTableView, Source, SourceEvent, SourceHandle, SourceMode, SourceSink,
 };
-use zippy_engines::{CrossSectionalEngine, TimeSeriesEngine};
+use zippy_engines::{
+    CrossSectionalEngine, StreamTableDescriptorPublisher, StreamTableMaterializer, TimeSeriesEngine,
+};
 use zippy_io::{NullPublisher, ZmqSource, ZmqStreamPublisher};
 use zippy_operators::{AggLastSpec, CSDemeanSpec, CSRankSpec, CSZscoreSpec};
+use zippy_segment_store::{
+    compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
+};
 
 const DEFAULT_WINDOW_NS: i64 = 1_000_000;
 const REMOTE_STARTUP_DELAY_MS: u64 = 500;
@@ -32,6 +37,8 @@ pub enum PerfProfile {
     InprocTimeseries,
     RemotePipelineUpstream,
     RemotePipelineDownstream,
+    StreamTableSegmentCopy,
+    StreamTableSegmentForward,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +122,8 @@ pub fn run_profile(config: &PerfConfig) -> PerfResult<PerfReport> {
         PerfProfile::InprocTimeseries => run_inproc_timeseries(config),
         PerfProfile::RemotePipelineUpstream => run_remote_pipeline_upstream(config),
         PerfProfile::RemotePipelineDownstream => run_remote_pipeline_downstream(config),
+        PerfProfile::StreamTableSegmentCopy => run_stream_table_segment(config, false),
+        PerfProfile::StreamTableSegmentForward => run_stream_table_segment(config, true),
     }
 }
 
@@ -328,6 +337,76 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
     })
 }
 
+fn run_stream_table_segment(config: &PerfConfig, forwarding: bool) -> PerfResult<PerfReport> {
+    let tick_schema = build_tick_schema();
+    let table = build_tick_segment_table(
+        config.rows_per_batch,
+        config.symbols,
+        config.target_rows_per_sec,
+    )?;
+    let row_capacity = config
+        .rows_per_batch
+        .saturating_mul(64)
+        .max(config.rows_per_batch)
+        .min(1_048_576);
+    let mut materializer = StreamTableMaterializer::new_with_row_capacity(
+        "perf_stream_table",
+        tick_schema,
+        row_capacity,
+    )
+    .map_err(|error| error.to_string())?;
+    let descriptor_publisher = Arc::new(CountingDescriptorPublisher::default());
+    if forwarding {
+        materializer = materializer
+            .with_descriptor_publisher(descriptor_publisher)
+            .with_descriptor_forwarding(true);
+    }
+
+    let drive_stats = drive_segment_view(config, &table, |input| {
+        materializer
+            .on_data(input)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })?;
+    materializer.on_flush().map_err(|error| error.to_string())?;
+
+    let processed_batches_total = drive_stats.input_rows_total / config.rows_per_batch as u64;
+    let engine_metrics = EngineMetricsReport {
+        processed_batches_total,
+        processed_rows_total: drive_stats.input_rows_total,
+        output_batches_total: processed_batches_total,
+        dropped_batches_total: 0,
+        late_rows_total: 0,
+        publish_errors_total: 0,
+        queue_depth: 0,
+    };
+    let pass = evaluate_pass(
+        config,
+        drive_stats.actual_average_rows_per_sec,
+        EngineStatus::Stopped,
+        &engine_metrics,
+        None,
+    );
+
+    Ok(PerfReport {
+        profile: config.profile,
+        config: config.clone(),
+        input_rows_total: drive_stats.input_rows_total,
+        output_rows_total: drive_stats.input_rows_total,
+        actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
+        actual_peak_rows_per_sec: drive_stats.actual_peak_rows_per_sec,
+        batches_per_sec: compute_batches_per_sec(
+            processed_batches_total,
+            config.duration_sec as f64,
+        ),
+        latency: build_latency_summary(&drive_stats.batch_latencies_micros),
+        engine_status: EngineStatus::Stopped.as_str().to_string(),
+        engine_metrics,
+        source_metrics: None,
+        pass,
+    })
+}
+
 fn wait_for_remote_shutdown(
     handle: &mut zippy_core::EngineHandle,
     config: &PerfConfig,
@@ -448,6 +527,57 @@ fn build_tick_schema() -> SchemaRef {
         Field::new("price", DataType::Float64, false),
         Field::new("volume", DataType::Float64, false),
     ]))
+}
+
+#[derive(Default)]
+struct CountingDescriptorPublisher {
+    published_total: AtomicU64,
+}
+
+impl StreamTableDescriptorPublisher for CountingDescriptorPublisher {
+    fn publish(&self, _descriptor_envelope: Vec<u8>) -> Result<()> {
+        self.published_total.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn build_tick_segment_table(
+    rows_per_batch: usize,
+    symbol_count: usize,
+    target_rows_per_sec: u64,
+) -> PerfResult<SegmentTableView> {
+    let schema = compile_schema(&[
+        ColumnSpec::new("symbol", ColumnType::Utf8),
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
+        ColumnSpec::new("price", ColumnType::Float64),
+        ColumnSpec::new("volume", ColumnType::Float64),
+    ])
+    .map_err(str::to_string)?;
+    let layout = LayoutPlan::for_schema(&schema, rows_per_batch).map_err(str::to_string)?;
+    let mut writer =
+        ActiveSegmentWriter::new_for_runtime(schema, layout, 9_001, 0).map_err(str::to_string)?;
+    let step_ns = ((1_000_000_000_u64 / target_rows_per_sec).max(1)) as i64;
+
+    for row_index in 0..rows_per_batch {
+        writer.begin_row().map_err(str::to_string)?;
+        writer
+            .write_utf8("symbol", &format!("S{:04}", row_index % symbol_count))
+            .map_err(str::to_string)?;
+        writer
+            .write_i64("dt", row_index as i64 * step_ns)
+            .map_err(str::to_string)?;
+        writer
+            .write_f64("price", 10.0 + (row_index % 100) as f64 * 0.01)
+            .map_err(str::to_string)?;
+        writer
+            .write_f64("volume", 100.0 + (row_index % 17) as f64)
+            .map_err(str::to_string)?;
+        writer.commit_row().map_err(str::to_string)?;
+    }
+
+    let span = RowSpanView::from_active_descriptor(writer.active_descriptor(), 0, rows_per_batch)
+        .map_err(str::to_string)?;
+    Ok(SegmentTableView::from_row_span(span))
 }
 
 fn build_bar_schema(tick_schema: &SchemaRef) -> Result<SchemaRef> {
@@ -794,6 +924,68 @@ where
     })
 }
 
+fn drive_segment_view<F>(
+    config: &PerfConfig,
+    table: &SegmentTableView,
+    mut send_table: F,
+) -> PerfResult<DriveStats>
+where
+    F: FnMut(SegmentTableView) -> PerfResult<()>,
+{
+    let warmup_duration = Duration::from_secs(config.warmup_sec);
+    let steady_duration = Duration::from_secs(config.duration_sec);
+    let total_duration = warmup_duration + steady_duration;
+    let batch_interval_ns = ((1_000_000_000_u128 * config.rows_per_batch as u128)
+        / config.target_rows_per_sec as u128)
+        .max(1) as u64;
+    let batch_interval = Duration::from_nanos(batch_interval_ns);
+    let start = Instant::now();
+    let warmup_end = start + warmup_duration;
+    let end = warmup_end + steady_duration;
+    let mut next_tick = start;
+    let mut input_rows_total = 0_u64;
+    let mut steady_rows_total = 0_u64;
+    let mut peak_rows_per_sec = 0_f64;
+    let mut batch_latencies_micros = Vec::new();
+    let mut second_window_start = warmup_end;
+    let mut second_window_rows = 0_u64;
+
+    while Instant::now() < end {
+        let now = Instant::now();
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+        }
+        let batch_start = Instant::now();
+        send_table(table.clone())?;
+        let send_elapsed = batch_start.elapsed();
+        input_rows_total += config.rows_per_batch as u64;
+        if batch_start >= warmup_end {
+            steady_rows_total += config.rows_per_batch as u64;
+            batch_latencies_micros.push(send_elapsed.as_micros() as u64);
+            second_window_rows += config.rows_per_batch as u64;
+            while batch_start >= second_window_start + Duration::from_secs(1) {
+                peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+                second_window_rows = 0;
+                second_window_start += Duration::from_secs(1);
+            }
+        }
+        next_tick += batch_interval;
+        if Instant::now() - start >= total_duration {
+            break;
+        }
+    }
+
+    peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+    let actual_average_rows_per_sec = steady_rows_total as f64 / steady_duration.as_secs_f64();
+
+    Ok(DriveStats {
+        input_rows_total,
+        actual_average_rows_per_sec,
+        actual_peak_rows_per_sec: peak_rows_per_sec,
+        batch_latencies_micros,
+    })
+}
+
 fn build_latency_summary(samples_micros: &[u64]) -> LatencySummary {
     if samples_micros.is_empty() {
         return LatencySummary::default();
@@ -921,6 +1113,20 @@ mod tests {
         assert!(report.input_rows_total > 0);
         assert!(report.actual_average_rows_per_sec > 0.0);
         assert!(report.pass);
+    }
+
+    #[test]
+    fn stream_table_segment_profiles_produce_nonzero_rows_and_pass() {
+        for profile in [
+            PerfProfile::StreamTableSegmentCopy,
+            PerfProfile::StreamTableSegmentForward,
+        ] {
+            let report = run_profile(&test_config(profile, test_endpoint())).unwrap();
+
+            assert!(report.input_rows_total > 0);
+            assert!(report.actual_average_rows_per_sec > 0.0);
+            assert!(report.pass);
+        }
     }
 
     #[test]

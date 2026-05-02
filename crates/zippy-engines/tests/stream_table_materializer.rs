@@ -10,9 +10,9 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::{
-    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableEngine,
-    StreamTableMaterializer, StreamTablePersistConfig, StreamTablePersistPartitionSpec,
-    StreamTablePersistPublisher, StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,
+    StreamTablePersistConfig, StreamTablePersistPartitionSpec, StreamTablePersistPublisher,
+    StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
@@ -179,7 +179,7 @@ fn empty_input_batch() -> RecordBatch {
 
 #[test]
 fn stream_table_on_data_passes_batch_through_without_schema_change() {
-    let mut engine = StreamTableEngine::new("ticks", input_schema()).unwrap();
+    let mut engine = StreamTableMaterializer::new("ticks", input_schema()).unwrap();
     let batch = input_batch();
     let view = SegmentTableView::from_record_batch(batch.clone());
 
@@ -732,6 +732,81 @@ fn stream_table_materializer_rolls_over_segment_view_input() {
 }
 
 #[test]
+fn stream_table_materializer_forwards_segment_descriptor_without_copying() {
+    let publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 2)
+            .unwrap()
+            .with_descriptor_publisher(publisher.clone())
+            .with_descriptor_forwarding(true);
+    let source_store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 5,
+    })
+    .unwrap();
+    let source_handle = source_store
+        .open_partition_with_schema("ticks", "source", segment_schema())
+        .unwrap();
+    let writer = source_handle.writer();
+    for row_index in 0..5 {
+        writer
+            .write_row(|row| {
+                row.write_utf8(
+                    "instrument_id",
+                    if row_index % 2 == 0 {
+                        "IF2606"
+                    } else {
+                        "IH2606"
+                    },
+                )?;
+                row.write_i64("dt", 1_710_000_000_000_000_000_i64 + row_index as i64)?;
+                row.write_f64("last_price", 3912.4 + row_index as f64)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let input = SegmentTableView::from_row_span(source_handle.active_row_span(0, 5).unwrap());
+    let expected_descriptor: serde_json::Value = serde_json::from_slice(
+        &input
+            .as_segment_row_view()
+            .unwrap()
+            .row_span()
+            .active_descriptor_envelope_bytes()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let outputs = materializer.on_data(input).unwrap();
+
+    assert_eq!(outputs[0].num_rows(), 5);
+    assert_eq!(materializer.active_committed_row_count(), 0);
+    let envelopes = publisher.envelopes.lock().unwrap();
+    assert_eq!(envelopes.len(), 1);
+    let descriptor: serde_json::Value = serde_json::from_slice(&envelopes[0]).unwrap();
+    assert_eq!(descriptor["shm_os_id"], expected_descriptor["shm_os_id"]);
+    assert_eq!(
+        descriptor["row_capacity"],
+        expected_descriptor["row_capacity"]
+    );
+    assert_eq!(descriptor["segment_id"], expected_descriptor["segment_id"]);
+    assert_eq!(descriptor["generation"], expected_descriptor["generation"]);
+    assert_eq!(descriptor["sealed_segments"].as_array().unwrap().len(), 0);
+    let batch = descriptor_batch(&envelopes[0], 5, 5);
+    let instrument_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prices = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(instrument_ids.value(4), "IF2606");
+    assert_eq!(prices.value(4), 3916.4);
+}
+
+#[test]
 fn stream_table_descriptor_published_after_rollover_includes_retained_sealed_segment() {
     let publisher = Arc::new(RecordingDescriptorPublisher::default());
     let mut materializer =
@@ -1210,7 +1285,7 @@ fn stream_table_persist_failure_publishes_queryable_error_event() {
 
 #[test]
 fn stream_table_flush_and_stop_emit_no_extra_batches() {
-    let mut engine = StreamTableEngine::new("ticks", input_schema()).unwrap();
+    let mut engine = StreamTableMaterializer::new("ticks", input_schema()).unwrap();
 
     assert!(engine.on_flush().unwrap().is_empty());
     assert!(engine.on_stop().unwrap().is_empty());
@@ -1218,7 +1293,7 @@ fn stream_table_flush_and_stop_emit_no_extra_batches() {
 
 #[test]
 fn stream_table_on_data_passes_empty_batch_through_without_modification() {
-    let mut engine = StreamTableEngine::new("ticks", input_schema()).unwrap();
+    let mut engine = StreamTableMaterializer::new("ticks", input_schema()).unwrap();
     let batch = empty_input_batch();
     let view = SegmentTableView::from_record_batch(batch.clone());
 
@@ -1244,7 +1319,7 @@ fn stream_table_on_data_passes_empty_batch_through_without_modification() {
 
 #[test]
 fn stream_table_rejects_schema_mismatch() {
-    let mut engine = StreamTableEngine::new("ticks", input_schema()).unwrap();
+    let mut engine = StreamTableMaterializer::new("ticks", input_schema()).unwrap();
     let wrong_schema = Arc::new(Schema::new(vec![
         Arc::new(Field::new("instrument_id", DataType::Utf8, false)),
         Arc::new(Field::new("last_price", DataType::Float64, false)),

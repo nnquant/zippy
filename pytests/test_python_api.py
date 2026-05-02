@@ -842,7 +842,7 @@ def test_session_engine_persist_false_disables_default_output_persistence(monkey
 
     captured_materializer: dict[str, object] = {}
 
-    class CapturingStreamTableEngine:
+    class CapturingStreamTableMaterializer:
         def __init__(self, **kwargs):
             captured_materializer.update(kwargs)
             self._status = "created"
@@ -878,7 +878,7 @@ def test_session_engine_persist_false_disables_default_output_persistence(monkey
         def _zippy_output_schema(self):
             return schema
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", CapturingStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", CapturingStreamTableMaterializer)
     session = zippy.Session(name="latest_session", master=FakeMaster())
     session.engine(
         CapturingPythonSourceEngine,
@@ -929,7 +929,7 @@ def test_session_engine_persist_true_materializes_parquet_output(monkeypatch) ->
 
     captured_materializer: dict[str, object] = {}
 
-    class CapturingStreamTableEngine:
+    class CapturingStreamTableMaterializer:
         def __init__(self, **kwargs):
             captured_materializer.update(kwargs)
             self._status = "created"
@@ -965,7 +965,7 @@ def test_session_engine_persist_true_materializes_parquet_output(monkeypatch) ->
         def _zippy_output_schema(self):
             return schema
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", CapturingStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", CapturingStreamTableMaterializer)
     session = zippy.Session(name="latest_session", master=FakeMaster())
     session.engine(
         CapturingPythonSourceEngine,
@@ -2012,7 +2012,7 @@ snapshot = zippy.setup_log(
     to_console=False,
     to_file=True,
 )
-engine = zippy.StreamTableEngine(
+engine = zippy._internal.StreamTableMaterializer(
     name="ticks",
     input_schema=pa.schema([("price", pa.float64())]),
     target=zippy.NullPublisher(),
@@ -3493,7 +3493,7 @@ def test_timeseries_engine_config_and_output_archive_roundtrip(
 
 def test_stream_table_engine_runtime_xfast_defaults_false() -> None:
     schema = pa.schema([("symbol", pa.string()), ("price", pa.float64())])
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="ticks",
         input_schema=schema,
         target=zippy.NullPublisher(),
@@ -3714,7 +3714,7 @@ def test_stream_table_engine_exposes_input_schema_as_output_schema() -> None:
         ]
     )
 
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="ticks",
         input_schema=schema,
         target=zippy.NullPublisher(),
@@ -3736,7 +3736,7 @@ def test_stream_table_engine_supports_source_target_and_sink(tmp_path: Path) -> 
         expected_schema=schema,
         mode=zippy.SourceMode.PIPELINE,
     )
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="ticks",
         input_schema=schema,
         source=source,
@@ -3776,7 +3776,7 @@ def test_stream_table_engine_rejects_invalid_sink_type() -> None:
     )
 
     with pytest.raises(TypeError, match="sink must be zippy.ParquetSink"):
-        zippy.StreamTableEngine(
+        zippy._internal.StreamTableMaterializer(
             name="ticks",
             input_schema=schema,
             target=zippy.NullPublisher(),
@@ -3810,13 +3810,13 @@ def test_stream_table_engine_passthrough_archives_output_and_publishes_remote_st
         expected_schema=schema,
         mode=zippy.SourceMode.PIPELINE,
     )
-    relay = zippy.StreamTableEngine(
+    relay = zippy._internal.StreamTableMaterializer(
         name="tick_table_relay",
         source=relay_source,
         input_schema=schema,
         target=zippy.ZmqPublisher(endpoint=relay_endpoint),
     )
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="tick_table",
         input_schema=schema,
         target=stream_target,
@@ -3881,7 +3881,7 @@ def test_stream_table_engine_can_drive_timeseries_downstream_pipeline() -> None:
     )
     port = reserve_tcp_port()
     endpoint = f"tcp://127.0.0.1:{port}"
-    source = zippy.StreamTableEngine(
+    source = zippy._internal.StreamTableMaterializer(
         name="tick_table",
         input_schema=tick_schema,
         target=zippy.NullPublisher(),
@@ -3961,7 +3961,7 @@ def test_stream_table_engine_can_publish_to_master_bus(tmp_path: Path) -> None:
     reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
     reader_master.register_process("reader")
 
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="ticks",
         input_schema=schema,
         target=zippy.BusStreamTarget(stream_name="ticks", master=writer_master),
@@ -5144,7 +5144,7 @@ def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
     reader_client.register_process("stream_table_reader")
     reader = reader_client.read_from("openctp_ticks")
 
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="stream_table_writer",
         input_schema=tick_schema,
         target=zippy.BusStreamTarget(stream_name="openctp_ticks", master=writer_client),
@@ -6926,7 +6926,7 @@ def test_pipeline_process_registration_starts_default_heartbeat(monkeypatch) -> 
         def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
             return None
 
-    class FakeStreamTableEngine:
+    class FakeStreamTableMaterializer:
         def __init__(self, *args, **kwargs) -> None:
             return None
 
@@ -6940,7 +6940,7 @@ def test_pipeline_process_registration_starts_default_heartbeat(monkeypatch) -> 
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
         reset_default_master()
-    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
 
     master = FakeMaster()
     zippy._set_default_master(master, None, 0.01)
@@ -7888,6 +7888,13 @@ def test_read_table_replaces_query_api(monkeypatch) -> None:
     assert not hasattr(zippy, "query")
     assert "Query" not in zippy.__all__
     assert "query" not in zippy.__all__
+
+
+def test_stream_table_engine_is_not_a_top_level_user_api() -> None:
+    assert not hasattr(zippy, "StreamTableEngine")
+    assert "StreamTableEngine" not in zippy.__all__
+    assert hasattr(zippy._internal, "StreamTableMaterializer")
+    assert not hasattr(zippy._internal, "StreamTableEngine")
 
 
 def test_archive_compatibility_aliases_are_removed() -> None:
@@ -9081,7 +9088,7 @@ def test_pipeline_run_forever_stops_pipeline_on_keyboard_interrupt(monkeypatch) 
         def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
             return None
 
-    class FakeStreamTableEngine:
+    class FakeStreamTableMaterializer:
         def __init__(self, *args, **kwargs) -> None:
             self.started = False
             self.stopped = False
@@ -9102,7 +9109,7 @@ def test_pipeline_run_forever_stops_pipeline_on_keyboard_interrupt(monkeypatch) 
         sleep_intervals.append(interval)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
     monkeypatch.setattr(zippy.time, "sleep", interrupting_sleep)
 
     pipeline = zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
@@ -9221,7 +9228,7 @@ def test_pipeline_stream_table_persist_publishes_master_metadata(
         ) -> None:
             self.persist_events.append((stream_name, persist_event))
 
-    class FakeStreamTableEngine:
+    class FakeStreamTableMaterializer:
         def __init__(self, *args, **kwargs) -> None:
             created["args"] = args
             created["kwargs"] = kwargs
@@ -9229,7 +9236,7 @@ def test_pipeline_stream_table_persist_publishes_master_metadata(
         def active_descriptor(self) -> dict[str, object]:
             return {}
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
     master = FakeMaster()
 
     zippy.Pipeline("test_ingest", master=master).stream_table(
@@ -9338,14 +9345,14 @@ def test_pipeline_stream_table_uses_master_config_defaults(
         def publish_persisted_file(self, stream_name: str, persisted_file: object) -> None:
             return None
 
-    class FakeStreamTableEngine:
+    class FakeStreamTableMaterializer:
         def __init__(self, *args, **kwargs) -> None:
             created["kwargs"] = kwargs
 
         def active_descriptor(self) -> dict[str, object]:
             return {}
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
 
     zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
         "openctp_ticks",
@@ -9407,14 +9414,14 @@ def test_pipeline_stream_table_explicit_persist_none_overrides_master_default(
         def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
             return None
 
-    class FakeStreamTableEngine:
+    class FakeStreamTableMaterializer:
         def __init__(self, *args, **kwargs) -> None:
             created["kwargs"] = kwargs
 
         def active_descriptor(self) -> dict[str, object]:
             return {}
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
 
     zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
         "openctp_ticks",
@@ -9467,14 +9474,14 @@ def test_pipeline_stream_table_passes_retention_segments_to_engine(monkeypatch) 
         def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
             return None
 
-    class FakeStreamTableEngine:
+    class FakeStreamTableMaterializer:
         def __init__(self, *args, **kwargs) -> None:
             created["kwargs"] = kwargs
 
         def active_descriptor(self) -> dict[str, object]:
             return {}
 
-    monkeypatch.setattr(zippy, "StreamTableEngine", FakeStreamTableEngine)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
 
     zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
         "openctp_ticks",
@@ -9495,7 +9502,7 @@ def test_stream_table_engine_persists_rollover_parquet_without_master(
             ("last_price", pa.float64()),
         ]
     )
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="openctp_ticks",
         input_schema=tick_schema,
         target=zippy.NullPublisher(),
@@ -9608,7 +9615,7 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
     input_client = zippy.MasterClient(control_endpoint=control_endpoint)
     input_client.register_process("tick_writer")
     input_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
-    upstream = zippy.StreamTableEngine(
+    upstream = zippy._internal.StreamTableMaterializer(
         name="stream_table_writer",
         input_schema=tick_schema,
         target=zippy.BusStreamTarget(stream_name="openctp_ticks", master=input_client),
@@ -9679,7 +9686,7 @@ def test_stream_table_engine_accepts_segment_stream_source() -> None:
         xfast=True,
     )
 
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="segment_table",
         input_schema=schema,
         source=source,
@@ -9760,7 +9767,7 @@ sys.stdin.readline()
         mode=zippy.SourceMode.PIPELINE,
         xfast=True,
     )
-    engine = zippy.StreamTableEngine(
+    engine = zippy._internal.StreamTableMaterializer(
         name="segment_table_live",
         input_schema=tick_schema,
         source=source,
@@ -9826,7 +9833,7 @@ def test_stream_table_engine_rejects_segment_stream_source_schema_mismatch() -> 
     )
 
     with pytest.raises(ValueError, match="source output schema must match downstream input_schema"):
-        zippy.StreamTableEngine(
+        zippy._internal.StreamTableMaterializer(
             name="segment_table_mismatch",
             input_schema=input_schema,
             source=source,

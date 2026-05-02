@@ -147,6 +147,22 @@ impl RowSpanView {
         }
     }
 
+    /// 如果当前 span 来自 active segment，返回可跨进程 attach 的 descriptor。
+    pub fn active_descriptor(&self) -> Option<&ActiveSegmentDescriptor> {
+        match &self.backing {
+            RowSpanBacking::Sealed(_) => None,
+            RowSpanBacking::Active(attachment) => Some(&attachment.descriptor),
+        }
+    }
+
+    /// 如果当前 span 来自 active segment，导出 descriptor envelope。
+    pub fn active_descriptor_envelope_bytes(&self) -> Result<Option<Vec<u8>>, &'static str> {
+        match self.active_descriptor() {
+            Some(descriptor) => descriptor.to_envelope_bytes().map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// 直接读取 span 内某行某列的标量值，不构造 Arrow array 或 RecordBatch。
     pub fn cell_value(
         &self,
@@ -172,6 +188,56 @@ impl RowSpanView {
                 self.active_cell_value(attachment, spec, absolute_row)
             }
         }
+    }
+
+    /// 直接借用 span 内某行 UTF-8 列值，避免热路径过滤时为每行分配字符串。
+    pub fn utf8_cell_value(
+        &self,
+        row_offset: usize,
+        field_name: &str,
+    ) -> Result<Option<&str>, ZippySegmentStoreError> {
+        let column_index = self.column_index(field_name)?;
+        self.utf8_cell_value_at(row_offset, column_index)
+    }
+
+    /// 按列序号直接借用 span 内某行 UTF-8 列值。
+    pub fn utf8_cell_value_at(
+        &self,
+        row_offset: usize,
+        column_index: usize,
+    ) -> Result<Option<&str>, ZippySegmentStoreError> {
+        if row_offset >= self.row_count() {
+            return Err(ZippySegmentStoreError::Lifecycle(
+                "row offset out of bounds",
+            ));
+        }
+        let spec = self
+            .schema()
+            .columns()
+            .get(column_index)
+            .ok_or(ZippySegmentStoreError::Schema("missing column"))?;
+        if !matches!(&spec.data_type, ColumnType::Utf8) {
+            return Err(ZippySegmentStoreError::Schema("column is not utf8"));
+        }
+
+        let absolute_row = self.start_row + row_offset;
+        match &self.backing {
+            RowSpanBacking::Sealed(handle) => {
+                self.sealed_utf8_cell_value(handle, spec, absolute_row)
+            }
+            RowSpanBacking::Active(attachment) => {
+                self.active_utf8_cell_value(attachment, spec, absolute_row)
+            }
+        }
+    }
+
+    /// 返回列名对应的 schema 序号。
+    pub fn column_index(&self, field_name: &str) -> Result<usize, ZippySegmentStoreError> {
+        self.schema()
+            .columns()
+            .iter()
+            .position(|spec| spec.name == field_name)
+            .ok_or(ZippySegmentStoreError::Schema("missing column"))
     }
 
     fn sealed_cell_value(
@@ -225,6 +291,35 @@ impl RowSpanView {
         }
     }
 
+    fn sealed_utf8_cell_value<'a>(
+        &self,
+        handle: &'a SealedSegmentHandle,
+        spec: &ColumnSpec,
+        row: usize,
+    ) -> Result<Option<&'a str>, ZippySegmentStoreError> {
+        if spec.nullable {
+            let validity = handle
+                .inner
+                .validity
+                .get(spec.name)
+                .ok_or(ZippySegmentStoreError::Schema("missing validity"))?;
+            if !validity[row] {
+                return Ok(None);
+            }
+        }
+
+        let values = handle
+            .inner
+            .utf8_columns
+            .get(spec.name)
+            .ok_or(ZippySegmentStoreError::Schema("missing utf8 column"))?;
+        let start = values.offsets[row] as usize;
+        let end = values.offsets[row + 1] as usize;
+        std::str::from_utf8(&values.values[start..end])
+            .map(Some)
+            .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))
+    }
+
     fn active_cell_value(
         &self,
         attachment: &ActiveSegmentAttachment,
@@ -255,6 +350,25 @@ impl RowSpanView {
                 attachment, layout, row,
             )?)),
         }
+    }
+
+    fn active_utf8_cell_value<'a>(
+        &self,
+        attachment: &'a ActiveSegmentAttachment,
+        spec: &ColumnSpec,
+        row: usize,
+    ) -> Result<Option<&'a str>, ZippySegmentStoreError> {
+        let layout = attachment
+            .descriptor
+            .layout()
+            .column(spec.name)
+            .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
+
+        if spec.nullable && !read_active_validity(attachment, layout, row)? {
+            return Ok(None);
+        }
+
+        read_active_utf8_slice(attachment, layout, row).map(Some)
     }
 }
 
@@ -324,6 +438,26 @@ fn read_active_utf8(
     std::str::from_utf8(&bytes)
         .map(str::to_owned)
         .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))
+}
+
+fn read_active_utf8_slice<'a>(
+    attachment: &'a ActiveSegmentAttachment,
+    layout: &ColumnLayout,
+    row: usize,
+) -> Result<&'a str, ZippySegmentStoreError> {
+    let start = read_active_u32(attachment, layout.offsets_offset + (row * 4))? as usize;
+    let end = read_active_u32(attachment, layout.offsets_offset + ((row + 1) * 4))? as usize;
+    if start > end || end > layout.values_len {
+        return Err(ZippySegmentStoreError::Shmem(format!(
+            "invalid utf8 offset range start=[{start}] end=[{end}] values_len=[{}]",
+            layout.values_len
+        )));
+    }
+    let bytes = attachment.shm_region.slice_at(
+        attachment.descriptor.payload_offset() + layout.values_offset + start,
+        end - start,
+    )?;
+    std::str::from_utf8(bytes).map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))
 }
 
 fn read_active_u32(

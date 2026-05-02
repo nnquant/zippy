@@ -472,6 +472,16 @@ pub struct PartitionRowWriter<'a> {
     writer: &'a mut ActiveSegmentWriter,
 }
 
+/// 批量列式写入器。
+///
+/// 该类型只在 `PartitionWriterHandle::write_columnar_rows` 的闭包内有效，所有列都写入
+/// 同一个预留 row range，最后统一发布 committed prefix。
+pub struct PartitionColumnWriter<'a> {
+    writer: &'a mut ActiveSegmentWriter,
+    start_row: usize,
+    row_count: usize,
+}
+
 impl PartitionRowWriter<'_> {
     /// 写入 i64 列值。
     pub fn write_i64(&mut self, column: &str, value: i64) -> Result<(), ZippySegmentStoreError> {
@@ -491,6 +501,73 @@ impl PartitionRowWriter<'_> {
     pub fn write_utf8(&mut self, column: &str, value: &str) -> Result<(), ZippySegmentStoreError> {
         self.writer
             .write_utf8(column, value)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+}
+
+impl PartitionColumnWriter<'_> {
+    /// 写入一整段 i64 / timestamp 列。
+    pub fn write_i64_values(
+        &mut self,
+        column: &str,
+        values: &[i64],
+    ) -> Result<(), ZippySegmentStoreError> {
+        if values.len() != self.row_count {
+            return Err(ZippySegmentStoreError::Writer(
+                "columnar i64 values length mismatch",
+            ));
+        }
+        self.writer
+            .write_i64_values_at(column, self.start_row, values)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+
+    /// 写入一整段 f64 列。
+    pub fn write_f64_values(
+        &mut self,
+        column: &str,
+        values: &[f64],
+    ) -> Result<(), ZippySegmentStoreError> {
+        if values.len() != self.row_count {
+            return Err(ZippySegmentStoreError::Writer(
+                "columnar f64 values length mismatch",
+            ));
+        }
+        self.writer
+            .write_f64_values_at(column, self.start_row, values)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+
+    /// 写入一整段 utf8 列。
+    pub fn write_utf8_values(
+        &mut self,
+        column: &str,
+        values: &[&str],
+    ) -> Result<(), ZippySegmentStoreError> {
+        if values.len() != self.row_count {
+            return Err(ZippySegmentStoreError::Writer(
+                "columnar utf8 values length mismatch",
+            ));
+        }
+        self.writer
+            .write_utf8_values_at(column, self.start_row, values)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+
+    /// 使用同一个 utf8 值填充一整段列。
+    pub fn write_utf8_repeated(
+        &mut self,
+        column: &str,
+        value: &str,
+        row_count: usize,
+    ) -> Result<(), ZippySegmentStoreError> {
+        if row_count != self.row_count {
+            return Err(ZippySegmentStoreError::Writer(
+                "columnar repeated utf8 row count mismatch",
+            ));
+        }
+        self.writer
+            .write_utf8_repeated_at(column, self.start_row, value, row_count)
             .map_err(ZippySegmentStoreError::Writer)
     }
 }
@@ -611,6 +688,55 @@ impl PartitionWriterHandle {
                 .publish_committed_prefix()
                 .map_err(ZippySegmentStoreError::Writer)?;
             written
+        };
+
+        if written > 0 {
+            self.handle
+                .inner
+                .broadcaster
+                .notify_all()
+                .map_err(ZippySegmentStoreError::Io)?;
+        }
+        Ok(written)
+    }
+
+    /// 在同一个分区锁内按列批量写入多行，并只发布一次 committed prefix。
+    pub fn write_columnar_rows<F>(
+        &self,
+        row_count: usize,
+        write: F,
+    ) -> Result<usize, ZippySegmentStoreError>
+    where
+        F: FnOnce(&mut PartitionColumnWriter<'_>, usize) -> Result<(), ZippySegmentStoreError>,
+    {
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        let written = {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            if state.writer.has_open_row() {
+                return Err(ZippySegmentStoreError::Writer("row already open"));
+            }
+
+            let rows_to_write = row_count.min(state.writer.remaining_row_capacity());
+            if rows_to_write == 0 {
+                return Err(ZippySegmentStoreError::Writer("segment is full"));
+            }
+            let start_row = state.writer.row_cursor();
+            {
+                let mut column_writer = PartitionColumnWriter {
+                    writer: &mut state.writer,
+                    start_row,
+                    row_count: rows_to_write,
+                };
+                write(&mut column_writer, rows_to_write)?;
+            }
+            state
+                .writer
+                .finish_columnar_rows(rows_to_write)
+                .map_err(ZippySegmentStoreError::Writer)?;
+            rows_to_write
         };
 
         if written > 0 {

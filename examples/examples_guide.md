@@ -84,8 +84,9 @@ uv run zippy stream ls --uri default
 - `zp.ops.compact_tables(...)` / `zp.ops.start_compaction_worker(...)`：批量或后台执行
   低频 compaction；该类运维任务不属于写入热路径。
 
-`ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、`StreamTableEngine`、
-`SegmentStreamSource` 等底层对象仍然可以使用，但示例默认不直接暴露这些细节。
+`ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、
+`SegmentStreamSource` 等底层对象仍然可以使用；StreamTable 物化器保留在内部层，
+示例默认不直接暴露这些细节。
 
 ## 运行约定
 

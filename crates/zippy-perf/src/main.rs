@@ -12,6 +12,8 @@ enum CliProfile {
     InprocTimeseries,
     RemotePipelineUpstream,
     RemotePipelineDownstream,
+    StreamTableSegmentCopy,
+    StreamTableSegmentForward,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -61,6 +63,8 @@ fn main() {
             CliProfile::InprocTimeseries => PerfProfile::InprocTimeseries,
             CliProfile::RemotePipelineUpstream => PerfProfile::RemotePipelineUpstream,
             CliProfile::RemotePipelineDownstream => PerfProfile::RemotePipelineDownstream,
+            CliProfile::StreamTableSegmentCopy => PerfProfile::StreamTableSegmentCopy,
+            CliProfile::StreamTableSegmentForward => PerfProfile::StreamTableSegmentForward,
         },
         rows_per_batch: cli.rows_per_batch,
         target_rows_per_sec: cli.target_rows_per_sec,
