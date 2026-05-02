@@ -15,6 +15,8 @@ crates/zippy-master/--no-console-log/
 # Local planning artifacts.
 /docs/superpowers/
 /docs/ROADMAP.md
+/docs/current-system-architecture.md
+/docs/zippy-documentation/
 /ROADMAP
 /ROADMAP.md
 .worktrees/
