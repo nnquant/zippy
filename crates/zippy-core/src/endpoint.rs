@@ -77,7 +77,16 @@ pub fn resolve_control_endpoint(uri: impl AsRef<str>) -> Result<ControlEndpoint>
 }
 
 pub fn resolve_control_endpoint_with_home(uri: &str, home: &Path) -> Result<ControlEndpoint> {
+    if uri.starts_with("zippy+tcp://") {
+        return Err(ZippyError::InvalidConfig {
+            reason: "zippy+tcp:// uri is no longer supported; use zippy://host:port/profile"
+                .to_string(),
+        });
+    }
     if let Some(addr) = uri.strip_prefix("tcp://") {
+        return parse_tcp_endpoint(uri, addr);
+    }
+    if let Some(addr) = remote_zippy_authority(uri) {
         return parse_tcp_endpoint(uri, addr);
     }
 
@@ -155,6 +164,16 @@ fn looks_like_path(uri: &str) -> bool {
         || uri.ends_with(".sock")
 }
 
+fn remote_zippy_authority(uri: &str) -> Option<&str> {
+    let body = uri.strip_prefix("zippy://")?;
+    let authority = body.split('/').next().unwrap_or_default();
+    if authority.contains(':') {
+        Some(authority)
+    } else {
+        None
+    }
+}
+
 fn expand_path(path: &str, home: &Path) -> PathBuf {
     if let Some(relative) = path.strip_prefix("~/") {
         return home.join(relative);
@@ -188,11 +207,6 @@ fn parse_tcp_endpoint(original_uri: &str, addr: &str) -> Result<ControlEndpoint>
         .map_err(|error| ZippyError::InvalidConfig {
             reason: format!("invalid tcp control endpoint uri=[{original_uri}] error=[{error}]"),
         })?;
-    if !socket_addr.ip().is_loopback() {
-        return Err(ZippyError::InvalidConfig {
-            reason: format!("tcp control endpoint must bind loopback address uri=[{original_uri}]"),
-        });
-    }
     Ok(ControlEndpoint::Tcp(socket_addr))
 }
 

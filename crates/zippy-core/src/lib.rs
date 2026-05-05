@@ -33,9 +33,10 @@ pub use bus_protocol::{
     UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
 };
 pub use config::{
-    default_config_path, ZippyConfig, ZippyLogConfig, ZippyTableConfig, ZippyTablePersistConfig,
-    ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL,
-    DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
+    default_config_path, ZippyConfig, ZippyLogConfig, ZippyRemoteGatewayConfig, ZippyTableConfig,
+    ZippyTablePersistConfig, ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH,
+    DEFAULT_LOG_LEVEL, DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD,
+    DEFAULT_TABLE_ROW_CAPACITY,
 };
 pub use control_transport::{connect_control_endpoint, send_control_line_request, ControlStream};
 pub use endpoint::{

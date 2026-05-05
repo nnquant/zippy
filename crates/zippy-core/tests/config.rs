@@ -14,6 +14,10 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_TABLE_PERSIST_PARTITION_DT_COLUMN",
     "ZIPPY_TABLE_PERSIST_PARTITION_ID_COLUMN",
     "ZIPPY_TABLE_PERSIST_PARTITION_DT_PART",
+    "ZIPPY_REMOTE_GATEWAY",
+    "ZIPPY_REMOTE_GATEWAY_ENDPOINT",
+    "ZIPPY_REMOTE_GATEWAY_TOKEN",
+    "ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION",
 ];
 
 #[test]
@@ -38,6 +42,12 @@ data_dir = "from-file"
 dt_column = "dt"
 id_column = "instrument_id"
 dt_part = "%Y%m%d"
+
+[remote_gateway]
+enabled = false
+endpoint = "127.0.0.1:17666"
+token = "from-file-token"
+protocol_version = 1
 "#,
     )
     .unwrap();
@@ -52,6 +62,10 @@ dt_part = "%Y%m%d"
             ("ZIPPY_TABLE_PERSIST_PARTITION_DT_COLUMN", "recv_ts"),
             ("ZIPPY_TABLE_PERSIST_PARTITION_ID_COLUMN", "symbol"),
             ("ZIPPY_TABLE_PERSIST_PARTITION_DT_PART", "%Y%m"),
+            ("ZIPPY_REMOTE_GATEWAY", "true"),
+            ("ZIPPY_REMOTE_GATEWAY_ENDPOINT", "127.0.0.1:27666"),
+            ("ZIPPY_REMOTE_GATEWAY_TOKEN", "from-env-token"),
+            ("ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION", "2"),
         ],
         || {
             let config = ZippyConfig::load_from_path(Some(&config_path)).unwrap();
@@ -74,8 +88,38 @@ dt_part = "%Y%m%d"
                 config.table.persist.partition.dt_part.as_deref(),
                 Some("%Y%m")
             );
+            assert!(config.remote_gateway.enabled);
+            assert_eq!(
+                config.remote_gateway.endpoint.as_deref(),
+                Some("127.0.0.1:27666")
+            );
+            assert_eq!(
+                config.remote_gateway.token.as_deref(),
+                Some("from-env-token")
+            );
+            assert_eq!(config.remote_gateway.protocol_version, 2);
         },
     );
+}
+
+#[test]
+fn zippy_config_rejects_enabled_remote_gateway_without_endpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[remote_gateway]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("remote_gateway endpoint must be set when enabled"));
 }
 
 #[test]

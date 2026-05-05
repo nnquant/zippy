@@ -28,7 +28,7 @@ use zippy_core::{
     LateDataPolicy, LogConfig, MasterClient as CoreMasterClient, OverflowPolicy,
     Publisher as CorePublisher, Reader as CoreBusReader, SegmentTableView, Source, SourceEvent,
     SourceHandle, SourceMode as RustSourceMode, SourceSink, StreamHello, StreamInfo,
-    Writer as CoreBusWriter, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
+    Writer as CoreBusWriter, ZippyConfig, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
@@ -132,6 +132,24 @@ fn python_json_loads<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, Py
 fn serde_json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     let text = serde_json::to_string(value).map_err(|error| py_value_error(error.to_string()))?;
     Ok(python_json_loads(py, &text)?.into_py(py))
+}
+
+fn merge_json_object(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(base_value) => merge_json_object(base_value, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay;
+        }
+    }
 }
 
 fn serde_json_option_to_py(
@@ -3542,14 +3560,32 @@ struct MasterDaemon {
 #[pymethods]
 impl MasterDaemon {
     #[new]
-    #[pyo3(signature = (uri=None, *, control_endpoint=None))]
-    fn new(uri: Option<String>, control_endpoint: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (uri=None, *, control_endpoint=None, config=None))]
+    fn new(
+        py: Python<'_>,
+        uri: Option<String>,
+        control_endpoint: Option<String>,
+        config: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
         let resolved_control_endpoint = resolve_control_endpoint_value(&control_endpoint)?;
         let resolved_control_endpoint = resolved_control_endpoint.display_string();
+        let server = if let Some(config) = config {
+            let payload = python_json_dumps(py, &config)?;
+            let mut merged = serde_json::to_value(ZippyConfig::default())
+                .map_err(|error| py_value_error(error.to_string()))?;
+            let overlay = serde_json::from_str::<serde_json::Value>(&payload)
+                .map_err(|error| py_value_error(error.to_string()))?;
+            merge_json_object(&mut merged, overlay);
+            let config = serde_json::from_value::<ZippyConfig>(merged)
+                .map_err(|error| py_value_error(error.to_string()))?;
+            RustMasterServer::with_config(config)
+        } else {
+            RustMasterServer::default()
+        };
         Ok(Self {
             control_endpoint: resolved_control_endpoint,
-            server: RustMasterServer::default(),
+            server,
             join_handle: Arc::new(Mutex::new(None)),
         })
     }

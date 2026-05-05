@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import click
 
+from .cli_gateway import gateway_group
 from .cli_master import master_group
 from .cli_stream import stream_group
 
@@ -18,6 +19,7 @@ def main() -> None:
 
 
 main.add_command(master_group)
+main.add_command(gateway_group)
 main.add_command(stream_group)
 
 

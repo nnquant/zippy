@@ -32,6 +32,8 @@ uv run zippy stream ls --uri default
 - `05_engines/`：`Session` 编排、`ReactiveLatestEngine`、时序和截面引擎。
 - `06_replay/`：从 persisted table / Parquet 回放到 StreamTable，并驱动下游 Engine。
 - `07_ops/`：运行时表状态、master 元数据和运维观察入口。
+- `08_remote_gateway/`：Windows/远端客户端通过 GatewayServer 写入、订阅和查询 WSL/Linux
+  中的 named stream。
 
 ## 推荐学习顺序
 
@@ -52,6 +54,16 @@ uv run zippy stream ls --uri default
 14. 用 `07_ops/03_subscribe_latency_probe.py` 记录 append、subscriber 行级和 rollover 延迟。
 15. 用 `07_ops/04_consumer_wait_for_table.py` 验证 consumer 先启动、producer 后注册表的场景。
 16. 用 `07_ops/05_table_health_check.py` 检查 stale stream、persist 失败等健康告警。
+17. 用 `zippy gateway run --uri default --endpoint 127.0.0.1:17666` 或
+    `08_remote_gateway/01_start_gateway_server.py` 在 WSL/Linux 侧启动 GatewayServer。
+18. 用 `08_remote_gateway/02_remote_writer.py` 模拟 Windows 侧行情源逐行写入。
+19. 用 `08_remote_gateway/03_remote_subscribe_and_query.py` 模拟 Windows 侧策略订阅和主动查询。
+20. 用 `zippy gateway smoke --master-uri tcp://127.0.0.1:28690 --gateway-endpoint 127.0.0.1:28666`
+    跑跨进程远端写入和查询 smoke。
+21. 在 Windows 侧用
+    `zippy gateway smoke-client --uri zippy://<wsl-host>:17690/default --stream windows_smoke_ticks`
+    验证只作为远端客户端访问 WSL/Linux Gateway 的路径。完整联调步骤见
+    `docs/remote_gateway_windows_smoke_runbook.md`。
 
 ## API 分层
 
@@ -83,6 +95,9 @@ uv run zippy stream ls --uri default
   生成 compacted parquet，并替换 master 中的 persisted metadata。
 - `zp.ops.compact_tables(...)` / `zp.ops.start_compaction_worker(...)`：批量或后台执行
   低频 compaction；该类运维任务不属于写入热路径。
+- `zp.GatewayServer(...)`：跨平台远端数据面服务，通常运行在 WSL/Linux 侧，由 master
+  config 暴露 endpoint/token；Windows 侧继续使用 `connect()`、`get_writer()`、
+  `subscribe_table()` 和 `read_table()`，不需要直接接触 mmap/segment。
 
 `ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、
 `SegmentStreamSource` 等底层对象仍然可以使用；StreamTable 物化器保留在内部层，

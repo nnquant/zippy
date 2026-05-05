@@ -16,6 +16,8 @@ const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%
 pub struct ZippyConfig {
     pub log: ZippyLogConfig,
     pub table: ZippyTableConfig,
+    #[serde(default)]
+    pub remote_gateway: ZippyRemoteGatewayConfig,
 }
 
 /// Logging defaults shared by master and Python clients.
@@ -49,10 +51,31 @@ pub struct ZippyTablePersistPartitionConfig {
     pub dt_part: Option<String>,
 }
 
+/// GatewayServer capability advertised by master for cross-platform data access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyRemoteGatewayConfig {
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub token: Option<String>,
+    pub protocol_version: u16,
+}
+
+impl Default for ZippyRemoteGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            token: None,
+            protocol_version: 1,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct PartialZippyConfig {
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
+    remote_gateway: Option<PartialRemoteGatewayConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +105,14 @@ struct PartialTablePersistPartitionConfig {
     dt_part: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PartialRemoteGatewayConfig {
+    enabled: Option<bool>,
+    endpoint: Option<String>,
+    token: Option<String>,
+    protocol_version: Option<u16>,
+}
+
 impl Default for ZippyConfig {
     fn default() -> Self {
         Self {
@@ -102,6 +133,7 @@ impl Default for ZippyConfig {
                     },
                 },
             },
+            remote_gateway: ZippyRemoteGatewayConfig::default(),
         }
     }
 }
@@ -176,6 +208,21 @@ impl ZippyConfig {
                 }
             }
         }
+        if let Some(remote_gateway) = partial.remote_gateway {
+            if let Some(enabled) = remote_gateway.enabled {
+                self.remote_gateway.enabled = enabled;
+            }
+            if let Some(endpoint) = remote_gateway.endpoint {
+                self.remote_gateway.endpoint =
+                    Some(non_empty(endpoint, "remote_gateway.endpoint")?);
+            }
+            if let Some(token) = remote_gateway.token {
+                self.remote_gateway.token = Some(non_empty(token, "remote_gateway.token")?);
+            }
+            if let Some(protocol_version) = remote_gateway.protocol_version {
+                self.remote_gateway.protocol_version = protocol_version;
+            }
+        }
         Ok(())
     }
 
@@ -231,6 +278,27 @@ impl ZippyConfig {
             self.table.persist.partition.dt_part =
                 Some(non_empty(dt_part, "ZIPPY_TABLE_PERSIST_PARTITION_DT_PART")?);
         }
+        if let Some(value) = env_string("ZIPPY_REMOTE_GATEWAY") {
+            self.remote_gateway.enabled = parse_bool_env("ZIPPY_REMOTE_GATEWAY", &value)?;
+        }
+        if let Some(endpoint) = env_string("ZIPPY_REMOTE_GATEWAY_ENDPOINT") {
+            self.remote_gateway.endpoint =
+                Some(non_empty(endpoint, "ZIPPY_REMOTE_GATEWAY_ENDPOINT")?);
+        }
+        if let Some(token) = env_string("ZIPPY_REMOTE_GATEWAY_TOKEN") {
+            self.remote_gateway.token = Some(non_empty(token, "ZIPPY_REMOTE_GATEWAY_TOKEN")?);
+        }
+        if let Some(value) = env_string("ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION") {
+            self.remote_gateway.protocol_version =
+                value
+                    .parse::<u16>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                        "env var must parse as u16 name=[ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION] error=[{}]",
+                        error
+                    ),
+                    })?;
+        }
         Ok(())
     }
 
@@ -254,6 +322,7 @@ impl ZippyConfig {
             });
         }
         validate_persist_partition(&self.table.persist.partition)?;
+        validate_remote_gateway(&self.remote_gateway)?;
         Ok(())
     }
 }
@@ -318,6 +387,25 @@ fn validate_persist_partition(partition: &ZippyTablePersistPartitionConfig) -> R
                     dt_part
                 ),
             });
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_gateway(remote_gateway: &ZippyRemoteGatewayConfig) -> Result<()> {
+    if remote_gateway.protocol_version == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: "remote_gateway protocol_version must be greater than zero".to_string(),
+        });
+    }
+    if remote_gateway.enabled {
+        match &remote_gateway.endpoint {
+            Some(endpoint) if !endpoint.trim().is_empty() => {}
+            _ => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "remote_gateway endpoint must be set when enabled".to_string(),
+                });
+            }
         }
     }
     Ok(())

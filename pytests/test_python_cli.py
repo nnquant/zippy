@@ -54,7 +54,157 @@ def test_cli_root_help() -> None:
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
     assert "master" in result.output
+    assert "gateway" in result.output
     assert "stream" in result.output
+
+
+def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeGatewayServer:
+        def __init__(
+            self,
+            *,
+            endpoint: str,
+            master,
+            token: str | None = None,
+            max_write_rows: int | None = None,
+        ) -> None:
+            events.append(("init", (endpoint, master, token, max_write_rows)))
+            self.endpoint = endpoint
+
+        def start(self):
+            events.append(("start", self.endpoint))
+            return self
+
+        def stop(self) -> None:
+            events.append(("stop", self.endpoint))
+
+        def metrics(self) -> dict[str, object]:
+            return {"endpoint": self.endpoint, "requests_total": 0}
+
+    def fake_connect(uri: str, app: str):
+        events.append(("connect", (uri, app)))
+        return "fake-master"
+
+    monkeypatch.setattr(zippy, "connect", fake_connect)
+    monkeypatch.setattr(zippy, "GatewayServer", FakeGatewayServer)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "run",
+            "--uri",
+            "default",
+            "--endpoint",
+            "127.0.0.1:17666",
+            "--token",
+            "dev-token",
+            "--max-write-rows",
+            "1024",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        ("connect", ("default", "gateway_server")),
+        ("init", ("127.0.0.1:17666", "fake-master", "dev-token", 1024)),
+        ("start", "127.0.0.1:17666"),
+        ("stop", "127.0.0.1:17666"),
+    ]
+    assert "gateway started endpoint=[127.0.0.1:17666]" in result.output
+
+
+def test_gateway_smoke_runs_cross_process_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    def fake_smoke(
+        *,
+        master_uri: str,
+        gateway_endpoint: str,
+        token: str | None,
+        stream_name: str,
+        timeout_sec: float,
+    ) -> dict[str, object]:
+        events.append(
+            (
+                "smoke",
+                (master_uri, gateway_endpoint, token, stream_name, timeout_sec),
+            )
+        )
+        return {"stream_name": stream_name, "rows": 1, "gateway_endpoint": gateway_endpoint}
+
+    monkeypatch.setattr("zippy.cli_gateway.run_gateway_smoke", fake_smoke)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "smoke",
+            "--master-uri",
+            "tcp://127.0.0.1:17690",
+            "--gateway-endpoint",
+            "127.0.0.1:17666",
+            "--token",
+            "dev-token",
+            "--stream",
+            "remote_smoke_ticks",
+            "--timeout-sec",
+            "7.5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        (
+            "smoke",
+            (
+                "tcp://127.0.0.1:17690",
+                "127.0.0.1:17666",
+                "dev-token",
+                "remote_smoke_ticks",
+                7.5,
+            ),
+        )
+    ]
+    assert "remote_smoke_ticks" in result.output
+
+
+def test_gateway_smoke_client_uses_existing_remote_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    def fake_client_smoke(
+        *,
+        uri: str,
+        stream_name: str,
+    ) -> dict[str, object]:
+        events.append(("client", (uri, stream_name)))
+        return {"stream_name": stream_name, "rows": 1}
+
+    monkeypatch.setattr("zippy.cli_gateway.run_gateway_smoke_client", fake_client_smoke)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "smoke-client",
+            "--uri",
+            "zippy://wsl-host:17690/default",
+            "--stream",
+            "windows_smoke_ticks",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        ("client", ("zippy://wsl-host:17690/default", "windows_smoke_ticks")),
+    ]
+    assert "windows_smoke_ticks" in result.output
 
 
 def test_master_run_returns_click_error_when_server_start_fails(monkeypatch: pytest.MonkeyPatch) -> None:

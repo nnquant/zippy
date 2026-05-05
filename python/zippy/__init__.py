@@ -4,6 +4,8 @@ from collections import Counter
 import hashlib
 import json
 import os
+import socket
+import struct
 import tempfile
 import threading
 import time
@@ -58,6 +60,7 @@ from ._internal import setup_log
 from ._internal import version
 
 DEFAULT_MASTER_URI = "zippy://default"
+DEFAULT_REMOTE_GATEWAY_PORT = 17666
 _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC = 3.0
 _DEFAULT_HEARTBEAT_INTERVAL_SEC = _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC
 _DEFAULT_MASTER: MasterClient | None = None
@@ -82,6 +85,12 @@ _BUILTIN_CONFIG: dict[str, object] = {
                 "dt_part": None,
             },
         },
+    },
+    "remote_gateway": {
+        "enabled": False,
+        "endpoint": None,
+        "token": None,
+        "protocol_version": 1,
     },
 }
 
@@ -395,6 +404,151 @@ def _combine_query_predicates(left: object | None, right: object | None) -> obje
     return _literal(left) & _literal(right)
 
 
+def _query_expr_to_json(expr: object) -> dict[str, object]:
+    if isinstance(expr, str):
+        return {"kind": "col", "value": expr}
+    if not isinstance(expr, _QueryExpr):
+        return {"kind": "literal", "value": expr}
+    if expr._kind == "col":
+        return {"kind": "col", "value": expr._value}
+    if expr._kind == "literal":
+        return {"kind": "literal", "value": expr._value}
+    if expr._kind == "alias":
+        return {
+            "kind": "alias",
+            "value": expr._value,
+            "arg": _query_expr_to_json(expr._args[0]),
+        }
+    if expr._kind == "is_in":
+        return {
+            "kind": "is_in",
+            "args": [
+                _query_expr_to_json(expr._args[0]),
+                _query_expr_to_json(_literal(list(expr._args[1]))),
+            ],
+        }
+    if expr._kind in {"is_null", "is_not_null"}:
+        return {
+            "kind": expr._kind,
+            "arg": _query_expr_to_json(expr._args[0]),
+        }
+    if expr._kind == "is_between":
+        return {
+            "kind": "is_between",
+            "args": [_query_expr_to_json(arg) for arg in expr._args],
+        }
+    if expr._kind == "unary":
+        return {
+            "kind": "unary",
+            "op": expr._value,
+            "arg": _query_expr_to_json(expr._args[0]),
+        }
+    if expr._kind == "binary":
+        return {
+            "kind": "binary",
+            "op": expr._value,
+            "args": [_query_expr_to_json(arg) for arg in expr._args],
+        }
+    raise ValueError(f"unsupported query expression kind=[{expr._kind}]")
+
+
+def _query_expr_from_json(payload: dict[str, object]) -> object:
+    kind = str(payload["kind"])
+    if kind == "col":
+        return col(str(payload["value"]))
+    if kind == "literal":
+        return lit(payload.get("value"))
+    if kind == "alias":
+        return _literal(_query_expr_from_json(payload["arg"])).alias(str(payload["value"]))
+    if kind == "is_in":
+        args = payload["args"]
+        return _literal(_query_expr_from_json(args[0])).is_in(
+            _query_expr_from_json(args[1])._value
+        )
+    if kind == "is_null":
+        return _literal(_query_expr_from_json(payload["arg"])).is_null()
+    if kind == "is_not_null":
+        return _literal(_query_expr_from_json(payload["arg"])).is_not_null()
+    if kind == "is_between":
+        args = payload["args"]
+        return _literal(_query_expr_from_json(args[0])).is_between(
+            _query_expr_from_json(args[1])._value,
+            _query_expr_from_json(args[2])._value,
+        )
+    if kind == "unary":
+        value = _literal(_query_expr_from_json(payload["arg"]))
+        op = str(payload["op"])
+        if op == "not":
+            return ~value
+        if op == "neg":
+            return -value
+        raise ValueError(f"unsupported remote query unary op=[{op}]")
+    if kind == "binary":
+        left, right = [_literal(_query_expr_from_json(arg)) for arg in payload["args"]]
+        op = str(payload["op"])
+        if op == "eq":
+            return left == right
+        if op == "ne":
+            return left != right
+        if op == "gt":
+            return left > right
+        if op == "ge":
+            return left >= right
+        if op == "lt":
+            return left < right
+        if op == "le":
+            return left <= right
+        if op == "and":
+            return left & right
+        if op == "or":
+            return left | right
+        if op == "add":
+            return left + right
+        if op == "sub":
+            return left - right
+        if op == "mul":
+            return left * right
+        if op == "div":
+            return left / right
+        raise ValueError(f"unsupported remote query binary op=[{op}]")
+    raise ValueError(f"unsupported remote query expression kind=[{kind}]")
+
+
+def _query_plan_to_json(plan_ops: list[tuple[str, object]]) -> list[dict[str, object]]:
+    plan: list[dict[str, object]] = []
+    for kind, value in plan_ops:
+        if kind == "filter":
+            plan.append({"op": "filter", "expr": _query_expr_to_json(value)})
+        elif kind == "select":
+            plan.append({"op": "select", "exprs": [_query_expr_to_json(expr) for expr in value]})
+        elif kind == "with_columns":
+            plan.append(
+                {
+                    "op": "with_columns",
+                    "exprs": [_query_expr_to_json(expr) for expr in value],
+                }
+            )
+        elif kind == "join":
+            raise ValueError("remote query join is not supported in this gateway version")
+        else:
+            raise ValueError(f"unsupported table plan operation=[{kind}]")
+    return plan
+
+
+def _apply_query_plan_json(table: "Table", plan: list[dict[str, object]]) -> "Table":
+    for item in plan:
+        op = str(item["op"])
+        if op == "filter":
+            table = table.filter(_query_expr_from_json(item["expr"]))
+        elif op == "select":
+            table = table.select([_query_expr_from_json(expr) for expr in item["exprs"]])
+        elif op == "with_columns":
+            table = table.with_columns([_query_expr_from_json(expr) for expr in item["exprs"]])
+        else:
+            raise ValueError(f"unsupported remote query plan op=[{op}]")
+    return table
+
+
 class _HeartbeatHandle:
     def __init__(self, master: MasterClient, interval_sec: float) -> None:
         self.master = master
@@ -451,13 +605,14 @@ def connect(
         >>> zippy.read_table("ctp_ticks").tail(1000)
     """
     interval_sec = _validate_heartbeat_interval(heartbeat_interval_sec)
-    endpoint = _resolve_uri(
+    raw_uri = (
         uri
         or os.environ.get("ZIPPY_MASTER_URI")
         or os.environ.get("ZIPPY_MASTER_ENDPOINT")
         or os.environ.get("ZIPPY_CONTROL_ENDPOINT")
         or DEFAULT_MASTER_URI
     )
+    endpoint = _resolve_uri(raw_uri)
     client = MasterClient(control_endpoint=endpoint)
     heartbeat = None
     try:
@@ -1404,8 +1559,16 @@ def _master_uri_for_error(master: MasterClient) -> str:
 
 
 def _resolve_uri(uri: str) -> str:
+    if uri.startswith("zippy+tcp://"):
+        raise ValueError(
+            "zippy+tcp:// uri is no longer supported; use "
+            "zippy://host:port/profile to connect to a remote master"
+        )
     if uri.startswith("tcp://"):
         return uri
+    remote_master_endpoint = _remote_master_endpoint_from_zippy_uri(uri)
+    if remote_master_endpoint is not None:
+        return f"tcp://{remote_master_endpoint}"
     if os.name == "nt" and not _looks_like_uri_path(uri):
         if uri.startswith("zippy://"):
             return uri
@@ -1422,6 +1585,10 @@ def _resolve_uri(uri: str) -> str:
 
 
 def _resolve_uri_path(uri: str) -> str:
+    if uri.startswith("~/"):
+        return str(_home_dir() / uri[2:])
+    if uri.startswith("~\\"):
+        return str(_home_dir()) + "\\" + uri[2:]
     return str(Path(uri).expanduser())
 
 
@@ -1604,6 +1771,874 @@ def _reset_default_master_for_test() -> None:
     _DEFAULT_MASTER = None
 
 
+_REMOTE_FRAME_HEADER = struct.Struct("!IQ")
+
+
+def _normalize_remote_endpoint(endpoint: str) -> str:
+    value = str(endpoint)
+    if value.startswith("tcp://"):
+        value = value.removeprefix("tcp://")
+    if "/" in value:
+        value = value.split("/", 1)[0]
+    return value
+
+
+def _remote_master_endpoint_from_zippy_uri(uri: str) -> str | None:
+    if not uri.startswith("zippy://"):
+        return None
+    body = uri.removeprefix("zippy://")
+    authority = body.split("/", 1)[0]
+    if not authority or ":" not in authority:
+        return None
+    return authority
+
+
+def _remote_gateway_endpoint(master: object) -> str | None:
+    endpoint = getattr(master, "remote_gateway_endpoint", None)
+    if callable(endpoint):
+        value = endpoint()
+        return _normalize_remote_endpoint(value) if value else None
+    value = getattr(master, "remote_gateway_endpoint", None)
+    if isinstance(value, str):
+        return _normalize_remote_endpoint(value)
+    get_config = getattr(master, "get_config", None)
+    if callable(get_config):
+        remote = get_config().get("remote_gateway", {})
+        if isinstance(remote, dict) and remote.get("enabled") is False:
+            return None
+        if isinstance(remote, dict) and remote.get("endpoint"):
+            return _normalize_remote_endpoint(str(remote["endpoint"]))
+    return None
+
+
+def _remote_gateway_token(master: object) -> str | None:
+    token = getattr(master, "remote_gateway_token", None)
+    if callable(token):
+        value = token()
+        return str(value) if value else None
+    value = getattr(master, "remote_gateway_token", None)
+    if isinstance(value, str):
+        return value
+    get_config = getattr(master, "get_config", None)
+    if callable(get_config):
+        remote = get_config().get("remote_gateway", {})
+        if isinstance(remote, dict) and remote.get("token"):
+            return str(remote["token"])
+    return None
+
+
+def _is_remote_master(master: object) -> bool:
+    return _remote_gateway_endpoint(master) is not None
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise RuntimeError("remote gateway connection closed while reading frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _send_remote_frame(
+    sock: socket.socket,
+    header: dict[str, object],
+    payload: bytes = b"",
+) -> None:
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    sock.sendall(_REMOTE_FRAME_HEADER.pack(len(header_bytes), len(payload)))
+    sock.sendall(header_bytes)
+    if payload:
+        sock.sendall(payload)
+
+
+def _recv_remote_frame(sock: socket.socket) -> tuple[dict[str, object], bytes]:
+    prefix = _recv_exact(sock, _REMOTE_FRAME_HEADER.size)
+    header_len, payload_len = _REMOTE_FRAME_HEADER.unpack(prefix)
+    header = json.loads(_recv_exact(sock, header_len).decode("utf-8"))
+    payload = _recv_exact(sock, payload_len) if payload_len else b""
+    return header, payload
+
+
+def _remote_request(
+    endpoint: str,
+    header: dict[str, object],
+    payload: bytes = b"",
+    *,
+    token: str | None = None,
+    timeout_sec: float = 5.0,
+) -> tuple[dict[str, object], bytes]:
+    host, port = _parse_remote_endpoint(endpoint)
+    if token is not None:
+        header = dict(header)
+        header["token"] = token
+    with socket.create_connection((host, port), timeout=timeout_sec) as sock:
+        _send_remote_frame(sock, header, payload)
+        response, response_payload = _recv_remote_frame(sock)
+    if response.get("status") != "ok":
+        reason = response.get("reason", "unknown remote gateway error")
+        raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
+    return response, response_payload
+
+
+def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
+    normalized = _normalize_remote_endpoint(endpoint)
+    host, port_text = normalized.rsplit(":", 1)
+    return host, int(port_text)
+
+
+def _pyarrow_table_to_ipc(table: object) -> bytes:
+    import pyarrow as pa
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue().to_pybytes()
+
+
+def _pyarrow_table_from_ipc(payload: bytes):
+    import pyarrow as pa
+
+    return pa.ipc.open_stream(pa.py_buffer(payload)).read_all()
+
+
+def _pyarrow_schema_to_ipc(schema: object) -> bytes:
+    import pyarrow as pa
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, schema):
+        pass
+    return sink.getvalue().to_pybytes()
+
+
+def _pyarrow_schema_from_ipc(payload: bytes):
+    import pyarrow as pa
+
+    return pa.ipc.open_stream(pa.py_buffer(payload)).schema
+
+
+def _is_scalar_row_dict(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return not any(isinstance(item, (list, tuple)) for item in value.values())
+
+
+def _value_to_pyarrow_table(value: object, schema: object | None = None):
+    import pyarrow as pa
+
+    if isinstance(value, pa.Table):
+        return value.cast(schema) if schema is not None and value.schema != schema else value
+    if isinstance(value, pa.RecordBatch):
+        table = pa.Table.from_batches([value])
+        return table.cast(schema) if schema is not None else table
+    if isinstance(value, dict):
+        if _is_scalar_row_dict(value):
+            return pa.Table.from_pylist([value], schema=schema)
+        return pa.table(value, schema=schema)
+    if isinstance(value, list):
+        return pa.Table.from_pylist(value, schema=schema)
+    to_arrow = getattr(value, "to_arrow", None)
+    if callable(to_arrow):
+        return _value_to_pyarrow_table(to_arrow(), schema)
+    raise TypeError(
+        "writer value must be a row dict, list[dict], pyarrow.Table, or pyarrow.RecordBatch"
+    )
+
+
+class RemoteMasterClient:
+    """
+    Lightweight remote master facade backed by a Zippy GatewayServer endpoint.
+    """
+
+    def __init__(self, endpoint: str, *, token: str | None = None) -> None:
+        self._endpoint = _normalize_remote_endpoint(endpoint)
+        self._token = token
+        self._process_id: str | None = None
+
+    def remote_gateway_endpoint(self) -> str:
+        return self._endpoint
+
+    def remote_gateway_token(self) -> str | None:
+        return self._token
+
+    def control_endpoint(self) -> str:
+        return f"zippy://{self._endpoint}/default"
+
+    def process_id(self) -> str | None:
+        return self._process_id
+
+    def register_process(self, app: str) -> str:
+        self._process_id = f"remote.{app}"
+        return self._process_id
+
+    def heartbeat(self) -> None:
+        return None
+
+    def list_streams(self) -> list[dict[str, object]]:
+        response, _ = _remote_request(
+            self._endpoint,
+            {"kind": "list_streams"},
+            token=self._token,
+        )
+        return list(response.get("streams", []))
+
+    def get_stream(self, source: str) -> dict[str, object]:
+        response, _ = _remote_request(
+            self._endpoint,
+            {"kind": "get_stream", "source": str(source)},
+            token=self._token,
+        )
+        return dict(response.get("stream", {}))
+
+    def get_stream_schema(self, source: str):
+        _, payload = _remote_request(
+            self._endpoint,
+            {"kind": "get_stream", "source": str(source)},
+            token=self._token,
+        )
+        return _pyarrow_schema_from_ipc(payload)
+
+    def get_config(self) -> dict[str, object]:
+        return {
+            "remote_gateway": {
+                "enabled": True,
+                "endpoint": self._endpoint,
+                "token": self._token,
+                "protocol_version": 1,
+            }
+        }
+
+    def gateway_metrics(self) -> dict[str, object]:
+        response, _ = _remote_request(
+            self._endpoint,
+            {"kind": "metrics"},
+            token=self._token,
+        )
+        return dict(response.get("metrics", {}))
+
+    def collect(
+        self,
+        source: str,
+        plan: list[dict[str, object]],
+        *,
+        snapshot: bool = True,
+    ):
+        _, payload = _remote_request(
+            self._endpoint,
+            {
+                "kind": "collect",
+                "source": str(source),
+                "plan": plan,
+                "snapshot": bool(snapshot),
+            },
+            token=self._token,
+        )
+        return _pyarrow_table_from_ipc(payload)
+
+
+class _RemoteQuery:
+    def __init__(
+        self,
+        source: str,
+        master: object,
+        *,
+        endpoint: str | None = None,
+        token: str | None = None,
+    ) -> None:
+        self.source = source
+        self.master = master
+        self.endpoint = endpoint or _remote_gateway_endpoint(master)
+        self.token = token if token is not None else _remote_gateway_token(master)
+        if self.endpoint is None:
+            raise RuntimeError(f"remote gateway endpoint missing source=[{source}]")
+
+    def schema(self):
+        get_stream_schema = getattr(self.master, "get_stream_schema", None)
+        if callable(get_stream_schema):
+            return get_stream_schema(self.source)
+        _, payload = _remote_request(
+            self.endpoint,
+            {"kind": "get_stream", "source": self.source},
+            token=self.token,
+        )
+        return _pyarrow_schema_from_ipc(payload)
+
+    def stream_info(self) -> dict[str, object]:
+        get_stream = getattr(self.master, "get_stream", None)
+        if callable(get_stream):
+            return get_stream(self.source)
+        response, _ = _remote_request(
+            self.endpoint,
+            {"kind": "get_stream", "source": self.source},
+            token=self.token,
+        )
+        return dict(response.get("stream", {}))
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "stream_name": self.source,
+            "data_path": "remote_gateway",
+            "remote_gateway_endpoint": self.endpoint,
+        }
+
+    def tail(self, n: int):
+        table = self.collect_plan([], snapshot=True)
+        if n == 0:
+            return table.slice(0, 0)
+        return table.slice(max(0, table.num_rows - n), n)
+
+    def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool):
+        _, payload = _remote_request(
+            self.endpoint,
+            {
+                "kind": "collect",
+                "source": str(self.source),
+                "plan": plan,
+                "snapshot": bool(snapshot),
+            },
+            token=self.token,
+        )
+        return _pyarrow_table_from_ipc(payload)
+
+
+class RemoteGatewayWriter:
+    """
+    Remote writer that accepts row writes and sends Arrow IPC batches to a gateway.
+    """
+
+    def __init__(
+        self,
+        stream_name: str,
+        *,
+        endpoint: str,
+        schema=None,
+        batch_size: int = 1024,
+        flush_interval_ms: int | None = 5,
+        token: str | None = None,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.stream_name = str(stream_name)
+        self.endpoint = _normalize_remote_endpoint(endpoint)
+        self.schema = schema
+        self.batch_size = int(batch_size)
+        self.flush_interval_ms = flush_interval_ms
+        self.token = token
+        self._rows: list[dict[str, object]] = []
+        self._last_flush_ns = time.perf_counter_ns()
+        self._closed = False
+
+    def write(self, value: object) -> None:
+        if self._closed:
+            raise RuntimeError("remote writer is closed")
+        if _is_scalar_row_dict(value):
+            self._rows.append(dict(value))
+            if len(self._rows) >= self.batch_size or self._flush_interval_elapsed():
+                self.flush()
+            return
+        self.flush()
+        self._send_table(_value_to_pyarrow_table(value, self.schema))
+
+    def flush(self) -> None:
+        if not self._rows:
+            return
+        table = _value_to_pyarrow_table(list(self._rows), self.schema)
+        self._rows = []
+        self._send_table(table)
+        self._last_flush_ns = time.perf_counter_ns()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.flush()
+        self._closed = True
+
+    def _flush_interval_elapsed(self) -> bool:
+        if self.flush_interval_ms is None:
+            return False
+        elapsed_ns = time.perf_counter_ns() - self._last_flush_ns
+        return elapsed_ns >= int(self.flush_interval_ms) * 1_000_000
+
+    def _send_table(self, table: object) -> None:
+        _remote_request(
+            self.endpoint,
+            {
+                "kind": "write_batch",
+                "stream_name": self.stream_name,
+                "rows": int(table.num_rows),
+            },
+            _pyarrow_table_to_ipc(table),
+            token=self.token,
+        )
+
+
+class RemoteStreamSubscriber:
+    """
+    Remote subscriber backed by a persistent GatewayServer table stream.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        *,
+        endpoint: str,
+        callback,
+        table_callback: bool = False,
+        filter: object | None = None,
+        batch_size: int | None = None,
+        throttle_ms: int | None = None,
+        count: int | None = None,
+        token: str | None = None,
+        reconnect: bool = True,
+        reconnect_interval_ms: int = 100,
+    ) -> None:
+        self.source = str(source)
+        self.endpoint = _normalize_remote_endpoint(endpoint)
+        self.callback = callback
+        self.table_callback = bool(table_callback)
+        self.filter = filter
+        self.batch_size = batch_size
+        self.throttle_ms = throttle_ms
+        self.count = count
+        self.token = token
+        self.reconnect = bool(reconnect)
+        if reconnect_interval_ms <= 0:
+            raise ValueError("reconnect_interval_ms must be positive")
+        self.reconnect_interval_ms = int(reconnect_interval_ms)
+        self._stop_event = threading.Event()
+        self._socket: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+        self._reconnects_total = 0
+
+    def start(self) -> "RemoteStreamSubscriber":
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"zippy-remote-subscriber-{self.source}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._socket is not None:
+            try:
+                self._socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._error is not None:
+            raise self._error
+
+    def join(self) -> None:
+        if self._thread is not None:
+            self._thread.join()
+        if self._error is not None:
+            raise self._error
+
+    def metrics(self) -> dict[str, object]:
+        return {
+            "source": self.source,
+            "remote_gateway_endpoint": self.endpoint,
+            "running": self._thread is not None and self._thread.is_alive(),
+            "reconnects_total": self._reconnects_total,
+        }
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._run_once()
+                return
+            except OSError:
+                if self._stop_event.is_set():
+                    return
+                if not self.reconnect:
+                    self._error = RuntimeError("remote subscriber connection closed")
+                    return
+                self._reconnects_total += 1
+                self._stop_event.wait(self.reconnect_interval_ms / 1000.0)
+            except RuntimeError as error:
+                if self._is_retryable_runtime_error(error):
+                    if self._stop_event.is_set():
+                        return
+                    if not self.reconnect:
+                        self._error = error
+                        return
+                    self._reconnects_total += 1
+                    self._stop_event.wait(self.reconnect_interval_ms / 1000.0)
+                    continue
+                if not self._stop_event.is_set():
+                    self._error = error
+                return
+            except BaseException as error:
+                if not self._stop_event.is_set():
+                    self._error = error
+                return
+
+    def _run_once(self) -> None:
+        host, port = _parse_remote_endpoint(self.endpoint)
+        with socket.create_connection((host, port), timeout=5.0) as sock:
+            self._socket = sock
+            request = {
+                "kind": "subscribe_table",
+                "source": self.source,
+                "filter": (
+                    _query_expr_to_json(self.filter) if self.filter is not None else None
+                ),
+                "batch_size": self.batch_size,
+                "throttle_ms": self.throttle_ms,
+                "count": self.count,
+            }
+            if self.token is not None:
+                request["token"] = self.token
+            _send_remote_frame(sock, request)
+            while not self._stop_event.is_set():
+                header, payload = _recv_remote_frame(sock)
+                if header.get("status") != "ok":
+                    raise RuntimeError(header.get("reason", "remote subscribe failed"))
+                if header.get("kind") == "subscribed":
+                    continue
+                if header.get("kind") != "table":
+                    continue
+                table = _pyarrow_table_from_ipc(payload)
+                if self.table_callback:
+                    self.callback(table)
+                else:
+                    for row in table.to_pylist():
+                        self.callback(Row(row))
+
+    @staticmethod
+    def _is_retryable_runtime_error(error: RuntimeError) -> bool:
+        message = str(error)
+        return "remote gateway connection closed" in message
+
+
+class _LocalGatewayWriter:
+    def __init__(self, stream_name: str, schema: object, master: MasterClient | None) -> None:
+        self._pipeline = (
+            Pipeline(f"remote_gateway.{stream_name}.{os.getpid()}", master=master)
+            .stream_table(stream_name, schema=schema)
+            .start()
+        )
+
+    def write(self, table: object) -> None:
+        self._pipeline.write(table)
+
+    def flush(self) -> None:
+        self._pipeline.flush()
+
+    def close(self) -> None:
+        self._pipeline.stop()
+
+
+class GatewayServer:
+    """
+    Minimal TCP gateway for remote writes and lazy collect requests.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "127.0.0.1:17666",
+        *,
+        master: MasterClient | None = None,
+        writer_factory=None,
+        stream_info_provider=None,
+        query_executor=None,
+        subscribe_table_provider=None,
+        token: str | None = None,
+        max_write_rows: int | None = None,
+    ) -> None:
+        self.endpoint = _normalize_remote_endpoint(endpoint)
+        self.master = master
+        self.token = token
+        if max_write_rows is not None and int(max_write_rows) <= 0:
+            raise ValueError("max_write_rows must be positive")
+        self.max_write_rows = int(max_write_rows) if max_write_rows is not None else None
+        self._writer_factory = writer_factory
+        self._stream_info_provider = stream_info_provider
+        self._query_executor = query_executor
+        self._subscribe_table_provider = subscribe_table_provider
+        self._writers: dict[str, object] = {}
+        self._stop_event = threading.Event()
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._metrics_lock = threading.Lock()
+        self._metrics: dict[str, int] = {
+            "requests_total": 0,
+            "auth_failures_total": 0,
+            "errors_total": 0,
+            "write_batches_total": 0,
+            "written_rows_total": 0,
+            "write_rejections_total": 0,
+            "collect_requests_total": 0,
+            "subscribe_clients_total": 0,
+        }
+
+    def start(self) -> "GatewayServer":
+        host, port = _parse_remote_endpoint(self.endpoint)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, port))
+        listener.listen()
+        listener.settimeout(0.1)
+        actual_host, actual_port = listener.getsockname()
+        self.endpoint = f"{actual_host}:{actual_port}"
+        self._listener = listener
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="zippy-remote-gateway",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        listener = self._listener
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        for writer in list(self._writers.values()):
+            close = getattr(writer, "close", None)
+            if callable(close):
+                close()
+        self._writers.clear()
+
+    def _serve(self) -> None:
+        assert self._listener is not None
+        while not self._stop_event.is_set():
+            try:
+                client, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._handle_client,
+                args=(client,),
+                name="zippy-remote-gateway-client",
+                daemon=True,
+            ).start()
+
+    def _handle_client(self, client: socket.socket) -> None:
+        with client:
+            try:
+                request, payload = _recv_remote_frame(client)
+                self._increment_metric("requests_total")
+                self._authorize(request)
+                if request.get("kind") == "subscribe_table":
+                    self._serve_subscribe_table(client, request)
+                    return
+                response, response_payload = self._dispatch(request, payload)
+            except Exception as error:
+                self._increment_metric("errors_total")
+                response = {"status": "error", "reason": str(error)}
+                response_payload = b""
+            try:
+                _send_remote_frame(client, response, response_payload)
+            except OSError:
+                return
+
+    def metrics(self) -> dict[str, int | str]:
+        with self._metrics_lock:
+            metrics = dict(self._metrics)
+        metrics["endpoint"] = self.endpoint
+        metrics["running"] = self._thread is not None and self._thread.is_alive()
+        return metrics
+
+    def _increment_metric(self, name: str, value: int = 1) -> None:
+        with self._metrics_lock:
+            self._metrics[name] = self._metrics.get(name, 0) + int(value)
+
+    def _authorize(self, request: dict[str, object]) -> None:
+        if self.token is None:
+            return
+        if request.get("token") == self.token:
+            return
+        self._increment_metric("auth_failures_total")
+        raise PermissionError("unauthorized remote gateway request")
+
+    def _serve_subscribe_table(
+        self,
+        client: socket.socket,
+        request: dict[str, object],
+    ) -> None:
+        source = str(request["source"])
+        self._increment_metric("subscribe_clients_total")
+        filter_payload = request.get("filter")
+        filter_expr = (
+            _query_expr_from_json(filter_payload)
+            if isinstance(filter_payload, dict)
+            else None
+        )
+        options = {
+            "filter": filter_expr,
+            "batch_size": request.get("batch_size"),
+            "throttle_ms": request.get("throttle_ms"),
+            "count": request.get("count"),
+        }
+        _send_remote_frame(client, {"status": "ok", "kind": "subscribed"})
+
+        send_lock = threading.Lock()
+
+        def send_table(table: object) -> None:
+            with send_lock:
+                _send_remote_frame(
+                    client,
+                    {"status": "ok", "kind": "table"},
+                    _pyarrow_table_to_ipc(table),
+                )
+
+        provider = self._subscribe_table_provider
+        if provider is None:
+            handle = subscribe_table(
+                source,
+                callback=send_table,
+                master=self.master,
+                filter=filter_expr,
+                batch_size=(
+                    int(options["batch_size"]) if options["batch_size"] is not None else None
+                ),
+                throttle_ms=(
+                    int(options["throttle_ms"]) if options["throttle_ms"] is not None else None
+                ),
+                count=(int(options["count"]) if options["count"] is not None else None),
+            )
+        else:
+            handle = provider(source, send_table, options)
+
+        try:
+            while not self._stop_event.wait(0.1):
+                try:
+                    client.send(b"")
+                except OSError:
+                    break
+        finally:
+            stop = getattr(handle, "stop", None)
+            if callable(stop):
+                stop()
+
+    def _dispatch(
+        self,
+        request: dict[str, object],
+        payload: bytes,
+    ) -> tuple[dict[str, object], bytes]:
+        kind = str(request.get("kind"))
+        if kind == "write_batch":
+            stream_name = str(request["stream_name"])
+            table = _pyarrow_table_from_ipc(payload)
+            if self.max_write_rows is not None and table.num_rows > self.max_write_rows:
+                self._increment_metric("write_rejections_total")
+                raise RuntimeError(
+                    "write batch row count exceeds limit "
+                    f"rows=[{table.num_rows}] max_write_rows=[{self.max_write_rows}]"
+                )
+            writer = self._writer_for(stream_name, table.schema)
+            writer.write(table)
+            flush = getattr(writer, "flush", None)
+            if callable(flush):
+                flush()
+            self._increment_metric("write_batches_total")
+            self._increment_metric("written_rows_total", int(table.num_rows))
+            return {"status": "ok"}, b""
+        if kind == "list_streams":
+            streams = self.master.list_streams() if self.master is not None else []
+            return {"status": "ok", "streams": streams}, b""
+        if kind == "get_stream":
+            info, schema = self._stream_info(str(request["source"]))
+            return {"status": "ok", "stream": info}, _pyarrow_schema_to_ipc(schema)
+        if kind == "collect":
+            self._increment_metric("collect_requests_total")
+            table = self._collect(
+                str(request["source"]),
+                list(request.get("plan", [])),
+                bool(request.get("snapshot", True)),
+            )
+            return {"status": "ok"}, _pyarrow_table_to_ipc(table)
+        if kind == "metrics":
+            return {"status": "ok", "metrics": self.metrics()}, b""
+        raise ValueError(f"unsupported remote gateway request kind=[{kind}]")
+
+    def _writer_for(self, stream_name: str, schema: object):
+        writer = self._writers.get(stream_name)
+        if writer is None:
+            factory = self._writer_factory
+            if factory is None:
+                writer = _LocalGatewayWriter(stream_name, schema, self.master)
+            else:
+                writer = factory(stream_name, schema)
+            self._writers[stream_name] = writer
+        return writer
+
+    def _stream_info(self, source: str) -> tuple[dict[str, object], object]:
+        if self._stream_info_provider is not None:
+            return self._stream_info_provider(source)
+        table = read_table(source, master=self.master, _force_local=True)
+        return table.info(), table.schema()
+
+    def _collect(
+        self,
+        source: str,
+        plan: list[dict[str, object]],
+        snapshot: bool,
+    ):
+        if self._query_executor is not None:
+            return self._query_executor(source, plan, snapshot)
+        table = read_table(source, master=self.master, snapshot=snapshot, _force_local=True)
+        return _apply_query_plan_json(table, plan).collect()
+
+
+def get_writer(
+    stream_name: str,
+    *,
+    master: MasterClient | RemoteMasterClient | None = None,
+    endpoint: str | None = None,
+    schema=None,
+    create: bool = False,
+    batch_size: int = 1024,
+    flush_interval_ms: int | None = 5,
+):
+    """
+    Return a writer for a named stream, choosing local segment or remote gateway automatically.
+    """
+    selected_master = master or _default_master()
+    remote_endpoint = endpoint or _remote_gateway_endpoint(selected_master)
+    if remote_endpoint is not None:
+        remote_token = _remote_gateway_token(selected_master)
+        if schema is None and not create:
+            try:
+                schema = selected_master.get_stream_schema(stream_name)
+            except Exception:
+                schema = None
+        return RemoteGatewayWriter(
+            stream_name,
+            endpoint=remote_endpoint,
+            schema=schema,
+            batch_size=batch_size,
+            flush_interval_ms=flush_interval_ms,
+            token=remote_token,
+        )
+
+    if schema is None:
+        if not create:
+            raise ValueError("local get_writer requires schema or create=True with schema")
+        raise ValueError("schema is required when creating a local writer")
+    return _LocalGatewayWriter(stream_name, schema, selected_master)
+
+
 class Table:
     """
     Read a named Zippy table through the default master connection.
@@ -1628,6 +2663,7 @@ class Table:
         wait: bool = False,
         timeout: float | str | None = None,
         snapshot: bool = True,
+        _force_local: bool = False,
     ) -> None:
         selected_master = master or _default_master()
         self.source = source
@@ -1635,7 +2671,15 @@ class Table:
             _ensure_master_process(selected_master, f"read_table.{source}")
             if wait:
                 _wait_for_table_ready(source, selected_master, timeout)
-            self._inner = _NativeQuery(source=source, master=selected_master)
+            if _is_remote_master(selected_master) and not _force_local:
+                self._inner = _RemoteQuery(
+                    source=source,
+                    master=selected_master,
+                    endpoint=_remote_gateway_endpoint(selected_master),
+                    token=_remote_gateway_token(selected_master),
+                )
+            else:
+                self._inner = _NativeQuery(source=source, master=selected_master)
             self._snapshot_enabled = bool(snapshot)
             self._fixed_snapshot: dict[str, object] | None = None
             self._plan_ops: list[tuple[str, object]] = []
@@ -1866,6 +2910,13 @@ class Table:
         :returns: Current query result.
         :rtype: pyarrow.Table
         """
+        remote_collect = getattr(self._inner, "collect_plan", None)
+        if callable(remote_collect):
+            return remote_collect(
+                _query_plan_to_json(self._plan_ops),
+                snapshot=self._snapshot_enabled,
+            )
+
         snapshot = self.snapshot()
         schema = self.schema()
         read_columns = self._source_read_columns(schema)
@@ -2076,6 +3127,7 @@ def read_table(
     wait: bool = False,
     timeout: float | str | None = None,
     snapshot: bool = True,
+    _force_local: bool = False,
 ) -> Table:
     """
     Open a named Zippy table.
@@ -2095,7 +3147,16 @@ def read_table(
     :returns: Table object for further operations such as ``tail``.
     :rtype: Table
     """
-    return Table(source=source, master=master, wait=wait, timeout=timeout, snapshot=snapshot)
+    kwargs = {
+        "source": source,
+        "master": master,
+        "wait": wait,
+        "timeout": timeout,
+        "snapshot": snapshot,
+    }
+    if _force_local:
+        kwargs["_force_local"] = True
+    return Table(**kwargs)
 
 
 def compare_replay(
@@ -2807,10 +3868,29 @@ def subscribe(
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
+    selected_master = master or _default_master()
+    remote_endpoint = _remote_gateway_endpoint(selected_master)
+    if remote_endpoint is not None:
+        remote_token = _remote_gateway_token(selected_master)
+        if filter is not None and instrument_ids is not None:
+            raise ValueError("filter and instrument_ids cannot be used together")
+        remote_filter = filter
+        if remote_filter is None and instrument_ids is not None:
+            values = [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
+            remote_filter = col("instrument_id").is_in(values)
+        return RemoteStreamSubscriber(
+            source,
+            endpoint=remote_endpoint,
+            callback=callback,
+            table_callback=False,
+            filter=remote_filter,
+            token=remote_token,
+        ).start()
+
     subscriber_kwargs = {
         "source": source,
         "callback": callback,
-        "master": master,
+        "master": selected_master,
         "poll_interval_ms": poll_interval_ms,
         "xfast": xfast,
         "idle_spin_checks": idle_spin_checks,
@@ -2873,10 +3953,26 @@ def subscribe_table(
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
+    selected_master = master or _default_master()
+    remote_endpoint = _remote_gateway_endpoint(selected_master)
+    if remote_endpoint is not None:
+        remote_token = _remote_gateway_token(selected_master)
+        return RemoteStreamSubscriber(
+            source,
+            endpoint=remote_endpoint,
+            callback=callback,
+            table_callback=True,
+            filter=filter,
+            batch_size=batch_size,
+            throttle_ms=throttle_ms,
+            count=count,
+            token=remote_token,
+        ).start()
+
     subscriber_kwargs = {
         "source": source,
         "callback": callback,
-        "master": master,
+        "master": selected_master,
         "poll_interval_ms": poll_interval_ms,
         "xfast": xfast,
         "idle_spin_checks": idle_spin_checks,
@@ -4889,6 +5985,7 @@ __all__ = [
     "CrossSectionalEngine",
     "Duration",
     "ExpressionFactor",
+    "GatewayServer",
     "LateDataPolicy",
     "LogSpec",
     "MasterClient",
@@ -4907,6 +6004,9 @@ __all__ = [
     "Pipeline",
     "ReactiveLatestEngine",
     "ReactiveStateEngine",
+    "RemoteGatewayWriter",
+    "RemoteMasterClient",
+    "RemoteStreamSubscriber",
     "Row",
     "Session",
     "SourceMode",
@@ -4951,6 +6051,7 @@ __all__ = [
     "compare_replay",
     "config",
     "connect",
+    "get_writer",
     "lit",
     "log_info",
     "master",

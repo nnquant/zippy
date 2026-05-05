@@ -12,6 +12,22 @@ def test_resolve_uri_passes_through_tcp_endpoint() -> None:
     assert zippy._resolve_uri("tcp://127.0.0.1:17690") == "tcp://127.0.0.1:17690"
 
 
+def test_resolve_uri_maps_remote_zippy_uri_to_tcp_master_endpoint() -> None:
+    assert (
+        zippy._resolve_uri("zippy://127.0.0.1:17690/default")
+        == "tcp://127.0.0.1:17690"
+    )
+
+
+def test_resolve_uri_rejects_legacy_remote_gateway_uri() -> None:
+    try:
+        zippy._resolve_uri("zippy+tcp://127.0.0.1:17666/default")
+    except ValueError as error:
+        assert "zippy://host:port/profile" in str(error)
+    else:
+        raise AssertionError("legacy zippy+tcp uri should be rejected")
+
+
 def test_home_dir_prefers_userprofile_when_home_is_missing(monkeypatch) -> None:
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.setenv("USERPROFILE", r"C:\Users\quant")
@@ -68,6 +84,21 @@ def test_native_master_client_roundtrips_tcp_uri() -> None:
         process_id = client.register_process("pytest_tcp")
 
         assert process_id.startswith("proc_")
+    finally:
+        server.stop()
+        server.join()
+
+
+def test_native_master_client_roundtrips_remote_zippy_uri() -> None:
+    addr = _unused_loopback_addr()
+    uri = f"zippy://{addr}/default"
+    server = zippy.MasterServer(uri=uri)
+    assert server.control_endpoint() == f"tcp://{addr}"
+    server.start()
+    try:
+        client = zippy.MasterClient(uri=uri)
+        assert client.control_endpoint() == f"tcp://{addr}"
+        assert client.register_process("pytest_remote_zippy").startswith("proc_")
     finally:
         server.stop()
         server.join()

@@ -39,12 +39,31 @@ fn resolves_explicit_tcp_endpoint() {
 }
 
 #[test]
+fn resolves_remote_zippy_uri_to_tcp_endpoint() {
+    let endpoint = resolve_control_endpoint("zippy://127.0.0.1:17777/default").unwrap();
+
+    assert_eq!(endpoint.kind(), ControlEndpointKind::Tcp);
+    assert_eq!(
+        endpoint,
+        ControlEndpoint::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 17777))
+    );
+    assert_eq!(endpoint.display_string(), "tcp://127.0.0.1:17777");
+}
+
+#[test]
 fn rejects_tcp_endpoint_without_port() {
     let error = resolve_control_endpoint("tcp://127.0.0.1").unwrap_err();
 
     assert!(error
         .to_string()
         .contains("invalid tcp control endpoint uri=[tcp://127.0.0.1]"));
+}
+
+#[test]
+fn rejects_legacy_remote_gateway_uri() {
+    let error = resolve_control_endpoint("zippy+tcp://127.0.0.1:17666/default").unwrap_err();
+
+    assert!(error.to_string().contains("zippy://host:port/profile"));
 }
 
 #[test]
