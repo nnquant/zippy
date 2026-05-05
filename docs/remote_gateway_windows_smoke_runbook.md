@@ -119,6 +119,31 @@ python examples\08_remote_gateway\04_standalone_windows_smoke_client.py `
 standalone smoke 通过后，只能说明跨平台协议和 Gateway 数据面可达；完整用户 API
 验收仍然需要安装 Windows 版 zippy 后运行 `zippy gateway smoke-client`。
 
+如果 Windows 侧暂时不能构建 native `_internal` 扩展，但可以拿到 `python/zippy`
+源码目录，也可以用 pure Python remote fallback 验证高层 API。这个模式只支持
+remote Gateway 路径，本地 segment、Engine、master server 等 native 能力会明确报错：
+
+```powershell
+$env:PYTHONPATH = "C:\path\to\zippy\python"
+$env:ZIPPY_FORCE_PURE_PYTHON = "1"
+python - <<'PY'
+import json
+import pyarrow as pa
+import zippy as zp
+
+schema = pa.schema([
+    ("instrument_id", pa.string()),
+    ("last_price", pa.float64()),
+])
+zp.connect("zippy://<wsl-host>:17690/default", app="windows_pure_remote")
+writer = zp.get_writer("windows_pure_ticks", schema=schema, batch_size=1)
+writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
+writer.close()
+table = zp.read_table("windows_pure_ticks").collect()
+print(json.dumps({"rows": table.num_rows, "data": table.to_pydict()}))
+PY
+```
+
 ## 5. Windows 侧 smoke
 
 在 Windows 原生 Python 环境中安装或切换到当前 zippy 包后运行：

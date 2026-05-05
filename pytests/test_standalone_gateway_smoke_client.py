@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import socket
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pyarrow as pa
+import zippy
 
 
 SCRIPT_PATH = (
@@ -185,3 +189,70 @@ def test_standalone_gateway_smoke_discovers_gateway_from_master_config() -> None
     assert master.requests[0] == {"GetConfig": {}}
     assert [request["kind"] for request in gateway.requests[:2]] == ["write_batch", "collect"]
     assert gateway.requests[0]["token"] == "dev-token"
+
+
+def test_pure_python_remote_zippy_client_smoke() -> None:
+    master_uri = "tcp://127.0.0.1:28990"
+    gateway_endpoint = "127.0.0.1:28966"
+    stream_name = "pure_python_remote_ticks"
+    server = zippy.MasterServer(
+        uri=master_uri,
+        config={
+            "remote_gateway": {
+                "enabled": True,
+                "endpoint": gateway_endpoint,
+                "token": "dev-token",
+                "protocol_version": 1,
+            }
+        },
+    )
+    server.start()
+    gateway = zippy.GatewayServer(
+        endpoint=gateway_endpoint,
+        master=zippy.MasterClient(uri=master_uri),
+        token="dev-token",
+    ).start()
+    child_code = f"""
+import json
+import pyarrow as pa
+import zippy as zp
+
+schema = pa.schema([
+    ("instrument_id", pa.string()),
+    ("last_price", pa.float64()),
+])
+zp.connect("zippy://127.0.0.1:28990/default", app="pure_python_remote_child")
+writer = zp.get_writer({stream_name!r}, schema=schema, batch_size=1)
+writer.write({{"instrument_id": "IF2606", "last_price": 4102.5}})
+writer.close()
+table = (
+    zp.read_table({stream_name!r})
+    .filter(zp.col("instrument_id") == "IF2606")
+    .select("instrument_id", "last_price")
+    .collect()
+)
+print(json.dumps({{"rows": table.num_rows, "data": table.to_pydict()}}, sort_keys=True))
+"""
+    try:
+        env = dict(os.environ)
+        env["ZIPPY_FORCE_PURE_PYTHON"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", child_code],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    finally:
+        gateway.stop()
+        server.stop()
+        server.join()
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["rows"] == 1
+    assert payload["data"] == {
+        "instrument_id": ["IF2606"],
+        "last_price": [4102.5],
+    }

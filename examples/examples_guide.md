@@ -67,6 +67,9 @@ uv run zippy stream ls --uri default
 22. 如果 Windows 侧还没有 zippy wheel，可先用
     `08_remote_gateway/04_standalone_windows_smoke_client.py` 验证 Windows 到 WSL/Linux
     master/Gateway 的纯 Python wire protocol。
+23. 如果 Windows 侧还不能构建 native `_internal` 扩展，但能访问 `python/zippy`
+    源码目录，可设置 `ZIPPY_FORCE_PURE_PYTHON=1` 先验证 remote-only 的
+    `connect()` / `get_writer()` / `read_table().collect()` 高层 API。
 
 ## API 分层
 

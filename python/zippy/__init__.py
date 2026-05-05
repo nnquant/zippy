@@ -11,53 +11,136 @@ import threading
 import time
 from pathlib import Path
 
-from ._internal import AbsSpec
-from ._internal import AggCountSpec
-from ._internal import AggFirstSpec
-from ._internal import AggLastSpec
-from ._internal import AggMaxSpec
-from ._internal import AggMinSpec
-from ._internal import AggSumSpec
-from ._internal import AggVwapSpec
-from ._internal import CastSpec
-from ._internal import ClipSpec
-from ._internal import CSDemeanSpec
-from ._internal import CSRankSpec
-from ._internal import CSZscoreSpec
-from ._internal import CrossSectionalEngine
-from ._internal import ExpressionFactor
-from ._internal import LogSpec
-from ._internal import MasterClient
-from ._internal import MasterServer
-from ._internal import run_master_daemon
-from ._internal import BusReader
-from ._internal import KeyValueTableMaterializer as _KeyValueTableMaterializer
-from ._internal import SegmentStreamSource
-from ._internal import BusStreamSource
-from ._internal import BusStreamTarget
-from ._internal import BusWriter
-from ._internal import NullPublisher
-from ._internal import ParquetSink
-from ._internal import Query as _NativeQuery
-from ._internal import ReactiveLatestEngine
-from ._internal import ReactiveStateEngine
-from ._internal import StreamSubscriber as _NativeStreamSubscriber
-from ._internal import StreamTableMaterializer as _StreamTableMaterializer
-from ._internal import TimeSeriesEngine
-from ._internal import TsDelaySpec
-from ._internal import TsDiffSpec
-from ._internal import TsEmaSpec
-from ._internal import TsMeanSpec
-from ._internal import TsReturnSpec
-from ._internal import TsStdSpec
-from ._internal import ZmqPublisher
-from ._internal import ZmqSource
-from ._internal import ZmqStreamPublisher
-from ._internal import ZmqSubscriber
-from ._internal import __version__
-from ._internal import log_info
-from ._internal import setup_log
-from ._internal import version
+_NATIVE_IMPORT_ERROR: BaseException | None = None
+_NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
+
+
+def _native_unavailable(name: str):
+    class _NativeUnavailable:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise RuntimeError(
+                "zippy native extension is unavailable; "
+                f"{name} requires the platform-specific zippy wheel"
+            ) from _NATIVE_IMPORT_ERROR
+
+    _NativeUnavailable.__name__ = name
+    return _NativeUnavailable
+
+
+if _NATIVE_AVAILABLE:
+    try:
+        from ._internal import AbsSpec
+        from ._internal import AggCountSpec
+        from ._internal import AggFirstSpec
+        from ._internal import AggLastSpec
+        from ._internal import AggMaxSpec
+        from ._internal import AggMinSpec
+        from ._internal import AggSumSpec
+        from ._internal import AggVwapSpec
+        from ._internal import CastSpec
+        from ._internal import ClipSpec
+        from ._internal import CSDemeanSpec
+        from ._internal import CSRankSpec
+        from ._internal import CSZscoreSpec
+        from ._internal import CrossSectionalEngine
+        from ._internal import ExpressionFactor
+        from ._internal import LogSpec
+        from ._internal import MasterClient
+        from ._internal import MasterServer
+        from ._internal import run_master_daemon
+        from ._internal import BusReader
+        from ._internal import KeyValueTableMaterializer as _KeyValueTableMaterializer
+        from ._internal import SegmentStreamSource
+        from ._internal import BusStreamSource
+        from ._internal import BusStreamTarget
+        from ._internal import BusWriter
+        from ._internal import NullPublisher
+        from ._internal import ParquetSink
+        from ._internal import Query as _NativeQuery
+        from ._internal import ReactiveLatestEngine
+        from ._internal import ReactiveStateEngine
+        from ._internal import StreamSubscriber as _NativeStreamSubscriber
+        from ._internal import StreamTableMaterializer as _StreamTableMaterializer
+        from ._internal import TimeSeriesEngine
+        from ._internal import TsDelaySpec
+        from ._internal import TsDiffSpec
+        from ._internal import TsEmaSpec
+        from ._internal import TsMeanSpec
+        from ._internal import TsReturnSpec
+        from ._internal import TsStdSpec
+        from ._internal import ZmqPublisher
+        from ._internal import ZmqSource
+        from ._internal import ZmqStreamPublisher
+        from ._internal import ZmqSubscriber
+        from ._internal import __version__
+        from ._internal import log_info
+        from ._internal import setup_log
+        from ._internal import version
+    except ImportError as error:
+        _NATIVE_AVAILABLE = False
+        _NATIVE_IMPORT_ERROR = error
+
+if not _NATIVE_AVAILABLE:
+    AbsSpec = _native_unavailable("AbsSpec")
+    AggCountSpec = _native_unavailable("AggCountSpec")
+    AggFirstSpec = _native_unavailable("AggFirstSpec")
+    AggLastSpec = _native_unavailable("AggLastSpec")
+    AggMaxSpec = _native_unavailable("AggMaxSpec")
+    AggMinSpec = _native_unavailable("AggMinSpec")
+    AggSumSpec = _native_unavailable("AggSumSpec")
+    AggVwapSpec = _native_unavailable("AggVwapSpec")
+    CastSpec = _native_unavailable("CastSpec")
+    ClipSpec = _native_unavailable("ClipSpec")
+    CSDemeanSpec = _native_unavailable("CSDemeanSpec")
+    CSRankSpec = _native_unavailable("CSRankSpec")
+    CSZscoreSpec = _native_unavailable("CSZscoreSpec")
+    CrossSectionalEngine = _native_unavailable("CrossSectionalEngine")
+    ExpressionFactor = _native_unavailable("ExpressionFactor")
+    LogSpec = _native_unavailable("LogSpec")
+    MasterClient = _native_unavailable("MasterClient")
+    MasterServer = _native_unavailable("MasterServer")
+    BusReader = _native_unavailable("BusReader")
+    _KeyValueTableMaterializer = _native_unavailable("KeyValueTableMaterializer")
+    SegmentStreamSource = _native_unavailable("SegmentStreamSource")
+    BusStreamSource = _native_unavailable("BusStreamSource")
+    BusStreamTarget = _native_unavailable("BusStreamTarget")
+    BusWriter = _native_unavailable("BusWriter")
+    NullPublisher = _native_unavailable("NullPublisher")
+    ParquetSink = _native_unavailable("ParquetSink")
+    _NativeQuery = _native_unavailable("Query")
+    ReactiveLatestEngine = _native_unavailable("ReactiveLatestEngine")
+    ReactiveStateEngine = _native_unavailable("ReactiveStateEngine")
+    _NativeStreamSubscriber = _native_unavailable("StreamSubscriber")
+    _StreamTableMaterializer = _native_unavailable("StreamTableMaterializer")
+    TimeSeriesEngine = _native_unavailable("TimeSeriesEngine")
+    TsDelaySpec = _native_unavailable("TsDelaySpec")
+    TsDiffSpec = _native_unavailable("TsDiffSpec")
+    TsEmaSpec = _native_unavailable("TsEmaSpec")
+    TsMeanSpec = _native_unavailable("TsMeanSpec")
+    TsReturnSpec = _native_unavailable("TsReturnSpec")
+    TsStdSpec = _native_unavailable("TsStdSpec")
+    ZmqPublisher = _native_unavailable("ZmqPublisher")
+    ZmqSource = _native_unavailable("ZmqSource")
+    ZmqStreamPublisher = _native_unavailable("ZmqStreamPublisher")
+    ZmqSubscriber = _native_unavailable("ZmqSubscriber")
+    __version__ = "0.1.0+pure"
+
+    def run_master_daemon(*args, **kwargs) -> None:
+        del args, kwargs
+        raise RuntimeError(
+            "zippy native extension is unavailable; run_master_daemon requires "
+            "the platform-specific zippy wheel"
+        ) from _NATIVE_IMPORT_ERROR
+
+    def log_info(*args, **kwargs) -> None:
+        del args, kwargs
+
+    def setup_log(*args, **kwargs) -> None:
+        del args, kwargs
+
+    def version() -> str:
+        return __version__
 
 DEFAULT_MASTER_URI = "zippy://default"
 DEFAULT_REMOTE_GATEWAY_PORT = 17666
@@ -613,6 +696,13 @@ def connect(
         or DEFAULT_MASTER_URI
     )
     endpoint = _resolve_uri(raw_uri)
+    remote_master_endpoint = _remote_master_endpoint_from_zippy_uri(raw_uri)
+    if remote_master_endpoint is not None and not _NATIVE_AVAILABLE:
+        client = RemoteMasterClient.from_master_endpoint(remote_master_endpoint)
+        if app is not None:
+            client.register_process(app)
+        _set_default_master(client, None, interval_sec)
+        return client
     client = MasterClient(control_endpoint=endpoint)
     heartbeat = None
     try:
@@ -1884,6 +1974,25 @@ def _remote_request(
     return response, response_payload
 
 
+def _remote_master_get_config(endpoint: str, timeout_sec: float = 5.0) -> dict[str, object]:
+    host, port = _parse_remote_endpoint(endpoint)
+    with socket.create_connection((host, port), timeout=timeout_sec) as sock:
+        sock.sendall(b'{"GetConfig":{}}\n')
+        response_line = b""
+        while not response_line.endswith(b"\n"):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response_line += chunk
+    if not response_line:
+        raise RuntimeError(f"remote master returned empty response endpoint=[{endpoint}]")
+    response = json.loads(response_line.decode("utf-8"))
+    if "Error" in response:
+        reason = response["Error"].get("reason", "remote master get_config failed")
+        raise RuntimeError(str(reason))
+    return dict(response["ConfigFetched"]["config"])
+
+
 def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
     normalized = _normalize_remote_endpoint(endpoint)
     host, port_text = normalized.rsplit(":", 1)
@@ -1953,10 +2062,41 @@ class RemoteMasterClient:
     Lightweight remote master facade backed by a Zippy GatewayServer endpoint.
     """
 
-    def __init__(self, endpoint: str, *, token: str | None = None) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        token: str | None = None,
+        master_endpoint: str | None = None,
+    ) -> None:
         self._endpoint = _normalize_remote_endpoint(endpoint)
         self._token = token
+        self._master_endpoint = (
+            _normalize_remote_endpoint(master_endpoint)
+            if master_endpoint is not None
+            else None
+        )
         self._process_id: str | None = None
+
+    @classmethod
+    def from_master_endpoint(cls, endpoint: str) -> "RemoteMasterClient":
+        """
+        Create a remote client by reading Gateway capability from a TCP master.
+
+        :param endpoint: Remote master endpoint without the ``zippy://`` prefix.
+        :type endpoint: str
+        :returns: Remote master facade backed by the advertised GatewayServer.
+        :rtype: RemoteMasterClient
+        """
+        config = _remote_master_get_config(endpoint)
+        remote = config.get("remote_gateway", {})
+        if not isinstance(remote, dict) or not remote.get("endpoint"):
+            raise RuntimeError(
+                "remote master does not advertise remote_gateway.endpoint "
+                f"endpoint=[{endpoint}]"
+            )
+        token = str(remote["token"]) if remote.get("token") else None
+        return cls(str(remote["endpoint"]), token=token, master_endpoint=endpoint)
 
     def remote_gateway_endpoint(self) -> str:
         return self._endpoint
@@ -1965,7 +2105,8 @@ class RemoteMasterClient:
         return self._token
 
     def control_endpoint(self) -> str:
-        return f"zippy://{self._endpoint}/default"
+        endpoint = self._master_endpoint or self._endpoint
+        return f"zippy://{endpoint}/default"
 
     def process_id(self) -> str | None:
         return self._process_id
