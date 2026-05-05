@@ -54,8 +54,10 @@ uv run zippy stream ls --uri default
 14. 用 `07_ops/03_subscribe_latency_probe.py` 记录 append、subscriber 行级和 rollover 延迟。
 15. 用 `07_ops/04_consumer_wait_for_table.py` 验证 consumer 先启动、producer 后注册表的场景。
 16. 用 `07_ops/05_table_health_check.py` 检查 stale stream、persist 失败等健康告警。
-17. 用 `zippy gateway run --uri default --endpoint 127.0.0.1:17666` 或
-    `08_remote_gateway/01_start_gateway_server.py` 在 WSL/Linux 侧启动 GatewayServer。
+17. 在 WSL/Linux 侧通过 master config 启用 `[gateway] enabled = true`，然后启动
+    `zippy master run tcp://0.0.0.0:17690 --config <config.toml>`。master 会自动管理
+    native GatewayServer；`zippy gateway run` 和
+    `08_remote_gateway/01_start_gateway_server.py` 只作为高级调试入口保留。
 18. 用 `08_remote_gateway/02_remote_writer.py` 模拟 Windows 侧行情源逐行写入。
 19. 用 `08_remote_gateway/03_remote_subscribe_and_query.py` 模拟 Windows 侧策略订阅和主动查询。
 20. 用 `zippy gateway smoke --master-uri tcp://127.0.0.1:28690 --gateway-endpoint 127.0.0.1:28666`
@@ -101,9 +103,10 @@ uv run zippy stream ls --uri default
   生成 compacted parquet，并替换 master 中的 persisted metadata。
 - `zp.ops.compact_tables(...)` / `zp.ops.start_compaction_worker(...)`：批量或后台执行
   低频 compaction；该类运维任务不属于写入热路径。
-- `zp.GatewayServer(...)`：跨平台远端数据面服务，通常运行在 WSL/Linux 侧，由 master
-  config 暴露 endpoint/token；Windows 侧继续使用 `connect()`、`get_writer()`、
-  `subscribe_table()` 和 `read_table()`，不需要直接接触 mmap/segment。
+- `zp.GatewayServer(...)`：native Rust 跨平台数据面服务。日常由 master 根据
+  `[gateway]` 配置自动启动和管理；Python 侧这个类只保留为调试/测试胶水。Windows
+  侧继续使用 `connect()`、`get_writer()`、`subscribe_table()` 和 `read_table()`，
+  不需要直接接触 mmap/segment。
 
 `ParquetReplayEngine` 用于显式 parquet 路径回放。`ParquetReplaySource`、
 `SegmentStreamSource` 等底层对象仍然可以使用；StreamTable 物化器保留在内部层，

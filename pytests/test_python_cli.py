@@ -115,7 +115,128 @@ def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch)
         ("start", "127.0.0.1:17666"),
         ("stop", "127.0.0.1:17666"),
     ]
-    assert "gateway started endpoint=[127.0.0.1:17666]" in result.output
+    assert "gateway started host=[127.0.0.1] port=[17666] endpoint=[127.0.0.1:17666]" in result.output
+
+
+def test_gateway_run_uses_config_host_and_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    events: list[tuple[str, object]] = []
+    config_path = tmp_path / "zippy-config.toml"
+    config_path.write_text(
+        """
+[gateway]
+enabled = true
+host = "0.0.0.0"
+port = 27666
+token = "config-token"
+""",
+        encoding="utf-8",
+    )
+
+    class FakeGatewayServer:
+        def __init__(
+            self,
+            *,
+            endpoint: str,
+            master,
+            token: str | None = None,
+            max_write_rows: int | None = None,
+        ) -> None:
+            events.append(("init", (endpoint, master, token, max_write_rows)))
+            self.endpoint = endpoint
+
+        def start(self):
+            events.append(("start", self.endpoint))
+            return self
+
+        def stop(self) -> None:
+            events.append(("stop", self.endpoint))
+
+        def metrics(self) -> dict[str, object]:
+            return {"endpoint": self.endpoint, "requests_total": 0}
+
+    def fake_connect(uri: str, app: str):
+        events.append(("connect", (uri, app)))
+        return "fake-master"
+
+    monkeypatch.setattr(zippy, "connect", fake_connect)
+    monkeypatch.setattr(zippy, "GatewayServer", FakeGatewayServer)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "run",
+            "--uri",
+            "default",
+            "--config",
+            str(config_path),
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        ("connect", ("default", "gateway_server")),
+        ("init", ("0.0.0.0:27666", "fake-master", "config-token", None)),
+        ("start", "0.0.0.0:27666"),
+        ("stop", "0.0.0.0:27666"),
+    ]
+    assert "gateway started host=[0.0.0.0] port=[27666] endpoint=[0.0.0.0:27666]" in result.output
+
+
+def test_gateway_run_derives_endpoint_from_master_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class FakeGatewayServer:
+        def __init__(
+            self,
+            *,
+            endpoint: str,
+            master,
+            token: str | None = None,
+            max_write_rows: int | None = None,
+        ) -> None:
+            events.append(("init", (endpoint, master, token, max_write_rows)))
+            self.endpoint = endpoint
+
+        def start(self):
+            events.append(("start", self.endpoint))
+            return self
+
+        def stop(self) -> None:
+            events.append(("stop", self.endpoint))
+
+        def metrics(self) -> dict[str, object]:
+            return {"endpoint": self.endpoint, "requests_total": 0}
+
+    def fake_connect(uri: str, app: str):
+        events.append(("connect", (uri, app)))
+        return "fake-master"
+
+    monkeypatch.setattr(zippy, "connect", fake_connect)
+    monkeypatch.setattr(zippy, "GatewayServer", FakeGatewayServer)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "run",
+            "--uri",
+            "tcp://127.0.0.1:27690",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        ("connect", ("tcp://127.0.0.1:27690", "gateway_server")),
+        ("init", ("127.0.0.1:27691", "fake-master", None, None)),
+        ("start", "127.0.0.1:27691"),
+        ("stop", "127.0.0.1:27691"),
+    ]
+    assert "gateway started host=[127.0.0.1] port=[27691] endpoint=[127.0.0.1:27691]" in result.output
 
 
 def test_gateway_smoke_runs_cross_process_probe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -356,6 +477,31 @@ def test_master_run_forwards_config_path(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert result.exit_code == 0
     assert events == [(str(Path("/tmp/custom-master.sock")), "/tmp/zippy-config.toml")]
+
+
+def test_master_run_uses_config_host_and_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    events: list[tuple[str, str]] = []
+    config_path = tmp_path / "zippy-config.toml"
+    config_path.write_text(
+        """
+[master]
+host = "0.0.0.0"
+port = 27690
+""",
+        encoding="utf-8",
+    )
+
+    def recording_run_master_daemon(control_endpoint: str, *, config: str | None = None) -> None:
+        events.append((control_endpoint, config or ""))
+
+    monkeypatch.setattr(zippy, "run_master_daemon", recording_run_master_daemon, raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["master", "run", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert events == [("tcp://0.0.0.0:27690", str(config_path))]
+    assert "master starting host=[0.0.0.0] port=[27690] endpoint=[tcp://0.0.0.0:27690]" in result.output
 
 
 def test_master_run_exits_cleanly_on_sigint(tmp_path: Path) -> None:

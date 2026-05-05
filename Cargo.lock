@@ -2130,6 +2130,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zippy-gateway"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "zippy-core",
+ "zippy-engines",
+ "zippy-master",
+]
+
+[[package]]
 name = "zippy-io"
 version = "0.1.0"
 dependencies = [
@@ -2151,6 +2165,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "zippy-core",
+ "zippy-gateway",
  "zippy-shm-bridge",
 ]
 
@@ -2198,6 +2213,7 @@ dependencies = [
  "tracing",
  "zippy-core",
  "zippy-engines",
+ "zippy-gateway",
  "zippy-io",
  "zippy-master",
  "zippy-operators",

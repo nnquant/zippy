@@ -164,7 +164,7 @@ def test_standalone_gateway_smoke_discovers_gateway_from_master_config() -> None
     gateway = FakeGatewayServer(client, token="dev-token").start()
     master = FakeMasterServer(
         {
-            "remote_gateway": {
+            "gateway": {
                 "enabled": True,
                 "endpoint": gateway.endpoint,
                 "token": "dev-token",
@@ -198,7 +198,7 @@ def test_pure_python_remote_zippy_client_smoke() -> None:
     server = zippy.MasterServer(
         uri=master_uri,
         config={
-            "remote_gateway": {
+            "gateway": {
                 "enabled": True,
                 "endpoint": gateway_endpoint,
                 "token": "dev-token",

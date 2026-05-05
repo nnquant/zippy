@@ -45,6 +45,7 @@ if _NATIVE_AVAILABLE:
         from ._internal import CSZscoreSpec
         from ._internal import CrossSectionalEngine
         from ._internal import ExpressionFactor
+        from ._internal import GatewayServer as _NativeGatewayServer
         from ._internal import LogSpec
         from ._internal import MasterClient
         from ._internal import MasterServer
@@ -97,6 +98,7 @@ if not _NATIVE_AVAILABLE:
     CSZscoreSpec = _native_unavailable("CSZscoreSpec")
     CrossSectionalEngine = _native_unavailable("CrossSectionalEngine")
     ExpressionFactor = _native_unavailable("ExpressionFactor")
+    _NativeGatewayServer = _native_unavailable("GatewayServer")
     LogSpec = _native_unavailable("LogSpec")
     MasterClient = _native_unavailable("MasterClient")
     MasterServer = _native_unavailable("MasterServer")
@@ -151,6 +153,10 @@ _DEFAULT_HEARTBEAT: _HeartbeatHandle | None = None
 _DEFAULT_HEARTBEAT_LOCK = threading.Lock()
 _USE_MASTER_CONFIG = object()
 _BUILTIN_CONFIG: dict[str, object] = {
+    "master": {
+        "host": None,
+        "port": None,
+    },
     "log": {
         "level": "info",
     },
@@ -169,9 +175,11 @@ _BUILTIN_CONFIG: dict[str, object] = {
             },
         },
     },
-    "remote_gateway": {
+    "gateway": {
         "enabled": False,
         "endpoint": None,
+        "host": None,
+        "port": None,
         "token": None,
         "protocol_version": 1,
     },
@@ -1893,11 +1901,11 @@ def _remote_gateway_endpoint(master: object) -> str | None:
         return _normalize_remote_endpoint(value)
     get_config = getattr(master, "get_config", None)
     if callable(get_config):
-        remote = get_config().get("remote_gateway", {})
-        if isinstance(remote, dict) and remote.get("enabled") is False:
+        gateway = get_config().get("gateway", {})
+        if isinstance(gateway, dict) and gateway.get("enabled") is False:
             return None
-        if isinstance(remote, dict) and remote.get("endpoint"):
-            return _normalize_remote_endpoint(str(remote["endpoint"]))
+        if isinstance(gateway, dict) and gateway.get("endpoint"):
+            return _normalize_remote_endpoint(str(gateway["endpoint"]))
     return None
 
 
@@ -1911,9 +1919,9 @@ def _remote_gateway_token(master: object) -> str | None:
         return value
     get_config = getattr(master, "get_config", None)
     if callable(get_config):
-        remote = get_config().get("remote_gateway", {})
-        if isinstance(remote, dict) and remote.get("token"):
-            return str(remote["token"])
+        gateway = get_config().get("gateway", {})
+        if isinstance(gateway, dict) and gateway.get("token"):
+            return str(gateway["token"])
     return None
 
 
@@ -2089,14 +2097,14 @@ class RemoteMasterClient:
         :rtype: RemoteMasterClient
         """
         config = _remote_master_get_config(endpoint)
-        remote = config.get("remote_gateway", {})
-        if not isinstance(remote, dict) or not remote.get("endpoint"):
+        gateway = config.get("gateway", {})
+        if not isinstance(gateway, dict) or not gateway.get("endpoint"):
             raise RuntimeError(
-                "remote master does not advertise remote_gateway.endpoint "
+                "remote master does not advertise gateway.endpoint "
                 f"endpoint=[{endpoint}]"
             )
-        token = str(remote["token"]) if remote.get("token") else None
-        return cls(str(remote["endpoint"]), token=token, master_endpoint=endpoint)
+        token = str(gateway["token"]) if gateway.get("token") else None
+        return cls(str(gateway["endpoint"]), token=token, master_endpoint=endpoint)
 
     def remote_gateway_endpoint(self) -> str:
         return self._endpoint
@@ -2144,7 +2152,7 @@ class RemoteMasterClient:
 
     def get_config(self) -> dict[str, object]:
         return {
-            "remote_gateway": {
+            "gateway": {
                 "enabled": True,
                 "endpoint": self._endpoint,
                 "token": self._token,
@@ -2483,7 +2491,7 @@ class _LocalGatewayWriter:
 
 class GatewayServer:
     """
-    Minimal TCP gateway for remote writes and lazy collect requests.
+    Native TCP gateway for remote writes and lazy collect requests.
     """
 
     def __init__(
@@ -2498,248 +2506,33 @@ class GatewayServer:
         token: str | None = None,
         max_write_rows: int | None = None,
     ) -> None:
+        if writer_factory is not None or stream_info_provider is not None:
+            raise ValueError("GatewayServer no longer accepts Python writer/stream providers")
+        if query_executor is not None or subscribe_table_provider is not None:
+            raise ValueError("GatewayServer no longer accepts Python query/subscribe providers")
         self.endpoint = _normalize_remote_endpoint(endpoint)
         self.master = master
         self.token = token
         if max_write_rows is not None and int(max_write_rows) <= 0:
             raise ValueError("max_write_rows must be positive")
         self.max_write_rows = int(max_write_rows) if max_write_rows is not None else None
-        self._writer_factory = writer_factory
-        self._stream_info_provider = stream_info_provider
-        self._query_executor = query_executor
-        self._subscribe_table_provider = subscribe_table_provider
-        self._writers: dict[str, object] = {}
-        self._stop_event = threading.Event()
-        self._listener: socket.socket | None = None
-        self._thread: threading.Thread | None = None
-        self._metrics_lock = threading.Lock()
-        self._metrics: dict[str, int] = {
-            "requests_total": 0,
-            "auth_failures_total": 0,
-            "errors_total": 0,
-            "write_batches_total": 0,
-            "written_rows_total": 0,
-            "write_rejections_total": 0,
-            "collect_requests_total": 0,
-            "subscribe_clients_total": 0,
-        }
+        self._native = _NativeGatewayServer(
+            endpoint=self.endpoint,
+            master=master,
+            token=token,
+            max_write_rows=max_write_rows,
+        )
 
     def start(self) -> "GatewayServer":
-        host, port = _parse_remote_endpoint(self.endpoint)
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((host, port))
-        listener.listen()
-        listener.settimeout(0.1)
-        actual_host, actual_port = listener.getsockname()
-        self.endpoint = f"{actual_host}:{actual_port}"
-        self._listener = listener
-        self._thread = threading.Thread(
-            target=self._serve,
-            name="zippy-remote-gateway",
-            daemon=True,
-        )
-        self._thread.start()
+        self._native.start()
+        self.endpoint = self._native.endpoint
         return self
 
     def stop(self) -> None:
-        self._stop_event.set()
-        listener = self._listener
-        if listener is not None:
-            try:
-                listener.close()
-            except OSError:
-                pass
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        for writer in list(self._writers.values()):
-            close = getattr(writer, "close", None)
-            if callable(close):
-                close()
-        self._writers.clear()
-
-    def _serve(self) -> None:
-        assert self._listener is not None
-        while not self._stop_event.is_set():
-            try:
-                client, _ = self._listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            threading.Thread(
-                target=self._handle_client,
-                args=(client,),
-                name="zippy-remote-gateway-client",
-                daemon=True,
-            ).start()
-
-    def _handle_client(self, client: socket.socket) -> None:
-        with client:
-            try:
-                request, payload = _recv_remote_frame(client)
-                self._increment_metric("requests_total")
-                self._authorize(request)
-                if request.get("kind") == "subscribe_table":
-                    self._serve_subscribe_table(client, request)
-                    return
-                response, response_payload = self._dispatch(request, payload)
-            except Exception as error:
-                self._increment_metric("errors_total")
-                response = {"status": "error", "reason": str(error)}
-                response_payload = b""
-            try:
-                _send_remote_frame(client, response, response_payload)
-            except OSError:
-                return
+        self._native.stop()
 
     def metrics(self) -> dict[str, int | str]:
-        with self._metrics_lock:
-            metrics = dict(self._metrics)
-        metrics["endpoint"] = self.endpoint
-        metrics["running"] = self._thread is not None and self._thread.is_alive()
-        return metrics
-
-    def _increment_metric(self, name: str, value: int = 1) -> None:
-        with self._metrics_lock:
-            self._metrics[name] = self._metrics.get(name, 0) + int(value)
-
-    def _authorize(self, request: dict[str, object]) -> None:
-        if self.token is None:
-            return
-        if request.get("token") == self.token:
-            return
-        self._increment_metric("auth_failures_total")
-        raise PermissionError("unauthorized remote gateway request")
-
-    def _serve_subscribe_table(
-        self,
-        client: socket.socket,
-        request: dict[str, object],
-    ) -> None:
-        source = str(request["source"])
-        self._increment_metric("subscribe_clients_total")
-        filter_payload = request.get("filter")
-        filter_expr = (
-            _query_expr_from_json(filter_payload)
-            if isinstance(filter_payload, dict)
-            else None
-        )
-        options = {
-            "filter": filter_expr,
-            "batch_size": request.get("batch_size"),
-            "throttle_ms": request.get("throttle_ms"),
-            "count": request.get("count"),
-        }
-        _send_remote_frame(client, {"status": "ok", "kind": "subscribed"})
-
-        send_lock = threading.Lock()
-
-        def send_table(table: object) -> None:
-            with send_lock:
-                _send_remote_frame(
-                    client,
-                    {"status": "ok", "kind": "table"},
-                    _pyarrow_table_to_ipc(table),
-                )
-
-        provider = self._subscribe_table_provider
-        if provider is None:
-            handle = subscribe_table(
-                source,
-                callback=send_table,
-                master=self.master,
-                filter=filter_expr,
-                batch_size=(
-                    int(options["batch_size"]) if options["batch_size"] is not None else None
-                ),
-                throttle_ms=(
-                    int(options["throttle_ms"]) if options["throttle_ms"] is not None else None
-                ),
-                count=(int(options["count"]) if options["count"] is not None else None),
-            )
-        else:
-            handle = provider(source, send_table, options)
-
-        try:
-            while not self._stop_event.wait(0.1):
-                try:
-                    client.send(b"")
-                except OSError:
-                    break
-        finally:
-            stop = getattr(handle, "stop", None)
-            if callable(stop):
-                stop()
-
-    def _dispatch(
-        self,
-        request: dict[str, object],
-        payload: bytes,
-    ) -> tuple[dict[str, object], bytes]:
-        kind = str(request.get("kind"))
-        if kind == "write_batch":
-            stream_name = str(request["stream_name"])
-            table = _pyarrow_table_from_ipc(payload)
-            if self.max_write_rows is not None and table.num_rows > self.max_write_rows:
-                self._increment_metric("write_rejections_total")
-                raise RuntimeError(
-                    "write batch row count exceeds limit "
-                    f"rows=[{table.num_rows}] max_write_rows=[{self.max_write_rows}]"
-                )
-            writer = self._writer_for(stream_name, table.schema)
-            writer.write(table)
-            flush = getattr(writer, "flush", None)
-            if callable(flush):
-                flush()
-            self._increment_metric("write_batches_total")
-            self._increment_metric("written_rows_total", int(table.num_rows))
-            return {"status": "ok"}, b""
-        if kind == "list_streams":
-            streams = self.master.list_streams() if self.master is not None else []
-            return {"status": "ok", "streams": streams}, b""
-        if kind == "get_stream":
-            info, schema = self._stream_info(str(request["source"]))
-            return {"status": "ok", "stream": info}, _pyarrow_schema_to_ipc(schema)
-        if kind == "collect":
-            self._increment_metric("collect_requests_total")
-            table = self._collect(
-                str(request["source"]),
-                list(request.get("plan", [])),
-                bool(request.get("snapshot", True)),
-            )
-            return {"status": "ok"}, _pyarrow_table_to_ipc(table)
-        if kind == "metrics":
-            return {"status": "ok", "metrics": self.metrics()}, b""
-        raise ValueError(f"unsupported remote gateway request kind=[{kind}]")
-
-    def _writer_for(self, stream_name: str, schema: object):
-        writer = self._writers.get(stream_name)
-        if writer is None:
-            factory = self._writer_factory
-            if factory is None:
-                writer = _LocalGatewayWriter(stream_name, schema, self.master)
-            else:
-                writer = factory(stream_name, schema)
-            self._writers[stream_name] = writer
-        return writer
-
-    def _stream_info(self, source: str) -> tuple[dict[str, object], object]:
-        if self._stream_info_provider is not None:
-            return self._stream_info_provider(source)
-        table = read_table(source, master=self.master, _force_local=True)
-        return table.info(), table.schema()
-
-    def _collect(
-        self,
-        source: str,
-        plan: list[dict[str, object]],
-        snapshot: bool,
-    ):
-        if self._query_executor is not None:
-            return self._query_executor(source, plan, snapshot)
-        table = read_table(source, master=self.master, snapshot=snapshot, _force_local=True)
-        return _apply_query_plan_json(table, plan).collect()
+        return dict(self._native.metrics())
 
 
 def get_writer(

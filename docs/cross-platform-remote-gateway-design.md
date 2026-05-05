@@ -88,10 +88,10 @@ Gateway 不应与 writer 一一对应。默认模型是：
 
 实现上可以有两种物理形态：
 
-1. master 内置线程；
-2. master 托管的 sidecar 进程。
+1. master 内置 native gateway 线程；
+2. master 托管 native sidecar 进程。
 
-推荐第一版采用“master 托管 sidecar 进程”的语义：
+推荐第一版采用“master 托管 native GatewayServer”的语义：
 
 - 用户只启动 master，或由 `zippy.connect()`/CLI 启动 master；
 - master 负责启动、停止、健康检查和发布 gateway endpoint；
@@ -102,12 +102,20 @@ Gateway 不应与 writer 一一对应。默认模型是：
 master config/capability 中需要暴露：
 
 ```toml
-[remote_gateway]
+[master]
+host = "127.0.0.1"
+port = 17690
+
+[gateway]
 enabled = true
-endpoint = "127.0.0.1:17666"
 token = "..."
 protocol_version = 1
 ```
+
+默认不需要配置 gateway 的 `host` / `port`：当 master 是 TCP endpoint 时，
+GatewayServer endpoint 从 master endpoint 推导，端口为 `master.port + 1`。高级场景
+也可以直接配置 `endpoint = "127.0.0.1:17691"`；当 `endpoint` 存在时，它优先于
+`host` / `port` / master 推导。
 
 ## 5. URI 与连接判定
 
@@ -142,7 +150,7 @@ zp.connect("zippy://wsl-host:17665/default")
 
 ```text
 can_attach_local_segment = true/false
-remote_gateway.endpoint = ...
+gateway.endpoint = ...
 ```
 
 后续 `get_writer()`、`subscribe()`、`read_table().collect()` 根据 capability 自动选择：
@@ -427,8 +435,9 @@ Windows 原生 master + Windows 原生 segment backend
 - gateway metrics：已提供 `GatewayServer.metrics()` 和远端 `metrics` request；
 - client reconnect：`RemoteStreamSubscriber` 已支持 Gateway 暂不可用时按间隔重连；
 - backpressure：当前 request/response 同步阻塞，且 `max_write_rows` 可限制单批写入；
-- token：当前 `remote_gateway.token` 可由 master config 下发，GatewayServer 校验请求 token；
-- CLI：已提供 `zippy gateway run`，用于启动统一 GatewayServer 服务；
+- token：当前 `gateway.token` 可由 master config 下发，GatewayServer 校验请求 token；
+- CLI：`zippy gateway run` 保留为高级调试入口；日常推荐由 master 管理 native
+  GatewayServer；
 - Smoke：已提供 `zippy gateway smoke`，用独立子进程模拟远端客户端写入和查询；
 - Windows client smoke：已提供 `zippy gateway smoke-client --uri zippy://host:port/default`，
   用于在 Windows 侧连接已有 WSL/Linux master/Gateway 验收；

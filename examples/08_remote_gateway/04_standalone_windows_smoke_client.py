@@ -161,12 +161,12 @@ def run_smoke(
     """
     if gateway_endpoint is None:
         config = _master_get_config(uri, timeout_sec)
-        remote_gateway = config.get("remote_gateway", {})
-        if not isinstance(remote_gateway, dict) or not remote_gateway.get("endpoint"):
-            raise RuntimeError("master config does not advertise remote_gateway.endpoint")
-        gateway_endpoint = str(remote_gateway["endpoint"])
-        if token is None and remote_gateway.get("token"):
-            token = str(remote_gateway["token"])
+        gateway = config.get("gateway", {})
+        if not isinstance(gateway, dict) or not gateway.get("endpoint"):
+            raise RuntimeError("master config does not advertise gateway.endpoint")
+        gateway_endpoint = str(gateway["endpoint"])
+        if token is None and gateway.get("token"):
+            token = str(gateway["token"])
 
     table = pa.Table.from_pylist(
         [{"instrument_id": "IF2606", "last_price": 4102.5}],

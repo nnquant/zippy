@@ -8124,6 +8124,39 @@ def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
     ]
 
 
+def _start_native_gateway_stack(
+    *,
+    token: str | None = None,
+    max_write_rows: int | None = None,
+    gateway_endpoint: str | None = None,
+) -> tuple[object, object, str, str]:
+    master_port = reserve_tcp_port()
+    gateway_endpoint = gateway_endpoint or f"127.0.0.1:{reserve_tcp_port()}"
+    master_uri = f"tcp://127.0.0.1:{master_port}"
+    gateway_config: dict[str, object] = {
+        "enabled": True,
+        "endpoint": gateway_endpoint,
+        "protocol_version": 1,
+    }
+    if token is not None:
+        gateway_config["token"] = token
+    server = zippy.MasterServer(
+        uri=master_uri,
+        config={
+            "gateway": gateway_config,
+        },
+    )
+    server.start()
+    gateway = zippy.GatewayServer(
+        endpoint=gateway_endpoint,
+        master=zippy.MasterClient(uri=master_uri),
+        token=token,
+        max_write_rows=max_write_rows,
+    )
+    gateway.start()
+    return server, gateway, master_uri, gateway.endpoint
+
+
 def test_remote_gateway_writer_batches_rows_to_gateway() -> None:
     schema = pa.schema(
         [
@@ -8131,48 +8164,34 @@ def test_remote_gateway_writer_batches_rows_to_gateway() -> None:
             ("last_price", pa.float64()),
         ]
     )
-    received: list[pa.Table] = []
-
-    class FakeWriter:
-        def __init__(self, stream_name: str, schema: pa.Schema) -> None:
-            self.stream_name = stream_name
-            self.schema = schema
-
-        def write(self, table: pa.Table) -> None:
-            received.append(table)
-
-        def flush(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        writer_factory=lambda stream_name, writer_schema: FakeWriter(stream_name, writer_schema),
-    )
-    gateway.start()
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
     try:
         writer = zippy.RemoteGatewayWriter(
             "qmt_ticks",
-            endpoint=gateway.endpoint,
+            endpoint=gateway_endpoint,
             schema=schema,
             batch_size=2,
         )
 
         writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
-        assert received == []
+        assert gateway.metrics()["written_rows_total"] == 0
 
         writer.write({"instrument_id": "IF2607", "last_price": 4103.5})
 
-        assert len(received) == 1
-        assert received[0].schema == schema
-        assert received[0].to_pydict() == {
+        table = (
+            zippy.read_table("qmt_ticks", master=zippy.RemoteMasterClient(gateway_endpoint))
+            .select("instrument_id", "last_price")
+            .collect()
+        )
+        assert table.schema == schema
+        assert table.to_pydict() == {
             "instrument_id": ["IF2606", "IF2607"],
             "last_price": [4102.5, 4103.5],
         }
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_gateway_server_requires_token_and_reports_metrics() -> None:
@@ -8182,25 +8201,13 @@ def test_gateway_server_requires_token_and_reports_metrics() -> None:
             ("last_price", pa.float64()),
         ]
     )
-    received: list[pa.Table] = []
-
-    class FakeWriter:
-        def write(self, table: pa.Table) -> None:
-            received.append(table)
-
-        def flush(self) -> None:
-            return None
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        token="secret-token",
-        writer_factory=lambda stream_name, writer_schema: FakeWriter(),
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(
+        token="secret-token"
     )
-    gateway.start()
     try:
         unauthenticated_writer = zippy.RemoteGatewayWriter(
             "qmt_ticks",
-            endpoint=gateway.endpoint,
+            endpoint=gateway_endpoint,
             schema=schema,
             batch_size=1,
         )
@@ -8209,7 +8216,7 @@ def test_gateway_server_requires_token_and_reports_metrics() -> None:
 
         writer = zippy.RemoteGatewayWriter(
             "qmt_ticks",
-            endpoint=gateway.endpoint,
+            endpoint=gateway_endpoint,
             schema=schema,
             batch_size=1,
             token="secret-token",
@@ -8217,12 +8224,15 @@ def test_gateway_server_requires_token_and_reports_metrics() -> None:
         writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
 
         metrics = zippy.RemoteMasterClient(
-            gateway.endpoint,
+            gateway_endpoint,
             token="secret-token",
         ).gateway_metrics()
 
-        assert len(received) == 1
-        assert received[0].to_pydict() == {
+        table = zippy.read_table(
+            "qmt_ticks",
+            master=zippy.RemoteMasterClient(gateway_endpoint, token="secret-token"),
+        ).collect()
+        assert table.to_pydict() == {
             "instrument_id": ["IF2606"],
             "last_price": [4102.5],
         }
@@ -8232,6 +8242,8 @@ def test_gateway_server_requires_token_and_reports_metrics() -> None:
         assert metrics["requests_total"] >= 3
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_gateway_server_rejects_write_batch_above_row_limit() -> None:
@@ -8241,16 +8253,13 @@ def test_gateway_server_rejects_write_batch_above_row_limit() -> None:
             ("last_price", pa.float64()),
         ]
     )
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        max_write_rows=1,
-        writer_factory=lambda stream_name, writer_schema: object(),
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(
+        max_write_rows=1
     )
-    gateway.start()
     try:
         writer = zippy.RemoteGatewayWriter(
             "qmt_ticks",
-            endpoint=gateway.endpoint,
+            endpoint=gateway_endpoint,
             schema=schema,
         )
         with pytest.raises(RuntimeError, match="write batch row count exceeds limit"):
@@ -8269,6 +8278,8 @@ def test_gateway_server_rejects_write_batch_above_row_limit() -> None:
         assert metrics["written_rows_total"] == 0
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_remote_read_table_collect_sends_plan_to_gateway() -> None:
@@ -8279,37 +8290,16 @@ def test_remote_read_table_collect_sends_plan_to_gateway() -> None:
             ("volume", pa.int64()),
         ]
     )
-    seen: dict[str, object] = {}
-
-    def stream_info_provider(source: str):
-        return (
-            {
-                "stream_name": source,
-                "schema_hash": "remote_schema_hash",
-                "data_path": "remote_gateway",
-                "status": "registered",
-            },
-            schema,
-        )
-
-    def query_executor(source: str, plan: list[dict[str, object]], snapshot: bool):
-        seen["source"] = source
-        seen["plan"] = plan
-        seen["snapshot"] = snapshot
-        return pa.table(
-            {
-                "instrument_id": ["IF2606"],
-                "last_price": [4102.5],
-            }
-        )
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        stream_info_provider=stream_info_provider,
-        query_executor=query_executor,
-    )
-    gateway.start()
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
     try:
+        writer = zippy.RemoteGatewayWriter(
+            "qmt_ticks",
+            endpoint=gateway_endpoint,
+            schema=schema,
+            batch_size=1,
+        )
+        writer.write({"instrument_id": "IF2606", "last_price": 4102.5, "volume": 12})
+
         remote_master = zippy.RemoteMasterClient(gateway.endpoint)
         table = (
             zippy.read_table("qmt_ticks", master=remote_master)
@@ -8322,30 +8312,11 @@ def test_remote_read_table_collect_sends_plan_to_gateway() -> None:
             "instrument_id": ["IF2606"],
             "last_price": [4102.5],
         }
-        assert seen["source"] == "qmt_ticks"
-        assert seen["snapshot"] is True
-        assert seen["plan"] == [
-            {
-                "op": "filter",
-                "expr": {
-                    "kind": "binary",
-                    "op": "eq",
-                    "args": [
-                        {"kind": "col", "value": "instrument_id"},
-                        {"kind": "literal", "value": "IF2606"},
-                    ],
-                },
-            },
-            {
-                "op": "select",
-                "exprs": [
-                    {"kind": "col", "value": "instrument_id"},
-                    {"kind": "col", "value": "last_price"},
-                ],
-            },
-        ]
+        assert gateway.metrics()["collect_requests_total"] == 1
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_remote_read_table_collect_uses_gateway_discovered_from_master_config() -> None:
@@ -8355,24 +8326,8 @@ def test_remote_read_table_collect_uses_gateway_discovered_from_master_config() 
             ("last_price", pa.float64()),
         ]
     )
-    seen: dict[str, object] = {}
-
-    def query_executor(source: str, plan: list[dict[str, object]], snapshot: bool):
-        seen["source"] = source
-        seen["plan"] = plan
-        seen["snapshot"] = snapshot
-        return pa.table(
-            {
-                "instrument_id": ["IF2606"],
-                "last_price": [4102.5],
-            },
-            schema=schema,
-        )
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        token="secret-token",
-        query_executor=query_executor,
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(
+        token="secret-token"
     )
 
     class FakeMasterClient:
@@ -8391,9 +8346,9 @@ def test_remote_read_table_collect_uses_gateway_discovered_from_master_config() 
 
         def get_config(self) -> dict[str, object]:
             return {
-                "remote_gateway": {
+                "gateway": {
                     "enabled": True,
-                    "endpoint": gateway.endpoint,
+                    "endpoint": gateway_endpoint,
                     "token": "secret-token",
                     "protocol_version": 1,
                 }
@@ -8405,8 +8360,16 @@ def test_remote_read_table_collect_uses_gateway_discovered_from_master_config() 
         def get_stream_schema(self, source: str) -> pa.Schema:
             return schema
 
-    gateway.start()
     try:
+        writer = zippy.RemoteGatewayWriter(
+            "qmt_ticks",
+            endpoint=gateway_endpoint,
+            schema=schema,
+            batch_size=1,
+            token="secret-token",
+        )
+        writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
+
         table = (
             zippy.read_table("qmt_ticks", master=FakeMasterClient())
             .filter(zippy.col("instrument_id") == "IF2606")
@@ -8417,23 +8380,11 @@ def test_remote_read_table_collect_uses_gateway_discovered_from_master_config() 
             "instrument_id": ["IF2606"],
             "last_price": [4102.5],
         }
-        assert seen["source"] == "qmt_ticks"
-        assert seen["snapshot"] is True
-        assert seen["plan"] == [
-            {
-                "op": "filter",
-                "expr": {
-                    "kind": "binary",
-                    "op": "eq",
-                    "args": [
-                        {"kind": "col", "value": "instrument_id"},
-                        {"kind": "literal", "value": "IF2606"},
-                    ],
-                },
-            },
-        ]
+        assert gateway.metrics()["collect_requests_total"] == 1
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path(
@@ -8449,19 +8400,7 @@ def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path
             ("last_price", pa.float64()),
         ]
     )
-    received: list[pa.Table] = []
-
-    class FakeWriter:
-        def write(self, table: pa.Table) -> None:
-            received.append(table)
-
-        def flush(self) -> None:
-            return None
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        writer_factory=lambda stream_name, writer_schema: FakeWriter(),
-    )
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
     seen: dict[str, object] = {}
 
     class FakeMasterClient:
@@ -8487,15 +8426,14 @@ def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path
 
         def get_config(self) -> dict[str, object]:
             return {
-                "remote_gateway": {
+                "gateway": {
                     "enabled": True,
-                    "endpoint": gateway.endpoint,
+                    "endpoint": gateway_endpoint,
                     "protocol_version": 1,
                 }
             }
 
     monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
-    gateway.start()
     try:
         client = zippy.connect("zippy://127.0.0.1:17690/default")
 
@@ -8505,8 +8443,11 @@ def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path
         writer = zippy.get_writer("qmt_ticks", schema=schema, batch_size=1)
         writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
 
-        assert len(received) == 1
-        assert received[0].to_pydict() == {
+        table = zippy.read_table(
+            "qmt_ticks",
+            master=zippy.RemoteMasterClient(gateway_endpoint),
+        ).collect()
+        assert table.to_pydict() == {
             "instrument_id": ["IF2606"],
             "last_price": [4102.5],
         }
@@ -8514,6 +8455,8 @@ def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path
         if reset_default_master is not None:
             reset_default_master()
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_get_writer_uses_gateway_token_discovered_from_master_config() -> None:
@@ -8523,19 +8466,8 @@ def test_get_writer_uses_gateway_token_discovered_from_master_config() -> None:
             ("last_price", pa.float64()),
         ]
     )
-    received: list[pa.Table] = []
-
-    class FakeWriter:
-        def write(self, table: pa.Table) -> None:
-            received.append(table)
-
-        def flush(self) -> None:
-            return None
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        token="secret-token",
-        writer_factory=lambda stream_name, writer_schema: FakeWriter(),
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(
+        token="secret-token"
     )
 
     class FakeMasterClient:
@@ -8544,9 +8476,9 @@ def test_get_writer_uses_gateway_token_discovered_from_master_config() -> None:
 
         def get_config(self) -> dict[str, object]:
             return {
-                "remote_gateway": {
+                "gateway": {
                     "enabled": True,
-                    "endpoint": gateway.endpoint,
+                    "endpoint": gateway_endpoint,
                     "token": "secret-token",
                     "protocol_version": 1,
                 }
@@ -8555,18 +8487,22 @@ def test_get_writer_uses_gateway_token_discovered_from_master_config() -> None:
         def get_stream_schema(self, source: str) -> pa.Schema:
             return schema
 
-    gateway.start()
     try:
         writer = zippy.get_writer("qmt_ticks", master=FakeMasterClient(), batch_size=1)
         writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
 
-        assert len(received) == 1
-        assert received[0].to_pydict() == {
+        table = zippy.read_table(
+            "qmt_ticks",
+            master=zippy.RemoteMasterClient(gateway_endpoint, token="secret-token"),
+        ).collect()
+        assert table.to_pydict() == {
             "instrument_id": ["IF2606"],
             "last_price": [4102.5],
         }
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_remote_subscribe_table_receives_gateway_table_callback() -> None:
@@ -8576,34 +8512,10 @@ def test_remote_subscribe_table_receives_gateway_table_callback() -> None:
             ("last_price", pa.float64()),
         ]
     )
-
-    def subscribe_table_provider(source: str, callback, options: dict[str, object]):
-        assert source == "qmt_ticks"
-        assert options["batch_size"] == 2
-        callback(
-            pa.table(
-                {
-                    "instrument_id": ["IF2606", "IF2607"],
-                    "last_price": [4102.5, 4103.5],
-                },
-                schema=schema,
-            )
-        )
-
-        class FakeHandle:
-            def stop(self) -> None:
-                return None
-
-        return FakeHandle()
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        subscribe_table_provider=subscribe_table_provider,
-    )
-    gateway.start()
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
     received: list[pa.Table] = []
     try:
-        remote_master = zippy.RemoteMasterClient(gateway.endpoint)
+        remote_master = zippy.RemoteMasterClient(gateway_endpoint)
         subscriber = zippy.subscribe_table(
             "qmt_ticks",
             callback=received.append,
@@ -8611,6 +8523,14 @@ def test_remote_subscribe_table_receives_gateway_table_callback() -> None:
             batch_size=2,
         )
         try:
+            writer = zippy.RemoteGatewayWriter(
+                "qmt_ticks",
+                endpoint=gateway_endpoint,
+                schema=schema,
+                batch_size=2,
+            )
+            writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
+            writer.write({"instrument_id": "IF2607", "last_price": 4103.5})
             for _ in range(50):
                 if received:
                     break
@@ -8624,6 +8544,8 @@ def test_remote_subscribe_table_receives_gateway_table_callback() -> None:
             subscriber.stop()
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_remote_subscribe_receives_gateway_row_callback() -> None:
@@ -8633,37 +8555,22 @@ def test_remote_subscribe_receives_gateway_row_callback() -> None:
             ("last_price", pa.float64()),
         ]
     )
-
-    def subscribe_table_provider(source: str, callback, options: dict[str, object]):
-        callback(
-            pa.table(
-                {
-                    "instrument_id": ["IF2606"],
-                    "last_price": [4102.5],
-                },
-                schema=schema,
-            )
-        )
-
-        class FakeHandle:
-            def stop(self) -> None:
-                return None
-
-        return FakeHandle()
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        subscribe_table_provider=subscribe_table_provider,
-    )
-    gateway.start()
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
     received: list[dict[str, object]] = []
     try:
         subscriber = zippy.subscribe(
             "qmt_ticks",
             callback=lambda row: received.append(row.to_dict()),
-            master=zippy.RemoteMasterClient(gateway.endpoint),
+            master=zippy.RemoteMasterClient(gateway_endpoint),
         )
         try:
+            writer = zippy.RemoteGatewayWriter(
+                "qmt_ticks",
+                endpoint=gateway_endpoint,
+                schema=schema,
+                batch_size=1,
+            )
+            writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
             for _ in range(50):
                 if received:
                     break
@@ -8673,6 +8580,8 @@ def test_remote_subscribe_receives_gateway_row_callback() -> None:
             subscriber.stop()
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_subscribe_table_uses_gateway_token_discovered_from_master_config() -> None:
@@ -8682,42 +8591,21 @@ def test_subscribe_table_uses_gateway_token_discovered_from_master_config() -> N
             ("last_price", pa.float64()),
         ]
     )
-
-    def subscribe_table_provider(source: str, callback, options: dict[str, object]):
-        callback(
-            pa.table(
-                {
-                    "instrument_id": ["IF2606"],
-                    "last_price": [4102.5],
-                },
-                schema=schema,
-            )
-        )
-
-        class FakeHandle:
-            def stop(self) -> None:
-                return None
-
-        return FakeHandle()
-
-    gateway = zippy.GatewayServer(
-        endpoint="127.0.0.1:0",
-        token="secret-token",
-        subscribe_table_provider=subscribe_table_provider,
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(
+        token="secret-token"
     )
 
     class FakeMasterClient:
         def get_config(self) -> dict[str, object]:
             return {
-                "remote_gateway": {
+                "gateway": {
                     "enabled": True,
-                    "endpoint": gateway.endpoint,
+                    "endpoint": gateway_endpoint,
                     "token": "secret-token",
                     "protocol_version": 1,
                 }
             }
 
-    gateway.start()
     received: list[pa.Table] = []
     try:
         subscriber = zippy.subscribe_table(
@@ -8726,6 +8614,14 @@ def test_subscribe_table_uses_gateway_token_discovered_from_master_config() -> N
             master=FakeMasterClient(),
         )
         try:
+            writer = zippy.RemoteGatewayWriter(
+                "qmt_ticks",
+                endpoint=gateway_endpoint,
+                schema=schema,
+                batch_size=1,
+                token="secret-token",
+            )
+            writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
             for _ in range(50):
                 if received:
                     break
@@ -8739,6 +8635,8 @@ def test_subscribe_table_uses_gateway_token_discovered_from_master_config() -> N
             subscriber.stop()
     finally:
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_remote_stream_subscriber_reconnects_until_gateway_starts() -> None:
@@ -8748,10 +8646,23 @@ def test_remote_stream_subscriber_reconnects_until_gateway_starts() -> None:
             ("last_price", pa.float64()),
         ]
     )
+    master_port = reserve_tcp_port()
     port = reserve_tcp_port()
+    master_uri = f"tcp://127.0.0.1:{master_port}"
     endpoint = f"127.0.0.1:{port}"
     received: list[pa.Table] = []
 
+    server = zippy.MasterServer(
+        uri=master_uri,
+        config={
+            "gateway": {
+                "enabled": True,
+                "endpoint": endpoint,
+                "protocol_version": 1,
+            }
+        },
+    )
+    server.start()
     subscriber = zippy.RemoteStreamSubscriber(
         "qmt_ticks",
         endpoint=endpoint,
@@ -8760,30 +8671,20 @@ def test_remote_stream_subscriber_reconnects_until_gateway_starts() -> None:
         reconnect_interval_ms=10,
     ).start()
 
-    def subscribe_table_provider(source: str, callback, options: dict[str, object]):
-        callback(
-            pa.table(
-                {
-                    "instrument_id": ["IF2606"],
-                    "last_price": [4102.5],
-                },
-                schema=schema,
-            )
-        )
-
-        class FakeHandle:
-            def stop(self) -> None:
-                return None
-
-        return FakeHandle()
-
     gateway = zippy.GatewayServer(
         endpoint=endpoint,
-        subscribe_table_provider=subscribe_table_provider,
+        master=zippy.MasterClient(uri=master_uri),
     )
     try:
         time.sleep(0.05)
         gateway.start()
+        writer = zippy.RemoteGatewayWriter(
+            "qmt_ticks",
+            endpoint=endpoint,
+            schema=schema,
+            batch_size=1,
+        )
+        writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
         for _ in range(100):
             if received:
                 break
@@ -8797,6 +8698,8 @@ def test_remote_stream_subscriber_reconnects_until_gateway_starts() -> None:
     finally:
         subscriber.stop()
         gateway.stop()
+        server.stop()
+        server.join()
 
 
 def test_remote_gateway_e2e_through_tcp_master_config() -> None:
@@ -8813,7 +8716,7 @@ def test_remote_gateway_e2e_through_tcp_master_config() -> None:
     server = zippy.MasterServer(
         uri=master_uri,
         config={
-            "remote_gateway": {
+            "gateway": {
                 "enabled": True,
                 "endpoint": gateway_endpoint,
                 "token": "secret-token",

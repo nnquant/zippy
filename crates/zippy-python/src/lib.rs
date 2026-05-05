@@ -42,6 +42,7 @@ use zippy_engines::{
     StreamTableRetentionGuard as RustStreamTableRetentionGuard,
     TimeSeriesEngine as RustTimeSeriesEngine,
 };
+use zippy_gateway::{GatewayServer as RustGatewayServer, GatewayServerConfig};
 use zippy_io::{
     FanoutPublisher as RustFanoutPublisher, NullPublisher as RustNullPublisher,
     ParquetSink as RustParquetSink, ParquetSinkWriter as RustParquetSinkWriter,
@@ -2134,6 +2135,86 @@ impl MasterClient {
 
     fn control_endpoint(&self) -> PyResult<String> {
         Ok(self.control_endpoint.clone())
+    }
+}
+
+#[pyclass]
+struct GatewayServer {
+    config: Mutex<Option<GatewayServerConfig>>,
+    server: Mutex<Option<RustGatewayServer>>,
+    endpoint: Mutex<String>,
+}
+
+#[pymethods]
+impl GatewayServer {
+    #[new]
+    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None))]
+    fn new(
+        endpoint: String,
+        master: Option<PyRef<'_, MasterClient>>,
+        token: Option<String>,
+        max_write_rows: Option<usize>,
+    ) -> PyResult<Self> {
+        let master_endpoint = match master {
+            Some(master) => resolve_control_endpoint_value(&master.control_endpoint)?,
+            None => resolve_control_endpoint(DEFAULT_CONTROL_ENDPOINT_URI)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        };
+        Ok(Self {
+            config: Mutex::new(Some(GatewayServerConfig {
+                endpoint: endpoint.clone(),
+                master_endpoint,
+                token,
+                max_write_rows,
+            })),
+            server: Mutex::new(None),
+            endpoint: Mutex::new(endpoint),
+        })
+    }
+
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        if self.server.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let config = self
+            .config
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| py_runtime_error("gateway server cannot be restarted after stop"))?;
+        let server = py
+            .allow_threads(|| RustGatewayServer::new(config).and_then(RustGatewayServer::start))
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        *self.endpoint.lock().unwrap() = server.endpoint().to_string();
+        *self.server.lock().unwrap() = Some(server);
+        Ok(())
+    }
+
+    fn stop(&self, py: Python<'_>) {
+        if let Some(server) = self.server.lock().unwrap().take() {
+            py.allow_threads(|| server.stop());
+        }
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let metrics = self
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(RustGatewayServer::metrics)
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "endpoint": self.endpoint.lock().unwrap().clone(),
+                    "running": false,
+                })
+            });
+        serde_json_value_to_py(py, &metrics)
+    }
+
+    #[getter]
+    fn endpoint(&self) -> String {
+        self.endpoint.lock().unwrap().clone()
     }
 }
 
@@ -5542,6 +5623,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ZmqSource>()?;
     module.add_class::<MasterDaemon>()?;
     module.add_class::<MasterClient>()?;
+    module.add_class::<GatewayServer>()?;
     module.add_class::<Query>()?;
     module.add_class::<StreamSubscriber>()?;
     module.add_class::<BusWriter>()?;

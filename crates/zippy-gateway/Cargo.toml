@@ -1,0 +1,16 @@
+[package]
+name = "zippy-gateway"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+zippy-core = { path = "../zippy-core" }
+zippy-engines = { path = "../zippy-engines" }
+
+[dev-dependencies]
+zippy-master = { path = "../zippy-master" }
+tempfile = "3"

@@ -15,7 +15,7 @@ Windows Python client
   -> zippy://wsl-host:17690/default
   -> WSL/Linux master tcp control endpoint
   -> master config 下发 GatewayServer endpoint/token
-  -> GatewayServer 写入/查询 WSL/Linux 本地 StreamTable
+  -> master 管理的 native GatewayServer 写入/查询 WSL/Linux 本地 StreamTable
 ```
 
 它不验证 Windows 直接 attach Linux mmap segment。Windows 侧只访问 master TCP
@@ -34,54 +34,63 @@ Windows Python client
 准备一个 config，例如 `/tmp/zippy-gateway-smoke.toml`：
 
 ```toml
-[remote_gateway]
+[master]
+host = "0.0.0.0"
+port = 17690
+
+[gateway]
 enabled = true
-endpoint = "0.0.0.0:17666"
 token = "dev-token"
 protocol_version = 1
 ```
 
 配置含义：
 
-- `enabled = true`：master 会向远端 client 发布 Gateway capability；
-- `endpoint`：GatewayServer 对 Windows 可达的监听地址；
+- `enabled = true`：master 会启动 native GatewayServer，并向远端 client 发布 Gateway
+  capability；
+- gateway 默认监听地址从 master TCP 配置推导，端口为 `master.port + 1`；
 - `token`：GatewayServer 的轻量访问令牌，Windows client 会从 master config 自动发现；
 - `protocol_version`：当前协议版本，第一版固定为 `1`。
 
-如果 Windows 不能直接访问 WSL 的 `0.0.0.0:17666`，需要把 endpoint 写成 Windows
-可达的 WSL IP 或宿主转发地址，例如：
+也可以直接使用 `endpoint = "host:port"`，它会优先于默认推导。也可以只覆写
+`host` 或 `port` 中的一个，缺失项会从 master 配置推导。如果 Windows
+不能直接访问 WSL 的 `0.0.0.0:17691`，需要把配置写成 Windows 可达的 WSL IP 或宿主
+转发地址，例如：
 
 ```toml
-[remote_gateway]
+[master]
+host = "0.0.0.0"
+port = 17690
+
+[gateway]
 enabled = true
-endpoint = "172.20.10.2:17666"
+host = "172.20.10.2"
 token = "dev-token"
 protocol_version = 1
 ```
 
+master 自身也可以通过配置文件指定 TCP 监听地址：
+
+```toml
+[master]
+host = "0.0.0.0"
+port = 17690
+```
+
 ## 3. WSL/Linux 侧启动
 
-在 WSL/Linux 终端启动 TCP master：
+在 WSL/Linux 终端启动 TCP master。GatewayServer 会由 master 根据 `[gateway]`
+配置自动启动，不需要再单独启动第二个程序：
 
 ```bash
 uv run zippy master run tcp://0.0.0.0:17690 --config /tmp/zippy-gateway-smoke.toml
-```
-
-再启动 GatewayServer：
-
-```bash
-uv run zippy gateway run \
-  --uri tcp://127.0.0.1:17690 \
-  --endpoint 0.0.0.0:17666 \
-  --token dev-token
 ```
 
 如果 master 或 Gateway 端口被占用，可以换端口，但要同步修改：
 
 - master 启动 URI；
 - Windows 侧 `zippy://<wsl-host>:<master-port>/default`；
-- config 中的 `remote_gateway.endpoint`；
-- GatewayServer 的 `--endpoint`。
+- config 中的 `gateway.endpoint`，或从 `[master]` 推导出的 gateway endpoint。
 
 ## 4. Windows 侧准备
 
@@ -189,6 +198,7 @@ io error reason=[connection refused]
 - 确认 WSL/Linux master 用 `tcp://0.0.0.0:17690` 或可达 IP 启动；
 - 确认 Windows 侧 `<wsl-host>:17690` 可以连通；
 - 检查 Windows 防火墙、WSL 网络、端口转发配置。
+- 查看 master 启动日志中打印的 master host/port 和 gateway host/port。
 
 ### 6.2 Gateway 连接失败
 
@@ -200,8 +210,9 @@ gateway endpoint unavailable
 
 排查：
 
-- 确认 `zippy gateway run --endpoint ...` 已启动；
-- 确认 master config 中 `[remote_gateway].endpoint` 是 Windows 可达地址；
+- 确认 master config 中 `[gateway] enabled = true`，并查看 master 启动日志中
+  GatewayServer 是否启动成功；
+- 确认 master config 中 `[gateway].endpoint` 或推导出的 gateway endpoint 是 Windows 可达地址；
 - 不要把 endpoint 写成 `127.0.0.1:17666`，除非 Windows client 与 GatewayServer
   在同一个 OS 网络命名空间内。
 
@@ -215,9 +226,9 @@ gateway request unauthorized
 
 排查：
 
-- 确认 master config 中的 token 与 `zippy gateway run --token` 一致；
+- 确认 master config 中的 `[gateway].token` 与 Windows client 自动发现的 token 一致；
 - 如果不需要 token，两边都不要配置 token；
-- 不要只改 GatewayServer 参数而忘记重启 master。
+- 不要只改配置文件而忘记重启 master。
 
 ### 6.4 Windows Python 没有 zippy
 

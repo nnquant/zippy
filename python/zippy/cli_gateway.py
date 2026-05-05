@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import tomllib
 
 import click
 
@@ -28,6 +29,84 @@ def _remote_uri_from_master_uri(master_uri: str) -> str:
     if master_uri.startswith("tcp://"):
         return f"zippy://{master_uri.removeprefix('tcp://')}/default"
     return master_uri
+
+
+def _load_config(path: str | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    with open(path, "rb") as handle:
+        return tomllib.load(handle)
+
+
+def _token_from_config(config: dict[str, object]) -> str | None:
+    gateway = config.get("gateway", {})
+    if not isinstance(gateway, dict):
+        return None
+    token = gateway.get("token")
+    return str(token) if token else None
+
+
+def _host_port_from_uri(uri: str) -> tuple[str, int] | None:
+    if uri.startswith("tcp://"):
+        host_port = uri.removeprefix("tcp://")
+    elif uri.startswith("zippy://"):
+        authority = uri.removeprefix("zippy://").split("/", 1)[0]
+        if ":" not in authority:
+            return None
+        host_port = authority
+    else:
+        return None
+    host, port_text = host_port.rsplit(":", 1)
+    return host, int(port_text)
+
+
+def _master_host_port_from_config_or_uri(
+    config: dict[str, object],
+    uri: str,
+) -> tuple[str, int] | None:
+    master = config.get("master", {})
+    if isinstance(master, dict):
+        host = master.get("host")
+        port = master.get("port")
+        if host is not None and port is not None:
+            return str(host), int(port)
+        if host is not None or port is not None:
+            raise ValueError("master host and port must be set together")
+    return _host_port_from_uri(uri)
+
+
+def _gateway_endpoint_from_config_or_master_uri(
+    config: dict[str, object],
+    uri: str,
+) -> str | None:
+    gateway = config.get("gateway", {})
+    if not isinstance(gateway, dict):
+        gateway = {}
+    endpoint = gateway.get("endpoint")
+    if endpoint:
+        return str(endpoint)
+
+    master = _master_host_port_from_config_or_uri(config, uri)
+    master_host = master[0] if master is not None else None
+    master_port = master[1] if master is not None else None
+    host = gateway.get("host") or master_host
+    if gateway.get("port") is not None:
+        port = int(gateway["port"])
+    elif master_port is not None:
+        port = master_port + 1
+    else:
+        port = None
+    if host is None and port is None:
+        return None
+    if host is None or port is None:
+        raise ValueError("gateway endpoint requires host and port, or a derivable master TCP port")
+    return f"{host}:{port}"
+
+
+def _endpoint_host_port(endpoint: str) -> tuple[str, int]:
+    normalized = str(endpoint).removeprefix("tcp://").split("/", 1)[0]
+    host, port_text = normalized.rsplit(":", 1)
+    return host, int(port_text)
 
 
 def run_gateway_smoke(
@@ -58,7 +137,7 @@ def run_gateway_smoke(
     server = zippy.MasterServer(
         uri=master_uri,
         config={
-            "remote_gateway": {
+            "gateway": {
                 "enabled": True,
                 "endpoint": gateway_endpoint,
                 "token": token,
@@ -168,9 +247,15 @@ def run_gateway_smoke_client(
 )
 @click.option(
     "--endpoint",
-    default="127.0.0.1:17666",
-    show_default=True,
+    default=None,
     help="GatewayServer listen endpoint",
+)
+@click.option(
+    "-c",
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Path to zippy config TOML file.",
 )
 @click.option("--token", default=None, help="remote client access token")
 @click.option(
@@ -183,7 +268,8 @@ def run_gateway_smoke_client(
 @click.option("--once", is_flag=True, hidden=True)
 def run_gateway(
     uri: str,
-    endpoint: str,
+    endpoint: str | None,
+    config_path: str | None,
     token: str | None,
     max_write_rows: int | None,
     as_json: bool,
@@ -194,6 +280,13 @@ def run_gateway(
     """
     gateway = None
     try:
+        config = _load_config(config_path)
+        endpoint = (
+            endpoint
+            or _gateway_endpoint_from_config_or_master_uri(config, uri)
+            or "127.0.0.1:17666"
+        )
+        token = token if token is not None else _token_from_config(config)
         master = zippy.connect(uri=uri, app="gateway_server")
         gateway = zippy.GatewayServer(
             endpoint=endpoint,
@@ -201,7 +294,10 @@ def run_gateway(
             token=token,
             max_write_rows=max_write_rows,
         ).start()
-        click.echo(f"gateway started endpoint=[{gateway.endpoint}]")
+        host, port = _endpoint_host_port(gateway.endpoint)
+        click.echo(
+            f"gateway started host=[{host}] port=[{port}] endpoint=[{gateway.endpoint}]"
+        )
         if once:
             return
 

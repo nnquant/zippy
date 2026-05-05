@@ -10,7 +10,11 @@ use std::sync::Arc;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
-use zippy_core::{ControlEndpoint, LogConfig, ZippyConfig, ZippyError};
+use zippy_core::{
+    default_control_endpoint, resolve_control_endpoint, ControlEndpoint, LogConfig, ZippyConfig,
+    ZippyError,
+};
+use zippy_gateway::{GatewayServer, GatewayServerConfig};
 
 use crate::server::MasterServer;
 
@@ -54,13 +58,18 @@ impl MasterDaemonConfig {
 
 pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
     let MasterDaemonConfig {
-        control_endpoint,
+        mut control_endpoint,
         config_path,
         log_dir,
         log_level,
         console_log,
     } = config;
     let mut runtime_config = load_runtime_config(config_path.as_deref())?;
+    if control_endpoint == default_control_endpoint() {
+        if let Some(endpoint) = runtime_config.master_endpoint() {
+            control_endpoint = resolve_control_endpoint(format!("tcp://{endpoint}"))?;
+        }
+    }
     if let Some(log_level) = log_level {
         runtime_config.log.level = log_level;
     }
@@ -73,7 +82,9 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
             })?;
         }
     }
+    let _gateway = start_gateway_if_enabled(&runtime_config, &control_endpoint)?;
     let control_endpoint_display = control_endpoint.display_string();
+    let (control_host, control_port) = control_endpoint_host_port(&control_endpoint);
 
     let snapshot = zippy_core::setup_log(LogConfig::new(
         "zippy-master",
@@ -88,6 +99,8 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         event = "master_start",
         status = "starting",
         control_endpoint = control_endpoint_display.as_str(),
+        host = control_host.as_str(),
+        port = control_port.as_str(),
         log_dir = log_dir.display().to_string(),
         log_level = effective_log_level,
         table_row_capacity = runtime_config.table.row_capacity,
@@ -165,6 +178,55 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
     }
 
     server.serve_endpoint_with_ready(&control_endpoint, None)
+}
+
+fn control_endpoint_host_port(endpoint: &ControlEndpoint) -> (String, String) {
+    match endpoint {
+        ControlEndpoint::Tcp(addr) => (addr.ip().to_string(), addr.port().to_string()),
+        ControlEndpoint::Unix(path) => (path.display().to_string(), String::new()),
+    }
+}
+
+fn start_gateway_if_enabled(
+    runtime_config: &ZippyConfig,
+    control_endpoint: &ControlEndpoint,
+) -> zippy_core::Result<Option<GatewayServer>> {
+    if !runtime_config.gateway.enabled {
+        return Ok(None);
+    }
+    let endpoint =
+        runtime_config
+            .gateway
+            .endpoint
+            .clone()
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "gateway endpoint is required when gateway is enabled".to_string(),
+            })?;
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint,
+        master_endpoint: control_endpoint.clone(),
+        token: runtime_config.gateway.token.clone(),
+        max_write_rows: None,
+    })?
+    .start()?;
+    let (host, port) = gateway_endpoint_host_port(gateway.endpoint());
+    tracing::info!(
+        component = "gateway",
+        event = "gateway_start",
+        status = "ready",
+        endpoint = gateway.endpoint(),
+        host = host.as_str(),
+        port = port.as_str(),
+        "started zippy gateway"
+    );
+    Ok(Some(gateway))
+}
+
+fn gateway_endpoint_host_port(endpoint: &str) -> (String, String) {
+    match endpoint.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.to_string()),
+        None => (endpoint.to_string(), String::new()),
+    }
 }
 
 fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyConfig> {

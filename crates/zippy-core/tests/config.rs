@@ -14,10 +14,14 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_TABLE_PERSIST_PARTITION_DT_COLUMN",
     "ZIPPY_TABLE_PERSIST_PARTITION_ID_COLUMN",
     "ZIPPY_TABLE_PERSIST_PARTITION_DT_PART",
-    "ZIPPY_REMOTE_GATEWAY",
-    "ZIPPY_REMOTE_GATEWAY_ENDPOINT",
-    "ZIPPY_REMOTE_GATEWAY_TOKEN",
-    "ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION",
+    "ZIPPY_GATEWAY",
+    "ZIPPY_GATEWAY_ENDPOINT",
+    "ZIPPY_GATEWAY_HOST",
+    "ZIPPY_GATEWAY_PORT",
+    "ZIPPY_GATEWAY_TOKEN",
+    "ZIPPY_GATEWAY_PROTOCOL_VERSION",
+    "ZIPPY_MASTER_HOST",
+    "ZIPPY_MASTER_PORT",
 ];
 
 #[test]
@@ -43,11 +47,15 @@ dt_column = "dt"
 id_column = "instrument_id"
 dt_part = "%Y%m%d"
 
-[remote_gateway]
+[gateway]
 enabled = false
 endpoint = "127.0.0.1:17666"
 token = "from-file-token"
 protocol_version = 1
+
+[master]
+host = "127.0.0.1"
+port = 17690
 "#,
     )
     .unwrap();
@@ -62,14 +70,18 @@ protocol_version = 1
             ("ZIPPY_TABLE_PERSIST_PARTITION_DT_COLUMN", "recv_ts"),
             ("ZIPPY_TABLE_PERSIST_PARTITION_ID_COLUMN", "symbol"),
             ("ZIPPY_TABLE_PERSIST_PARTITION_DT_PART", "%Y%m"),
-            ("ZIPPY_REMOTE_GATEWAY", "true"),
-            ("ZIPPY_REMOTE_GATEWAY_ENDPOINT", "127.0.0.1:27666"),
-            ("ZIPPY_REMOTE_GATEWAY_TOKEN", "from-env-token"),
-            ("ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION", "2"),
+            ("ZIPPY_GATEWAY", "true"),
+            ("ZIPPY_GATEWAY_ENDPOINT", "127.0.0.1:27666"),
+            ("ZIPPY_GATEWAY_TOKEN", "from-env-token"),
+            ("ZIPPY_GATEWAY_PROTOCOL_VERSION", "2"),
+            ("ZIPPY_MASTER_HOST", "0.0.0.0"),
+            ("ZIPPY_MASTER_PORT", "27690"),
         ],
         || {
             let config = ZippyConfig::load_from_path(Some(&config_path)).unwrap();
 
+            assert_eq!(config.master.host.as_deref(), Some("0.0.0.0"));
+            assert_eq!(config.master.port, Some(27690));
             assert_eq!(config.log.level, "warn");
             assert_eq!(config.table.row_capacity, 2048);
             assert_eq!(config.table.retention_segments, Some(5));
@@ -88,28 +100,86 @@ protocol_version = 1
                 config.table.persist.partition.dt_part.as_deref(),
                 Some("%Y%m")
             );
-            assert!(config.remote_gateway.enabled);
-            assert_eq!(
-                config.remote_gateway.endpoint.as_deref(),
-                Some("127.0.0.1:27666")
-            );
-            assert_eq!(
-                config.remote_gateway.token.as_deref(),
-                Some("from-env-token")
-            );
-            assert_eq!(config.remote_gateway.protocol_version, 2);
+            assert!(config.gateway.enabled);
+            assert_eq!(config.gateway.endpoint.as_deref(), Some("127.0.0.1:27666"));
+            assert_eq!(config.gateway.token.as_deref(), Some("from-env-token"));
+            assert_eq!(config.gateway.protocol_version, 2);
         },
     );
 }
 
 #[test]
-fn zippy_config_rejects_enabled_remote_gateway_without_endpoint() {
+fn zippy_config_builds_gateway_endpoint_from_host_and_port() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     fs::write(
         &config_path,
         r#"
-[remote_gateway]
+[gateway]
+enabled = true
+host = "0.0.0.0"
+port = 17666
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.gateway.endpoint.as_deref(), Some("0.0.0.0:17666"));
+}
+
+#[test]
+fn zippy_config_derives_gateway_endpoint_from_master_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[master]
+host = "127.0.0.1"
+port = 17690
+
+[gateway]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.gateway.endpoint.as_deref(), Some("127.0.0.1:17691"));
+}
+
+#[test]
+fn zippy_config_does_not_derive_disabled_gateway_endpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[master]
+host = "127.0.0.1"
+port = 17690
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert!(!config.gateway.enabled);
+    assert_eq!(config.gateway.endpoint, None);
+    assert_eq!(config.gateway.host, None);
+    assert_eq!(config.gateway.port, None);
+}
+
+#[test]
+fn zippy_config_rejects_enabled_gateway_without_endpoint_or_master_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[gateway]
 enabled = true
 "#,
     )
@@ -119,7 +189,7 @@ enabled = true
 
     assert!(error
         .to_string()
-        .contains("remote_gateway endpoint must be set when enabled"));
+        .contains("gateway endpoint must be set when enabled or derivable from master port"));
 }
 
 #[test]

@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -185,6 +185,107 @@ fn master_binary_serves_tcp_control_endpoint() {
     let process_id = client.register_process("tcp_binary").unwrap();
 
     assert!(process_id.starts_with("proc_"));
+
+    let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(status, 0);
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
+}
+
+#[test]
+fn master_binary_uses_configured_master_host_and_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let addr = unused_loopback_addr();
+    let log_dir = temp.path().join("logs");
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[master]
+host = "127.0.0.1"
+port = {}
+"#,
+            addr.port()
+        ),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_zippy-master");
+
+    let mut child = Command::new(binary)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--log-dir")
+        .arg(&log_dir)
+        .arg("--log-level")
+        .arg("info")
+        .arg("--no-console-log")
+        .env("HOME", temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_log_contains(&log_dir, "\"event\":\"master_listening\"");
+    let log_file = wait_for_single_log_file(&log_dir);
+    let log_contents = fs::read_to_string(log_file).unwrap();
+    assert!(log_contents.contains("\"host\":\"127.0.0.1\""));
+    assert!(log_contents.contains(&format!("\"port\":\"{}\"", addr.port())));
+
+    let mut client = MasterClient::connect_endpoint(ControlEndpoint::Tcp(addr)).unwrap();
+    let process_id = client.register_process("tcp_config_binary").unwrap();
+    assert!(process_id.starts_with("proc_"));
+
+    let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(status, 0);
+    let exit = child.wait().unwrap();
+    assert!(exit.success());
+}
+
+#[test]
+fn master_binary_starts_native_gateway_when_enabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let master_addr = unused_loopback_addr();
+    let gateway_addr = SocketAddr::new(master_addr.ip(), master_addr.port() + 1);
+    let log_dir = temp.path().join("logs");
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[master]
+host = "127.0.0.1"
+port = {}
+
+[gateway]
+enabled = true
+token = "dev-token"
+"#,
+            master_addr.port()
+        ),
+    )
+    .unwrap();
+    let binary = env!("CARGO_BIN_EXE_zippy-master");
+
+    let mut child = Command::new(binary)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--log-dir")
+        .arg(&log_dir)
+        .arg("--log-level")
+        .arg("info")
+        .arg("--no-console-log")
+        .env("HOME", temp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_log_contains(&log_dir, "\"event\":\"master_listening\"");
+    let response = wait_for_gateway_metrics(gateway_addr, "dev-token");
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["metrics"]["requests_total"], 1);
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);
@@ -440,4 +541,39 @@ fn read_stderr(child: &mut std::process::Child) -> String {
     let mut output = String::new();
     stderr.read_to_string(&mut output).unwrap();
     output
+}
+
+fn wait_for_gateway_metrics(addr: SocketAddr, token: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(response) = send_gateway_metrics(addr, token) {
+            return response;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("gateway metrics endpoint was not reachable addr=[{}]", addr);
+}
+
+fn send_gateway_metrics(addr: SocketAddr, token: &str) -> std::io::Result<serde_json::Value> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(100))?;
+    let header = serde_json::to_vec(&serde_json::json!({
+        "kind": "metrics",
+        "token": token,
+    }))?;
+    stream.write_all(&(header.len() as u32).to_be_bytes())?;
+    stream.write_all(&0u64.to_be_bytes())?;
+    stream.write_all(&header)?;
+
+    let mut prefix = [0u8; 12];
+    stream.read_exact(&mut prefix)?;
+    let header_len = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
+    let payload_len = u64::from_be_bytes(prefix[4..12].try_into().unwrap()) as usize;
+    let mut response_header = vec![0u8; header_len];
+    stream.read_exact(&mut response_header)?;
+    if payload_len > 0 {
+        let mut response_payload = vec![0u8; payload_len];
+        stream.read_exact(&mut response_payload)?;
+    }
+    serde_json::from_slice(&response_header)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }

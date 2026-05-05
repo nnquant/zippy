@@ -1,9 +1,10 @@
 """
-启动一个跨平台 GatewayServer。
+高级调试：手动启动一个跨平台 GatewayServer。
 
-这个脚本运行在 WSL/Linux 侧，负责把远端 TCP + Arrow IPC 请求转成本地 Zippy
-StreamTable、subscribe_table 和 read_table 查询。Windows 侧 QMT/策略进程只需要连接
-远端 master，再由 master config 发现这里启动的 GatewayServer。
+生产和日常测试推荐在 master config 中配置 ``[gateway] enabled = true``，由 master
+自动管理 native GatewayServer。这个脚本只用于调试独立 Gateway 生命周期，负责把远端
+TCP + Arrow IPC 请求转成本地 Zippy StreamTable、subscribe_table 和 read_table 查询。
+Windows 侧 QMT/策略进程只需要连接远端 master，再由 master config 发现 GatewayServer。
 
 :example:
 
@@ -24,7 +25,7 @@ import zippy as zp
 
 def main() -> None:
     """
-    连接本地 master，并启动 GatewayServer 常驻服务。
+    连接本地 master，并手动启动 GatewayServer 常驻服务。
 
     :returns: None
     :rtype: None
@@ -68,7 +69,7 @@ def main() -> None:
 
     print("gateway started endpoint=[{}]".format(gateway.endpoint))
     print("master config should contain:")
-    print("[remote_gateway]")
+    print("[gateway]")
     print("enabled = true")
     print('endpoint = "{}"'.format(gateway.endpoint))
     print("protocol_version = 1")

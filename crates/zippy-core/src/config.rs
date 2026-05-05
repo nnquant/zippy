@@ -14,10 +14,19 @@ const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%
 /// Process-wide Zippy runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyConfig {
+    #[serde(default)]
+    pub master: ZippyMasterConfig,
     pub log: ZippyLogConfig,
     pub table: ZippyTableConfig,
     #[serde(default)]
-    pub remote_gateway: ZippyRemoteGatewayConfig,
+    pub gateway: ZippyGatewayConfig,
+}
+
+/// Master control endpoint defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ZippyMasterConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
 /// Logging defaults shared by master and Python clients.
@@ -53,18 +62,22 @@ pub struct ZippyTablePersistPartitionConfig {
 
 /// GatewayServer capability advertised by master for cross-platform data access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ZippyRemoteGatewayConfig {
+pub struct ZippyGatewayConfig {
     pub enabled: bool,
     pub endpoint: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
     pub token: Option<String>,
     pub protocol_version: u16,
 }
 
-impl Default for ZippyRemoteGatewayConfig {
+impl Default for ZippyGatewayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             endpoint: None,
+            host: None,
+            port: None,
             token: None,
             protocol_version: 1,
         }
@@ -73,9 +86,16 @@ impl Default for ZippyRemoteGatewayConfig {
 
 #[derive(Debug, Deserialize)]
 struct PartialZippyConfig {
+    master: Option<PartialMasterConfig>,
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
-    remote_gateway: Option<PartialRemoteGatewayConfig>,
+    gateway: Option<PartialGatewayConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialMasterConfig {
+    host: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,9 +126,11 @@ struct PartialTablePersistPartitionConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct PartialRemoteGatewayConfig {
+struct PartialGatewayConfig {
     enabled: Option<bool>,
     endpoint: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
     token: Option<String>,
     protocol_version: Option<u16>,
 }
@@ -116,6 +138,7 @@ struct PartialRemoteGatewayConfig {
 impl Default for ZippyConfig {
     fn default() -> Self {
         Self {
+            master: ZippyMasterConfig::default(),
             log: ZippyLogConfig {
                 level: DEFAULT_LOG_LEVEL.to_string(),
             },
@@ -133,7 +156,7 @@ impl Default for ZippyConfig {
                     },
                 },
             },
-            remote_gateway: ZippyRemoteGatewayConfig::default(),
+            gateway: ZippyGatewayConfig::default(),
         }
     }
 }
@@ -161,6 +184,7 @@ impl ZippyConfig {
             }
         }
         config.apply_env()?;
+        config.derive_endpoints()?;
         config.validate()?;
         Ok(config)
     }
@@ -170,6 +194,14 @@ impl ZippyConfig {
     }
 
     fn apply_partial(&mut self, partial: PartialZippyConfig) -> Result<()> {
+        if let Some(master) = partial.master {
+            if let Some(host) = master.host {
+                self.master.host = Some(non_empty(host, "master.host")?);
+            }
+            if let Some(port) = master.port {
+                self.master.port = Some(port);
+            }
+        }
         if let Some(log) = partial.log {
             if let Some(level) = log.level {
                 self.log.level = non_empty(level, "log.level")?;
@@ -208,25 +240,46 @@ impl ZippyConfig {
                 }
             }
         }
-        if let Some(remote_gateway) = partial.remote_gateway {
-            if let Some(enabled) = remote_gateway.enabled {
-                self.remote_gateway.enabled = enabled;
+        if let Some(gateway) = partial.gateway {
+            if let Some(enabled) = gateway.enabled {
+                self.gateway.enabled = enabled;
             }
-            if let Some(endpoint) = remote_gateway.endpoint {
-                self.remote_gateway.endpoint =
-                    Some(non_empty(endpoint, "remote_gateway.endpoint")?);
+            if let Some(endpoint) = gateway.endpoint {
+                self.gateway.endpoint = Some(non_empty(endpoint, "gateway.endpoint")?);
             }
-            if let Some(token) = remote_gateway.token {
-                self.remote_gateway.token = Some(non_empty(token, "remote_gateway.token")?);
+            if let Some(host) = gateway.host {
+                self.gateway.host = Some(non_empty(host, "gateway.host")?);
             }
-            if let Some(protocol_version) = remote_gateway.protocol_version {
-                self.remote_gateway.protocol_version = protocol_version;
+            if let Some(port) = gateway.port {
+                self.gateway.port = Some(port);
+            }
+            if let Some(token) = gateway.token {
+                self.gateway.token = Some(non_empty(token, "gateway.token")?);
+            }
+            if let Some(protocol_version) = gateway.protocol_version {
+                self.gateway.protocol_version = protocol_version;
             }
         }
         Ok(())
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if let Some(host) = env_string("ZIPPY_MASTER_HOST") {
+            self.master.host = Some(non_empty(host, "ZIPPY_MASTER_HOST")?);
+        }
+        if let Some(value) = env_string("ZIPPY_MASTER_PORT") {
+            self.master.port =
+                Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|error| ZippyError::InvalidConfig {
+                            reason: format!(
+                                "env var must parse as u16 name=[ZIPPY_MASTER_PORT] error=[{}]",
+                                error
+                            ),
+                        })?,
+                );
+        }
         if let Some(level) = env_string("ZIPPY_LOG_LEVEL") {
             self.log.level = non_empty(level, "ZIPPY_LOG_LEVEL")?;
         }
@@ -278,23 +331,38 @@ impl ZippyConfig {
             self.table.persist.partition.dt_part =
                 Some(non_empty(dt_part, "ZIPPY_TABLE_PERSIST_PARTITION_DT_PART")?);
         }
-        if let Some(value) = env_string("ZIPPY_REMOTE_GATEWAY") {
-            self.remote_gateway.enabled = parse_bool_env("ZIPPY_REMOTE_GATEWAY", &value)?;
+        if let Some(value) = env_string("ZIPPY_GATEWAY") {
+            self.gateway.enabled = parse_bool_env("ZIPPY_GATEWAY", &value)?;
         }
-        if let Some(endpoint) = env_string("ZIPPY_REMOTE_GATEWAY_ENDPOINT") {
-            self.remote_gateway.endpoint =
-                Some(non_empty(endpoint, "ZIPPY_REMOTE_GATEWAY_ENDPOINT")?);
+        if let Some(endpoint) = env_string("ZIPPY_GATEWAY_ENDPOINT") {
+            self.gateway.endpoint = Some(non_empty(endpoint, "ZIPPY_GATEWAY_ENDPOINT")?);
         }
-        if let Some(token) = env_string("ZIPPY_REMOTE_GATEWAY_TOKEN") {
-            self.remote_gateway.token = Some(non_empty(token, "ZIPPY_REMOTE_GATEWAY_TOKEN")?);
+        if let Some(host) = env_string("ZIPPY_GATEWAY_HOST") {
+            self.gateway.host = Some(non_empty(host, "ZIPPY_GATEWAY_HOST")?);
         }
-        if let Some(value) = env_string("ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION") {
-            self.remote_gateway.protocol_version =
+        if let Some(value) = env_string("ZIPPY_GATEWAY_PORT") {
+            self.gateway.port =
+                Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|error| ZippyError::InvalidConfig {
+                            reason: format!(
+                                "env var must parse as u16 name=[ZIPPY_GATEWAY_PORT] error=[{}]",
+                                error
+                            ),
+                        })?,
+                );
+        }
+        if let Some(token) = env_string("ZIPPY_GATEWAY_TOKEN") {
+            self.gateway.token = Some(non_empty(token, "ZIPPY_GATEWAY_TOKEN")?);
+        }
+        if let Some(value) = env_string("ZIPPY_GATEWAY_PROTOCOL_VERSION") {
+            self.gateway.protocol_version =
                 value
                     .parse::<u16>()
                     .map_err(|error| ZippyError::InvalidConfig {
                         reason: format!(
-                        "env var must parse as u16 name=[ZIPPY_REMOTE_GATEWAY_PROTOCOL_VERSION] error=[{}]",
+                        "env var must parse as u16 name=[ZIPPY_GATEWAY_PROTOCOL_VERSION] error=[{}]",
                         error
                     ),
                     })?;
@@ -322,8 +390,39 @@ impl ZippyConfig {
             });
         }
         validate_persist_partition(&self.table.persist.partition)?;
-        validate_remote_gateway(&self.remote_gateway)?;
+        validate_host_port("master", self.master.host.as_ref(), self.master.port)?;
+        validate_gateway_host_port(&self.gateway)?;
+        validate_gateway(&self.gateway)?;
         Ok(())
+    }
+
+    fn derive_endpoints(&mut self) -> Result<()> {
+        validate_host_port("master", self.master.host.as_ref(), self.master.port)?;
+        let should_derive_gateway =
+            self.gateway.enabled || self.gateway.host.is_some() || self.gateway.port.is_some();
+        if should_derive_gateway && self.gateway.endpoint.is_none() {
+            self.gateway.endpoint = self.gateway_endpoint();
+        }
+        Ok(())
+    }
+
+    pub fn master_endpoint(&self) -> Option<String> {
+        match (self.master.host.as_ref(), self.master.port) {
+            (Some(host), Some(port)) => Some(format!("{host}:{port}")),
+            _ => None,
+        }
+    }
+
+    pub fn gateway_endpoint(&self) -> Option<String> {
+        self.gateway.endpoint.clone().or_else(|| {
+            let host = self.gateway.host.as_ref().or(self.master.host.as_ref())?;
+            let port = self.gateway.port.or_else(|| {
+                self.master
+                    .port
+                    .and_then(|master_port| master_port.checked_add(1))
+            })?;
+            Some(format!("{host}:{port}"))
+        })
     }
 }
 
@@ -392,18 +491,41 @@ fn validate_persist_partition(partition: &ZippyTablePersistPartitionConfig) -> R
     Ok(())
 }
 
-fn validate_remote_gateway(remote_gateway: &ZippyRemoteGatewayConfig) -> Result<()> {
-    if remote_gateway.protocol_version == 0 {
+fn validate_host_port(name: &str, host: Option<&String>, port: Option<u16>) -> Result<()> {
+    match (host, port) {
+        (Some(_), Some(0)) => Err(ZippyError::InvalidConfig {
+            reason: format!("{name} port must be greater than zero"),
+        }),
+        (Some(_), Some(_)) | (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => Err(ZippyError::InvalidConfig {
+            reason: format!("{name} host and port must be set together"),
+        }),
+    }
+}
+
+fn validate_gateway_host_port(gateway: &ZippyGatewayConfig) -> Result<()> {
+    if gateway.port == Some(0) {
         return Err(ZippyError::InvalidConfig {
-            reason: "remote_gateway protocol_version must be greater than zero".to_string(),
+            reason: "gateway port must be greater than zero".to_string(),
         });
     }
-    if remote_gateway.enabled {
-        match &remote_gateway.endpoint {
+    Ok(())
+}
+
+fn validate_gateway(gateway: &ZippyGatewayConfig) -> Result<()> {
+    if gateway.protocol_version == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: "gateway protocol_version must be greater than zero".to_string(),
+        });
+    }
+    if gateway.enabled {
+        match &gateway.endpoint {
             Some(endpoint) if !endpoint.trim().is_empty() => {}
             _ => {
                 return Err(ZippyError::InvalidConfig {
-                    reason: "remote_gateway endpoint must be set when enabled".to_string(),
+                    reason:
+                        "gateway endpoint must be set when enabled or derivable from master port"
+                            .to_string(),
                 });
             }
         }
