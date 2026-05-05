@@ -2,9 +2,21 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::mem::align_of;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::Memory::{
+        CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+        MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    },
+};
 
 const RING_MAGIC: u64 = 0x5a49_5050_595f_5247;
 const RING_LAYOUT_VERSION: u32 = 1;
@@ -149,7 +161,10 @@ struct PublishInProgress {
 
 #[derive(Debug)]
 struct FileLockGuard {
+    #[cfg(unix)]
     file: File,
+    #[cfg(not(unix))]
+    _file: File,
 }
 
 impl FileLockGuard {
@@ -165,17 +180,25 @@ impl FileLockGuard {
             .truncate(false)
             .open(lock_path_for(mmap_path))?;
 
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if result != 0 {
-            return Err(SharedFrameRingError::Io(std::io::Error::last_os_error()));
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result != 0 {
+                return Err(SharedFrameRingError::Io(std::io::Error::last_os_error()));
+            }
         }
 
-        Ok(Self { file })
+        #[cfg(unix)]
+        return Ok(Self { file });
+
+        #[cfg(not(unix))]
+        return Ok(Self { _file: file });
     }
 }
 
 impl Drop for FileLockGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -550,18 +573,29 @@ impl SharedFrameRing {
 impl Drop for SharedFrameRing {
     fn drop(&mut self) {
         if self.mapping.is_owner() {
+            self.mapping.close();
             let _ = fs::remove_file(&self.mmap_path);
             let _ = fs::remove_file(lock_path_for(&self.mmap_path));
         }
     }
 }
 
-#[derive(Debug)]
 struct MappedFile {
-    _file: File,
+    file: Option<File>,
     ptr: *mut u8,
     len: usize,
     owner: bool,
+    #[cfg(windows)]
+    mapping_handle: HANDLE,
+}
+
+impl fmt::Debug for MappedFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MappedFile")
+            .field("len", &self.len)
+            .field("owner", &self.owner)
+            .finish()
+    }
 }
 
 impl MappedFile {
@@ -594,28 +628,19 @@ impl MappedFile {
 
         preallocate_file(&file, len)?;
 
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(SharedFrameRingError::Mapping(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
+        #[cfg(unix)]
+        let ptr = map_file(&file, len)?;
+        #[cfg(windows)]
+        let (ptr, mapping_handle) = map_file(&file, len)?;
 
         Ok((
             Self {
-                _file: file,
-                ptr: ptr.cast::<u8>(),
+                file: Some(file),
+                ptr,
                 len,
                 owner: needs_initialize,
+                #[cfg(windows)]
+                mapping_handle,
             },
             needs_initialize,
         ))
@@ -629,6 +654,30 @@ impl MappedFile {
         self.owner
     }
 
+    fn close(&mut self) {
+        if !self.ptr.is_null() {
+            #[cfg(unix)]
+            {
+                let _ = unsafe { libc::munmap(self.ptr.cast(), self.len) };
+            }
+            #[cfg(windows)]
+            {
+                let _ = unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.ptr.cast(),
+                    })
+                };
+            }
+            self.ptr = std::ptr::null_mut();
+        }
+        #[cfg(windows)]
+        if !self.mapping_handle.is_null() {
+            let _ = unsafe { CloseHandle(self.mapping_handle) };
+            self.mapping_handle = std::ptr::null_mut();
+        }
+        drop(self.file.take());
+    }
+
     fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -640,12 +689,60 @@ impl MappedFile {
 
 impl Drop for MappedFile {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            let _ = unsafe { libc::munmap(self.ptr.cast(), self.len) };
-        }
+        self.close();
     }
 }
 
+#[cfg(unix)]
+fn map_file(file: &File, len: usize) -> Result<*mut u8, SharedFrameRingError> {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(SharedFrameRingError::Mapping(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    Ok(ptr.cast::<u8>())
+}
+
+#[cfg(windows)]
+fn map_file(file: &File, len: usize) -> Result<(*mut u8, HANDLE), SharedFrameRingError> {
+    let len = u64::try_from(len).map_err(|_| SharedFrameRingError::SizeOverflow)?;
+    let mapping_handle = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            (len >> 32) as u32,
+            len as u32,
+            std::ptr::null(),
+        )
+    };
+    if mapping_handle.is_null() {
+        return Err(SharedFrameRingError::Mapping(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+
+    let view = unsafe { MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, len as usize) };
+    if view.Value.is_null() {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { CloseHandle(mapping_handle) };
+        return Err(SharedFrameRingError::Mapping(error.to_string()));
+    }
+
+    Ok((view.Value.cast::<u8>(), mapping_handle))
+}
+
+#[cfg(unix)]
 fn preallocate_file(file: &File, len: usize) -> Result<(), SharedFrameRingError> {
     let len = libc::off_t::try_from(len).map_err(|_| SharedFrameRingError::SizeOverflow)?;
     let result = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) };
@@ -654,6 +751,11 @@ fn preallocate_file(file: &File, len: usize) -> Result<(), SharedFrameRingError>
             result,
         )));
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn preallocate_file(_file: &File, _len: usize) -> Result<(), SharedFrameRingError> {
     Ok(())
 }
 

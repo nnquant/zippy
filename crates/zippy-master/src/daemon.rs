@@ -1,9 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::Arc;
+
+#[cfg(unix)]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
+#[cfg(unix)]
 use signal_hook::iterator::Signals;
 use zippy_core::{ControlEndpoint, LogConfig, ZippyConfig, ZippyError};
 
@@ -178,33 +183,43 @@ fn install_shutdown_handlers(
     control_endpoint: &ControlEndpoint,
     server: MasterServer,
 ) -> zippy_core::Result<()> {
-    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| ZippyError::Io {
-        reason: format!("failed to install signal handler error=[{}]", error),
-    })?;
-    let shutdown_logged = Arc::new(AtomicBool::new(false));
-    let control_endpoint = control_endpoint.display_string();
-    let control_endpoint_for_thread = control_endpoint.clone();
-    let shutdown_logged_for_thread = Arc::clone(&shutdown_logged);
+    #[cfg(unix)]
+    {
+        let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| ZippyError::Io {
+            reason: format!("failed to install signal handler error=[{}]", error),
+        })?;
+        let shutdown_logged = Arc::new(AtomicBool::new(false));
+        let control_endpoint = control_endpoint.display_string();
+        let control_endpoint_for_thread = control_endpoint.clone();
+        let shutdown_logged_for_thread = Arc::clone(&shutdown_logged);
 
-    std::thread::spawn(move || {
-        for signal in signals.forever() {
-            if !shutdown_logged_for_thread.swap(true, Ordering::SeqCst) {
-                tracing::info!(
-                    component = "master",
-                    event = "master_shutdown_requested",
-                    status = "stopping",
-                    control_endpoint = control_endpoint_for_thread.as_str(),
-                    signal = signal_name(signal),
-                    "received shutdown signal"
-                );
+        std::thread::spawn(move || {
+            for signal in signals.forever() {
+                if !shutdown_logged_for_thread.swap(true, Ordering::SeqCst) {
+                    tracing::info!(
+                        component = "master",
+                        event = "master_shutdown_requested",
+                        status = "stopping",
+                        control_endpoint = control_endpoint_for_thread.as_str(),
+                        signal = signal_name(signal),
+                        "received shutdown signal"
+                    );
+                }
+                server.shutdown();
             }
-            server.shutdown();
-        }
-    });
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = control_endpoint;
+        let _ = server;
+    }
 
     Ok(())
 }
 
+#[cfg(unix)]
 fn signal_name(signal: i32) -> &'static str {
     match signal {
         SIGINT => "SIGINT",

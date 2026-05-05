@@ -592,6 +592,23 @@ fn temp_persist_root(name: &str) -> PathBuf {
     root
 }
 
+fn file_path_has_partition_components(file: &serde_json::Value, expected: &[&str]) -> bool {
+    let Some(file_path) = file["file_path"].as_str() else {
+        return false;
+    };
+    let components = PathBuf::from(file_path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    components.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    })
+}
+
 fn wait_for_persist_failure(materializer: &StreamTableMaterializer) -> Vec<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -1076,28 +1093,19 @@ fn stream_table_materializer_partitions_persisted_parquet_by_dt_part_and_id() {
             && file["partition"]["instrument_id"] == "A/B"
             && file["partition_path"]["instrument_id"] == "A%2FB"
             && file["row_count"] == 2
-            && file["file_path"]
-                .as_str()
-                .unwrap()
-                .contains("dt_part=202604/instrument_id=A%2FB")
+            && file_path_has_partition_components(file, &["dt_part=202604", "instrument_id=A%2FB"])
     }));
     assert!(files.iter().any(|file| {
         file["partition"]["dt_part"] == "202604"
             && file["partition"]["instrument_id"] == "IF2606"
             && file["row_count"] == 1
-            && file["file_path"]
-                .as_str()
-                .unwrap()
-                .contains("dt_part=202604/instrument_id=IF2606")
+            && file_path_has_partition_components(file, &["dt_part=202604", "instrument_id=IF2606"])
     }));
     assert!(files.iter().any(|file| {
         file["partition"]["dt_part"] == "202605"
             && file["partition"]["instrument_id"] == "IF2606"
             && file["row_count"] == 1
-            && file["file_path"]
-                .as_str()
-                .unwrap()
-                .contains("dt_part=202605/instrument_id=IF2606")
+            && file_path_has_partition_components(file, &["dt_part=202605", "instrument_id=IF2606"])
     }));
 
     for metadata in files.iter() {

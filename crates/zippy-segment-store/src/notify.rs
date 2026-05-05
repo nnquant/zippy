@@ -1,58 +1,37 @@
 use std::{
     collections::HashMap,
-    os::fd::{AsFd, OwnedFd},
-    sync::{Arc, Mutex, Weak},
-    time::Duration,
+    sync::{Arc, Condvar, Mutex, Weak},
+    time::{Duration, Instant},
 };
 
-use rustix::io;
-
-/// 基于 eventfd 的最小通知器。
+/// 最小 segment 通知器。
 #[derive(Debug)]
 pub struct SegmentNotifier {
-    fd: OwnedFd,
+    state: Arc<NotifyState>,
     subscription_id: u64,
-    subscriptions: Weak<Mutex<HashMap<u64, OwnedFd>>>,
+    subscriptions: Weak<Mutex<HashMap<u64, Arc<NotifyState>>>>,
 }
 
 impl SegmentNotifier {
-    /// 创建新的通知器。
     fn new(
         subscription_id: u64,
-        subscriptions: Weak<Mutex<HashMap<u64, OwnedFd>>>,
-    ) -> std::io::Result<Self> {
-        let fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)?;
-        Ok(Self {
-            fd,
+        subscriptions: Weak<Mutex<HashMap<u64, Arc<NotifyState>>>>,
+    ) -> Self {
+        Self {
+            state: Arc::new(NotifyState::default()),
             subscription_id,
             subscriptions,
-        })
-    }
-
-    /// 返回可供 broadcaster 保存的文件描述符副本。
-    pub(crate) fn try_clone_fd(&self) -> std::io::Result<OwnedFd> {
-        self.fd.as_fd().try_clone_to_owned()
+        }
     }
 
     /// 发送一次通知。
     pub fn notify(&self) -> std::io::Result<()> {
-        write_eventfd(&self.fd, 1)?;
-        Ok(())
+        self.state.notify()
     }
 
     /// 在超时内等待通知。
     pub fn wait_timeout(&self, timeout: Duration) -> std::io::Result<bool> {
-        let mut fds = [rustix::event::PollFd::new(
-            &self.fd,
-            rustix::event::PollFlags::IN,
-        )];
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let ready = rustix::event::poll(&mut fds, timeout_ms)?;
-        if ready == 0 {
-            return Ok(false);
-        }
-        let _ = read_eventfd(&self.fd)?;
-        Ok(true)
+        self.state.wait_timeout(timeout)
     }
 }
 
@@ -69,7 +48,7 @@ impl Drop for SegmentNotifier {
 #[derive(Debug)]
 pub(crate) struct SegmentBroadcaster {
     next_subscription_id: std::sync::atomic::AtomicU64,
-    subscribers: Arc<Mutex<HashMap<u64, OwnedFd>>>,
+    subscribers: Arc<Mutex<HashMap<u64, Arc<NotifyState>>>>,
 }
 
 impl Default for SegmentBroadcaster {
@@ -82,59 +61,80 @@ impl Default for SegmentBroadcaster {
 }
 
 impl SegmentBroadcaster {
-    /// 注册新的 eventfd 订阅者。
+    /// 注册新的订阅者。
     pub(crate) fn subscribe(&self) -> std::io::Result<SegmentNotifier> {
         let subscription_id = self
             .next_subscription_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let notifier = SegmentNotifier::new(subscription_id, Arc::downgrade(&self.subscribers))?;
+        let notifier = SegmentNotifier::new(subscription_id, Arc::downgrade(&self.subscribers));
         self.subscribers
             .lock()
             .unwrap()
-            .insert(subscription_id, notifier.try_clone_fd()?);
+            .insert(subscription_id, Arc::clone(&notifier.state));
         Ok(notifier)
     }
 
     /// 广播一次事件给所有订阅者。
     pub(crate) fn notify_all(&self) -> std::io::Result<()> {
         let subscribers = self.subscribers.lock().unwrap();
-        for fd in subscribers.values() {
-            write_eventfd(fd, 1)?;
+        for state in subscribers.values() {
+            state.notify()?;
         }
         Ok(())
     }
 }
 
-fn write_eventfd(fd: &OwnedFd, value: u64) -> std::io::Result<()> {
-    let bytes = value.to_ne_bytes();
-    let written = io::write(fd, &bytes)?;
-    if written == bytes.len() {
-        return Ok(());
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::WriteZero,
-        "short write to eventfd",
-    ))
+#[derive(Debug, Default)]
+struct NotifyState {
+    pending: Mutex<u64>,
+    condvar: Condvar,
 }
 
-fn read_eventfd(fd: &OwnedFd) -> std::io::Result<u64> {
-    let mut bytes = [0_u8; 8];
-    let read = io::read(fd, &mut bytes)?;
-    if read == bytes.len() {
-        return Ok(u64::from_ne_bytes(bytes));
+impl NotifyState {
+    fn notify(&self) -> std::io::Result<()> {
+        let mut pending = self.pending.lock().map_err(poison_error)?;
+        *pending = pending.saturating_add(1);
+        self.condvar.notify_all();
+        Ok(())
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::UnexpectedEof,
-        "short read from eventfd",
-    ))
+    fn wait_timeout(&self, timeout: Duration) -> std::io::Result<bool> {
+        let mut pending = self.pending.lock().map_err(poison_error)?;
+        if *pending > 0 {
+            *pending -= 1;
+            return Ok(true);
+        }
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            if *pending > 0 {
+                *pending -= 1;
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_pending, wait_result) = self
+                .condvar
+                .wait_timeout(pending, remaining)
+                .map_err(poison_error)?;
+            pending = next_pending;
+            if wait_result.timed_out() && *pending == 0 {
+                return Ok(false);
+            }
+        }
+    }
+}
+
+fn poison_error<T>(_: std::sync::PoisonError<T>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, "segment notifier lock poisoned")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
 
     #[test]
     fn dropping_notifier_removes_subscription() {
@@ -148,12 +148,25 @@ mod tests {
     }
 
     #[test]
-    fn notify_all_propagates_write_error() {
+    fn notify_all_wakes_subscription() {
         let broadcaster = SegmentBroadcaster::default();
-        let file = File::open("/dev/null").unwrap();
-        let fd: OwnedFd = file.into();
-        broadcaster.subscribers.lock().unwrap().insert(1, fd);
+        let notifier = broadcaster.subscribe().unwrap();
 
-        assert!(broadcaster.notify_all().is_err());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                broadcaster.notify_all().unwrap();
+            });
+
+            assert!(notifier.wait_timeout(Duration::from_secs(1)).unwrap());
+        });
+    }
+
+    #[test]
+    fn wait_timeout_returns_false_when_idle() {
+        let broadcaster = SegmentBroadcaster::default();
+        let notifier = broadcaster.subscribe().unwrap();
+
+        assert!(!notifier.wait_timeout(Duration::from_millis(1)).unwrap());
     }
 }

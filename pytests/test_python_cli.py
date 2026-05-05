@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from click.testing import CliRunner
+import os
 import signal
+import socket
 import subprocess
 import pytest
 import pyarrow as pa
@@ -14,8 +16,25 @@ from zippy.cli import main
 from zippy.cli_common import DEFAULT_CONTROL_ENDPOINT, ensure_control_parent_dir
 
 
+def expected_logical_endpoint(fake_home: Path, name: str = "default") -> str:
+    if os.name == "nt":
+        return f"zippy://{name or 'default'}"
+    return str(fake_home / ".zippy" / "control_endpoints" / name / "master.sock")
+
+
+def unused_loopback_uri() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+    return f"tcp://{host}:{port}"
+
+
 def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
-    control_endpoint = str(tmp_path / "zippy-master-cli.sock")
+    control_endpoint = (
+        unused_loopback_uri()
+        if os.name == "nt"
+        else str(tmp_path / "zippy-master-cli.sock")
+    )
     server = zippy.MasterServer(control_endpoint=control_endpoint)
     server.start()
     return server, control_endpoint
@@ -98,7 +117,7 @@ def test_master_run_uses_expanded_default_control_endpoint(monkeypatch: pytest.M
     runner = CliRunner()
     result = runner.invoke(main, ["master", "run"])
 
-    expected = str(fake_home / ".zippy" / "control_endpoints" / "default" / "master.sock")
+    expected = expected_logical_endpoint(fake_home)
     assert result.exit_code == 0
     assert events == [("run_master_daemon", expected)]
     assert result.output == ""
@@ -118,7 +137,7 @@ def test_master_run_accepts_named_logical_endpoint(monkeypatch: pytest.MonkeyPat
     runner = CliRunner()
     result = runner.invoke(main, ["master", "run", "sim"])
 
-    expected = str(fake_home / ".zippy" / "control_endpoints" / "sim" / "master.sock")
+    expected = expected_logical_endpoint(fake_home, "sim")
     assert result.exit_code == 0
     assert events == [("run_master_daemon", expected)]
     assert result.output == ""
@@ -143,7 +162,7 @@ def test_master_run_accepts_explicit_control_endpoint(monkeypatch: pytest.Monkey
     result = runner.invoke(main, ["master", "run", "/tmp/custom-master.sock"])
 
     assert result.exit_code == 0
-    assert events == [("run_master_daemon", "/tmp/custom-master.sock")]
+    assert events == [("run_master_daemon", str(Path("/tmp/custom-master.sock")))]
     assert result.output == ""
     assert "keyboard interrupt" not in result.output.lower()
 
@@ -186,10 +205,13 @@ def test_master_run_forwards_config_path(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     assert result.exit_code == 0
-    assert events == [("/tmp/custom-master.sock", "/tmp/zippy-config.toml")]
+    assert events == [(str(Path("/tmp/custom-master.sock")), "/tmp/zippy-config.toml")]
 
 
 def test_master_run_exits_cleanly_on_sigint(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("SIGINT subprocess semantics are Unix-specific in this test")
+
     control_endpoint = tmp_path / "zippy-master-cli-signal.sock"
     owner_path = Path(f"{control_endpoint}.owner")
     process = subprocess.Popen(

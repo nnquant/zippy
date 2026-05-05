@@ -1,14 +1,17 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use zippy_core::bus_protocol::{
     DropTableResult, GetStreamResponse, ListStreamsResponse, StreamInfo,
@@ -211,11 +214,26 @@ impl MasterServer {
         ready_tx: Option<SyncSender<std::result::Result<(), String>>>,
     ) -> Result<()> {
         match endpoint {
+            #[cfg(unix)]
             ControlEndpoint::Unix(path) => self.serve_with_ready(path, ready_tx),
+            #[cfg(not(unix))]
+            ControlEndpoint::Unix(path) => {
+                let error = ZippyError::InvalidConfig {
+                    reason: format!(
+                        "unix control endpoint is not supported on this platform path=[{}]",
+                        path.display()
+                    ),
+                };
+                if let Some(ready_tx) = ready_tx {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+                Err(error)
+            }
             ControlEndpoint::Tcp(addr) => self.serve_tcp_with_ready(addr, ready_tx),
         }
     }
 
+    #[cfg(unix)]
     pub fn serve_with_ready(
         &self,
         socket_path: &Path,
@@ -414,6 +432,24 @@ impl MasterServer {
         }
     }
 
+    #[cfg(not(unix))]
+    pub fn serve_with_ready(
+        &self,
+        socket_path: &Path,
+        ready_tx: Option<SyncSender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
+        let error = ZippyError::InvalidConfig {
+            reason: format!(
+                "unix control endpoint is not supported on this platform path=[{}]",
+                socket_path.display()
+            ),
+        };
+        if let Some(ready_tx) = ready_tx {
+            let _ = ready_tx.send(Err(error.to_string()));
+        }
+        Err(error)
+    }
+
     pub fn shutdown(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
@@ -530,6 +566,7 @@ impl MasterServer {
         }
     }
 
+    #[cfg(unix)]
     fn handle_unix_stream(&self, stream: UnixStream) -> Result<()> {
         stream
             .set_read_timeout(Some(Duration::from_secs(1)))
@@ -2234,6 +2271,7 @@ fn bus_error(error: crate::bus::BusError) -> ZippyError {
     }
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     if !socket_path.exists() {
         return Ok(());
@@ -2286,6 +2324,7 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
     }
 }
 
+#[cfg(unix)]
 fn socket_is_active(socket_path: &Path) -> Result<bool> {
     match UnixStream::connect(socket_path) {
         Ok(stream) => {
@@ -2304,12 +2343,14 @@ fn socket_is_active(socket_path: &Path) -> Result<bool> {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SocketOwnership {
     token: String,
     owner_path: std::path::PathBuf,
 }
 
+#[cfg(unix)]
 impl SocketOwnership {
     fn create(socket_path: &Path) -> Result<Self> {
         let owner_path = socket_owner_path(socket_path);
@@ -2331,6 +2372,7 @@ impl SocketOwnership {
     }
 }
 
+#[cfg(unix)]
 fn cleanup_socket(socket_path: &Path, socket_ownership: &SocketOwnership) -> Result<()> {
     if !socket_ownership.matches_socket_path(socket_path)? {
         return Ok(());
@@ -2345,6 +2387,7 @@ fn cleanup_socket(socket_path: &Path, socket_ownership: &SocketOwnership) -> Res
     }
 }
 
+#[cfg(unix)]
 fn cleanup_socket_owner_file(socket_path: &Path) -> Result<()> {
     let owner_path = socket_owner_path(socket_path);
     match fs::remove_file(owner_path) {
@@ -2354,12 +2397,14 @@ fn cleanup_socket_owner_file(socket_path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn socket_owner_path(socket_path: &Path) -> std::path::PathBuf {
     let mut owner_path = socket_path.as_os_str().to_os_string();
     owner_path.push(".owner");
     std::path::PathBuf::from(owner_path)
 }
 
+#[cfg(unix)]
 fn socket_creation_timestamp() -> Result<u128> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

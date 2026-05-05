@@ -756,8 +756,10 @@ impl StreamTableMaterializer {
                         .map_err(segment_error)?;
                     self.sealed_segment_descriptors
                         .push(sealed_descriptor.clone());
-                    self.apply_retention()?;
                     if publish_rollovers {
+                        self.publish_active_descriptor()?;
+                    }
+                    if self.apply_retention()? && publish_rollovers {
                         self.publish_active_descriptor()?;
                     }
                     self.write_materialized_row(&writer, &fields, &columns, row_index)
@@ -801,8 +803,10 @@ impl StreamTableMaterializer {
                         .map_err(segment_error)?;
                     self.sealed_segment_descriptors
                         .push(sealed_descriptor.clone());
-                    self.apply_retention()?;
                     if publish_rollovers {
+                        self.publish_active_descriptor()?;
+                    }
+                    if self.apply_retention()? && publish_rollovers {
                         self.publish_active_descriptor()?;
                     }
                     self.enqueue_persist_task(sealed, &sealed_descriptor)?;

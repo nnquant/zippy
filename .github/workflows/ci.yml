@@ -5,6 +5,19 @@ on:
   pull_request:
 
 jobs:
+  windows-check:
+    runs-on: windows-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: run windows cargo check
+        run: cargo check --workspace
+
   verify:
     runs-on: ubuntu-latest
 

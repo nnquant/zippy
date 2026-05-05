@@ -81,6 +81,9 @@ pub fn resolve_control_endpoint_with_home(uri: &str, home: &Path) -> Result<Cont
         return parse_tcp_endpoint(uri, addr);
     }
 
+    #[cfg(not(unix))]
+    let _ = home;
+
     #[cfg(unix)]
     {
         Ok(ControlEndpoint::Unix(
@@ -137,16 +140,26 @@ fn logical_endpoint_path(name: &str, home: &Path) -> PathBuf {
 }
 
 fn looks_like_path(uri: &str) -> bool {
+    if uri.starts_with("zippy://") {
+        return false;
+    }
+
     uri.starts_with('/')
         || uri.starts_with("~/")
+        || uri.starts_with("~\\")
         || uri.starts_with("./")
         || uri.starts_with("../")
+        || uri.contains('\\')
         || uri.contains('/')
+        || uri.as_bytes().get(1) == Some(&b':')
         || uri.ends_with(".sock")
 }
 
 fn expand_path(path: &str, home: &Path) -> PathBuf {
     if let Some(relative) = path.strip_prefix("~/") {
+        return home.join(relative);
+    }
+    if let Some(relative) = path.strip_prefix("~\\") {
         return home.join(relative);
     }
     if path == "~" {
@@ -157,8 +170,16 @@ fn expand_path(path: &str, home: &Path) -> PathBuf {
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = std::ffi::OsString::from(drive);
+            home.push(path);
+            Some(home)
+        })
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn parse_tcp_endpoint(original_uri: &str, addr: &str) -> Result<ControlEndpoint> {
@@ -216,11 +237,14 @@ mod tests {
     fn treats_bare_names_as_logical_endpoints() {
         assert!(!looks_like_path("default"));
         assert!(!looks_like_path("sim"));
+        assert!(!looks_like_path("zippy://default"));
         assert!(looks_like_path("/tmp/master.sock"));
         assert!(looks_like_path("~/master.sock"));
         assert!(looks_like_path("./master.sock"));
         assert!(looks_like_path("../master.sock"));
         assert!(looks_like_path("runtime/master.sock"));
+        assert!(looks_like_path(r"runtime\master.sock"));
+        assert!(looks_like_path(r"C:\zippy\master.sock"));
         assert!(looks_like_path("master.sock"));
     }
 }

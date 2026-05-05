@@ -3276,19 +3276,19 @@ impl StreamSubscriber {
         Ok(())
     }
 
-    fn stop(&mut self) -> PyResult<()> {
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let join_handle = self.join_handle.lock().unwrap().take();
         if let Some(join_handle) = join_handle {
-            join_stream_subscriber_thread(join_handle)?;
+            py.allow_threads(|| join_stream_subscriber_thread(join_handle))?;
         }
         Ok(())
     }
 
-    fn join(&mut self) -> PyResult<()> {
+    fn join(&mut self, py: Python<'_>) -> PyResult<()> {
         let join_handle = self.join_handle.lock().unwrap().take();
         if let Some(join_handle) = join_handle {
-            join_stream_subscriber_thread(join_handle)?;
+            py.allow_threads(|| join_stream_subscriber_thread(join_handle))?;
         }
         Ok(())
     }

@@ -4,6 +4,7 @@ from collections import Counter
 import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -277,7 +278,8 @@ def connect(
 
     :param uri: Master URI. When omitted,
         ``ZIPPY_MASTER_URI``, ``ZIPPY_MASTER_ENDPOINT``, ``ZIPPY_CONTROL_ENDPOINT``,
-        or ``zippy://default`` is used. ``zippy://default`` resolves to
+        or ``zippy://default`` is used. On Windows this resolves to the
+        platform default TCP loopback endpoint; on Unix it resolves to
         ``~/.zippy/control_endpoints/default/master.sock``.
     :type uri: str | None
     :param app: Optional process name to register immediately after connecting. When provided,
@@ -314,7 +316,7 @@ def connect(
         raise RuntimeError(
             "failed to connect to zippy master "
             f"uri=[{endpoint}]; start zippy-master or call zippy.connect(uri=...) "
-            "with the active master socket"
+            "with the active master endpoint"
         ) from error
 
     _set_default_master(client, heartbeat, interval_sec)
@@ -1281,16 +1283,27 @@ def _logical_control_endpoint_path(name: str) -> str:
 
 
 def _home_dir() -> Path:
-    return Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or "/tmp")
+    if home := os.environ.get("HOME"):
+        return Path(home)
+    if user_profile := os.environ.get("USERPROFILE"):
+        return Path(user_profile)
+    if (drive := os.environ.get("HOMEDRIVE")) and (path := os.environ.get("HOMEPATH")):
+        return Path(drive + path)
+    return Path(tempfile.gettempdir())
 
 
 def _looks_like_uri_path(uri: str) -> bool:
+    if uri.startswith("zippy://"):
+        return False
     return (
         uri.startswith("/")
         or uri.startswith("~/")
+        or uri.startswith("~\\")
         or uri.startswith("./")
         or uri.startswith("../")
+        or "\\" in uri
         or "/" in uri
+        or (len(uri) > 1 and uri[1] == ":")
         or uri.endswith(".sock")
     )
 
@@ -3764,9 +3777,13 @@ class Pipeline:
                 if table_options["persist_path"] is not None
                 else None
             ),
+            # Windows file-backed mappings can be deleted as soon as the
+            # upstream source retires a segment, so default to a table-owned
+            # live segment there unless callers opt in at the native layer.
             descriptor_forwarding=(
                 table_options["persist_path"] is None
                 and table_options["retention_segments"] is None
+                and os.name != "nt"
             ),
         )
         self.master.publish_segment_descriptor(name, self._engine.active_descriptor())

@@ -1,10 +1,25 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    os::fd::AsRawFd,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(not(target_os = "linux"))]
+use std::time::Instant;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::Memory::{
+        CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
+        MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    },
 };
 
 use crate::ZippySegmentStoreError;
@@ -196,61 +211,89 @@ impl ShmRegion {
         Ok(atomic.fetch_sub(value, Ordering::Release))
     }
 
-    /// 在 Linux futex 上等待共享 `u32` 发生变化。
+    /// 等待共享 `u32` 发生变化。
     pub fn wait_u32_changed(
         &self,
         offset: usize,
         observed: u32,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<bool, ZippySegmentStoreError> {
         self.checked_atomic_u32_offset(offset)?;
         if self.load_u32_acquire(offset)? != observed {
             return Ok(true);
         }
 
-        let timeout = duration_to_timespec(timeout)?;
-        let ptr = unsafe { self.inner.as_ptr().add(offset).cast::<libc::c_int>() };
-        let observed = i32::from_ne_bytes(observed.to_ne_bytes());
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                ptr,
-                libc::FUTEX_WAIT,
-                observed,
-                &timeout as *const libc::timespec,
-            )
-        };
-        if result == 0 {
-            return Ok(true);
+        #[cfg(target_os = "linux")]
+        {
+            let timeout = duration_to_timespec(timeout)?;
+            let ptr = unsafe { self.inner.as_ptr().add(offset).cast::<libc::c_int>() };
+            let observed = i32::from_ne_bytes(observed.to_ne_bytes());
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    ptr,
+                    libc::FUTEX_WAIT,
+                    observed,
+                    &timeout as *const libc::timespec,
+                )
+            };
+            if result == 0 {
+                return Ok(true);
+            }
+
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ETIMEDOUT) => Ok(false),
+                Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(true),
+                _ => Err(ZippySegmentStoreError::Shmem(format!(
+                    "failed to wait on shared memory futex error=[{}]",
+                    error
+                ))),
+            }
         }
 
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ETIMEDOUT) => Ok(false),
-            Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(true),
-            _ => Err(ZippySegmentStoreError::Shmem(format!(
-                "failed to wait on shared memory futex error=[{}]",
-                error
-            ))),
+        #[cfg(not(target_os = "linux"))]
+        {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if self.load_u32_acquire(offset)? != observed {
+                    return Ok(true);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(false);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
         }
     }
 
-    /// 唤醒等待共享 `u32` 的 Linux futex reader。
+    /// 唤醒等待共享 `u32` 的 reader。
     pub fn wake_u32(&self, offset: usize) -> Result<usize, ZippySegmentStoreError> {
         self.checked_atomic_u32_offset(offset)?;
-        let ptr = unsafe { self.inner.as_ptr().add(offset).cast::<libc::c_int>() };
-        let result =
-            unsafe { libc::syscall(libc::SYS_futex, ptr, libc::FUTEX_WAKE, libc::c_int::MAX) };
-        if result >= 0 {
-            return usize::try_from(result).map_err(|_| {
-                ZippySegmentStoreError::Shmem("futex wake result overflows usize".to_string())
-            });
+
+        #[cfg(target_os = "linux")]
+        {
+            let ptr = unsafe { self.inner.as_ptr().add(offset).cast::<libc::c_int>() };
+            let result =
+                unsafe { libc::syscall(libc::SYS_futex, ptr, libc::FUTEX_WAKE, libc::c_int::MAX) };
+            if result >= 0 {
+                return usize::try_from(result).map_err(|_| {
+                    ZippySegmentStoreError::Shmem("futex wake result overflows usize".to_string())
+                });
+            }
+
+            Err(ZippySegmentStoreError::Shmem(format!(
+                "failed to wake shared memory futex error=[{}]",
+                std::io::Error::last_os_error()
+            )))
         }
 
-        Err(ZippySegmentStoreError::Shmem(format!(
-            "failed to wake shared memory futex error=[{}]",
-            std::io::Error::last_os_error()
-        )))
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(0)
+        }
     }
 
     fn checked_range(&self, offset: usize, len: usize) -> Result<(), ZippySegmentStoreError> {
@@ -289,9 +332,8 @@ impl ShmRegion {
     }
 }
 
-fn duration_to_timespec(
-    timeout: std::time::Duration,
-) -> Result<libc::timespec, ZippySegmentStoreError> {
+#[cfg(target_os = "linux")]
+fn duration_to_timespec(timeout: Duration) -> Result<libc::timespec, ZippySegmentStoreError> {
     let tv_sec = libc::time_t::try_from(timeout.as_secs()).map_err(|_| {
         ZippySegmentStoreError::Shmem("futex timeout seconds overflow time_t".to_string())
     })?;
@@ -303,11 +345,13 @@ const FILE_OS_ID_PREFIX: &str = "file:";
 const FILE_CREATE_ATTEMPTS: usize = 100;
 
 struct MappedFile {
-    _file: File,
+    file: Option<File>,
     path: PathBuf,
     ptr: *mut u8,
     len: usize,
     owner: bool,
+    #[cfg(windows)]
+    mapping_handle: HANDLE,
 }
 
 impl fmt::Debug for MappedFile {
@@ -336,7 +380,9 @@ impl MappedFile {
             match Self::create_new(&path, size) {
                 Ok(mapping) => return Ok(mapping),
                 Err(ZippySegmentStoreError::Shmem(reason))
-                    if reason.contains("File exists") || reason.contains("file exists") =>
+                    if reason.contains("already exists")
+                        || reason.contains("File exists")
+                        || reason.contains("file exists") =>
                 {
                     continue;
                 }
@@ -355,7 +401,13 @@ impl MappedFile {
             .write(true)
             .create_new(true)
             .open(path)
-            .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
+            .map_err(|error| {
+                if error.kind() == ErrorKind::AlreadyExists {
+                    ZippySegmentStoreError::Shmem("shared memory file already exists".to_string())
+                } else {
+                    ZippySegmentStoreError::Shmem(error.to_string())
+                }
+            })?;
         file.set_len(size as u64)
             .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
         preallocate_file(&file, size)?;
@@ -389,28 +441,19 @@ impl MappedFile {
         len: usize,
         owner: bool,
     ) -> Result<Self, ZippySegmentStoreError> {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(ZippySegmentStoreError::Shmem(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
+        #[cfg(unix)]
+        let ptr = map_file(&file, len)?;
+        #[cfg(windows)]
+        let (ptr, mapping_handle) = map_file(&file, len)?;
 
         Ok(Self {
-            _file: file,
+            file: Some(file),
             path,
-            ptr: ptr.cast::<u8>(),
+            ptr,
             len,
             owner,
+            #[cfg(windows)]
+            mapping_handle,
         })
     }
 
@@ -435,6 +478,58 @@ impl MappedFile {
     }
 }
 
+#[cfg(unix)]
+fn map_file(file: &File, len: usize) -> Result<*mut u8, ZippySegmentStoreError> {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(ZippySegmentStoreError::Shmem(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    Ok(ptr.cast::<u8>())
+}
+
+#[cfg(windows)]
+fn map_file(file: &File, len: usize) -> Result<(*mut u8, HANDLE), ZippySegmentStoreError> {
+    let len = u64::try_from(len).map_err(|_| {
+        ZippySegmentStoreError::Shmem("shared memory file length overflows u64".to_string())
+    })?;
+    let mapping_handle = unsafe {
+        CreateFileMappingW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            (len >> 32) as u32,
+            len as u32,
+            std::ptr::null(),
+        )
+    };
+    if mapping_handle.is_null() {
+        return Err(ZippySegmentStoreError::Shmem(
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+
+    let view = unsafe { MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, len as usize) };
+    if view.Value.is_null() {
+        let error = std::io::Error::last_os_error();
+        let _ = unsafe { CloseHandle(mapping_handle) };
+        return Err(ZippySegmentStoreError::Shmem(error.to_string()));
+    }
+
+    Ok((view.Value.cast::<u8>(), mapping_handle))
+}
+
+#[cfg(unix)]
 fn preallocate_file(file: &File, len: usize) -> Result<(), ZippySegmentStoreError> {
     let len = libc::off_t::try_from(len).map_err(|_| {
         ZippySegmentStoreError::Shmem("shared memory file length overflows off_t".to_string())
@@ -449,11 +544,34 @@ fn preallocate_file(file: &File, len: usize) -> Result<(), ZippySegmentStoreErro
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn preallocate_file(_file: &File, _len: usize) -> Result<(), ZippySegmentStoreError> {
+    Ok(())
+}
+
 impl Drop for MappedFile {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            let _ = unsafe { libc::munmap(self.ptr.cast(), self.len) };
+            #[cfg(unix)]
+            {
+                let _ = unsafe { libc::munmap(self.ptr.cast(), self.len) };
+            }
+            #[cfg(windows)]
+            {
+                let _ = unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.ptr.cast(),
+                    })
+                };
+            }
+            self.ptr = std::ptr::null_mut();
         }
+        #[cfg(windows)]
+        if !self.mapping_handle.is_null() {
+            let _ = unsafe { CloseHandle(self.mapping_handle) };
+            self.mapping_handle = std::ptr::null_mut();
+        }
+        drop(self.file.take());
         if self.owner {
             let _ = fs::remove_file(&self.path);
         }

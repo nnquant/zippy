@@ -5051,16 +5051,32 @@ def test_cross_sectional_engine_start_can_retry_after_publisher_failure() -> Non
 
 
 def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
-    control_endpoint = str(tmp_path / "zippy-master.sock")
+    control_endpoint = (
+        unused_loopback_uri() if os.name == "nt" else str(tmp_path / "zippy-master.sock")
+    )
     server = zippy.MasterServer(control_endpoint=control_endpoint)
     server.start()
     return server, control_endpoint
 
 
+def unused_loopback_uri() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        _, port = listener.getsockname()
+    return f"tcp://127.0.0.1:{port}"
+
+
 def expire_process_for_test(control_endpoint: str, process_id: str) -> dict[str, object]:
     request = json.dumps({"ExpireProcessForTest": {"process_id": process_id}}) + "\n"
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.connect(control_endpoint)
+    if control_endpoint.startswith("tcp://"):
+        host, port_text = control_endpoint.removeprefix("tcp://").rsplit(":", 1)
+        address = (host, int(port_text))
+        family = socket.AF_INET
+    else:
+        address = control_endpoint
+        family = socket.AF_UNIX
+    with socket.socket(family, socket.SOCK_STREAM) as client:
+        client.connect(address)
         client.sendall(request.encode("utf-8"))
         response = client.makefile("r", encoding="utf-8").readline()
     if not response:
@@ -9433,6 +9449,56 @@ def test_pipeline_stream_table_explicit_persist_none_overrides_master_default(
     assert kwargs["row_capacity"] == 2048
     assert kwargs["persist_path"] is None
     assert kwargs["persist_publisher"] is None
+
+
+def test_pipeline_stream_table_disables_default_descriptor_forwarding_on_windows(
+    monkeypatch,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    created: dict[str, object] = {}
+
+    class FakeMaster:
+        def process_id(self) -> str | None:
+            return "proc_1"
+
+        def register_stream(
+            self,
+            stream_name: str,
+            schema: pa.Schema,
+            buffer_size: int,
+            frame_size: int,
+        ) -> None:
+            return None
+
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            return None
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            created["kwargs"] = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+    monkeypatch.setattr(zippy.os, "name", "nt")
+
+    zippy.Pipeline("test_ingest", master=FakeMaster()).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        persist=None,
+    )
+
+    assert created["kwargs"]["descriptor_forwarding"] is False
 
 
 def test_pipeline_stream_table_rejects_legacy_partition_dt_part_format() -> None:

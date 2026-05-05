@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use zippy_core::bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,

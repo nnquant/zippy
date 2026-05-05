@@ -129,6 +129,12 @@ pub fn run_profile(config: &PerfConfig) -> PerfResult<PerfReport> {
 
 pub fn write_report_json(path: &Path, report: &PerfReport) -> PerfResult<()> {
     let json = serde_json::to_string_pretty(report).map_err(|error| error.to_string())?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
     fs::write(path, json).map_err(|error| error.to_string())
 }
 
@@ -1075,7 +1081,6 @@ fn evaluate_pass(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -1161,8 +1166,8 @@ mod tests {
     fn writes_report_json_with_profile_and_pass_fields() {
         let report =
             run_profile(&test_config(PerfProfile::InprocTimeseries, test_endpoint())).unwrap();
-        let path = PathBuf::from(format!(
-            "/tmp/zippy-perf-report-{}.json",
+        let path = std::env::temp_dir().join(format!(
+            "zippy-perf-report-{}.json",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
