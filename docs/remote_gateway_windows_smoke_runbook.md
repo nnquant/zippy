@@ -83,7 +83,29 @@ uv run zippy gateway run \
 - config 中的 `remote_gateway.endpoint`；
 - GatewayServer 的 `--endpoint`。
 
-## 4. Windows 侧 smoke
+## 4. Windows 侧准备
+
+先确认 Windows 原生 Python 能导入 zippy：
+
+```powershell
+python -c "import sys; print(sys.executable); import zippy; print(zippy.__file__)"
+```
+
+如果没有安装 zippy，需要先安装 Windows 版 wheel，或在 Windows 环境中构建 editable
+扩展。构建前置条件：
+
+- Windows Python 版本与 wheel tag 匹配；
+- Rust MSVC toolchain 可用，`rustc --version` 和 `cargo --version` 能正常返回；
+- `maturin` 可用；
+- rustup 不能卡在 channel 同步或下载超时。
+
+如果 `zippy` console script 不在 `PATH` 中，也可以使用 Python module 入口：
+
+```powershell
+python -m zippy.cli --help
+```
+
+## 5. Windows 侧 smoke
 
 在 Windows 原生 Python 环境中安装或切换到当前 zippy 包后运行：
 
@@ -113,9 +135,9 @@ zippy gateway smoke-client `
 }
 ```
 
-## 5. 失败排查
+## 6. 失败排查
 
-### 5.1 master 连接失败
+### 6.1 master 连接失败
 
 现象：
 
@@ -129,7 +151,7 @@ io error reason=[connection refused]
 - 确认 Windows 侧 `<wsl-host>:17690` 可以连通；
 - 检查 Windows 防火墙、WSL 网络、端口转发配置。
 
-### 5.2 Gateway 连接失败
+### 6.2 Gateway 连接失败
 
 现象：
 
@@ -144,7 +166,7 @@ gateway endpoint unavailable
 - 不要把 endpoint 写成 `127.0.0.1:17666`，除非 Windows client 与 GatewayServer
   在同一个 OS 网络命名空间内。
 
-### 5.3 token 错误
+### 6.3 token 错误
 
 现象：
 
@@ -158,7 +180,22 @@ gateway request unauthorized
 - 如果不需要 token，两边都不要配置 token；
 - 不要只改 GatewayServer 参数而忘记重启 master。
 
-### 5.4 查询不到刚写入的数据
+### 6.4 Windows Python 没有 zippy
+
+现象：
+
+```text
+ModuleNotFoundError: No module named 'zippy'
+```
+
+排查：
+
+- 确认当前 `python` 是预期的 Windows Python，不是 WSL Python；
+- 优先安装 Windows 版 zippy wheel；
+- 如果需要本地构建，先让 `rustc --version`、`cargo --version` 和 `python -m pip show maturin`
+  都能正常返回。
+
+### 6.5 查询不到刚写入的数据
 
 排查：
 
@@ -166,7 +203,7 @@ gateway request unauthorized
 - 确认 smoke-client 输出里没有 write error；
 - 换一个新的 stream name 重试，避免旧测试数据或旧 master metadata 干扰。
 
-## 6. Linux 侧替代 smoke
+## 7. Linux 侧替代 smoke
 
 如果当前没有 Windows 环境，可以先在 Linux/WSL 内跑跨进程 smoke：
 
