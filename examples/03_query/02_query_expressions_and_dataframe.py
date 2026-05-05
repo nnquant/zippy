@@ -36,14 +36,12 @@ def main() -> None:
         predicate = predicate & zp.col("instrument_id").is_in(args.instrument)
 
     result = (
-        query.where(predicate)
+        query.filter(predicate)
         .select(
-            [
-                "instrument_id",
-                "dt",
-                "last_price",
-                (zp.col("last_price") * zp.col("volume")).alias("notional"),
-            ]
+            "instrument_id",
+            "dt",
+            "last_price",
+            notional=zp.col("last_price") * zp.col("volume"),
         )
         .collect()
     )
@@ -53,12 +51,12 @@ def main() -> None:
 
     try:
         print("pandas.DataFrame:")
-        print(query.where(predicate).to_pandas())
+        print(query.filter(predicate).to_pandas())
     except ImportError:
         print("pandas 未安装，跳过 pandas.DataFrame 转换示例")
 
     print("polars.DataFrame:")
-    print(query.where(predicate).to_polars())
+    print(query.filter(predicate).to_polars())
 
 
 if __name__ == "__main__":

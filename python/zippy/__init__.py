@@ -111,6 +111,22 @@ class _QueryExpr:
         """Return an expression testing membership in ``values``."""
         return _QueryExpr("is_in", None, (self, values))
 
+    def is_null(self) -> _QueryExpr:
+        """Return an expression testing whether this expression is null."""
+        return _QueryExpr("is_null", None, (self,))
+
+    def is_not_null(self) -> _QueryExpr:
+        """Return an expression testing whether this expression is not null."""
+        return _QueryExpr("is_not_null", None, (self,))
+
+    def is_between(self, lower_bound: object, upper_bound: object) -> _QueryExpr:
+        """Return an inclusive range predicate for this expression."""
+        return _QueryExpr(
+            "is_between",
+            None,
+            (self, _literal(lower_bound), _literal(upper_bound)),
+        )
+
     def __eq__(self, other: object) -> _QueryExpr:  # type: ignore[override]
         return self._binary("eq", other)
 
@@ -159,6 +175,12 @@ class _QueryExpr:
     def __rtruediv__(self, other: object) -> _QueryExpr:
         return _literal(other)._binary("div", self)
 
+    def __invert__(self) -> _QueryExpr:
+        return _QueryExpr("unary", "not", (self,))
+
+    def __neg__(self) -> _QueryExpr:
+        return _QueryExpr("unary", "neg", (self,))
+
     def __bool__(self) -> bool:
         raise TypeError("query expressions cannot be evaluated as booleans; use '&' or '|'")
 
@@ -176,6 +198,18 @@ def col(name: str) -> _QueryExpr:
     :rtype: zippy query expression
     """
     return _QueryExpr("col", str(name))
+
+
+def lit(value: object) -> _QueryExpr:
+    """
+    Create a Zippy query literal expression.
+
+    :param value: Literal value used in a query expression.
+    :type value: object
+    :returns: Table expression wrapping the literal value.
+    :rtype: zippy query expression
+    """
+    return _literal(value)
 
 
 def _literal(value: object) -> _QueryExpr:
@@ -200,6 +234,23 @@ def _compile_query_expr_to_polars(expr: object):
         return _compile_query_expr_to_polars(expr._args[0]).alias(str(expr._value))
     if expr._kind == "is_in":
         return _compile_query_expr_to_polars(expr._args[0]).is_in(expr._args[1])
+    if expr._kind == "is_null":
+        return _compile_query_expr_to_polars(expr._args[0]).is_null()
+    if expr._kind == "is_not_null":
+        return _compile_query_expr_to_polars(expr._args[0]).is_not_null()
+    if expr._kind == "is_between":
+        return _compile_query_expr_to_polars(expr._args[0]).is_between(
+            _compile_query_expr_to_polars(expr._args[1]),
+            _compile_query_expr_to_polars(expr._args[2]),
+        )
+    if expr._kind == "unary":
+        value = _compile_query_expr_to_polars(expr._args[0])
+        op = expr._value
+        if op == "not":
+            return ~value
+        if op == "neg":
+            return -value
+        raise ValueError(f"unsupported query expression operator=[{op}]")
     if expr._kind != "binary":
         raise ValueError(f"unsupported query expression kind=[{expr._kind}]")
 
@@ -231,6 +282,109 @@ def _compile_query_expr_to_polars(expr: object):
     if op == "div":
         return left / right
     raise ValueError(f"unsupported query expression operator=[{op}]")
+
+
+def _expr_columns(expr: object) -> set[str]:
+    if isinstance(expr, str):
+        return {expr}
+    if not isinstance(expr, _QueryExpr):
+        return set()
+    if expr._kind == "col":
+        return {str(expr._value)}
+    columns: set[str] = set()
+    for arg in expr._args:
+        columns.update(_expr_columns(arg))
+    return columns
+
+
+def _normalize_query_exprs(
+    exprs: tuple[object, ...],
+    named_exprs: dict[str, object],
+) -> list[object]:
+    normalized: list[object] = []
+    if len(exprs) == 1 and isinstance(exprs[0], (list, tuple)):
+        normalized.extend(exprs[0])
+    else:
+        normalized.extend(exprs)
+    for name, expr in named_exprs.items():
+        normalized.append(_literal(expr).alias(name))
+    return normalized
+
+
+def _combine_filter_ops(filters: list[object]) -> object | None:
+    predicate: object | None = None
+    for item in filters:
+        predicate = _combine_query_predicates(predicate, item)
+    return predicate
+
+
+def _predicate_to_pyarrow_filters(
+    predicate: object | None,
+) -> list[tuple[str, str, object]] | None:
+    if predicate is None:
+        return None
+    if isinstance(predicate, _QueryExpr):
+        if predicate._kind == "binary":
+            op = str(predicate._value)
+            left, right = predicate._args
+            if op == "and":
+                left_filters = _predicate_to_pyarrow_filters(left)
+                right_filters = _predicate_to_pyarrow_filters(right)
+                if left_filters is None or right_filters is None:
+                    return None
+                return left_filters + right_filters
+            pyarrow_op = {
+                "eq": "==",
+                "ne": "!=",
+                "gt": ">",
+                "ge": ">=",
+                "lt": "<",
+                "le": "<=",
+            }.get(op)
+            if pyarrow_op is None:
+                return None
+            simple = _simple_column_literal_pair(left, right)
+            if simple is None:
+                reverse = _simple_column_literal_pair(right, left)
+                if reverse is None:
+                    return None
+                column, value = reverse
+                reverse_op = {
+                    "==": "==",
+                    "!=": "!=",
+                    ">": "<",
+                    ">=": "<=",
+                    "<": ">",
+                    "<=": ">=",
+                }[pyarrow_op]
+                return [(column, reverse_op, value)]
+            column, value = simple
+            return [(column, pyarrow_op, value)]
+        if predicate._kind == "is_in":
+            target = predicate._args[0]
+            values = predicate._args[1]
+            if isinstance(target, _QueryExpr) and target._kind == "col":
+                return [(str(target._value), "in", list(values))]
+    return None
+
+
+def _simple_column_literal_pair(left: object, right: object) -> tuple[str, object] | None:
+    if not (isinstance(left, _QueryExpr) and left._kind == "col"):
+        return None
+    if isinstance(right, _QueryExpr):
+        if right._kind != "literal":
+            return None
+        return (str(left._value), right._value)
+    return (str(left._value), right)
+
+
+def _ordered_subset(values: set[str], schema: object | None = None) -> list[str]:
+    if schema is not None:
+        names = list(getattr(schema, "names", []))
+        ordered = [name for name in names if name in values]
+        ordered.extend(sorted(values - set(ordered)))
+        return ordered
+    return sorted(values)
 
 
 def _combine_query_predicates(left: object | None, right: object | None) -> object | None:
@@ -1473,6 +1627,7 @@ class Table:
         *,
         wait: bool = False,
         timeout: float | str | None = None,
+        snapshot: bool = True,
     ) -> None:
         selected_master = master or _default_master()
         self.source = source
@@ -1481,8 +1636,9 @@ class Table:
             if wait:
                 _wait_for_table_ready(source, selected_master, timeout)
             self._inner = _NativeQuery(source=source, master=selected_master)
-            self._select_exprs: list[object] | None = None
-            self._where_expr: object | None = None
+            self._snapshot_enabled = bool(snapshot)
+            self._fixed_snapshot: dict[str, object] | None = None
+            self._plan_ops: list[tuple[str, object]] = []
         except RuntimeError as error:
             raise RuntimeError(
                 f"failed to read table source=[{source}] "
@@ -1506,6 +1662,8 @@ class Table:
             raise ValueError("n must be non-negative")
         if self._has_query_plan():
             table = self.collect()
+            if n == 0:
+                return table.slice(0, 0)
             return table.slice(table.num_rows - n)
 
         live = self._inner.tail(n)
@@ -1577,9 +1735,13 @@ class Table:
         :returns: Table snapshot metadata including active and retained sealed segments.
         :rtype: dict[str, object]
         """
+        if self._snapshot_enabled:
+            if self._fixed_snapshot is None:
+                self._fixed_snapshot = self._inner.snapshot()
+            return self._fixed_snapshot
         return self._inner.snapshot()
 
-    def scan_live(self):
+    def _scan_live(self):
         """
         Return a PyArrow RecordBatchReader over live segment data.
 
@@ -1591,7 +1753,7 @@ class Table:
         """
         return self._inner.scan_live()
 
-    def select(self, columns: object) -> Table:
+    def select(self, *columns: object, **named_exprs: object) -> Table:
         """
         Return a query selecting columns or expressions.
 
@@ -1600,13 +1762,10 @@ class Table:
         :returns: New table reader with projection applied at execution time.
         :rtype: Table
         """
-        if isinstance(columns, (str, _QueryExpr)):
-            select_exprs = [columns]
-        else:
-            select_exprs = list(columns)
+        select_exprs = _normalize_query_exprs(columns, named_exprs)
         return self._clone_with_plan(select_exprs=select_exprs)
 
-    def where(self, predicate: object | None = None, **equals: object) -> Table:
+    def filter(self, predicate: object | None = None, **equals: object) -> Table:
         """
         Return a query filtered by a predicate expression.
 
@@ -1621,8 +1780,65 @@ class Table:
                 predicate_expr,
                 col(name) == value,
             )
-        combined = _combine_query_predicates(self._where_expr, predicate_expr)
-        return self._clone_with_plan(where_expr=combined)
+        if predicate_expr is None:
+            return self
+        return self._clone_with_plan(filter_expr=predicate_expr)
+
+    def where(self, predicate: object | None = None, **equals: object) -> Table:
+        """
+        Compatibility alias for :meth:`filter`.
+
+        New user code should prefer ``filter`` to match Polars naming.
+        """
+        return self.filter(predicate, **equals)
+
+    def with_columns(self, *exprs: object, **named_exprs: object) -> Table:
+        """
+        Return a query with additional or replaced columns.
+
+        :param exprs: Zippy query expressions.
+        :type exprs: object
+        :returns: New table reader with expressions evaluated at execution time.
+        :rtype: Table
+        """
+        column_exprs = _normalize_query_exprs(exprs, named_exprs)
+        if not column_exprs:
+            return self
+        return self._clone_with_plan(with_columns_exprs=column_exprs)
+
+    def join(
+        self,
+        other: Table,
+        *,
+        on: str | list[str] | tuple[str, ...],
+        how: str = "inner",
+        suffix: str = "_right",
+    ) -> Table:
+        """
+        Return a query joining another Zippy table query.
+
+        :param other: Right-hand table query.
+        :type other: Table
+        :param on: Join key column or columns.
+        :type on: str | list[str] | tuple[str, ...]
+        :param how: Join mode forwarded to Polars.
+        :type how: str
+        :param suffix: Suffix for duplicate right-hand column names.
+        :type suffix: str
+        :returns: New table reader with join applied at execution time.
+        :rtype: Table
+        """
+        if not isinstance(other, Table):
+            raise TypeError("join other must be a zippy.Table")
+        keys = [on] if isinstance(on, str) else [str(item) for item in on]
+        return self._clone_with_plan(
+            join_spec={
+                "other": other,
+                "on": keys,
+                "how": str(how),
+                "suffix": str(suffix),
+            }
+        )
 
     def between(self, column: object, start: object, end: object) -> Table:
         """
@@ -1638,7 +1854,7 @@ class Table:
         :rtype: Table
         """
         column_expr = col(column) if isinstance(column, str) else _literal(column)
-        return self.where((column_expr >= start) & (column_expr <= end))
+        return self.filter((column_expr >= start) & (column_expr <= end))
 
     def collect(self):
         """
@@ -1651,9 +1867,21 @@ class Table:
         :rtype: pyarrow.Table
         """
         snapshot = self.snapshot()
-        persisted = _collect_persisted_rows(snapshot)
-        live = self.scan_live().read_all()
-        table = _concat_query_tables([persisted, live], self.schema())
+        schema = self.schema()
+        read_columns = self._source_read_columns(schema)
+        pushdown_filters = self._pushdown_filters(schema)
+        persisted = _collect_persisted_rows(
+            snapshot,
+            columns=read_columns,
+            filters=pushdown_filters,
+        )
+        live = self._scan_live_snapshot(snapshot).read_all()
+        live = _filter_query_table(live, pushdown_filters)
+        live = _select_query_columns(live, read_columns)
+        table = _concat_query_tables(
+            [persisted, live],
+            _schema_for_query_columns(schema, read_columns),
+        )
         return self._apply_query_plan(table)
 
     def to_pyarrow(self):
@@ -1730,7 +1958,7 @@ class Table:
         """
         return list(self.stream_info().get("segment_reader_leases", []))
 
-    def scan_persisted(self):
+    def _scan_persisted(self):
         """
         Return a PyArrow Dataset over persisted parquet files.
 
@@ -1750,19 +1978,28 @@ class Table:
         self,
         *,
         select_exprs: list[object] | None = None,
-        where_expr: object | None = None,
+        filter_expr: object | None = None,
+        with_columns_exprs: list[object] | None = None,
+        join_spec: dict[str, object] | None = None,
     ) -> Table:
         table = object.__new__(Table)
         table.source = self.source
         table._inner = self._inner
-        table._select_exprs = (
-            list(select_exprs) if select_exprs is not None else self._select_exprs
-        )
-        table._where_expr = self._where_expr if where_expr is None else where_expr
+        table._snapshot_enabled = self._snapshot_enabled
+        table._fixed_snapshot = self._fixed_snapshot
+        table._plan_ops = list(self._plan_ops)
+        if filter_expr is not None:
+            table._plan_ops.append(("filter", filter_expr))
+        if select_exprs is not None:
+            table._plan_ops.append(("select", list(select_exprs)))
+        if with_columns_exprs is not None:
+            table._plan_ops.append(("with_columns", list(with_columns_exprs)))
+        if join_spec is not None:
+            table._plan_ops.append(("join", join_spec))
         return table
 
     def _has_query_plan(self) -> bool:
-        return self._select_exprs is not None or self._where_expr is not None
+        return bool(self._plan_ops)
 
     def _apply_query_plan(self, table):
         if not self._has_query_plan():
@@ -1771,13 +2008,66 @@ class Table:
         import polars as pl
 
         frame = pl.from_arrow(table).lazy()
-        if self._where_expr is not None:
-            frame = frame.filter(_compile_query_expr_to_polars(self._where_expr))
-        if self._select_exprs is not None:
-            frame = frame.select(
-                [_compile_query_expr_to_polars(expr) for expr in self._select_exprs]
-            )
+        for kind, value in self._plan_ops:
+            if kind == "filter":
+                frame = frame.filter(_compile_query_expr_to_polars(value))
+            elif kind == "select":
+                frame = frame.select(
+                    [_compile_query_expr_to_polars(expr) for expr in value]
+                )
+            elif kind == "with_columns":
+                frame = frame.with_columns(
+                    [_compile_query_expr_to_polars(expr) for expr in value]
+                )
+            elif kind == "join":
+                other = value["other"]
+                right_frame = pl.from_arrow(other.collect()).lazy()
+                frame = frame.join(
+                    right_frame,
+                    on=value["on"],
+                    how=value["how"],
+                    suffix=value["suffix"],
+                )
+            else:
+                raise ValueError(f"unsupported table plan operation=[{kind}]")
         return frame.collect().to_arrow()
+
+    def _scan_live_snapshot(self, snapshot: dict[str, object]):
+        scan_snapshot = getattr(self._inner, "scan_snapshot", None)
+        if callable(scan_snapshot):
+            return scan_snapshot(snapshot)
+        return self._inner.scan_live()
+
+    def _source_read_columns(self, schema: object | None) -> list[str] | None:
+        if not self._plan_ops:
+            return None
+        if any(kind == "join" for kind, _ in self._plan_ops):
+            return None
+        if not any(kind == "select" for kind, _ in self._plan_ops):
+            return None
+        required: set[str] = set()
+        for kind, value in self._plan_ops:
+            if kind == "filter":
+                required.update(_expr_columns(value))
+            elif kind in {"select", "with_columns"}:
+                for expr in value:
+                    required.update(_expr_columns(expr))
+        if not required:
+            return None
+        return _ordered_subset(required, schema)
+
+    def _pushdown_filters(self, schema: object | None) -> list[tuple[str, str, object]] | None:
+        filters = [value for kind, value in self._plan_ops if kind == "filter"]
+        predicate = _combine_filter_ops(filters)
+        pyarrow_filters = _predicate_to_pyarrow_filters(predicate)
+        if pyarrow_filters is None:
+            return None
+        if schema is None:
+            return pyarrow_filters
+        schema_names = set(getattr(schema, "names", []))
+        if any(column not in schema_names for column, _, _ in pyarrow_filters):
+            return None
+        return pyarrow_filters
 
 def read_table(
     source: str,
@@ -1785,6 +2075,7 @@ def read_table(
     *,
     wait: bool = False,
     timeout: float | str | None = None,
+    snapshot: bool = True,
 ) -> Table:
     """
     Open a named Zippy table.
@@ -1798,10 +2089,13 @@ def read_table(
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"500ms"``,
         ``"30s"`` or ``"2m"``. ``None`` waits indefinitely.
     :type timeout: float | str | None
+    :param snapshot: When true, reuse one query snapshot for repeated terminal operations. When
+        false, each terminal operation resolves the latest table snapshot.
+    :type snapshot: bool
     :returns: Table object for further operations such as ``tail``.
     :rtype: Table
     """
-    return Table(source=source, master=master, wait=wait, timeout=timeout)
+    return Table(source=source, master=master, wait=wait, timeout=timeout, snapshot=snapshot)
 
 
 def compare_replay(
@@ -1949,22 +2243,36 @@ def _tail_persisted_rows(snapshot: dict[str, object], n: int):
     return combined
 
 
-def _collect_persisted_rows(snapshot: dict[str, object]):
+def _collect_persisted_rows(
+    snapshot: dict[str, object],
+    *,
+    columns: list[str] | None = None,
+    filters: object | None = None,
+):
     files = _non_overlapping_persisted_files(snapshot)
     if not files:
         return None
 
     tables = [
-        _read_persisted_parquet_file(item["file_path"])
+        _read_persisted_parquet_file(
+            item["file_path"],
+            columns=columns,
+            filters=filters,
+        )
         for item in sorted(files, key=_persisted_file_order_key)
     ]
     return _concat_query_tables(tables, None)
 
 
-def _read_persisted_parquet_file(file_path: object):
+def _read_persisted_parquet_file(
+    file_path: object,
+    *,
+    columns: list[str] | None = None,
+    filters: object | None = None,
+):
     import pyarrow.parquet as pq
 
-    return pq.read_table(str(file_path), partitioning=None)
+    return pq.read_table(str(file_path), columns=columns, filters=filters, partitioning=None)
 
 
 def _non_overlapping_persisted_files(
@@ -2005,6 +2313,55 @@ def _concat_query_tables(tables: list[object | None], schema: object | None):
     if schema is None:
         return None
     return pa.Table.from_batches([], schema=schema)
+
+
+def _select_query_columns(table: object, columns: list[str] | None):
+    if columns is None:
+        return table
+    available = [name for name in columns if name in table.column_names]
+    return table.select(available)
+
+
+def _filter_query_table(table: object, filters: object | None):
+    if not filters:
+        return table
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    mask = None
+    for column, op, value in filters:
+        if column not in table.column_names:
+            return table
+        column_values = table[column]
+        if op == "==":
+            current = pc.equal(column_values, value)
+        elif op == "!=":
+            current = pc.not_equal(column_values, value)
+        elif op == ">":
+            current = pc.greater(column_values, value)
+        elif op == ">=":
+            current = pc.greater_equal(column_values, value)
+        elif op == "<":
+            current = pc.less(column_values, value)
+        elif op == "<=":
+            current = pc.less_equal(column_values, value)
+        elif op == "in":
+            current = pc.is_in(column_values, value_set=pa.array(value))
+        else:
+            return table
+        mask = current if mask is None else pc.and_(mask, current)
+    if mask is None:
+        return table
+    return table.filter(mask)
+
+
+def _schema_for_query_columns(schema: object | None, columns: list[str] | None):
+    if schema is None or columns is None:
+        return schema
+    import pyarrow as pa
+
+    fields = [schema.field(name) for name in columns if name in schema.names]
+    return pa.schema(fields)
 
 
 def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int]]:
@@ -2143,6 +2500,142 @@ class Row:
         return dict(self._values)
 
 
+def _require_positive_optional_int(name: str, value: int | None) -> int | None:
+    if value is None:
+        return None
+    normalized = int(value)
+    if normalized <= 0:
+        raise ValueError(f"{name} must be positive")
+    return normalized
+
+
+def _instrument_ids_from_query_filter(filter_expr: object | None) -> list[str] | None:
+    if filter_expr is None:
+        return None
+    filters = _predicate_to_pyarrow_filters(filter_expr)
+    if not filters:
+        raise ValueError(
+            "subscribe row filter only supports zp.col('instrument_id') equality/is_in"
+        )
+
+    selected: set[str] | None = None
+    ordered: list[str] = []
+    for column, op, value in filters:
+        if column != "instrument_id":
+            raise ValueError(
+                "subscribe row filter only supports zp.col('instrument_id') equality/is_in"
+            )
+        if op == "==":
+            values = [str(value)]
+        elif op == "in":
+            values = [str(item) for item in value]
+        else:
+            raise ValueError(
+                "subscribe row filter only supports zp.col('instrument_id') equality/is_in"
+            )
+
+        value_set = set(values)
+        if selected is None:
+            selected = value_set
+            ordered = values
+        else:
+            selected &= value_set
+            ordered = [item for item in ordered if item in selected]
+
+    return ordered if selected is not None else None
+
+
+def _pyarrow_filters_from_query_filter(filter_expr: object | None):
+    if filter_expr is None:
+        return None
+    filters = _predicate_to_pyarrow_filters(filter_expr)
+    if filters is None:
+        raise ValueError(
+            "subscribe_table filter only supports simple zp.col predicates that can run on Arrow"
+        )
+    return filters
+
+
+class _TableSubscriptionCallback:
+    """
+    Adapt native incremental Arrow tables into filtered, batched table callbacks.
+    """
+
+    def __init__(
+        self,
+        callback,
+        *,
+        filter_expr: object | None = None,
+        batch_size: int | None = None,
+        throttle_ms: int | None = None,
+        count: int | None = None,
+    ) -> None:
+        self._callback = callback
+        self._filters = _pyarrow_filters_from_query_filter(filter_expr)
+        self._batch_size = _require_positive_optional_int("batch_size", batch_size)
+        self._throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
+        self._count = _require_positive_optional_int("count", count)
+        self._pending: list[object] = []
+        self._pending_rows = 0
+        self._last_emit_ns = time.perf_counter_ns()
+        self._immediate = (
+            self._filters is None
+            and self._batch_size is None
+            and self._throttle_ms is None
+            and self._count is None
+        )
+
+    def __call__(self, table: object) -> None:
+        if self._immediate:
+            self._callback(table)
+            return
+
+        table = _filter_query_table(table, self._filters)
+        row_count = int(getattr(table, "num_rows", 0))
+        if row_count <= 0:
+            return
+
+        if self._batch_size is None and self._throttle_ms is None:
+            self._callback(self._tail(table))
+            return
+
+        self._pending.append(table)
+        self._pending_rows += row_count
+        if self._should_emit():
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._pending:
+            return
+        import pyarrow as pa
+
+        if len(self._pending) == 1:
+            table = self._pending[0]
+        else:
+            table = pa.concat_tables(self._pending)
+        table = self._tail(table)
+        self._pending = []
+        self._pending_rows = 0
+        self._last_emit_ns = time.perf_counter_ns()
+        self._callback(table)
+
+    def _should_emit(self) -> bool:
+        if self._batch_size is not None and self._pending_rows >= self._batch_size:
+            return True
+        if self._throttle_ms is None:
+            return False
+        elapsed_ns = time.perf_counter_ns() - self._last_emit_ns
+        return elapsed_ns >= self._throttle_ms * 1_000_000
+
+    def _tail(self, table: object) -> object:
+        if self._count is None:
+            return table
+        row_count = int(getattr(table, "num_rows", 0))
+        if row_count <= self._count:
+            return table
+        return table.slice(row_count - self._count, self._count)
+
+
 class StreamSubscriber:
     """
     Subscribe to a named stream and invoke a local Python callback with rows.
@@ -2165,6 +2658,8 @@ class StreamSubscriber:
     :type idle_spin_checks: int
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
+    :param filter: Optional ``zp.col`` predicate. Row mode supports ``instrument_id`` equality/is_in.
+    :type filter: object | None
     :param wait: When true, wait until the stream exists and has an active segment descriptor.
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
@@ -2182,6 +2677,10 @@ class StreamSubscriber:
         xfast: bool = False,
         idle_spin_checks: int = 64,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+        filter: object | None = None,
+        batch_size: int | None = None,
+        throttle_ms: int | None = None,
+        count: int | None = None,
         wait: bool = False,
         timeout: float | str | None = None,
         _table_callback: bool = False,
@@ -2190,8 +2689,26 @@ class StreamSubscriber:
         _ensure_master_process(selected_master, f"subscribe.{source}")
         if wait:
             _wait_for_table_ready(source, selected_master, timeout)
+        self._table_callback_adapter: _TableSubscriptionCallback | None = None
+        if filter is not None and instrument_ids is not None:
+            raise ValueError("filter and instrument_ids cannot be used together")
         if _table_callback and instrument_ids is not None:
             raise ValueError("instrument_ids is only supported by subscribe row callbacks")
+        if _table_callback:
+            callback = _TableSubscriptionCallback(
+                callback,
+                filter_expr=filter,
+                batch_size=batch_size,
+                throttle_ms=throttle_ms,
+                count=count,
+            )
+            self._table_callback_adapter = callback
+        else:
+            if instrument_ids is None:
+                instrument_ids = _instrument_ids_from_query_filter(filter)
+            _require_positive_optional_int("batch_size", batch_size)
+            _require_positive_optional_int("throttle_ms", throttle_ms)
+            _require_positive_optional_int("count", count)
         if poll_interval_ms is None:
             effective_poll_interval_ms = 10 if _table_callback else 1
         else:
@@ -2224,6 +2741,8 @@ class StreamSubscriber:
         :raises RuntimeError: If the background subscriber failed.
         """
         self._inner.stop()
+        if self._table_callback_adapter is not None:
+            self._table_callback_adapter.flush()
 
     def join(self) -> None:
         """
@@ -2232,6 +2751,8 @@ class StreamSubscriber:
         :raises RuntimeError: If the background subscriber failed.
         """
         self._inner.join()
+        if self._table_callback_adapter is not None:
+            self._table_callback_adapter.flush()
 
     def metrics(self) -> dict[str, object]:
         """
@@ -2252,6 +2773,7 @@ def subscribe(
     xfast: bool = False,
     idle_spin_checks: int = 64,
     instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+    filter: object | None = None,
     wait: bool = False,
     timeout: float | str | None = None,
 ) -> StreamSubscriber:
@@ -2276,6 +2798,8 @@ def subscribe(
     :type idle_spin_checks: int
     :param instrument_ids: Optional instrument filter evaluated before row callbacks.
     :type instrument_ids: list[str] | tuple[str, ...] | str | None
+    :param filter: Optional ``zp.col`` predicate. Row mode supports ``instrument_id`` equality/is_in.
+    :type filter: object | None
     :param wait: When true, wait until the stream exists and has an active segment descriptor.
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
@@ -2283,17 +2807,20 @@ def subscribe(
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
-    subscriber = StreamSubscriber(
-        source=source,
-        callback=callback,
-        master=master,
-        poll_interval_ms=poll_interval_ms,
-        xfast=xfast,
-        idle_spin_checks=idle_spin_checks,
-        instrument_ids=instrument_ids,
-        wait=wait,
-        timeout=timeout,
-    )
+    subscriber_kwargs = {
+        "source": source,
+        "callback": callback,
+        "master": master,
+        "poll_interval_ms": poll_interval_ms,
+        "xfast": xfast,
+        "idle_spin_checks": idle_spin_checks,
+        "instrument_ids": instrument_ids,
+        "wait": wait,
+        "timeout": timeout,
+    }
+    if filter is not None:
+        subscriber_kwargs["filter"] = filter
+    subscriber = StreamSubscriber(**subscriber_kwargs)
     return subscriber.start()
 
 
@@ -2305,6 +2832,10 @@ def subscribe_table(
     poll_interval_ms: int = 10,
     xfast: bool = False,
     idle_spin_checks: int = 64,
+    filter: object | None = None,
+    batch_size: int | None = None,
+    throttle_ms: int | None = None,
+    count: int | None = None,
     wait: bool = False,
     timeout: float | str | None = None,
 ) -> StreamSubscriber:
@@ -2327,6 +2858,14 @@ def subscribe_table(
     :type xfast: bool
     :param idle_spin_checks: Short spin checks before entering mmap futex wait in non-xfast mode.
     :type idle_spin_checks: int
+    :param filter: Optional ``zp.col`` predicate applied before table callbacks.
+    :type filter: object | None
+    :param batch_size: Emit only after at least this many filtered pending rows are available.
+    :type batch_size: int | None
+    :param throttle_ms: Emit pending rows once this many milliseconds have elapsed.
+    :type throttle_ms: int | None
+    :param count: Limit each callback table to the latest ``count`` rows.
+    :type count: int | None
     :param wait: When true, wait until the stream exists and has an active segment descriptor.
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
@@ -2334,17 +2873,26 @@ def subscribe_table(
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
-    subscriber = StreamSubscriber(
-        source=source,
-        callback=callback,
-        master=master,
-        poll_interval_ms=poll_interval_ms,
-        xfast=xfast,
-        idle_spin_checks=idle_spin_checks,
-        wait=wait,
-        timeout=timeout,
-        _table_callback=True,
-    )
+    subscriber_kwargs = {
+        "source": source,
+        "callback": callback,
+        "master": master,
+        "poll_interval_ms": poll_interval_ms,
+        "xfast": xfast,
+        "idle_spin_checks": idle_spin_checks,
+        "wait": wait,
+        "timeout": timeout,
+        "_table_callback": True,
+    }
+    if filter is not None:
+        subscriber_kwargs["filter"] = filter
+    if batch_size is not None:
+        subscriber_kwargs["batch_size"] = batch_size
+    if throttle_ms is not None:
+        subscriber_kwargs["throttle_ms"] = throttle_ms
+    if count is not None:
+        subscriber_kwargs["count"] = count
+    subscriber = StreamSubscriber(**subscriber_kwargs)
     return subscriber.start()
 
 
@@ -4403,6 +4951,7 @@ __all__ = [
     "compare_replay",
     "config",
     "connect",
+    "lit",
     "log_info",
     "master",
     "ops",

@@ -2405,6 +2405,47 @@ impl Query {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         record_batches_to_pyarrow_record_batch_reader(py, self.schema.as_ref(), batches)
     }
+
+    fn scan_snapshot(&self, py: Python<'_>, snapshot: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let snapshot_text = python_json_dumps(py, snapshot)?;
+        let snapshot = serde_json::from_str::<serde_json::Value>(&snapshot_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let descriptor = snapshot
+            .get("active_segment_descriptor")
+            .cloned()
+            .ok_or_else(|| py_runtime_error("snapshot missing active_segment_descriptor"))?;
+        let sealed_descriptors = snapshot
+            .get("sealed_segments")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let active_committed_row_high_watermark = snapshot
+            .get("active_committed_row_high_watermark")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                py_runtime_error("snapshot missing active_committed_row_high_watermark")
+            })? as usize;
+        let segment_schema = self.segment_schema.clone();
+        let master = Arc::clone(&self.master);
+        let source = self.source.clone();
+        let batches = py
+            .allow_threads(|| {
+                let _leases = SegmentReaderLeaseSet::acquire_for_descriptors(
+                    master,
+                    &source,
+                    &descriptor,
+                    &sealed_descriptors,
+                )?;
+                live_segment_record_batches(
+                    &descriptor,
+                    &sealed_descriptors,
+                    segment_schema,
+                    active_committed_row_high_watermark,
+                )
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        record_batches_to_pyarrow_record_batch_reader(py, self.schema.as_ref(), batches)
+    }
 }
 
 fn ensure_stream_live_readable(stream: &StreamInfo) -> PyResult<()> {

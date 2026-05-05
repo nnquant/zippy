@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
+import pyarrow.dataset as ds
 import zippy as zp
 
 
@@ -48,7 +50,15 @@ def main() -> None:
     zp.connect(uri=args.uri, app="example_replay_parity_check")
 
     # persisted 侧只取已经落盘的不可变数据，避免 active segment 尚未落盘造成误差。
-    expected = zp.read_table(args.live_table).scan_persisted().to_table()
+    live_table = zp.read_table(args.live_table)
+    persisted_paths = [
+        str(Path(item["file_path"]))
+        for item in live_table.persisted_files()
+        if item.get("file_path")
+    ]
+    if not persisted_paths:
+        raise RuntimeError(f"persisted files are not registered table=[{args.live_table}]")
+    expected = ds.dataset(persisted_paths, format="parquet").to_table()
     actual = zp.read_table(args.replay_table).collect()
     comparison = zp.compare_replay(expected, actual, by=parse_keys(args.by))
 

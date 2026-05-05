@@ -14,6 +14,7 @@ import time
 
 import polars as pl
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 
@@ -1132,7 +1133,7 @@ def test_replay_function_replays_persisted_table_to_named_stream(tmp_path: Path)
             if persisted_rows == 2:
                 break
             time.sleep(0.02)
-        expected = live_query.scan_persisted().to_table()
+        expected = live_query._scan_persisted().to_table()
         assert expected.num_rows == 2
 
         replay_engine = zippy.replay(
@@ -1208,7 +1209,7 @@ def test_replay_function_replays_persisted_table_to_callback(tmp_path: Path) -> 
                 break
             time.sleep(0.02)
 
-        expected = query.scan_persisted().to_table().to_pylist()
+        expected = query._scan_persisted().to_table().to_pylist()
         replay_engine = zippy.replay("callback_live_ticks", callback=on_row)
 
         assert isinstance(replay_engine, zippy.TableReplayEngine)
@@ -1275,7 +1276,7 @@ def test_replay_function_filters_persisted_table_by_time_window(tmp_path: Path) 
             if persisted_rows == 4:
                 break
             time.sleep(0.02)
-        expected = query.scan_persisted().to_table().slice(1, 2).to_pylist()
+        expected = query._scan_persisted().to_table().slice(1, 2).to_pylist()
 
         replay_engine = zippy.replay(
             "window_live_ticks",
@@ -1440,7 +1441,7 @@ def test_replay_output_stream_drives_reactive_latest_engine(tmp_path: Path) -> N
             if persisted_rows == 4:
                 break
             time.sleep(0.02)
-        assert live_query.scan_persisted().to_table().num_rows == 4
+        assert live_query._scan_persisted().to_table().num_rows == 4
 
         replay_engine = zippy.TableReplayEngine(
             "downstream_live_ticks",
@@ -1757,7 +1758,7 @@ def test_parquet_replay_e2e_matches_persisted_table_snapshot(tmp_path: Path) -> 
                 break
             time.sleep(0.02)
 
-        persisted = live_query.scan_persisted().to_table()
+        persisted = live_query._scan_persisted().to_table()
         assert persisted.num_rows == 4
 
         replay_engine = zippy.replay(
@@ -5775,7 +5776,7 @@ def test_table_perf_probe_summarizes_latency_samples() -> None:
     }
 
 
-def test_table_perf_probe_measures_scan_live_throughput(monkeypatch) -> None:
+def test_table_perf_probe_measures_private_scan_live_throughput(monkeypatch) -> None:
     module_path = WORKSPACE_ROOT / "examples" / "07_ops" / "02_table_perf_probe.py"
     spec = importlib.util.spec_from_file_location("table_perf_probe_example", module_path)
     assert spec is not None
@@ -5790,14 +5791,14 @@ def test_table_perf_probe_measures_scan_live_throughput(monkeypatch) -> None:
     ]
 
     class FakeTable:
-        def scan_live(self):
+        def _scan_live(self):
             return pa.RecordBatchReader.from_batches(schema, batches)
 
     monkeypatch.setattr(module.zp, "read_table", lambda table_name: FakeTable())
     timestamps = iter([1_000_000_000, 1_005_000_000])
     monkeypatch.setattr(module.time, "perf_counter_ns", lambda: next(timestamps))
 
-    report = module.measure_scan_live_throughput("ticks", iterations=1)
+    report = module.measure_private_scan_live_throughput("ticks", iterations=1)
 
     assert report["iterations"] == 1
     assert report["last_batches"] == 2
@@ -6102,7 +6103,7 @@ def test_query_scan_live_returns_reader_over_retained_sealed_and_active_rows() -
             )
 
             query = zippy.read_table("openctp_ticks")
-            reader = query.scan_live()
+            reader = query._scan_live()
             assert isinstance(reader, pa.RecordBatchReader)
 
             table = reader.read_all()
@@ -6110,13 +6111,90 @@ def test_query_scan_live_returns_reader_over_retained_sealed_and_active_rows() -
                 if table.num_rows == row_count:
                     break
                 time.sleep(0.02)
-                table = query.scan_live().read_all()
+                table = query._scan_live().read_all()
 
             assert table.schema == tick_schema
             assert table.num_rows == row_count
             assert table.column("last_price").to_pylist() == [
                 4100.0 + index for index in range(row_count)
             ]
+        finally:
+            if pipeline is not None:
+                pipeline.stop()
+            if reset_default_master is not None:
+                reset_default_master()
+            server.stop()
+
+
+def test_read_table_snapshot_collect_reuses_fixed_live_boundary() -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        control_endpoint = str(Path(directory) / "zippy-master.sock")
+        server = zippy.MasterServer(control_endpoint=control_endpoint)
+        try:
+            server.start()
+        except RuntimeError as error:
+            if "Operation not permitted" in str(error):
+                pytest.skip("unix socket bind is not permitted in this test environment")
+            raise
+        pipeline = None
+        try:
+            zippy.connect(uri=control_endpoint, app="query_snapshot_collect_test")
+            tick_schema = pa.schema(
+                [
+                    ("instrument_id", pa.string()),
+                    ("dt", pa.timestamp("ns", tz="UTC")),
+                    ("last_price", pa.float64()),
+                ]
+            )
+            pipeline = (
+                zippy.Pipeline("query_snapshot_collect_test")
+                .stream_table("snapshot_ticks", schema=tick_schema, row_capacity=32)
+                .start()
+            )
+            pipeline.write(
+                {
+                    "instrument_id": ["IF2606", "IF2607"],
+                    "dt": [1777017600000000000, 1777017600000000001],
+                    "last_price": [4102.5, 4103.5],
+                }
+            )
+
+            warmup = zippy.read_table("snapshot_ticks", snapshot=False).collect()
+            for _ in range(50):
+                if warmup.num_rows == 2:
+                    break
+                time.sleep(0.02)
+                warmup = zippy.read_table("snapshot_ticks", snapshot=False).collect()
+            assert warmup.num_rows == 2
+
+            frozen = zippy.read_table("snapshot_ticks", snapshot=True)
+            first = frozen.collect()
+            assert first.num_rows == 2
+
+            pipeline.write(
+                {
+                    "instrument_id": ["IF2608"],
+                    "dt": [1777017600000000002],
+                    "last_price": [4104.5],
+                }
+            )
+
+            second = frozen.collect()
+            assert second.num_rows == 2
+            assert second.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
+
+            latest = zippy.read_table("snapshot_ticks", snapshot=False).collect()
+            for _ in range(50):
+                if latest.num_rows == 3:
+                    break
+                time.sleep(0.02)
+                latest = zippy.read_table("snapshot_ticks", snapshot=False).collect()
+            assert latest.num_rows == 3
+            assert latest.column("instrument_id").to_pylist() == ["IF2606", "IF2607", "IF2608"]
         finally:
             if pipeline is not None:
                 pipeline.stop()
@@ -6186,7 +6264,7 @@ def test_stream_table_e2e_ingest_rollover_persist_and_query(tmp_path: Path) -> N
             latest = query.tail(row_count)
 
         stream = zippy.ops.table_info("e2e_ticks")
-        persisted = query.scan_persisted().to_table()
+        persisted = query._scan_persisted().to_table()
         collected = query.collect()
 
         assert len(stream["sealed_segments"]) == 1
@@ -6410,7 +6488,7 @@ def test_query_snapshot_includes_published_files() -> None:
 
 
 def test_read_table_function_returns_table_object(monkeypatch) -> None:
-    created: list[tuple[str, object, bool, object]] = []
+    created: list[tuple[str, object, bool, object, bool]] = []
 
     class FakeTable:
         def __init__(
@@ -6420,12 +6498,14 @@ def test_read_table_function_returns_table_object(monkeypatch) -> None:
             *,
             wait: bool = False,
             timeout: float | str | None = None,
+            snapshot: bool = True,
         ) -> None:
             self.source = source
             self.master = master
             self.wait = wait
             self.timeout = timeout
-            created.append((source, master, wait, timeout))
+            self.snapshot = snapshot
+            created.append((source, master, wait, timeout, snapshot))
 
     explicit_master = object()
     monkeypatch.setattr(zippy, "Table", FakeTable)
@@ -6437,7 +6517,8 @@ def test_read_table_function_returns_table_object(monkeypatch) -> None:
     assert table.master is explicit_master
     assert table.wait is False
     assert table.timeout is None
-    assert created == [("ctp_ticks", explicit_master, False, None)]
+    assert table.snapshot is True
+    assert created == [("ctp_ticks", explicit_master, False, None, True)]
 
 
 def test_connect_sets_default_master_and_init_is_removed(monkeypatch) -> None:
@@ -7084,6 +7165,47 @@ def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> N
     assert created["row_factory"] is zippy.Row
 
 
+def test_subscribe_row_mode_accepts_col_instrument_filter(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            idle_spin_checks: int = 64,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["poll_interval_ms"] = poll_interval_ms
+            created["xfast"] = xfast
+            created["idle_spin_checks"] = idle_spin_checks
+            created["row_factory"] = row_factory
+            created["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber(
+        "ctp_ticks",
+        callback=lambda row: None,
+        master=explicit_master,
+        filter=zippy.col("instrument_id").is_in(["IF2606", "IF2607"]),
+    )
+
+    assert created["instrument_ids"] == ["IF2606", "IF2607"]
+    assert created["row_factory"] is zippy.Row
+
+
 def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) -> None:
     created: dict[str, object] = {}
 
@@ -7263,6 +7385,119 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
     assert created["idle_spin_checks"] == 64
     assert created["row_factory"] is None
     assert created["instrument_ids"] is None
+
+
+def test_subscribe_table_filters_batches_and_limits_latest_count(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            idle_spin_checks: int = 64,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            captured["callback"] = callback
+            captured["row_factory"] = row_factory
+            captured["instrument_ids"] = instrument_ids
+
+        def start(self) -> None:
+            return None
+
+    received: list[pa.Table] = []
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.subscribe_table(
+        "ctp_ticks",
+        callback=received.append,
+        master=explicit_master,
+        filter=zippy.col("instrument_id") == "IF2606",
+        batch_size=4,
+        count=3,
+    )
+
+    native_callback = captured["callback"]
+    assert callable(native_callback)
+    assert captured["row_factory"] is None
+    assert captured["instrument_ids"] is None
+
+    native_callback(
+        pa.table(
+            {
+                "instrument_id": ["IF2605", "IF2606"],
+                "last_price": [100.0, 101.0],
+            }
+        )
+    )
+    assert received == []
+
+    native_callback(
+        pa.table(
+            {
+                "instrument_id": ["IF2606", "IF2605", "IF2606", "IF2606"],
+                "last_price": [102.0, 103.0, 104.0, 105.0],
+            }
+        )
+    )
+
+    assert len(received) == 1
+    assert received[0].to_pydict() == {
+        "instrument_id": ["IF2606", "IF2606", "IF2606"],
+        "last_price": [102.0, 104.0, 105.0],
+    }
+
+
+def test_subscribe_table_throttle_ms_flushes_pending_rows(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            idle_spin_checks: int = 64,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+        ) -> None:
+            captured["callback"] = callback
+
+        def start(self) -> None:
+            return None
+
+    times = iter([0, 1_000_000, 12_000_000, 12_000_000])
+    received: list[pa.Table] = []
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+    monkeypatch.setattr(zippy.time, "perf_counter_ns", lambda: next(times))
+
+    zippy.subscribe_table(
+        "ctp_ticks",
+        callback=received.append,
+        master=explicit_master,
+        throttle_ms=10,
+    )
+
+    native_callback = captured["callback"]
+    assert callable(native_callback)
+
+    native_callback(pa.table({"instrument_id": ["IF2606"], "last_price": [101.0]}))
+    assert received == []
+
+    native_callback(pa.table({"instrument_id": ["IF2607"], "last_price": [102.0]}))
+    assert len(received) == 1
+    assert received[0].to_pydict() == {
+        "instrument_id": ["IF2606", "IF2607"],
+        "last_price": [101.0, 102.0],
+    }
 
 
 def test_subscribe_registers_default_master_process_before_native_subscriber(
@@ -7469,8 +7704,8 @@ def test_query_object_exposes_schema_stream_info_and_snapshot(monkeypatch, tmp_p
     assert query.stream_info() == stream_info
     assert query.snapshot() == snapshot
     assert query.persisted_files() == [persisted_file]
-    assert query.scan_live().read_all().num_rows == 1
-    assert query.scan_persisted().count_rows() == 1
+    assert query._scan_live().read_all().num_rows == 1
+    assert query._scan_persisted().count_rows() == 1
 
 
 def test_query_tail_backfills_from_persisted_without_duplicate_live_segments(
@@ -7859,15 +8094,17 @@ def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
 
     query = zippy.read_table("ctp_ticks", master=explicit_master)
     filtered = (
-        query.select(
+        query.filter(
+            (zippy.col("instrument_id") == "IF2606") & (zippy.col("last_price") > 4000.0)
+        )
+        .between(zippy.col("dt"), 2, 4)
+        .select(
             [
                 zippy.col("dt"),
                 zippy.col("instrument_id"),
                 (zippy.col("ask_price_1") - zippy.col("bid_price_1")).alias("spread"),
             ]
         )
-        .where((zippy.col("instrument_id") == "IF2606") & (zippy.col("last_price") > 4000.0))
-        .between(zippy.col("dt"), 2, 4)
     )
 
     table = filtered.tail(1)
@@ -7885,6 +8122,245 @@ def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
         "bid_price_1",
         "ask_price_1",
     ]
+
+
+def test_read_table_snapshot_policy_controls_collect_boundary(monkeypatch) -> None:
+    schema = pa.schema([("value", pa.int64())])
+
+    class FakeNativeQuery:
+        snapshot_calls = 0
+
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            type(self).snapshot_calls += 1
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": type(self).snapshot_calls,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": type(self).snapshot_calls,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            value = int(snapshot["active_committed_row_high_watermark"])
+            batch = pa.record_batch({"value": [value]}, schema=schema)
+            return pa.RecordBatchReader.from_batches(schema, [batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    frozen = zippy.read_table("ticks", master=explicit_master, snapshot=True)
+    first = frozen.collect()
+    second = frozen.collect()
+
+    assert first.column("value").to_pylist() == [1]
+    assert second.column("value").to_pylist() == [1]
+
+    live = zippy.read_table("ticks", master=explicit_master, snapshot=False)
+    third = live.collect()
+    fourth = live.collect()
+
+    assert third.column("value").to_pylist() == [2]
+    assert fourth.column("value").to_pylist() == [3]
+
+
+def test_lazy_table_api_supports_filter_select_join_with_columns_and_lit(monkeypatch) -> None:
+    spot_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    future_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("future_price", pa.float64()),
+        ]
+    )
+    batches = {
+        "spot_latest": pa.record_batch(
+            {
+                "instrument_id": ["a", "b"],
+                "last_price": [102.0, 201.0],
+            },
+            schema=spot_schema,
+        ),
+        "future_latest": pa.record_batch(
+            {
+                "instrument_id": ["a", "b"],
+                "future_price": [100.0, 200.0],
+            },
+            schema=future_schema,
+        ),
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return batches[self.source].schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": batches[self.source].num_rows,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            batch = batches[self.source]
+            return pa.RecordBatchReader.from_batches(batch.schema, [batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    spot = (
+        zippy.read_table("spot_latest", master=explicit_master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "a")
+        .select("instrument_id", "last_price")
+    )
+    future = (
+        zippy.read_table("future_latest", master=explicit_master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "a")
+        .select("instrument_id", "future_price")
+        .join(spot, on="instrument_id")
+        .with_columns(
+            basis=zippy.col("last_price") / zippy.col("future_price") - zippy.lit(1.0),
+        )
+        .select("instrument_id", "basis")
+    )
+
+    result = future.collect()
+
+    assert result.column_names == ["instrument_id", "basis"]
+    assert result.column("instrument_id").to_pylist() == ["a"]
+    assert result.column("basis").to_pylist() == pytest.approx([0.02])
+
+
+def test_table_plan_pushes_projection_and_simple_predicate_to_persisted_reader(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("volume", pa.int64()),
+        ]
+    )
+    persisted_table = pa.table(
+        {
+            "instrument_id": ["IF2606", "IF2607"],
+            "last_price": [4102.5, 4103.5],
+            "volume": [10, 20],
+        },
+        schema=schema,
+    )
+    read_calls: list[dict[str, object]] = []
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/ctp_ticks.parquet",
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    }
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        read_calls.append(
+            {
+                "file_path": file_path,
+                "columns": columns,
+                "filters": filters,
+            }
+        )
+        table = persisted_table
+        if filters == [("instrument_id", "==", "IF2606")]:
+            table = table.filter(pc.equal(table["instrument_id"], "IF2606"))
+        if columns is not None:
+            table = table.select(columns)
+        return table
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    query = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "IF2606")
+        .select("instrument_id", "last_price")
+    )
+
+    result = query.collect()
+
+    assert result.column_names == ["instrument_id", "last_price"]
+    assert result.column("instrument_id").to_pylist() == ["IF2606"]
+    assert read_calls == [
+        {
+            "file_path": "/tmp/ctp_ticks.parquet",
+            "columns": ["instrument_id", "last_price"],
+            "filters": [("instrument_id", "==", "IF2606")],
+        }
+    ]
+
+
+def test_table_scan_apis_are_private_to_avoid_query_semantics_confusion(monkeypatch) -> None:
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    assert not hasattr(query, "scan_live")
+    assert not hasattr(query, "scan_persisted")
+    assert hasattr(query, "_scan_live")
+    assert hasattr(query, "_scan_persisted")
 
 
 def test_read_table_replaces_query_api(monkeypatch) -> None:

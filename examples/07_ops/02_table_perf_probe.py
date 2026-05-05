@@ -174,9 +174,9 @@ def measure_tail_latency(table_name: str, tail_n: int, iterations: int) -> dict[
     }
 
 
-def measure_scan_live_throughput(table_name: str, iterations: int) -> dict[str, object]:
+def measure_private_scan_live_throughput(table_name: str, iterations: int) -> dict[str, object]:
     """
-    Measure ``read_table(...).scan_live()`` throughput.
+    Measure low-level ``read_table(...)._scan_live()`` throughput.
 
     :param table_name: Zippy table name.
     :type table_name: str
@@ -199,7 +199,7 @@ def measure_scan_live_throughput(table_name: str, iterations: int) -> dict[str, 
         started_ns = time.perf_counter_ns()
         rows = 0
         batches = 0
-        for batch in table.scan_live():
+        for batch in table._scan_live():
             batches += 1
             rows += batch.num_rows
         elapsed_ns = time.perf_counter_ns() - started_ns
@@ -257,7 +257,7 @@ def main() -> None:
     parser.add_argument("--table", required=True, help="要测量的表名")
     parser.add_argument("--tail-n", type=int, default=1000, help="tail 请求行数")
     parser.add_argument("--iterations", type=int, default=20, help="tail 重复测量次数")
-    parser.add_argument("--scan-iterations", type=int, default=5, help="scan_live 重复测量次数")
+    parser.add_argument("--scan-iterations", type=int, default=5, help="底层 _scan_live 重复测量次数")
     parser.add_argument("--include-replay", action="store_true", help="额外测量 persisted replay 吞吐")
     args = parser.parse_args()
 
@@ -268,7 +268,7 @@ def main() -> None:
         "observed_at_unix_ns": time.time_ns(),
         "storage": table_storage_summary(info),
         "tail": measure_tail_latency(args.table, args.tail_n, args.iterations),
-        "scan_live": measure_scan_live_throughput(args.table, args.scan_iterations),
+        "_scan_live": measure_private_scan_live_throughput(args.table, args.scan_iterations),
         "dev_shm": dev_shm_usage(),
     }
 
