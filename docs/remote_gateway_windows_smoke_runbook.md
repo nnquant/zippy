@@ -105,6 +105,20 @@ python -c "import sys; print(sys.executable); import zippy; print(zippy.__file__
 python -m zippy.cli --help
 ```
 
+如果 Windows 侧暂时还没有 zippy wheel，可以先运行纯 Python standalone smoke。这个脚本
+不导入 `zippy`，只依赖 `pyarrow`，用于先验证 Windows 到 WSL/Linux master/Gateway 的
+网络和 wire protocol：
+
+```powershell
+python examples\08_remote_gateway\04_standalone_windows_smoke_client.py `
+  --uri zippy://<wsl-host>:17690/default `
+  --stream windows_standalone_smoke_ticks `
+  --json
+```
+
+standalone smoke 通过后，只能说明跨平台协议和 Gateway 数据面可达；完整用户 API
+验收仍然需要安装 Windows 版 zippy 后运行 `zippy gateway smoke-client`。
+
 ## 5. Windows 侧 smoke
 
 在 Windows 原生 Python 环境中安装或切换到当前 zippy 包后运行：

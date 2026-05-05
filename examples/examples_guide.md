@@ -64,6 +64,9 @@ uv run zippy stream ls --uri default
     `zippy gateway smoke-client --uri zippy://<wsl-host>:17690/default --stream windows_smoke_ticks`
     验证只作为远端客户端访问 WSL/Linux Gateway 的路径。完整联调步骤见
     `docs/remote_gateway_windows_smoke_runbook.md`。
+22. 如果 Windows 侧还没有 zippy wheel，可先用
+    `08_remote_gateway/04_standalone_windows_smoke_client.py` 验证 Windows 到 WSL/Linux
+    master/Gateway 的纯 Python wire protocol。
 
 ## API 分层
 
