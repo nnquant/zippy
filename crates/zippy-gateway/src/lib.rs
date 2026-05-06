@@ -38,6 +38,7 @@ pub struct GatewayServer {
     endpoint: String,
     state: Arc<GatewayState>,
     join_handle: Option<JoinHandle<()>>,
+    heartbeat_handle: Option<JoinHandle<()>>,
 }
 
 struct GatewayState {
@@ -99,6 +100,7 @@ impl GatewayServer {
                 stopped: AtomicBool::new(false),
             }),
             join_handle: None,
+            heartbeat_handle: None,
         })
     }
 
@@ -127,6 +129,8 @@ impl GatewayServer {
 
         let state = Arc::clone(&self.state);
         self.join_handle = Some(thread::spawn(move || serve_loop(listener, state)));
+        let state = Arc::clone(&self.state);
+        self.heartbeat_handle = Some(thread::spawn(move || heartbeat_loop(state)));
         Ok(self)
     }
 
@@ -161,6 +165,9 @@ impl GatewayServer {
         self.state.stopped.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(&self.endpoint);
         if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.heartbeat_handle.take() {
             let _ = handle.join();
         }
         let mut writers = self.state.writers.lock().unwrap();
@@ -462,14 +469,26 @@ impl GatewayState {
         Ok(())
     }
 
-    fn with_master<T>(&self, f: impl FnOnce(&mut MasterClient) -> Result<T>) -> Result<T> {
+    fn with_master<T>(&self, mut f: impl FnMut(&mut MasterClient) -> Result<T>) -> Result<T> {
         let mut guard = self.master.lock().unwrap();
-        if guard.is_none() {
-            let mut client = MasterClient::connect_endpoint(self.master_endpoint.clone())?;
-            client.register_process("zippy_gateway")?;
-            *guard = Some(client);
+        let mut last_error = None;
+        for _ in 0..2 {
+            if guard.is_none() {
+                let mut client = MasterClient::connect_endpoint(self.master_endpoint.clone())?;
+                client.register_process("zippy_gateway")?;
+                *guard = Some(client);
+            }
+            let result = f(guard.as_mut().expect("master client initialized"));
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) if gateway_master_process_invalid(&error) => {
+                    *guard = None;
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        f(guard.as_mut().expect("master client initialized"))
+        Err(last_error.expect("gateway master process retry must store the last error"))
     }
 
     fn collect_segment_source(&self, source: &str) -> Result<RecordBatch> {
@@ -540,6 +559,11 @@ impl GatewayState {
     }
 }
 
+fn gateway_master_process_invalid(error: &ZippyError) -> bool {
+    let message = error.to_string();
+    message.contains("process lease expired") || message.contains("process not found")
+}
+
 impl Drop for SegmentReaderLeaseGuard {
     fn drop(&mut self) {
         let Some(lease_id) = self.lease_id.take() else {
@@ -564,6 +588,29 @@ fn serve_loop(listener: TcpListener, state: Arc<GatewayState>) {
                 thread::sleep(Duration::from_millis(10));
             }
             Err(_) => break,
+        }
+    }
+}
+
+fn heartbeat_loop(state: Arc<GatewayState>) {
+    while !state.stopped.load(Ordering::SeqCst) {
+        let mut elapsed = Duration::ZERO;
+        while elapsed < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(100));
+            if state.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            elapsed += Duration::from_millis(100);
+        }
+
+        let mut guard = state.master.lock().unwrap();
+        let Some(master) = guard.as_mut() else {
+            continue;
+        };
+        if let Err(error) = master.heartbeat() {
+            if gateway_master_process_invalid(&error) {
+                *guard = None;
+            }
         }
     }
 }

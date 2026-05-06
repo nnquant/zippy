@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
@@ -10,7 +10,9 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use serde_json::json;
-use zippy_core::{ControlEndpoint, Engine, MasterClient, SegmentTableView};
+use zippy_core::{
+    connect_control_endpoint, ControlEndpoint, Engine, MasterClient, SegmentTableView,
+};
 use zippy_engines::StreamTableMaterializer;
 use zippy_gateway::{GatewayServer, GatewayServerConfig};
 use zippy_master::server::MasterServer;
@@ -145,6 +147,88 @@ fn native_gateway_collects_existing_segment_stream() {
     master_thread.join().unwrap().unwrap();
 }
 
+#[test]
+fn native_gateway_reregisters_master_process_after_lease_expiry() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint.clone()).unwrap();
+    client.register_process("external_segment_writer").unwrap();
+    client
+        .register_stream("external_ticks", batch.schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("external_source", "test", "external_ticks", json!({}))
+        .unwrap();
+    let mut materializer = StreamTableMaterializer::new("external_ticks", batch.schema()).unwrap();
+    client
+        .publish_segment_descriptor_bytes(
+            "external_ticks",
+            &materializer.active_descriptor_envelope_bytes().unwrap(),
+        )
+        .unwrap();
+    materializer
+        .on_data(SegmentTableView::from_record_batch(batch))
+        .unwrap();
+    materializer.on_flush().unwrap();
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "external_ticks",
+            "token": "dev-token",
+        }),
+        vec![],
+    );
+    assert_eq!(response["status"], "ok");
+    assert_eq!(decode_ipc_batch(&payload).num_rows(), 1);
+
+    let expire_response = send_raw_control_line(
+        &master_endpoint,
+        "{\"ExpireProcessForTest\":{\"process_id\":\"proc_2\"}}\n",
+    );
+    assert!(expire_response.to_string().contains("proc_2"));
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "external_ticks",
+            "token": "dev-token",
+        }),
+        vec![],
+    );
+    assert_eq!(response["status"], "ok");
+    assert_eq!(decode_ipc_batch(&payload).num_rows(), 1);
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
 fn spawn_master(
     endpoint: ControlEndpoint,
 ) -> (MasterServer, thread::JoinHandle<zippy_core::Result<()>>) {
@@ -159,6 +243,17 @@ fn spawn_master(
         .unwrap()
         .unwrap();
     (server, handle)
+}
+
+fn send_raw_control_line(endpoint: &ControlEndpoint, line: &str) -> serde_json::Value {
+    let mut stream = connect_control_endpoint(endpoint).unwrap();
+    stream.write_all(line.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut response = String::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_line(&mut response).unwrap();
+    serde_json::from_str(&response).unwrap()
 }
 
 fn reserve_tcp_port() -> u16 {
