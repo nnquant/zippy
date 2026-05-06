@@ -2141,6 +2141,7 @@ dependencies = [
  "zippy-core",
  "zippy-engines",
  "zippy-master",
+ "zippy-segment-store",
 ]
 
 [[package]]

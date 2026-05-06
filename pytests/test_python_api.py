@@ -8532,6 +8532,51 @@ def test_connect_tcp_master_local_false_uses_gateway_data_path(
         server.join()
 
 
+def test_remote_gateway_unspecified_host_uses_master_host(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeMasterClient:
+        def __init__(self) -> None:
+            self._process_id = None
+
+        def control_endpoint(self) -> str:
+            return "tcp://127.0.0.1:17690"
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def heartbeat(self) -> None:
+            return None
+
+        def list_streams(self) -> list[dict[str, object]]:
+            return []
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "0.0.0.0:17691",
+                    "protocol_version": 1,
+                }
+            }
+
+    class FakeRemoteQuery:
+        def __init__(self, **kwargs: object) -> None:
+            seen["query"] = kwargs
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+    client = FakeMasterClient()
+    zippy._set_master_local_data_path(client, False)
+
+    zippy.read_table("qmt_ticks", master=client)
+
+    assert seen["query"]["endpoint"] == "127.0.0.1:17691"
+
+
 def test_get_writer_uses_gateway_token_discovered_from_master_config() -> None:
     schema = pa.schema(
         [

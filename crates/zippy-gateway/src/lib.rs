@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
@@ -9,13 +9,20 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use serde_json::{json, Value};
-use zippy_core::{ControlEndpoint, Engine, MasterClient, Result, SegmentTableView, ZippyError};
+use zippy_core::{
+    ControlEndpoint, Engine, MasterClient, Result, SegmentTableView, StreamInfo, ZippyError,
+};
 use zippy_engines::{StreamTableDescriptorPublisher, StreamTableMaterializer};
+use zippy_segment_store::{
+    compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
+    ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanView,
+};
 
 /// Native Rust GatewayServer configuration.
 #[derive(Debug, Clone)]
@@ -45,6 +52,12 @@ struct GatewayState {
 
 struct GatewayTableWriter {
     materializer: StreamTableMaterializer,
+}
+
+struct SegmentReaderLeaseGuard {
+    master: Arc<Mutex<Option<MasterClient>>>,
+    source: String,
+    lease_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -242,12 +255,14 @@ impl GatewayState {
             .unwrap_or_default();
         let batch = {
             let writers = self.writers.lock().unwrap();
-            let writer = writers
+            writers
                 .get(source)
-                .ok_or_else(|| ZippyError::InvalidState {
-                    status: "gateway collect source is not materialized by this gateway",
-                })?;
-            writer.materializer.active_record_batch()?
+                .map(|writer| writer.materializer.active_record_batch())
+                .transpose()?
+        };
+        let batch = match batch {
+            Some(batch) => batch,
+            None => self.collect_segment_source(source)?,
         };
         let batch = apply_collect_plan(batch, &plan)?;
         Ok((json!({"status": "ok"}), encode_ipc_table(&batch)?))
@@ -308,7 +323,12 @@ impl GatewayState {
                 .get(source)
                 .map(|writer| encode_ipc_schema(&writer.materializer.output_schema()))
                 .transpose()?
-                .unwrap_or_default()
+        };
+        let schema_payload = match schema_payload {
+            Some(payload) => payload,
+            None => encode_ipc_schema(&Arc::new(arrow_schema_from_stream_metadata(
+                &stream.schema,
+            )?))?,
         };
         Ok((json!({"status": "ok", "stream": stream}), schema_payload))
     }
@@ -388,6 +408,13 @@ impl GatewayState {
                     .map(|writer| writer.materializer.active_record_batch())
                     .transpose()?
             };
+            let batch = match batch {
+                Some(batch) => Some(batch),
+                None => match self.collect_segment_source(source) {
+                    Ok(batch) => Some(batch),
+                    Err(_) => None,
+                },
+            };
             let Some(batch) = batch else {
                 thread::sleep(Duration::from_millis(10));
                 continue;
@@ -443,6 +470,86 @@ impl GatewayState {
             *guard = Some(client);
         }
         f(guard.as_mut().expect("master client initialized"))
+    }
+
+    fn collect_segment_source(&self, source: &str) -> Result<RecordBatch> {
+        let stream = self.with_master(|master| master.get_stream(source))?;
+        if stream.data_path != "segment" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "gateway collect source is not materialized by this gateway and is not a segment stream data_path=[{}]",
+                    stream.data_path
+                ),
+            });
+        }
+        if stream.status == "stale" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "stream is stale source=[{}] status=[{}]",
+                    source, stream.status
+                ),
+            });
+        }
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Err(ZippyError::Io {
+                reason: format!("segment descriptor is not published source=[{}]", source),
+            });
+        };
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+        let _leases = self.acquire_segment_reader_leases(source, &descriptor, &stream)?;
+        let active_committed_row_high_watermark =
+            active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
+        let batches = live_segment_record_batches(
+            &descriptor,
+            &stream.sealed_segments,
+            segment_schema,
+            active_committed_row_high_watermark,
+        )?;
+        concat_record_batches(schema, batches)
+    }
+
+    fn acquire_segment_reader_leases(
+        &self,
+        source: &str,
+        active_descriptor: &Value,
+        stream: &StreamInfo,
+    ) -> Result<Vec<SegmentReaderLeaseGuard>> {
+        let mut leases = Vec::with_capacity(stream.sealed_segments.len() + 1);
+        for descriptor in &stream.sealed_segments {
+            leases.push(self.acquire_segment_reader_lease(source, descriptor)?);
+        }
+        leases.push(self.acquire_segment_reader_lease(source, active_descriptor)?);
+        Ok(leases)
+    }
+
+    fn acquire_segment_reader_lease(
+        &self,
+        source: &str,
+        descriptor: &Value,
+    ) -> Result<SegmentReaderLeaseGuard> {
+        let (segment_id, generation) = descriptor_segment_identity(descriptor)?;
+        let lease_id = self.with_master(|master| {
+            master.acquire_segment_reader_lease(source, segment_id, generation)
+        })?;
+        Ok(SegmentReaderLeaseGuard {
+            master: Arc::clone(&self.master),
+            source: source.to_string(),
+            lease_id: Some(lease_id),
+        })
+    }
+}
+
+impl Drop for SegmentReaderLeaseGuard {
+    fn drop(&mut self) {
+        let Some(lease_id) = self.lease_id.take() else {
+            return;
+        };
+        let mut guard = self.master.lock().unwrap();
+        let Some(master) = guard.as_mut() else {
+            return;
+        };
+        let _ = master.release_segment_reader_lease(&self.source, &lease_id);
     }
 }
 
@@ -567,6 +674,293 @@ fn encode_ipc_schema(schema: &SchemaRef) -> Result<Vec<u8>> {
         })?;
     }
     Ok(payload)
+}
+
+fn concat_record_batches(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next().unwrap());
+    }
+    concat_batches(&schema, batches.iter()).map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
+}
+
+fn live_segment_record_batches(
+    descriptor: &Value,
+    sealed_descriptors: &[Value],
+    segment_schema: CompiledSchema,
+    active_committed_row_high_watermark: usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut batches = Vec::with_capacity(sealed_descriptors.len() + 1);
+    for sealed_descriptor in sealed_descriptors {
+        let batch = descriptor_record_batch_until(sealed_descriptor, segment_schema.clone(), None)?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+
+    let active_batch = descriptor_record_batch_until(
+        descriptor,
+        segment_schema,
+        Some(active_committed_row_high_watermark),
+    )?;
+    if active_batch.num_rows() > 0 {
+        batches.push(active_batch);
+    }
+    Ok(batches)
+}
+
+fn descriptor_record_batch_until(
+    descriptor: &Value,
+    segment_schema: CompiledSchema,
+    end_row_limit: Option<usize>,
+) -> Result<RecordBatch> {
+    let (committed, active_descriptor) =
+        active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
+    let end_row = end_row_limit.map_or(committed, |limit| limit.min(committed));
+    let span = RowSpanView::from_active_descriptor(active_descriptor, 0, end_row)
+        .map_err(|status| ZippyError::InvalidState { status })?;
+    span.as_record_batch().map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
+}
+
+fn active_descriptor_with_committed_row_count(
+    descriptor: &Value,
+    segment_schema: CompiledSchema,
+) -> Result<(usize, ActiveSegmentDescriptor)> {
+    let row_capacity = descriptor_row_capacity(descriptor)?;
+    let layout = LayoutPlan::for_schema(&segment_schema, row_capacity).map_err(|error| {
+        ZippyError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
+    let reader = ActiveSegmentReader::from_descriptor_envelope(
+        &descriptor_envelope,
+        segment_schema.clone(),
+        layout.clone(),
+    )
+    .map_err(segment_zippy_error)?;
+    let committed = reader.committed_row_count().map_err(segment_zippy_error)?;
+    let active_descriptor =
+        ActiveSegmentDescriptor::from_envelope_bytes(&descriptor_envelope, segment_schema, layout)
+            .map_err(|error| ZippyError::InvalidConfig {
+                reason: error.to_string(),
+            })?;
+    Ok((committed, active_descriptor))
+}
+
+fn active_committed_row_high_watermark(
+    descriptor: &Value,
+    segment_schema: CompiledSchema,
+) -> Result<usize> {
+    let row_capacity = descriptor_row_capacity(descriptor)?;
+    let layout = LayoutPlan::for_schema(&segment_schema, row_capacity).map_err(|error| {
+        ZippyError::InvalidConfig {
+            reason: error.to_string(),
+        }
+    })?;
+    let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
+    ActiveSegmentReader::from_descriptor_envelope(&descriptor_envelope, segment_schema, layout)
+        .map_err(segment_zippy_error)?
+        .committed_row_count()
+        .map_err(segment_zippy_error)
+}
+
+fn descriptor_row_capacity(descriptor: &Value) -> Result<usize> {
+    let row_capacity = descriptor
+        .get("row_capacity")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing row_capacity".to_string(),
+        })?;
+    usize::try_from(row_capacity).map_err(|_| ZippyError::InvalidConfig {
+        reason: "segment descriptor row_capacity overflows usize".to_string(),
+    })
+}
+
+fn descriptor_segment_identity(descriptor: &Value) -> Result<(u64, u64)> {
+    let segment_id = descriptor
+        .get("segment_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing segment_id".to_string(),
+        })?;
+    let generation = descriptor
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "segment descriptor missing generation".to_string(),
+        })?;
+    Ok((segment_id, generation))
+}
+
+fn arrow_schema_from_stream_metadata(schema: &Value) -> Result<Schema> {
+    let fields = schema
+        .get("fields")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "stream schema metadata missing fields".to_string(),
+        })?;
+    let fields = fields
+        .iter()
+        .map(|field| {
+            let name = field.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ZippyError::InvalidConfig {
+                    reason: "stream schema field missing name".to_string(),
+                }
+            })?;
+            let segment_type = field
+                .get("segment_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "stream schema field missing segment_type".to_string(),
+                })?;
+            let nullable = field
+                .get("nullable")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "stream schema field missing nullable".to_string(),
+                })?;
+            let timezone = field.get("timezone").and_then(Value::as_str);
+            let data_type = parse_arrow_schema_metadata_data_type(segment_type, timezone)?;
+            let metadata = string_map_from_json_value(field.get("metadata"))?;
+            Ok(Field::new(name, data_type, nullable).with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let metadata = string_map_from_json_value(schema.get("metadata"))?;
+    Ok(Schema::new_with_metadata(fields, metadata))
+}
+
+fn compile_segment_schema_from_stream_metadata(schema: &Value) -> Result<CompiledSchema> {
+    let fields = schema
+        .get("fields")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "stream schema metadata missing fields".to_string(),
+        })?;
+    let columns = fields
+        .iter()
+        .map(|field| {
+            let name = field.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ZippyError::InvalidConfig {
+                    reason: "stream schema field missing name".to_string(),
+                }
+            })?;
+            let segment_type = field
+                .get("segment_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "stream schema field missing segment_type".to_string(),
+                })?;
+            let nullable = field
+                .get("nullable")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "stream schema field missing nullable".to_string(),
+                })?;
+            let timezone = field.get("timezone").and_then(Value::as_str);
+            let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+            let data_type = parse_segment_schema_metadata_data_type(segment_type, timezone)?;
+            Ok(if nullable {
+                ColumnSpec::nullable(name, data_type)
+            } else {
+                ColumnSpec::new(name, data_type)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    compile_segment_schema(&columns).map_err(|error| ZippyError::InvalidConfig {
+        reason: error.to_string(),
+    })
+}
+
+fn parse_arrow_schema_metadata_data_type(
+    segment_type: &str,
+    timezone: Option<&str>,
+) -> Result<DataType> {
+    match segment_type {
+        "int64" => Ok(DataType::Int64),
+        "float64" => Ok(DataType::Float64),
+        "utf8" => Ok(DataType::Utf8),
+        "timestamp_ns_tz" => {
+            let timezone = timezone.ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "timestamp_ns_tz stream schema field missing timezone".to_string(),
+            })?;
+            Ok(DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some(timezone.into()),
+            ))
+        }
+        "timestamp_ns" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        _ => Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "unsupported stream field type segment_type=[{}]",
+                segment_type
+            ),
+        }),
+    }
+}
+
+fn parse_segment_schema_metadata_data_type(
+    segment_type: &str,
+    timezone: Option<&str>,
+) -> Result<ColumnType> {
+    match segment_type {
+        "int64" => Ok(ColumnType::Int64),
+        "float64" => Ok(ColumnType::Float64),
+        "utf8" => Ok(ColumnType::Utf8),
+        "timestamp_ns_tz" => {
+            let timezone = timezone.ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "timestamp_ns_tz stream schema field missing timezone".to_string(),
+            })?;
+            let timezone: &'static str = Box::leak(timezone.to_string().into_boxed_str());
+            Ok(ColumnType::TimestampNsTz(timezone))
+        }
+        "timestamp_ns" => Err(ZippyError::InvalidConfig {
+            reason: "segment stream timestamp columns must include an explicit timezone"
+                .to_string(),
+        }),
+        _ => Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "unsupported segment stream field type segment_type=[{}]",
+                segment_type
+            ),
+        }),
+    }
+}
+
+fn string_map_from_json_value(value: Option<&Value>) -> Result<HashMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let object = value.as_object().ok_or_else(|| ZippyError::InvalidConfig {
+        reason: "stream schema metadata must be an object".to_string(),
+    })?;
+    object
+        .iter()
+        .map(|(key, value)| {
+            let value = value.as_str().ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "stream schema metadata values must be strings".to_string(),
+            })?;
+            Ok((key.clone(), value.to_string()))
+        })
+        .collect()
+}
+
+fn json_zippy_error(error: serde_json::Error) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
+    }
+}
+
+fn segment_zippy_error(error: zippy_segment_store::ZippySegmentStoreError) -> ZippyError {
+    ZippyError::Io {
+        reason: error.to_string(),
+    }
 }
 
 fn apply_collect_plan(mut batch: RecordBatch, plan: &[Value]) -> Result<RecordBatch> {

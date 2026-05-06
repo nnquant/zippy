@@ -1895,21 +1895,54 @@ def _remote_master_endpoint_from_zippy_uri(uri: str) -> str | None:
 
 
 def _remote_gateway_endpoint(master: object) -> str | None:
+    candidate: str | None = None
     endpoint = getattr(master, "remote_gateway_endpoint", None)
     if callable(endpoint):
         value = endpoint()
-        return _normalize_remote_endpoint(value) if value else None
-    value = getattr(master, "remote_gateway_endpoint", None)
-    if isinstance(value, str):
-        return _normalize_remote_endpoint(value)
-    get_config = getattr(master, "get_config", None)
-    if callable(get_config):
+        candidate = _normalize_remote_endpoint(value) if value else None
+    elif isinstance(endpoint, str):
+        candidate = _normalize_remote_endpoint(endpoint)
+    if candidate is None and callable(get_config := getattr(master, "get_config", None)):
         gateway = get_config().get("gateway", {})
         if isinstance(gateway, dict) and gateway.get("enabled") is False:
             return None
         if isinstance(gateway, dict) and gateway.get("endpoint"):
-            return _normalize_remote_endpoint(str(gateway["endpoint"]))
-    return None
+            candidate = _normalize_remote_endpoint(str(gateway["endpoint"]))
+    if candidate is None:
+        return None
+    return _client_connectable_remote_endpoint(candidate, master)
+
+
+def _client_connectable_remote_endpoint(endpoint: str, master: object) -> str:
+    normalized = _normalize_remote_endpoint(endpoint)
+    host, port = _parse_remote_endpoint(normalized)
+    if host not in {"0.0.0.0", "::", "[::]"}:
+        return normalized
+    control_host = _control_endpoint_host(master)
+    if control_host is None:
+        return normalized
+    return f"{control_host}:{port}"
+
+
+def _control_endpoint_host(master: object) -> str | None:
+    control_endpoint = getattr(master, "control_endpoint", None)
+    if not callable(control_endpoint):
+        return None
+    try:
+        value = str(control_endpoint())
+    except Exception:
+        return None
+    if value.startswith("tcp://"):
+        value = value.removeprefix("tcp://")
+    elif value.startswith("zippy://"):
+        value = value.removeprefix("zippy://")
+    else:
+        return None
+    authority = value.split("/", 1)[0]
+    if ":" not in authority:
+        return None
+    host, _port = authority.rsplit(":", 1)
+    return host or None
 
 
 def _set_master_local_data_path(master: object, local: bool) -> None:
@@ -1996,9 +2029,15 @@ def _remote_request(
     if token is not None:
         header = dict(header)
         header["token"] = token
-    with socket.create_connection((host, port), timeout=timeout_sec) as sock:
-        _send_remote_frame(sock, header, payload)
-        response, response_payload = _recv_remote_frame(sock)
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec) as sock:
+            _send_remote_frame(sock, header, payload)
+            response, response_payload = _recv_remote_frame(sock)
+    except OSError as error:
+        raise RuntimeError(
+            "failed to connect remote gateway "
+            f"endpoint=[{endpoint}] host=[{host}] port=[{port}] error=[{error}]"
+        ) from error
     if response.get("status") != "ok":
         reason = response.get("reason", "unknown remote gateway error")
         raise RuntimeError(f"remote gateway request failed reason=[{reason}]")

@@ -10,6 +10,7 @@ serde_json.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-engines = { path = "../zippy-engines" }
+zippy-segment-store = { path = "../zippy-segment-store" }
 
 [dev-dependencies]
 zippy-master = { path = "../zippy-master" }
