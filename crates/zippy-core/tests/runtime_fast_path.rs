@@ -4,12 +4,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arrow::array::Int64Array;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{
-    spawn_source_engine_with_publisher, Engine, EngineConfig, EngineMetricsDelta, EngineStatus,
-    OverflowPolicy, Publisher, Result, SegmentTableView, Source, SourceEvent, SourceHandle,
-    SourceMode, SourceSink, StreamHello, ZippyError,
+    spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine, EngineConfig,
+    EngineMetricsDelta, EngineStatus, OverflowPolicy, Publisher, Result, SegmentTableView, Source,
+    SourceEvent, SourceHandle, SourceMode, SourceSink, StreamHello, ZippyError,
+};
+use zippy_segment_store::{
+    compile_schema, ColumnSpec, ColumnType, SegmentStore, SegmentStoreConfig,
 };
 
 struct BlockingEngine {
@@ -95,11 +98,60 @@ impl Engine for BlockingEngine {
     }
 }
 
+struct PassthroughEngine {
+    schema: Arc<Schema>,
+}
+
+impl Engine for PassthroughEngine {
+    fn name(&self) -> &str {
+        "passthrough-engine"
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        Ok(vec![table])
+    }
+}
+
+#[derive(Default)]
+struct TableVariantPublisher {
+    segment_tables: Arc<Mutex<usize>>,
+    memory_tables: Arc<Mutex<usize>>,
+}
+
+impl Publisher for TableVariantPublisher {
+    fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+        Err(ZippyError::InvalidState {
+            status: "record batch publisher fallback used",
+        })
+    }
+
+    fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
+        match table {
+            SegmentTableView::Segment(_) => {
+                *self.segment_tables.lock().unwrap() += 1;
+            }
+            SegmentTableView::Memory(_) => {
+                *self.memory_tables.lock().unwrap() += 1;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct NoopPublisher;
 
 impl Publisher for NoopPublisher {
-    fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+    fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
         Ok(())
     }
 }
@@ -382,6 +434,71 @@ fn test_schema() -> Arc<Schema> {
 
 fn single_row_batch(value: i64) -> RecordBatch {
     RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(vec![value]))]).unwrap()
+}
+
+fn tick_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("last_price", DataType::Float64, false),
+    ]))
+}
+
+fn tick_segment_schema() -> zippy_segment_store::CompiledSchema {
+    compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap()
+}
+
+fn single_tick_segment_table() -> SegmentTableView {
+    let store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 8,
+    })
+    .unwrap();
+    let handle = store
+        .open_partition_with_schema("ticks", "source", tick_segment_schema())
+        .unwrap();
+    handle
+        .writer()
+        .append_tick_for_test(1_710_000_000_000_000_000, "IF2606", 3912.4)
+        .unwrap();
+    SegmentTableView::from_row_span(handle.active_row_span(0, 1).unwrap())
+}
+
+#[test]
+fn engine_handle_write_table_preserves_segment_view_to_publisher() {
+    let publisher = TableVariantPublisher::default();
+    let segment_tables = Arc::clone(&publisher.segment_tables);
+    let memory_tables = Arc::clone(&publisher.memory_tables);
+    let mut handle = spawn_engine_with_publisher(
+        PassthroughEngine {
+            schema: tick_schema(),
+        },
+        EngineConfig {
+            name: "segment-passthrough".to_string(),
+            buffer_capacity: 8,
+            overflow_policy: Default::default(),
+            late_data_policy: Default::default(),
+            xfast: false,
+        },
+        publisher,
+    )
+    .unwrap();
+
+    handle.write_table(single_tick_segment_table()).unwrap();
+    handle.flush().unwrap();
+
+    assert_eq!(*segment_tables.lock().unwrap(), 1);
+    assert_eq!(*memory_tables.lock().unwrap(), 0);
+
+    handle.stop().unwrap();
 }
 
 #[test]

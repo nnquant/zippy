@@ -113,7 +113,7 @@ struct BlockingDataEngine {
 struct FailingPublisher;
 
 impl Publisher for FailingPublisher {
-    fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+    fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
         Err(ZippyError::Io {
             reason: "publish failure".to_string(),
         })

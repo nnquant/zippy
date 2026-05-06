@@ -53,8 +53,6 @@ if _NATIVE_AVAILABLE:
         from ._internal import BusReader
         from ._internal import KeyValueTableMaterializer as _KeyValueTableMaterializer
         from ._internal import SegmentStreamSource
-        from ._internal import BusStreamSource
-        from ._internal import BusStreamTarget
         from ._internal import BusWriter
         from ._internal import NullPublisher
         from ._internal import ParquetSink
@@ -105,8 +103,6 @@ if not _NATIVE_AVAILABLE:
     BusReader = _native_unavailable("BusReader")
     _KeyValueTableMaterializer = _native_unavailable("KeyValueTableMaterializer")
     SegmentStreamSource = _native_unavailable("SegmentStreamSource")
-    BusStreamSource = _native_unavailable("BusStreamSource")
-    BusStreamTarget = _native_unavailable("BusStreamTarget")
     BusWriter = _native_unavailable("BusWriter")
     NullPublisher = _native_unavailable("NullPublisher")
     ParquetSink = _native_unavailable("ParquetSink")
@@ -151,6 +147,7 @@ _DEFAULT_HEARTBEAT_INTERVAL_SEC = _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC
 _DEFAULT_MASTER: MasterClient | None = None
 _DEFAULT_HEARTBEAT: _HeartbeatHandle | None = None
 _DEFAULT_HEARTBEAT_LOCK = threading.Lock()
+_MASTER_LOCAL_DATA_PATH: dict[int, bool] = {}
 _USE_MASTER_CONFIG = object()
 _BUILTIN_CONFIG: dict[str, object] = {
     "master": {
@@ -671,6 +668,7 @@ def connect(
     *,
     app: str | None = None,
     heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC,
+    local: bool = True,
 ) -> MasterClient:
     """
     Connect to zippy-master and set the process-wide default master connection.
@@ -686,6 +684,9 @@ def connect(
     :type app: str | None
     :param heartbeat_interval_sec: Process lease heartbeat interval in seconds.
     :type heartbeat_interval_sec: float
+    :param local: When true, prefer local segment/mmap data paths even if the TCP master advertises
+        a GatewayServer. Set to false to force Gateway data paths.
+    :type local: bool
     :returns: The default master client.
     :rtype: MasterClient
     :raises RuntimeError: If the master connection or process registration fails.
@@ -712,6 +713,7 @@ def connect(
         _set_default_master(client, None, interval_sec)
         return client
     client = MasterClient(control_endpoint=endpoint)
+    _set_master_local_data_path(client, bool(local))
     heartbeat = None
     try:
         if app is not None:
@@ -1867,6 +1869,7 @@ def _reset_default_master_for_test() -> None:
     _stop_default_heartbeat()
     _DEFAULT_HEARTBEAT_INTERVAL_SEC = _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC
     _DEFAULT_MASTER = None
+    _MASTER_LOCAL_DATA_PATH.clear()
 
 
 _REMOTE_FRAME_HEADER = struct.Struct("!IQ")
@@ -1909,6 +1912,26 @@ def _remote_gateway_endpoint(master: object) -> str | None:
     return None
 
 
+def _set_master_local_data_path(master: object, local: bool) -> None:
+    try:
+        setattr(master, "_zippy_local_data_path", bool(local))
+    except Exception:
+        _MASTER_LOCAL_DATA_PATH[id(master)] = bool(local)
+
+
+def _master_prefers_local_data_path(master: object) -> bool:
+    value = getattr(master, "_zippy_local_data_path", None)
+    if value is not None:
+        return bool(value)
+    return bool(_MASTER_LOCAL_DATA_PATH.get(id(master), False))
+
+
+def _remote_gateway_endpoint_for_data(master: object) -> str | None:
+    if _master_prefers_local_data_path(master):
+        return None
+    return _remote_gateway_endpoint(master)
+
+
 def _remote_gateway_token(master: object) -> str | None:
     token = getattr(master, "remote_gateway_token", None)
     if callable(token):
@@ -1926,7 +1949,7 @@ def _remote_gateway_token(master: object) -> str | None:
 
 
 def _is_remote_master(master: object) -> bool:
-    return _remote_gateway_endpoint(master) is not None
+    return _remote_gateway_endpoint_for_data(master) is not None
 
 
 def _recv_exact(sock: socket.socket, size: int) -> bytes:
@@ -2549,7 +2572,11 @@ def get_writer(
     Return a writer for a named stream, choosing local segment or remote gateway automatically.
     """
     selected_master = master or _default_master()
-    remote_endpoint = endpoint or _remote_gateway_endpoint(selected_master)
+    remote_endpoint = (
+        _normalize_remote_endpoint(endpoint)
+        if endpoint is not None
+        else _remote_gateway_endpoint_for_data(selected_master)
+    )
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
         if schema is None and not create:
@@ -2605,11 +2632,14 @@ class Table:
             _ensure_master_process(selected_master, f"read_table.{source}")
             if wait:
                 _wait_for_table_ready(source, selected_master, timeout)
-            if _is_remote_master(selected_master) and not _force_local:
+            remote_endpoint = (
+                None if _force_local else _remote_gateway_endpoint_for_data(selected_master)
+            )
+            if remote_endpoint is not None:
                 self._inner = _RemoteQuery(
                     source=source,
                     master=selected_master,
-                    endpoint=_remote_gateway_endpoint(selected_master),
+                    endpoint=remote_endpoint,
                     token=_remote_gateway_token(selected_master),
                 )
             else:
@@ -3803,7 +3833,7 @@ def subscribe(
     :rtype: StreamSubscriber
     """
     selected_master = master or _default_master()
-    remote_endpoint = _remote_gateway_endpoint(selected_master)
+    remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
         if filter is not None and instrument_ids is not None:
@@ -3888,7 +3918,7 @@ def subscribe_table(
     :rtype: StreamSubscriber
     """
     selected_master = master or _default_master()
-    remote_endpoint = _remote_gateway_endpoint(selected_master)
+    remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
         return RemoteStreamSubscriber(
@@ -5926,8 +5956,6 @@ __all__ = [
     "MasterServer",
     "run_master_daemon",
     "BusReader",
-    "BusStreamSource",
-    "BusStreamTarget",
     "BusWriter",
     "NullPublisher",
     "OverflowPolicy",

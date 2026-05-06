@@ -18,7 +18,7 @@ use zippy_core::{
 struct NoopPublisher;
 
 impl Publisher for NoopPublisher {
-    fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+    fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
         Ok(())
     }
 }
@@ -31,7 +31,7 @@ struct TrackingPublisher {
 }
 
 impl Publisher for TrackingPublisher {
-    fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+    fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
         self.published_batches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }

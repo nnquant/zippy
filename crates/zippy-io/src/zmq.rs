@@ -935,8 +935,9 @@ mod implementation {
     }
 
     impl CorePublisher for ZmqPublisher {
-        fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
-            let payload = encode_batch(batch)?;
+        fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
+            let batch = table.to_record_batch()?;
+            let payload = encode_batch(&batch)?;
             self.socket
                 .send(payload, 0)
                 .map_err(|error| socket_error("failed to send zmq payload", error))?;
@@ -945,8 +946,9 @@ mod implementation {
     }
 
     impl CorePublisher for ZmqStreamPublisher {
-        fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
-            self.publish_data(batch)
+        fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
+            let batch = table.to_record_batch()?;
+            self.publish_data(&batch)
         }
 
         fn flush(&mut self) -> Result<()> {
@@ -993,8 +995,8 @@ mod implementation {
 
     use arrow::record_batch::RecordBatch;
     use zippy_core::{
-        Publisher as CorePublisher, Result, SchemaRef, Source, SourceEvent, SourceHandle,
-        SourceMode, SourceSink, ZippyError,
+        Publisher as CorePublisher, Result, SchemaRef, SegmentTableView, Source, SourceEvent,
+        SourceHandle, SourceMode, SourceSink, ZippyError,
     };
 
     /// Publish bare Arrow IPC batches over a ZMQ PUB socket.
@@ -1115,7 +1117,7 @@ mod implementation {
     }
 
     impl CorePublisher for ZmqPublisher {
-        fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+        fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
             Err(ZippyError::Io {
                 reason: "failed to publish zmq payload because feature is disabled".to_string(),
             })
@@ -1123,7 +1125,7 @@ mod implementation {
     }
 
     impl CorePublisher for ZmqStreamPublisher {
-        fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+        fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
             Err(ZippyError::Io {
                 reason: "failed to publish zmq stream data because feature is disabled".to_string(),
             })

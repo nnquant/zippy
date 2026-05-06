@@ -459,21 +459,6 @@ class StreamSubscriber:
     def metrics(self) -> dict[str, object]: ...
 
 
-class BusStreamTarget:
-    def __init__(self, stream_name: str, master: MasterClient) -> None: ...
-
-
-class BusStreamSource:
-    def __init__(
-        self,
-        stream_name: str,
-        expected_schema: pa.Schema,
-        master: MasterClient,
-        mode: _SourceModeValue | None = None,
-        xfast: bool = False,
-    ) -> None: ...
-
-
 class SegmentStreamSource:
     def __init__(
         self,
@@ -496,8 +481,7 @@ PublisherTarget = (
     NullPublisher
     | ZmqPublisher
     | ZmqStreamPublisher
-    | BusStreamTarget
-    | list[NullPublisher | ZmqPublisher | ZmqStreamPublisher | BusStreamTarget]
+    | list[NullPublisher | ZmqPublisher | ZmqStreamPublisher]
 )
 ReactiveFactor = (
     TsEmaSpec
@@ -541,7 +525,6 @@ class ReactiveStateEngine:
         | TimeSeriesEngine
         | CrossSectionalEngine
         | ZmqSource
-        | BusStreamSource
         | SegmentStreamSource
         | None = None,
         master: MasterClient | None = None,
@@ -584,7 +567,6 @@ class ReactiveLatestEngine:
         | StreamTableMaterializer
         | TimeSeriesEngine
         | ZmqSource
-        | BusStreamSource
         | SegmentStreamSource
         | None = None,
         master: MasterClient | None = None,
@@ -625,7 +607,6 @@ class StreamTableMaterializer:
         | StreamTableMaterializer
         | TimeSeriesEngine
         | ZmqSource
-        | BusStreamSource
         | SegmentStreamSource
         | None = None,
         master: MasterClient | None = None,
@@ -681,7 +662,6 @@ class KeyValueTableMaterializer:
         | TimeSeriesEngine
         | CrossSectionalEngine
         | ZmqSource
-        | BusStreamSource
         | SegmentStreamSource
         | None = None,
         master: MasterClient | None = None,
@@ -738,7 +718,6 @@ class TimeSeriesEngine:
         | StreamTableMaterializer
         | TimeSeriesEngine
         | ZmqSource
-        | BusStreamSource
         | SegmentStreamSource
         | None = None,
         master: MasterClient | None = None,

@@ -219,7 +219,6 @@ type SourceOwner = Option<Py<PyAny>>;
 type RegisteredSource = (
     SourceOwner,
     Option<RemoteSourceConfig>,
-    Option<BusSourceConfig>,
     Option<SegmentSourceConfig>,
     Option<PythonSourceConfig>,
 );
@@ -247,15 +246,6 @@ struct RemoteSourceConfig {
 }
 
 #[derive(Clone)]
-struct BusSourceConfig {
-    stream_name: String,
-    expected_schema: Arc<Schema>,
-    master: SharedMasterClient,
-    mode: RustSourceMode,
-    xfast: bool,
-}
-
-#[derive(Clone)]
 struct SegmentSourceConfig {
     stream_name: String,
     expected_schema: Arc<Schema>,
@@ -279,10 +269,6 @@ enum TargetConfig {
     Zmq {
         endpoint: String,
     },
-    BusStream {
-        stream_name: String,
-        master: SharedMasterClient,
-    },
     ZmqStream {
         endpoint: String,
         stream_name: String,
@@ -296,6 +282,10 @@ struct InProcessPublisher {
 
 impl CorePublisher for InProcessPublisher {
     fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
+        self.publish_table(&SegmentTableView::from_record_batch(batch.clone()))
+    }
+
+    fn publish_table(&mut self, table: &SegmentTableView) -> zippy_core::Result<()> {
         if self.downstream.write_input {
             let archive = self.downstream.archive.lock().unwrap();
             let archive = archive
@@ -303,14 +293,14 @@ impl CorePublisher for InProcessPublisher {
                 .ok_or(zippy_core::ZippyError::InvalidState {
                     status: "parquet sink not started",
                 })?;
-            archive.write(ArchiveKind::Input, batch.clone())?;
+            archive.write(ArchiveKind::Input, table.to_record_batch()?)?;
         }
 
         let guard = self.downstream.handle.lock().unwrap();
         let handle = guard.as_ref().ok_or(zippy_core::ZippyError::InvalidState {
             status: "engine not started",
         })?;
-        handle.write(batch.clone())
+        handle.write_table(table.clone())
     }
 }
 
@@ -638,8 +628,9 @@ struct ParquetOutputPublisher {
 }
 
 impl CorePublisher for ParquetOutputPublisher {
-    fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
-        self.archive.write(ArchiveKind::Output, batch.clone())
+    fn publish_table(&mut self, table: &SegmentTableView) -> zippy_core::Result<()> {
+        self.archive
+            .write(ArchiveKind::Output, table.to_record_batch()?)
     }
 
     fn flush(&mut self) -> zippy_core::Result<()> {
@@ -3733,67 +3724,6 @@ impl MasterDaemon {
 }
 
 #[pyclass]
-struct BusStreamTarget {
-    stream_name: String,
-    master: SharedMasterClient,
-}
-
-#[pymethods]
-impl BusStreamTarget {
-    #[new]
-    #[pyo3(signature = (stream_name, master))]
-    fn new(stream_name: String, master: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let master = master
-            .extract::<PyRef<'_, MasterClient>>()
-            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
-        Ok(Self {
-            stream_name,
-            master: Arc::clone(&master.client),
-        })
-    }
-}
-
-#[pyclass]
-struct BusStreamSource {
-    stream_name: String,
-    expected_schema: Arc<Schema>,
-    mode: RustSourceMode,
-    master: SharedMasterClient,
-    xfast: bool,
-}
-
-#[pymethods]
-impl BusStreamSource {
-    #[new]
-    #[pyo3(signature = (stream_name, expected_schema, master, mode=None, xfast=false))]
-    fn new(
-        stream_name: String,
-        expected_schema: &Bound<'_, PyAny>,
-        master: &Bound<'_, PyAny>,
-        mode: Option<&Bound<'_, PyAny>>,
-        xfast: bool,
-    ) -> PyResult<Self> {
-        let expected_schema = Arc::new(
-            Schema::from_pyarrow_bound(expected_schema)
-                .map_err(|error| py_value_error(error.to_string()))?,
-        );
-        let master = master
-            .extract::<PyRef<'_, MasterClient>>()
-            .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
-        Ok(Self {
-            stream_name,
-            expected_schema,
-            mode: match mode {
-                Some(mode) => parse_source_mode(mode)?,
-                None => RustSourceMode::Pipeline,
-            },
-            master: Arc::clone(&master.client),
-            xfast,
-        })
-    }
-}
-
-#[pyclass]
 struct SegmentStreamSource {
     stream_name: String,
     expected_schema: Arc<Schema>,
@@ -3980,86 +3910,6 @@ impl BusReader {
         reader
             .close()
             .map_err(|error| py_runtime_error(error.to_string()))
-    }
-}
-
-struct BusTargetPublisher {
-    writer: CoreBusWriter,
-}
-
-impl CorePublisher for BusTargetPublisher {
-    fn publish(&mut self, batch: &RecordBatch) -> zippy_core::Result<()> {
-        self.writer
-            .write_with_target_publish_enter_ns(batch.clone(), current_localtime_ns())
-    }
-
-    fn flush(&mut self) -> zippy_core::Result<()> {
-        self.writer.flush()
-    }
-
-    fn close(&mut self) -> zippy_core::Result<()> {
-        self.writer.close()
-    }
-}
-
-struct BusSourceBridge {
-    stream_name: String,
-    expected_schema: Arc<Schema>,
-    mode: RustSourceMode,
-    master: SharedMasterClient,
-    xfast: bool,
-}
-
-impl Source for BusSourceBridge {
-    fn name(&self) -> &str {
-        &self.stream_name
-    }
-
-    fn output_schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.expected_schema)
-    }
-
-    fn mode(&self) -> RustSourceMode {
-        self.mode
-    }
-
-    fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
-        let mut reader = self
-            .master
-            .lock()
-            .unwrap()
-            .read_from_with_xfast(&self.stream_name, self.xfast)?;
-        let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
-        sink.emit(SourceEvent::Hello(hello))?;
-
-        let running = Arc::new(AtomicBool::new(true));
-        let running_flag = Arc::clone(&running);
-        let join_handle = thread::spawn(move || {
-            while running_flag.load(Ordering::SeqCst) {
-                match reader.read(Some(100)) {
-                    Ok(batch) => sink.emit(SourceEvent::Data(
-                        SegmentTableView::from_record_batch(batch),
-                    ))?,
-                    Err(ZippyError::Io { reason }) if reason.contains("reader timed out") => {
-                        continue;
-                    }
-                    Err(error) => {
-                        sink.emit(SourceEvent::Error(error.to_string()))?;
-                        return Err(error);
-                    }
-                }
-            }
-
-            Ok(())
-        });
-
-        Ok(SourceHandle::new_with_stop(
-            join_handle,
-            Box::new(move || {
-                running.store(false, Ordering::SeqCst);
-                Ok(())
-            }),
-        ))
     }
 }
 
@@ -4252,7 +4102,6 @@ struct ReactiveStateEngine {
     handle: SharedHandle,
     engine: Option<RustReactiveStateEngine>,
     remote_source: Option<RemoteSourceConfig>,
-    bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
@@ -4274,7 +4123,6 @@ struct ReactiveLatestEngine {
     handle: SharedHandle,
     engine: Option<RustReactiveLatestEngine>,
     remote_source: Option<RemoteSourceConfig>,
-    bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
@@ -4300,7 +4148,6 @@ struct TimeSeriesEngine {
     handle: SharedHandle,
     engine: Option<RustTimeSeriesEngine>,
     remote_source: Option<RemoteSourceConfig>,
-    bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
@@ -4344,7 +4191,6 @@ struct StreamTableMaterializer {
     handle: SharedHandle,
     engine: Option<RustStreamTableMaterializer>,
     remote_source: Option<RemoteSourceConfig>,
-    bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
@@ -4366,7 +4212,6 @@ struct KeyValueTableMaterializer {
     handle: SharedHandle,
     engine: Option<RustKeyValueTableMaterializer>,
     remote_source: Option<RemoteSourceConfig>,
-    bus_source: Option<BusSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
     downstreams: Vec<DownstreamLink>,
@@ -4421,22 +4266,21 @@ impl ReactiveStateEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, segment_source, python_source) =
-            register_source(
-                py,
-                source,
-                master,
-                DownstreamLink {
-                    handle: Arc::clone(&handle),
-                    archive: Arc::clone(&archive),
-                    write_input: parquet_sink
-                        .as_ref()
-                        .map(|config| config.write_input)
-                        .unwrap_or(false),
-                },
-                schema.as_ref(),
-                xfast,
-            )?;
+        let (source_owner, remote_source, segment_source, python_source) = register_source(
+            py,
+            source,
+            master,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+            xfast,
+        )?;
 
         Ok(Self {
             name,
@@ -4453,7 +4297,6 @@ impl ReactiveStateEngine {
             handle,
             engine: Some(engine),
             remote_source,
-            bus_source,
             segment_source,
             python_source,
             downstreams: Vec::new(),
@@ -4468,7 +4311,6 @@ impl ReactiveStateEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
-            self.bus_source.as_ref(),
             self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
@@ -4522,7 +4364,6 @@ impl ReactiveStateEngine {
             engine_has_source(
                 &self._source_owner,
                 &self.remote_source,
-                &self.bus_source,
                 &self.segment_source,
                 &self.python_source,
             ),
@@ -4603,9 +4444,9 @@ impl ReactiveLatestEngine {
         let engine = RustReactiveLatestEngine::new(&name, Arc::clone(&schema), by.clone())
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
-        let (source_owner, remote_source, bus_source, segment_source, python_source) =
+        let (source_owner, remote_source, segment_source, python_source) =
             if let Some(segment_source) = resolved_segment_source {
-                (None, None, None, Some(segment_source), None)
+                (None, None, Some(segment_source), None)
             } else if let Some(stream_name) = named_source.as_deref() {
                 let (_, segment_source) = segment_source_config_from_named_stream(
                     py,
@@ -4614,7 +4455,7 @@ impl ReactiveLatestEngine {
                     Some(schema.as_ref()),
                     xfast,
                 )?;
-                (None, None, None, Some(segment_source), None)
+                (None, None, Some(segment_source), None)
             } else {
                 register_source(
                     py,
@@ -4647,7 +4488,6 @@ impl ReactiveLatestEngine {
             handle,
             engine: Some(engine),
             remote_source,
-            bus_source,
             segment_source,
             python_source,
             downstreams: Vec::new(),
@@ -4662,7 +4502,6 @@ impl ReactiveLatestEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
-            self.bus_source.as_ref(),
             self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
@@ -4716,7 +4555,6 @@ impl ReactiveLatestEngine {
             engine_has_source(
                 &self._source_owner,
                 &self.remote_source,
-                &self.bus_source,
                 &self.segment_source,
                 &self.python_source,
             ),
@@ -4847,22 +4685,21 @@ impl StreamTableMaterializer {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, segment_source, python_source) =
-            register_source(
-                py,
-                source,
-                master,
-                DownstreamLink {
-                    handle: Arc::clone(&handle),
-                    archive: Arc::clone(&archive),
-                    write_input: parquet_sink
-                        .as_ref()
-                        .map(|config| config.write_input)
-                        .unwrap_or(false),
-                },
-                schema.as_ref(),
-                xfast,
-            )?;
+        let (source_owner, remote_source, segment_source, python_source) = register_source(
+            py,
+            source,
+            master,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+            xfast,
+        )?;
 
         Ok(Self {
             name,
@@ -4877,7 +4714,6 @@ impl StreamTableMaterializer {
             handle,
             engine: Some(engine),
             remote_source,
-            bus_source,
             segment_source,
             python_source,
             downstreams: Vec::new(),
@@ -4892,7 +4728,6 @@ impl StreamTableMaterializer {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
-            self.bus_source.as_ref(),
             self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
@@ -4946,7 +4781,6 @@ impl StreamTableMaterializer {
             engine_has_source(
                 &self._source_owner,
                 &self.remote_source,
-                &self.bus_source,
                 &self.segment_source,
                 &self.python_source,
             ),
@@ -5062,22 +4896,21 @@ impl KeyValueTableMaterializer {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, segment_source, python_source) =
-            register_source(
-                py,
-                source,
-                master,
-                DownstreamLink {
-                    handle: Arc::clone(&handle),
-                    archive: Arc::clone(&archive),
-                    write_input: parquet_sink
-                        .as_ref()
-                        .map(|config| config.write_input)
-                        .unwrap_or(false),
-                },
-                schema.as_ref(),
-                xfast,
-            )?;
+        let (source_owner, remote_source, segment_source, python_source) = register_source(
+            py,
+            source,
+            master,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+            xfast,
+        )?;
 
         Ok(Self {
             name,
@@ -5093,7 +4926,6 @@ impl KeyValueTableMaterializer {
             handle,
             engine: Some(engine),
             remote_source,
-            bus_source,
             segment_source,
             python_source,
             downstreams: Vec::new(),
@@ -5108,7 +4940,6 @@ impl KeyValueTableMaterializer {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
-            self.bus_source.as_ref(),
             self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
@@ -5162,7 +4993,6 @@ impl KeyValueTableMaterializer {
             engine_has_source(
                 &self._source_owner,
                 &self.remote_source,
-                &self.bus_source,
                 &self.segment_source,
                 &self.python_source,
             ),
@@ -5272,22 +5102,21 @@ impl TimeSeriesEngine {
         let archive = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
-        let (source_owner, remote_source, bus_source, segment_source, python_source) =
-            register_source(
-                py,
-                source,
-                master,
-                DownstreamLink {
-                    handle: Arc::clone(&handle),
-                    archive: Arc::clone(&archive),
-                    write_input: parquet_sink
-                        .as_ref()
-                        .map(|config| config.write_input)
-                        .unwrap_or(false),
-                },
-                schema.as_ref(),
-                xfast,
-            )?;
+        let (source_owner, remote_source, segment_source, python_source) = register_source(
+            py,
+            source,
+            master,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+            xfast,
+        )?;
 
         Ok(Self {
             name,
@@ -5307,7 +5136,6 @@ impl TimeSeriesEngine {
             handle,
             engine: Some(engine),
             remote_source,
-            bus_source,
             segment_source,
             python_source,
             downstreams: Vec::new(),
@@ -5322,7 +5150,6 @@ impl TimeSeriesEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
-            self.bus_source.as_ref(),
             self.segment_source.as_ref(),
             self.python_source.as_ref(),
             &self.downstreams,
@@ -5376,7 +5203,6 @@ impl TimeSeriesEngine {
             engine_has_source(
                 &self._source_owner,
                 &self.remote_source,
-                &self.bus_source,
                 &self.segment_source,
                 &self.python_source,
             ),
@@ -5512,7 +5338,6 @@ impl CrossSectionalEngine {
             &self.target,
             self.parquet_sink.as_ref(),
             self.remote_source.as_ref(),
-            None,
             self.segment_source.as_ref(),
             None,
             &self.downstreams,
@@ -5628,8 +5453,6 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StreamSubscriber>()?;
     module.add_class::<BusWriter>()?;
     module.add_class::<BusReader>()?;
-    module.add_class::<BusStreamTarget>()?;
-    module.add_class::<BusStreamSource>()?;
     module.add_class::<SegmentStreamSource>()?;
     module.add_class::<SegmentTestWriter>()?;
     module.add_class::<ReactiveStateEngine>()?;
@@ -5838,15 +5661,8 @@ fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
         });
     }
 
-    if let Ok(target) = target.extract::<PyRef<'_, BusStreamTarget>>() {
-        return Ok(TargetConfig::BusStream {
-            stream_name: target.stream_name.clone(),
-            master: Arc::clone(&target.master),
-        });
-    }
-
     Err(PyTypeError::new_err(
-        "target must be NullPublisher, ZmqPublisher, ZmqStreamPublisher, BusStreamTarget, or a non-empty list of them",
+        "target must be NullPublisher, ZmqPublisher, ZmqStreamPublisher, or a non-empty list of them",
     ))
 }
 
@@ -5934,7 +5750,7 @@ fn register_source(
     xfast: bool,
 ) -> PyResult<RegisteredSource> {
     let Some(source) = source else {
-        return Ok((None, None, None, None, None));
+        return Ok((None, None, None, None));
     };
 
     if let Ok(stream_name) = source.extract::<String>() {
@@ -5945,7 +5761,7 @@ fn register_source(
             Some(input_schema),
             xfast,
         )?;
-        return Ok((None, None, None, Some(segment_source), None));
+        return Ok((None, None, Some(segment_source), None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveStateEngine>>() {
@@ -5960,7 +5776,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, ReactiveLatestEngine>>() {
@@ -5975,7 +5791,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, StreamTableMaterializer>>() {
@@ -5990,7 +5806,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, KeyValueTableMaterializer>>() {
@@ -6005,7 +5821,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream.clone());
-        return Ok((Some(source.clone().unbind()), None, None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, TimeSeriesEngine>>() {
@@ -6020,7 +5836,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok((Some(source.clone().unbind()), None, None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, CrossSectionalEngine>>() {
@@ -6035,7 +5851,7 @@ fn register_source(
             ));
         }
         engine.downstreams.push(downstream);
-        return Ok((Some(source.clone().unbind()), None, None, None, None));
+        return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
     if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
@@ -6054,29 +5870,6 @@ fn register_source(
             }),
             None,
             None,
-            None,
-        ));
-    }
-
-    if let Ok(bus_source) = source.extract::<PyRef<'_, BusStreamSource>>() {
-        if bus_source.expected_schema.as_ref() != input_schema {
-            return Err(py_value_error(
-                "source output schema must match downstream input_schema",
-            ));
-        }
-
-        return Ok((
-            Some(source.clone().unbind()),
-            None,
-            Some(BusSourceConfig {
-                stream_name: bus_source.stream_name.clone(),
-                expected_schema: bus_source.expected_schema.clone(),
-                master: Arc::clone(&bus_source.master),
-                mode: bus_source.mode,
-                xfast: bus_source.xfast,
-            }),
-            None,
-            None,
         ));
     }
 
@@ -6089,7 +5882,6 @@ fn register_source(
 
         return Ok((
             Some(source.clone().unbind()),
-            None,
             None,
             Some(SegmentSourceConfig {
                 stream_name: segment_source.stream_name.clone(),
@@ -6132,7 +5924,6 @@ fn register_source(
             Some(source.clone().unbind()),
             None,
             None,
-            None,
             Some(PythonSourceConfig {
                 owner: source.clone().unbind(),
                 name,
@@ -6143,7 +5934,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableMaterializer, KeyValueTableMaterializer, TimeSeriesEngine, CrossSectionalEngine, ZmqSource, BusStreamSource, SegmentStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableMaterializer, KeyValueTableMaterializer, TimeSeriesEngine, CrossSectionalEngine, ZmqSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
@@ -6236,17 +6027,6 @@ fn build_publisher(
                     )
                 })?;
                 publishers.push(Box::new(publisher));
-            }
-            TargetConfig::BusStream {
-                stream_name,
-                master,
-            } => {
-                let writer = master
-                    .lock()
-                    .unwrap()
-                    .write_to(stream_name)
-                    .map_err(|error| py_runtime_error(error.to_string()))?;
-                publishers.push(Box::new(BusTargetPublisher { writer }));
             }
         }
     }
@@ -6354,7 +6134,6 @@ fn start_runtime_engine<E: Engine>(
     targets: &[TargetConfig],
     parquet_sink: Option<&ParquetSinkConfig>,
     remote_source: Option<&RemoteSourceConfig>,
-    bus_source: Option<&BusSourceConfig>,
     segment_source: Option<&SegmentSourceConfig>,
     python_source: Option<&PythonSourceConfig>,
     downstreams: &[DownstreamLink],
@@ -6386,8 +6165,8 @@ fn start_runtime_engine<E: Engine>(
         return Err(py_runtime_error("engine already started"));
     }
 
-    let handle = match (remote_source, bus_source, segment_source, python_source) {
-        (Some(remote_source), None, None, None) => {
+    let handle = match (remote_source, segment_source, python_source) {
+        (Some(remote_source), None, None) => {
             let source = Box::new(
                 RustZmqSource::connect(
                     &format!("{name}_source"),
@@ -6399,17 +6178,7 @@ fn start_runtime_engine<E: Engine>(
             );
             start_prepared_source_runtime(source, config, publisher, engine)
         }
-        (None, Some(bus_source), None, None) => {
-            let source = Box::new(BusSourceBridge {
-                stream_name: bus_source.stream_name.clone(),
-                expected_schema: Arc::clone(&bus_source.expected_schema),
-                mode: bus_source.mode,
-                master: Arc::clone(&bus_source.master),
-                xfast: bus_source.xfast,
-            });
-            start_prepared_source_runtime(source, config, publisher, engine)
-        }
-        (None, None, Some(segment_source), None) => {
+        (None, Some(segment_source), None) => {
             let source = Box::new(SegmentSourceBridge {
                 stream_name: segment_source.stream_name.clone(),
                 expected_schema: Arc::clone(&segment_source.expected_schema),
@@ -6421,7 +6190,7 @@ fn start_runtime_engine<E: Engine>(
             });
             start_prepared_source_runtime(source, config, publisher, engine)
         }
-        (None, None, None, Some(python_source)) => {
+        (None, None, Some(python_source)) => {
             let source = Box::new(PythonSourceBridge {
                 owner: Python::with_gil(|py| python_source.owner.clone_ref(py)),
                 name: python_source.name.clone(),
@@ -6430,7 +6199,7 @@ fn start_runtime_engine<E: Engine>(
             });
             start_prepared_source_runtime(source, config, publisher, engine)
         }
-        (None, None, None, None) => {
+        (None, None, None) => {
             let engine = engine
                 .take()
                 .expect("engine must be available after pre-start validation");
@@ -6741,13 +6510,11 @@ fn engine_base_config_dict<'py>(
 fn engine_has_source(
     source_owner: &SourceOwner,
     remote_source: &Option<RemoteSourceConfig>,
-    bus_source: &Option<BusSourceConfig>,
     segment_source: &Option<SegmentSourceConfig>,
     python_source: &Option<PythonSourceConfig>,
 ) -> bool {
     source_owner.is_some()
         || remote_source.is_some()
-        || bus_source.is_some()
         || segment_source.is_some()
         || python_source.is_some()
 }
@@ -6771,10 +6538,6 @@ fn target_configs_to_pylist(py: Python<'_>, targets: &[TargetConfig]) -> PyResul
             } => {
                 item.set_item("type", "zmq_stream")?;
                 item.set_item("endpoint", endpoint)?;
-                item.set_item("stream_name", stream_name)?;
-            }
-            TargetConfig::BusStream { stream_name, .. } => {
-                item.set_item("type", "bus_stream")?;
                 item.set_item("stream_name", stream_name)?;
             }
         }

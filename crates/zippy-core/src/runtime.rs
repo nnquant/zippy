@@ -40,7 +40,7 @@ fn zippy_debug_stop_log(message: &str) {
 struct NoopPublisher;
 
 impl Publisher for NoopPublisher {
-    fn publish(&mut self, _batch: &RecordBatch) -> Result<()> {
+    fn publish_table(&mut self, _table: &SegmentTableView) -> Result<()> {
         Ok(())
     }
 }
@@ -121,6 +121,11 @@ impl EngineHandle {
     pub fn write(&self, batch: RecordBatch) -> Result<()> {
         self.ensure_running()?;
         self.enqueue_command(Command::Data(SegmentTableView::from_record_batch(batch)))
+    }
+
+    pub fn write_table(&self, table: SegmentTableView) -> Result<()> {
+        self.ensure_running()?;
+        self.enqueue_command(Command::Data(table))
     }
 
     pub fn flush(&self) -> Result<Vec<RecordBatch>> {

@@ -46,6 +46,17 @@ def reserve_tcp_port() -> int:
         return probe.getsockname()[1]
 
 
+def recv_zmq_with_retry(subscriber, timeout_sec: float = 2.0):
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            return subscriber.recv()
+        except RuntimeError as error:
+            if "Resource temporarily unavailable" not in str(error) or time.time() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def test_expr_factory_replaces_expr() -> None:
     factor = zippy.Expr(expression="ABS(price)", output="score")
 
@@ -3944,33 +3955,27 @@ def test_stream_table_engine_can_drive_timeseries_downstream_pipeline() -> None:
     subscriber.close()
 
 
-def test_stream_table_engine_can_publish_to_master_bus(tmp_path: Path) -> None:
+def test_stream_table_engine_can_publish_to_zmq() -> None:
     schema = pa.schema(
         [
             ("instrument_id", pa.string()),
             ("last_price", pa.float64()),
         ]
     )
-    control_endpoint = str(tmp_path / "zippy-master.sock")
-    server = zippy.MasterServer(control_endpoint=control_endpoint)
-    server.start()
-
-    writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
-    writer_master.register_process("writer")
-    writer_master.register_stream("ticks", schema, 64, 4096)
-
-    reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
-    reader_master.register_process("reader")
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = None
 
     engine = zippy._internal.StreamTableMaterializer(
         name="ticks",
         input_schema=schema,
-        target=zippy.BusStreamTarget(stream_name="ticks", master=writer_master),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
     )
-    reader = reader_master.read_from("ticks")
 
     try:
         engine.start()
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+        time.sleep(0.1)
         engine.write(
             pl.DataFrame(
                 {
@@ -3979,16 +3984,16 @@ def test_stream_table_engine_can_publish_to_master_bus(tmp_path: Path) -> None:
                 }
             )
         )
-        received = reader.read(1_000)
+        engine.flush()
+        received = recv_zmq_with_retry(subscriber)
 
         assert received.schema == schema
         assert received.column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
         assert received.column("last_price").to_pylist() == [3898.2, 2675.4]
     finally:
-        reader.close()
         engine.stop()
-        server.stop()
-        server.join()
+        if subscriber is not None:
+            subscriber.close()
 
 
 def test_master_server_start_raises_when_socket_is_already_active(tmp_path: Path) -> None:
@@ -4081,9 +4086,10 @@ def test_run_master_daemon_expands_user_path_and_creates_parent_dir(tmp_path: Pa
             process.wait(timeout=5)
 
 
-def test_reactive_engine_can_consume_master_bus_stream(tmp_path: Path) -> None:
+def test_reactive_engine_can_consume_segment_stream_source(tmp_path: Path) -> None:
     schema = pa.schema(
         [
+            ("dt", pa.timestamp("ns", tz="UTC")),
             ("instrument_id", pa.string()),
             ("last_price", pa.float64()),
         ]
@@ -4093,22 +4099,24 @@ def test_reactive_engine_can_consume_master_bus_stream(tmp_path: Path) -> None:
     server.start()
 
     writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
-    writer_master.register_process("writer")
+    writer_master.register_process("segment_writer")
     writer_master.register_stream("ticks", schema, 64, 4096)
-    writer = writer_master.write_to("ticks")
+    writer_master.register_source("segment_md", "segment_test", "ticks", {})
+    writer = zippy._internal._SegmentTestWriter("ticks", schema, row_capacity=16)
+    writer_master.publish_segment_descriptor("ticks", writer.descriptor())
 
-    reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
-    reader_master.register_process("reactive_reader")
+    engine_master = zippy.MasterClient(control_endpoint=control_endpoint)
+    engine_master.register_process("reactive_reader")
 
     port = reserve_tcp_port()
     endpoint = f"tcp://127.0.0.1:{port}"
-    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    subscriber = None
     engine = zippy.ReactiveStateEngine(
-        name="reactive_bus",
-        source=zippy.BusStreamSource(
+        name="reactive_segment",
+        source=zippy.SegmentStreamSource(
             stream_name="ticks",
             expected_schema=schema,
-            master=reader_master,
+            master=engine_master,
             mode=zippy.SourceMode.PIPELINE,
         ),
         input_schema=schema,
@@ -4121,32 +4129,18 @@ def test_reactive_engine_can_consume_master_bus_stream(tmp_path: Path) -> None:
 
     try:
         engine.start()
-        time.sleep(0.3)
-        writer.write(
-            pl.DataFrame(
-                {
-                    "instrument_id": ["IF2606"],
-                    "last_price": [10.0],
-                }
-            )
-        )
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+        time.sleep(0.1)
+        writer.append_tick(1777017600000000000, "IF2606", 10.0)
 
-        deadline = time.time() + 2.0
-        while True:
-            try:
-                received = subscriber.recv()
-                break
-            except RuntimeError as error:
-                if "Resource temporarily unavailable" not in str(error) or time.time() >= deadline:
-                    raise
-                time.sleep(0.05)
+        received = recv_zmq_with_retry(subscriber)
         assert received.column("instrument_id").to_pylist() == ["IF2606"]
         assert received.column("last_price").to_pylist() == [10.0]
         assert received.column("price_x2").to_pylist() == [20.0]
     finally:
-        writer.close()
         engine.stop()
-        subscriber.close()
+        if subscriber is not None:
+            subscriber.close()
         server.stop()
         server.join()
 
@@ -5142,10 +5136,7 @@ def test_master_bus_writer_close_releases_stream_for_restart(tmp_path: Path) -> 
     server.stop()
 
 
-def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
-    tmp_path: Path,
-) -> None:
-    server, control_endpoint = start_master_server(tmp_path)
+def test_stream_table_engine_can_publish_to_zmq_direct_reader() -> None:
     tick_schema = pa.schema(
         [
             ("instrument_id", pa.string()),
@@ -5153,22 +5144,20 @@ def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
             ("last_price", pa.float64()),
         ]
     )
-    writer_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    writer_client.register_process("stream_table_writer")
-    writer_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
-
-    reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    reader_client.register_process("stream_table_reader")
-    reader = reader_client.read_from("openctp_ticks")
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = None
 
     engine = zippy._internal.StreamTableMaterializer(
         name="stream_table_writer",
         input_schema=tick_schema,
-        target=zippy.BusStreamTarget(stream_name="openctp_ticks", master=writer_client),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
     )
 
     try:
         engine.start()
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+        time.sleep(0.1)
         engine.write(
             pl.DataFrame(
                 {
@@ -5178,15 +5167,16 @@ def test_stream_table_engine_can_publish_to_master_bus_direct_reader(
                 }
             )
         )
-        received = reader.read(timeout_ms=1000)
+        engine.flush()
+        received = recv_zmq_with_retry(subscriber)
 
         assert received.schema == tick_schema
         assert received.column("instrument_id").to_pylist() == ["IF2606"]
         assert received.column("last_price").to_pylist() == [4102.5]
     finally:
-        reader.close()
         engine.stop()
-        server.stop()
+        if subscriber is not None:
+            subscriber.close()
 
 
 def test_master_client_lists_streams(tmp_path: Path) -> None:
@@ -8387,7 +8377,90 @@ def test_remote_read_table_collect_uses_gateway_discovered_from_master_config() 
         server.join()
 
 
-def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path(
+def test_connect_tcp_master_defaults_to_local_data_path(
+    monkeypatch,
+) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    seen: dict[str, object] = {}
+
+    class FakeMasterClient:
+        def __init__(self, control_endpoint: str) -> None:
+            seen["control_endpoint"] = control_endpoint
+            self._process_id = None
+
+        def control_endpoint(self) -> str:
+            return str(seen["control_endpoint"])
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def heartbeat(self) -> None:
+            return None
+
+        def list_streams(self) -> list[dict[str, object]]:
+            return []
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "protocol_version": 1,
+                }
+            }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            seen["query"] = ("native", source, master)
+
+    class FakeRemoteQuery:
+        def __init__(self, **kwargs: object) -> None:
+            seen["query"] = ("remote", kwargs)
+
+    class FakeLocalWriter:
+        def __init__(self, stream_name: str, schema: object, master: object) -> None:
+            seen["writer"] = ("local", stream_name, schema, master)
+
+    class FakeRemoteWriter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            seen["writer"] = ("remote", args, kwargs)
+
+    monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+    monkeypatch.setattr(zippy, "_LocalGatewayWriter", FakeLocalWriter)
+    monkeypatch.setattr(zippy, "RemoteGatewayWriter", FakeRemoteWriter)
+
+    try:
+        client = zippy.connect("zippy://127.0.0.1:17690/default")
+
+        assert isinstance(client, FakeMasterClient)
+        assert seen["control_endpoint"] == "tcp://127.0.0.1:17690"
+
+        zippy.read_table("qmt_ticks")
+        assert seen["query"] == ("native", "qmt_ticks", client)
+
+        zippy.get_writer("qmt_ticks", schema=schema, batch_size=1)
+        assert seen["writer"] == ("local", "qmt_ticks", schema, client)
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+
+
+def test_connect_tcp_master_local_false_uses_gateway_data_path(
     monkeypatch,
 ) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
@@ -8435,7 +8508,7 @@ def test_connect_remote_master_discovers_gateway_and_get_writer_uses_remote_path
 
     monkeypatch.setattr(zippy, "MasterClient", FakeMasterClient)
     try:
-        client = zippy.connect("zippy://127.0.0.1:17690/default")
+        client = zippy.connect("zippy://127.0.0.1:17690/default", local=False)
 
         assert isinstance(client, FakeMasterClient)
         assert seen["control_endpoint"] == "tcp://127.0.0.1:17690"
@@ -8735,7 +8808,7 @@ def test_remote_gateway_e2e_through_tcp_master_config() -> None:
     if reset_default_master is not None:
         reset_default_master()
     try:
-        zippy.connect(f"zippy://127.0.0.1:{master_port}/default")
+        zippy.connect(f"zippy://127.0.0.1:{master_port}/default", local=False)
         writer = zippy.get_writer("remote_e2e_ticks", schema=schema, batch_size=1)
         writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
         writer.close()
@@ -9838,10 +9911,9 @@ def test_reactive_latest_named_segment_source_starts_from_live_tail(tmp_path: Pa
     writer.append_tick(1777017602000000000, "IF2607", 4104.5)
     writer_client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
 
-    output_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    output_client.register_process("latest_reader")
-    output_client.register_stream("latest_ticks", tick_schema, 64, 4096)
-    output_reader = output_client.read_from("latest_ticks")
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = None
 
     engine_client = zippy.MasterClient(control_endpoint=control_endpoint)
     engine_client.register_process("latest_engine")
@@ -9850,25 +9922,25 @@ def test_reactive_latest_named_segment_source_starts_from_live_tail(tmp_path: Pa
         by="instrument_id",
         source="openctp_ticks",
         master=engine_client,
-        target=zippy.BusStreamTarget(stream_name="latest_ticks", master=output_client),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
     )
 
     engine_started = False
     try:
         engine.start()
         engine_started = True
-
-        with pytest.raises(RuntimeError, match="reader timed out"):
-            output_reader.read(timeout_ms=100)
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+        time.sleep(0.1)
 
         writer.append_tick(1777017603000000000, "IF2606", 4105.0)
-        received = output_reader.read(timeout_ms=1000)
+        received = recv_zmq_with_retry(subscriber)
 
         assert received.schema == tick_schema
         assert received.column("instrument_id").to_pylist() == ["IF2606"]
         assert received.column("last_price").to_pylist() == [4105.0]
     finally:
-        output_reader.close()
+        if subscriber is not None:
+            subscriber.close()
         if engine_started:
             engine.stop()
         server.stop()
@@ -10772,18 +10844,20 @@ def test_master_client_registers_control_plane_entities_and_updates_status(
     server.stop()
 
 
-def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
+def test_reactive_engine_can_consume_segment_stream_source_and_publish_to_zmq(
     tmp_path: Path,
 ) -> None:
     server, control_endpoint = start_master_server(tmp_path)
     tick_schema = pa.schema(
         [
+            ("dt", pa.timestamp("ns", tz="UTC")),
             ("instrument_id", pa.string()),
             ("last_price", pa.float64()),
         ]
     )
     factor_schema = pa.schema(
         [
+            ("dt", pa.timestamp("ns", tz="UTC")),
             ("instrument_id", pa.string()),
             ("last_price", pa.float64()),
             ("price_x2", pa.float64()),
@@ -10791,59 +10865,47 @@ def test_reactive_engine_can_consume_master_bus_stream_and_publish_to_bus(
     )
 
     input_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    input_client.register_process("tick_writer")
+    input_client.register_process("segment_writer")
     input_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
-    upstream = zippy._internal.StreamTableMaterializer(
-        name="stream_table_writer",
-        input_schema=tick_schema,
-        target=zippy.BusStreamTarget(stream_name="openctp_ticks", master=input_client),
-    )
+    input_client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+    writer = zippy._internal._SegmentTestWriter("openctp_ticks", tick_schema, row_capacity=16)
+    input_client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
 
     factor_client = zippy.MasterClient(control_endpoint=control_endpoint)
     factor_client.register_process("reactive_engine")
-    factor_client.register_stream("openctp_factor_ticks", factor_schema, 64, 4096)
 
-    output_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    output_client.register_process("factor_reader")
-    output_reader = output_client.read_from("openctp_factor_ticks")
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
 
     engine = zippy.ReactiveStateEngine(
-        name="reactive_bus",
+        name="reactive_segment",
         input_schema=tick_schema,
         id_column="instrument_id",
         factors=[zippy.Expr(expression="last_price * 2.0", output="price_x2")],
-        source=zippy.BusStreamSource(
+        source=zippy.SegmentStreamSource(
             stream_name="openctp_ticks",
             expected_schema=tick_schema,
             master=factor_client,
             mode=zippy.SourceMode.PIPELINE,
             xfast=True,
         ),
-        target=zippy.BusStreamTarget(
-            stream_name="openctp_factor_ticks",
-            master=factor_client,
-        ),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
     )
 
     try:
         engine.start()
-        upstream.start()
-        upstream.write(
-            pl.DataFrame(
-                {
-                    "instrument_id": ["IF2606"],
-                    "last_price": [4102.5],
-                }
-            )
-        )
-        received = output_reader.read(timeout_ms=1000)
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+        time.sleep(0.1)
+        writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+        received = recv_zmq_with_retry(subscriber)
 
         assert received.schema == factor_schema
         assert received.column("instrument_id").to_pylist() == ["IF2606"]
         assert received.column("price_x2").to_pylist() == [8205.0]
     finally:
-        output_reader.close()
-        upstream.stop()
+        if subscriber is not None:
+            subscriber.close()
         engine.stop()
         server.stop()
 
@@ -10886,13 +10948,9 @@ def test_stream_table_engine_consumes_segment_stream_source_live_cross_process(
         ]
     )
 
-    output_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    output_client.register_process("segment_table_writer")
-    output_client.register_stream("segment_table_ticks", tick_schema, 64, 4096)
-
-    reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
-    reader_client.register_process("segment_table_reader")
-    output_reader = reader_client.read_from("segment_table_ticks")
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = None
 
     writer_code = """
 import sys
@@ -10949,10 +11007,7 @@ sys.stdin.readline()
         name="segment_table_live",
         input_schema=tick_schema,
         source=source,
-        target=zippy.BusStreamTarget(
-            stream_name="segment_table_ticks",
-            master=output_client,
-        ),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
     )
 
     engine_started = False
@@ -10968,6 +11023,8 @@ sys.stdin.readline()
 
         engine.start()
         engine_started = True
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=2_000)
+        time.sleep(0.1)
         writer.stdin.write("go\n")
         writer.stdin.flush()
         written = writer.stdout.readline().strip()
@@ -10975,7 +11032,7 @@ sys.stdin.readline()
             stdout, stderr = writer.communicate(timeout=5)
             raise AssertionError(f"writer did not append row stdout={stdout} stderr={stderr}")
 
-        received = output_reader.read(timeout_ms=2000)
+        received = recv_zmq_with_retry(subscriber)
 
         assert received.schema == tick_schema
         assert received.column("instrument_id").to_pylist() == ["IF2606"]
@@ -10989,7 +11046,8 @@ sys.stdin.readline()
         except subprocess.TimeoutExpired:
             writer.kill()
             writer.communicate(timeout=5)
-        output_reader.close()
+        if subscriber is not None:
+            subscriber.close()
         if engine_started:
             engine.stop()
         server.stop()
@@ -11019,10 +11077,11 @@ def test_stream_table_engine_rejects_segment_stream_source_schema_mismatch() -> 
         )
 
 
-def test_bus_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> None:
+def test_segment_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> None:
     server, control_endpoint = start_master_server(tmp_path)
     tick_schema = pa.schema(
         [
+            ("dt", pa.timestamp("ns", tz="UTC")),
             ("instrument_id", pa.string()),
             ("last_price", pa.float64()),
         ]
@@ -11034,8 +11093,8 @@ def test_bus_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> None
     writer_master.register_process("writer")
 
     engine = zippy.ReactiveStateEngine(
-        name="reactive_bus_retry",
-        source=zippy.BusStreamSource(
+        name="reactive_segment_retry",
+        source=zippy.SegmentStreamSource(
             stream_name="ticks",
             expected_schema=tick_schema,
             master=reader_master,
@@ -11053,6 +11112,9 @@ def test_bus_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> None
             engine.start()
 
         writer_master.register_stream("ticks", tick_schema, 64, 4096)
+        writer_master.register_source("segment_md", "segment_test", "ticks", {})
+        writer = zippy._internal._SegmentTestWriter("ticks", tick_schema, row_capacity=16)
+        writer_master.publish_segment_descriptor("ticks", writer.descriptor())
 
         engine.start()
         engine.stop()
