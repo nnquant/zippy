@@ -51,6 +51,18 @@ fn resolves_remote_zippy_uri_to_tcp_endpoint() {
 }
 
 #[test]
+fn resolves_localhost_remote_zippy_uri_to_tcp_endpoint() {
+    let endpoint = resolve_control_endpoint("zippy://localhost:17777").unwrap();
+
+    assert_eq!(endpoint.kind(), ControlEndpointKind::Tcp);
+    assert_eq!(
+        endpoint,
+        ControlEndpoint::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 17777))
+    );
+    assert_eq!(endpoint.display_string(), "tcp://127.0.0.1:17777");
+}
+
+#[test]
 fn rejects_tcp_endpoint_without_port() {
     let error = resolve_control_endpoint("tcp://127.0.0.1").unwrap_err();
 

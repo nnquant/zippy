@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use crate::{Result, ZippyError};
@@ -204,6 +204,14 @@ fn home_dir() -> PathBuf {
 fn parse_tcp_endpoint(original_uri: &str, addr: &str) -> Result<ControlEndpoint> {
     let socket_addr = addr
         .parse::<SocketAddr>()
+        .or_else(|_| {
+            addr.to_socket_addrs()?.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no socket address resolved",
+                )
+            })
+        })
         .map_err(|error| ZippyError::InvalidConfig {
             reason: format!("invalid tcp control endpoint uri=[{original_uri}] error=[{error}]"),
         })?;

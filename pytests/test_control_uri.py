@@ -19,6 +19,10 @@ def test_resolve_uri_maps_remote_zippy_uri_to_tcp_master_endpoint() -> None:
     )
 
 
+def test_resolve_uri_maps_localhost_zippy_uri_to_tcp_master_endpoint() -> None:
+    assert zippy._resolve_uri("zippy://localhost:17690") == "tcp://localhost:17690"
+
+
 def test_resolve_uri_rejects_legacy_remote_gateway_uri() -> None:
     try:
         zippy._resolve_uri("zippy+tcp://127.0.0.1:17666/default")
@@ -104,8 +108,29 @@ def test_native_master_client_roundtrips_remote_zippy_uri() -> None:
         server.join()
 
 
+def test_native_master_client_roundtrips_localhost_remote_zippy_uri() -> None:
+    port = _unused_loopback_port()
+    uri = f"zippy://localhost:{port}"
+    server = zippy.MasterServer(uri=uri)
+    assert server.control_endpoint() == f"tcp://127.0.0.1:{port}"
+    server.start()
+    try:
+        client = zippy.MasterClient(uri=uri)
+        assert client.control_endpoint() == f"tcp://127.0.0.1:{port}"
+        assert client.register_process("pytest_localhost_zippy").startswith("proc_")
+    finally:
+        server.stop()
+        server.join()
+
+
 def _unused_loopback_addr() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         host, port = sock.getsockname()
     return f"{host}:{port}"
+
+
+def _unused_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
