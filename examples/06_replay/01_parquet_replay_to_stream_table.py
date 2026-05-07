@@ -113,7 +113,7 @@ def main() -> None:
 
     try:
         # ParquetReplayEngine 默认等待 parquet 数据完成回放；engine 仍保持运行，方便继续查询。
-        print(replay.table().tail(10))
+        print(replay.table().tail(10).collect())
     finally:
         replay.stop()
 

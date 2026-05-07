@@ -96,7 +96,7 @@ def main() -> None:
         pipeline.start()
         pipeline.write(make_ticks())
         pipeline.flush()
-        print(zp.read_table(args.table).tail(10))
+        print(zp.read_table(args.table).tail(10).collect())
     finally:
         pipeline.stop()
 

@@ -29,8 +29,8 @@ def main() -> None:
     zp.connect(uri=args.uri, app="example_query_tail_collect")
     query = zp.read_table(args.table)
 
-    # tail(n) 只关心最近 N 行，底层会自动补齐 persisted/live 数据。
-    latest = query.tail(args.n)
+    # tail(n) 只构建 lazy plan，collect() 才会真正读取 persisted/live 数据。
+    latest = query.tail(args.n).collect()
     print("tail:")
     print(latest)
 
@@ -42,4 +42,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

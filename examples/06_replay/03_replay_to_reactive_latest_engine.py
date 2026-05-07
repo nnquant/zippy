@@ -147,7 +147,7 @@ def main() -> None:
 
         replay.run()
 
-        latest = zp.read_table(args.latest_table).tail(10)
+        latest = zp.read_table(args.latest_table).tail(10).collect()
         print(latest)
     finally:
         if latest_session is not None:

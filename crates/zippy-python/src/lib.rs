@@ -2404,16 +2404,56 @@ impl Query {
         let source = self.source.clone();
         let batch = py
             .allow_threads(|| {
-                let _leases = SegmentReaderLeaseSet::acquire_for_descriptors(
+                tail_live_segment_record_batch_with_leases(
                     master,
                     &source,
                     &descriptor,
                     &stream.sealed_segments,
-                )?;
-                tail_live_segment_record_batch(
-                    &descriptor,
-                    &stream.sealed_segments,
                     segment_schema,
+                    None,
+                    n,
+                )
+            })
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        record_batch_to_pyarrow_table(py, batch)
+    }
+
+    fn tail_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot: &Bound<'_, PyAny>,
+        n: usize,
+    ) -> PyResult<PyObject> {
+        let snapshot_text = python_json_dumps(py, snapshot)?;
+        let snapshot = serde_json::from_str::<serde_json::Value>(&snapshot_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let descriptor = snapshot
+            .get("active_segment_descriptor")
+            .cloned()
+            .ok_or_else(|| py_runtime_error("snapshot missing active_segment_descriptor"))?;
+        let sealed_descriptors = snapshot
+            .get("sealed_segments")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let active_committed_row_high_watermark = snapshot
+            .get("active_committed_row_high_watermark")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                py_runtime_error("snapshot missing active_committed_row_high_watermark")
+            })? as usize;
+        let segment_schema = self.segment_schema.clone();
+        let master = Arc::clone(&self.master);
+        let source = self.source.clone();
+        let batch = py
+            .allow_threads(|| {
+                tail_live_segment_record_batch_with_leases(
+                    master,
+                    &source,
+                    &descriptor,
+                    &sealed_descriptors,
+                    segment_schema,
+                    Some(active_committed_row_high_watermark),
                     n,
                 )
             })
@@ -2580,16 +2620,35 @@ fn query_snapshot_value(
     }))
 }
 
-fn tail_live_segment_record_batch(
+fn tail_live_segment_record_batch_with_leases(
+    master: SharedMasterClient,
+    source: &str,
     descriptor: &serde_json::Value,
     sealed_descriptors: &[serde_json::Value],
     segment_schema: CompiledSchema,
+    active_committed_row_high_watermark_limit: Option<usize>,
     n: usize,
 ) -> zippy_core::Result<RecordBatch> {
+    let mut _leases = Vec::new();
+    _leases.push(SegmentReaderLeaseGuard::acquire(
+        Arc::clone(&master),
+        source,
+        descriptor,
+    )?);
+    let active_committed_row_high_watermark = match active_committed_row_high_watermark_limit {
+        Some(value) => value,
+        None => active_committed_row_high_watermark(descriptor, segment_schema.clone())?,
+    };
+
     let mut remaining = n;
     let mut batches_reversed = Vec::new();
 
-    let active_batch = tail_single_descriptor_record_batch(descriptor, segment_schema.clone(), n)?;
+    let active_batch = tail_single_descriptor_record_batch_until(
+        descriptor,
+        segment_schema.clone(),
+        n,
+        Some(active_committed_row_high_watermark),
+    )?;
     remaining = remaining.saturating_sub(active_batch.num_rows());
     batches_reversed.push(active_batch);
 
@@ -2597,6 +2656,11 @@ fn tail_live_segment_record_batch(
         if remaining == 0 {
             break;
         }
+        _leases.push(SegmentReaderLeaseGuard::acquire(
+            Arc::clone(&master),
+            source,
+            sealed_descriptor,
+        )?);
         let batch = tail_single_descriptor_record_batch(
             sealed_descriptor,
             segment_schema.clone(),
@@ -2615,8 +2679,18 @@ fn tail_single_descriptor_record_batch(
     segment_schema: CompiledSchema,
     n: usize,
 ) -> zippy_core::Result<RecordBatch> {
+    tail_single_descriptor_record_batch_until(descriptor, segment_schema, n, None)
+}
+
+fn tail_single_descriptor_record_batch_until(
+    descriptor: &serde_json::Value,
+    segment_schema: CompiledSchema,
+    n: usize,
+    end_row_limit: Option<usize>,
+) -> zippy_core::Result<RecordBatch> {
     let (committed, active_descriptor) =
         active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
+    let committed = end_row_limit.map_or(committed, |limit| limit.min(committed));
     let start_row = committed.saturating_sub(n);
     let span = RowSpanView::from_active_descriptor(active_descriptor, start_row, committed)
         .map_err(|reason| ZippyError::InvalidState { status: reason })?;

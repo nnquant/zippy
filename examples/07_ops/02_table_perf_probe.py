@@ -139,7 +139,7 @@ def dev_shm_usage() -> dict[str, int] | None:
 
 def measure_tail_latency(table_name: str, tail_n: int, iterations: int) -> dict[str, object]:
     """
-    Measure repeated ``read_table(...).tail(...)`` latency.
+    Measure repeated ``read_table(...).tail(...).collect()`` latency.
 
     :param table_name: Zippy table name.
     :type table_name: str
@@ -161,7 +161,7 @@ def measure_tail_latency(table_name: str, tail_n: int, iterations: int) -> dict[
     last_rows = 0
     for _ in range(iterations):
         started_ns = time.perf_counter_ns()
-        result = table.tail(tail_n)
+        result = table.tail(tail_n).collect()
         elapsed_ns = time.perf_counter_ns() - started_ns
         samples_ms.append(elapsed_ns / 1_000_000.0)
         last_rows = result.num_rows

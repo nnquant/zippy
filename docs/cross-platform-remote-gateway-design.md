@@ -465,7 +465,7 @@ def on_qmt_tick(tick):
 WSL 侧：
 
 ```python
-zp.read_table("qmt_ticks").tail(1000)
+zp.read_table("qmt_ticks").tail(1000).collect()
 ```
 
 要求：Windows 逐行写入，WSL 可持续查询。

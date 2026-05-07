@@ -408,6 +408,12 @@ def _normalize_query_exprs(
     return normalized
 
 
+def _normalize_column_names(columns: tuple[object, ...]) -> list[str]:
+    if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
+        columns = tuple(columns[0])
+    return [str(column) for column in columns]
+
+
 def _combine_filter_ops(filters: list[object]) -> object | None:
     predicate: object | None = None
     for item in filters:
@@ -616,6 +622,28 @@ def _query_plan_to_json(plan_ops: list[tuple[str, object]]) -> list[dict[str, ob
                     "exprs": [_query_expr_to_json(expr) for expr in value],
                 }
             )
+        elif kind in {"tail", "head"}:
+            plan.append({"op": kind, "n": int(value)})
+        elif kind == "slice":
+            plan.append(
+                {
+                    "op": "slice",
+                    "offset": int(value["offset"]),
+                    "length": value["length"],
+                }
+            )
+        elif kind == "sort":
+            plan.append(
+                {
+                    "op": "sort",
+                    "by": [_query_expr_to_json(expr) for expr in value["by"]],
+                    "descending": value["descending"],
+                }
+            )
+        elif kind == "drop":
+            plan.append({"op": "drop", "columns": list(value)})
+        elif kind == "rename":
+            plan.append({"op": "rename", "mapping": dict(value)})
         elif kind == "join":
             raise ValueError("remote query join is not supported in this gateway version")
         else:
@@ -632,6 +660,24 @@ def _apply_query_plan_json(table: "Table", plan: list[dict[str, object]]) -> "Ta
             table = table.select([_query_expr_from_json(expr) for expr in item["exprs"]])
         elif op == "with_columns":
             table = table.with_columns([_query_expr_from_json(expr) for expr in item["exprs"]])
+        elif op == "tail":
+            table = table.tail(int(item["n"]))
+        elif op == "head":
+            table = table.head(int(item["n"]))
+        elif op == "slice":
+            table = table.slice(
+                int(item["offset"]),
+                item.get("length"),
+            )
+        elif op == "sort":
+            table = table.sort(
+                [_query_expr_from_json(expr) for expr in item["by"]],
+                descending=item.get("descending", False),
+            )
+        elif op == "drop":
+            table = table.drop(list(item["columns"]))
+        elif op == "rename":
+            table = table.rename(dict(item["mapping"]))
         else:
             raise ValueError(f"unsupported remote query plan op=[{op}]")
     return table
@@ -694,7 +740,7 @@ def connect(
     :example:
 
         >>> client = zippy.connect(uri="default", app="research_session")
-        >>> zippy.read_table("ctp_ticks").tail(1000)
+        >>> zippy.read_table("ctp_ticks").tail(1000).collect()
     """
     interval_sec = _validate_heartbeat_interval(heartbeat_interval_sec)
     raw_uri = (
@@ -2694,41 +2740,118 @@ class Table:
 
     def tail(self, n: int):
         """
-        Return the latest available rows as a ``pyarrow.Table``.
+        Return a lazy query that keeps the latest available rows.
 
-        This is the user-level query path. It reads from the current live segment
-        view first, and transparently backfills from persisted parquet files when
-        live retention contains fewer than ``n`` rows.
+        This method does not materialize data. Call :meth:`collect` to execute
+        the accumulated table plan against persisted and live rows.
 
         :param n: Maximum number of rows to return.
         :type n: int
-        :returns: Latest available rows.
-        :rtype: pyarrow.Table
+        :returns: New table reader with tail applied at execution time.
+        :rtype: Table
         """
         if n < 0:
             raise ValueError("n must be non-negative")
-        if self._has_query_plan():
-            table = self.collect()
-            if n == 0:
-                return table.slice(0, 0)
-            return table.slice(table.num_rows - n)
+        return self._clone_with_plan(plan_op=("tail", int(n)))
 
-        live = self._inner.tail(n)
-        if live.num_rows >= n:
-            return live
+    def head(self, n: int) -> Table:
+        """
+        Return a lazy query that keeps the first ``n`` rows.
 
-        snapshot = self.snapshot()
-        needed = n - live.num_rows
-        persisted = _tail_persisted_rows(snapshot, needed)
-        if persisted is None or persisted.num_rows == 0:
-            return live
+        :param n: Maximum number of rows to return.
+        :type n: int
+        :returns: New table reader with head applied at execution time.
+        :rtype: Table
+        """
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        return self._clone_with_plan(plan_op=("head", int(n)))
 
-        import pyarrow as pa
+    def limit(self, n: int) -> Table:
+        """
+        Return a lazy query limited to the first ``n`` rows.
 
-        combined = pa.concat_tables([persisted, live])
-        if combined.num_rows > n:
-            return combined.slice(combined.num_rows - n)
-        return combined
+        This is an alias for :meth:`head`.
+        """
+        return self.head(n)
+
+    def slice(self, offset: int, length: int | None = None) -> Table:
+        """
+        Return a lazy query slicing rows by offset and optional length.
+
+        :param offset: Row offset passed to the query backend.
+        :type offset: int
+        :param length: Optional number of rows to keep.
+        :type length: int | None
+        :returns: New table reader with slice applied at execution time.
+        :rtype: Table
+        """
+        if length is not None and length < 0:
+            raise ValueError("length must be non-negative")
+        return self._clone_with_plan(
+            plan_op=("slice", {"offset": int(offset), "length": length})
+        )
+
+    def sort(
+        self,
+        by: object | list[object] | tuple[object, ...],
+        *,
+        descending: bool | list[bool] | tuple[bool, ...] = False,
+    ) -> Table:
+        """
+        Return a lazy query sorted by one or more columns or expressions.
+
+        :param by: Sort key expression, column name, or sequence of keys.
+        :type by: object | list[object] | tuple[object, ...]
+        :param descending: Sort direction forwarded to Polars.
+        :type descending: bool | list[bool] | tuple[bool, ...]
+        :returns: New table reader with sort applied at execution time.
+        :rtype: Table
+        """
+        keys = list(by) if isinstance(by, (list, tuple)) else [by]
+        if not keys:
+            raise ValueError("sort requires at least one key")
+        directions = (
+            list(descending) if isinstance(descending, (list, tuple)) else bool(descending)
+        )
+        return self._clone_with_plan(
+            plan_op=("sort", {"by": keys, "descending": directions})
+        )
+
+    def drop(self, *columns: object) -> Table:
+        """
+        Return a lazy query dropping columns by name.
+
+        :param columns: Column names to remove. A single list or tuple is accepted.
+        :type columns: object
+        :returns: New table reader with columns dropped at execution time.
+        :rtype: Table
+        """
+        normalized = _normalize_column_names(columns)
+        if not normalized:
+            return self
+        return self._clone_with_plan(plan_op=("drop", normalized))
+
+    def rename(
+        self,
+        mapping: dict[str, str] | None = None,
+        **renames: str,
+    ) -> Table:
+        """
+        Return a lazy query renaming columns.
+
+        :param mapping: Mapping from old column name to new column name.
+        :type mapping: dict[str, str] | None
+        :returns: New table reader with renamed columns at execution time.
+        :rtype: Table
+        """
+        renamed: dict[str, str] = {}
+        if mapping is not None:
+            renamed.update({str(old): str(new) for old, new in mapping.items()})
+        renamed.update({str(old): str(new) for old, new in renames.items()})
+        if not renamed:
+            return self
+        return self._clone_with_plan(plan_op=("rename", renamed))
 
     def schema(self):
         """
@@ -2920,6 +3043,10 @@ class Table:
                 snapshot=self._snapshot_enabled,
             )
 
+        tail_n = self._tail_pushdown_count()
+        if tail_n is not None:
+            return self._collect_tail_pushdown(tail_n)
+
         snapshot = self.snapshot()
         schema = self.schema()
         read_columns = self._source_read_columns(schema)
@@ -3035,6 +3162,7 @@ class Table:
         filter_expr: object | None = None,
         with_columns_exprs: list[object] | None = None,
         join_spec: dict[str, object] | None = None,
+        plan_op: tuple[str, object] | None = None,
     ) -> Table:
         table = object.__new__(Table)
         table.source = self.source
@@ -3050,10 +3178,32 @@ class Table:
             table._plan_ops.append(("with_columns", list(with_columns_exprs)))
         if join_spec is not None:
             table._plan_ops.append(("join", join_spec))
+        if plan_op is not None:
+            table._plan_ops.append(plan_op)
         return table
 
     def _has_query_plan(self) -> bool:
         return bool(self._plan_ops)
+
+    def _tail_pushdown_count(self) -> int | None:
+        if len(self._plan_ops) != 1:
+            return None
+        kind, value = self._plan_ops[0]
+        if kind != "tail":
+            return None
+        return int(value)
+
+    def _collect_tail_pushdown(self, n: int):
+        snapshot = self.snapshot()
+        live = self._tail_live_snapshot(snapshot, n)
+        if n <= 0 or live.num_rows >= n:
+            return live
+
+        persisted = _tail_persisted_rows(snapshot, n - live.num_rows)
+        table = _concat_query_tables([persisted, live], self.schema())
+        if table.num_rows > n:
+            return table.slice(table.num_rows - n)
+        return table
 
     def _apply_query_plan(self, table):
         if not self._has_query_plan():
@@ -3061,6 +3211,7 @@ class Table:
 
         import polars as pl
 
+        source_schema = table.schema
         frame = pl.from_arrow(table).lazy()
         for kind, value in self._plan_ops:
             if kind == "filter":
@@ -3082,15 +3233,41 @@ class Table:
                     how=value["how"],
                     suffix=value["suffix"],
                 )
+            elif kind == "tail":
+                frame = frame.tail(int(value))
+            elif kind == "head":
+                frame = frame.head(int(value))
+            elif kind == "slice":
+                frame = frame.slice(int(value["offset"]), value["length"])
+            elif kind == "sort":
+                frame = frame.sort(
+                    [_compile_query_expr_to_polars(expr) for expr in value["by"]],
+                    descending=value["descending"],
+                )
+            elif kind == "drop":
+                frame = frame.drop(list(value))
+            elif kind == "rename":
+                frame = frame.rename(dict(value))
             else:
                 raise ValueError(f"unsupported table plan operation=[{kind}]")
-        return frame.collect().to_arrow()
+        return _restore_query_schema_types(frame.collect().to_arrow(), source_schema)
 
     def _scan_live_snapshot(self, snapshot: dict[str, object]):
         scan_snapshot = getattr(self._inner, "scan_snapshot", None)
         if callable(scan_snapshot):
             return scan_snapshot(snapshot)
         return self._inner.scan_live()
+
+    def _tail_live_snapshot(self, snapshot: dict[str, object], n: int):
+        tail_snapshot = getattr(self._inner, "tail_snapshot", None)
+        if callable(tail_snapshot):
+            return tail_snapshot(snapshot, n)
+        tail = getattr(self._inner, "tail", None)
+        if callable(tail):
+            return tail(n)
+        live = self._scan_live_snapshot(snapshot).read_all()
+        length = min(n, live.num_rows)
+        return live.slice(live.num_rows - length, length)
 
     def _source_read_columns(self, schema: object | None) -> list[str] | None:
         if not self._plan_ops:
@@ -3417,6 +3594,37 @@ def _filter_query_table(table: object, filters: object | None):
     if mask is None:
         return table
     return table.filter(mask)
+
+
+def _restore_query_schema_types(table: object, source_schema: object):
+    import pyarrow as pa
+
+    fields = []
+    arrays = []
+    changed = False
+    source_names = set(getattr(source_schema, "names", []))
+    for field in table.schema:
+        array = table[field.name]
+        next_field = field
+        if field.name in source_names:
+            source_field = source_schema.field(field.name)
+            if not field.type.equals(source_field.type):
+                try:
+                    array = array.cast(source_field.type)
+                    next_field = pa.field(
+                        field.name,
+                        source_field.type,
+                        nullable=source_field.nullable,
+                        metadata=source_field.metadata,
+                    )
+                    changed = True
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError, TypeError):
+                    pass
+        fields.append(next_field)
+        arrays.append(array)
+    if not changed:
+        return table
+    return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
 def _schema_for_query_columns(schema: object | None, columns: list[str] | None):

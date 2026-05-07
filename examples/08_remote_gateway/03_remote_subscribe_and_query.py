@@ -69,6 +69,7 @@ def main() -> None:
         .filter(zp.col("instrument_id") == args.instrument_id)
         .select("instrument_id", "dt", "last_price", "volume")
         .tail(5)
+        .collect()
     )
     print(latest)
 

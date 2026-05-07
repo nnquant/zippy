@@ -106,11 +106,11 @@ def main() -> None:
         writer.flush()
 
         table = zp.read_table(args.output, master=master)
-        result = table.tail(10)
+        result = table.tail(10).collect()
         deadline = time.monotonic() + 2.0
         while result.num_rows < 3 and time.monotonic() < deadline:
             time.sleep(0.02)
-            result = table.tail(10)
+            result = table.tail(10).collect()
 
         print(result)
     finally:

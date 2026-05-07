@@ -100,7 +100,7 @@ def main() -> None:
         pipeline.stop()
 
     query = zp.read_table(args.table)
-    print(query.tail(10))
+    print(query.tail(10).collect())
     print("persisted_files:")
     for item in query.persisted_files():
         print(item)

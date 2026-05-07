@@ -30,10 +30,9 @@ def main() -> None:
     # app 参数会注册当前 Python 进程，并启动后台 heartbeat，避免 lease 过期。
     zp.connect(uri=args.uri, app="example_read_table")
 
-    table = zp.read_table(args.table).tail(args.n)
+    table = zp.read_table(args.table).tail(args.n).collect()
     print(table)
 
 
 if __name__ == "__main__":
     main()
-

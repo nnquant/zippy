@@ -8,8 +8,11 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use arrow::array::ArrayRef;
-use arrow::compute::concat_batches;
+use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow::compute::{
+    and, concat_batches, filter_record_batch, lexsort_to_indices, or, take, SortColumn, SortOptions,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -260,6 +263,7 @@ impl GatewayState {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let tail_pushdown = collect_plan_tail_only(&plan)?;
         let batch = {
             let writers = self.writers.lock().unwrap();
             writers
@@ -269,7 +273,10 @@ impl GatewayState {
         };
         let batch = match batch {
             Some(batch) => batch,
-            None => self.collect_segment_source(source)?,
+            None => match tail_pushdown {
+                Some(n) => self.collect_segment_source_tail(source, n)?,
+                None => self.collect_segment_source(source)?,
+            },
         };
         let batch = apply_collect_plan(batch, &plan)?;
         Ok((json!({"status": "ok"}), encode_ipc_table(&batch)?))
@@ -528,6 +535,48 @@ impl GatewayState {
         concat_record_batches(schema, batches)
     }
 
+    fn collect_segment_source_tail(&self, source: &str, n: usize) -> Result<RecordBatch> {
+        let stream = self.with_master(|master| master.get_stream(source))?;
+        if stream.data_path != "segment" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "gateway collect source is not materialized by this gateway and is not a segment stream data_path=[{}]",
+                    stream.data_path
+                ),
+            });
+        }
+        if stream.status == "stale" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "stream is stale source=[{}] status=[{}]",
+                    source, stream.status
+                ),
+            });
+        }
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Err(ZippyError::Io {
+                reason: format!("segment descriptor is not published source=[{}]", source),
+            });
+        };
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+        let mut _leases = Vec::new();
+        _leases.push(self.acquire_segment_reader_lease(source, &descriptor)?);
+        let active_committed_row_high_watermark =
+            active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
+        let batches = tail_live_segment_record_batches_with_leases(
+            self,
+            source,
+            &descriptor,
+            &stream.sealed_segments,
+            segment_schema,
+            active_committed_row_high_watermark,
+            n,
+            &mut _leases,
+        )?;
+        concat_record_batches(schema, batches)
+    }
+
     fn acquire_segment_reader_leases(
         &self,
         source: &str,
@@ -760,6 +809,51 @@ fn live_segment_record_batches(
     Ok(batches)
 }
 
+fn tail_live_segment_record_batches_with_leases(
+    state: &GatewayState,
+    source: &str,
+    descriptor: &Value,
+    sealed_descriptors: &[Value],
+    segment_schema: CompiledSchema,
+    active_committed_row_high_watermark: usize,
+    n: usize,
+    leases: &mut Vec<SegmentReaderLeaseGuard>,
+) -> Result<Vec<RecordBatch>> {
+    let mut remaining = n;
+    let mut batches_reversed = Vec::new();
+
+    let active_batch = descriptor_tail_record_batch_until(
+        descriptor,
+        segment_schema.clone(),
+        n,
+        Some(active_committed_row_high_watermark),
+    )?;
+    remaining = remaining.saturating_sub(active_batch.num_rows());
+    if active_batch.num_rows() > 0 {
+        batches_reversed.push(active_batch);
+    }
+
+    for sealed_descriptor in sealed_descriptors.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        let batch = descriptor_tail_record_batch_until(
+            sealed_descriptor,
+            segment_schema.clone(),
+            remaining,
+            None,
+        )?;
+        remaining = remaining.saturating_sub(batch.num_rows());
+        if batch.num_rows() > 0 {
+            batches_reversed.push(batch);
+        }
+    }
+
+    batches_reversed.reverse();
+    Ok(batches_reversed)
+}
+
 fn descriptor_record_batch_until(
     descriptor: &Value,
     segment_schema: CompiledSchema,
@@ -769,6 +863,23 @@ fn descriptor_record_batch_until(
         active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
     let end_row = end_row_limit.map_or(committed, |limit| limit.min(committed));
     let span = RowSpanView::from_active_descriptor(active_descriptor, 0, end_row)
+        .map_err(|status| ZippyError::InvalidState { status })?;
+    span.as_record_batch().map_err(|error| ZippyError::Io {
+        reason: error.to_string(),
+    })
+}
+
+fn descriptor_tail_record_batch_until(
+    descriptor: &Value,
+    segment_schema: CompiledSchema,
+    n: usize,
+    end_row_limit: Option<usize>,
+) -> Result<RecordBatch> {
+    let (committed, active_descriptor) =
+        active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
+    let committed = end_row_limit.map_or(committed, |limit| limit.min(committed));
+    let start_row = committed.saturating_sub(n);
+    let span = RowSpanView::from_active_descriptor(active_descriptor, start_row, committed)
         .map_err(|status| ZippyError::InvalidState { status })?;
     span.as_record_batch().map_err(|error| ZippyError::Io {
         reason: error.to_string(),
@@ -1012,11 +1123,42 @@ fn segment_zippy_error(error: zippy_segment_store::ZippySegmentStoreError) -> Zi
 
 fn apply_collect_plan(mut batch: RecordBatch, plan: &[Value]) -> Result<RecordBatch> {
     for op in plan {
-        if op.get("op").and_then(Value::as_str) == Some("select") {
-            batch = apply_select(batch, op)?;
+        let op_name =
+            op.get("op")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "collect plan requires op".to_string(),
+                })?;
+        match op_name {
+            "select" => batch = apply_select(batch, op)?,
+            "filter" => batch = apply_filter(batch, op)?,
+            "head" => batch = apply_head(batch, op)?,
+            "tail" => batch = apply_tail(batch, op)?,
+            "slice" => batch = apply_slice(batch, op)?,
+            "sort" => batch = apply_sort(batch, op)?,
+            "drop" => batch = apply_drop(batch, op)?,
+            "rename" => batch = apply_rename(batch, op)?,
+            other => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!("unsupported native gateway collect plan op=[{}]", other),
+                });
+            }
         }
     }
     Ok(batch)
+}
+
+fn collect_plan_tail_only(plan: &[Value]) -> Result<Option<usize>> {
+    if plan.len() != 1 {
+        return Ok(None);
+    }
+    let Some(op) = plan[0].get("op").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if op != "tail" {
+        return Ok(None);
+    }
+    collect_plan_usize(&plan[0], "n").map(Some)
 }
 
 fn apply_select(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
@@ -1052,6 +1194,398 @@ fn apply_select(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| ZippyError::Io {
         reason: format!("failed to build gateway select batch error=[{}]", error),
     })
+}
+
+fn apply_filter(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let expr = op.get("expr").ok_or_else(|| ZippyError::InvalidConfig {
+        reason: "filter plan requires expr".to_string(),
+    })?;
+    let mask = evaluate_filter_expr(&batch, expr)?;
+    filter_record_batch(&batch, &mask).map_err(|error| ZippyError::Io {
+        reason: format!("failed to filter gateway batch error=[{}]", error),
+    })
+}
+
+fn evaluate_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<BooleanArray> {
+    let kind =
+        expr.get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "filter expression requires kind".to_string(),
+            })?;
+    if kind != "binary" {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "native gateway filter currently supports binary expressions kind=[{}]",
+                kind
+            ),
+        });
+    }
+    let op = expr
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "filter binary expression requires op".to_string(),
+        })?;
+    let args = expr
+        .get("args")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == 2)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "filter binary expression requires two args".to_string(),
+        })?;
+    if op == "and" || op == "or" {
+        let left = evaluate_filter_expr(batch, &args[0])?;
+        let right = evaluate_filter_expr(batch, &args[1])?;
+        let mask = if op == "and" {
+            and(&left, &right)
+        } else {
+            or(&left, &right)
+        }
+        .map_err(|error| ZippyError::Io {
+            reason: format!("failed to combine gateway filter masks error=[{}]", error),
+        })?;
+        return Ok(mask);
+    }
+    compare_filter_expr(batch, op, &args[0], &args[1])
+}
+
+fn compare_filter_expr(
+    batch: &RecordBatch,
+    op: &str,
+    left: &Value,
+    right: &Value,
+) -> Result<BooleanArray> {
+    if let Some((column_name, literal, reverse)) = column_literal_filter_pair(left, right)? {
+        let column_index =
+            batch
+                .schema()
+                .index_of(column_name)
+                .map_err(|error| ZippyError::SchemaMismatch {
+                    reason: format!(
+                        "filter column not found column=[{}] error=[{}]",
+                        column_name, error
+                    ),
+                })?;
+        let column = batch.column(column_index);
+        let literal = literal_array_for_type(column.data_type(), literal, batch.num_rows())?;
+        let op = if reverse {
+            reverse_filter_op(op)?
+        } else {
+            op.to_string()
+        };
+        let result = match op.as_str() {
+            "eq" => eq(column, &literal),
+            "ne" => neq(column, &literal),
+            "gt" => gt(column, &literal),
+            "ge" => gt_eq(column, &literal),
+            "lt" => lt(column, &literal),
+            "le" => lt_eq(column, &literal),
+            other => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!("unsupported gateway filter op=[{}]", other),
+                });
+            }
+        };
+        return result.map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to compare gateway filter expression error=[{}]",
+                error
+            ),
+        });
+    }
+    Err(ZippyError::InvalidConfig {
+        reason: "native gateway filter requires column-literal comparison".to_string(),
+    })
+}
+
+fn column_literal_filter_pair<'a>(
+    left: &'a Value,
+    right: &'a Value,
+) -> Result<Option<(&'a str, &'a Value, bool)>> {
+    if let Some(column_name) = query_expr_column_name(left)? {
+        if query_expr_kind(right) == Some("literal") {
+            return Ok(Some((
+                column_name,
+                right.get("value").unwrap_or(&Value::Null),
+                false,
+            )));
+        }
+    }
+    if let Some(column_name) = query_expr_column_name(right)? {
+        if query_expr_kind(left) == Some("literal") {
+            return Ok(Some((
+                column_name,
+                left.get("value").unwrap_or(&Value::Null),
+                true,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn query_expr_kind(expr: &Value) -> Option<&str> {
+    expr.get("kind").and_then(Value::as_str)
+}
+
+fn query_expr_column_name(expr: &Value) -> Result<Option<&str>> {
+    if query_expr_kind(expr) != Some("col") {
+        return Ok(None);
+    }
+    expr.get("value")
+        .and_then(Value::as_str)
+        .map(Some)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "column expression requires string value".to_string(),
+        })
+}
+
+fn reverse_filter_op(op: &str) -> Result<String> {
+    let reversed = match op {
+        "eq" => "eq",
+        "ne" => "ne",
+        "gt" => "lt",
+        "ge" => "le",
+        "lt" => "gt",
+        "le" => "ge",
+        other => {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!("unsupported gateway filter op=[{}]", other),
+            });
+        }
+    };
+    Ok(reversed.to_string())
+}
+
+fn literal_array_for_type(data_type: &DataType, value: &Value, len: usize) -> Result<ArrayRef> {
+    match data_type {
+        DataType::Utf8 => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "string filter literal must be a string".to_string(),
+                })?
+                .to_string();
+            Ok(Arc::new(StringArray::from(vec![value; len])))
+        }
+        DataType::Float64 => {
+            let value = value.as_f64().ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "float filter literal must be numeric".to_string(),
+            })?;
+            Ok(Arc::new(Float64Array::from(vec![value; len])))
+        }
+        DataType::Int64 => {
+            let value = value.as_i64().ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "int filter literal must be integer".to_string(),
+            })?;
+            Ok(Arc::new(Int64Array::from(vec![value; len])))
+        }
+        DataType::Boolean => {
+            let value = value.as_bool().ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "boolean filter literal must be boolean".to_string(),
+            })?;
+            Ok(Arc::new(BooleanArray::from(vec![value; len])))
+        }
+        other => Err(ZippyError::InvalidConfig {
+            reason: format!("unsupported gateway filter literal type=[{:?}]", other),
+        }),
+    }
+}
+
+fn apply_head(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let n = collect_plan_usize(op, "n")?;
+    Ok(batch.slice(0, n.min(batch.num_rows())))
+}
+
+fn apply_tail(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let n = collect_plan_usize(op, "n")?;
+    let length = n.min(batch.num_rows());
+    Ok(batch.slice(batch.num_rows().saturating_sub(length), length))
+}
+
+fn apply_slice(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let offset = collect_plan_usize(op, "offset")?;
+    let offset = offset.min(batch.num_rows());
+    let available = batch.num_rows().saturating_sub(offset);
+    let length = match op.get("length") {
+        Some(Value::Null) | None => available,
+        Some(_) => collect_plan_usize(op, "length")?.min(available),
+    };
+    Ok(batch.slice(offset, length))
+}
+
+fn apply_drop(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let columns =
+        op.get("columns")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "drop plan requires columns".to_string(),
+            })?;
+    let drop_names = columns
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "drop column names must be strings".to_string(),
+                })
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !drop_names.contains(field.name().as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !drop_names.contains(field.name().as_str()))
+        .map(|(index, _)| batch.column(index).clone())
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| ZippyError::Io {
+        reason: format!("failed to build gateway drop batch error=[{}]", error),
+    })
+}
+
+fn apply_rename(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let mapping = op
+        .get("mapping")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "rename plan requires mapping".to_string(),
+        })?;
+    let fields = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            mapping
+                .get(field.name())
+                .and_then(Value::as_str)
+                .map(|name| field.as_ref().clone().with_name(name))
+                .unwrap_or_else(|| field.as_ref().clone())
+        })
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec()).map_err(|error| {
+        ZippyError::Io {
+            reason: format!("failed to build gateway rename batch error=[{}]", error),
+        }
+    })
+}
+
+fn apply_sort(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
+    let by = op
+        .get("by")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "sort plan requires by".to_string(),
+        })?;
+    if by.is_empty() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "sort plan requires at least one key".to_string(),
+        });
+    }
+    let descending = collect_sort_descending(op, by.len())?;
+    let mut sort_columns = Vec::with_capacity(by.len());
+    for (index, expr) in by.iter().enumerate() {
+        let column_name = collect_plan_column_expr(expr, "sort")?;
+        let column_index =
+            batch
+                .schema()
+                .index_of(column_name)
+                .map_err(|error| ZippyError::SchemaMismatch {
+                    reason: format!(
+                        "sort column not found column=[{}] error=[{}]",
+                        column_name, error
+                    ),
+                })?;
+        sort_columns.push(SortColumn {
+            values: batch.column(column_index).clone(),
+            options: Some(SortOptions {
+                descending: descending[index],
+                nulls_first: false,
+            }),
+        });
+    }
+    let indices = lexsort_to_indices(&sort_columns, None).map_err(|error| ZippyError::Io {
+        reason: format!("failed to sort gateway batch error=[{}]", error),
+    })?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            take(column.as_ref(), &indices, None).map_err(|error| ZippyError::Io {
+                reason: format!("failed to reorder gateway column error=[{}]", error),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|error| ZippyError::Io {
+        reason: format!("failed to build gateway sorted batch error=[{}]", error),
+    })
+}
+
+fn collect_sort_descending(op: &Value, key_count: usize) -> Result<Vec<bool>> {
+    match op.get("descending") {
+        Some(Value::Bool(value)) => Ok(vec![*value; key_count]),
+        Some(Value::Array(values)) => {
+            if values.len() != key_count {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "sort descending length mismatch keys=[{}] descending=[{}]",
+                        key_count,
+                        values.len()
+                    ),
+                });
+            }
+            values
+                .iter()
+                .map(|value| {
+                    value.as_bool().ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: "sort descending values must be booleans".to_string(),
+                    })
+                })
+                .collect()
+        }
+        Some(Value::Null) | None => Ok(vec![false; key_count]),
+        Some(_) => Err(ZippyError::InvalidConfig {
+            reason: "sort descending must be a boolean or boolean list".to_string(),
+        }),
+    }
+}
+
+fn collect_plan_usize(op: &Value, name: &str) -> Result<usize> {
+    let value = op
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: format!(
+                "collect plan requires non-negative integer field=[{}]",
+                name
+            ),
+        })?;
+    usize::try_from(value).map_err(|error| ZippyError::InvalidConfig {
+        reason: format!(
+            "collect plan integer overflow field=[{}] error=[{}]",
+            name, error
+        ),
+    })
+}
+
+fn collect_plan_column_expr<'a>(expr: &'a Value, op_name: &str) -> Result<&'a str> {
+    expr.get("value")
+        .and_then(Value::as_str)
+        .filter(|_| expr.get("kind").and_then(Value::as_str) == Some("col"))
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: format!(
+                "native gateway {} currently supports column expressions",
+                op_name
+            ),
+        })
 }
 
 fn normalize_endpoint(endpoint: &str) -> String {

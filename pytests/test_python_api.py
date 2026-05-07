@@ -1475,13 +1475,13 @@ def test_replay_output_stream_drives_reactive_latest_engine(tmp_path: Path) -> N
 
         replay_engine.run()
 
-        latest = zippy.read_table("replay_downstream_latest").tail(10)
+        latest = zippy.read_table("replay_downstream_latest").tail(10).collect()
         deadline = time.time() + 2.0
         while (
             latest.num_rows != 2 or latest.column("last_price").to_pylist() != [3899.0, 2676.0]
         ) and time.time() < deadline:
             time.sleep(0.02)
-            latest = zippy.read_table("replay_downstream_latest").tail(10)
+            latest = zippy.read_table("replay_downstream_latest").tail(10).collect()
 
         assert latest.num_rows == 2
         assert latest.column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
@@ -5574,7 +5574,7 @@ def test_read_table_waits_for_late_producer_stream(tmp_path: Path) -> None:
 
         table = result["table"]
         assert isinstance(table, zippy.Table)
-        rows = table.tail(1).to_pydict()
+        rows = table.tail(1).collect().to_pydict()
 
         assert rows == {
             "instrument_id": ["IF2606"],
@@ -5977,14 +5977,14 @@ def test_query_tail_reads_latest_available_active_segment_rows(tmp_path: Path) -
 
     query = zippy.read_table(source="openctp_ticks", master=client)
 
-    available = query.tail(10)
+    available = query.tail(10).collect()
     assert isinstance(available, pa.Table)
     assert available.schema == tick_schema
     assert available.num_rows == 3
     assert available.column("instrument_id").to_pylist() == ["IF2606", "IF2606", "IF2607"]
     assert available.column("last_price").to_pylist() == [4102.5, 4103.0, 4104.5]
 
-    latest = query.tail(2)
+    latest = query.tail(2).collect()
     assert latest.num_rows == 2
     assert latest.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
     assert latest.column("last_price").to_pylist() == [4103.0, 4104.5]
@@ -6031,12 +6031,12 @@ def test_query_tail_reads_retained_sealed_segments_before_active_rows() -> None:
             )
 
             query = zippy.read_table("openctp_ticks")
-            latest = query.tail(row_count)
+            latest = query.tail(row_count).collect()
             for _ in range(50):
                 if latest.num_rows == row_count:
                     break
                 time.sleep(0.02)
-                latest = query.tail(row_count)
+                latest = query.tail(row_count).collect()
 
             stream = client.get_stream("openctp_ticks")
             descriptor = client.get_segment_descriptor("openctp_ticks")
@@ -6246,12 +6246,12 @@ def test_stream_table_e2e_ingest_rollover_persist_and_query(tmp_path: Path) -> N
         persisted_files = query.persisted_files()
         persisted_rows = sum(int(item.get("row_count", 0)) for item in persisted_files)
 
-        latest = query.tail(row_count)
+        latest = query.tail(row_count).collect()
         for _ in range(50):
             if latest.num_rows == row_count:
                 break
             time.sleep(0.02)
-            latest = query.tail(row_count)
+            latest = query.tail(row_count).collect()
 
         stream = zippy.ops.table_info("e2e_ticks")
         persisted = query._scan_persisted().to_table()
@@ -6387,7 +6387,7 @@ def test_stream_table_e2e_writer_expiration_marks_stream_stale_and_blocks_live_r
         reader_client = zippy.MasterClient(control_endpoint=control_endpoint)
         reader_client.register_process("query_reader")
         query = zippy.read_table("stale_ticks", master=reader_client)
-        assert query.tail(1).column("instrument_id").to_pylist() == ["IF2606"]
+        assert query.tail(1).collect().column("instrument_id").to_pylist() == ["IF2606"]
 
         response = expire_process_for_test(control_endpoint, writer_process_id)
         assert response == {"HeartbeatAccepted": {"process_id": writer_process_id}}
@@ -6398,7 +6398,7 @@ def test_stream_table_e2e_writer_expiration_marks_stream_stale_and_blocks_live_r
         assert stream["active_segment_descriptor"] is not None
 
         with pytest.raises(RuntimeError, match="stream is stale"):
-            query.tail(1)
+            query.tail(1).collect()
     finally:
         server.stop()
 
@@ -7773,22 +7773,21 @@ def test_query_tail_backfills_from_persisted_without_duplicate_live_segments(
             self.source = source
             self.master = master
 
-        def tail(self, n: int) -> pa.Table:
-            assert n == 4
-            return live_table
-
         def schema(self) -> pa.Schema:
             return schema
 
         def snapshot(self) -> dict[str, object]:
             return snapshot
 
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, live_table.to_batches())
+
     explicit_master = object()
     monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
 
     query = zippy.read_table("ctp_ticks", master=explicit_master)
 
-    latest = query.tail(4)
+    latest = query.tail(4).collect()
 
     assert latest.column("instrument_id").to_pylist() == [
         "IF2604",
@@ -7853,9 +7852,80 @@ def test_query_tail_reads_partitioned_persisted_files_with_same_column_name(
             self.source = source
             self.master = master
 
-        def tail(self, n: int) -> pa.Table:
-            assert n == 2
-            return live_table
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, live_table.to_batches())
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    latest = query.tail(2).collect()
+
+    assert latest.schema.field("instrument_id").type == pa.string()
+    assert latest.column("instrument_id").to_pylist() == ["IF2604", "IF2605"]
+    assert latest.column("last_price").to_pylist() == [4099.5, 4100.5]
+
+
+def test_table_tail_is_lazy_and_collect_backfills_from_persisted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    persisted_file = tmp_path / "segment-1.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2604", "IF2605"],
+                "last_price": [4099.5, 4100.5],
+            },
+            schema=schema,
+        ),
+        persisted_file,
+    )
+    live_batch = pa.record_batch(
+        {
+            "instrument_id": ["IF2606", "IF2607"],
+            "last_price": [4101.5, 4102.5],
+        },
+        schema=schema,
+    )
+    snapshot = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "active_segment_descriptor": {
+            "segment_id": 2,
+            "generation": 0,
+        },
+        "active_committed_row_high_watermark": 1,
+        "sealed_segments": [],
+        "persisted_files": [
+            {
+                "file_path": str(persisted_file),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+            },
+        ],
+        "descriptor_generation": 2,
+    }
+    tail_snapshot_calls = 0
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
 
         def schema(self) -> pa.Schema:
             return schema
@@ -7863,16 +7933,103 @@ def test_query_tail_reads_partitioned_persisted_files_with_same_column_name(
         def snapshot(self) -> dict[str, object]:
             return snapshot
 
+        def tail_snapshot(self, snapshot_arg: dict[str, object], n: int) -> pa.Table:
+            nonlocal tail_snapshot_calls
+            tail_snapshot_calls += 1
+            assert snapshot_arg is snapshot
+            length = min(n, live_batch.num_rows)
+            return pa.Table.from_batches([live_batch.slice(live_batch.num_rows - length, length)])
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            raise AssertionError("tail().collect() should not scan the full live segment")
+
     explicit_master = object()
     monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
 
     query = zippy.read_table("ctp_ticks", master=explicit_master)
+    latest = query.tail(3)
 
-    latest = query.tail(2)
+    assert isinstance(latest, zippy.Table)
+    assert tail_snapshot_calls == 0
 
-    assert latest.schema.field("instrument_id").type == pa.string()
-    assert latest.column("instrument_id").to_pylist() == ["IF2604", "IF2605"]
-    assert latest.column("last_price").to_pylist() == [4099.5, 4100.5]
+    collected = latest.collect()
+
+    assert tail_snapshot_calls == 1
+    assert collected.column("instrument_id").to_pylist() == [
+        "IF2605",
+        "IF2606",
+        "IF2607",
+    ]
+    assert collected.column("last_price").to_pylist() == [4100.5, 4101.5, 4102.5]
+
+
+def test_table_shape_operations_are_lazy_and_execute_in_call_order(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("dt", pa.int64()),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("volume", pa.int64()),
+        ]
+    )
+    live_batch = pa.record_batch(
+        {
+            "dt": [3, 1, 2, 4],
+            "instrument_id": ["c", "a", "b", "d"],
+            "last_price": [30.0, 10.0, 20.0, 40.0],
+            "volume": [300, 100, 200, 400],
+        },
+        schema=schema,
+    )
+    scan_calls = 0
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": live_batch.num_rows,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            nonlocal scan_calls
+            scan_calls += 1
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = (
+        zippy.read_table("ctp_ticks", master=explicit_master)
+        .sort("dt")
+        .slice(1, 3)
+        .limit(2)
+        .drop("volume")
+        .rename({"last_price": "price"})
+        .tail(1)
+    )
+
+    assert isinstance(query, zippy.Table)
+    assert scan_calls == 0
+
+    collected = query.collect()
+
+    assert scan_calls == 1
+    assert collected.column_names == ["dt", "instrument_id", "price"]
+    assert collected.column("dt").to_pylist() == [3]
+    assert collected.column("instrument_id").to_pylist() == ["c"]
+    assert collected.column("price").to_pylist() == [30.0]
 
 
 def test_query_collect_and_reader_merge_persisted_and_live_without_duplicates(
@@ -8097,7 +8254,7 @@ def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
         )
     )
 
-    table = filtered.tail(1)
+    table = filtered.tail(1).collect()
     frame = filtered.to_polars()
 
     assert table.column_names == ["dt", "instrument_id", "spread"]
@@ -9175,7 +9332,7 @@ def test_connect_sets_default_master_for_query_tail(tmp_path: Path) -> None:
     writer.append_tick(1777017601000000000, "IF2607", 4104.5)
     client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
 
-    latest = zippy.read_table("openctp_ticks").tail(10)
+    latest = zippy.read_table("openctp_ticks").tail(10).collect()
     snapshot = zippy.read_table("openctp_ticks").snapshot()
 
     assert latest.num_rows == 2
@@ -9330,7 +9487,7 @@ def test_subscribe_resumes_after_writer_process_restart(tmp_path: Path) -> None:
         assert metrics["descriptor_updates_total"] >= 1
         assert metrics["current_descriptor_generation"] == 2
         assert metrics["last_descriptor_update_ns"] > 0
-        latest = zippy.read_table("restart_ticks", master=subscriber_client).tail(1)
+        latest = zippy.read_table("restart_ticks", master=subscriber_client).tail(1).collect()
         assert latest.column("last_price").to_pylist() == [4103.5]
         assert [row["last_price"] for row in received] == [4102.5, 4103.5]
     finally:
@@ -9590,7 +9747,7 @@ def test_pipeline_stream_table_publishes_descriptor_for_query_tail(tmp_path: Pat
     )
 
     try:
-        latest = zippy.read_table("openctp_ticks").tail(10)
+        latest = zippy.read_table("openctp_ticks").tail(10).collect()
         assert latest.num_rows == 2
         assert latest.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
         assert latest.column("last_price").to_pylist() == [4102.5, 4104.5]
@@ -9642,13 +9799,13 @@ def test_reactive_latest_stream_table_tail_returns_key_value_snapshot(tmp_path: 
             }
         )
 
-        latest = zippy.read_table("ctp_ticks_latest").tail(10)
+        latest = zippy.read_table("ctp_ticks_latest").tail(10).collect()
         deadline = time.time() + 2.0
         while (
             latest.num_rows != 2 or latest.column("last_price").to_pylist() != [4103.5, 2711.0]
         ) and time.time() < deadline:
             time.sleep(0.02)
-            latest = zippy.read_table("ctp_ticks_latest").tail(10)
+            latest = zippy.read_table("ctp_ticks_latest").tail(10).collect()
 
         assert latest.num_rows == 2
         assert latest.column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
@@ -9888,11 +10045,11 @@ def test_reactive_latest_tail_stays_non_empty_during_snapshot_replace(
                 "last_price": [4102.5, 2711.0],
             }
         )
-        latest = zippy.read_table("ctp_ticks_latest").tail(10)
+        latest = zippy.read_table("ctp_ticks_latest").tail(10).collect()
         deadline = time.time() + 2.0
         while latest.num_rows == 0 and time.time() < deadline:
             time.sleep(0.01)
-            latest = zippy.read_table("ctp_ticks_latest").tail(10)
+            latest = zippy.read_table("ctp_ticks_latest").tail(10).collect()
         assert latest.num_rows == 2
 
         writer_done = threading.Event()
@@ -9918,7 +10075,7 @@ def test_reactive_latest_tail_stays_non_empty_during_snapshot_replace(
         writer.start()
 
         while not writer_done.wait(timeout=0.0):
-            latest = zippy.read_table("ctp_ticks_latest").tail(10)
+            latest = zippy.read_table("ctp_ticks_latest").tail(10).collect()
             if latest.num_rows == 0:
                 empty_reads.append(latest)
                 break
@@ -9928,7 +10085,7 @@ def test_reactive_latest_tail_stays_non_empty_during_snapshot_replace(
         assert not writer.is_alive()
         assert writer_error == []
         assert empty_reads == []
-        assert zippy.read_table("ctp_ticks_latest").tail(10).num_rows == 2
+        assert zippy.read_table("ctp_ticks_latest").tail(10).collect().num_rows == 2
     finally:
         session.stop()
         if reset_default_master is not None:
@@ -10055,11 +10212,11 @@ def test_session_timeseries_named_segment_source_materializes_output_table(tmp_p
         )
         writer.flush()
 
-        bars = zippy.read_table("named_bars").tail(10)
+        bars = zippy.read_table("named_bars").tail(10).collect()
         deadline = time.time() + 2.0
         while bars.num_rows != 2 and time.time() < deadline:
             time.sleep(0.02)
-            bars = zippy.read_table("named_bars").tail(10)
+            bars = zippy.read_table("named_bars").tail(10).collect()
 
         assert bars.column_names == ["symbol", "window_start", "window_end", "close"]
         assert bars.column("symbol").to_pylist() == ["A", "B"]
@@ -10139,11 +10296,11 @@ def test_session_cross_sectional_named_segment_source_materializes_output_table(
         )
         writer.flush()
 
-        ranks = zippy.read_table("named_return_ranks").tail(10)
+        ranks = zippy.read_table("named_return_ranks").tail(10).collect()
         deadline = time.time() + 2.0
         while ranks.num_rows != 3 and time.time() < deadline:
             time.sleep(0.02)
-            ranks = zippy.read_table("named_return_ranks").tail(10)
+            ranks = zippy.read_table("named_return_ranks").tail(10).collect()
 
         assert ranks.column_names == ["symbol", "dt", "ret_rank"]
         assert ranks.column("symbol").to_pylist() == ["A", "B", "C"]
@@ -10222,10 +10379,10 @@ def test_pipeline_source_stream_table_lifecycle_feeds_query_tail(tmp_path: Path)
 
     try:
         deadline = time.time() + 2.0
-        latest = zippy.read_table("openctp_ticks").tail(10)
+        latest = zippy.read_table("openctp_ticks").tail(10).collect()
         while latest.num_rows == 0 and time.time() < deadline:
             time.sleep(0.01)
-            latest = zippy.read_table("openctp_ticks").tail(10)
+            latest = zippy.read_table("openctp_ticks").tail(10).collect()
 
         assert latest.num_rows == 1
         assert latest.column("instrument_id").to_pylist() == ["IF2606"]

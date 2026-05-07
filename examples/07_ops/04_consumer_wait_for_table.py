@@ -43,7 +43,7 @@ def run_consumer(table_name: str, ready: threading.Event) -> None:
     """
     ready.set()
     table = zp.read_table(table_name, wait=True, timeout="5s")
-    latest = table.tail(1)
+    latest = table.tail(1).collect()
     print("consumer received latest row:")
     print(latest)
 
