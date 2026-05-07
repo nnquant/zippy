@@ -126,6 +126,127 @@ fn registry_source_owner_publishes_segment_descriptor() {
 }
 
 #[test]
+fn registry_source_descriptor_takes_writer_ownership_after_old_writer_lost() {
+    let mut registry = Registry::default();
+    let old_process_id = registry.register_process("openctp");
+    let new_process_id = registry.register_process("openctp");
+    registry
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
+        .unwrap();
+    registry
+        .attach_writer("openctp_ticks", &old_process_id)
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md_old",
+            "openctp",
+            &old_process_id,
+            "openctp_ticks",
+            serde_json::json!({"front": "old"}),
+        )
+        .unwrap();
+    registry.force_expire_process(&old_process_id).unwrap();
+    registry.mark_records_lost_for_process(&old_process_id);
+    registry
+        .register_source(
+            "openctp_md_restarted",
+            "openctp",
+            &new_process_id,
+            "openctp_ticks",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    registry
+        .publish_segment_descriptor(
+            "openctp_ticks",
+            &new_process_id,
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-restarted",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+            }),
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.streams_for_writer_process(&old_process_id),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        registry.streams_for_writer_process(&new_process_id),
+        vec!["openctp_ticks".to_string()]
+    );
+    assert_eq!(
+        registry.get_stream("openctp_ticks").unwrap().status,
+        "writer_attached"
+    );
+}
+
+#[test]
+fn registry_rejects_second_active_writer_source_for_stream() {
+    let mut registry = Registry::default();
+    let old_process_id = registry.register_process("openctp");
+    let new_process_id = registry.register_process("openctp");
+    registry
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md_old",
+            "openctp",
+            &old_process_id,
+            "openctp_ticks",
+            serde_json::json!({"front": "old"}),
+        )
+        .unwrap();
+
+    let error = registry
+        .register_source(
+            "openctp_md_restarted",
+            "openctp",
+            &new_process_id,
+            "openctp_ticks",
+            serde_json::json!({"front": "new"}),
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RegistryError::StreamWriterSourceAlreadyExists {
+            stream_name: "openctp_ticks".to_string(),
+            source_name: "openctp_md_restarted".to_string(),
+            owner_source_name: "openctp_md_old".to_string(),
+        }
+    );
+    assert_eq!(
+        registry
+            .get_stream("openctp_ticks")
+            .unwrap()
+            .active_writer_source_name
+            .as_deref(),
+        Some("openctp_md_old")
+    );
+}
+
+#[test]
 fn registry_register_source_rebinds_same_definition_to_new_process() {
     let mut registry = Registry::default();
     let old_process_id = registry.register_process("openctp");
@@ -191,7 +312,7 @@ fn registry_register_source_rebinds_same_definition_to_new_process() {
         .unwrap();
     assert_eq!(
         registry.get_stream("openctp_ticks").unwrap().status,
-        "registered"
+        "writer_attached"
     );
 }
 

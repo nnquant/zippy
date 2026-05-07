@@ -6,7 +6,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
@@ -56,6 +56,37 @@ struct GatewayState {
 
 struct GatewayTableWriter {
     materializer: StreamTableMaterializer,
+}
+
+#[derive(Default)]
+struct GatewayScanPushdown {
+    filters: Vec<Value>,
+    projection_columns: Option<Vec<String>>,
+}
+
+struct GatewayScannedBatch {
+    batch: RecordBatch,
+    scanned_rows: usize,
+}
+
+#[derive(Clone, Copy)]
+enum GatewayRowRangePushdown {
+    Tail(usize),
+    Head(usize),
+    Slice {
+        offset: usize,
+        length: Option<usize>,
+    },
+}
+
+impl GatewayRowRangePushdown {
+    fn op_name(self) -> &'static str {
+        match self {
+            Self::Tail(_) => "tail",
+            Self::Head(_) => "head",
+            Self::Slice { .. } => "slice",
+        }
+    }
 }
 
 struct SegmentReaderLeaseGuard {
@@ -251,6 +282,7 @@ impl GatewayState {
     }
 
     fn handle_collect(&self, header: Value) -> Result<(Value, Vec<u8>)> {
+        let started = Instant::now();
         self.increment_metric(|metrics| metrics.collect_requests_total += 1);
         let source = header
             .get("source")
@@ -263,7 +295,17 @@ impl GatewayState {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let tail_pushdown = collect_plan_tail_only(&plan)?;
+        let row_range_pushdown = collect_plan_row_range_prefix(&plan)?;
+        let row_range_residual_start = row_range_pushdown.map_or(0, |(_, start)| start);
+        let pushed_filter_count =
+            collect_plan_leading_filter_count(&plan[row_range_residual_start..]);
+        let scan_residual_start = row_range_residual_start + pushed_filter_count;
+        let requested_scan_pushdown = GatewayScanPushdown {
+            filters: plan[row_range_residual_start..scan_residual_start].to_vec(),
+            projection_columns: collect_plan_scan_projection_columns(
+                &plan[row_range_residual_start..],
+            )?,
+        };
         let batch = {
             let writers = self.writers.lock().unwrap();
             writers
@@ -271,15 +313,85 @@ impl GatewayState {
                 .map(|writer| writer.materializer.active_record_batch())
                 .transpose()?
         };
-        let batch = match batch {
-            Some(batch) => batch,
-            None => match tail_pushdown {
-                Some(n) => self.collect_segment_source_tail(source, n)?,
-                None => self.collect_segment_source(source)?,
+        let mut row_range_pushed = false;
+        let mut scan_pushdown_applied = false;
+        let scanned = match batch {
+            Some(batch) => GatewayScannedBatch {
+                scanned_rows: batch.num_rows(),
+                batch,
+            },
+            None => match row_range_pushdown {
+                Some((pushdown, _)) => {
+                    row_range_pushed = true;
+                    scan_pushdown_applied = true;
+                    self.collect_segment_source_row_range(
+                        source,
+                        pushdown,
+                        &requested_scan_pushdown,
+                    )?
+                }
+                None => {
+                    scan_pushdown_applied = true;
+                    self.collect_segment_source(source, &requested_scan_pushdown)?
+                }
             },
         };
-        let batch = apply_collect_plan(batch, &plan)?;
-        Ok((json!({"status": "ok"}), encode_ipc_table(&batch)?))
+        let residual_plan = if scan_pushdown_applied {
+            &plan[scan_residual_start..]
+        } else if let Some((_, residual_start)) = row_range_pushdown {
+            if row_range_pushed {
+                &plan[residual_start..]
+            } else {
+                plan.as_slice()
+            }
+        } else {
+            plan.as_slice()
+        };
+        let batch = apply_collect_plan(scanned.batch, residual_plan)?;
+        let returned_rows = batch.num_rows();
+        let tail_pushdown = row_range_pushed
+            && matches!(
+                row_range_pushdown,
+                Some((GatewayRowRangePushdown::Tail(_), _))
+            );
+        let row_range_pushdown_metric = if row_range_pushed {
+            row_range_pushdown.map(|(pushdown, _)| pushdown.op_name())
+        } else {
+            None
+        };
+        let residual_filters = collect_plan_filter_ops(residual_plan);
+        let projection_columns = collect_plan_projection_columns(residual_plan);
+        let pushed_filters = if scan_pushdown_applied {
+            requested_scan_pushdown.filters.clone()
+        } else {
+            Vec::new()
+        };
+        let scan_projection_columns = if scan_pushdown_applied {
+            requested_scan_pushdown.projection_columns.clone()
+        } else {
+            None
+        };
+        Ok((
+            json!({
+                "status": "ok",
+                "metrics": {
+                    "scanned_files": [],
+                    "scanned_rows": scanned.scanned_rows,
+                    "scanned_live_rows": scanned.scanned_rows,
+                    "returned_rows": returned_rows,
+                    "plan_ops": plan.len(),
+                    "tail_pushdown": tail_pushdown,
+                    "row_range_pushdown": row_range_pushdown_metric,
+                    "pushed_filters": pushed_filters,
+                    "residual_filters": residual_filters,
+                    "projection_columns": projection_columns,
+                    "scan_projection_columns": scan_projection_columns,
+                    "residual_plan_ops": residual_plan.len(),
+                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                }
+            }),
+            encode_ipc_table(&batch)?,
+        ))
     }
 
     fn write_batch(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
@@ -424,10 +536,12 @@ impl GatewayState {
             };
             let batch = match batch {
                 Some(batch) => Some(batch),
-                None => match self.collect_segment_source(source) {
-                    Ok(batch) => Some(batch),
-                    Err(_) => None,
-                },
+                None => {
+                    match self.collect_segment_source(source, &GatewayScanPushdown::default()) {
+                        Ok(scanned) => Some(scanned.batch),
+                        Err(_) => None,
+                    }
+                }
             };
             let Some(batch) = batch else {
                 thread::sleep(Duration::from_millis(10));
@@ -498,7 +612,11 @@ impl GatewayState {
         Err(last_error.expect("gateway master process retry must store the last error"))
     }
 
-    fn collect_segment_source(&self, source: &str) -> Result<RecordBatch> {
+    fn collect_segment_source(
+        &self,
+        source: &str,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
         let stream = self.with_master(|master| master.get_stream(source))?;
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
@@ -526,16 +644,27 @@ impl GatewayState {
         let _leases = self.acquire_segment_reader_leases(source, &descriptor, &stream)?;
         let active_committed_row_high_watermark =
             active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
+        let mut scanned_rows = 0usize;
         let batches = live_segment_record_batches(
             &descriptor,
             &stream.sealed_segments,
             segment_schema,
             active_committed_row_high_watermark,
+            scan_pushdown,
+            &mut scanned_rows,
         )?;
-        concat_record_batches(schema, batches)
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(schema, batches)?,
+            scanned_rows,
+        })
     }
 
-    fn collect_segment_source_tail(&self, source: &str, n: usize) -> Result<RecordBatch> {
+    fn collect_segment_source_row_range(
+        &self,
+        source: &str,
+        pushdown: GatewayRowRangePushdown,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
         let stream = self.with_master(|master| master.get_stream(source))?;
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
@@ -561,20 +690,55 @@ impl GatewayState {
         let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
         let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
         let mut _leases = Vec::new();
-        _leases.push(self.acquire_segment_reader_lease(source, &descriptor)?);
-        let active_committed_row_high_watermark =
-            active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
-        let batches = tail_live_segment_record_batches_with_leases(
-            self,
-            source,
-            &descriptor,
-            &stream.sealed_segments,
-            segment_schema,
-            active_committed_row_high_watermark,
-            n,
-            &mut _leases,
-        )?;
-        concat_record_batches(schema, batches)
+        let mut scanned_rows = 0usize;
+        let batches = match pushdown {
+            GatewayRowRangePushdown::Tail(n) => {
+                _leases.push(self.acquire_segment_reader_lease(source, &descriptor)?);
+                let active_committed_row_high_watermark =
+                    active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
+                tail_live_segment_record_batches_with_leases(
+                    self,
+                    source,
+                    &descriptor,
+                    &stream.sealed_segments,
+                    segment_schema,
+                    active_committed_row_high_watermark,
+                    n,
+                    &mut _leases,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                )?
+            }
+            GatewayRowRangePushdown::Head(n) => head_live_segment_record_batches_with_leases(
+                self,
+                source,
+                &descriptor,
+                &stream.sealed_segments,
+                segment_schema,
+                n,
+                &mut _leases,
+                scan_pushdown,
+                &mut scanned_rows,
+            )?,
+            GatewayRowRangePushdown::Slice { offset, length } => {
+                slice_live_segment_record_batches_with_leases(
+                    self,
+                    source,
+                    &descriptor,
+                    &stream.sealed_segments,
+                    segment_schema,
+                    offset,
+                    length,
+                    &mut _leases,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                )?
+            }
+        };
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(schema, batches)?,
+            scanned_rows,
+        })
     }
 
     fn acquire_segment_reader_leases(
@@ -789,10 +953,18 @@ fn live_segment_record_batches(
     sealed_descriptors: &[Value],
     segment_schema: CompiledSchema,
     active_committed_row_high_watermark: usize,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
 ) -> Result<Vec<RecordBatch>> {
     let mut batches = Vec::with_capacity(sealed_descriptors.len() + 1);
     for sealed_descriptor in sealed_descriptors {
-        let batch = descriptor_record_batch_until(sealed_descriptor, segment_schema.clone(), None)?;
+        let batch = descriptor_record_batch_until(
+            sealed_descriptor,
+            segment_schema.clone(),
+            None,
+            scan_pushdown,
+            scanned_rows,
+        )?;
         if batch.num_rows() > 0 {
             batches.push(batch);
         }
@@ -802,6 +974,8 @@ fn live_segment_record_batches(
         descriptor,
         segment_schema,
         Some(active_committed_row_high_watermark),
+        scan_pushdown,
+        scanned_rows,
     )?;
     if active_batch.num_rows() > 0 {
         batches.push(active_batch);
@@ -818,6 +992,8 @@ fn tail_live_segment_record_batches_with_leases(
     active_committed_row_high_watermark: usize,
     n: usize,
     leases: &mut Vec<SegmentReaderLeaseGuard>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
 ) -> Result<Vec<RecordBatch>> {
     let mut remaining = n;
     let mut batches_reversed = Vec::new();
@@ -827,6 +1003,8 @@ fn tail_live_segment_record_batches_with_leases(
         segment_schema.clone(),
         n,
         Some(active_committed_row_high_watermark),
+        scan_pushdown,
+        scanned_rows,
     )?;
     remaining = remaining.saturating_sub(active_batch.num_rows());
     if active_batch.num_rows() > 0 {
@@ -843,6 +1021,8 @@ fn tail_live_segment_record_batches_with_leases(
             segment_schema.clone(),
             remaining,
             None,
+            scan_pushdown,
+            scanned_rows,
         )?;
         remaining = remaining.saturating_sub(batch.num_rows());
         if batch.num_rows() > 0 {
@@ -854,19 +1034,140 @@ fn tail_live_segment_record_batches_with_leases(
     Ok(batches_reversed)
 }
 
+fn head_live_segment_record_batches_with_leases(
+    state: &GatewayState,
+    source: &str,
+    descriptor: &Value,
+    sealed_descriptors: &[Value],
+    segment_schema: CompiledSchema,
+    n: usize,
+    leases: &mut Vec<SegmentReaderLeaseGuard>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut remaining = n;
+    let mut batches = Vec::new();
+
+    for sealed_descriptor in sealed_descriptors {
+        if remaining == 0 {
+            break;
+        }
+        leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        let (batch, _) = descriptor_slice_record_batch_until(
+            sealed_descriptor,
+            segment_schema.clone(),
+            0,
+            Some(remaining),
+            None,
+            scan_pushdown,
+            scanned_rows,
+        )?;
+        remaining = remaining.saturating_sub(batch.num_rows());
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+
+    if remaining > 0 {
+        leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
+        let active_committed_row_high_watermark =
+            active_committed_row_high_watermark(descriptor, segment_schema.clone())?;
+        let (active_batch, _) = descriptor_slice_record_batch_until(
+            descriptor,
+            segment_schema,
+            0,
+            Some(remaining),
+            Some(active_committed_row_high_watermark),
+            scan_pushdown,
+            scanned_rows,
+        )?;
+        if active_batch.num_rows() > 0 {
+            batches.push(active_batch);
+        }
+    }
+
+    Ok(batches)
+}
+
+fn slice_live_segment_record_batches_with_leases(
+    state: &GatewayState,
+    source: &str,
+    descriptor: &Value,
+    sealed_descriptors: &[Value],
+    segment_schema: CompiledSchema,
+    offset: usize,
+    length: Option<usize>,
+    leases: &mut Vec<SegmentReaderLeaseGuard>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut absolute_position = 0usize;
+    let mut collected_rows = 0usize;
+    let mut batches = Vec::new();
+
+    for sealed_descriptor in sealed_descriptors {
+        if length.is_some_and(|value| collected_rows >= value) {
+            break;
+        }
+        leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        let remaining_length = length.map(|value| value.saturating_sub(collected_rows));
+        let start_row = offset.saturating_sub(absolute_position);
+        let (batch, committed_rows) = descriptor_slice_record_batch_until(
+            sealed_descriptor,
+            segment_schema.clone(),
+            start_row,
+            remaining_length,
+            None,
+            scan_pushdown,
+            scanned_rows,
+        )?;
+        absolute_position = absolute_position.saturating_add(committed_rows);
+        collected_rows = collected_rows.saturating_add(batch.num_rows());
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+
+    if !length.is_some_and(|value| collected_rows >= value) {
+        leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
+        let active_committed_row_high_watermark =
+            active_committed_row_high_watermark(descriptor, segment_schema.clone())?;
+        let remaining_length = length.map(|value| value.saturating_sub(collected_rows));
+        let start_row = offset.saturating_sub(absolute_position);
+        let (active_batch, _) = descriptor_slice_record_batch_until(
+            descriptor,
+            segment_schema,
+            start_row,
+            remaining_length,
+            Some(active_committed_row_high_watermark),
+            scan_pushdown,
+            scanned_rows,
+        )?;
+        if active_batch.num_rows() > 0 {
+            batches.push(active_batch);
+        }
+    }
+
+    Ok(batches)
+}
+
 fn descriptor_record_batch_until(
     descriptor: &Value,
     segment_schema: CompiledSchema,
     end_row_limit: Option<usize>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
 ) -> Result<RecordBatch> {
-    let (committed, active_descriptor) =
-        active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
-    let end_row = end_row_limit.map_or(committed, |limit| limit.min(committed));
-    let span = RowSpanView::from_active_descriptor(active_descriptor, 0, end_row)
-        .map_err(|status| ZippyError::InvalidState { status })?;
-    span.as_record_batch().map_err(|error| ZippyError::Io {
-        reason: error.to_string(),
-    })
+    let (batch, _) = descriptor_slice_record_batch_until(
+        descriptor,
+        segment_schema,
+        0,
+        None,
+        end_row_limit,
+        scan_pushdown,
+        scanned_rows,
+    )?;
+    Ok(batch)
 }
 
 fn descriptor_tail_record_batch_until(
@@ -874,6 +1175,8 @@ fn descriptor_tail_record_batch_until(
     segment_schema: CompiledSchema,
     n: usize,
     end_row_limit: Option<usize>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
 ) -> Result<RecordBatch> {
     let (committed, active_descriptor) =
         active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
@@ -881,8 +1184,77 @@ fn descriptor_tail_record_batch_until(
     let start_row = committed.saturating_sub(n);
     let span = RowSpanView::from_active_descriptor(active_descriptor, start_row, committed)
         .map_err(|status| ZippyError::InvalidState { status })?;
-    span.as_record_batch().map_err(|error| ZippyError::Io {
-        reason: error.to_string(),
+    row_span_record_batch(span, scan_pushdown, scanned_rows)
+}
+
+fn descriptor_slice_record_batch_until(
+    descriptor: &Value,
+    segment_schema: CompiledSchema,
+    start_row: usize,
+    length: Option<usize>,
+    end_row_limit: Option<usize>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+) -> Result<(RecordBatch, usize)> {
+    let (committed, active_descriptor) =
+        active_descriptor_with_committed_row_count(descriptor, segment_schema)?;
+    let committed = end_row_limit.map_or(committed, |limit| limit.min(committed));
+    let start_row = start_row.min(committed);
+    let available = committed.saturating_sub(start_row);
+    let row_count = length.map_or(available, |value| value.min(available));
+    let end_row = start_row + row_count;
+    let span = RowSpanView::from_active_descriptor(active_descriptor, start_row, end_row)
+        .map_err(|status| ZippyError::InvalidState { status })?;
+    let batch = row_span_record_batch(span, scan_pushdown, scanned_rows)?;
+    Ok((batch, committed))
+}
+
+fn row_span_record_batch(
+    span: RowSpanView,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+) -> Result<RecordBatch> {
+    let mut batch =
+        project_row_span_record_batch(&span, scan_pushdown.projection_columns.as_deref())?;
+    *scanned_rows = scanned_rows.saturating_add(batch.num_rows());
+    for filter in &scan_pushdown.filters {
+        batch = apply_filter(batch, filter)?;
+    }
+    Ok(batch)
+}
+
+fn project_row_span_record_batch(
+    span: &RowSpanView,
+    projection_columns: Option<&[String]>,
+) -> Result<RecordBatch> {
+    let Some(projection_columns) = projection_columns else {
+        return span.as_record_batch().map_err(|error| ZippyError::Io {
+            reason: error.to_string(),
+        });
+    };
+    let source_schema = span.schema_ref();
+    let mut fields = Vec::with_capacity(projection_columns.len());
+    let mut arrays = Vec::with_capacity(projection_columns.len());
+    for column_name in projection_columns {
+        let index =
+            source_schema
+                .index_of(column_name)
+                .map_err(|error| ZippyError::SchemaMismatch {
+                    reason: format!(
+                        "scan projection column not found column=[{}] error=[{}]",
+                        column_name, error
+                    ),
+                })?;
+        fields.push(source_schema.field(index).clone());
+        arrays.push(span.column(column_name).map_err(|error| ZippyError::Io {
+            reason: error.to_string(),
+        })?);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to build gateway scan projection batch error=[{}]",
+            error
+        ),
     })
 }
 
@@ -1148,17 +1520,138 @@ fn apply_collect_plan(mut batch: RecordBatch, plan: &[Value]) -> Result<RecordBa
     Ok(batch)
 }
 
-fn collect_plan_tail_only(plan: &[Value]) -> Result<Option<usize>> {
-    if plan.len() != 1 {
+fn collect_plan_row_range_prefix(
+    plan: &[Value],
+) -> Result<Option<(GatewayRowRangePushdown, usize)>> {
+    if plan.is_empty() {
         return Ok(None);
     }
     let Some(op) = plan[0].get("op").and_then(Value::as_str) else {
         return Ok(None);
     };
-    if op != "tail" {
+    let pushdown = match op {
+        "tail" => collect_plan_usize(&plan[0], "n")
+            .map(GatewayRowRangePushdown::Tail)
+            .map(Some)?,
+        "head" => collect_plan_usize(&plan[0], "n")
+            .map(GatewayRowRangePushdown::Head)
+            .map(Some)?,
+        "slice" => {
+            let offset = collect_plan_usize(&plan[0], "offset")?;
+            let length = match plan[0].get("length") {
+                Some(Value::Null) | None => None,
+                Some(_) => Some(collect_plan_usize(&plan[0], "length")?),
+            };
+            Some(GatewayRowRangePushdown::Slice { offset, length })
+        }
+        _ => None,
+    };
+    Ok(pushdown.map(|value| (value, 1)))
+}
+
+fn collect_plan_filter_ops(plan: &[Value]) -> Vec<Value> {
+    plan.iter()
+        .filter(|op| op.get("op").and_then(Value::as_str) == Some("filter"))
+        .cloned()
+        .collect()
+}
+
+fn collect_plan_leading_filter_count(plan: &[Value]) -> usize {
+    plan.iter()
+        .take_while(|op| op.get("op").and_then(Value::as_str) == Some("filter"))
+        .count()
+}
+
+fn collect_plan_projection_columns(plan: &[Value]) -> Option<Vec<String>> {
+    let select = plan
+        .iter()
+        .rev()
+        .find(|op| op.get("op").and_then(Value::as_str) == Some("select"))?;
+    let exprs = select.get("exprs").and_then(Value::as_array)?;
+    let columns = exprs
+        .iter()
+        .filter_map(|expr| {
+            if expr.get("kind").and_then(Value::as_str) != Some("col") {
+                return None;
+            }
+            expr.get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    Some(columns)
+}
+
+fn collect_plan_scan_projection_columns(plan: &[Value]) -> Result<Option<Vec<String>>> {
+    if !plan
+        .iter()
+        .any(|op| op.get("op").and_then(Value::as_str) == Some("select"))
+    {
         return Ok(None);
     }
-    collect_plan_usize(&plan[0], "n").map(Some)
+    let mut columns = Vec::new();
+    for op in plan {
+        match op.get("op").and_then(Value::as_str) {
+            Some("filter") => {
+                if let Some(expr) = op.get("expr") {
+                    collect_query_expr_columns(expr, &mut columns)?;
+                }
+            }
+            Some("select") => {
+                let exprs = op.get("exprs").and_then(Value::as_array).ok_or_else(|| {
+                    ZippyError::InvalidConfig {
+                        reason: "select plan requires exprs".to_string(),
+                    }
+                })?;
+                for expr in exprs {
+                    collect_query_expr_columns(expr, &mut columns)?;
+                }
+            }
+            Some("sort") => {
+                let exprs = op.get("by").and_then(Value::as_array).ok_or_else(|| {
+                    ZippyError::InvalidConfig {
+                        reason: "sort plan requires by".to_string(),
+                    }
+                })?;
+                for expr in exprs {
+                    collect_query_expr_columns(expr, &mut columns)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(columns))
+}
+
+fn collect_query_expr_columns(expr: &Value, columns: &mut Vec<String>) -> Result<()> {
+    match query_expr_kind(expr) {
+        Some("col") => {
+            let column = expr.get("value").and_then(Value::as_str).ok_or_else(|| {
+                ZippyError::InvalidConfig {
+                    reason: "column expression requires string value".to_string(),
+                }
+            })?;
+            if !columns.iter().any(|existing| existing == column) {
+                columns.push(column.to_string());
+            }
+        }
+        Some("binary") => {
+            let args = expr.get("args").and_then(Value::as_array).ok_or_else(|| {
+                ZippyError::InvalidConfig {
+                    reason: "binary expression requires args".to_string(),
+                }
+            })?;
+            for arg in args {
+                collect_query_expr_columns(arg, columns)?;
+            }
+        }
+        Some("literal") => {}
+        Some(_) | None => {}
+    }
+    Ok(())
 }
 
 fn apply_select(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {

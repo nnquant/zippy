@@ -140,6 +140,7 @@ if not _NATIVE_AVAILABLE:
     def version() -> str:
         return __version__
 
+
 DEFAULT_MASTER_URI = "zippy://default"
 DEFAULT_REMOTE_GATEWAY_PORT = 17666
 _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC = 3.0
@@ -426,18 +427,23 @@ def _combine_filter_ops(filters: list[object]) -> object | None:
 def _predicate_to_pyarrow_filters(
     predicate: object | None,
 ) -> list[tuple[str, str, object]] | None:
-    if predicate is None:
+    filters = _predicate_pushdown_conjuncts(predicate)
+    if not filters:
         return None
+    return filters
+
+
+def _predicate_pushdown_conjuncts(
+    predicate: object | None,
+) -> list[tuple[str, str, object]]:
+    if predicate is None:
+        return []
     if isinstance(predicate, _QueryExpr):
         if predicate._kind == "binary":
             op = str(predicate._value)
             left, right = predicate._args
             if op == "and":
-                left_filters = _predicate_to_pyarrow_filters(left)
-                right_filters = _predicate_to_pyarrow_filters(right)
-                if left_filters is None or right_filters is None:
-                    return None
-                return left_filters + right_filters
+                return _predicate_pushdown_conjuncts(left) + _predicate_pushdown_conjuncts(right)
             pyarrow_op = {
                 "eq": "==",
                 "ne": "!=",
@@ -447,12 +453,12 @@ def _predicate_to_pyarrow_filters(
                 "le": "<=",
             }.get(op)
             if pyarrow_op is None:
-                return None
+                return []
             simple = _simple_column_literal_pair(left, right)
             if simple is None:
                 reverse = _simple_column_literal_pair(right, left)
                 if reverse is None:
-                    return None
+                    return []
                 column, value = reverse
                 reverse_op = {
                     "==": "==",
@@ -470,7 +476,7 @@ def _predicate_to_pyarrow_filters(
             values = predicate._args[1]
             if isinstance(target, _QueryExpr) and target._kind == "col":
                 return [(str(target._value), "in", list(values))]
-    return None
+    return []
 
 
 def _simple_column_literal_pair(left: object, right: object) -> tuple[str, object] | None:
@@ -558,9 +564,7 @@ def _query_expr_from_json(payload: dict[str, object]) -> object:
         return _literal(_query_expr_from_json(payload["arg"])).alias(str(payload["value"]))
     if kind == "is_in":
         args = payload["args"]
-        return _literal(_query_expr_from_json(args[0])).is_in(
-            _query_expr_from_json(args[1])._value
-        )
+        return _literal(_query_expr_from_json(args[0])).is_in(_query_expr_from_json(args[1])._value)
     if kind == "is_null":
         return _literal(_query_expr_from_json(payload["arg"])).is_null()
     if kind == "is_not_null":
@@ -1222,15 +1226,9 @@ def _compact_tables(
         "tables_compacted": sum(
             1 for result in table_results if int(result.get("groups_compacted", 0)) > 0
         ),
-        "groups_compacted": sum(
-            int(result.get("groups_compacted", 0)) for result in table_results
-        ),
-        "files_compacted": sum(
-            int(result.get("files_compacted", 0)) for result in table_results
-        ),
-        "rows_compacted": sum(
-            int(result.get("rows_compacted", 0)) for result in table_results
-        ),
+        "groups_compacted": sum(int(result.get("groups_compacted", 0)) for result in table_results),
+        "files_compacted": sum(int(result.get("files_compacted", 0)) for result in table_results),
+        "rows_compacted": sum(int(result.get("rows_compacted", 0)) for result in table_results),
         "table_results": table_results,
         "table_errors": table_errors,
     }
@@ -1257,7 +1255,9 @@ def _resolve_compaction_table_names(
         try:
             names = [str(item) for item in table_names]  # type: ignore[operator]
         except TypeError as error:
-            raise TypeError("table_names must be a table name or iterable of table names") from error
+            raise TypeError(
+                "table_names must be a table name or iterable of table names"
+            ) from error
 
     names = [name for name in names if name]
     if not names:
@@ -1465,9 +1465,7 @@ def _compact_persisted_file_group(
     first_file = group_files[0]
     target_dir = Path(str(first_file["file_path"])).parent
     target_path = target_dir / _compacted_parquet_file_name(table_name, group_files)
-    temp_path = target_path.with_name(
-        f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
-    )
+    temp_path = target_path.with_name(f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}")
     pq.write_table(table, temp_path)
     os.replace(temp_path, target_path)
     return _compacted_persisted_file_metadata(
@@ -1484,8 +1482,9 @@ def _compacted_parquet_file_name(
     group_files: list[dict[str, object]],
 ) -> str:
     digest = hashlib.sha1(
-        "|".join(str(item.get("persist_file_id") or item.get("file_path")) for item in group_files)
-        .encode("utf-8")
+        "|".join(
+            str(item.get("persist_file_id") or item.get("file_path")) for item in group_files
+        ).encode("utf-8")
     ).hexdigest()[:16]
     return f"compact-{_safe_file_token(table_name)}-{digest}.parquet"
 
@@ -1507,8 +1506,9 @@ def _compacted_persisted_file_metadata(
         for identity in sorted(_persisted_segment_identities(item))
     ]
     digest = hashlib.sha1(
-        "|".join(str(item.get("persist_file_id") or item.get("file_path")) for item in group_files)
-        .encode("utf-8")
+        "|".join(
+            str(item.get("persist_file_id") or item.get("file_path")) for item in group_files
+        ).encode("utf-8")
     ).hexdigest()[:16]
     metadata: dict[str, object] = {
         "persist_file_id": f"compact:{table_name}:{digest}",
@@ -1790,13 +1790,7 @@ def _resolve_uri_path(uri: str) -> str:
 
 def _logical_control_endpoint_path(name: str) -> str:
     endpoint_name = name or "default"
-    return str(
-        _home_dir()
-        / ".zippy"
-        / "control_endpoints"
-        / endpoint_name
-        / "master.sock"
-    )
+    return str(_home_dir() / ".zippy" / "control_endpoints" / endpoint_name / "master.sock")
 
 
 def _home_dir() -> Path:
@@ -1875,8 +1869,7 @@ def _wait_for_table_ready(
             if stream.get("status") != "stale" and stream.get("active_segment_descriptor"):
                 return
             last_error = RuntimeError(
-                "table is not ready "
-                f"source=[{source}] status=[{stream.get('status')}]"
+                "table is not ready " f"source=[{source}] status=[{stream.get('status')}]"
             )
 
         if deadline is not None:
@@ -2238,9 +2231,7 @@ class RemoteMasterClient:
         self._endpoint = _normalize_remote_endpoint(endpoint)
         self._token = token
         self._master_endpoint = (
-            _normalize_remote_endpoint(master_endpoint)
-            if master_endpoint is not None
-            else None
+            _normalize_remote_endpoint(master_endpoint) if master_endpoint is not None else None
         )
         self._process_id: str | None = None
 
@@ -2258,8 +2249,7 @@ class RemoteMasterClient:
         gateway = config.get("gateway", {})
         if not isinstance(gateway, dict) or not gateway.get("endpoint"):
             raise RuntimeError(
-                "remote master does not advertise gateway.endpoint "
-                f"endpoint=[{endpoint}]"
+                "remote master does not advertise gateway.endpoint " f"endpoint=[{endpoint}]"
             )
         token = str(gateway["token"]) if gateway.get("token") else None
         return cls(str(gateway["endpoint"]), token=token, master_endpoint=endpoint)
@@ -2359,6 +2349,7 @@ class _RemoteQuery:
         self.master = master
         self.endpoint = endpoint or _remote_gateway_endpoint(master)
         self.token = token if token is not None else _remote_gateway_token(master)
+        self._last_collect_metrics: dict[str, object] = {}
         if self.endpoint is None:
             raise RuntimeError(f"remote gateway endpoint missing source=[{source}]")
 
@@ -2398,7 +2389,7 @@ class _RemoteQuery:
         return table.slice(max(0, table.num_rows - n), n)
 
     def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool):
-        _, payload = _remote_request(
+        response, payload = _remote_request(
             self.endpoint,
             {
                 "kind": "collect",
@@ -2408,7 +2399,12 @@ class _RemoteQuery:
             },
             token=self.token,
         )
+        metrics = response.get("metrics", {})
+        self._last_collect_metrics = dict(metrics) if isinstance(metrics, dict) else {}
         return _pyarrow_table_from_ipc(payload)
+
+    def last_collect_metrics(self) -> dict[str, object]:
+        return dict(self._last_collect_metrics)
 
 
 class RemoteGatewayWriter:
@@ -2598,9 +2594,7 @@ class RemoteStreamSubscriber:
             request = {
                 "kind": "subscribe_table",
                 "source": self.source,
-                "filter": (
-                    _query_expr_to_json(self.filter) if self.filter is not None else None
-                ),
+                "filter": (_query_expr_to_json(self.filter) if self.filter is not None else None),
                 "batch_size": self.batch_size,
                 "throttle_ms": self.throttle_ms,
                 "count": self.count,
@@ -2838,9 +2832,7 @@ class Table:
         """
         if length is not None and length < 0:
             raise ValueError("length must be non-negative")
-        return self._clone_with_plan(
-            plan_op=("slice", {"offset": int(offset), "length": length})
-        )
+        return self._clone_with_plan(plan_op=("slice", {"offset": int(offset), "length": length}))
 
     def sort(
         self,
@@ -2861,12 +2853,8 @@ class Table:
         keys = list(by) if isinstance(by, (list, tuple)) else [by]
         if not keys:
             raise ValueError("sort requires at least one key")
-        directions = (
-            list(descending) if isinstance(descending, (list, tuple)) else bool(descending)
-        )
-        return self._clone_with_plan(
-            plan_op=("sort", {"by": keys, "descending": directions})
-        )
+        directions = list(descending) if isinstance(descending, (list, tuple)) else bool(descending)
+        return self._clone_with_plan(plan_op=("sort", {"by": keys, "descending": directions}))
 
     def drop(self, *columns: object) -> Table:
         """
@@ -3086,16 +3074,54 @@ class Table:
         :returns: Current query result.
         :rtype: pyarrow.Table
         """
+        return self._collect_query(metrics=None)
+
+    def profile(self) -> dict[str, object]:
+        """
+        Execute the query and return the result together with scan metrics.
+
+        This is intended for low-frequency performance diagnosis. Normal query
+        code should keep using :meth:`collect` to avoid carrying metric payloads.
+
+        :returns: Dictionary with ``result`` and ``metrics`` entries.
+        :rtype: dict[str, object]
+        """
+        import time
+
+        metrics = self._new_query_metrics()
+        started_ns = time.perf_counter_ns()
+        result = self._collect_query(metrics=metrics)
+        metrics["returned_rows"] = result.num_rows
+        metrics["elapsed_ms"] = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        return {"result": result, "metrics": metrics}
+
+    def _collect_query(self, metrics: dict[str, object] | None):
         remote_collect = getattr(self._inner, "collect_plan", None)
         if callable(remote_collect):
-            return remote_collect(
-                _query_plan_to_json(self._plan_ops),
+            result = remote_collect(
+                _query_plan_to_json(self._optimized_plan_ops()),
                 snapshot=self._snapshot_enabled,
             )
+            if metrics is not None:
+                metrics["returned_rows"] = result.num_rows
+                _merge_remote_collect_metrics(metrics, self._inner)
+            return result
 
         tail_n = self._tail_pushdown_count()
         if tail_n is not None:
-            return self._collect_tail_pushdown(tail_n)
+            return self._collect_tail_pushdown(tail_n, metrics=metrics)
+
+        head_n = self._head_pushdown_count()
+        if head_n is not None:
+            return self._collect_head_pushdown(head_n, metrics=metrics)
+
+        slice_spec = self._slice_pushdown_spec()
+        if slice_spec is not None:
+            return self._collect_slice_pushdown(
+                int(slice_spec["offset"]),
+                slice_spec["length"],
+                metrics=metrics,
+            )
 
         snapshot = self.snapshot()
         schema = self.schema()
@@ -3105,8 +3131,10 @@ class Table:
             snapshot,
             columns=read_columns,
             filters=pushdown_filters,
+            metrics=metrics,
         )
         live = self._scan_live_snapshot(snapshot).read_all()
+        _record_live_scan(metrics, live)
         live = _filter_query_table(live, pushdown_filters)
         live = _select_query_columns(live, read_columns)
         table = _concat_query_tables(
@@ -3114,6 +3142,36 @@ class Table:
             _schema_for_query_columns(schema, read_columns),
         )
         return self._apply_query_plan(table)
+
+    def explain(self) -> dict[str, object]:
+        """
+        Return the logical plan, optimized plan, and scan pushdown summary.
+
+        The returned dictionary is intended for low-frequency debugging and
+        performance inspection. It does not execute the query.
+
+        :returns: Plan explanation including original, optimized, and pushdown sections.
+        :rtype: dict[str, object]
+        """
+        schema = self.schema()
+        optimized_plan = self._optimized_plan_ops()
+        pushdown_plan = self._pushdown_plan_summary(schema, optimized_plan)
+        return {
+            "source": self.source,
+            "snapshot": self._snapshot_enabled,
+            "executor": self._executor_kind(),
+            "original_plan": _query_plan_to_json(self._plan_ops),
+            "optimized_plan": _query_plan_to_json(optimized_plan),
+            "pushdown": {
+                "tail": self._tail_pushdown_count(optimized_plan),
+                "head": self._head_pushdown_count(optimized_plan),
+                "slice": self._slice_pushdown_spec(optimized_plan),
+                "columns": pushdown_plan["columns"],
+                "filters": pushdown_plan["filters"],
+            },
+            "pushdown_plan": pushdown_plan,
+            "residual_plan": _query_plan_to_json(self._residual_plan_ops(optimized_plan)),
+        }
 
     def to_pyarrow(self):
         """
@@ -3235,45 +3293,200 @@ class Table:
     def _has_query_plan(self) -> bool:
         return bool(self._plan_ops)
 
-    def _tail_pushdown_count(self) -> int | None:
-        if len(self._plan_ops) != 1:
+    def _optimized_plan_ops(self) -> list[tuple[str, object]]:
+        optimized: list[tuple[str, object]] = []
+        pending_filters: list[object] = []
+
+        def flush_filters() -> None:
+            nonlocal pending_filters
+            if not pending_filters:
+                return
+            optimized.append(("filter", _combine_filter_ops(pending_filters)))
+            pending_filters = []
+
+        for kind, value in self._plan_ops:
+            if kind == "filter":
+                pending_filters.append(value)
+                continue
+            flush_filters()
+            optimized.append((kind, value))
+        flush_filters()
+        return optimized
+
+    def _executor_kind(self) -> str:
+        return "remote" if callable(getattr(self._inner, "collect_plan", None)) else "local"
+
+    def _new_query_metrics(self) -> dict[str, object]:
+        schema = self.schema()
+        optimized_plan = self._optimized_plan_ops()
+        return {
+            "executor": self._executor_kind(),
+            "original_plan": _query_plan_to_json(self._plan_ops),
+            "optimized_plan": _query_plan_to_json(optimized_plan),
+            "pushdown_plan": self._pushdown_plan_summary(schema, optimized_plan),
+            "residual_plan": _query_plan_to_json(self._residual_plan_ops(optimized_plan)),
+            "scanned_files": [],
+            "scanned_rows": 0,
+            "scanned_live_rows": 0,
+            "returned_rows": None,
+            "elapsed_ms": None,
+        }
+
+    def _pushdown_plan_summary(
+        self,
+        schema: object | None,
+        plan_ops: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        return {
+            "row_range": self._row_range_pushdown_summary(plan_ops),
+            "columns": self._source_read_columns(schema, plan_ops),
+            "filters": self._pushdown_filters(schema, plan_ops),
+        }
+
+    def _row_range_pushdown_summary(
+        self,
+        plan_ops: list[tuple[str, object]],
+    ) -> dict[str, object] | None:
+        tail_n = self._tail_pushdown_count(plan_ops)
+        if tail_n is not None:
+            return {"op": "tail", "n": tail_n}
+        head_n = self._head_pushdown_count(plan_ops)
+        if head_n is not None:
+            return {"op": "head", "n": head_n}
+        slice_spec = self._slice_pushdown_spec(plan_ops)
+        if slice_spec is not None:
+            return {
+                "op": "slice",
+                "offset": slice_spec["offset"],
+                "length": slice_spec["length"],
+            }
+        return None
+
+    def _residual_plan_ops(
+        self,
+        plan_ops: list[tuple[str, object]],
+    ) -> list[tuple[str, object]]:
+        if self._row_range_pushdown_summary(plan_ops) is not None:
+            return []
+        return list(plan_ops)
+
+    def _tail_pushdown_count(self, plan_ops: list[tuple[str, object]] | None = None) -> int | None:
+        plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
+        if len(plan_ops) != 1:
             return None
-        kind, value = self._plan_ops[0]
+        kind, value = plan_ops[0]
         if kind != "tail":
             return None
         return int(value)
 
-    def _collect_tail_pushdown(self, n: int):
+    def _head_pushdown_count(self, plan_ops: list[tuple[str, object]] | None = None) -> int | None:
+        plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
+        if len(plan_ops) != 1:
+            return None
+        kind, value = plan_ops[0]
+        if kind != "head":
+            return None
+        return int(value)
+
+    def _slice_pushdown_spec(
+        self,
+        plan_ops: list[tuple[str, object]] | None = None,
+    ) -> dict[str, int | None] | None:
+        plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
+        if len(plan_ops) != 1:
+            return None
+        kind, value = plan_ops[0]
+        if kind != "slice" or not isinstance(value, dict):
+            return None
+        offset = int(value["offset"])
+        length = value["length"]
+        if offset < 0:
+            return None
+        if length is not None and int(length) < 0:
+            return None
+        return {"offset": offset, "length": None if length is None else int(length)}
+
+    def _collect_tail_pushdown(self, n: int, metrics: dict[str, object] | None = None):
         snapshot = self.snapshot()
         live = self._tail_live_snapshot(snapshot, n)
+        _record_live_scan(metrics, live)
         if n <= 0 or live.num_rows >= n:
             return live
 
-        persisted = _tail_persisted_rows(snapshot, n - live.num_rows)
+        persisted = _tail_persisted_rows(snapshot, n - live.num_rows, metrics=metrics)
         table = _concat_query_tables([persisted, live], self.schema())
         if table.num_rows > n:
             return table.slice(table.num_rows - n)
         return table
 
+    def _collect_head_pushdown(self, n: int, metrics: dict[str, object] | None = None):
+        snapshot = self.snapshot()
+        schema = self.schema()
+        if n <= 0:
+            return _concat_query_tables([], schema)
+
+        persisted = _head_persisted_rows(snapshot, n, metrics=metrics)
+        if persisted is not None and persisted.num_rows >= n:
+            return persisted.slice(0, n)
+
+        remaining = n - (0 if persisted is None else persisted.num_rows)
+        live = self._slice_live_snapshot(snapshot, 0, remaining, metrics=metrics)
+        table = _concat_query_tables([persisted, live], schema)
+        if table.num_rows > n:
+            return table.slice(0, n)
+        return table
+
+    def _collect_slice_pushdown(
+        self,
+        offset: int,
+        length: int | None,
+        metrics: dict[str, object] | None = None,
+    ):
+        snapshot = self.snapshot()
+        schema = self.schema()
+        if length == 0:
+            return _concat_query_tables([], schema)
+
+        persisted, persisted_row_count, collected_rows = _slice_persisted_rows(
+            snapshot,
+            offset,
+            length,
+            metrics=metrics,
+        )
+        if length is not None and collected_rows >= length:
+            if persisted is not None:
+                return persisted.slice(0, length)
+            return _concat_query_tables([], schema)
+
+        live_offset = max(0, offset - persisted_row_count)
+        live_length = None if length is None else length - collected_rows
+        live = self._slice_live_snapshot(
+            snapshot,
+            live_offset,
+            live_length,
+            metrics=metrics,
+        )
+        table = _concat_query_tables([persisted, live], schema)
+        if length is not None and table.num_rows > length:
+            return table.slice(0, length)
+        return table
+
     def _apply_query_plan(self, table):
-        if not self._has_query_plan():
+        plan_ops = self._optimized_plan_ops()
+        if not plan_ops:
             return table
 
         import polars as pl
 
         source_schema = table.schema
         frame = pl.from_arrow(table).lazy()
-        for kind, value in self._plan_ops:
+        for kind, value in plan_ops:
             if kind == "filter":
                 frame = frame.filter(_compile_query_expr_to_polars(value))
             elif kind == "select":
-                frame = frame.select(
-                    [_compile_query_expr_to_polars(expr) for expr in value]
-                )
+                frame = frame.select([_compile_query_expr_to_polars(expr) for expr in value])
             elif kind == "with_columns":
-                frame = frame.with_columns(
-                    [_compile_query_expr_to_polars(expr) for expr in value]
-                )
+                frame = frame.with_columns([_compile_query_expr_to_polars(expr) for expr in value])
             elif kind == "join":
                 other = value["other"]
                 right_frame = pl.from_arrow(other.collect()).lazy()
@@ -3319,15 +3532,35 @@ class Table:
         length = min(n, live.num_rows)
         return live.slice(live.num_rows - length, length)
 
-    def _source_read_columns(self, schema: object | None) -> list[str] | None:
-        if not self._plan_ops:
+    def _slice_live_snapshot(
+        self,
+        snapshot: dict[str, object],
+        offset: int,
+        length: int | None,
+        metrics: dict[str, object] | None = None,
+    ):
+        live = self._scan_live_snapshot(snapshot).read_all()
+        _record_live_scan(metrics, live)
+        if offset >= live.num_rows:
+            return live.slice(live.num_rows, 0)
+        if length is None:
+            return live.slice(offset)
+        return live.slice(offset, max(0, length))
+
+    def _source_read_columns(
+        self,
+        schema: object | None,
+        plan_ops: list[tuple[str, object]] | None = None,
+    ) -> list[str] | None:
+        plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
+        if not plan_ops:
             return None
-        if any(kind == "join" for kind, _ in self._plan_ops):
+        if any(kind == "join" for kind, _ in plan_ops):
             return None
-        if not any(kind == "select" for kind, _ in self._plan_ops):
+        if not any(kind == "select" for kind, _ in plan_ops):
             return None
         required: set[str] = set()
-        for kind, value in self._plan_ops:
+        for kind, value in plan_ops:
             if kind == "filter":
                 required.update(_expr_columns(value))
             elif kind in {"select", "with_columns"}:
@@ -3337,8 +3570,13 @@ class Table:
             return None
         return _ordered_subset(required, schema)
 
-    def _pushdown_filters(self, schema: object | None) -> list[tuple[str, str, object]] | None:
-        filters = [value for kind, value in self._plan_ops if kind == "filter"]
+    def _pushdown_filters(
+        self,
+        schema: object | None,
+        plan_ops: list[tuple[str, object]] | None = None,
+    ) -> list[tuple[str, str, object]] | None:
+        plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
+        filters = [value for kind, value in plan_ops if kind == "filter"]
         predicate = _combine_filter_ops(filters)
         pyarrow_filters = _predicate_to_pyarrow_filters(predicate)
         if pyarrow_filters is None:
@@ -3349,6 +3587,7 @@ class Table:
         if any(column not in schema_names for column, _, _ in pyarrow_filters):
             return None
         return pyarrow_filters
+
 
 def read_table(
     source: str,
@@ -3505,7 +3744,11 @@ def _arrow_row_bytes(table, row_index: int) -> bytes:
     return sink.getvalue().to_pybytes()
 
 
-def _tail_persisted_rows(snapshot: dict[str, object], n: int):
+def _tail_persisted_rows(
+    snapshot: dict[str, object],
+    n: int,
+    metrics: dict[str, object] | None = None,
+):
     if n <= 0:
         return None
 
@@ -3517,6 +3760,7 @@ def _tail_persisted_rows(snapshot: dict[str, object], n: int):
     row_count = 0
     for item in reversed(sorted(files, key=_persisted_file_order_key)):
         table = _read_persisted_parquet_file(item["file_path"])
+        _record_persisted_file_scan(metrics, item, table)
         if table.num_rows == 0:
             continue
         tables.append(table)
@@ -3534,24 +3778,121 @@ def _tail_persisted_rows(snapshot: dict[str, object], n: int):
     return combined
 
 
+def _head_persisted_rows(
+    snapshot: dict[str, object],
+    n: int,
+    metrics: dict[str, object] | None = None,
+):
+    if n <= 0:
+        return None
+
+    files = _non_overlapping_persisted_files(snapshot)
+    if not files:
+        return None
+
+    tables = []
+    remaining = n
+    for item in sorted(files, key=_persisted_file_order_key):
+        table = _read_persisted_parquet_file(item["file_path"])
+        _record_persisted_file_scan(metrics, item, table)
+        if table.num_rows == 0:
+            continue
+        if table.num_rows > remaining:
+            table = table.slice(0, remaining)
+        tables.append(table)
+        remaining -= table.num_rows
+        if remaining <= 0:
+            break
+
+    if not tables:
+        return None
+    return _concat_query_tables(tables, None)
+
+
+def _slice_persisted_rows(
+    snapshot: dict[str, object],
+    offset: int,
+    length: int | None,
+    metrics: dict[str, object] | None = None,
+):
+    files = sorted(_non_overlapping_persisted_files(snapshot), key=_persisted_file_order_key)
+    if not files:
+        return None, 0, 0
+
+    tables = []
+    absolute_position = 0
+    collected_rows = 0
+    requested_end = None if length is None else offset + length
+
+    for item in files:
+        row_count = _persisted_file_row_count(item)
+        if row_count is not None and absolute_position + row_count <= offset:
+            absolute_position += row_count
+            continue
+        if requested_end is not None and absolute_position >= requested_end:
+            break
+
+        table = _read_persisted_parquet_file(item["file_path"])
+        _record_persisted_file_scan(metrics, item, table)
+        file_row_count = table.num_rows
+        file_start = absolute_position
+        file_end = file_start + file_row_count
+        absolute_position = file_end
+        if file_row_count == 0 or file_end <= offset:
+            continue
+
+        start_in_file = max(0, offset - file_start)
+        if requested_end is None:
+            take_length = file_row_count - start_in_file
+        else:
+            take_until = min(file_row_count, requested_end - file_start)
+            take_length = max(0, take_until - start_in_file)
+        if take_length <= 0:
+            continue
+        sliced = table.slice(start_in_file, take_length)
+        tables.append(sliced)
+        collected_rows += sliced.num_rows
+        if length is not None and collected_rows >= length:
+            break
+
+    table = _concat_query_tables(tables, None) if tables else None
+    return table, absolute_position, collected_rows
+
+
+def _persisted_file_row_count(item: dict[str, object]) -> int | None:
+    try:
+        row_count = int(item["row_count"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if row_count < 0:
+        return None
+    return row_count
+
+
 def _collect_persisted_rows(
     snapshot: dict[str, object],
     *,
     columns: list[str] | None = None,
     filters: object | None = None,
+    metrics: dict[str, object] | None = None,
 ):
-    files = _non_overlapping_persisted_files(snapshot)
+    files = [
+        item
+        for item in _non_overlapping_persisted_files(snapshot)
+        if _persisted_file_matches_filters(item, filters)
+    ]
     if not files:
         return None
 
-    tables = [
-        _read_persisted_parquet_file(
+    tables = []
+    for item in sorted(files, key=_persisted_file_order_key):
+        table = _read_persisted_parquet_file(
             item["file_path"],
             columns=columns,
             filters=filters,
         )
-        for item in sorted(files, key=_persisted_file_order_key)
-    ]
+        _record_persisted_file_scan(metrics, item, table)
+        tables.append(table)
     return _concat_query_tables(tables, None)
 
 
@@ -3564,6 +3905,151 @@ def _read_persisted_parquet_file(
     import pyarrow.parquet as pq
 
     return pq.read_table(str(file_path), columns=columns, filters=filters, partitioning=None)
+
+
+def _record_persisted_file_scan(
+    metrics: dict[str, object] | None,
+    item: dict[str, object],
+    table: object,
+) -> None:
+    if metrics is None:
+        return
+    scanned_files = metrics.setdefault("scanned_files", [])
+    if isinstance(scanned_files, list):
+        scanned_files.append(str(item.get("file_path", "")))
+    metrics["scanned_rows"] = int(metrics.get("scanned_rows", 0)) + table.num_rows
+
+
+def _record_live_scan(metrics: dict[str, object] | None, table: object) -> None:
+    if metrics is None:
+        return
+    metrics["scanned_live_rows"] = int(metrics.get("scanned_live_rows", 0)) + table.num_rows
+    metrics["scanned_rows"] = int(metrics.get("scanned_rows", 0)) + table.num_rows
+
+
+def _merge_remote_collect_metrics(metrics: dict[str, object], remote_query: object) -> None:
+    last_collect_metrics = getattr(remote_query, "last_collect_metrics", None)
+    if not callable(last_collect_metrics):
+        return
+    gateway_metrics = last_collect_metrics()
+    if not isinstance(gateway_metrics, dict):
+        return
+    metrics["gateway"] = dict(gateway_metrics)
+    for key in ("scanned_rows", "scanned_live_rows", "returned_rows"):
+        if key in gateway_metrics:
+            metrics[key] = gateway_metrics[key]
+    if "elapsed_ms" in gateway_metrics:
+        metrics["gateway_elapsed_ms"] = gateway_metrics["elapsed_ms"]
+
+
+def _persisted_file_matches_filters(
+    item: dict[str, object],
+    filters: object | None,
+) -> bool:
+    if not filters:
+        return True
+    if not isinstance(filters, list):
+        return True
+    partition = item.get("partition")
+    if not isinstance(partition, dict):
+        partition = {}
+    for filter_item in filters:
+        if not (
+            isinstance(filter_item, tuple)
+            and len(filter_item) == 3
+            and isinstance(filter_item[0], str)
+        ):
+            continue
+        column, op, value = filter_item
+        if not _persisted_file_range_may_match_filter(item, column, str(op), value):
+            return False
+        if column not in partition:
+            continue
+        if not _partition_value_matches_filter(partition[column], str(op), value):
+            return False
+    return True
+
+
+def _persisted_file_range_may_match_filter(
+    item: dict[str, object],
+    column: str,
+    op: str,
+    value: object,
+) -> bool:
+    min_value, max_value = _persisted_file_min_max_for_column(item, column)
+    if min_value is None or max_value is None:
+        return True
+    return _range_may_match_filter(min_value, max_value, op, value)
+
+
+def _persisted_file_min_max_for_column(
+    item: dict[str, object],
+    column: str,
+) -> tuple[object | None, object | None]:
+    stats = item.get("stats")
+    if isinstance(stats, dict):
+        column_stats = stats.get(column)
+        if isinstance(column_stats, dict):
+            return column_stats.get("min"), column_stats.get("max")
+    if column in {"dt", "event_ts"}:
+        return item.get("min_event_ts"), item.get("max_event_ts")
+    if column == "seq":
+        return item.get("min_seq"), item.get("max_seq")
+    return None, None
+
+
+def _range_may_match_filter(
+    min_value: object,
+    max_value: object,
+    op: str,
+    value: object,
+) -> bool:
+    try:
+        left_min = float(min_value)
+        left_max = float(max_value)
+        right = float(value)
+    except (TypeError, ValueError):
+        return True
+    if op == "==":
+        return left_min <= right <= left_max
+    if op == "!=":
+        return not (left_min == left_max == right)
+    if op == ">":
+        return left_max > right
+    if op == ">=":
+        return left_max >= right
+    if op == "<":
+        return left_min < right
+    if op == "<=":
+        return left_min <= right
+    if op == "in" and isinstance(value, (list, tuple, set)):
+        return any(left_min <= float(item) <= left_max for item in value)
+    return True
+
+
+def _partition_value_matches_filter(partition_value: object, op: str, value: object) -> bool:
+    if op == "==":
+        return str(partition_value) == str(value)
+    if op == "!=":
+        return str(partition_value) != str(value)
+    if op == "in":
+        if not isinstance(value, (list, tuple, set)):
+            return True
+        return str(partition_value) in {str(item) for item in value}
+    try:
+        left = float(partition_value)
+        right = float(value)
+    except (TypeError, ValueError):
+        return True
+    if op == ">":
+        return left > right
+    if op == ">=":
+        return left >= right
+    if op == "<":
+        return left < right
+    if op == "<=":
+        return left <= right
+    return True
 
 
 def _non_overlapping_persisted_files(
@@ -3688,9 +4174,7 @@ def _schema_for_query_columns(schema: object | None, columns: list[str] | None):
 
 def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int]]:
     identities: set[tuple[int, int]] = set()
-    active_identity = _descriptor_segment_identity(
-        snapshot.get("active_segment_descriptor")
-    )
+    active_identity = _descriptor_segment_identity(snapshot.get("active_segment_descriptor"))
     if active_identity is not None:
         identities.add(active_identity)
 
@@ -4769,9 +5253,7 @@ class ParquetReplayEngine:
             raise RuntimeError("replay engine is not started")
         completed = self._source.wait_replay(timeout)
         if not completed:
-            raise TimeoutError(
-                f"table replay did not finish output_stream=[{self.output_stream}]"
-            )
+            raise TimeoutError(f"table replay did not finish output_stream=[{self.output_stream}]")
         return True
 
     def stop(self) -> None:
@@ -5406,9 +5888,7 @@ class Session:
                 descriptor_publisher=self._descriptor_publisher(table_name),
                 row_capacity=table_options["row_capacity"],
                 retention_guard=self._retention_guard(table_name),
-                replacement_retention_snapshots=table_options[
-                    "replacement_retention_snapshots"
-                ],
+                replacement_retention_snapshots=table_options["replacement_retention_snapshots"],
             )
         else:
             materializer = _StreamTableMaterializer(
@@ -5685,9 +6165,7 @@ class Pipeline:
             dt_part=table_options["dt_part"],
             persist_path=table_options["persist_path"],
             persist_publisher=(
-                self._persist_publisher(name)
-                if table_options["persist_path"] is not None
-                else None
+                self._persist_publisher(name) if table_options["persist_path"] is not None else None
             ),
             # Windows file-backed mappings can be deleted as soon as the
             # upstream source retires a segment, so default to a table-owned
@@ -5920,9 +6398,7 @@ def _resolve_stream_table_options(
             retention_segments = int(configured_retention_segments)
     if retention_segments is not None and retention_segments < 0:
         raise ValueError("retention_segments must be non-negative")
-    replacement_retention_snapshots = int(
-        table_config.get("replacement_retention_snapshots", 8)
-    )
+    replacement_retention_snapshots = int(table_config.get("replacement_retention_snapshots", 8))
     if replacement_retention_snapshots <= 0:
         raise ValueError("replacement_retention_snapshots must be greater than zero")
 
@@ -6284,7 +6760,7 @@ __all__ = [
     "StreamSubscriber",
     "Table",
     "TableReplayEngine",
-        "TimeSeriesEngine",
+    "TimeSeriesEngine",
     "TsDelaySpec",
     "TsDiffSpec",
     "TsEmaSpec",

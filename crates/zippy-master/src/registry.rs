@@ -31,6 +31,8 @@ pub struct StreamRecord {
     pub buffer_size: usize,
     pub frame_size: usize,
     pub writer_process_id: Option<String>,
+    #[serde(default)]
+    pub active_writer_source_name: Option<String>,
     pub reader_count: usize,
     pub status: String,
     #[serde(default)]
@@ -164,6 +166,11 @@ pub enum RegistryError {
     },
     SourceAlreadyExists {
         source_name: String,
+    },
+    StreamWriterSourceAlreadyExists {
+        stream_name: String,
+        source_name: String,
+        owner_source_name: String,
     },
     EngineAlreadyExists {
         engine_name: String,
@@ -330,6 +337,15 @@ impl fmt::Display for RegistryError {
             Self::SourceAlreadyExists { source_name } => {
                 write!(f, "source already exists source_name=[{}]", source_name)
             }
+            Self::StreamWriterSourceAlreadyExists {
+                stream_name,
+                source_name,
+                owner_source_name,
+            } => write!(
+                f,
+                "stream writer source already exists stream_name=[{}] source_name=[{}] owner_source_name=[{}]",
+                stream_name, source_name, owner_source_name
+            ),
             Self::EngineAlreadyExists { engine_name } => {
                 write!(f, "engine already exists engine_name=[{}]", engine_name)
             }
@@ -626,6 +642,15 @@ impl Registry {
             });
         }
 
+        let active_writer_source_name = self
+            .sources
+            .values()
+            .find(|source| {
+                source.output_stream == stream_name
+                    && source.status != "lost"
+                    && self.process_is_alive(&source.process_id)
+            })
+            .map(|source| source.source_name.clone());
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
             schema,
@@ -639,6 +664,7 @@ impl Registry {
             buffer_size,
             frame_size,
             writer_process_id: None,
+            active_writer_source_name,
             reader_count: 0,
             status: "registered".to_string(),
             active_segment_descriptor: None,
@@ -740,6 +766,7 @@ impl Registry {
         output_stream: &str,
         config: serde_json::Value,
     ) -> Result<(), RegistryError> {
+        self.validate_single_active_writer_source(source_name, output_stream)?;
         if let Some(existing) = self.sources.get(source_name) {
             if existing.source_type != source_type
                 || existing.output_stream != output_stream
@@ -761,6 +788,9 @@ impl Registry {
                 existing.metrics = serde_json::json!({});
             }
             existing.status = "registered".to_string();
+            if let Some(stream) = self.streams.get_mut(output_stream) {
+                stream.active_writer_source_name = Some(source_name.to_string());
+            }
             return Ok(());
         }
         self.sources.insert(
@@ -775,7 +805,48 @@ impl Registry {
                 metrics: serde_json::json!({}),
             },
         );
+        if let Some(stream) = self.streams.get_mut(output_stream) {
+            stream.active_writer_source_name = Some(source_name.to_string());
+        }
         Ok(())
+    }
+
+    fn validate_single_active_writer_source(
+        &self,
+        source_name: &str,
+        output_stream: &str,
+    ) -> Result<(), RegistryError> {
+        for source in self.sources.values() {
+            if source.source_name == source_name
+                || source.output_stream != output_stream
+                || source.status == "lost"
+                || !self.process_is_alive(&source.process_id)
+            {
+                continue;
+            }
+            return Err(RegistryError::StreamWriterSourceAlreadyExists {
+                stream_name: output_stream.to_string(),
+                source_name: source_name.to_string(),
+                owner_source_name: source.source_name.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn stream_active_source_owned_by(&self, stream_name: &str, process_id: &str) -> bool {
+        let Some(stream) = self.streams.get(stream_name) else {
+            return false;
+        };
+        stream
+            .active_writer_source_name
+            .as_deref()
+            .and_then(|source_name| self.sources.get(source_name))
+            .map(|source| {
+                source.output_stream == stream_name
+                    && source.process_id == process_id
+                    && source.status != "lost"
+            })
+            .unwrap_or(false)
     }
 
     fn process_is_alive(&self, process_id: &str) -> bool {
@@ -962,23 +1033,13 @@ impl Registry {
                     stream_name: stream_name.to_string(),
                 })?;
         let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
-        let source_owner = self.sources.values().any(|source| {
-            source.output_stream == stream_name
-                && source.process_id == process_id
-                && source.status != "lost"
-        });
+        let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
         if !writer_owner && !source_owner {
             return Err(RegistryError::SegmentDescriptorPublisherNotAuthorized {
                 stream_name: stream_name.to_string(),
                 process_id: process_id.to_string(),
             });
         }
-        let next_status = if writer_owner {
-            "writer_attached"
-        } else {
-            "registered"
-        };
-
         let (active_descriptor, sealed_segments) =
             split_active_segment_descriptor(stream_name, descriptor)?;
         let stream =
@@ -990,7 +1051,8 @@ impl Registry {
         stream.active_segment_descriptor = Some(active_descriptor);
         stream.sealed_segments = sealed_segments;
         stream.descriptor_generation = stream.descriptor_generation.saturating_add(1);
-        stream.status = next_status.to_string();
+        stream.writer_process_id = Some(process_id.to_string());
+        stream.status = "writer_attached".to_string();
         Ok(())
     }
 
@@ -1008,11 +1070,7 @@ impl Registry {
                     stream_name: stream_name.to_string(),
                 })?;
         let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
-        let source_owner = self.sources.values().any(|source| {
-            source.output_stream == stream_name
-                && source.process_id == process_id
-                && source.status != "lost"
-        });
+        let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
         let sink_owner = self.sinks.values().any(|sink| {
             sink.input_stream == stream_name
                 && sink.process_id == process_id
@@ -1098,11 +1156,7 @@ impl Registry {
                     stream_name: stream_name.to_string(),
                 })?;
         let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
-        let source_owner = self.sources.values().any(|source| {
-            source.output_stream == stream_name
-                && source.process_id == process_id
-                && source.status != "lost"
-        });
+        let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
         let sink_owner = self.sinks.values().any(|sink| {
             sink.input_stream == stream_name
                 && sink.process_id == process_id
@@ -1430,12 +1484,22 @@ impl Registry {
         for source in self.sources.values_mut() {
             if source.process_id == process_id {
                 source.status = "lost".to_string();
-                lost_output_streams.push(source.output_stream.clone());
+                lost_output_streams
+                    .push((source.output_stream.clone(), source.source_name.clone()));
             }
         }
-        for stream_name in lost_output_streams {
+        for (stream_name, source_name) in lost_output_streams {
             if let Some(stream) = self.streams.get_mut(&stream_name) {
-                stream.status = "stale".to_string();
+                let lost_source_still_owns_stream =
+                    stream.active_writer_source_name.as_deref() == Some(source_name.as_str());
+                if lost_source_still_owns_stream {
+                    stream.active_writer_source_name = None;
+                }
+                let lost_process_still_owns_writer =
+                    stream.writer_process_id.as_deref() == Some(process_id);
+                if lost_source_still_owns_stream || lost_process_still_owns_writer {
+                    stream.status = "stale".to_string();
+                }
             }
         }
         for engine in self.engines.values_mut() {
@@ -1451,7 +1515,11 @@ impl Registry {
     }
 
     pub fn unregister_source(&mut self, source_name: &str) -> Option<SourceRecord> {
-        self.sources.remove(source_name)
+        let removed = self.sources.remove(source_name);
+        if let Some(source) = &removed {
+            self.clear_active_writer_source(&source.output_stream, source_name);
+        }
+        removed
     }
 
     pub fn unregister_source_for_process(
@@ -1472,11 +1540,23 @@ impl Registry {
                 owner_process_id: Some(source.process_id.clone()),
             });
         }
-        self.sources
-            .remove(source_name)
-            .ok_or_else(|| RegistryError::SourceNotFound {
-                source_name: source_name.to_string(),
-            })
+        let removed =
+            self.sources
+                .remove(source_name)
+                .ok_or_else(|| RegistryError::SourceNotFound {
+                    source_name: source_name.to_string(),
+                })?;
+        self.clear_active_writer_source(&removed.output_stream, source_name);
+        Ok(removed)
+    }
+
+    fn clear_active_writer_source(&mut self, output_stream: &str, source_name: &str) {
+        let Some(stream) = self.streams.get_mut(output_stream) else {
+            return;
+        };
+        if stream.active_writer_source_name.as_deref() == Some(source_name) {
+            stream.active_writer_source_name = None;
+        }
     }
 
     pub fn unregister_engine(&mut self, engine_name: &str) -> Option<EngineRecord> {

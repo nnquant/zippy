@@ -125,6 +125,14 @@ fn native_gateway_collects_existing_segment_stream() {
             "source": "external_ticks",
             "token": "dev-token",
             "plan": [
+                {"op": "filter", "expr": {
+                    "kind": "binary",
+                    "op": "eq",
+                    "args": [
+                        {"kind": "col", "value": "instrument_id"},
+                        {"kind": "literal", "value": "IF2606"}
+                    ]
+                }},
                 {"op": "select", "exprs": [{"kind": "col", "value": "instrument_id"}]}
             ]
         }),
@@ -132,6 +140,22 @@ fn native_gateway_collects_existing_segment_stream() {
     );
 
     assert_eq!(response["status"], "ok");
+    assert_eq!(response["metrics"]["scanned_rows"], 1);
+    assert_eq!(response["metrics"]["returned_rows"], 1);
+    assert_eq!(response["metrics"]["plan_ops"], 2);
+    assert_eq!(
+        response["metrics"]["pushed_filters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(response["metrics"]["residual_filters"], json!([]));
+    assert_eq!(
+        response["metrics"]["scan_projection_columns"],
+        json!(["instrument_id"])
+    );
+    assert!(response["metrics"]["elapsed_ms"].as_f64().unwrap() >= 0.0);
     let collected = decode_ipc_batch(&payload);
     assert_eq!(collected.num_rows(), 1);
     assert_eq!(collected.num_columns(), 1);
@@ -233,6 +257,188 @@ fn native_gateway_pushes_tail_collect_into_segment_reader() {
 }
 
 #[test]
+fn native_gateway_pushes_head_collect_into_segment_reader() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("dt", DataType::Int64, false),
+            Field::new("instrument_id", DataType::Utf8, false),
+        ])),
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            std::sync::Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+        ],
+    )
+    .unwrap();
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("external_head_writer").unwrap();
+    client
+        .register_stream("head_external_ticks", batch.schema(), 2, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "external_head_source",
+            "test",
+            "head_external_ticks",
+            json!({}),
+        )
+        .unwrap();
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("head_external_ticks", batch.schema(), 2)
+            .unwrap();
+    materializer
+        .on_data(SegmentTableView::from_record_batch(batch))
+        .unwrap();
+    materializer.on_flush().unwrap();
+    let descriptor_bytes = materializer.active_descriptor_envelope_bytes().unwrap();
+    let mut descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes).unwrap();
+    descriptor["shm_os_id"] = json!("/tmp/zippy-missing-active-segment");
+    client
+        .publish_segment_descriptor_bytes(
+            "head_external_ticks",
+            &serde_json::to_vec(&descriptor).unwrap(),
+        )
+        .unwrap();
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "head_external_ticks",
+            "token": "dev-token",
+            "plan": [
+                {"op": "head", "n": 1},
+                {"op": "select", "exprs": [{"kind": "col", "value": "instrument_id"}]}
+            ]
+        }),
+        vec![],
+    );
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["metrics"]["row_range_pushdown"], "head");
+    assert_eq!(response["metrics"]["residual_plan_ops"], 1);
+    assert_eq!(
+        response["metrics"]["projection_columns"],
+        json!(["instrument_id"])
+    );
+    assert_eq!(
+        response["metrics"]["scan_projection_columns"],
+        json!(["instrument_id"])
+    );
+    assert_eq!(response["metrics"]["residual_filters"], json!([]));
+    let collected = decode_ipc_batch(&payload);
+    assert_eq!(collected.num_rows(), 1);
+    assert_eq!(collected.num_columns(), 1);
+    let instrument_id = collected
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(instrument_id.value(0), "a");
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_pushes_slice_collect_into_segment_reader() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("dt", DataType::Int64, false),
+            Field::new("instrument_id", DataType::Utf8, false),
+        ])),
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            std::sync::Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+        ],
+    )
+    .unwrap();
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("external_slice_writer").unwrap();
+    client
+        .register_stream("slice_external_ticks", batch.schema(), 2, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "external_slice_source",
+            "test",
+            "slice_external_ticks",
+            json!({}),
+        )
+        .unwrap();
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("slice_external_ticks", batch.schema(), 2)
+            .unwrap();
+    materializer
+        .on_data(SegmentTableView::from_record_batch(batch))
+        .unwrap();
+    materializer.on_flush().unwrap();
+    let descriptor_bytes = materializer.active_descriptor_envelope_bytes().unwrap();
+    let mut descriptor: serde_json::Value = serde_json::from_slice(&descriptor_bytes).unwrap();
+    descriptor["shm_os_id"] = json!("/tmp/zippy-missing-active-segment");
+    client
+        .publish_segment_descriptor_bytes(
+            "slice_external_ticks",
+            &serde_json::to_vec(&descriptor).unwrap(),
+        )
+        .unwrap();
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "slice_external_ticks",
+            "token": "dev-token",
+            "plan": [{"op": "slice", "offset": 2, "length": 1}]
+        }),
+        vec![],
+    );
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["metrics"]["row_range_pushdown"], "slice");
+    let collected = decode_ipc_batch(&payload);
+    assert_eq!(collected.num_rows(), 1);
+    let instrument_id = collected
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(instrument_id.value(0), "c");
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_applies_lazy_shape_collect_plan() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -301,6 +507,22 @@ fn native_gateway_applies_lazy_shape_collect_plan() {
     );
 
     assert_eq!(response["status"], "ok");
+    assert_eq!(
+        response["metrics"]["residual_filters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(response["metrics"]["pushed_filters"], json!([]));
+    assert_eq!(
+        response["metrics"]["scan_projection_columns"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        response["metrics"]["projection_columns"],
+        serde_json::Value::Null
+    );
     let collected = decode_ipc_batch(&payload);
     assert_eq!(collected.num_rows(), 1);
     assert_eq!(

@@ -6901,9 +6901,7 @@ def test_ops_compact_table_replaces_small_partition_files(
     assert other_file.exists()
     assert master.replaced_files is not None
     assert len(master.replaced_files) == 2
-    compacted = [
-        item for item in master.replaced_files if item.get("compacted_file_count") == 2
-    ][0]
+    compacted = [item for item in master.replaced_files if item.get("compacted_file_count") == 2][0]
     assert compacted["row_count"] == 3
     assert compacted["partition_path"] == "dt_part=202604/instrument_id=IF2606"
     assert pq.read_table(compacted["file_path"], partitioning=None).num_rows == 3
@@ -7256,7 +7254,9 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
             created["started"] = True
             return self
 
-    callback = lambda row: None
+    def callback(row: object) -> None:
+        return None
+
     explicit_master = object()
     monkeypatch.setattr(zippy, "StreamSubscriber", FakeStreamSubscriber)
 
@@ -8270,9 +8270,7 @@ def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
 
     query = zippy.read_table("ctp_ticks", master=explicit_master)
     filtered = (
-        query.filter(
-            (zippy.col("instrument_id") == "IF2606") & (zippy.col("last_price") > 4000.0)
-        )
+        query.filter((zippy.col("instrument_id") == "IF2606") & (zippy.col("last_price") > 4000.0))
         .between(zippy.col("dt"), 2, 4)
         .select(
             [
@@ -8429,9 +8427,7 @@ def test_gateway_server_rejects_write_batch_above_row_limit() -> None:
             ("last_price", pa.float64()),
         ]
     )
-    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(
-        max_write_rows=1
-    )
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack(max_write_rows=1)
     try:
         writer = zippy.RemoteGatewayWriter(
             "qmt_ticks",
@@ -9286,6 +9282,728 @@ def test_table_plan_pushes_projection_and_simple_predicate_to_persisted_reader(
     ]
 
 
+def test_table_plan_splits_pushdownable_and_residual_predicates(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("volume", pa.int64()),
+        ]
+    )
+    persisted_table = pa.table(
+        {
+            "instrument_id": ["IF2606", "IF2606", "IF2607"],
+            "last_price": [4102.5, 3999.0, 4103.5],
+            "volume": [10, 20, 30],
+        },
+        schema=schema,
+    )
+    read_calls: list[dict[str, object]] = []
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/ctp_ticks.parquet",
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    }
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        read_calls.append(
+            {
+                "file_path": file_path,
+                "columns": columns,
+                "filters": filters,
+            }
+        )
+        table = persisted_table
+        if filters == [("instrument_id", "==", "IF2606")]:
+            table = table.filter(pc.equal(table["instrument_id"], "IF2606"))
+        if columns is not None:
+            table = table.select(columns)
+        return table
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    query = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False)
+        .filter(
+            (zippy.col("instrument_id") == "IF2606")
+            & ((zippy.col("last_price") + zippy.col("volume")) > 4100.0)
+        )
+        .select("instrument_id", "last_price")
+    )
+
+    result = query.collect()
+
+    assert result.column("instrument_id").to_pylist() == ["IF2606"]
+    assert result.column("last_price").to_pylist() == [4102.5]
+    assert read_calls == [
+        {
+            "file_path": "/tmp/ctp_ticks.parquet",
+            "columns": ["instrument_id", "last_price", "volume"],
+            "filters": [("instrument_id", "==", "IF2606")],
+        }
+    ]
+    assert query.explain()["pushdown"]["filters"] == [("instrument_id", "==", "IF2606")]
+
+
+def test_table_plan_prunes_persisted_files_by_partition_metadata(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    read_files: list[str] = []
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/IF2606.parquet",
+                        "partition": {"instrument_id": "IF2606"},
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    },
+                    {
+                        "file_path": "/tmp/IH2606.parquet",
+                        "partition": {"instrument_id": "IH2606"},
+                        "source_segment_id": 3,
+                        "source_generation": 0,
+                    },
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        read_files.append(str(file_path))
+        return pa.table(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4102.5],
+            },
+            schema=schema,
+        ).select(columns or schema.names)
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    result = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "IF2606")
+        .select("instrument_id", "last_price")
+        .collect()
+    )
+
+    assert result.column("instrument_id").to_pylist() == ["IF2606"]
+    assert read_files == ["/tmp/IF2606.parquet"]
+
+
+def test_table_plan_prunes_persisted_files_by_event_time_metadata(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("dt", pa.int64()),
+            ("instrument_id", pa.string()),
+        ]
+    )
+    read_files: list[str] = []
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/old.parquet",
+                        "min_event_ts": 100,
+                        "max_event_ts": 199,
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    },
+                    {
+                        "file_path": "/tmp/new.parquet",
+                        "min_event_ts": 200,
+                        "max_event_ts": 299,
+                        "source_segment_id": 3,
+                        "source_generation": 0,
+                    },
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        read_files.append(str(file_path))
+        return pa.table(
+            {
+                "dt": [210],
+                "instrument_id": ["IF2606"],
+            },
+            schema=schema,
+        ).select(columns or schema.names)
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    result = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False)
+        .filter(zippy.col("dt") >= 200)
+        .select("dt", "instrument_id")
+        .collect()
+    )
+
+    assert result.column("dt").to_pylist() == [210]
+    assert read_files == ["/tmp/new.parquet"]
+
+
+def test_table_head_pushdown_skips_later_persisted_files(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    persisted_rows = {
+        "/tmp/segment-1.parquet": pa.table(
+            {
+                "instrument_id": ["IF2606", "IF2607"],
+                "last_price": [4102.5, 4103.5],
+            },
+            schema=schema,
+        ),
+        "/tmp/segment-2.parquet": pa.table(
+            {
+                "instrument_id": ["IH2606", "IH2607"],
+                "last_price": [2800.5, 2801.5],
+            },
+            schema=schema,
+        ),
+    }
+    read_files: list[str] = []
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/segment-1.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    },
+                    {
+                        "file_path": "/tmp/segment-2.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 3,
+                        "source_generation": 0,
+                    },
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            raise AssertionError(
+                "head pushdown should not scan live rows when persisted has enough"
+            )
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        read_files.append(str(file_path))
+        return persisted_rows[str(file_path)].select(columns or schema.names)
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    result = zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False).head(1).collect()
+
+    assert result.column("instrument_id").to_pylist() == ["IF2606"]
+    assert read_files == ["/tmp/segment-1.parquet"]
+
+
+def test_table_profile_reports_scan_metrics_for_head_pushdown(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    persisted_rows = {
+        "/tmp/segment-1.parquet": pa.table(
+            {
+                "instrument_id": ["IF2606", "IF2607"],
+                "last_price": [4102.5, 4103.5],
+            },
+            schema=schema,
+        ),
+        "/tmp/segment-2.parquet": pa.table(
+            {
+                "instrument_id": ["IH2606", "IH2607"],
+                "last_price": [2800.5, 2801.5],
+            },
+            schema=schema,
+        ),
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/segment-1.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    },
+                    {
+                        "file_path": "/tmp/segment-2.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 3,
+                        "source_generation": 0,
+                    },
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            raise AssertionError("head profile should not scan live rows when persisted has enough")
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        return persisted_rows[str(file_path)].select(columns or schema.names)
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    profile = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False).head(1).profile()
+    )
+
+    assert profile["result"].column("instrument_id").to_pylist() == ["IF2606"]
+    assert profile["metrics"]["returned_rows"] == 1
+    assert profile["metrics"]["scanned_files"] == ["/tmp/segment-1.parquet"]
+    assert profile["metrics"]["scanned_rows"] == 2
+    assert profile["metrics"]["pushdown_plan"]["row_range"] == {"op": "head", "n": 1}
+
+
+def test_table_slice_pushdown_skips_non_overlapping_persisted_files(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    persisted_rows = {
+        "/tmp/segment-1.parquet": pa.table(
+            {
+                "instrument_id": ["IF2606", "IF2607"],
+                "last_price": [4102.5, 4103.5],
+            },
+            schema=schema,
+        ),
+        "/tmp/segment-2.parquet": pa.table(
+            {
+                "instrument_id": ["IH2606", "IH2607"],
+                "last_price": [2800.5, 2801.5],
+            },
+            schema=schema,
+        ),
+        "/tmp/segment-3.parquet": pa.table(
+            {
+                "instrument_id": ["AU2606", "AU2607"],
+                "last_price": [520.5, 521.5],
+            },
+            schema=schema,
+        ),
+    }
+    read_files: list[str] = []
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/segment-1.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 2,
+                        "source_generation": 0,
+                    },
+                    {
+                        "file_path": "/tmp/segment-2.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 3,
+                        "source_generation": 0,
+                    },
+                    {
+                        "file_path": "/tmp/segment-3.parquet",
+                        "row_count": 2,
+                        "source_segment_id": 4,
+                        "source_generation": 0,
+                    },
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            raise AssertionError(
+                "slice pushdown should not scan live rows when persisted has enough"
+            )
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        read_files.append(str(file_path))
+        return persisted_rows[str(file_path)].select(columns or schema.names)
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+
+    result = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False).slice(3, 2).collect()
+    )
+
+    assert result.column("instrument_id").to_pylist() == ["IH2607", "AU2606"]
+    assert read_files == ["/tmp/segment-2.parquet", "/tmp/segment-3.parquet"]
+
+
+def test_table_explain_reports_optimized_plan_and_scan_pushdown(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("volume", pa.int64()),
+        ]
+    )
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = (
+        zippy.read_table("ctp_ticks", master=explicit_master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "IF2606")
+        .filter(zippy.col("last_price") > 4000.0)
+        .select("instrument_id", "last_price")
+    )
+
+    explain = query.explain()
+
+    assert [item["op"] for item in explain["original_plan"]] == [
+        "filter",
+        "filter",
+        "select",
+    ]
+    assert [item["op"] for item in explain["optimized_plan"]] == ["filter", "select"]
+    assert explain["pushdown"]["columns"] == ["instrument_id", "last_price"]
+    assert explain["pushdown"]["filters"] == [
+        ("instrument_id", "==", "IF2606"),
+        ("last_price", ">", 4000.0),
+    ]
+    assert explain["pushdown"]["tail"] is None
+    assert explain["pushdown_plan"] == {
+        "row_range": None,
+        "columns": ["instrument_id", "last_price"],
+        "filters": [
+            ("instrument_id", "==", "IF2606"),
+            ("last_price", ">", 4000.0),
+        ],
+    }
+    assert [item["op"] for item in explain["residual_plan"]] == ["filter", "select"]
+    assert explain["executor"] == "local"
+
+
+def test_remote_collect_sends_optimized_plan(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    sent_plans: list[list[dict[str, object]]] = []
+
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, endpoint: str, token: str | None) -> None:
+            self.source = source
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool) -> pa.Table:
+            sent_plans.append(plan)
+            return pa.table({"instrument_id": [], "last_price": []}, schema=schema)
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self._process_id = None
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "token": None,
+                }
+            }
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+
+    (
+        zippy.read_table("ctp_ticks", master=FakeMaster())
+        .filter(zippy.col("instrument_id") == "IF2606")
+        .filter(zippy.col("last_price") > 4000.0)
+        .select("instrument_id", "last_price")
+        .collect()
+    )
+
+    assert [item["op"] for item in sent_plans[0]] == ["filter", "select"]
+
+
+def test_remote_profile_merges_gateway_collect_metrics(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, endpoint: str, token: str | None) -> None:
+            self.source = source
+            self._last_collect_metrics: dict[str, object] = {}
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool) -> pa.Table:
+            self._last_collect_metrics = {
+                "scanned_rows": 300000,
+                "returned_rows": 10,
+                "elapsed_ms": 12.5,
+            }
+            return pa.table(
+                {
+                    "instrument_id": ["IF2606"],
+                    "last_price": [4102.5],
+                },
+                schema=schema,
+            )
+
+        def last_collect_metrics(self) -> dict[str, object]:
+            return dict(self._last_collect_metrics)
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self._process_id = None
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "token": None,
+                }
+            }
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+
+    profile = zippy.read_table("ctp_ticks", master=FakeMaster()).tail(10).profile()
+
+    assert profile["result"].column("instrument_id").to_pylist() == ["IF2606"]
+    assert profile["metrics"]["gateway"]["scanned_rows"] == 300000
+    assert profile["metrics"]["gateway"]["returned_rows"] == 10
+    assert profile["metrics"]["gateway"]["elapsed_ms"] == 12.5
+    assert profile["metrics"]["scanned_rows"] == 300000
+
+
 def test_table_scan_apis_are_private_to_avoid_query_semantics_confusion(monkeypatch) -> None:
     class FakeNativeQuery:
         def __init__(self, source: str, master: object) -> None:
@@ -9510,7 +10228,7 @@ def test_subscribe_resumes_after_writer_process_restart(tmp_path: Path) -> None:
         restarted_writer.append_tick(1777017601000000000, "IF2606", 4103.5)
 
         assert resumed_ready.wait(timeout=2.0)
-        assert subscriber_client.get_stream("restart_ticks")["status"] == "registered"
+        assert subscriber_client.get_stream("restart_ticks")["status"] == "writer_attached"
         metrics = subscriber.metrics()
         assert metrics["rows_delivered_total"] == 2
         assert metrics["descriptor_updates_total"] >= 1
@@ -11007,11 +11725,11 @@ def test_stream_table_engine_persists_rollover_parquet_without_master(
     finally:
         engine.stop()
 
-    parquet_files = list(tmp_path.glob("*.parquet"))
-    assert len(parquet_files) == 1
-    archived = pq.read_table(parquet_files[0])
-    assert archived.num_rows == 2
-    assert archived.column("instrument_id").to_pylist() == ["IF2606", "IF2607"]
+    parquet_files = sorted(tmp_path.glob("*.parquet"))
+    assert len(parquet_files) == 2
+    archived = pa.concat_tables([pq.read_table(path) for path in parquet_files])
+    assert archived.num_rows == 3
+    assert archived.column("instrument_id").to_pylist() == ["IF2606", "IF2607", "IF2608"]
 
 
 def test_master_client_heartbeat_keeps_registered_process_alive(tmp_path: Path) -> None:
