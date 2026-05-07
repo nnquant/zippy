@@ -6672,6 +6672,35 @@ def test_connect_starts_background_heartbeat_for_registered_process(monkeypatch)
             reset_default_master()
 
 
+def test_heartbeat_shutdown_request_runs_hooks_and_unregisters_process() -> None:
+    hook_seen = threading.Event()
+    unregister_seen = threading.Event()
+
+    class FakeMasterClient:
+        def heartbeat(self) -> None:
+            raise RuntimeError(
+                "master shutdown requested process_id=[proc_1] reason=[master shutdown requested]"
+            )
+
+        def unregister_process(self) -> None:
+            unregister_seen.set()
+
+    with zippy._SHUTDOWN_HOOKS_LOCK:
+        zippy._SHUTDOWN_HOOKS.clear()
+    unregister_hook = zippy._register_shutdown_hook(hook_seen.set)
+    heartbeat = zippy._HeartbeatHandle(FakeMasterClient(), 0.01)
+
+    try:
+        assert unregister_seen.wait(timeout=1.0)
+        assert hook_seen.is_set()
+        assert heartbeat.last_error is None
+    finally:
+        heartbeat.stop()
+        unregister_hook()
+        with zippy._SHUTDOWN_HOOKS_LOCK:
+            zippy._SHUTDOWN_HOOKS.clear()
+
+
 def test_connect_without_app_validates_master_connection(monkeypatch) -> None:
     created: list[str] = []
     list_calls: list[str] = []

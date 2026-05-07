@@ -18,6 +18,8 @@ pub enum ZippyError {
     ChannelReceive,
     #[error("queue closed")]
     QueueClosed,
+    #[error("master shutdown requested process_id=[{process_id}] reason=[{reason}]")]
+    MasterShutdownRequested { process_id: String, reason: String },
     #[error("io error reason=[{reason}]")]
     Io { reason: String },
 }

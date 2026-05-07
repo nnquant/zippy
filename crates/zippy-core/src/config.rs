@@ -9,6 +9,7 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_TABLE_ROW_CAPACITY: usize = 65_536;
 pub const DEFAULT_TABLE_PERSIST_METHOD: &str = "parquet";
 pub const DEFAULT_TABLE_PERSIST_DATA_DIR: &str = "data";
+pub const DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%m%d%H"];
 
 /// Process-wide Zippy runtime configuration.
@@ -23,10 +24,21 @@ pub struct ZippyConfig {
 }
 
 /// Master control endpoint defaults.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyMasterConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub shutdown_timeout_ms: u64,
+}
+
+impl Default for ZippyMasterConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: None,
+            shutdown_timeout_ms: DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS,
+        }
+    }
 }
 
 /// Logging defaults shared by master and Python clients.
@@ -96,6 +108,7 @@ struct PartialZippyConfig {
 struct PartialMasterConfig {
     host: Option<String>,
     port: Option<u16>,
+    shutdown_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +214,9 @@ impl ZippyConfig {
             if let Some(port) = master.port {
                 self.master.port = Some(port);
             }
+            if let Some(shutdown_timeout_ms) = master.shutdown_timeout_ms {
+                self.master.shutdown_timeout_ms = shutdown_timeout_ms;
+            }
         }
         if let Some(log) = partial.log {
             if let Some(level) = log.level {
@@ -279,6 +295,17 @@ impl ZippyConfig {
                             ),
                         })?,
                 );
+        }
+        if let Some(value) = env_string("ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS") {
+            self.master.shutdown_timeout_ms =
+                value
+                    .parse::<u64>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                            "env var must parse as u64 name=[ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS] error=[{}]",
+                            error
+                        ),
+                    })?;
         }
         if let Some(level) = env_string("ZIPPY_LOG_LEVEL") {
             self.log.level = non_empty(level, "ZIPPY_LOG_LEVEL")?;
@@ -391,6 +418,11 @@ impl ZippyConfig {
         }
         validate_persist_partition(&self.table.persist.partition)?;
         validate_host_port("master", self.master.host.as_ref(), self.master.port)?;
+        if self.master.shutdown_timeout_ms == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "master shutdown_timeout_ms must be greater than zero".to_string(),
+            });
+        }
         validate_gateway_host_port(&self.gateway)?;
         validate_gateway(&self.gateway)?;
         Ok(())

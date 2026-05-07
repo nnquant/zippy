@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -30,6 +30,12 @@ use crate::snapshot::{
 const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(2);
 const MASTER_ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const MASTER_SHUTDOWN_REASON: &str = "master shutdown requested";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GracefulShutdownOutcome {
+    pub timed_out_processes: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct MasterServer {
@@ -38,6 +44,7 @@ pub struct MasterServer {
     #[allow(dead_code)]
     bus: Arc<Mutex<Bus>>,
     running: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     snapshot_lock: Arc<Mutex<()>>,
     snapshot_path: Option<PathBuf>,
     lease_timeout: Duration,
@@ -85,6 +92,7 @@ impl MasterServer {
             descriptor_changed: Arc::new(Condvar::new()),
             bus: Arc::new(Mutex::new(Bus::default())),
             running: Arc::new(AtomicBool::new(true)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
             snapshot_lock: Arc::new(Mutex::new(())),
             snapshot_path,
             lease_timeout,
@@ -454,6 +462,35 @@ impl MasterServer {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    pub fn request_graceful_shutdown(&self, timeout: Duration) -> GracefulShutdownOutcome {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.descriptor_changed.notify_all();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let alive = self.registry.lock().unwrap().alive_process_ids();
+            if alive.is_empty() {
+                self.running.store(false, Ordering::SeqCst);
+                return GracefulShutdownOutcome {
+                    timed_out_processes: Vec::new(),
+                };
+            }
+            if Instant::now() >= deadline {
+                tracing::error!(
+                    component = "master",
+                    event = "master_shutdown_timeout",
+                    status = "timeout",
+                    timed_out_processes = ?alive,
+                    "timed out waiting for child processes to unregister"
+                );
+                self.running.store(false, Ordering::SeqCst);
+                return GracefulShutdownOutcome {
+                    timed_out_processes: alive,
+                };
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn serve_tcp_with_ready(
         &self,
         addr: &SocketAddr,
@@ -604,44 +641,110 @@ impl MasterServer {
 
         let response = match request {
             ControlRequest::RegisterProcess(request) => {
-                let process_id = self.registry.lock().unwrap().register_process(&request.app);
-                tracing::info!(
-                    component = "master_server",
-                    event = "register_process",
-                    status = "success",
-                    process_id = process_id.as_str(),
-                    app = request.app.as_str(),
-                    "registered process"
-                );
-                ControlResponse::ProcessRegistered { process_id }
+                if self.shutdown_requested.load(Ordering::SeqCst) {
+                    ControlResponse::Error {
+                        reason: MASTER_SHUTDOWN_REASON.to_string(),
+                    }
+                } else {
+                    let process_id = self.registry.lock().unwrap().register_process(&request.app);
+                    tracing::info!(
+                        component = "master_server",
+                        event = "register_process",
+                        status = "success",
+                        process_id = process_id.as_str(),
+                        app = request.app.as_str(),
+                        "registered process"
+                    );
+                    ControlResponse::ProcessRegistered { process_id }
+                }
             }
             ControlRequest::Heartbeat(request) => {
-                match self
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .record_heartbeat(&request.process_id)
-                {
+                if self.shutdown_requested.load(Ordering::SeqCst) {
+                    tracing::info!(
+                        component = "master_server",
+                        event = "shutdown_notify",
+                        status = "requested",
+                        process_id = request.process_id.as_str(),
+                        "notified process of master shutdown"
+                    );
+                    ControlResponse::ShutdownRequested {
+                        process_id: request.process_id,
+                        reason: MASTER_SHUTDOWN_REASON.to_string(),
+                    }
+                } else {
+                    match self
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .record_heartbeat(&request.process_id)
+                    {
+                        Ok(()) => {
+                            tracing::debug!(
+                                component = "master_server",
+                                event = "heartbeat",
+                                status = "success",
+                                process_id = request.process_id.as_str(),
+                                "accepted process heartbeat"
+                            );
+                            ControlResponse::HeartbeatAccepted {
+                                process_id: request.process_id,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                component = "master_server",
+                                event = "heartbeat",
+                                status = "error",
+                                process_id = request.process_id.as_str(),
+                                error = %error,
+                                "failed to accept process heartbeat"
+                            );
+                            ControlResponse::Error {
+                                reason: error.to_string(),
+                            }
+                        }
+                    }
+                }
+            }
+            ControlRequest::UnregisterProcess(request) => {
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+                let mut registry = self.registry.lock().unwrap();
+                match registry.unregister_process(&request.process_id) {
                     Ok(()) => {
-                        tracing::debug!(
-                            component = "master_server",
-                            event = "heartbeat",
-                            status = "success",
-                            process_id = request.process_id.as_str(),
-                            "accepted process heartbeat"
-                        );
-                        ControlResponse::HeartbeatAccepted {
-                            process_id: request.process_id,
+                        let snapshot = Self::snapshot_from_registry(&registry);
+                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            tracing::error!(
+                                component = "master_server",
+                                event = "unregister_process",
+                                status = "error",
+                                process_id = request.process_id.as_str(),
+                                error = %error,
+                                "failed to persist process unregister snapshot"
+                            );
+                            ControlResponse::Error {
+                                reason: error.to_string(),
+                            }
+                        } else {
+                            tracing::info!(
+                                component = "master_server",
+                                event = "unregister_process",
+                                status = "success",
+                                process_id = request.process_id.as_str(),
+                                "unregistered process"
+                            );
+                            ControlResponse::ProcessUnregistered {
+                                process_id: request.process_id,
+                            }
                         }
                     }
                     Err(error) => {
                         tracing::error!(
                             component = "master_server",
-                            event = "heartbeat",
+                            event = "unregister_process",
                             status = "error",
                             process_id = request.process_id.as_str(),
                             error = %error,
-                            "failed to accept process heartbeat"
+                            "failed to unregister process"
                         );
                         ControlResponse::Error {
                             reason: error.to_string(),

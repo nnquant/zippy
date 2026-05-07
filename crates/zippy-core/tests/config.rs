@@ -22,6 +22,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_GATEWAY_PROTOCOL_VERSION",
     "ZIPPY_MASTER_HOST",
     "ZIPPY_MASTER_PORT",
+    "ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS",
 ];
 
 #[test]
@@ -56,6 +57,7 @@ protocol_version = 1
 [master]
 host = "127.0.0.1"
 port = 17690
+shutdown_timeout_ms = 3000
 "#,
     )
     .unwrap();
@@ -76,12 +78,14 @@ port = 17690
             ("ZIPPY_GATEWAY_PROTOCOL_VERSION", "2"),
             ("ZIPPY_MASTER_HOST", "0.0.0.0"),
             ("ZIPPY_MASTER_PORT", "27690"),
+            ("ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS", "7000"),
         ],
         || {
             let config = ZippyConfig::load_from_path(Some(&config_path)).unwrap();
 
             assert_eq!(config.master.host.as_deref(), Some("0.0.0.0"));
             assert_eq!(config.master.port, Some(27690));
+            assert_eq!(config.master.shutdown_timeout_ms, 7000);
             assert_eq!(config.log.level, "warn");
             assert_eq!(config.table.row_capacity, 2048);
             assert_eq!(config.table.retention_segments, Some(5));

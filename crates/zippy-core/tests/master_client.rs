@@ -187,6 +187,12 @@ fn spawn_fake_server(
                         process_id: "proc_1".to_string(),
                     }
                 }
+                ControlRequest::UnregisterProcess(request) => {
+                    assert_eq!(request.process_id, "proc_1");
+                    ControlResponse::ProcessUnregistered {
+                        process_id: request.process_id,
+                    }
+                }
                 ControlRequest::RegisterStream(RegisterStreamRequest {
                     stream_name,
                     schema,
@@ -904,6 +910,23 @@ fn master_client_sends_heartbeat_for_registered_process() {
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("local_dc").unwrap();
     client.heartbeat().unwrap();
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
+}
+
+#[test]
+fn master_client_unregisters_registered_process() {
+    let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("unregister-process");
+    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client.unregister_process().unwrap();
+
+    assert_eq!(client.process_id(), None);
 
     server.join().unwrap();
     let _ = fs::remove_dir_all(shm_dir);

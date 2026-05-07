@@ -1690,6 +1690,11 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    fn unregister_process(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.client.lock().unwrap().unregister_process())
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     #[pyo3(signature = (stream_name, schema, buffer_size, frame_size))]
     fn register_stream(
         &self,

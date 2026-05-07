@@ -506,6 +506,44 @@ impl Registry {
         Ok(())
     }
 
+    pub fn unregister_process(&mut self, process_id: &str) -> Result<(), RegistryError> {
+        self.processes
+            .remove(process_id)
+            .ok_or_else(|| RegistryError::ProcessNotFound {
+                process_id: process_id.to_string(),
+            })?;
+        self.remove_segment_reader_leases_for_process(process_id);
+        for stream in self.streams.values_mut() {
+            if stream.writer_process_id.as_deref() == Some(process_id) {
+                stream.writer_process_id = None;
+                stream.status = if stream.reader_count > 0 {
+                    "active".to_string()
+                } else {
+                    "registered".to_string()
+                };
+            }
+            let removed_readers = stream
+                .reader_process_ids
+                .iter()
+                .filter(|(_, owner)| owner.as_str() == process_id)
+                .map(|(reader_id, _)| reader_id.clone())
+                .collect::<Vec<_>>();
+            for reader_id in removed_readers {
+                stream.reader_process_ids.remove(&reader_id);
+                stream.reader_count = stream.reader_count.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn alive_process_ids(&self) -> Vec<String> {
+        self.processes
+            .values()
+            .filter(|process| process.lease_status == "alive")
+            .map(|process| process.process_id.clone())
+            .collect()
+    }
+
     pub fn validate_process_alive(&self, process_id: &str) -> Result<(), RegistryError> {
         let process =
             self.processes

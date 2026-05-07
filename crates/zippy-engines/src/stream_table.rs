@@ -452,6 +452,13 @@ impl StreamTablePersistWorker {
         std::mem::take(&mut *lock.lock().unwrap())
     }
 
+    fn stop(&mut self) {
+        self.sender.take();
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+
     fn commit_snapshot(&self) -> Vec<serde_json::Value> {
         self.commit_state
             .lock()
@@ -517,10 +524,7 @@ fn update_persist_commit_state<F>(
 
 impl Drop for StreamTablePersistWorker {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
-        }
+        self.stop();
     }
 }
 
@@ -1111,6 +1115,32 @@ impl StreamTableMaterializer {
             });
         }
         Ok(())
+    }
+
+    fn seal_active_for_persist_on_stop(&mut self) -> Result<bool> {
+        if self.persist_config.is_none() || self.active_committed_row_count() == 0 {
+            return Ok(false);
+        }
+
+        let sealed_descriptor = self.active_descriptor_value()?;
+        let writer = self.partition.writer();
+        let sealed = writer
+            .rollover_without_persistence()
+            .map_err(segment_error)?;
+        self.forwarded_active_descriptor = None;
+        self.sealed_segment_descriptors
+            .push(sealed_descriptor.clone());
+        self.publish_active_descriptor()?;
+        self.enqueue_persist_task(sealed, &sealed_descriptor)?;
+        Ok(true)
+    }
+
+    fn stop_persist_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.persist_worker.as_mut() {
+            worker.stop();
+        }
+        self.drain_persist_completions();
+        self.ensure_persist_healthy()
     }
 }
 
@@ -1828,6 +1858,11 @@ impl Engine for StreamTableMaterializer {
 
     fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
         self.ensure_persist_healthy()?;
+        let sealed_active = self.seal_active_for_persist_on_stop()?;
+        self.stop_persist_worker()?;
+        if self.apply_retention()? || sealed_active {
+            self.publish_active_descriptor()?;
+        }
         Ok(vec![])
     }
 }

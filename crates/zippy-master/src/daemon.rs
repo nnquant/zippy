@@ -120,6 +120,7 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         reason: error.to_string(),
     })?;
     let snapshot_path = snapshot_dir.join("master-registry.json");
+    let shutdown_timeout = Duration::from_millis(runtime_config.master.shutdown_timeout_ms);
 
     let server = if snapshot_path.exists() {
         tracing::info!(
@@ -160,7 +161,7 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
             runtime_config,
         )
     };
-    install_shutdown_handlers(&control_endpoint, server.clone())?;
+    install_shutdown_handlers(&control_endpoint, server.clone(), shutdown_timeout)?;
 
     if std::env::var_os("ZIPPY_MASTER_TEST_PAUSE_BEFORE_SERVE").is_some() {
         std::thread::sleep(Duration::from_millis(150));
@@ -244,6 +245,7 @@ fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyCo
 fn install_shutdown_handlers(
     control_endpoint: &ControlEndpoint,
     server: MasterServer,
+    shutdown_timeout: Duration,
 ) -> zippy_core::Result<()> {
     #[cfg(unix)]
     {
@@ -267,7 +269,16 @@ fn install_shutdown_handlers(
                         "received shutdown signal"
                     );
                 }
-                server.shutdown();
+                let outcome = server.request_graceful_shutdown(shutdown_timeout);
+                if !outcome.timed_out_processes.is_empty() {
+                    tracing::error!(
+                        component = "master",
+                        event = "master_shutdown_timeout",
+                        status = "timeout",
+                        timed_out_processes = ?outcome.timed_out_processes,
+                        "master shutdown timed out waiting for child processes"
+                    );
+                }
             }
         });
     }
@@ -276,6 +287,7 @@ fn install_shutdown_handlers(
     {
         let _ = control_endpoint;
         let _ = server;
+        let _ = shutdown_timeout;
     }
 
     Ok(())

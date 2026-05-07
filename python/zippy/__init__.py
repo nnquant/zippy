@@ -147,6 +147,8 @@ _DEFAULT_HEARTBEAT_INTERVAL_SEC = _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC
 _DEFAULT_MASTER: MasterClient | None = None
 _DEFAULT_HEARTBEAT: _HeartbeatHandle | None = None
 _DEFAULT_HEARTBEAT_LOCK = threading.Lock()
+_SHUTDOWN_HOOKS: list[callable] = []
+_SHUTDOWN_HOOKS_LOCK = threading.RLock()
 _MASTER_LOCAL_DATA_PATH: dict[int, bool] = {}
 _USE_MASTER_CONFIG = object()
 _BUILTIN_CONFIG: dict[str, object] = {
@@ -707,6 +709,54 @@ class _HeartbeatHandle:
                 self.last_error = None
             except Exception as error:
                 self.last_error = error
+                if _is_master_shutdown_requested(error):
+                    try:
+                        _run_shutdown_hooks()
+                    except Exception as hook_error:
+                        self.last_error = hook_error
+                        return
+                    try:
+                        unregister_process = getattr(self.master, "unregister_process", None)
+                        if callable(unregister_process):
+                            unregister_process()
+                        self.last_error = None
+                    except Exception as unregister_error:
+                        self.last_error = unregister_error
+                        return
+                    self._stop_event.set()
+                    return
+
+
+def _is_master_shutdown_requested(error: BaseException) -> bool:
+    return "master shutdown requested" in str(error)
+
+
+def _register_shutdown_hook(callback) -> callable:
+    with _SHUTDOWN_HOOKS_LOCK:
+        _SHUTDOWN_HOOKS.append(callback)
+
+    def unregister() -> None:
+        with _SHUTDOWN_HOOKS_LOCK:
+            try:
+                _SHUTDOWN_HOOKS.remove(callback)
+            except ValueError:
+                pass
+
+    return unregister
+
+
+def _run_shutdown_hooks() -> None:
+    with _SHUTDOWN_HOOKS_LOCK:
+        hooks = list(_SHUTDOWN_HOOKS)
+    first_error: BaseException | None = None
+    for hook in reversed(hooks):
+        try:
+            hook()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def connect(
@@ -5106,6 +5156,7 @@ class Session:
         self._materializer_source_names: list[str] = []
         self._started = False
         self._needs_master_process = False
+        self._shutdown_hook_unregister = None
 
     def engine(self, engine=None, /, **kwargs) -> "Session":
         """
@@ -5203,6 +5254,8 @@ class Session:
                 continue
             engine.start()
         self._started = True
+        if self._shutdown_hook_unregister is None:
+            self._shutdown_hook_unregister = _register_shutdown_hook(self.stop)
         _ACTIVE_SESSIONS[self.name] = self
         return self
 
@@ -5232,6 +5285,9 @@ class Session:
             if first_error is None:
                 first_error = error
         self._started = False
+        if self._shutdown_hook_unregister is not None:
+            self._shutdown_hook_unregister()
+            self._shutdown_hook_unregister = None
         if _ACTIVE_SESSIONS.get(self.name) is self:
             _ACTIVE_SESSIONS.pop(self.name, None)
         if first_error is not None:
@@ -5512,6 +5568,7 @@ class Pipeline:
         self._engine: _StreamTableMaterializer | None = None
         self._registered_source_name: str | None = None
         self._started = False
+        self._shutdown_hook_unregister = None
 
     def source(
         self,
@@ -5655,6 +5712,8 @@ class Pipeline:
         if not self._started:
             engine.start()
             self._started = True
+            if self._shutdown_hook_unregister is None:
+                self._shutdown_hook_unregister = _register_shutdown_hook(self.stop)
         return self
 
     def run_forever(self, *, poll_interval_sec: float = 1.0) -> "Pipeline":
@@ -5703,6 +5762,9 @@ class Pipeline:
             except BaseException as error:
                 first_error = error
         self._started = False
+        if self._shutdown_hook_unregister is not None:
+            self._shutdown_hook_unregister()
+            self._shutdown_hook_unregister = None
         try:
             self._unregister_registered_source()
         except BaseException as error:

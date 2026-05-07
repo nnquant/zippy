@@ -22,8 +22,8 @@ use crate::bus_protocol::{
     PublishPersistEventRequest, PublishPersistedFileRequest, PublishSegmentDescriptorRequest,
     ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
     RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest,
-    ReplacePersistedFilesRequest, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest,
-    WaitSegmentDescriptorRequest, WriterDescriptor,
+    ReplacePersistedFilesRequest, StreamInfo, UnregisterProcessRequest, UnregisterSourceRequest,
+    UpdateRecordStatusRequest, WaitSegmentDescriptorRequest, WriterDescriptor,
 };
 use crate::{
     canonical_schema_hash, resolve_control_endpoint, schema_metadata, send_control_line_request,
@@ -114,7 +114,27 @@ impl MasterClient {
 
         match response {
             ControlResponse::HeartbeatAccepted { .. } => Ok(()),
+            ControlResponse::ShutdownRequested { process_id, reason } => {
+                Err(ZippyError::MasterShutdownRequested { process_id, reason })
+            }
             other => Err(unexpected_response("HeartbeatAccepted", other)),
+        }
+    }
+
+    pub fn unregister_process(&mut self) -> Result<()> {
+        let process_id = self.require_process_id()?;
+        let response = self.send_request(ControlRequest::UnregisterProcess(
+            UnregisterProcessRequest {
+                process_id: process_id.clone(),
+            },
+        ))?;
+
+        match response {
+            ControlResponse::ProcessUnregistered { .. } => {
+                self.process_id = None;
+                Ok(())
+            }
+            other => Err(unexpected_response("ProcessUnregistered", other)),
         }
     }
 

@@ -3,7 +3,7 @@
 use zippy_core::bus_protocol::{
     AttachStreamRequest, ControlRequest, ControlResponse, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    UpdateRecordStatusRequest, BUS_LAYOUT_VERSION,
+    UnregisterProcessRequest, UpdateRecordStatusRequest, BUS_LAYOUT_VERSION,
 };
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
@@ -1100,6 +1100,93 @@ fn master_server_registers_process_over_unix_socket() {
     assert!(response.contains("proc_1"));
 
     server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_graceful_shutdown_notifies_process_and_waits_for_unregister() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "local_dc".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+
+    let shutdown_server = server.clone();
+    let shutdown_handle =
+        thread::spawn(move || shutdown_server.request_graceful_shutdown(Duration::from_secs(1)));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let shutdown_response = loop {
+        let response = send_control_request(
+            &socket_path,
+            ControlRequest::Heartbeat(zippy_core::HeartbeatRequest {
+                process_id: process_id.clone(),
+            }),
+        );
+        if matches!(response, ControlResponse::ShutdownRequested { .. }) {
+            break response;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("heartbeat did not receive shutdown request response={response:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    match shutdown_response {
+        ControlResponse::ShutdownRequested {
+            process_id: notified_process_id,
+            reason,
+        } => {
+            assert_eq!(notified_process_id, process_id);
+            assert_eq!(reason, "master shutdown requested");
+        }
+        other => panic!("unexpected shutdown response {other:?}"),
+    }
+
+    let unregister_response = send_control_request(
+        &socket_path,
+        ControlRequest::UnregisterProcess(UnregisterProcessRequest {
+            process_id: process_id.clone(),
+        }),
+    );
+    match unregister_response {
+        ControlResponse::ProcessUnregistered {
+            process_id: unregistered_process_id,
+        } => assert_eq!(unregistered_process_id, process_id),
+        other => panic!("unexpected unregister response {other:?}"),
+    }
+
+    let outcome = shutdown_handle.join().unwrap();
+    assert!(outcome.timed_out_processes.is_empty());
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_graceful_shutdown_times_out_with_alive_processes() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "local_dc".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+
+    let outcome = server.request_graceful_shutdown(Duration::from_millis(20));
+
+    assert_eq!(outcome.timed_out_processes, vec![process_id]);
     join_handle.join().unwrap();
     let _ = fs::remove_file(socket_path);
 }

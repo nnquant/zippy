@@ -14,6 +14,11 @@ pub struct HeartbeatRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterProcessRequest {
+    pub process_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterStreamRequest {
     pub stream_name: String,
     #[serde(default = "default_stream_schema")]
@@ -244,6 +249,7 @@ pub struct ReaderDescriptor {
 pub enum ControlRequest {
     RegisterProcess(RegisterProcessRequest),
     Heartbeat(HeartbeatRequest),
+    UnregisterProcess(UnregisterProcessRequest),
     RegisterStream(RegisterStreamRequest),
     RegisterSource(RegisterSourceRequest),
     UnregisterSource(UnregisterSourceRequest),
@@ -274,6 +280,13 @@ pub enum ControlResponse {
         process_id: String,
     },
     HeartbeatAccepted {
+        process_id: String,
+    },
+    ShutdownRequested {
+        process_id: String,
+        reason: String,
+    },
+    ProcessUnregistered {
         process_id: String,
     },
     StreamRegistered {
@@ -357,6 +370,14 @@ impl fmt::Display for ControlResponse {
             }
             Self::HeartbeatAccepted { process_id } => {
                 write!(f, "heartbeat accepted process_id=[{}]", process_id)
+            }
+            Self::ShutdownRequested { process_id, reason } => write!(
+                f,
+                "shutdown requested process_id=[{}] reason=[{}]",
+                process_id, reason
+            ),
+            Self::ProcessUnregistered { process_id } => {
+                write!(f, "process unregistered process_id=[{}]", process_id)
             }
             Self::StreamRegistered { stream_name } => {
                 write!(f, "stream registered stream_name=[{}]", stream_name)

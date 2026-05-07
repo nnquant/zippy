@@ -1046,6 +1046,46 @@ fn stream_table_materializer_persists_sealed_segment_and_publishes_metadata() {
 }
 
 #[test]
+fn stream_table_stop_persists_active_segment_and_publishes_metadata() {
+    let persist_root = temp_persist_root("stop-active");
+    let persist_publisher = Arc::new(RecordingPersistPublisher::default());
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 32)
+            .unwrap()
+            .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+            .with_persist_publisher(persist_publisher.clone());
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
+            2,
+        )))
+        .unwrap();
+    materializer.on_stop().unwrap();
+
+    let files = persist_publisher.files.lock().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["stream_name"], "ticks");
+    assert_eq!(files[0]["row_count"], 2);
+    assert_eq!(files[0]["source_segment_id"], 1);
+    assert_eq!(files[0]["source_generation"], 0);
+
+    let file_path = PathBuf::from(files[0]["file_path"].as_str().unwrap());
+    assert!(file_path.starts_with(&persist_root));
+    assert!(file_path.exists());
+
+    let file = File::open(file_path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let rows = builder
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 2);
+
+    let _ = fs::remove_dir_all(persist_root);
+}
+
+#[test]
 fn stream_table_materializer_partitions_persisted_parquet_by_dt_part_and_id() {
     let persist_root = temp_persist_root("partitioned");
     let persist_publisher = Arc::new(RecordingPersistPublisher::default());
