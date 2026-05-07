@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -17,6 +19,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
 use serde_json::{json, Value};
 use zippy_core::{
     ControlEndpoint, Engine, MasterClient, Result, SegmentTableView, StreamInfo, ZippyError,
@@ -67,6 +70,8 @@ struct GatewayScanPushdown {
 struct GatewayScannedBatch {
     batch: RecordBatch,
     scanned_rows: usize,
+    scanned_live_rows: usize,
+    scanned_files: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +90,16 @@ impl GatewayRowRangePushdown {
             Self::Tail(_) => "tail",
             Self::Head(_) => "head",
             Self::Slice { .. } => "slice",
+        }
+    }
+
+    fn to_plan_op(self) -> Value {
+        match self {
+            Self::Tail(n) => json!({"op": "tail", "n": n}),
+            Self::Head(n) => json!({"op": "head", "n": n}),
+            Self::Slice { offset, length } => {
+                json!({"op": "slice", "offset": offset, "length": length})
+            }
         }
     }
 }
@@ -318,13 +333,15 @@ impl GatewayState {
         let scanned = match batch {
             Some(batch) => GatewayScannedBatch {
                 scanned_rows: batch.num_rows(),
+                scanned_live_rows: batch.num_rows(),
+                scanned_files: Vec::new(),
                 batch,
             },
             None => match row_range_pushdown {
                 Some((pushdown, _)) => {
                     row_range_pushed = true;
                     scan_pushdown_applied = true;
-                    self.collect_segment_source_row_range(
+                    self.collect_stream_source_row_range(
                         source,
                         pushdown,
                         &requested_scan_pushdown,
@@ -332,7 +349,7 @@ impl GatewayState {
                 }
                 None => {
                     scan_pushdown_applied = true;
-                    self.collect_segment_source(source, &requested_scan_pushdown)?
+                    self.collect_stream_source(source, &requested_scan_pushdown)?
                 }
             },
         };
@@ -375,9 +392,9 @@ impl GatewayState {
             json!({
                 "status": "ok",
                 "metrics": {
-                    "scanned_files": [],
+                    "scanned_files": scanned.scanned_files,
                     "scanned_rows": scanned.scanned_rows,
-                    "scanned_live_rows": scanned.scanned_rows,
+                    "scanned_live_rows": scanned.scanned_live_rows,
                     "returned_rows": returned_rows,
                     "plan_ops": plan.len(),
                     "tail_pushdown": tail_pushdown,
@@ -536,12 +553,10 @@ impl GatewayState {
             };
             let batch = match batch {
                 Some(batch) => Some(batch),
-                None => {
-                    match self.collect_segment_source(source, &GatewayScanPushdown::default()) {
-                        Ok(scanned) => Some(scanned.batch),
-                        Err(_) => None,
-                    }
-                }
+                None => match self.collect_stream_source(source, &GatewayScanPushdown::default()) {
+                    Ok(scanned) => Some(scanned.batch),
+                    Err(_) => None,
+                },
             };
             let Some(batch) = batch else {
                 thread::sleep(Duration::from_millis(10));
@@ -612,7 +627,7 @@ impl GatewayState {
         Err(last_error.expect("gateway master process retry must store the last error"))
     }
 
-    fn collect_segment_source(
+    fn collect_stream_source(
         &self,
         source: &str,
         scan_pushdown: &GatewayScanPushdown,
@@ -626,22 +641,62 @@ impl GatewayState {
                 ),
             });
         }
-        if stream.status == "stale" {
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_live_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let mut batches = persisted_file_record_batches(
+            &stream,
+            scan_pushdown,
+            &mut scanned_rows,
+            &mut scanned_files,
+        )?;
+        if let Some(mut live_batches) = self.try_collect_live_segment_batches(
+            source,
+            &stream,
+            scan_pushdown,
+            &mut scanned_live_rows,
+        )? {
+            scanned_rows = scanned_rows.saturating_add(scanned_live_rows);
+            batches.append(&mut live_batches);
+        } else if batches.is_empty() && stream.status == "stale" {
             return Err(ZippyError::Io {
                 reason: format!(
                     "stream is stale source=[{}] status=[{}]",
                     source, stream.status
                 ),
             });
-        }
-        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+        } else if batches.is_empty() && stream.active_segment_descriptor.is_none() {
             return Err(ZippyError::Io {
                 reason: format!("segment descriptor is not published source=[{}]", source),
             });
+        }
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(
+                schema_for_scan_pushdown(&schema, scan_pushdown)?,
+                batches,
+            )?,
+            scanned_rows,
+            scanned_live_rows,
+            scanned_files,
+        })
+    }
+
+    fn try_collect_live_segment_batches(
+        &self,
+        source: &str,
+        stream: &StreamInfo,
+        scan_pushdown: &GatewayScanPushdown,
+        scanned_live_rows: &mut usize,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        if stream.status == "stale" {
+            return Ok(None);
+        }
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Ok(None);
         };
-        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
         let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
-        let _leases = self.acquire_segment_reader_leases(source, &descriptor, &stream)?;
+        let _leases = self.acquire_segment_reader_leases(source, &descriptor, stream)?;
         let active_committed_row_high_watermark =
             active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
         let mut scanned_rows = 0usize;
@@ -653,19 +708,23 @@ impl GatewayState {
             scan_pushdown,
             &mut scanned_rows,
         )?;
-        Ok(GatewayScannedBatch {
-            batch: concat_record_batches(schema, batches)?,
-            scanned_rows,
-        })
+        *scanned_live_rows = scanned_rows;
+        Ok(Some(batches))
     }
 
-    fn collect_segment_source_row_range(
+    fn collect_stream_source_row_range(
         &self,
         source: &str,
         pushdown: GatewayRowRangePushdown,
         scan_pushdown: &GatewayScanPushdown,
     ) -> Result<GatewayScannedBatch> {
         let stream = self.with_master(|master| master.get_stream(source))?;
+        if stream_has_persisted_files(&stream) {
+            let mut scanned = self.collect_stream_source(source, scan_pushdown)?;
+            let row_range_op = pushdown.to_plan_op();
+            scanned.batch = apply_collect_plan(scanned.batch, &[row_range_op])?;
+            return Ok(scanned);
+        }
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
                 reason: format!(
@@ -738,6 +797,8 @@ impl GatewayState {
         Ok(GatewayScannedBatch {
             batch: concat_record_batches(schema, batches)?,
             scanned_rows,
+            scanned_live_rows: scanned_rows,
+            scanned_files: Vec::new(),
         })
     }
 
@@ -946,6 +1007,253 @@ fn concat_record_batches(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result
     concat_batches(&schema, batches.iter()).map_err(|error| ZippyError::Io {
         reason: error.to_string(),
     })
+}
+
+fn persisted_file_record_batches(
+    stream: &StreamInfo,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+    scanned_files: &mut Vec<String>,
+) -> Result<Vec<RecordBatch>> {
+    let mut batches = Vec::new();
+    for persisted_file in non_overlapping_persisted_files(stream) {
+        let file_path = persisted_file_path(persisted_file)?;
+        let batch = read_parquet_record_batch(
+            Path::new(&file_path),
+            scan_pushdown.projection_columns.as_deref(),
+        )?;
+        scanned_files.push(file_path);
+        let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
+
+fn read_parquet_record_batch(
+    path: &Path,
+    projection_columns: Option<&[String]>,
+) -> Result<RecordBatch> {
+    let file = File::open(path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to open persisted parquet file path=[{}] error=[{}]",
+            path.display(),
+            error
+        ),
+    })?;
+    let mut builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to create persisted parquet reader path=[{}] error=[{}]",
+                path.display(),
+                error
+            ),
+        })?;
+    if let Some(projection_columns) = projection_columns {
+        let indices = projection_columns
+            .iter()
+            .map(|column_name| {
+                builder
+                    .schema()
+                    .index_of(column_name)
+                    .map_err(|error| ZippyError::SchemaMismatch {
+                        reason: format!(
+                            "persisted parquet projection column not found path=[{}] column=[{}] error=[{}]",
+                            path.display(),
+                            column_name,
+                            error
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projection = ProjectionMask::roots(builder.parquet_schema(), indices);
+        builder = builder.with_projection(projection);
+    }
+    let schema = builder.schema().clone();
+    let reader = builder.build().map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to build persisted parquet reader path=[{}] error=[{}]",
+            path.display(),
+            error
+        ),
+    })?;
+    let batches = reader
+        .map(|batch| {
+            batch.map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to read persisted parquet batch path=[{}] error=[{}]",
+                    path.display(),
+                    error
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    concat_record_batches(schema, batches)
+}
+
+fn apply_scan_pushdown_to_record_batch(
+    batch: RecordBatch,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+) -> Result<RecordBatch> {
+    let mut batch = project_record_batch(&batch, scan_pushdown.projection_columns.as_deref())?;
+    *scanned_rows = scanned_rows.saturating_add(batch.num_rows());
+    for filter in &scan_pushdown.filters {
+        batch = apply_filter(batch, filter)?;
+    }
+    Ok(batch)
+}
+
+fn project_record_batch(
+    batch: &RecordBatch,
+    projection_columns: Option<&[String]>,
+) -> Result<RecordBatch> {
+    let Some(projection_columns) = projection_columns else {
+        return Ok(batch.clone());
+    };
+    let mut fields = Vec::with_capacity(projection_columns.len());
+    let mut arrays = Vec::with_capacity(projection_columns.len());
+    for column_name in projection_columns {
+        let index =
+            batch
+                .schema()
+                .index_of(column_name)
+                .map_err(|error| ZippyError::SchemaMismatch {
+                    reason: format!(
+                        "scan projection column not found column=[{}] error=[{}]",
+                        column_name, error
+                    ),
+                })?;
+        fields.push(batch.schema().field(index).clone());
+        arrays.push(batch.column(index).clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to build gateway scan projection batch error=[{}]",
+            error
+        ),
+    })
+}
+
+fn schema_for_scan_pushdown(
+    schema: &SchemaRef,
+    scan_pushdown: &GatewayScanPushdown,
+) -> Result<SchemaRef> {
+    let Some(projection_columns) = scan_pushdown.projection_columns.as_deref() else {
+        return Ok(Arc::clone(schema));
+    };
+    let mut fields = Vec::with_capacity(projection_columns.len());
+    for column_name in projection_columns {
+        let index = schema
+            .index_of(column_name)
+            .map_err(|error| ZippyError::SchemaMismatch {
+                reason: format!(
+                    "scan projection column not found column=[{}] error=[{}]",
+                    column_name, error
+                ),
+            })?;
+        fields.push(schema.field(index).clone());
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+fn stream_has_persisted_files(stream: &StreamInfo) -> bool {
+    stream
+        .persisted_files
+        .iter()
+        .any(|item| persisted_file_path(item).is_ok())
+}
+
+fn non_overlapping_persisted_files(stream: &StreamInfo) -> Vec<&Value> {
+    let live_identities = live_segment_identities(stream);
+    let mut files = stream
+        .persisted_files
+        .iter()
+        .filter(|item| persisted_file_path(item).is_ok())
+        .filter(|item| persisted_segment_identities(item).is_disjoint(&live_identities))
+        .collect::<Vec<_>>();
+    files.sort_by_key(|item| persisted_file_order_key(item));
+    files
+}
+
+fn persisted_file_path(value: &Value) -> Result<String> {
+    value
+        .get("file_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "persisted file metadata missing file_path".to_string(),
+        })
+}
+
+fn live_segment_identities(stream: &StreamInfo) -> std::collections::BTreeSet<(u64, u64)> {
+    let mut identities = std::collections::BTreeSet::new();
+    if let Some(descriptor) = stream.active_segment_descriptor.as_ref() {
+        if let Some(identity) = segment_identity_from_value(descriptor, "segment_id", "generation")
+        {
+            identities.insert(identity);
+        }
+    }
+    for descriptor in &stream.sealed_segments {
+        if let Some(identity) = segment_identity_from_value(descriptor, "segment_id", "generation")
+        {
+            identities.insert(identity);
+        }
+    }
+    identities
+}
+
+fn persisted_segment_identities(value: &Value) -> std::collections::BTreeSet<(u64, u64)> {
+    let mut identities = std::collections::BTreeSet::new();
+    if let Some(source_segments) = value.get("source_segments").and_then(Value::as_array) {
+        for source_segment in source_segments {
+            if let Some(identity) = segment_identity_from_value(
+                source_segment,
+                "source_segment_id",
+                "source_generation",
+            ) {
+                identities.insert(identity);
+            }
+        }
+    }
+    if identities.is_empty() {
+        if let Some(identity) =
+            segment_identity_from_value(value, "source_segment_id", "source_generation")
+        {
+            identities.insert(identity);
+        }
+    }
+    identities
+}
+
+fn segment_identity_from_value(
+    value: &Value,
+    segment_id_key: &str,
+    generation_key: &str,
+) -> Option<(u64, u64)> {
+    Some((
+        value.get(segment_id_key)?.as_u64()?,
+        value.get(generation_key)?.as_u64()?,
+    ))
+}
+
+fn persisted_file_order_key(value: &Value) -> (u64, u64, u64, String) {
+    (
+        json_u64_order_value(value.get("source_segment_id")),
+        json_u64_order_value(value.get("source_generation")),
+        json_u64_order_value(value.get("created_at")),
+        value
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+fn json_u64_order_value(value: Option<&Value>) -> u64 {
+    value.and_then(Value::as_u64).unwrap_or(u64::MAX)
 }
 
 fn live_segment_record_batches(

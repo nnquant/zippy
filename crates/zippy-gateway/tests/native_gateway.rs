@@ -1,5 +1,7 @@
+use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -9,6 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use zippy_core::{
     connect_control_endpoint, ControlEndpoint, Engine, MasterClient, SegmentTableView,
@@ -165,6 +168,100 @@ fn native_gateway_collects_existing_segment_stream() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(instruments.value(0), "IF2606");
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet_path = temp.path().join("ticks.parquet");
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606", "IH2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5, 2801.0])),
+        ],
+    )
+    .unwrap();
+    write_parquet_batch(&parquet_path, &batch);
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("persisted_catalog_writer").unwrap();
+    client
+        .register_stream("persisted_ticks", batch.schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("persisted_source", "test", "persisted_ticks", json!({}))
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "persisted_ticks",
+            json!({
+                "file_path": parquet_path.to_string_lossy(),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "persisted_ticks",
+            "token": "dev-token",
+            "plan": [
+                {"op": "filter", "expr": {
+                    "kind": "binary",
+                    "op": "eq",
+                    "args": [
+                        {"kind": "col", "value": "instrument_id"},
+                        {"kind": "literal", "value": "IF2606"}
+                    ]
+                }},
+                {"op": "select", "exprs": [{"kind": "col", "value": "last_price"}]}
+            ]
+        }),
+        vec![],
+    );
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(
+        response["metrics"]["scanned_files"],
+        json!([parquet_path.to_string_lossy()])
+    );
+    assert_eq!(response["metrics"]["scanned_rows"], 2);
+    assert_eq!(response["metrics"]["scanned_live_rows"], 0);
+    assert_eq!(response["metrics"]["returned_rows"], 1);
+    let collected = decode_ipc_batch(&payload);
+    assert_eq!(collected.num_rows(), 1);
+    assert_eq!(collected.num_columns(), 1);
+    let prices = collected
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(prices.value(0), 4102.5);
 
     gateway.stop();
     master.shutdown();
@@ -684,6 +781,13 @@ fn encode_ipc_batch(batch: &RecordBatch) -> Vec<u8> {
         writer.finish().unwrap();
     }
     payload
+}
+
+fn write_parquet_batch(path: &Path, batch: &RecordBatch) {
+    let file = File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
 }
 
 fn send_gateway_frame(

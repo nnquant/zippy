@@ -2134,6 +2134,7 @@ name = "zippy-gateway"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "parquet",
  "serde",
  "serde_json",
  "tempfile",
