@@ -55,6 +55,11 @@ impl SessionWindow {
             end_seconds,
         })
     }
+
+    /// Return whether the local second belongs to this non-cross-midnight window.
+    pub fn contains(&self, seconds: u32) -> bool {
+        self.start_seconds <= seconds && seconds < self.end_seconds
+    }
 }
 
 /// Session profile used to assign ticks into bar windows.
@@ -63,6 +68,13 @@ pub struct BarSessionSpec {
     pub timezone: String,
     pub regular: Vec<SessionWindow>,
     pub auction: Vec<SessionWindow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickSessionKind {
+    Regular,
+    Auction,
+    Outside,
 }
 
 /// Bootstrap policy for cumulative volume streams.
@@ -115,6 +127,7 @@ pub struct BarGeneratorEngine {
     output_schema: SchemaRef,
     spec: BarGeneratorSpec,
     open_bars: BTreeMap<String, OpenBar>,
+    cumulative_states: BTreeMap<String, CumulativeState>,
     pending_filtered_rows: u64,
 }
 
@@ -134,6 +147,7 @@ impl BarGeneratorEngine {
             output_schema,
             spec,
             open_bars: BTreeMap::new(),
+            cumulative_states: BTreeMap::new(),
             pending_filtered_rows: 0,
         })
     }
@@ -192,19 +206,49 @@ impl BarGeneratorEngine {
             }
         })
     }
-
-    fn ensure_delta_volume_runtime(&self) -> Result<()> {
+    fn compute_volume_delta(&mut self, tick: &TickRow) -> Option<(f64, f64)> {
         match &self.spec.volume {
-            VolumeSpec::Delta => Ok(()),
-            VolumeSpec::Cumulative { .. } => Err(ZippyError::InvalidConfig {
-                reason: format!(
-                    concat!(
-                        "cumulative volume mode not supported by current bar generator runtime ",
-                        "volume_mode=[cumulative] engine=[{}]"
-                    ),
-                    self.name
-                ),
-            }),
+            VolumeSpec::Delta => Some((tick.volume, tick.total_turnover)),
+            VolumeSpec::Cumulative { bootstrap, .. } => {
+                let Some(trading_day) = tick.trading_day.as_ref() else {
+                    self.pending_filtered_rows += 1;
+                    return None;
+                };
+
+                let state = self
+                    .cumulative_states
+                    .entry(tick.instrument.clone())
+                    .or_insert_with(|| CumulativeState {
+                        trading_day: trading_day.clone(),
+                        last_volume: 0.0,
+                        last_total_turnover: 0.0,
+                        initialized: false,
+                    });
+
+                if !state.initialized || state.trading_day != *trading_day {
+                    state.trading_day = trading_day.clone();
+                    state.last_volume = tick.volume;
+                    state.last_total_turnover = tick.total_turnover;
+                    state.initialized = true;
+
+                    return match bootstrap {
+                        BootstrapPolicy::SkipFirstDelta => None,
+                        BootstrapPolicy::FromZero => Some((tick.volume, tick.total_turnover)),
+                    };
+                }
+
+                let volume_delta = tick.volume - state.last_volume;
+                let total_turnover_delta = tick.total_turnover - state.last_total_turnover;
+                state.last_volume = tick.volume;
+                state.last_total_turnover = tick.total_turnover;
+
+                if volume_delta < 0.0 || total_turnover_delta < 0.0 {
+                    self.pending_filtered_rows += 1;
+                    return None;
+                }
+
+                Some((volume_delta, total_turnover_delta))
+            }
         }
     }
 }
@@ -232,8 +276,6 @@ impl Engine for BarGeneratorEngine {
             });
         }
 
-        self.ensure_delta_volume_runtime()?;
-
         if table.num_rows() == 0 {
             return Ok(vec![]);
         }
@@ -243,6 +285,12 @@ impl Engine for BarGeneratorEngine {
         let price_array = table.column(&self.spec.columns.price)?;
         let volume_array = table.column(&self.spec.columns.volume)?;
         let total_turnover_array = table.column(&self.spec.columns.total_turnover)?;
+        let trading_day_array = match &self.spec.volume {
+            VolumeSpec::Delta => None,
+            VolumeSpec::Cumulative {
+                trading_day_column, ..
+            } => Some(table.column(trading_day_column)?),
+        };
         let num_trades_array =
             optional_table_column(&table, self.spec.columns.num_trades.as_deref())?;
         let limit_up_array = optional_table_column(&table, self.spec.columns.limit_up.as_deref())?;
@@ -262,6 +310,15 @@ impl Engine for BarGeneratorEngine {
             &self.spec.columns.total_turnover,
             "total_turnover",
         )?;
+        let trading_days = match (&trading_day_array, &self.spec.volume) {
+            (
+                Some(array),
+                VolumeSpec::Cumulative {
+                    trading_day_column, ..
+                },
+            ) => Some(string_array(array, trading_day_column)?),
+            _ => None,
+        };
         let num_trades = optional_int64_values(
             num_trades_array.as_ref(),
             self.spec.columns.num_trades.as_deref(),
@@ -280,17 +337,30 @@ impl Engine for BarGeneratorEngine {
         let mut completed = Vec::new();
 
         for row_index in 0..table.num_rows() {
-            let tick = TickRow::from_arrays(TickRowArrays {
+            let mut tick = TickRow::from_arrays(TickRowArrays {
                 instruments,
                 dts,
                 prices,
                 volumes,
                 total_turnovers,
+                trading_days,
                 num_trades,
                 limit_ups,
                 limit_downs,
                 row_index,
             })?;
+
+            if classify_session(&self.spec.sessions, tick.dt) != TickSessionKind::Regular {
+                self.pending_filtered_rows += 1;
+                continue;
+            }
+
+            let Some((volume, total_turnover)) = self.compute_volume_delta(&tick) else {
+                continue;
+            };
+            tick.volume = volume;
+            tick.total_turnover = total_turnover;
+
             let window_start = minute_start_ns(tick.dt);
             let window_end =
                 window_start
@@ -357,6 +427,7 @@ struct TickRow {
     price: f64,
     volume: f64,
     total_turnover: f64,
+    trading_day: Option<String>,
     num_trades: Option<i64>,
     limit_up: Option<f64>,
     limit_down: Option<f64>,
@@ -368,6 +439,7 @@ struct TickRowArrays<'a> {
     prices: &'a Float64Array,
     volumes: &'a Float64Array,
     total_turnovers: &'a Float64Array,
+    trading_days: Option<&'a StringArray>,
     num_trades: Option<&'a Int64Array>,
     limit_ups: Option<&'a Float64Array>,
     limit_downs: Option<&'a Float64Array>,
@@ -388,6 +460,7 @@ impl TickRow {
             price: arrays.prices.value(arrays.row_index),
             volume: arrays.volumes.value(arrays.row_index),
             total_turnover: arrays.total_turnovers.value(arrays.row_index),
+            trading_day: optional_string_at(arrays.trading_days, arrays.row_index),
             num_trades: optional_i64_at(arrays.num_trades, arrays.row_index),
             limit_up: optional_f64_at(arrays.limit_ups, arrays.row_index),
             limit_down: optional_f64_at(arrays.limit_downs, arrays.row_index),
@@ -409,6 +482,13 @@ struct OpenBar {
     num_trades: Option<i64>,
     limit_up: Option<f64>,
     limit_down: Option<f64>,
+}
+
+struct CumulativeState {
+    trading_day: String,
+    last_volume: f64,
+    last_total_turnover: f64,
+    initialized: bool,
 }
 
 impl OpenBar {
@@ -443,6 +523,24 @@ impl OpenBar {
 
 fn minute_start_ns(dt: i64) -> i64 {
     dt.div_euclid(BAR_FREQUENCY_1M_NS) * BAR_FREQUENCY_1M_NS
+}
+
+fn classify_session(spec: &BarSessionSpec, dt_ns: i64) -> TickSessionKind {
+    let seconds = local_seconds_of_day(dt_ns);
+    if spec.regular.iter().any(|window| window.contains(seconds)) {
+        return TickSessionKind::Regular;
+    }
+    if spec.auction.iter().any(|window| window.contains(seconds)) {
+        return TickSessionKind::Auction;
+    }
+
+    TickSessionKind::Outside
+}
+
+fn local_seconds_of_day(dt_ns: i64) -> u32 {
+    // v1 assumes input timestamps already follow the profile timezone contract.
+    let seconds = dt_ns.div_euclid(1_000_000_000);
+    seconds.rem_euclid(86_400) as u32
 }
 
 fn optional_table_column(
@@ -547,6 +645,16 @@ fn optional_i64_at(values: Option<&Int64Array>, row_index: usize) -> Option<i64>
             None
         } else {
             Some(values.value(row_index))
+        }
+    })
+}
+
+fn optional_string_at(values: Option<&StringArray>, row_index: usize) -> Option<String> {
+    values.and_then(|values| {
+        if values.is_null(row_index) {
+            None
+        } else {
+            Some(values.value(row_index).to_string())
         }
     })
 }

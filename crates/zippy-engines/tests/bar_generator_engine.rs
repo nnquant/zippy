@@ -41,6 +41,21 @@ fn nullable_instrument_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+fn tick_schema_without_optional_columns() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
+            false,
+        ),
+        Field::new("last_price", DataType::Float64, false),
+        Field::new("volume", DataType::Float64, false),
+        Field::new("turnover", DataType::Float64, false),
+        Field::new("trading_day", DataType::Utf8, false),
+    ]))
+}
+
 fn delta_spec() -> BarGeneratorSpec {
     BarGeneratorSpec {
         columns: BarInputColumns {
@@ -56,7 +71,7 @@ fn delta_spec() -> BarGeneratorSpec {
         },
         sessions: BarSessionSpec {
             timezone: "Asia/Shanghai".to_string(),
-            regular: vec![SessionWindow::parse("09:30:00", "15:00:00").unwrap()],
+            regular: vec![SessionWindow::parse("00:00:00", "01:00:00").unwrap()],
             auction: vec![],
         },
         frequency: "1m".to_string(),
@@ -64,6 +79,15 @@ fn delta_spec() -> BarGeneratorSpec {
         auction: AuctionPolicy::Drop,
         dt_label: DtLabelPolicy::CloseDt,
     }
+}
+
+fn cumulative_spec(bootstrap: BootstrapPolicy) -> BarGeneratorSpec {
+    let mut spec = delta_spec();
+    spec.volume = VolumeSpec::Cumulative {
+        trading_day_column: "trading_day".to_string(),
+        bootstrap,
+    };
+    spec
 }
 
 fn mismatched_batch() -> SegmentTableView {
@@ -115,6 +139,34 @@ fn tick_batch(
     SegmentTableView::from_record_batch(batch)
 }
 
+fn tick_batch_without_optional_columns(
+    instruments: Vec<&str>,
+    dts: Vec<i64>,
+    prices: Vec<f64>,
+    volumes: Vec<f64>,
+    turnovers: Vec<f64>,
+    trading_days: Vec<&str>,
+) -> SegmentTableView {
+    let row_count = instruments.len();
+    assert_eq!(dts.len(), row_count);
+    assert_eq!(prices.len(), row_count);
+    assert_eq!(volumes.len(), row_count);
+    assert_eq!(turnovers.len(), row_count);
+    assert_eq!(trading_days.len(), row_count);
+
+    let columns = vec![
+        Arc::new(StringArray::from(instruments)) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("Asia/Shanghai")) as ArrayRef,
+        Arc::new(Float64Array::from(prices)) as ArrayRef,
+        Arc::new(Float64Array::from(volumes)) as ArrayRef,
+        Arc::new(Float64Array::from(turnovers)) as ArrayRef,
+        Arc::new(StringArray::from(trading_days)) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(tick_schema_without_optional_columns(), columns).unwrap();
+
+    SegmentTableView::from_record_batch(batch)
+}
+
 fn f64_column(table: &SegmentTableView, name: &str) -> Vec<f64> {
     let column = table.column(name).unwrap();
     let values = column.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -146,6 +198,12 @@ fn assert_field(schema: &Schema, name: &str, data_type: &DataType, nullable: boo
 
     assert_eq!(field.data_type(), data_type);
     assert_eq!(field.is_nullable(), nullable);
+}
+
+fn assert_column_null_at(table: &SegmentTableView, name: &str, row_index: usize) {
+    let column = table.column(name).unwrap();
+
+    assert!(column.is_null(row_index));
 }
 
 #[test]
@@ -200,31 +258,119 @@ fn bar_generator_keeps_multi_instrument_state_independent() {
 }
 
 #[test]
-fn bar_generator_rejects_cumulative_volume_until_baseline_is_implemented() {
-    let mut spec = delta_spec();
-    spec.volume = VolumeSpec::Cumulative {
-        trading_day_column: "trading_day".to_string(),
-        bootstrap: BootstrapPolicy::SkipFirstDelta,
-    };
-    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), spec).unwrap();
-
-    let error = engine
+fn bar_generator_drops_non_session_ticks_without_updating_state() {
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
+    let output = engine
         .on_data(tick_batch(
-            vec!["rb2601"],
-            vec![30_000_000_000],
-            vec![10.0],
-            vec![100.0],
-            vec![1_000.0],
-            vec!["20260508"],
+            vec!["rb2601", "rb2601"],
+            vec![8 * 60 * MINUTE_NS, 30_000_000_000],
+            vec![99.0, 10.0],
+            vec![99.0, 1.0],
+            vec![9_999.0, 10.0],
+            vec!["20260508", "20260508"],
         ))
-        .unwrap_err();
+        .unwrap();
 
-    assert!(matches!(
-        error,
-        ZippyError::InvalidConfig { .. } | ZippyError::InvalidState { .. }
-    ));
-    assert!(error.to_string().contains("cumulative volume mode"));
-    assert!(error.to_string().contains("bar generator runtime"));
+    assert!(output.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 1);
+    assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![1.0]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn cumulative_mode_skips_first_delta_on_intraday_bootstrap() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        tick_schema(),
+        cumulative_spec(BootstrapPolicy::SkipFirstDelta),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![30_000_000_000, 45_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 11.0, 12.0],
+            vec![100.0, 105.0, 107.0],
+            vec![1_000.0, 1_060.0, 1_085.0],
+            vec!["20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(f64_column(&output[0], "open"), vec![11.0]);
+    assert_eq!(f64_column(&output[0], "close"), vec![11.0]);
+    assert_eq!(f64_column(&output[0], "volume"), vec![5.0]);
+    assert_eq!(f64_column(&output[0], "total_turnover"), vec![60.0]);
+}
+
+#[test]
+fn cumulative_mode_resets_at_trading_day_boundary() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        tick_schema(),
+        cumulative_spec(BootstrapPolicy::SkipFirstDelta),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601", "rb2601", "rb2601"],
+            vec![
+                30_000_000_000,
+                45_000_000_000,
+                MINUTE_NS + 1_000_000_000,
+                MINUTE_NS + 10_000_000_000,
+            ],
+            vec![10.0, 11.0, 12.0, 13.0],
+            vec![100.0, 105.0, 3.0, 8.0],
+            vec![1_000.0, 1_060.0, 30.0, 90.0],
+            vec!["20260508", "20260508", "20260509", "20260509"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(f64_column(&output[0], "volume"), vec![5.0]);
+    assert_eq!(f64_column(&output[0], "total_turnover"), vec![60.0]);
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 1);
+    assert_eq!(f64_column(&flushed[0], "open"), vec![13.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![5.0]);
+    assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![60.0]);
+}
+
+#[test]
+fn bar_generator_outputs_null_optional_columns_when_inputs_missing() {
+    let mut spec = delta_spec();
+    spec.columns.num_trades = None;
+    spec.columns.limit_up = None;
+    spec.columns.limit_down = None;
+    let mut engine =
+        BarGeneratorEngine::new("bars", tick_schema_without_optional_columns(), spec).unwrap();
+    let output = engine
+        .on_data(tick_batch_without_optional_columns(
+            vec!["rb2601", "rb2601"],
+            vec![30_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 11.0],
+            vec![2.0, 3.0],
+            vec![20.0, 33.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_column_null_at(&output[0], "num_trades", 0);
+    assert_column_null_at(&output[0], "limit_up", 0);
+    assert_column_null_at(&output[0], "limit_down", 0);
 }
 
 #[test]
