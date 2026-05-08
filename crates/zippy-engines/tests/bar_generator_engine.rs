@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray, TimestampNanosecondArray};
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, SchemaRef, SegmentTableView, ZippyError};
@@ -8,6 +10,8 @@ use zippy_engines::{
     AuctionPolicy, BarGeneratorEngine, BarGeneratorSpec, BarInputColumns, BarSessionSpec,
     DtLabelPolicy, SessionWindow, VolumeSpec,
 };
+
+const MINUTE_NS: i64 = 60_000_000_000;
 
 fn tick_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -80,11 +84,119 @@ fn mismatched_batch() -> SegmentTableView {
     SegmentTableView::from_record_batch(batch)
 }
 
+fn tick_batch(
+    instruments: Vec<&str>,
+    dts: Vec<i64>,
+    prices: Vec<f64>,
+    volumes: Vec<f64>,
+    turnovers: Vec<f64>,
+    trading_days: Vec<&str>,
+) -> SegmentTableView {
+    let row_count = instruments.len();
+    assert_eq!(dts.len(), row_count);
+    assert_eq!(prices.len(), row_count);
+    assert_eq!(volumes.len(), row_count);
+    assert_eq!(turnovers.len(), row_count);
+    assert_eq!(trading_days.len(), row_count);
+
+    let columns = vec![
+        Arc::new(StringArray::from(instruments)) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("Asia/Shanghai")) as ArrayRef,
+        Arc::new(Float64Array::from(prices)) as ArrayRef,
+        Arc::new(Float64Array::from(volumes)) as ArrayRef,
+        Arc::new(Float64Array::from(turnovers)) as ArrayRef,
+        Arc::new(StringArray::from(trading_days)) as ArrayRef,
+        Arc::new(Int64Array::from(vec![Some(1); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(999.0); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(tick_schema(), columns).unwrap();
+
+    SegmentTableView::from_record_batch(batch)
+}
+
+fn f64_column(table: &SegmentTableView, name: &str) -> Vec<f64> {
+    let column = table.column(name).unwrap();
+    let values = column.as_any().downcast_ref::<Float64Array>().unwrap();
+
+    (0..values.len()).map(|row| values.value(row)).collect()
+}
+
+fn string_column(table: &SegmentTableView, name: &str) -> Vec<String> {
+    let column = table.column(name).unwrap();
+    let values = column.as_any().downcast_ref::<StringArray>().unwrap();
+
+    (0..values.len())
+        .map(|row| values.value(row).to_string())
+        .collect()
+}
+
+fn ts_column(table: &SegmentTableView, name: &str) -> Vec<i64> {
+    let column = table.column(name).unwrap();
+    let values = column
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+
+    (0..values.len()).map(|row| values.value(row)).collect()
+}
+
 fn assert_field(schema: &Schema, name: &str, data_type: &DataType, nullable: bool) {
     let field = schema.field_with_name(name).unwrap();
 
     assert_eq!(field.data_type(), data_type);
     assert_eq!(field.is_nullable(), nullable);
+}
+
+#[test]
+fn bar_generator_emits_completed_delta_bar_on_minute_transition() {
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![30_000_000_000, 45_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 12.0, 11.0],
+            vec![2.0, 3.0, 5.0],
+            vec![20.0, 36.0, 55.0],
+            vec!["20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(string_column(&output[0], "instrument_id"), vec!["rb2601"]);
+    assert_eq!(ts_column(&output[0], "start_dt"), vec![0]);
+    assert_eq!(ts_column(&output[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&output[0], "dt"), vec![MINUTE_NS]);
+    assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "high"), vec![12.0]);
+    assert_eq!(f64_column(&output[0], "low"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "close"), vec![12.0]);
+    assert_eq!(f64_column(&output[0], "volume"), vec![5.0]);
+    assert_eq!(f64_column(&output[0], "total_turnover"), vec![56.0]);
+}
+
+#[test]
+fn bar_generator_keeps_multi_instrument_state_independent() {
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "au2606", "rb2601", "au2606"],
+            vec![30_000_000_000, 30_000_000_000, MINUTE_NS + 1, MINUTE_NS + 1],
+            vec![10.0, 500.0, 11.0, 502.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![10.0, 1000.0, 33.0, 2008.0],
+            vec!["20260508", "20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 2);
+    assert_eq!(
+        string_column(&output[0], "instrument_id"),
+        vec!["au2606", "rb2601"]
+    );
+    assert_eq!(f64_column(&output[0], "close"), vec![500.0, 10.0]);
 }
 
 #[test]
