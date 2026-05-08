@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, SchemaRef, SegmentTableView, ZippyError};
 use zippy_engines::{
     AuctionPolicy, BarGeneratorEngine, BarGeneratorSpec, BarInputColumns, BarSessionSpec,
-    DtLabelPolicy, SessionWindow, VolumeSpec,
+    BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeSpec,
 };
 
 const MINUTE_NS: i64 = 60_000_000_000;
@@ -197,6 +197,89 @@ fn bar_generator_keeps_multi_instrument_state_independent() {
         vec!["au2606", "rb2601"]
     );
     assert_eq!(f64_column(&output[0], "close"), vec![500.0, 10.0]);
+}
+
+#[test]
+fn bar_generator_rejects_cumulative_volume_until_baseline_is_implemented() {
+    let mut spec = delta_spec();
+    spec.volume = VolumeSpec::Cumulative {
+        trading_day_column: "trading_day".to_string(),
+        bootstrap: BootstrapPolicy::SkipFirstDelta,
+    };
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), spec).unwrap();
+
+    let error = engine
+        .on_data(tick_batch(
+            vec!["rb2601"],
+            vec![30_000_000_000],
+            vec![10.0],
+            vec![100.0],
+            vec![1_000.0],
+            vec!["20260508"],
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ZippyError::InvalidConfig { .. } | ZippyError::InvalidState { .. }
+    ));
+    assert!(error.to_string().contains("cumulative volume mode"));
+    assert!(error.to_string().contains("bar generator runtime"));
+}
+
+#[test]
+fn bar_generator_flushes_and_clears_open_delta_bars() {
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "au2606"],
+            vec![30_000_000_000, 45_000_000_000],
+            vec![10.0, 500.0],
+            vec![2.0, 3.0],
+            vec![20.0, 1_500.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+    assert!(output.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 2);
+    assert_eq!(
+        string_column(&flushed[0], "instrument_id"),
+        vec!["au2606", "rb2601"]
+    );
+    assert_eq!(f64_column(&flushed[0], "close"), vec![500.0, 10.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0, 2.0]);
+
+    let second_flush = engine.on_flush().unwrap();
+
+    assert!(second_flush.is_empty());
+}
+
+#[test]
+fn bar_generator_uses_start_dt_label_when_configured() {
+    let mut spec = delta_spec();
+    spec.dt_label = DtLabelPolicy::StartDt;
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), spec).unwrap();
+
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601"],
+            vec![30_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 11.0],
+            vec![2.0, 3.0],
+            vec![20.0, 33.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(ts_column(&output[0], "dt"), vec![0]);
+    assert_eq!(ts_column(&output[0], "start_dt"), vec![0]);
+    assert_eq!(ts_column(&output[0], "close_dt"), vec![MINUTE_NS]);
 }
 
 #[test]

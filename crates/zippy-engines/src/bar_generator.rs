@@ -192,6 +192,21 @@ impl BarGeneratorEngine {
             }
         })
     }
+
+    fn ensure_delta_volume_runtime(&self) -> Result<()> {
+        match &self.spec.volume {
+            VolumeSpec::Delta => Ok(()),
+            VolumeSpec::Cumulative { .. } => Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    concat!(
+                        "cumulative volume mode not supported by current bar generator runtime ",
+                        "volume_mode=[cumulative] engine=[{}]"
+                    ),
+                    self.name
+                ),
+            }),
+        }
+    }
 }
 
 impl Engine for BarGeneratorEngine {
@@ -216,6 +231,8 @@ impl Engine for BarGeneratorEngine {
                 ),
             });
         }
+
+        self.ensure_delta_volume_runtime()?;
 
         if table.num_rows() == 0 {
             return Ok(vec![]);
