@@ -127,6 +127,8 @@ pub struct BarGeneratorEngine {
     output_schema: SchemaRef,
     spec: BarGeneratorSpec,
     open_bars: BTreeMap<String, OpenBar>,
+    pending_auction_bars: BTreeMap<String, OpenBar>,
+    open_auction_bars: BTreeMap<AuctionBarKey, OpenBar>,
     cumulative_states: BTreeMap<String, CumulativeState>,
     pending_filtered_rows: u64,
 }
@@ -147,6 +149,8 @@ impl BarGeneratorEngine {
             output_schema,
             spec,
             open_bars: BTreeMap::new(),
+            pending_auction_bars: BTreeMap::new(),
+            open_auction_bars: BTreeMap::new(),
             cumulative_states: BTreeMap::new(),
             pending_filtered_rows: 0,
         })
@@ -277,6 +281,151 @@ impl BarGeneratorEngine {
             }
         }
     }
+
+    fn handle_regular_tick(
+        &mut self,
+        mut tick: TickRow,
+        completed: &mut Vec<OpenBar>,
+    ) -> Result<()> {
+        let Some(delta) = self.compute_volume_delta(&tick) else {
+            return Ok(());
+        };
+        tick.volume = delta.volume;
+        tick.total_turnover = delta.total_turnover;
+
+        let current_window_start = minute_start_ns(tick.dt);
+        let window_start = delta.window_start.unwrap_or(current_window_start);
+        let window_end =
+            window_start
+                .checked_add(BAR_FREQUENCY_1M_NS)
+                .ok_or(ZippyError::InvalidState {
+                    status: "bar window end overflow",
+                })?;
+        let mut incoming_bar = if self.spec.auction == AuctionPolicy::MergeToFirstRegularBar {
+            self.pending_auction_bars
+                .remove(&tick.instrument)
+                .map(|mut auction_bar| {
+                    auction_bar.start_dt = window_start;
+                    auction_bar.close_dt = window_end;
+                    auction_bar.update(&tick);
+                    auction_bar
+                })
+                .unwrap_or_else(|| OpenBar::from_tick(&tick, window_start, window_end))
+        } else {
+            OpenBar::from_tick(&tick, window_start, window_end)
+        };
+        incoming_bar.start_dt = window_start;
+        incoming_bar.close_dt = window_end;
+
+        self.insert_regular_bar(incoming_bar, current_window_start, completed);
+
+        Ok(())
+    }
+
+    fn handle_auction_tick(&mut self, mut tick: TickRow) -> Result<()> {
+        match self.spec.auction {
+            AuctionPolicy::Drop => {
+                if matches!(self.spec.volume, VolumeSpec::Cumulative { .. }) {
+                    let filtered_before = self.pending_filtered_rows;
+                    let _ = self.compute_volume_delta(&tick);
+                    if self.pending_filtered_rows == filtered_before {
+                        self.pending_filtered_rows += 1;
+                    }
+                } else {
+                    self.pending_filtered_rows += 1;
+                }
+            }
+            AuctionPolicy::MergeToFirstRegularBar => {
+                let Some(delta) = self.compute_volume_delta(&tick) else {
+                    return Ok(());
+                };
+                tick.volume = delta.volume;
+                tick.total_turnover = delta.total_turnover;
+
+                let Some((start_dt, close_dt)) =
+                    auction_window_bounds(&self.spec.sessions, tick.dt)
+                else {
+                    self.pending_filtered_rows += 1;
+                    return Ok(());
+                };
+
+                match self.pending_auction_bars.remove(&tick.instrument) {
+                    Some(mut auction_bar) => {
+                        auction_bar.update(&tick);
+                        self.pending_auction_bars
+                            .insert(tick.instrument.clone(), auction_bar);
+                    }
+                    None => {
+                        self.pending_auction_bars.insert(
+                            tick.instrument.clone(),
+                            OpenBar::from_tick(&tick, start_dt, close_dt),
+                        );
+                    }
+                }
+            }
+            AuctionPolicy::EmitSeparateBar => {
+                let Some((start_dt, close_dt)) =
+                    auction_window_bounds(&self.spec.sessions, tick.dt)
+                else {
+                    self.pending_filtered_rows += 1;
+                    return Ok(());
+                };
+                let Some(delta) = self.compute_volume_delta(&tick) else {
+                    return Ok(());
+                };
+                tick.volume = delta.volume;
+                tick.total_turnover = delta.total_turnover;
+
+                let key = AuctionBarKey {
+                    instrument: tick.instrument.clone(),
+                    start_dt,
+                    close_dt,
+                };
+                match self.open_auction_bars.remove(&key) {
+                    Some(mut auction_bar) => {
+                        auction_bar.update(&tick);
+                        self.open_auction_bars.insert(key, auction_bar);
+                    }
+                    None => {
+                        self.open_auction_bars
+                            .insert(key, OpenBar::from_tick(&tick, start_dt, close_dt));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn insert_regular_bar(
+        &mut self,
+        incoming_bar: OpenBar,
+        current_window_start: i64,
+        completed: &mut Vec<OpenBar>,
+    ) {
+        let instrument = incoming_bar.instrument.clone();
+        match self.open_bars.remove(&instrument) {
+            Some(mut open_bar) if open_bar.start_dt == incoming_bar.start_dt => {
+                open_bar.merge_from_bar(&incoming_bar);
+                self.open_bars.insert(instrument, open_bar);
+            }
+            Some(open_bar) => {
+                completed.push(open_bar);
+                if incoming_bar.close_dt <= current_window_start {
+                    completed.push(incoming_bar);
+                } else {
+                    self.open_bars.insert(instrument, incoming_bar);
+                }
+            }
+            None => {
+                if incoming_bar.close_dt <= current_window_start {
+                    completed.push(incoming_bar);
+                } else {
+                    self.open_bars.insert(instrument, incoming_bar);
+                }
+            }
+        }
+    }
 }
 
 impl Engine for BarGeneratorEngine {
@@ -363,7 +512,7 @@ impl Engine for BarGeneratorEngine {
         let mut completed = Vec::new();
 
         for row_index in 0..table.num_rows() {
-            let mut tick = TickRow::from_arrays(TickRowArrays {
+            let tick = TickRow::from_arrays(TickRowArrays {
                 instruments,
                 dts,
                 prices,
@@ -376,45 +525,11 @@ impl Engine for BarGeneratorEngine {
                 row_index,
             })?;
 
-            if classify_session(&self.spec.sessions, tick.dt) != TickSessionKind::Regular {
-                self.pending_filtered_rows += 1;
-                continue;
-            }
-
-            let Some(delta) = self.compute_volume_delta(&tick) else {
-                continue;
-            };
-            tick.volume = delta.volume;
-            tick.total_turnover = delta.total_turnover;
-
-            let current_window_start = minute_start_ns(tick.dt);
-            let window_start = delta.window_start.unwrap_or(current_window_start);
-            let window_end =
-                window_start
-                    .checked_add(BAR_FREQUENCY_1M_NS)
-                    .ok_or(ZippyError::InvalidState {
-                        status: "bar window end overflow",
-                    })?;
-
-            match self.open_bars.remove(&tick.instrument) {
-                Some(mut open_bar) if open_bar.start_dt == window_start => {
-                    open_bar.update(&tick);
-                    self.open_bars.insert(tick.instrument.clone(), open_bar);
-                }
-                Some(open_bar) => {
-                    completed.push(open_bar);
-                    self.open_bars.insert(
-                        tick.instrument.clone(),
-                        OpenBar::from_tick(&tick, window_start, window_end),
-                    );
-                }
-                None => {
-                    let open_bar = OpenBar::from_tick(&tick, window_start, window_end);
-                    if window_end <= current_window_start {
-                        completed.push(open_bar);
-                    } else {
-                        self.open_bars.insert(tick.instrument.clone(), open_bar);
-                    }
+            match classify_session(&self.spec.sessions, tick.dt) {
+                TickSessionKind::Regular => self.handle_regular_tick(tick, &mut completed)?,
+                TickSessionKind::Auction => self.handle_auction_tick(tick)?,
+                TickSessionKind::Outside => {
+                    self.pending_filtered_rows += 1;
                 }
             }
         }
@@ -423,19 +538,22 @@ impl Engine for BarGeneratorEngine {
             return Ok(vec![]);
         }
 
-        completed.sort_by(|left, right| left.instrument.cmp(&right.instrument));
+        sort_bars(&mut completed);
         let output = self.build_output_batch(&completed)?;
         Ok(vec![SegmentTableView::from_record_batch(output)])
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
-        if self.open_bars.is_empty() {
+        if self.open_bars.is_empty() && self.open_auction_bars.is_empty() {
             return Ok(vec![]);
         }
 
-        let completed = self.open_bars.values().cloned().collect::<Vec<_>>();
+        let mut completed = self.open_auction_bars.values().cloned().collect::<Vec<_>>();
+        completed.extend(self.open_bars.values().cloned());
+        sort_bars(&mut completed);
         let output = self.build_output_batch(&completed)?;
         self.open_bars.clear();
+        self.open_auction_bars.clear();
 
         Ok(vec![SegmentTableView::from_record_batch(output)])
     }
@@ -528,6 +646,13 @@ struct CumulativeDelta {
     window_start: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AuctionBarKey {
+    instrument: String,
+    start_dt: i64,
+    close_dt: i64,
+}
+
 impl OpenBar {
     fn from_tick(tick: &TickRow, start_dt: i64, close_dt: i64) -> Self {
         Self {
@@ -556,6 +681,17 @@ impl OpenBar {
         self.limit_up = tick.limit_up.or(self.limit_up);
         self.limit_down = tick.limit_down.or(self.limit_down);
     }
+
+    fn merge_from_bar(&mut self, bar: &OpenBar) {
+        self.high = self.high.max(bar.high);
+        self.low = self.low.min(bar.low);
+        self.close = bar.close;
+        self.volume += bar.volume;
+        self.total_turnover += bar.total_turnover;
+        self.num_trades = bar.num_trades.or(self.num_trades);
+        self.limit_up = bar.limit_up.or(self.limit_up);
+        self.limit_down = bar.limit_down.or(self.limit_down);
+    }
 }
 
 fn minute_start_ns(dt: i64) -> i64 {
@@ -572,6 +708,29 @@ fn classify_session(spec: &BarSessionSpec, dt_ns: i64) -> TickSessionKind {
     }
 
     TickSessionKind::Outside
+}
+
+fn auction_window_bounds(spec: &BarSessionSpec, dt_ns: i64) -> Option<(i64, i64)> {
+    let seconds = local_seconds_of_day(dt_ns);
+    let window = spec
+        .auction
+        .iter()
+        .find(|window| window.contains(seconds))?;
+    let day_start = dt_ns - i64::from(seconds) * 1_000_000_000;
+    let start_dt = day_start + i64::from(window.start_seconds) * 1_000_000_000;
+    let close_dt = day_start + i64::from(window.end_seconds) * 1_000_000_000;
+
+    Some((start_dt, close_dt))
+}
+
+fn sort_bars(bars: &mut [OpenBar]) {
+    bars.sort_by(|left, right| {
+        (left.close_dt, left.instrument.as_str(), left.start_dt).cmp(&(
+            right.close_dt,
+            right.instrument.as_str(),
+            right.start_dt,
+        ))
+    });
 }
 
 fn local_seconds_of_day(dt_ns: i64) -> u32 {

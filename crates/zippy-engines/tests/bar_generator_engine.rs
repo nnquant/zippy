@@ -90,6 +90,16 @@ fn cumulative_spec(bootstrap: BootstrapPolicy) -> BarGeneratorSpec {
     spec
 }
 
+fn auction_spec(policy: AuctionPolicy, volume: VolumeSpec) -> BarGeneratorSpec {
+    let mut spec = delta_spec();
+    spec.sessions.regular = vec![SessionWindow::parse("00:00:20", "01:00:00").unwrap()];
+    spec.sessions.auction = vec![SessionWindow::parse("00:00:10", "00:00:20").unwrap()];
+    spec.auction = policy;
+    spec.volume = volume;
+
+    spec
+}
+
 fn mismatched_batch() -> SegmentTableView {
     let schema = Arc::new(Schema::new(vec![
         Field::new("instrument_id", DataType::Utf8, false),
@@ -507,19 +517,27 @@ fn bar_generator_session_window_is_start_inclusive_end_exclusive() {
 }
 
 #[test]
-fn bar_generator_drops_auction_ticks_before_auction_policy_task() {
-    let mut spec = delta_spec();
-    spec.sessions.regular = vec![SessionWindow::parse("00:00:20", "01:00:00").unwrap()];
-    spec.sessions.auction = vec![SessionWindow::parse("00:00:10", "00:00:20").unwrap()];
-    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), spec).unwrap();
+fn auction_drop_updates_cumulative_baseline_without_output_bar() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        tick_schema(),
+        auction_spec(
+            AuctionPolicy::Drop,
+            VolumeSpec::Cumulative {
+                trading_day_column: "trading_day".to_string(),
+                bootstrap: BootstrapPolicy::SkipFirstDelta,
+            },
+        ),
+    )
+    .unwrap();
     let output = engine
         .on_data(tick_batch(
-            vec!["rb2601", "rb2601"],
-            vec![15_000_000_000, 30_000_000_000],
-            vec![99.0, 10.0],
-            vec![100.0, 1.0],
-            vec![9_900.0, 10.0],
-            vec!["20260508", "20260508"],
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![15_000_000_000, 30_000_000_000, 45_000_000_000],
+            vec![99.0, 10.0, 11.0],
+            vec![100.0, 100.0, 103.0],
+            vec![1_000.0, 1_000.0, 1_033.0],
+            vec!["20260508", "20260508", "20260508"],
         ))
         .unwrap();
 
@@ -530,8 +548,89 @@ fn bar_generator_drops_auction_ticks_before_auction_policy_task() {
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].num_rows(), 1);
     assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
-    assert_eq!(f64_column(&flushed[0], "volume"), vec![1.0]);
+    assert_eq!(f64_column(&flushed[0], "high"), vec![11.0]);
+    assert_eq!(f64_column(&flushed[0], "low"), vec![10.0]);
+    assert_eq!(f64_column(&flushed[0], "close"), vec![11.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0]);
+    assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![33.0]);
     assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn auction_merge_to_first_regular_bar_includes_auction_tick() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        tick_schema(),
+        auction_spec(AuctionPolicy::MergeToFirstRegularBar, VolumeSpec::Delta),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![15_000_000_000, 30_000_000_000, 45_000_000_000],
+            vec![9.0, 10.0, 8.0],
+            vec![2.0, 3.0, 5.0],
+            vec![18.0, 30.0, 40.0],
+            vec!["20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert!(output.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 1);
+    assert_eq!(ts_column(&flushed[0], "start_dt"), vec![0]);
+    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(f64_column(&flushed[0], "open"), vec![9.0]);
+    assert_eq!(f64_column(&flushed[0], "high"), vec![10.0]);
+    assert_eq!(f64_column(&flushed[0], "low"), vec![8.0]);
+    assert_eq!(f64_column(&flushed[0], "close"), vec![8.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![10.0]);
+    assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![88.0]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 0);
+}
+
+#[test]
+fn auction_emit_separate_bar_outputs_auction_window_bar() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        tick_schema(),
+        auction_spec(AuctionPolicy::EmitSeparateBar, VolumeSpec::Delta),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601"],
+            vec![15_000_000_000, 30_000_000_000],
+            vec![9.0, 10.0],
+            vec![2.0, 3.0],
+            vec![18.0, 30.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert!(output.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 2);
+    assert_eq!(
+        string_column(&flushed[0], "instrument_id"),
+        vec!["rb2601", "rb2601"]
+    );
+    assert_eq!(ts_column(&flushed[0], "start_dt"), vec![10_000_000_000, 0]);
+    assert_eq!(
+        ts_column(&flushed[0], "close_dt"),
+        vec![20_000_000_000, MINUTE_NS]
+    );
+    assert_eq!(f64_column(&flushed[0], "open"), vec![9.0, 10.0]);
+    assert_eq!(f64_column(&flushed[0], "close"), vec![9.0, 10.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![2.0, 3.0]);
+    assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![18.0, 30.0]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 0);
 }
 
 #[test]
