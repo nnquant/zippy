@@ -6629,8 +6629,8 @@ class _BarTradingSessions:
     def to_bar_generator_spec(self) -> dict[str, object]:
         return {
             "timezone": self.timezone,
-            "regular": self.regular,
-            "auction": self.auction,
+            "regular": list(self.regular),
+            "auction": list(self.auction),
         }
 
 

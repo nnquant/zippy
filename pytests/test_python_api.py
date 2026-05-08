@@ -10104,7 +10104,8 @@ def test_bar_profile_normalizes_to_native_spec() -> None:
         dt_label="close_dt",
     )
 
-    assert profile.to_bar_generator_spec() == {
+    spec = profile.to_bar_generator_spec()
+    assert spec == {
         "frequency": "1m",
         "columns": {
             "instrument": "instrument_id",
@@ -10130,6 +10131,10 @@ def test_bar_profile_normalizes_to_native_spec() -> None:
         "auction": "drop",
         "dt_label": "close_dt",
     }
+    spec["sessions"]["regular"].append(("21:00:00", "23:00:00"))
+    spec["columns"]["instrument"] = "symbol"
+    assert profile.sessions.regular == [("09:30:00", "15:00:00")]
+    assert profile.columns.instrument == "instrument_id"
     assert zippy.bar.Volume.delta().to_bar_generator_spec() == {"mode": "delta"}
     assert (
         zippy.bar.Auction.merge_to_first_regular_bar().to_bar_generator_spec()
