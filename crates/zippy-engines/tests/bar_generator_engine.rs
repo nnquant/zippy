@@ -27,7 +27,7 @@ fn tick_schema() -> SchemaRef {
 
 fn delta_spec() -> BarGeneratorSpec {
     BarGeneratorSpec {
-        input: BarInputColumns {
+        columns: BarInputColumns {
             instrument: "instrument_id".to_string(),
             dt: "dt".to_string(),
             price: "last_price".to_string(),
@@ -38,7 +38,7 @@ fn delta_spec() -> BarGeneratorSpec {
             limit_up: Some("upper_limit_price".to_string()),
             limit_down: Some("lower_limit_price".to_string()),
         },
-        session: BarSessionSpec {
+        sessions: BarSessionSpec {
             timezone: "Asia/Shanghai".to_string(),
             regular: vec![SessionWindow::parse("09:30:00", "15:00:00").unwrap()],
             auction: vec![],

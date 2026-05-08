@@ -92,9 +92,9 @@ pub enum DtLabelPolicy {
 /// Configuration for [`BarGeneratorEngine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarGeneratorSpec {
-    pub input: BarInputColumns,
-    pub session: BarSessionSpec,
     pub frequency: String,
+    pub columns: BarInputColumns,
+    pub sessions: BarSessionSpec,
     pub volume: VolumeSpec,
     pub auction: AuctionPolicy,
     pub dt_label: DtLabelPolicy,
@@ -164,19 +164,19 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
         });
     }
 
-    if spec.session.regular.is_empty() {
+    if spec.sessions.regular.is_empty() {
         return Err(ZippyError::InvalidConfig {
             reason: "regular sessions must not be empty".to_string(),
         });
     }
 
-    validate_utf8_column(schema, &spec.input.instrument, "instrument")?;
-    validate_dt_column(schema, &spec.input.dt)?;
-    validate_float64_column(schema, &spec.input.price, "price")?;
-    validate_float64_column(schema, &spec.input.volume, "volume")?;
-    validate_float64_column(schema, &spec.input.total_turnover, "total_turnover")?;
+    validate_utf8_column(schema, &spec.columns.instrument, "instrument")?;
+    validate_dt_column(schema, &spec.columns.dt)?;
+    validate_float64_column(schema, &spec.columns.price, "price")?;
+    validate_float64_column(schema, &spec.columns.volume, "volume")?;
+    validate_float64_column(schema, &spec.columns.total_turnover, "total_turnover")?;
 
-    if let Some(column) = &spec.input.trading_day {
+    if let Some(column) = &spec.columns.trading_day {
         validate_utf8_column(schema, column, "trading_day")?;
     }
 
@@ -187,15 +187,15 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
         validate_utf8_column(schema, trading_day_column, "trading_day")?;
     }
 
-    if let Some(column) = &spec.input.num_trades {
+    if let Some(column) = &spec.columns.num_trades {
         validate_int64_column(schema, column, "num_trades")?;
     }
 
-    if let Some(column) = &spec.input.limit_up {
+    if let Some(column) = &spec.columns.limit_up {
         validate_float64_column(schema, column, "limit_up")?;
     }
 
-    if let Some(column) = &spec.input.limit_down {
+    if let Some(column) = &spec.columns.limit_down {
         validate_float64_column(schema, column, "limit_down")?;
     }
 
@@ -204,16 +204,16 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
 
 fn build_output_schema(schema: &Schema, spec: &BarGeneratorSpec) -> Result<SchemaRef> {
     let instrument_field = schema
-        .field_with_name(&spec.input.instrument)
+        .field_with_name(&spec.columns.instrument)
         .map_err(|_| ZippyError::SchemaMismatch {
             reason: format!(
                 "missing utf8 instrument field field=[{}]",
-                spec.input.instrument
+                spec.columns.instrument
             ),
         })?;
     let timestamp_type = DataType::Timestamp(
         TimeUnit::Nanosecond,
-        Some(spec.session.timezone.clone().into()),
+        Some(spec.sessions.timezone.clone().into()),
     );
 
     Ok(Arc::new(Schema::new(vec![
