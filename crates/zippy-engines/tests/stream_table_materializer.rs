@@ -446,6 +446,16 @@ impl StreamTableDescriptorPublisher for RecordingDescriptorPublisher {
     }
 }
 
+struct FailingDescriptorPublisher;
+
+impl StreamTableDescriptorPublisher for FailingDescriptorPublisher {
+    fn publish(&self, _descriptor_envelope: Vec<u8>) -> zippy_core::Result<()> {
+        Err(ZippyError::Io {
+            reason: "descriptor publisher failed".to_string(),
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingPersistPublisher {
     files: Mutex<Vec<serde_json::Value>>,
@@ -607,20 +617,6 @@ fn file_path_has_partition_components(file: &serde_json::Value, expected: &[&str
             .map(String::as_str)
             .eq(expected.iter().copied())
     })
-}
-
-fn wait_for_persist_failure(materializer: &StreamTableMaterializer) -> Vec<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let failures = materializer.persist_failures_for_test();
-        if !failures.is_empty() {
-            return failures;
-        }
-        if std::time::Instant::now() >= deadline {
-            return failures;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[test]
@@ -1086,6 +1082,44 @@ fn stream_table_stop_persists_active_segment_and_publishes_metadata() {
 }
 
 #[test]
+fn stream_table_stop_persists_active_segment_when_descriptor_publish_fails() {
+    let persist_root = temp_persist_root("stop-descriptor-failure");
+    let persist_publisher = Arc::new(RecordingPersistPublisher::default());
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 32)
+            .unwrap()
+            .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+            .with_persist_publisher(persist_publisher.clone())
+            .with_descriptor_publisher(Arc::new(FailingDescriptorPublisher));
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
+            2,
+        )))
+        .unwrap();
+
+    let error = materializer.on_stop().unwrap_err();
+    assert!(error.to_string().contains("descriptor publisher failed"));
+
+    let files = persist_publisher.files.lock().unwrap();
+    assert_eq!(files.len(), 1);
+    let file_path = PathBuf::from(files[0]["file_path"].as_str().unwrap());
+    assert!(file_path.starts_with(&persist_root));
+    assert!(file_path.exists());
+
+    let file = File::open(file_path).unwrap();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let rows = builder
+        .build()
+        .unwrap()
+        .map(|batch| batch.unwrap().num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 2);
+
+    let _ = fs::remove_dir_all(persist_root);
+}
+
+#[test]
 fn stream_table_materializer_partitions_persisted_parquet_by_dt_part_and_id() {
     let persist_root = temp_persist_root("partitioned");
     let persist_publisher = Arc::new(RecordingPersistPublisher::default());
@@ -1250,8 +1284,8 @@ fn stream_table_materializer_does_not_block_on_persist_publisher_after_rollover(
 }
 
 #[test]
-fn stream_table_flush_reports_background_persist_failure() {
-    let persist_root = temp_persist_root("failure");
+fn stream_table_metadata_publish_failure_keeps_local_persist_committed() {
+    let persist_root = temp_persist_root("metadata-publish-failure");
     let persist_publisher = Arc::new(FailingPersistPublisher);
     let persist_config = StreamTablePersistConfig::new(&persist_root)
         .with_max_attempts(2)
@@ -1269,30 +1303,36 @@ fn stream_table_flush_reports_background_persist_failure() {
         )))
         .unwrap();
 
-    let failures = wait_for_persist_failure(&materializer);
-    assert_eq!(failures.len(), 1);
-    assert!(failures[0].contains("publisher failed"));
+    materializer
+        .wait_for_persisted_files_for_test(1, Duration::from_secs(2))
+        .unwrap();
     let snapshot = materializer.persist_commit_snapshot();
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot[0]["source_segment_id"], 1);
     assert_eq!(snapshot[0]["source_generation"], 0);
-    assert_eq!(snapshot[0]["status"], "failed");
+    assert_eq!(snapshot[0]["status"], "committed");
     assert_eq!(snapshot[0]["attempts"], 2);
+    assert_eq!(snapshot[0]["file_count"], 1);
     assert!(snapshot[0]["error"]
         .as_str()
         .unwrap()
         .contains("publisher failed"));
+    assert_eq!(
+        materializer.persist_failures_for_test(),
+        Vec::<String>::new()
+    );
+    materializer.on_flush().unwrap();
 
-    let error = materializer.on_flush().unwrap_err();
-    assert!(error.to_string().contains("stream table persist failed"));
-    assert!(error.to_string().contains("publisher failed"));
+    let sidecar_dir = persist_root.join("_zippy_persist_metadata");
+    let sidecars = fs::read_dir(&sidecar_dir).unwrap().count();
+    assert_eq!(sidecars, 1);
 
     let _ = fs::remove_dir_all(persist_root);
 }
 
 #[test]
-fn stream_table_persist_failure_publishes_queryable_error_event() {
-    let persist_root = temp_persist_root("failure-event");
+fn stream_table_metadata_publish_failure_publishes_queryable_error_event() {
+    let persist_root = temp_persist_root("metadata-failure-event");
     let persist_publisher = Arc::new(FailingPersistEventPublisher::default());
     let persist_config = StreamTablePersistConfig::new(&persist_root)
         .with_max_attempts(2)
@@ -1310,23 +1350,31 @@ fn stream_table_persist_failure_publishes_queryable_error_event() {
         )))
         .unwrap();
 
-    let failures = wait_for_persist_failure(&materializer);
-    assert_eq!(failures.len(), 1);
+    materializer
+        .wait_for_persisted_files_for_test(1, Duration::from_secs(2))
+        .unwrap();
     let events = persist_publisher.events.lock().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["stream_name"], "ticks");
-    assert_eq!(events[0]["persist_event_type"], "persist_failed");
+    assert_eq!(
+        events[0]["persist_event_type"],
+        "persist_metadata_sync_failed"
+    );
     assert_eq!(events[0]["source_segment_id"], 1);
     assert_eq!(events[0]["source_generation"], 0);
     assert_eq!(events[0]["attempts"], 2);
     assert!(events[0]["persist_event_id"]
         .as_str()
         .unwrap()
-        .starts_with("ticks:1:0:failed"));
+        .starts_with("ticks:1:0:metadata_sync_failed"));
     assert!(events[0]["error"]
         .as_str()
         .unwrap()
         .contains("publisher failed"));
+    assert_eq!(
+        materializer.persist_failures_for_test(),
+        Vec::<String>::new()
+    );
 
     let _ = fs::remove_dir_all(persist_root);
 }

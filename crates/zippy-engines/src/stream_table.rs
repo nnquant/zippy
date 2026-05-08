@@ -130,6 +130,12 @@ struct StreamTablePersistTask {
     identity: SegmentIdentity,
 }
 
+struct StreamTablePersistOutcome {
+    attempts: u64,
+    file_count: usize,
+    metadata_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTablePersistCommitStatus {
     Pending,
@@ -307,17 +313,29 @@ impl StreamTablePersistWorker {
                             &config,
                             publisher.as_deref(),
                         ) {
-                            Ok(file_count) => {
+                            Ok(outcome) => {
                                 last_error = None;
                                 update_persist_commit_state(
                                     &worker_commit_state,
                                     task.identity,
                                     StreamTablePersistCommitStatus::Committed,
                                     |record| {
-                                        record.file_count = file_count;
-                                        record.error = None;
+                                        record.attempts = outcome.attempts;
+                                        record.file_count = outcome.file_count;
+                                        record.error = outcome.metadata_error.clone();
                                     },
                                 );
+                                if let (Some(publisher), Some(error)) =
+                                    (&publisher, outcome.metadata_error.as_deref())
+                                {
+                                    let event = persist_metadata_sync_failure_event(
+                                        &stream_name,
+                                        task.identity,
+                                        outcome.attempts,
+                                        error,
+                                    );
+                                    let _ = publisher.publish_event(event);
+                                }
                                 let (segments_lock, segments_changed) = &*worker_completed_segments;
                                 segments_lock.lock().unwrap().push(task.identity);
                                 segments_changed.notify_all();
@@ -1130,7 +1148,6 @@ impl StreamTableMaterializer {
         self.forwarded_active_descriptor = None;
         self.sealed_segment_descriptors
             .push(sealed_descriptor.clone());
-        self.publish_active_descriptor()?;
         self.enqueue_persist_task(sealed, &sealed_descriptor)?;
         Ok(true)
     }
@@ -1460,20 +1477,50 @@ fn write_and_publish_persisted_files(
     task: &StreamTablePersistTask,
     config: &StreamTablePersistConfig,
     publisher: Option<&dyn StreamTablePersistPublisher>,
-) -> Result<usize> {
+) -> Result<StreamTablePersistOutcome> {
     let persisted_files = write_sealed_segment_parquet(
         stream_name,
         &task.sealed,
         task.source_generation.clone(),
         config,
     )?;
+    write_persist_metadata_sidecars(config.root(), &persisted_files)?;
     let file_count = persisted_files.len();
+    let mut attempts = 1_u64;
+    let mut metadata_error = None;
     if let Some(publisher) = publisher {
-        for persisted_file in persisted_files {
-            publisher.publish(persisted_file)?;
+        metadata_error = Some("persisted metadata publisher was not attempted".to_string());
+        for attempt in 1..=config.max_attempts {
+            attempts = attempt as u64;
+            match publish_persisted_files(publisher, &persisted_files) {
+                Ok(()) => {
+                    metadata_error = None;
+                    break;
+                }
+                Err(error) => {
+                    metadata_error = Some(error.to_string());
+                    if attempt < config.max_attempts && !config.retry_delay.is_zero() {
+                        thread::sleep(config.retry_delay);
+                    }
+                }
+            }
         }
     }
-    Ok(file_count)
+    Ok(StreamTablePersistOutcome {
+        attempts,
+        file_count,
+        metadata_error,
+    })
+}
+
+fn publish_persisted_files(
+    publisher: &dyn StreamTablePersistPublisher,
+    persisted_files: &[serde_json::Value],
+) -> Result<()> {
+    for persisted_file in persisted_files {
+        publisher.publish(persisted_file.clone())?;
+    }
+    Ok(())
 }
 
 fn persist_file_id(
@@ -1501,6 +1548,71 @@ fn persist_failure_event(
         "error": error,
         "created_at": current_time_millis(),
     })
+}
+
+fn persist_metadata_sync_failure_event(
+    stream_name: &str,
+    identity: SegmentIdentity,
+    attempts: u64,
+    error: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "stream_name": stream_name,
+        "persist_event_id": format!("{}:{}:{}:metadata_sync_failed", stream_name, identity.0, identity.1),
+        "persist_event_type": "persist_metadata_sync_failed",
+        "source_segment_id": identity.0,
+        "source_generation": identity.1,
+        "attempts": attempts,
+        "error": error,
+        "created_at": current_time_millis(),
+    })
+}
+
+fn write_persist_metadata_sidecars(
+    root: &Path,
+    persisted_files: &[serde_json::Value],
+) -> Result<()> {
+    let metadata_dir = root.join("_zippy_persist_metadata");
+    fs::create_dir_all(&metadata_dir).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to create stream table persist metadata directory path=[{}] error=[{}]",
+            metadata_dir.display(),
+            error
+        ),
+    })?;
+    for persisted_file in persisted_files {
+        let persist_file_id = persisted_file
+            .get("persist_file_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("persisted-file");
+        let file_name = format!("{}.json", sanitize_persist_file_component(persist_file_id));
+        let target_path = metadata_dir.join(file_name);
+        let temp_path = temp_parquet_path_for_target(&target_path);
+        let bytes = serde_json::to_vec_pretty(persisted_file).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to encode stream table persist metadata error=[{}]",
+                error
+            ),
+        })?;
+        fs::write(&temp_path, bytes).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to write stream table persist metadata path=[{}] error=[{}]",
+                temp_path.display(),
+                error
+            ),
+        })?;
+        fs::rename(&temp_path, &target_path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            ZippyError::Io {
+                reason: format!(
+                    "failed to commit stream table persist metadata path=[{}] error=[{}]",
+                    target_path.display(),
+                    error
+                ),
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn write_record_batch_parquet(target_path: &Path, batch: &RecordBatch) -> Result<()> {
