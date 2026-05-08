@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -39,6 +40,7 @@ if _NATIVE_AVAILABLE:
         from ._internal import AggMinSpec
         from ._internal import AggSumSpec
         from ._internal import AggVwapSpec
+        from ._internal import BarGeneratorEngine
         from ._internal import CastSpec
         from ._internal import ClipSpec
         from ._internal import CSDemeanSpec
@@ -90,6 +92,7 @@ if not _NATIVE_AVAILABLE:
     AggMinSpec = _native_unavailable("AggMinSpec")
     AggSumSpec = _native_unavailable("AggSumSpec")
     AggVwapSpec = _native_unavailable("AggVwapSpec")
+    BarGeneratorEngine = _native_unavailable("BarGeneratorEngine")
     CastSpec = _native_unavailable("CastSpec")
     ClipSpec = _native_unavailable("ClipSpec")
     CSDemeanSpec = _native_unavailable("CSDemeanSpec")
@@ -283,7 +286,9 @@ class _QueryExpr:
         return _QueryExpr("unary", "neg", (self,))
 
     def __bool__(self) -> bool:
-        raise TypeError("query expressions cannot be evaluated as booleans; use '&' or '|'")
+        raise TypeError(
+            "query expressions cannot be evaluated as booleans; use '&' or '|'"
+        )
 
     def _binary(self, op: str, other: object) -> _QueryExpr:
         return _QueryExpr("binary", op, (self, _literal(other)))
@@ -444,7 +449,9 @@ def _predicate_pushdown_conjuncts(
             op = str(predicate._value)
             left, right = predicate._args
             if op == "and":
-                return _predicate_pushdown_conjuncts(left) + _predicate_pushdown_conjuncts(right)
+                return _predicate_pushdown_conjuncts(
+                    left
+                ) + _predicate_pushdown_conjuncts(right)
             pyarrow_op = {
                 "eq": "==",
                 "ne": "!=",
@@ -480,7 +487,9 @@ def _predicate_pushdown_conjuncts(
     return []
 
 
-def _simple_column_literal_pair(left: object, right: object) -> tuple[str, object] | None:
+def _simple_column_literal_pair(
+    left: object, right: object
+) -> tuple[str, object] | None:
     if not (isinstance(left, _QueryExpr) and left._kind == "col"):
         return None
     if isinstance(right, _QueryExpr):
@@ -499,7 +508,9 @@ def _ordered_subset(values: set[str], schema: object | None = None) -> list[str]
     return sorted(values)
 
 
-def _combine_query_predicates(left: object | None, right: object | None) -> object | None:
+def _combine_query_predicates(
+    left: object | None, right: object | None
+) -> object | None:
     if left is None:
         return right
     if right is None:
@@ -562,10 +573,14 @@ def _query_expr_from_json(payload: dict[str, object]) -> object:
     if kind == "literal":
         return lit(payload.get("value"))
     if kind == "alias":
-        return _literal(_query_expr_from_json(payload["arg"])).alias(str(payload["value"]))
+        return _literal(_query_expr_from_json(payload["arg"])).alias(
+            str(payload["value"])
+        )
     if kind == "is_in":
         args = payload["args"]
-        return _literal(_query_expr_from_json(args[0])).is_in(_query_expr_from_json(args[1])._value)
+        return _literal(_query_expr_from_json(args[0])).is_in(
+            _query_expr_from_json(args[1])._value
+        )
     if kind == "is_null":
         return _literal(_query_expr_from_json(payload["arg"])).is_null()
     if kind == "is_not_null":
@@ -621,7 +636,9 @@ def _query_plan_to_json(plan_ops: list[tuple[str, object]]) -> list[dict[str, ob
         if kind == "filter":
             plan.append({"op": "filter", "expr": _query_expr_to_json(value)})
         elif kind == "select":
-            plan.append({"op": "select", "exprs": [_query_expr_to_json(expr) for expr in value]})
+            plan.append(
+                {"op": "select", "exprs": [_query_expr_to_json(expr) for expr in value]}
+            )
         elif kind == "with_columns":
             plan.append(
                 {
@@ -652,7 +669,9 @@ def _query_plan_to_json(plan_ops: list[tuple[str, object]]) -> list[dict[str, ob
         elif kind == "rename":
             plan.append({"op": "rename", "mapping": dict(value)})
         elif kind == "join":
-            raise ValueError("remote query join is not supported in this gateway version")
+            raise ValueError(
+                "remote query join is not supported in this gateway version"
+            )
         else:
             raise ValueError(f"unsupported table plan operation=[{kind}]")
     return plan
@@ -664,9 +683,13 @@ def _apply_query_plan_json(table: "Table", plan: list[dict[str, object]]) -> "Ta
         if op == "filter":
             table = table.filter(_query_expr_from_json(item["expr"]))
         elif op == "select":
-            table = table.select([_query_expr_from_json(expr) for expr in item["exprs"]])
+            table = table.select(
+                [_query_expr_from_json(expr) for expr in item["exprs"]]
+            )
         elif op == "with_columns":
-            table = table.with_columns([_query_expr_from_json(expr) for expr in item["exprs"]])
+            table = table.with_columns(
+                [_query_expr_from_json(expr) for expr in item["exprs"]]
+            )
         elif op == "tail":
             table = table.tail(int(item["n"]))
         elif op == "head":
@@ -721,7 +744,9 @@ class _HeartbeatHandle:
                         self.last_error = hook_error
                         return
                     try:
-                        unregister_process = getattr(self.master, "unregister_process", None)
+                        unregister_process = getattr(
+                            self.master, "unregister_process", None
+                        )
                         if callable(unregister_process):
                             unregister_process()
                         self.last_error = None
@@ -1167,7 +1192,9 @@ def _compact_table(
         "table_name": table_name,
         "groups_compacted": len(compacted_files),
         "files_compacted": len(compacted_source_keys),
-        "rows_compacted": sum(int(item.get("row_count", 0)) for item in compacted_files),
+        "rows_compacted": sum(
+            int(item.get("row_count", 0)) for item in compacted_files
+        ),
         "compacted_files": compacted_files,
         "source_files_deleted": deleted,
         "source_file_delete_errors": delete_errors,
@@ -1227,9 +1254,15 @@ def _compact_tables(
         "tables_compacted": sum(
             1 for result in table_results if int(result.get("groups_compacted", 0)) > 0
         ),
-        "groups_compacted": sum(int(result.get("groups_compacted", 0)) for result in table_results),
-        "files_compacted": sum(int(result.get("files_compacted", 0)) for result in table_results),
-        "rows_compacted": sum(int(result.get("rows_compacted", 0)) for result in table_results),
+        "groups_compacted": sum(
+            int(result.get("groups_compacted", 0)) for result in table_results
+        ),
+        "files_compacted": sum(
+            int(result.get("files_compacted", 0)) for result in table_results
+        ),
+        "rows_compacted": sum(
+            int(result.get("rows_compacted", 0)) for result in table_results
+        ),
         "table_results": table_results,
         "table_errors": table_errors,
     }
@@ -1417,7 +1450,9 @@ def _freeze_compaction_table_names(table_names: object) -> object:
     try:
         names = tuple(str(item) for item in table_names)  # type: ignore[operator]
     except TypeError as error:
-        raise TypeError("table_names must be a table name or iterable of table names") from error
+        raise TypeError(
+            "table_names must be a table name or iterable of table names"
+        ) from error
     if not names:
         raise ValueError("table_names must not be empty")
     return names
@@ -1449,7 +1484,9 @@ def _persisted_compaction_group_key(item: dict[str, object], path: Path) -> str:
         return f"partition_path:{partition_path}"
     partition = item.get("partition")
     if isinstance(partition, dict) and partition:
-        return f"partition:{json.dumps(partition, sort_keys=True, separators=(',', ':'))}"
+        return (
+            f"partition:{json.dumps(partition, sort_keys=True, separators=(',', ':'))}"
+        )
     return f"parent:{path.parent}"
 
 
@@ -1466,7 +1503,9 @@ def _compact_persisted_file_group(
     first_file = group_files[0]
     target_dir = Path(str(first_file["file_path"])).parent
     target_path = target_dir / _compacted_parquet_file_name(table_name, group_files)
-    temp_path = target_path.with_name(f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+    temp_path = target_path.with_name(
+        f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
     pq.write_table(table, temp_path)
     os.replace(temp_path, target_path)
     return _compacted_persisted_file_metadata(
@@ -1484,7 +1523,8 @@ def _compacted_parquet_file_name(
 ) -> str:
     digest = hashlib.sha1(
         "|".join(
-            str(item.get("persist_file_id") or item.get("file_path")) for item in group_files
+            str(item.get("persist_file_id") or item.get("file_path"))
+            for item in group_files
         ).encode("utf-8")
     ).hexdigest()[:16]
     return f"compact-{_safe_file_token(table_name)}-{digest}.parquet"
@@ -1508,7 +1548,8 @@ def _compacted_persisted_file_metadata(
     ]
     digest = hashlib.sha1(
         "|".join(
-            str(item.get("persist_file_id") or item.get("file_path")) for item in group_files
+            str(item.get("persist_file_id") or item.get("file_path"))
+            for item in group_files
         ).encode("utf-8")
     ).hexdigest()[:16]
     metadata: dict[str, object] = {
@@ -1553,7 +1594,9 @@ class Ops:
     focused on high-frequency user workflows such as ``read_table`` and ``subscribe``.
     """
 
-    def list_tables(self, master: MasterClient | None = None) -> list[dict[str, object]]:
+    def list_tables(
+        self, master: MasterClient | None = None
+    ) -> list[dict[str, object]]:
         """
         List tables registered in the connected Zippy master.
 
@@ -1791,7 +1834,9 @@ def _resolve_uri_path(uri: str) -> str:
 
 def _logical_control_endpoint_path(name: str) -> str:
     endpoint_name = name or "default"
-    return str(_home_dir() / ".zippy" / "control_endpoints" / endpoint_name / "master.sock")
+    return str(
+        _home_dir() / ".zippy" / "control_endpoints" / endpoint_name / "master.sock"
+    )
 
 
 def _home_dir() -> Path:
@@ -1867,10 +1912,13 @@ def _wait_for_table_ready(
         else:
             if stream.get("data_path") != "segment":
                 return
-            if stream.get("status") != "stale" and stream.get("active_segment_descriptor"):
+            if stream.get("status") != "stale" and stream.get(
+                "active_segment_descriptor"
+            ):
                 return
             last_error = RuntimeError(
-                "table is not ready " f"source=[{source}] status=[{stream.get('status')}]"
+                "table is not ready "
+                f"source=[{source}] status=[{stream.get('status')}]"
             )
 
         if deadline is not None:
@@ -1912,7 +1960,10 @@ def _ensure_default_heartbeat() -> None:
     with _DEFAULT_HEARTBEAT_LOCK:
         if _DEFAULT_MASTER is None:
             return
-        if _DEFAULT_HEARTBEAT is not None and _DEFAULT_HEARTBEAT.master is _DEFAULT_MASTER:
+        if (
+            _DEFAULT_HEARTBEAT is not None
+            and _DEFAULT_HEARTBEAT.master is _DEFAULT_MASTER
+        ):
             return
 
         process_id = getattr(_DEFAULT_MASTER, "process_id", lambda: None)()
@@ -1992,7 +2043,9 @@ def _remote_gateway_endpoint(master: object) -> str | None:
         candidate = _normalize_remote_endpoint(value) if value else None
     elif isinstance(endpoint, str):
         candidate = _normalize_remote_endpoint(endpoint)
-    if candidate is None and callable(get_config := getattr(master, "get_config", None)):
+    if candidate is None and callable(
+        get_config := getattr(master, "get_config", None)
+    ):
         gateway = get_config().get("gateway", {})
         if isinstance(gateway, dict) and gateway.get("enabled") is False:
             return None
@@ -2129,7 +2182,9 @@ def _remote_request(
     timeout_sec: float | None = None,
 ) -> tuple[dict[str, object], bytes]:
     host, port = _parse_remote_endpoint(endpoint)
-    timeout_sec = _remote_gateway_timeout_sec() if timeout_sec is None else float(timeout_sec)
+    timeout_sec = (
+        _remote_gateway_timeout_sec() if timeout_sec is None else float(timeout_sec)
+    )
     if token is not None:
         header = dict(header)
         header["token"] = token
@@ -2162,7 +2217,9 @@ def _remote_request(
     return response, response_payload
 
 
-def _remote_master_get_config(endpoint: str, timeout_sec: float = 5.0) -> dict[str, object]:
+def _remote_master_get_config(
+    endpoint: str, timeout_sec: float = 5.0
+) -> dict[str, object]:
     host, port = _parse_remote_endpoint(endpoint)
     with socket.create_connection((host, port), timeout=timeout_sec) as sock:
         sock.sendall(b'{"GetConfig":{}}\n')
@@ -2173,7 +2230,9 @@ def _remote_master_get_config(endpoint: str, timeout_sec: float = 5.0) -> dict[s
                 break
             response_line += chunk
     if not response_line:
-        raise RuntimeError(f"remote master returned empty response endpoint=[{endpoint}]")
+        raise RuntimeError(
+            f"remote master returned empty response endpoint=[{endpoint}]"
+        )
     response = json.loads(response_line.decode("utf-8"))
     if "Error" in response:
         reason = response["Error"].get("reason", "remote master get_config failed")
@@ -2227,7 +2286,11 @@ def _value_to_pyarrow_table(value: object, schema: object | None = None):
     import pyarrow as pa
 
     if isinstance(value, pa.Table):
-        return value.cast(schema) if schema is not None and value.schema != schema else value
+        return (
+            value.cast(schema)
+            if schema is not None and value.schema != schema
+            else value
+        )
     if isinstance(value, pa.RecordBatch):
         table = pa.Table.from_batches([value])
         return table.cast(schema) if schema is not None else table
@@ -2260,7 +2323,9 @@ class RemoteMasterClient:
         self._endpoint = _normalize_remote_endpoint(endpoint)
         self._token = token
         self._master_endpoint = (
-            _normalize_remote_endpoint(master_endpoint) if master_endpoint is not None else None
+            _normalize_remote_endpoint(master_endpoint)
+            if master_endpoint is not None
+            else None
         )
         self._process_id: str | None = None
 
@@ -2278,7 +2343,8 @@ class RemoteMasterClient:
         gateway = config.get("gateway", {})
         if not isinstance(gateway, dict) or not gateway.get("endpoint"):
             raise RuntimeError(
-                "remote master does not advertise gateway.endpoint " f"endpoint=[{endpoint}]"
+                "remote master does not advertise gateway.endpoint "
+                f"endpoint=[{endpoint}]"
             )
         token = str(gateway["token"]) if gateway.get("token") else None
         return cls(str(gateway["endpoint"]), token=token, master_endpoint=endpoint)
@@ -2623,7 +2689,11 @@ class RemoteStreamSubscriber:
             request = {
                 "kind": "subscribe_table",
                 "source": self.source,
-                "filter": (_query_expr_to_json(self.filter) if self.filter is not None else None),
+                "filter": (
+                    _query_expr_to_json(self.filter)
+                    if self.filter is not None
+                    else None
+                ),
                 "batch_size": self.batch_size,
                 "throttle_ms": self.throttle_ms,
                 "count": self.count,
@@ -2653,7 +2723,9 @@ class RemoteStreamSubscriber:
 
 
 class _LocalGatewayWriter:
-    def __init__(self, stream_name: str, schema: object, master: MasterClient | None) -> None:
+    def __init__(
+        self, stream_name: str, schema: object, master: MasterClient | None
+    ) -> None:
         self._pipeline = (
             Pipeline(f"remote_gateway.{stream_name}.{os.getpid()}", master=master)
             .stream_table(stream_name, schema=schema)
@@ -2688,15 +2760,21 @@ class GatewayServer:
         max_write_rows: int | None = None,
     ) -> None:
         if writer_factory is not None or stream_info_provider is not None:
-            raise ValueError("GatewayServer no longer accepts Python writer/stream providers")
+            raise ValueError(
+                "GatewayServer no longer accepts Python writer/stream providers"
+            )
         if query_executor is not None or subscribe_table_provider is not None:
-            raise ValueError("GatewayServer no longer accepts Python query/subscribe providers")
+            raise ValueError(
+                "GatewayServer no longer accepts Python query/subscribe providers"
+            )
         self.endpoint = _normalize_remote_endpoint(endpoint)
         self.master = master
         self.token = token
         if max_write_rows is not None and int(max_write_rows) <= 0:
             raise ValueError("max_write_rows must be positive")
-        self.max_write_rows = int(max_write_rows) if max_write_rows is not None else None
+        self.max_write_rows = (
+            int(max_write_rows) if max_write_rows is not None else None
+        )
         self._native = _NativeGatewayServer(
             endpoint=self.endpoint,
             master=master,
@@ -2753,7 +2831,9 @@ def get_writer(
 
     if schema is None:
         if not create:
-            raise ValueError("local get_writer requires schema or create=True with schema")
+            raise ValueError(
+                "local get_writer requires schema or create=True with schema"
+            )
         raise ValueError("schema is required when creating a local writer")
     return _LocalGatewayWriter(stream_name, schema, selected_master)
 
@@ -2791,7 +2871,9 @@ class Table:
             if wait:
                 _wait_for_table_ready(source, selected_master, timeout)
             remote_endpoint = (
-                None if _force_local else _remote_gateway_endpoint_for_data(selected_master)
+                None
+                if _force_local
+                else _remote_gateway_endpoint_for_data(selected_master)
             )
             if remote_endpoint is not None:
                 self._inner = _RemoteQuery(
@@ -2861,7 +2943,9 @@ class Table:
         """
         if length is not None and length < 0:
             raise ValueError("length must be non-negative")
-        return self._clone_with_plan(plan_op=("slice", {"offset": int(offset), "length": length}))
+        return self._clone_with_plan(
+            plan_op=("slice", {"offset": int(offset), "length": length})
+        )
 
     def sort(
         self,
@@ -2882,8 +2966,14 @@ class Table:
         keys = list(by) if isinstance(by, (list, tuple)) else [by]
         if not keys:
             raise ValueError("sort requires at least one key")
-        directions = list(descending) if isinstance(descending, (list, tuple)) else bool(descending)
-        return self._clone_with_plan(plan_op=("sort", {"by": keys, "descending": directions}))
+        directions = (
+            list(descending)
+            if isinstance(descending, (list, tuple))
+            else bool(descending)
+        )
+        return self._clone_with_plan(
+            plan_op=("sort", {"by": keys, "descending": directions})
+        )
 
     def drop(self, *columns: object) -> Table:
         """
@@ -3199,7 +3289,9 @@ class Table:
                 "filters": pushdown_plan["filters"],
             },
             "pushdown_plan": pushdown_plan,
-            "residual_plan": _query_plan_to_json(self._residual_plan_ops(optimized_plan)),
+            "residual_plan": _query_plan_to_json(
+                self._residual_plan_ops(optimized_plan)
+            ),
         }
 
     def to_pyarrow(self):
@@ -3287,7 +3379,9 @@ class Table:
         files = self.persisted_files()
         paths = [str(item["file_path"]) for item in files if item.get("file_path")]
         if not paths:
-            raise RuntimeError(f"persisted files are not registered source=[{self.source}]")
+            raise RuntimeError(
+                f"persisted files are not registered source=[{self.source}]"
+            )
         import pyarrow.dataset as ds
 
         return ds.dataset(paths, format="parquet")
@@ -3343,7 +3437,11 @@ class Table:
         return optimized
 
     def _executor_kind(self) -> str:
-        return "remote" if callable(getattr(self._inner, "collect_plan", None)) else "local"
+        return (
+            "remote"
+            if callable(getattr(self._inner, "collect_plan", None))
+            else "local"
+        )
 
     def _new_query_metrics(self) -> dict[str, object]:
         schema = self.schema()
@@ -3353,7 +3451,9 @@ class Table:
             "original_plan": _query_plan_to_json(self._plan_ops),
             "optimized_plan": _query_plan_to_json(optimized_plan),
             "pushdown_plan": self._pushdown_plan_summary(schema, optimized_plan),
-            "residual_plan": _query_plan_to_json(self._residual_plan_ops(optimized_plan)),
+            "residual_plan": _query_plan_to_json(
+                self._residual_plan_ops(optimized_plan)
+            ),
             "scanned_files": [],
             "scanned_rows": 0,
             "scanned_live_rows": 0,
@@ -3399,7 +3499,9 @@ class Table:
             return []
         return list(plan_ops)
 
-    def _tail_pushdown_count(self, plan_ops: list[tuple[str, object]] | None = None) -> int | None:
+    def _tail_pushdown_count(
+        self, plan_ops: list[tuple[str, object]] | None = None
+    ) -> int | None:
         plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
         if len(plan_ops) != 1:
             return None
@@ -3408,7 +3510,9 @@ class Table:
             return None
         return int(value)
 
-    def _head_pushdown_count(self, plan_ops: list[tuple[str, object]] | None = None) -> int | None:
+    def _head_pushdown_count(
+        self, plan_ops: list[tuple[str, object]] | None = None
+    ) -> int | None:
         plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
         if len(plan_ops) != 1:
             return None
@@ -3513,9 +3617,13 @@ class Table:
             if kind == "filter":
                 frame = frame.filter(_compile_query_expr_to_polars(value))
             elif kind == "select":
-                frame = frame.select([_compile_query_expr_to_polars(expr) for expr in value])
+                frame = frame.select(
+                    [_compile_query_expr_to_polars(expr) for expr in value]
+                )
             elif kind == "with_columns":
-                frame = frame.with_columns([_compile_query_expr_to_polars(expr) for expr in value])
+                frame = frame.with_columns(
+                    [_compile_query_expr_to_polars(expr) for expr in value]
+                )
             elif kind == "join":
                 other = value["other"]
                 right_frame = pl.from_arrow(other.collect()).lazy()
@@ -3723,7 +3831,9 @@ def _coerce_replay_table(value, master: MasterClient | None):
     if callable(to_table):
         return to_table()
 
-    raise TypeError("replay comparison input must be a table name or Arrow-compatible object")
+    raise TypeError(
+        "replay comparison input must be a table name or Arrow-compatible object"
+    )
 
 
 def _sort_replay_table(table, by: str | list[str] | tuple[str, ...] | None):
@@ -3732,7 +3842,9 @@ def _sort_replay_table(table, by: str | list[str] | tuple[str, ...] | None):
     keys = [by] if isinstance(by, str) else [str(item) for item in by]
     missing = [name for name in keys if name not in table.column_names]
     if missing:
-        raise ValueError(f"replay comparison key columns are missing columns=[{missing}]")
+        raise ValueError(
+            f"replay comparison key columns are missing columns=[{missing}]"
+        )
     return table.sort_by([(name, "ascending") for name in keys])
 
 
@@ -3761,7 +3873,9 @@ def _replay_row_deltas(left, right) -> tuple[int, int]:
 
 
 def _table_row_counter(table) -> Counter:
-    return Counter(_arrow_row_bytes(table, row_index) for row_index in range(table.num_rows))
+    return Counter(
+        _arrow_row_bytes(table, row_index) for row_index in range(table.num_rows)
+    )
 
 
 def _arrow_row_bytes(table, row_index: int) -> bytes:
@@ -3844,7 +3958,9 @@ def _slice_persisted_rows(
     length: int | None,
     metrics: dict[str, object] | None = None,
 ):
-    files = sorted(_non_overlapping_persisted_files(snapshot), key=_persisted_file_order_key)
+    files = sorted(
+        _non_overlapping_persisted_files(snapshot), key=_persisted_file_order_key
+    )
     if not files:
         return None, 0, 0
 
@@ -3933,7 +4049,9 @@ def _read_persisted_parquet_file(
 ):
     import pyarrow.parquet as pq
 
-    return pq.read_table(str(file_path), columns=columns, filters=filters, partitioning=None)
+    return pq.read_table(
+        str(file_path), columns=columns, filters=filters, partitioning=None
+    )
 
 
 def _record_persisted_file_scan(
@@ -3952,11 +4070,15 @@ def _record_persisted_file_scan(
 def _record_live_scan(metrics: dict[str, object] | None, table: object) -> None:
     if metrics is None:
         return
-    metrics["scanned_live_rows"] = int(metrics.get("scanned_live_rows", 0)) + table.num_rows
+    metrics["scanned_live_rows"] = (
+        int(metrics.get("scanned_live_rows", 0)) + table.num_rows
+    )
     metrics["scanned_rows"] = int(metrics.get("scanned_rows", 0)) + table.num_rows
 
 
-def _merge_remote_collect_metrics(metrics: dict[str, object], remote_query: object) -> None:
+def _merge_remote_collect_metrics(
+    metrics: dict[str, object], remote_query: object
+) -> None:
     last_collect_metrics = getattr(remote_query, "last_collect_metrics", None)
     if not callable(last_collect_metrics):
         return
@@ -4056,7 +4178,9 @@ def _range_may_match_filter(
     return True
 
 
-def _partition_value_matches_filter(partition_value: object, op: str, value: object) -> bool:
+def _partition_value_matches_filter(
+    partition_value: object, op: str, value: object
+) -> bool:
     if op == "==":
         return str(partition_value) == str(value)
     if op == "!=":
@@ -4203,7 +4327,9 @@ def _schema_for_query_columns(schema: object | None, columns: list[str] | None):
 
 def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int]]:
     identities: set[tuple[int, int]] = set()
-    active_identity = _descriptor_segment_identity(snapshot.get("active_segment_descriptor"))
+    active_identity = _descriptor_segment_identity(
+        snapshot.get("active_segment_descriptor")
+    )
     if active_identity is not None:
         identities.add(active_identity)
 
@@ -4528,7 +4654,9 @@ class StreamSubscriber:
         if filter is not None and instrument_ids is not None:
             raise ValueError("filter and instrument_ids cannot be used together")
         if _table_callback and instrument_ids is not None:
-            raise ValueError("instrument_ids is only supported by subscribe row callbacks")
+            raise ValueError(
+                "instrument_ids is only supported by subscribe row callbacks"
+            )
         if _table_callback:
             callback = _TableSubscriptionCallback(
                 callback,
@@ -4650,7 +4778,11 @@ def subscribe(
             raise ValueError("filter and instrument_ids cannot be used together")
         remote_filter = filter
         if remote_filter is None and instrument_ids is not None:
-            values = [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
+            values = (
+                [instrument_ids]
+                if isinstance(instrument_ids, str)
+                else list(instrument_ids)
+            )
             remote_filter = col("instrument_id").is_in(values)
         return RemoteStreamSubscriber(
             source,
@@ -4859,7 +4991,9 @@ def _normalize_parquet_replay_paths(value: object) -> str | list[str]:
     try:
         paths = [str(Path(item).expanduser()) for item in value]  # type: ignore[arg-type]
     except TypeError as error:
-        raise TypeError("parquet replay source must be a path or a sequence of paths") from error
+        raise TypeError(
+            "parquet replay source must be a path or a sequence of paths"
+        ) from error
     if not paths:
         raise ValueError("parquet replay source path list must not be empty")
     return paths
@@ -4883,7 +5017,9 @@ def _arrow_scalar_to_python(value):
         raise
 
 
-def _normalize_replay_timing(mode: str, replay_rate: object) -> tuple[str, float | None]:
+def _normalize_replay_timing(
+    mode: str, replay_rate: object
+) -> tuple[str, float | None]:
     if replay_rate is not None:
         try:
             rate = float(replay_rate)
@@ -5039,7 +5175,9 @@ class ParquetReplaySource:
         import pyarrow as pa
         import pyarrow.dataset as ds
 
-        scanner = ds.dataset(self.path, format="parquet").scanner(batch_size=self.batch_size)
+        scanner = ds.dataset(self.path, format="parquet").scanner(
+            batch_size=self.batch_size
+        )
         expected_schema = self._zippy_output_schema()
         for batch in scanner.to_batches():
             if batch.num_rows == 0:
@@ -5282,7 +5420,9 @@ class ParquetReplayEngine:
             raise RuntimeError("replay engine is not started")
         completed = self._source.wait_replay(timeout)
         if not completed:
-            raise TimeoutError(f"table replay did not finish output_stream=[{self.output_stream}]")
+            raise TimeoutError(
+                f"table replay did not finish output_stream=[{self.output_stream}]"
+            )
         return True
 
     def stop(self) -> None:
@@ -5417,7 +5557,9 @@ class TableReplayEngine:
         if self._delegate is None:
             self.init()
         elif self._delegate.status() != "initialized":
-            raise RuntimeError("table replay engine cannot be restarted after completion")
+            raise RuntimeError(
+                "table replay engine cannot be restarted after completion"
+            )
 
         if self._delegate is None:
             raise RuntimeError("table replay engine is not initialized")
@@ -5434,7 +5576,9 @@ class TableReplayEngine:
         if self._delegate is not None:
             if self._delegate.status() in {"initialized", "running"}:
                 return self
-            raise RuntimeError("table replay engine cannot be initialized after completion")
+            raise RuntimeError(
+                "table replay engine cannot be initialized after completion"
+            )
         paths, schema = self._resolve_persisted_paths_and_schema()
         self._delegate = ParquetReplayEngine(
             paths,
@@ -5519,7 +5663,9 @@ class TableReplayEngine:
             if item.get("file_path")
         ]
         if not paths:
-            raise RuntimeError(f"persisted files are not registered source=[{self.source}]")
+            raise RuntimeError(
+                f"persisted files are not registered source=[{self.source}]"
+            )
         return paths, self.schema or table.schema()
 
 
@@ -5691,10 +5837,14 @@ class Session:
 
         materializers: list[object] = []
         if isinstance(engine, type):
-            engine_obj, materializers, pending_output = self._build_engine(engine, kwargs)
+            engine_obj, materializers, pending_output = self._build_engine(
+                engine, kwargs
+            )
         else:
             if kwargs:
-                raise TypeError("engine instance does not accept constructor keyword arguments")
+                raise TypeError(
+                    "engine instance does not accept constructor keyword arguments"
+                )
             engine_obj = engine
             pending_output = None
 
@@ -5813,7 +5963,9 @@ class Session:
     def _build_engine(self, engine_cls: type, kwargs: dict[str, object]):
         explicit_target = "target" in kwargs
         if "output" in kwargs:
-            raise TypeError("output is not supported; use output_stream or .stream_table(...)")
+            raise TypeError(
+                "output is not supported; use output_stream or .stream_table(...)"
+            )
         output_stream = kwargs.pop("output_stream", None)
         if output_stream is not None and not isinstance(output_stream, str):
             raise TypeError("output_stream must be a stream table name")
@@ -5835,7 +5987,9 @@ class Session:
             )
         )
         if persist and output_table_name is None:
-            raise ValueError("persist=True requires automatic output table materialization")
+            raise ValueError(
+                "persist=True requires automatic output table materialization"
+            )
 
         if not explicit_target:
             kwargs["target"] = NullPublisher()
@@ -5846,7 +6000,9 @@ class Session:
 
         materializers: list[object] = []
         pending_output = None
-        if output_stream is not None and callable(getattr(engine, "output_schema", None)):
+        if output_stream is not None and callable(
+            getattr(engine, "output_schema", None)
+        ):
             materializers.append(
                 self._materialize_engine_output(
                     engine,
@@ -5876,7 +6032,9 @@ class Session:
         *,
         persist: bool,
     ) -> None:
-        materializer = self._materialize_engine_output(engine, table_name, persist=persist)
+        materializer = self._materialize_engine_output(
+            engine, table_name, persist=persist
+        )
         engine_index = self._runtime_engines.index(engine)
         self._runtime_engines.insert(engine_index, materializer)
         self._materialized_engine_ids.add(id(engine))
@@ -5903,7 +6061,9 @@ class Session:
         )
         latest_by = _engine_latest_by(engine)
         if latest_by is not None and table_options["persist_path"] is not None:
-            raise ValueError("ReactiveLatestEngine stream_table does not support persist=True")
+            raise ValueError(
+                "ReactiveLatestEngine stream_table does not support persist=True"
+            )
         _ensure_master_process(self.master, self.app or self.name)
         self.master.register_stream(table_name, output_schema, 64, 4096)
         self._register_materializer_source(table_name)
@@ -5917,7 +6077,9 @@ class Session:
                 descriptor_publisher=self._descriptor_publisher(table_name),
                 row_capacity=table_options["row_capacity"],
                 retention_guard=self._retention_guard(table_name),
-                replacement_retention_snapshots=table_options["replacement_retention_snapshots"],
+                replacement_retention_snapshots=table_options[
+                    "replacement_retention_snapshots"
+                ],
             )
         else:
             materializer = _StreamTableMaterializer(
@@ -5939,7 +6101,9 @@ class Session:
                     else None
                 ),
             )
-        self.master.publish_segment_descriptor(table_name, materializer.active_descriptor())
+        self.master.publish_segment_descriptor(
+            table_name, materializer.active_descriptor()
+        )
         self._needs_master_process = True
         return materializer
 
@@ -6007,12 +6171,16 @@ class Session:
                 isinstance(persisted_file, dict)
                 and persisted_file.get("persist_event_type") is not None
             ):
-                publish_persist_event = getattr(self.master, "publish_persist_event", None)
+                publish_persist_event = getattr(
+                    self.master, "publish_persist_event", None
+                )
                 if publish_persist_event is None:
                     raise RuntimeError("master does not support publish_persist_event")
                 publish_persist_event(stream_name, persisted_file)
                 return
-            publish_persisted_file = getattr(self.master, "publish_persisted_file", None)
+            publish_persisted_file = getattr(
+                self.master, "publish_persisted_file", None
+            )
             if publish_persisted_file is None:
                 raise RuntimeError("master does not support publish_persisted_file")
             publish_persisted_file(stream_name, persisted_file)
@@ -6099,7 +6267,9 @@ class Pipeline:
         :rtype: Pipeline
         """
         self._source = source
-        self._source_name = name or self._call_optional_source_string("_zippy_source_name")
+        self._source_name = name or self._call_optional_source_string(
+            "_zippy_source_name"
+        )
         self._source_type = (
             source_type
             or self._call_optional_source_string("_zippy_source_type")
@@ -6194,7 +6364,9 @@ class Pipeline:
             dt_part=table_options["dt_part"],
             persist_path=table_options["persist_path"],
             persist_publisher=(
-                self._persist_publisher(name) if table_options["persist_path"] is not None else None
+                self._persist_publisher(name)
+                if table_options["persist_path"] is not None
+                else None
             ),
             # Windows file-backed mappings can be deleted as soon as the
             # upstream source retires a segment, so default to a table-owned
@@ -6300,7 +6472,9 @@ class Pipeline:
 
     def _infer_source_schema(self):
         if self._source is None or not hasattr(self._source, "_zippy_output_schema"):
-            raise ValueError("stream_table schema is required when source does not expose schema")
+            raise ValueError(
+                "stream_table schema is required when source does not expose schema"
+            )
         return self._source._zippy_output_schema()
 
     def _call_optional_source_string(self, method_name: str) -> str | None:
@@ -6335,12 +6509,16 @@ class Pipeline:
                 isinstance(persisted_file, dict)
                 and persisted_file.get("persist_event_type") is not None
             ):
-                publish_persist_event = getattr(self.master, "publish_persist_event", None)
+                publish_persist_event = getattr(
+                    self.master, "publish_persist_event", None
+                )
                 if publish_persist_event is None:
                     raise RuntimeError("master does not support publish_persist_event")
                 publish_persist_event(stream_name, persisted_file)
                 return
-            publish_persisted_file = getattr(self.master, "publish_persisted_file", None)
+            publish_persisted_file = getattr(
+                self.master, "publish_persisted_file", None
+            )
             if publish_persisted_file is None:
                 raise RuntimeError("master does not support publish_persisted_file")
             publish_persisted_file(stream_name, persisted_file)
@@ -6368,7 +6546,9 @@ class Pipeline:
 
     def _require_engine(self) -> _StreamTableMaterializer:
         if self._engine is None:
-            raise RuntimeError("pipeline stream_table() must be configured before start/write")
+            raise RuntimeError(
+                "pipeline stream_table() must be configured before start/write"
+            )
         return self._engine
 
 
@@ -6402,7 +6582,9 @@ def _resolve_stream_table_options(
     data_dir: str | os.PathLike[str] | None,
     persist_path: ParquetPersist | str | os.PathLike[str] | None,
 ) -> dict[str, object]:
-    if persist_path is not None and (persist is not _USE_MASTER_CONFIG or data_dir is not None):
+    if persist_path is not None and (
+        persist is not _USE_MASTER_CONFIG or data_dir is not None
+    ):
         raise ValueError("persist_path cannot be combined with persist or data_dir")
 
     master_config = _master_config(master)
@@ -6427,7 +6609,9 @@ def _resolve_stream_table_options(
             retention_segments = int(configured_retention_segments)
     if retention_segments is not None and retention_segments < 0:
         raise ValueError("retention_segments must be non-negative")
-    replacement_retention_snapshots = int(table_config.get("replacement_retention_snapshots", 8))
+    replacement_retention_snapshots = int(
+        table_config.get("replacement_retention_snapshots", 8)
+    )
     if replacement_retention_snapshots <= 0:
         raise ValueError("replacement_retention_snapshots must be greater than zero")
 
@@ -6437,7 +6621,9 @@ def _resolve_stream_table_options(
         id_column = _optional_config_string(partition_config.get("id_column"))
     if dt_part is None:
         dt_part = _optional_config_string(partition_config.get("dt_part"))
-    _validate_partition_options(dt_column=dt_column, id_column=id_column, dt_part=dt_part)
+    _validate_partition_options(
+        dt_column=dt_column, id_column=id_column, dt_part=dt_part
+    )
 
     if persist_path is not None:
         return {
@@ -6508,7 +6694,11 @@ def _validate_partition_options(
 class _PolicyConstant:
     """Represent a predefined policy constant understood by the Rust bindings."""
 
-    __slots__ = ("_zippy_constant_kind", "_zippy_constant_value", "_zippy_constant_name")
+    __slots__ = (
+        "_zippy_constant_kind",
+        "_zippy_constant_value",
+        "_zippy_constant_name",
+    )
 
     def __init__(self, *, kind: str, value: str, name: str) -> None:
         self._zippy_constant_kind = kind
@@ -6589,6 +6779,123 @@ class SourceMode:
 
     def __new__(cls, *args: object, **kwargs: object) -> "SourceMode":
         raise TypeError("SourceMode cannot be instantiated")
+
+
+@dataclass(frozen=True)
+class _BarInputColumns:
+    instrument: str
+    dt: str
+    price: str
+    volume: str
+    total_turnover: str
+    trading_day: str | None = None
+    num_trades: str | None = None
+    limit_up: str | None = None
+    limit_down: str | None = None
+
+    def to_bar_generator_spec(self) -> dict[str, str | None]:
+        return {
+            "instrument": self.instrument,
+            "dt": self.dt,
+            "price": self.price,
+            "volume": self.volume,
+            "total_turnover": self.total_turnover,
+            "trading_day": self.trading_day,
+            "num_trades": self.num_trades,
+            "limit_up": self.limit_up,
+            "limit_down": self.limit_down,
+        }
+
+
+@dataclass(frozen=True)
+class _BarTradingSessions:
+    timezone: str
+    regular: list[tuple[str, str]]
+    auction: list[tuple[str, str]]
+
+    def to_bar_generator_spec(self) -> dict[str, object]:
+        return {
+            "timezone": self.timezone,
+            "regular": self.regular,
+            "auction": self.auction,
+        }
+
+
+@dataclass(frozen=True)
+class _BarVolume:
+    spec: dict[str, object]
+
+    @staticmethod
+    def delta() -> "_BarVolume":
+        return _BarVolume({"mode": "delta"})
+
+    @staticmethod
+    def cumulative(
+        *,
+        trading_day_column: str,
+        bootstrap: str = "skip_first_delta",
+    ) -> "_BarVolume":
+        return _BarVolume(
+            {
+                "mode": "cumulative",
+                "trading_day_column": trading_day_column,
+                "bootstrap": bootstrap,
+            }
+        )
+
+    def to_bar_generator_spec(self) -> dict[str, object]:
+        return dict(self.spec)
+
+
+@dataclass(frozen=True)
+class _BarAuction:
+    mode: str
+
+    @staticmethod
+    def drop() -> "_BarAuction":
+        return _BarAuction("drop")
+
+    @staticmethod
+    def merge_to_first_regular_bar() -> "_BarAuction":
+        return _BarAuction("merge_to_first_regular_bar")
+
+    @staticmethod
+    def emit_separate_bar() -> "_BarAuction":
+        return _BarAuction("emit_separate_bar")
+
+    def to_bar_generator_spec(self) -> str:
+        return self.mode
+
+
+@dataclass(frozen=True)
+class _BarGeneratorProfile:
+    frequency: str
+    columns: _BarInputColumns
+    sessions: _BarTradingSessions
+    volume: _BarVolume
+    auction: _BarAuction
+    dt_label: str = "close_dt"
+
+    def to_bar_generator_spec(self) -> dict[str, object]:
+        return {
+            "frequency": self.frequency,
+            "columns": self.columns.to_bar_generator_spec(),
+            "sessions": self.sessions.to_bar_generator_spec(),
+            "volume": self.volume.to_bar_generator_spec(),
+            "auction": self.auction.to_bar_generator_spec(),
+            "dt_label": self.dt_label,
+        }
+
+
+class _BarNamespace:
+    InputColumns = _BarInputColumns
+    TradingSessions = _BarTradingSessions
+    Volume = _BarVolume
+    Auction = _BarAuction
+    BarGeneratorProfile = _BarGeneratorProfile
+
+
+bar = _BarNamespace()
 
 
 class Duration:
@@ -6755,6 +7062,7 @@ __all__ = [
     "AggMinSpec",
     "AggSumSpec",
     "AggVwapSpec",
+    "BarGeneratorEngine",
     "CastSpec",
     "ClipSpec",
     "CSDemeanSpec",
@@ -6823,6 +7131,7 @@ __all__ = [
     "ZmqStreamPublisher",
     "ZmqSubscriber",
     "__version__",
+    "bar",
     "col",
     "compare_replay",
     "config",
