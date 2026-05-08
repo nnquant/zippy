@@ -13,6 +13,9 @@ use crate::table_view::{float64_array, string_array, timestamp_ns_array};
 /// Supported one-minute bar frequency.
 pub const BAR_FREQUENCY_1M: &str = "1m";
 const BAR_FREQUENCY_1M_NS: i64 = 60_000_000_000;
+const SECOND_NS: i64 = 1_000_000_000;
+const LOCAL_DAY_SECONDS: i64 = 86_400;
+const LOCAL_DAY_NS: i64 = LOCAL_DAY_SECONDS * SECOND_NS;
 
 /// Input column names consumed by [`BarGeneratorEngine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,10 +44,10 @@ impl SessionWindow {
         let start_seconds = parse_seconds_since_midnight(start)?;
         let end_seconds = parse_seconds_since_midnight(end)?;
 
-        if start_seconds >= end_seconds {
+        if start_seconds == end_seconds {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
-                    "session start must be before end start=[{}] end=[{}]",
+                    "session start must not equal end start=[{}] end=[{}]",
                     start, end
                 ),
             });
@@ -56,9 +59,17 @@ impl SessionWindow {
         })
     }
 
-    /// Return whether the local second belongs to this non-cross-midnight window.
+    /// Return whether the local second belongs to this session window.
     pub fn contains(&self, seconds: u32) -> bool {
-        self.start_seconds <= seconds && seconds < self.end_seconds
+        if self.wraps_midnight() {
+            self.start_seconds <= seconds || seconds < self.end_seconds
+        } else {
+            self.start_seconds <= seconds && seconds < self.end_seconds
+        }
+    }
+
+    fn wraps_midnight(&self) -> bool {
+        self.start_seconds > self.end_seconds
     }
 }
 
@@ -130,6 +141,7 @@ pub struct BarGeneratorEngine {
     pending_auction_bars: BTreeMap<String, OpenBar>,
     open_auction_bars: BTreeMap<AuctionBarKey, OpenBar>,
     cumulative_states: BTreeMap<String, CumulativeState>,
+    timezone_offset_seconds: i64,
     pending_filtered_rows: u64,
 }
 
@@ -140,7 +152,7 @@ impl BarGeneratorEngine {
         input_schema: SchemaRef,
         spec: BarGeneratorSpec,
     ) -> Result<Self> {
-        validate_spec(input_schema.as_ref(), &spec)?;
+        let timezone_offset_seconds = validate_spec(input_schema.as_ref(), &spec)?;
         let output_schema = build_output_schema(input_schema.as_ref(), &spec)?;
 
         Ok(Self {
@@ -152,6 +164,7 @@ impl BarGeneratorEngine {
             pending_auction_bars: BTreeMap::new(),
             open_auction_bars: BTreeMap::new(),
             cumulative_states: BTreeMap::new(),
+            timezone_offset_seconds,
             pending_filtered_rows: 0,
         })
     }
@@ -296,13 +309,17 @@ impl BarGeneratorEngine {
         mut tick: TickRow,
         completed: &mut Vec<OpenBar>,
     ) -> Result<()> {
+        let current_window_start = minute_start_ns(tick.dt);
+        if self.spec.auction == AuctionPolicy::EmitSeparateBar {
+            self.drain_completed_auction_bars(current_window_start, completed);
+        }
+
         let Some(delta) = self.compute_volume_delta(&tick, TickSessionKind::Regular) else {
             return Ok(());
         };
         tick.volume = delta.volume;
         tick.total_turnover = delta.total_turnover;
 
-        let current_window_start = minute_start_ns(tick.dt);
         let window_start = delta.window_start.unwrap_or(current_window_start);
         let window_end =
             window_start
@@ -313,11 +330,20 @@ impl BarGeneratorEngine {
         let mut incoming_bar = if self.spec.auction == AuctionPolicy::MergeToFirstRegularBar {
             self.pending_auction_bars
                 .remove(&tick.instrument)
-                .map(|mut auction_bar| {
-                    auction_bar.start_dt = window_start;
-                    auction_bar.close_dt = window_end;
-                    auction_bar.update(&tick);
-                    auction_bar
+                .and_then(|mut auction_bar| {
+                    if auction_bar_matches_regular_window(
+                        &auction_bar,
+                        window_start,
+                        window_end,
+                        self.timezone_offset_seconds,
+                    ) {
+                        auction_bar.start_dt = window_start;
+                        auction_bar.close_dt = window_end;
+                        auction_bar.update(&tick);
+                        Some(auction_bar)
+                    } else {
+                        None
+                    }
                 })
                 .unwrap_or_else(|| OpenBar::from_tick(&tick, window_start, window_end))
         } else {
@@ -351,9 +377,11 @@ impl BarGeneratorEngine {
                 tick.volume = delta.volume;
                 tick.total_turnover = delta.total_turnover;
 
-                let Some((start_dt, close_dt)) =
-                    auction_window_bounds(&self.spec.sessions, tick.dt)
-                else {
+                let Some((start_dt, close_dt)) = auction_window_bounds(
+                    &self.spec.sessions,
+                    tick.dt,
+                    self.timezone_offset_seconds,
+                ) else {
                     self.pending_filtered_rows += 1;
                     return Ok(());
                 };
@@ -373,9 +401,11 @@ impl BarGeneratorEngine {
                 }
             }
             AuctionPolicy::EmitSeparateBar => {
-                let Some((start_dt, close_dt)) =
-                    auction_window_bounds(&self.spec.sessions, tick.dt)
-                else {
+                let Some((start_dt, close_dt)) = auction_window_bounds(
+                    &self.spec.sessions,
+                    tick.dt,
+                    self.timezone_offset_seconds,
+                ) else {
                     self.pending_filtered_rows += 1;
                     return Ok(());
                 };
@@ -404,6 +434,25 @@ impl BarGeneratorEngine {
         }
 
         Ok(())
+    }
+
+    fn drain_completed_auction_bars(
+        &mut self,
+        current_window_start: i64,
+        completed: &mut Vec<OpenBar>,
+    ) {
+        let completed_keys = self
+            .open_auction_bars
+            .keys()
+            .filter(|key| key.close_dt <= current_window_start)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for key in completed_keys {
+            if let Some(bar) = self.open_auction_bars.remove(&key) {
+                completed.push(bar);
+            }
+        }
     }
 
     fn insert_regular_bar(
@@ -534,7 +583,7 @@ impl Engine for BarGeneratorEngine {
                 row_index,
             })?;
 
-            match classify_session(&self.spec.sessions, tick.dt) {
+            match classify_session(&self.spec.sessions, tick.dt, self.timezone_offset_seconds) {
                 TickSessionKind::Regular => self.handle_regular_tick(tick, &mut completed)?,
                 TickSessionKind::Auction => self.handle_auction_tick(tick)?,
                 TickSessionKind::Outside => {
@@ -689,7 +738,7 @@ impl OpenBar {
         self.close = tick.price;
         self.volume += tick.volume;
         self.total_turnover += tick.total_turnover;
-        self.num_trades = tick.num_trades.or(self.num_trades);
+        self.num_trades = sum_optional_i64(self.num_trades, tick.num_trades);
         self.limit_up = tick.limit_up.or(self.limit_up);
         self.limit_down = tick.limit_down.or(self.limit_down);
     }
@@ -700,7 +749,7 @@ impl OpenBar {
         self.close = bar.close;
         self.volume += bar.volume;
         self.total_turnover += bar.total_turnover;
-        self.num_trades = bar.num_trades.or(self.num_trades);
+        self.num_trades = sum_optional_i64(self.num_trades, bar.num_trades);
         self.limit_up = bar.limit_up.or(self.limit_up);
         self.limit_down = bar.limit_down.or(self.limit_down);
     }
@@ -710,8 +759,12 @@ fn minute_start_ns(dt: i64) -> i64 {
     dt.div_euclid(BAR_FREQUENCY_1M_NS) * BAR_FREQUENCY_1M_NS
 }
 
-fn classify_session(spec: &BarSessionSpec, dt_ns: i64) -> TickSessionKind {
-    let seconds = local_seconds_of_day(dt_ns);
+fn classify_session(
+    spec: &BarSessionSpec,
+    dt_ns: i64,
+    timezone_offset_seconds: i64,
+) -> TickSessionKind {
+    let seconds = local_seconds_of_day(dt_ns, timezone_offset_seconds);
     if spec.regular.iter().any(|window| window.contains(seconds)) {
         return TickSessionKind::Regular;
     }
@@ -722,33 +775,69 @@ fn classify_session(spec: &BarSessionSpec, dt_ns: i64) -> TickSessionKind {
     TickSessionKind::Outside
 }
 
-fn auction_window_bounds(spec: &BarSessionSpec, dt_ns: i64) -> Option<(i64, i64)> {
-    let seconds = local_seconds_of_day(dt_ns);
+fn auction_window_bounds(
+    spec: &BarSessionSpec,
+    dt_ns: i64,
+    timezone_offset_seconds: i64,
+) -> Option<(i64, i64)> {
+    let seconds = local_seconds_of_day(dt_ns, timezone_offset_seconds);
     let window = spec
         .auction
         .iter()
         .find(|window| window.contains(seconds))?;
-    let day_start = dt_ns - i64::from(seconds) * 1_000_000_000;
-    let start_dt = day_start + i64::from(window.start_seconds) * 1_000_000_000;
-    let close_dt = day_start + i64::from(window.end_seconds) * 1_000_000_000;
+    let day_start = local_day_start_ns(dt_ns, timezone_offset_seconds);
+    let (start_day, close_day) = if !window.wraps_midnight() {
+        (day_start, day_start)
+    } else if seconds >= window.start_seconds {
+        (day_start, day_start + LOCAL_DAY_NS)
+    } else {
+        (day_start - LOCAL_DAY_NS, day_start)
+    };
+    let start_dt = start_day + i64::from(window.start_seconds) * SECOND_NS;
+    let close_dt = close_day + i64::from(window.end_seconds) * SECOND_NS;
 
     Some((start_dt, close_dt))
 }
 
 fn sort_bars(bars: &mut [OpenBar]) {
     bars.sort_by(|left, right| {
-        (left.close_dt, left.instrument.as_str(), left.start_dt).cmp(&(
+        (left.close_dt, left.start_dt, left.instrument.as_str()).cmp(&(
             right.close_dt,
-            right.instrument.as_str(),
             right.start_dt,
+            right.instrument.as_str(),
         ))
     });
 }
 
-fn local_seconds_of_day(dt_ns: i64) -> u32 {
-    // v1 assumes input timestamps already follow the profile timezone contract.
-    let seconds = dt_ns.div_euclid(1_000_000_000);
-    seconds.rem_euclid(86_400) as u32
+fn local_seconds_of_day(dt_ns: i64, timezone_offset_seconds: i64) -> u32 {
+    let seconds = dt_ns.div_euclid(SECOND_NS);
+    (seconds + timezone_offset_seconds).rem_euclid(LOCAL_DAY_SECONDS) as u32
+}
+
+fn local_day_start_ns(dt_ns: i64, timezone_offset_seconds: i64) -> i64 {
+    let seconds = dt_ns.div_euclid(SECOND_NS);
+    ((seconds + timezone_offset_seconds).div_euclid(LOCAL_DAY_SECONDS) * LOCAL_DAY_SECONDS
+        - timezone_offset_seconds)
+        * SECOND_NS
+}
+
+fn auction_bar_matches_regular_window(
+    auction_bar: &OpenBar,
+    regular_window_start: i64,
+    regular_window_end: i64,
+    timezone_offset_seconds: i64,
+) -> bool {
+    auction_bar.close_dt <= regular_window_end
+        && local_day_start_ns(auction_bar.close_dt, timezone_offset_seconds)
+            == local_day_start_ns(regular_window_start, timezone_offset_seconds)
+}
+
+fn sum_optional_i64(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn optional_table_column(
@@ -877,7 +966,7 @@ fn optional_f64_at(values: Option<&Float64Array>, row_index: usize) -> Option<f6
     })
 }
 
-fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
+fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<i64> {
     if spec.frequency != BAR_FREQUENCY_1M {
         return Err(ZippyError::InvalidConfig {
             reason: format!(
@@ -886,6 +975,7 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
             ),
         });
     }
+    let timezone_offset_seconds = timezone_offset_seconds(&spec.sessions.timezone)?;
 
     if spec.sessions.regular.is_empty() {
         return Err(ZippyError::InvalidConfig {
@@ -896,7 +986,7 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
     validate_session_windows("auction", &spec.sessions.auction)?;
 
     validate_instrument_column(schema, &spec.columns.instrument)?;
-    validate_dt_column(schema, &spec.columns.dt)?;
+    validate_dt_column(schema, &spec.columns.dt, &spec.sessions.timezone)?;
     validate_float64_column(schema, &spec.columns.price, "price")?;
     validate_float64_column(schema, &spec.columns.volume, "volume")?;
     validate_float64_column(schema, &spec.columns.total_turnover, "total_turnover")?;
@@ -924,7 +1014,7 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
         validate_float64_column(schema, column, "limit_down")?;
     }
 
-    Ok(())
+    Ok(timezone_offset_seconds)
 }
 
 fn validate_session_windows(kind: &str, windows: &[SessionWindow]) -> Result<()> {
@@ -941,11 +1031,11 @@ fn validate_session_windows(kind: &str, windows: &[SessionWindow]) -> Result<()>
             });
         }
 
-        if window.start_seconds >= window.end_seconds {
+        if window.start_seconds == window.end_seconds {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
                     concat!(
-                        "session window start must be before end kind=[{}] index=[{}] ",
+                        "session window start must not equal end kind=[{}] index=[{}] ",
                         "start_seconds=[{}] end_seconds=[{}]"
                     ),
                     kind, index, window.start_seconds, window.end_seconds
@@ -1026,7 +1116,7 @@ fn validate_utf8_column(schema: &Schema, column: &str, role: &str) -> Result<()>
     Ok(())
 }
 
-fn validate_dt_column(schema: &Schema, column: &str) -> Result<()> {
+fn validate_dt_column(schema: &Schema, column: &str, profile_timezone: &str) -> Result<()> {
     let field = schema
         .field_with_name(column)
         .map_err(|_| ZippyError::SchemaMismatch {
@@ -1036,19 +1126,40 @@ fn validate_dt_column(schema: &Schema, column: &str) -> Result<()> {
             ),
         })?;
 
-    if !matches!(
-        field.data_type(),
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(_))
-    ) {
-        return Err(ZippyError::SchemaMismatch {
+    match field.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone))
+            if timezone.as_ref() == profile_timezone =>
+        {
+            Ok(())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) => {
+            Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    concat!(
+                        "dt field timezone must match session profile field=[{}] ",
+                        "timezone=[{}] profile_timezone=[{}]"
+                    ),
+                    column, timezone, profile_timezone
+                ),
+            })
+        }
+        _ => Err(ZippyError::SchemaMismatch {
             reason: format!(
                 "dt field must be timezone-aware nanosecond timestamp field=[{}]",
                 column
             ),
-        });
+        }),
     }
+}
 
-    Ok(())
+fn timezone_offset_seconds(timezone: &str) -> Result<i64> {
+    match timezone {
+        "UTC" | "Etc/UTC" => Ok(0),
+        "Asia/Shanghai" => Ok(8 * 60 * 60),
+        _ => Err(ZippyError::InvalidConfig {
+            reason: format!("unsupported session timezone timezone=[{}]", timezone),
+        }),
+    }
 }
 
 fn validate_float64_column(schema: &Schema, column: &str, role: &str) -> Result<()> {

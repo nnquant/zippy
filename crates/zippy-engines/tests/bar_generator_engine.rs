@@ -12,8 +12,39 @@ use zippy_engines::{
 };
 
 const MINUTE_NS: i64 = 60_000_000_000;
+const SECOND_NS: i64 = 1_000_000_000;
+const SHANGHAI_2026_05_08_DAY_START_NS: i64 = 1_778_169_600_000_000_000;
+const SHANGHAI_2026_05_08_09_20_30_NS: i64 = 1_778_203_230_000_000_000;
+const SHANGHAI_2026_05_08_09_25_00_NS: i64 = 1_778_203_500_000_000_000;
+const SHANGHAI_2026_05_08_09_30_00_NS: i64 = 1_778_203_800_000_000_000;
+const SHANGHAI_2026_05_08_09_30_30_NS: i64 = 1_778_203_830_000_000_000;
+const SHANGHAI_2026_05_08_09_31_00_NS: i64 = 1_778_203_860_000_000_000;
+const SHANGHAI_2026_05_08_21_00_00_NS: i64 = 1_778_245_200_000_000_000;
+const SHANGHAI_2026_05_08_21_01_00_NS: i64 = 1_778_245_260_000_000_000;
+const SHANGHAI_2026_05_09_01_00_00_NS: i64 = 1_778_259_600_000_000_000;
+const SHANGHAI_2026_05_09_02_30_00_NS: i64 = 1_778_265_000_000_000_000;
+const SHANGHAI_2026_05_09_03_00_00_NS: i64 = 1_778_266_800_000_000_000;
+const SHANGHAI_2026_05_09_09_30_30_NS: i64 = 1_778_290_230_000_000_000;
 
 fn tick_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("last_price", DataType::Float64, false),
+        Field::new("volume", DataType::Float64, false),
+        Field::new("turnover", DataType::Float64, false),
+        Field::new("trading_day", DataType::Utf8, false),
+        Field::new("num_trades", DataType::Int64, true),
+        Field::new("upper_limit_price", DataType::Float64, true),
+        Field::new("lower_limit_price", DataType::Float64, true),
+    ]))
+}
+
+fn shanghai_tick_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("instrument_id", DataType::Utf8, false),
         Field::new(
@@ -46,7 +77,7 @@ fn tick_schema_without_optional_columns() -> SchemaRef {
         Field::new("instrument_id", DataType::Utf8, false),
         Field::new(
             "dt",
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
             false,
         ),
         Field::new("last_price", DataType::Float64, false),
@@ -70,7 +101,7 @@ fn delta_spec() -> BarGeneratorSpec {
             limit_down: Some("lower_limit_price".to_string()),
         },
         sessions: BarSessionSpec {
-            timezone: "Asia/Shanghai".to_string(),
+            timezone: "UTC".to_string(),
             regular: vec![SessionWindow::parse("00:00:00", "01:00:00").unwrap()],
             auction: vec![],
         },
@@ -112,13 +143,13 @@ fn mismatched_batch() -> SegmentTableView {
         Field::new("instrument_id", DataType::Utf8, false),
         Field::new(
             "dt",
-            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
             false,
         ),
     ]));
     let columns = vec![
         Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
-        Arc::new(TimestampNanosecondArray::from(Vec::<i64>::new()).with_timezone("UTC"))
+        Arc::new(TimestampNanosecondArray::from(Vec::<i64>::new()).with_timezone("Asia/Shanghai"))
             as ArrayRef,
     ];
     let batch = RecordBatch::try_new(schema, columns).unwrap();
@@ -142,12 +173,90 @@ fn tick_batch(
 
     let columns = vec![
         Arc::new(StringArray::from(instruments)) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
+        Arc::new(Float64Array::from(prices)) as ArrayRef,
+        Arc::new(Float64Array::from(volumes)) as ArrayRef,
+        Arc::new(Float64Array::from(turnovers)) as ArrayRef,
+        Arc::new(StringArray::from(trading_days)) as ArrayRef,
+        Arc::new(Int64Array::from(vec![Some(1); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(999.0); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(tick_schema(), columns).unwrap();
+
+    SegmentTableView::from_record_batch(batch)
+}
+
+fn shanghai_tick_batch(
+    instruments: Vec<&str>,
+    dts: Vec<i64>,
+    prices: Vec<f64>,
+    volumes: Vec<f64>,
+    turnovers: Vec<f64>,
+    trading_days: Vec<&str>,
+) -> SegmentTableView {
+    let row_count = instruments.len();
+    assert_eq!(dts.len(), row_count);
+    assert_eq!(prices.len(), row_count);
+    assert_eq!(volumes.len(), row_count);
+    assert_eq!(turnovers.len(), row_count);
+    assert_eq!(trading_days.len(), row_count);
+
+    let columns = vec![
+        Arc::new(StringArray::from(instruments)) as ArrayRef,
         Arc::new(TimestampNanosecondArray::from(dts).with_timezone("Asia/Shanghai")) as ArrayRef,
         Arc::new(Float64Array::from(prices)) as ArrayRef,
         Arc::new(Float64Array::from(volumes)) as ArrayRef,
         Arc::new(Float64Array::from(turnovers)) as ArrayRef,
         Arc::new(StringArray::from(trading_days)) as ArrayRef,
         Arc::new(Int64Array::from(vec![Some(1); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(999.0); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(shanghai_tick_schema(), columns).unwrap();
+
+    SegmentTableView::from_record_batch(batch)
+}
+
+fn shanghai_regular_spec() -> BarGeneratorSpec {
+    let mut spec = delta_spec();
+    spec.sessions.timezone = "Asia/Shanghai".to_string();
+    spec.sessions.regular = vec![SessionWindow::parse("09:30:00", "15:00:00").unwrap()];
+    spec
+}
+
+fn shanghai_auction_spec(policy: AuctionPolicy) -> BarGeneratorSpec {
+    let mut spec = shanghai_regular_spec();
+    spec.sessions.auction = vec![SessionWindow::parse("09:20:00", "09:25:00").unwrap()];
+    spec.auction = policy;
+    spec
+}
+
+fn tick_batch_with_num_trades(
+    instruments: Vec<&str>,
+    dts: Vec<i64>,
+    prices: Vec<f64>,
+    volumes: Vec<f64>,
+    turnovers: Vec<f64>,
+    trading_days: Vec<&str>,
+    num_trades: Vec<Option<i64>>,
+) -> SegmentTableView {
+    let row_count = instruments.len();
+    assert_eq!(dts.len(), row_count);
+    assert_eq!(prices.len(), row_count);
+    assert_eq!(volumes.len(), row_count);
+    assert_eq!(turnovers.len(), row_count);
+    assert_eq!(trading_days.len(), row_count);
+    assert_eq!(num_trades.len(), row_count);
+
+    let columns = vec![
+        Arc::new(StringArray::from(instruments)) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
+        Arc::new(Float64Array::from(prices)) as ArrayRef,
+        Arc::new(Float64Array::from(volumes)) as ArrayRef,
+        Arc::new(Float64Array::from(turnovers)) as ArrayRef,
+        Arc::new(StringArray::from(trading_days)) as ArrayRef,
+        Arc::new(Int64Array::from(num_trades)) as ArrayRef,
         Arc::new(Float64Array::from(vec![Some(999.0); row_count])) as ArrayRef,
         Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
     ];
@@ -180,7 +289,7 @@ fn tick_batch_with_nullable_trading_day(
     let schema = Arc::new(Schema::new(fields));
     let columns = vec![
         Arc::new(StringArray::from(instruments)) as ArrayRef,
-        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("Asia/Shanghai")) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
         Arc::new(Float64Array::from(prices)) as ArrayRef,
         Arc::new(Float64Array::from(volumes)) as ArrayRef,
         Arc::new(Float64Array::from(turnovers)) as ArrayRef,
@@ -211,7 +320,7 @@ fn tick_batch_without_optional_columns(
 
     let columns = vec![
         Arc::new(StringArray::from(instruments)) as ArrayRef,
-        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("Asia/Shanghai")) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
         Arc::new(Float64Array::from(prices)) as ArrayRef,
         Arc::new(Float64Array::from(volumes)) as ArrayRef,
         Arc::new(Float64Array::from(turnovers)) as ArrayRef,
@@ -246,6 +355,21 @@ fn ts_column(table: &SegmentTableView, name: &str) -> Vec<i64> {
         .unwrap();
 
     (0..values.len()).map(|row| values.value(row)).collect()
+}
+
+fn i64_column_options(table: &SegmentTableView, name: &str) -> Vec<Option<i64>> {
+    let column = table.column(name).unwrap();
+    let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
+
+    (0..values.len())
+        .map(|row| {
+            if values.is_null(row) {
+                None
+            } else {
+                Some(values.value(row))
+            }
+        })
+        .collect()
 }
 
 fn assert_field(schema: &Schema, name: &str, data_type: &DataType, nullable: bool) {
@@ -524,6 +648,112 @@ fn bar_generator_session_window_is_start_inclusive_end_exclusive() {
 }
 
 #[test]
+fn bar_generator_uses_profile_timezone_for_real_shanghai_epoch() {
+    let mut engine =
+        BarGeneratorEngine::new("bars", shanghai_tick_schema(), shanghai_regular_spec()).unwrap();
+    let output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601", "rb2601"],
+            vec![
+                SHANGHAI_2026_05_08_09_30_30_NS,
+                SHANGHAI_2026_05_08_09_31_00_NS,
+            ],
+            vec![10.0, 11.0],
+            vec![2.0, 3.0],
+            vec![20.0, 33.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(
+        ts_column(&output[0], "start_dt"),
+        vec![SHANGHAI_2026_05_08_09_30_00_NS]
+    );
+    assert_eq!(
+        ts_column(&output[0], "close_dt"),
+        vec![SHANGHAI_2026_05_08_09_31_00_NS]
+    );
+    assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
+}
+
+#[test]
+fn bar_generator_supports_cross_midnight_session_window() {
+    let mut spec = shanghai_regular_spec();
+    spec.sessions.regular = vec![SessionWindow::parse("21:00:00", "02:30:00").unwrap()];
+    let mut engine = BarGeneratorEngine::new("bars", shanghai_tick_schema(), spec).unwrap();
+    let output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![
+                SHANGHAI_2026_05_08_21_01_00_NS,
+                SHANGHAI_2026_05_09_01_00_00_NS,
+                SHANGHAI_2026_05_09_03_00_00_NS,
+            ],
+            vec![10.0, 11.0, 99.0],
+            vec![2.0, 3.0, 100.0],
+            vec![20.0, 33.0, 9_900.0],
+            vec!["20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(
+        ts_column(&output[0], "start_dt"),
+        vec![SHANGHAI_2026_05_08_21_01_00_NS]
+    );
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 1);
+    assert_eq!(
+        ts_column(&flushed[0], "start_dt"),
+        vec![SHANGHAI_2026_05_09_01_00_00_NS]
+    );
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn bar_generator_auction_bounds_support_cross_midnight_window() {
+    let mut spec = shanghai_regular_spec();
+    spec.sessions.regular = vec![SessionWindow::parse("03:00:00", "04:00:00").unwrap()];
+    spec.sessions.auction = vec![SessionWindow::parse("21:00:00", "02:30:00").unwrap()];
+    spec.auction = AuctionPolicy::EmitSeparateBar;
+    let mut engine = BarGeneratorEngine::new("bars", shanghai_tick_schema(), spec).unwrap();
+    let output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![
+                SHANGHAI_2026_05_08_21_01_00_NS,
+                SHANGHAI_2026_05_09_01_00_00_NS,
+                SHANGHAI_2026_05_09_03_00_00_NS,
+            ],
+            vec![10.0, 11.0, 12.0],
+            vec![2.0, 3.0, 4.0],
+            vec![20.0, 33.0, 48.0],
+            vec!["20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(
+        ts_column(&output[0], "start_dt"),
+        vec![SHANGHAI_2026_05_08_21_00_00_NS]
+    );
+    assert_eq!(
+        ts_column(&output[0], "close_dt"),
+        vec![SHANGHAI_2026_05_09_02_30_00_NS]
+    );
+    assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "close"), vec![11.0]);
+    assert_eq!(f64_column(&output[0], "volume"), vec![5.0]);
+}
+
+#[test]
 fn bar_generator_auction_drop_updates_cumulative_baseline_without_output_bar() {
     let mut engine = BarGeneratorEngine::new(
         "bars",
@@ -591,6 +821,52 @@ fn bar_generator_auction_merge_to_first_regular_bar_includes_auction_tick() {
     assert_eq!(f64_column(&flushed[0], "volume"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![88.0]);
     assert_eq!(engine.drain_metrics().filtered_rows_total, 0);
+}
+
+#[test]
+fn bar_generator_auction_merge_drops_stale_pending_from_previous_local_day() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        shanghai_tick_schema(),
+        shanghai_auction_spec(AuctionPolicy::MergeToFirstRegularBar),
+    )
+    .unwrap();
+
+    let auction_output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601"],
+            vec![SHANGHAI_2026_05_08_09_20_30_NS],
+            vec![9.0],
+            vec![2.0],
+            vec![18.0],
+            vec!["20260508"],
+        ))
+        .unwrap();
+    assert!(auction_output.is_empty());
+
+    let regular_output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601"],
+            vec![SHANGHAI_2026_05_09_09_30_30_NS],
+            vec![10.0],
+            vec![3.0],
+            vec![30.0],
+            vec!["20260509"],
+        ))
+        .unwrap();
+    assert!(regular_output.is_empty());
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 1);
+    assert_eq!(
+        ts_column(&flushed[0], "start_dt"),
+        vec![SHANGHAI_2026_05_09_09_30_30_NS - 30 * SECOND_NS]
+    );
+    assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
+    assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0]);
+    assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![30.0]);
 }
 
 #[test]
@@ -831,6 +1107,86 @@ fn bar_generator_auction_emit_separate_bar_outputs_auction_window_bar() {
 }
 
 #[test]
+fn bar_generator_auction_emit_separate_bar_streams_before_regular_tick() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        shanghai_tick_schema(),
+        shanghai_auction_spec(AuctionPolicy::EmitSeparateBar),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601", "rb2601"],
+            vec![
+                SHANGHAI_2026_05_08_09_20_30_NS,
+                SHANGHAI_2026_05_08_09_30_30_NS,
+            ],
+            vec![9.0, 10.0],
+            vec![2.0, 3.0],
+            vec![18.0, 30.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(
+        ts_column(&output[0], "start_dt"),
+        vec![SHANGHAI_2026_05_08_DAY_START_NS + 9 * 60 * MINUTE_NS + 20 * MINUTE_NS]
+    );
+    assert_eq!(
+        ts_column(&output[0], "close_dt"),
+        vec![SHANGHAI_2026_05_08_09_25_00_NS]
+    );
+    assert_eq!(f64_column(&output[0], "open"), vec![9.0]);
+    assert_eq!(f64_column(&output[0], "volume"), vec![2.0]);
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 1);
+    assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
+}
+
+#[test]
+fn bar_generator_sums_delta_num_trades_within_bar() {
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
+    let output = engine
+        .on_data(tick_batch_with_num_trades(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![30_000_000_000, 45_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 12.0, 11.0],
+            vec![2.0, 3.0, 5.0],
+            vec![20.0, 36.0, 55.0],
+            vec!["20260508", "20260508", "20260508"],
+            vec![Some(1), Some(1), Some(1)],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(i64_column_options(&output[0], "num_trades"), vec![Some(2)]);
+}
+
+#[test]
+fn bar_generator_keeps_num_trades_null_when_all_values_missing() {
+    let mut engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
+    let output = engine
+        .on_data(tick_batch_with_num_trades(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![30_000_000_000, 45_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 12.0, 11.0],
+            vec![2.0, 3.0, 5.0],
+            vec![20.0, 36.0, 55.0],
+            vec!["20260508", "20260508", "20260508"],
+            vec![None, None, Some(1)],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(i64_column_options(&output[0], "num_trades"), vec![None]);
+}
+
+#[test]
 fn bar_generator_outputs_null_optional_columns_when_inputs_missing() {
     let mut spec = delta_spec();
     spec.columns.num_trades = None;
@@ -940,7 +1296,7 @@ fn bar_generator_output_schema_is_stable() {
         ]
     );
 
-    let timestamp_type = DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into()));
+    let timestamp_type = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
     assert_field(
         output_schema.as_ref(),
         "instrument_id",
@@ -1011,6 +1367,15 @@ fn bar_generator_rejects_invalid_session_windows() {
 #[test]
 fn bar_generator_rejects_nullable_instrument() {
     let result = BarGeneratorEngine::new("bars", nullable_instrument_schema(), delta_spec());
+
+    assert!(matches!(result, Err(ZippyError::SchemaMismatch { .. })));
+}
+
+#[test]
+fn bar_generator_rejects_dt_timezone_mismatch_with_profile_timezone() {
+    let mut spec = delta_spec();
+    spec.sessions.timezone = "Asia/Shanghai".to_string();
+    let result = BarGeneratorEngine::new("bars", tick_schema(), spec);
 
     assert!(matches!(result, Err(ZippyError::SchemaMismatch { .. })));
 }
