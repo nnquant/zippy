@@ -537,7 +537,8 @@ impl Engine for BarGeneratorEngine {
         )?;
         let dts = checked_timestamp_array(&dt_array, &self.spec.columns.dt)?;
         let prices = checked_float64_array(&price_array, &self.spec.columns.price, "price")?;
-        let volumes = checked_float64_array(&volume_array, &self.spec.columns.volume, "volume")?;
+        let volumes =
+            checked_numeric_f64_array(&volume_array, &self.spec.columns.volume, "volume")?;
         let total_turnovers = checked_float64_array(
             &total_turnover_array,
             &self.spec.columns.total_turnover,
@@ -644,7 +645,7 @@ struct TickRowArrays<'a> {
     instruments: &'a StringArray,
     dts: &'a TimestampNanosecondArray,
     prices: &'a Float64Array,
-    volumes: &'a Float64Array,
+    volumes: NumericF64Array<'a>,
     total_turnovers: &'a Float64Array,
     trading_days: Option<&'a StringArray>,
     num_trades: Option<&'a Int64Array>,
@@ -658,7 +659,7 @@ impl TickRow {
         ensure_non_null(arrays.instruments, arrays.row_index, "instrument")?;
         ensure_non_null(arrays.dts, arrays.row_index, "dt")?;
         ensure_non_null(arrays.prices, arrays.row_index, "price")?;
-        ensure_non_null(arrays.volumes, arrays.row_index, "volume")?;
+        ensure_numeric_non_null(arrays.volumes, arrays.row_index, "volume")?;
         ensure_non_null(arrays.total_turnovers, arrays.row_index, "total_turnover")?;
 
         Ok(Self {
@@ -891,6 +892,59 @@ fn checked_float64_array<'a>(
     Ok(values)
 }
 
+#[derive(Clone, Copy)]
+enum NumericF64Array<'a> {
+    Float64(&'a Float64Array),
+    Int64(&'a Int64Array),
+}
+
+impl NumericF64Array<'_> {
+    fn is_null(self, row_index: usize) -> bool {
+        match self {
+            Self::Float64(values) => values.is_null(row_index),
+            Self::Int64(values) => values.is_null(row_index),
+        }
+    }
+
+    fn null_count(self) -> usize {
+        match self {
+            Self::Float64(values) => values.null_count(),
+            Self::Int64(values) => values.null_count(),
+        }
+    }
+
+    fn value(self, row_index: usize) -> f64 {
+        match self {
+            Self::Float64(values) => values.value(row_index),
+            Self::Int64(values) => values.value(row_index) as f64,
+        }
+    }
+}
+
+fn checked_numeric_f64_array<'a>(
+    array: &'a ArrayRef,
+    column: &str,
+    role: &str,
+) -> Result<NumericF64Array<'a>> {
+    let values = if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        NumericF64Array::Float64(values)
+    } else if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
+        NumericF64Array::Int64(values)
+    } else {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("{} field must be float64 or int64 field=[{}]", role, column),
+        });
+    };
+
+    if values.null_count() > 0 {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("{} field contains nulls field=[{}]", role, column),
+        });
+    }
+
+    Ok(values)
+}
+
 fn optional_int64_values<'a>(
     array: Option<&'a ArrayRef>,
     column: Option<&str>,
@@ -928,6 +982,20 @@ fn int64_array<'a>(array: &'a ArrayRef, column: &str) -> Result<&'a Int64Array> 
 
 fn ensure_non_null(array: &dyn Array, row_index: usize, role: &str) -> Result<()> {
     if array.is_null(row_index) {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("{} field contains nulls row_index=[{}]", role, row_index),
+        });
+    }
+
+    Ok(())
+}
+
+fn ensure_numeric_non_null(
+    values: NumericF64Array<'_>,
+    row_index: usize,
+    role: &str,
+) -> Result<()> {
+    if values.is_null(row_index) {
         return Err(ZippyError::SchemaMismatch {
             reason: format!("{} field contains nulls row_index=[{}]", role, row_index),
         });
@@ -988,7 +1056,7 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<i64> {
     validate_instrument_column(schema, &spec.columns.instrument)?;
     validate_dt_column(schema, &spec.columns.dt, &spec.sessions.timezone)?;
     validate_float64_column(schema, &spec.columns.price, "price")?;
-    validate_float64_column(schema, &spec.columns.volume, "volume")?;
+    validate_volume_column(schema, &spec.columns.volume)?;
     validate_float64_column(schema, &spec.columns.total_turnover, "total_turnover")?;
 
     if let Some(column) = &spec.columns.trading_day {
@@ -1172,6 +1240,22 @@ fn validate_float64_column(schema: &Schema, column: &str, role: &str) -> Result<
     if field.data_type() != &DataType::Float64 {
         return Err(ZippyError::SchemaMismatch {
             reason: format!("{} field must be float64 field=[{}]", role, column),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_volume_column(schema: &Schema, column: &str) -> Result<()> {
+    let field = schema
+        .field_with_name(column)
+        .map_err(|_| ZippyError::SchemaMismatch {
+            reason: format!("missing float64 or int64 volume field field=[{}]", column),
+        })?;
+
+    if !matches!(field.data_type(), DataType::Float64 | DataType::Int64) {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("volume field must be float64 or int64 field=[{}]", column),
         });
     }
 

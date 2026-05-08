@@ -72,6 +72,16 @@ fn nullable_instrument_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+fn int64_volume_schema() -> SchemaRef {
+    let mut fields = tick_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields[3] = Field::new("volume", DataType::Int64, false);
+    Arc::new(Schema::new(fields))
+}
+
 fn tick_schema_without_optional_columns() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("instrument_id", DataType::Utf8, false),
@@ -183,6 +193,37 @@ fn tick_batch(
         Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
     ];
     let batch = RecordBatch::try_new(tick_schema(), columns).unwrap();
+
+    SegmentTableView::from_record_batch(batch)
+}
+
+fn tick_batch_with_int64_volume(
+    instruments: Vec<&str>,
+    dts: Vec<i64>,
+    prices: Vec<f64>,
+    volumes: Vec<i64>,
+    turnovers: Vec<f64>,
+    trading_days: Vec<&str>,
+) -> SegmentTableView {
+    let row_count = instruments.len();
+    assert_eq!(dts.len(), row_count);
+    assert_eq!(prices.len(), row_count);
+    assert_eq!(volumes.len(), row_count);
+    assert_eq!(turnovers.len(), row_count);
+    assert_eq!(trading_days.len(), row_count);
+
+    let columns = vec![
+        Arc::new(StringArray::from(instruments)) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
+        Arc::new(Float64Array::from(prices)) as ArrayRef,
+        Arc::new(Int64Array::from(volumes)) as ArrayRef,
+        Arc::new(Float64Array::from(turnovers)) as ArrayRef,
+        Arc::new(StringArray::from(trading_days)) as ArrayRef,
+        Arc::new(Int64Array::from(vec![Some(1); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(999.0); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(int64_volume_schema(), columns).unwrap();
 
     SegmentTableView::from_record_batch(batch)
 }
@@ -484,6 +525,31 @@ fn cumulative_mode_skips_first_delta_on_intraday_bootstrap() {
     assert_eq!(output[0].num_rows(), 1);
     assert_eq!(f64_column(&output[0], "open"), vec![11.0]);
     assert_eq!(f64_column(&output[0], "close"), vec![11.0]);
+    assert_eq!(f64_column(&output[0], "volume"), vec![5.0]);
+    assert_eq!(f64_column(&output[0], "total_turnover"), vec![60.0]);
+}
+
+#[test]
+fn cumulative_mode_accepts_int64_volume_input() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        int64_volume_schema(),
+        cumulative_spec(BootstrapPolicy::SkipFirstDelta),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(tick_batch_with_int64_volume(
+            vec!["rb2601", "rb2601", "rb2601"],
+            vec![30_000_000_000, 45_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 11.0, 12.0],
+            vec![100, 105, 107],
+            vec![1_000.0, 1_060.0, 1_085.0],
+            vec!["20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
     assert_eq!(f64_column(&output[0], "volume"), vec![5.0]);
     assert_eq!(f64_column(&output[0], "total_turnover"), vec![60.0]);
 }
