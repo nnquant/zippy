@@ -210,7 +210,11 @@ impl BarGeneratorEngine {
             }
         })
     }
-    fn compute_volume_delta(&mut self, tick: &TickRow) -> Option<CumulativeDelta> {
+    fn compute_volume_delta(
+        &mut self,
+        tick: &TickRow,
+        session_kind: TickSessionKind,
+    ) -> Option<CumulativeDelta> {
         match &self.spec.volume {
             VolumeSpec::Delta => Some(CumulativeDelta {
                 volume: tick.volume,
@@ -231,6 +235,7 @@ impl BarGeneratorEngine {
                         last_volume: 0.0,
                         last_total_turnover: 0.0,
                         last_dt: tick.dt,
+                        last_session_kind: session_kind,
                         initialized: false,
                         has_valid_delta: false,
                     });
@@ -240,6 +245,7 @@ impl BarGeneratorEngine {
                     state.last_volume = tick.volume;
                     state.last_total_turnover = tick.total_turnover;
                     state.last_dt = tick.dt;
+                    state.last_session_kind = session_kind;
                     state.initialized = true;
                     state.has_valid_delta = false;
 
@@ -260,12 +266,15 @@ impl BarGeneratorEngine {
                 let total_turnover_delta = tick.total_turnover - state.last_total_turnover;
                 let window_start = if state.has_valid_delta {
                     None
-                } else {
+                } else if state.last_session_kind == TickSessionKind::Regular {
                     Some(minute_start_ns(state.last_dt))
+                } else {
+                    None
                 };
                 state.last_volume = tick.volume;
                 state.last_total_turnover = tick.total_turnover;
                 state.last_dt = tick.dt;
+                state.last_session_kind = session_kind;
 
                 if volume_delta < 0.0 || total_turnover_delta < 0.0 {
                     self.pending_filtered_rows += 1;
@@ -287,7 +296,7 @@ impl BarGeneratorEngine {
         mut tick: TickRow,
         completed: &mut Vec<OpenBar>,
     ) -> Result<()> {
-        let Some(delta) = self.compute_volume_delta(&tick) else {
+        let Some(delta) = self.compute_volume_delta(&tick, TickSessionKind::Regular) else {
             return Ok(());
         };
         tick.volume = delta.volume;
@@ -327,7 +336,7 @@ impl BarGeneratorEngine {
             AuctionPolicy::Drop => {
                 if matches!(self.spec.volume, VolumeSpec::Cumulative { .. }) {
                     let filtered_before = self.pending_filtered_rows;
-                    let _ = self.compute_volume_delta(&tick);
+                    let _ = self.compute_volume_delta(&tick, TickSessionKind::Auction);
                     if self.pending_filtered_rows == filtered_before {
                         self.pending_filtered_rows += 1;
                     }
@@ -336,7 +345,7 @@ impl BarGeneratorEngine {
                 }
             }
             AuctionPolicy::MergeToFirstRegularBar => {
-                let Some(delta) = self.compute_volume_delta(&tick) else {
+                let Some(delta) = self.compute_volume_delta(&tick, TickSessionKind::Auction) else {
                     return Ok(());
                 };
                 tick.volume = delta.volume;
@@ -370,7 +379,7 @@ impl BarGeneratorEngine {
                     self.pending_filtered_rows += 1;
                     return Ok(());
                 };
-                let Some(delta) = self.compute_volume_delta(&tick) else {
+                let Some(delta) = self.compute_volume_delta(&tick, TickSessionKind::Auction) else {
                     return Ok(());
                 };
                 tick.volume = delta.volume;
@@ -636,6 +645,7 @@ struct CumulativeState {
     last_volume: f64,
     last_total_turnover: f64,
     last_dt: i64,
+    last_session_kind: TickSessionKind,
     initialized: bool,
     has_valid_delta: bool,
 }
