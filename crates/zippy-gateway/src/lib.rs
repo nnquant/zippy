@@ -19,7 +19,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
+use parquet::arrow::{
+    arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+    ProjectionMask,
+};
 use serde_json::{json, Value};
 use zippy_core::{
     ControlEndpoint, Engine, MasterClient, Result, SegmentTableView, StreamInfo, ZippyError,
@@ -720,6 +723,9 @@ impl GatewayState {
     ) -> Result<GatewayScannedBatch> {
         let stream = self.with_master(|master| master.get_stream(source))?;
         if stream_has_persisted_files(&stream) {
+            if let GatewayRowRangePushdown::Tail(n) = pushdown {
+                return self.collect_stream_source_tail(source, &stream, n, scan_pushdown);
+            }
             let mut scanned = self.collect_stream_source(source, scan_pushdown)?;
             let row_range_op = pushdown.to_plan_op();
             scanned.batch = apply_collect_plan(scanned.batch, &[row_range_op])?;
@@ -800,6 +806,91 @@ impl GatewayState {
             scanned_live_rows: scanned_rows,
             scanned_files: Vec::new(),
         })
+    }
+
+    fn collect_stream_source_tail(
+        &self,
+        source: &str,
+        stream: &StreamInfo,
+        n: usize,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_live_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let mut live_batches = self
+            .try_collect_live_segment_tail_batches(
+                source,
+                stream,
+                n,
+                scan_pushdown,
+                &mut scanned_live_rows,
+            )?
+            .unwrap_or_default();
+        let live_rows = scanned_live_rows;
+        let persisted_remaining = n.saturating_sub(live_rows);
+        let mut batches = if persisted_remaining > 0 {
+            tail_persisted_file_record_batches(
+                stream,
+                persisted_remaining,
+                scan_pushdown,
+                &mut scanned_rows,
+                &mut scanned_files,
+            )?
+        } else {
+            Vec::new()
+        };
+
+        scanned_rows = scanned_rows.saturating_add(scanned_live_rows);
+        batches.append(&mut live_batches);
+        let mut batch =
+            concat_record_batches(schema_for_scan_pushdown(&schema, scan_pushdown)?, batches)?;
+        if batch.num_rows() > n {
+            batch = apply_collect_plan(batch, &[GatewayRowRangePushdown::Tail(n).to_plan_op()])?;
+        }
+        Ok(GatewayScannedBatch {
+            batch,
+            scanned_rows,
+            scanned_live_rows,
+            scanned_files,
+        })
+    }
+
+    fn try_collect_live_segment_tail_batches(
+        &self,
+        source: &str,
+        stream: &StreamInfo,
+        n: usize,
+        scan_pushdown: &GatewayScanPushdown,
+        scanned_live_rows: &mut usize,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        if stream.status == "stale" {
+            return Ok(None);
+        }
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Ok(None);
+        };
+        let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+        let mut leases = Vec::new();
+        leases.push(self.acquire_segment_reader_lease(source, &descriptor)?);
+        let active_committed_row_high_watermark =
+            active_committed_row_high_watermark(&descriptor, segment_schema.clone())?;
+        let mut scanned_rows = 0usize;
+        let batches = tail_live_segment_record_batches_with_leases(
+            self,
+            source,
+            &descriptor,
+            &stream.sealed_segments,
+            segment_schema,
+            active_committed_row_high_watermark,
+            n,
+            &mut leases,
+            scan_pushdown,
+            &mut scanned_rows,
+        )?;
+        *scanned_live_rows = scanned_rows;
+        Ok(Some(batches))
     }
 
     fn acquire_segment_reader_leases(
@@ -1031,9 +1122,57 @@ fn persisted_file_record_batches(
     Ok(batches)
 }
 
+fn tail_persisted_file_record_batches(
+    stream: &StreamInfo,
+    n: usize,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+    scanned_files: &mut Vec<String>,
+) -> Result<Vec<RecordBatch>> {
+    let mut remaining = n;
+    let mut batches_reversed = Vec::new();
+    for persisted_file in non_overlapping_persisted_files(stream).into_iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let file_path = persisted_file_path(persisted_file)?;
+        let batch = read_parquet_record_batch_tail(
+            Path::new(&file_path),
+            scan_pushdown.projection_columns.as_deref(),
+            remaining,
+        )?;
+        let raw_rows = batch.num_rows();
+        scanned_files.push(file_path);
+        let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
+        remaining = remaining.saturating_sub(raw_rows);
+        if batch.num_rows() > 0 {
+            batches_reversed.push(batch);
+        }
+    }
+    scanned_files.reverse();
+    batches_reversed.reverse();
+    Ok(batches_reversed)
+}
+
 fn read_parquet_record_batch(
     path: &Path,
     projection_columns: Option<&[String]>,
+) -> Result<RecordBatch> {
+    read_parquet_record_batch_with_tail(path, projection_columns, None)
+}
+
+fn read_parquet_record_batch_tail(
+    path: &Path,
+    projection_columns: Option<&[String]>,
+    n: usize,
+) -> Result<RecordBatch> {
+    read_parquet_record_batch_with_tail(path, projection_columns, Some(n))
+}
+
+fn read_parquet_record_batch_with_tail(
+    path: &Path,
+    projection_columns: Option<&[String]>,
+    tail_rows: Option<usize>,
 ) -> Result<RecordBatch> {
     let file = File::open(path).map_err(|error| ZippyError::Io {
         reason: format!(
@@ -1069,6 +1208,29 @@ fn read_parquet_record_batch(
             .collect::<Result<Vec<_>>>()?;
         let projection = ProjectionMask::roots(builder.parquet_schema(), indices);
         builder = builder.with_projection(projection);
+    }
+    if let Some(tail_rows) = tail_rows {
+        let total_rows =
+            usize::try_from(builder.metadata().file_metadata().num_rows()).map_err(|_| {
+                ZippyError::InvalidConfig {
+                    reason: format!(
+                        "persisted parquet row count overflows usize path=[{}]",
+                        path.display()
+                    ),
+                }
+            })?;
+        let selected_rows = tail_rows.min(total_rows);
+        let skipped_rows = total_rows.saturating_sub(selected_rows);
+        let mut selectors = Vec::new();
+        if skipped_rows > 0 {
+            selectors.push(RowSelector::skip(skipped_rows));
+        }
+        if selected_rows > 0 {
+            selectors.push(RowSelector::select(selected_rows));
+        }
+        builder = builder
+            .with_batch_size(selected_rows.max(1))
+            .with_row_selection(RowSelection::from(selectors));
     }
     let schema = builder.schema().clone();
     let reader = builder.build().map_err(|error| ZippyError::Io {

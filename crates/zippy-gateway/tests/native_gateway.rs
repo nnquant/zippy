@@ -269,6 +269,116 @@ fn native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment()
 }
 
 #[test]
+fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let old_path = temp.path().join("segment-1.parquet");
+    let new_path = temp.path().join("segment-2.parquet");
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("dt", DataType::Int64, false),
+        Field::new("instrument_id", DataType::Utf8, false),
+    ]));
+    let old_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2])),
+            std::sync::Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .unwrap();
+    let new_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![3, 4])),
+            std::sync::Arc::new(StringArray::from(vec!["c", "d"])),
+        ],
+    )
+    .unwrap();
+    write_parquet_batch(&old_path, &old_batch);
+    write_parquet_batch(&new_path, &new_batch);
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("persisted_tail_writer").unwrap();
+    client
+        .register_stream("persisted_tail_ticks", schema, 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "persisted_tail_source",
+            "test",
+            "persisted_tail_ticks",
+            json!({}),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "persisted_tail_ticks",
+            json!({
+                "file_path": old_path.to_string_lossy(),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "persisted_tail_ticks",
+            json!({
+                "file_path": new_path.to_string_lossy(),
+                "row_count": 2,
+                "source_segment_id": 2,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "persisted_tail_ticks",
+            "token": "dev-token",
+            "plan": [{"op": "tail", "n": 1}]
+        }),
+        vec![],
+    );
+
+    assert_eq!(response["status"], "ok");
+    assert_eq!(response["metrics"]["tail_pushdown"], true);
+    assert_eq!(
+        response["metrics"]["scanned_files"],
+        json!([new_path.to_string_lossy()])
+    );
+    assert_eq!(response["metrics"]["scanned_rows"], 1);
+    assert_eq!(response["metrics"]["returned_rows"], 1);
+    let collected = decode_ipc_batch(&payload);
+    assert_eq!(collected.num_rows(), 1);
+    let instrument_id = collected
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(instrument_id.value(0), "d");
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_pushes_tail_collect_into_segment_reader() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
