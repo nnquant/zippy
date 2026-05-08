@@ -206,9 +206,13 @@ impl BarGeneratorEngine {
             }
         })
     }
-    fn compute_volume_delta(&mut self, tick: &TickRow) -> Option<(f64, f64)> {
+    fn compute_volume_delta(&mut self, tick: &TickRow) -> Option<CumulativeDelta> {
         match &self.spec.volume {
-            VolumeSpec::Delta => Some((tick.volume, tick.total_turnover)),
+            VolumeSpec::Delta => Some(CumulativeDelta {
+                volume: tick.volume,
+                total_turnover: tick.total_turnover,
+                window_start: None,
+            }),
             VolumeSpec::Cumulative { bootstrap, .. } => {
                 let Some(trading_day) = tick.trading_day.as_ref() else {
                     self.pending_filtered_rows += 1;
@@ -222,32 +226,54 @@ impl BarGeneratorEngine {
                         trading_day: trading_day.clone(),
                         last_volume: 0.0,
                         last_total_turnover: 0.0,
+                        last_dt: tick.dt,
                         initialized: false,
+                        has_valid_delta: false,
                     });
 
                 if !state.initialized || state.trading_day != *trading_day {
                     state.trading_day = trading_day.clone();
                     state.last_volume = tick.volume;
                     state.last_total_turnover = tick.total_turnover;
+                    state.last_dt = tick.dt;
                     state.initialized = true;
+                    state.has_valid_delta = false;
 
                     return match bootstrap {
                         BootstrapPolicy::SkipFirstDelta => None,
-                        BootstrapPolicy::FromZero => Some((tick.volume, tick.total_turnover)),
+                        BootstrapPolicy::FromZero => {
+                            state.has_valid_delta = true;
+                            Some(CumulativeDelta {
+                                volume: tick.volume,
+                                total_turnover: tick.total_turnover,
+                                window_start: None,
+                            })
+                        }
                     };
                 }
 
                 let volume_delta = tick.volume - state.last_volume;
                 let total_turnover_delta = tick.total_turnover - state.last_total_turnover;
+                let window_start = if state.has_valid_delta {
+                    None
+                } else {
+                    Some(minute_start_ns(state.last_dt))
+                };
                 state.last_volume = tick.volume;
                 state.last_total_turnover = tick.total_turnover;
+                state.last_dt = tick.dt;
 
                 if volume_delta < 0.0 || total_turnover_delta < 0.0 {
                     self.pending_filtered_rows += 1;
                     return None;
                 }
 
-                Some((volume_delta, total_turnover_delta))
+                state.has_valid_delta = true;
+                Some(CumulativeDelta {
+                    volume: volume_delta,
+                    total_turnover: total_turnover_delta,
+                    window_start,
+                })
             }
         }
     }
@@ -355,13 +381,14 @@ impl Engine for BarGeneratorEngine {
                 continue;
             }
 
-            let Some((volume, total_turnover)) = self.compute_volume_delta(&tick) else {
+            let Some(delta) = self.compute_volume_delta(&tick) else {
                 continue;
             };
-            tick.volume = volume;
-            tick.total_turnover = total_turnover;
+            tick.volume = delta.volume;
+            tick.total_turnover = delta.total_turnover;
 
-            let window_start = minute_start_ns(tick.dt);
+            let current_window_start = minute_start_ns(tick.dt);
+            let window_start = delta.window_start.unwrap_or(current_window_start);
             let window_end =
                 window_start
                     .checked_add(BAR_FREQUENCY_1M_NS)
@@ -382,10 +409,12 @@ impl Engine for BarGeneratorEngine {
                     );
                 }
                 None => {
-                    self.open_bars.insert(
-                        tick.instrument.clone(),
-                        OpenBar::from_tick(&tick, window_start, window_end),
-                    );
+                    let open_bar = OpenBar::from_tick(&tick, window_start, window_end);
+                    if window_end <= current_window_start {
+                        completed.push(open_bar);
+                    } else {
+                        self.open_bars.insert(tick.instrument.clone(), open_bar);
+                    }
                 }
             }
         }
@@ -488,7 +517,15 @@ struct CumulativeState {
     trading_day: String,
     last_volume: f64,
     last_total_turnover: f64,
+    last_dt: i64,
     initialized: bool,
+    has_valid_delta: bool,
+}
+
+struct CumulativeDelta {
+    volume: f64,
+    total_turnover: f64,
+    window_start: Option<i64>,
 }
 
 impl OpenBar {
