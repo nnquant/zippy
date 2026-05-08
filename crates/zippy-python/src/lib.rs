@@ -5870,6 +5870,10 @@ fn normalize_bar_profile(
 }
 
 fn py_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    py_to_json_value_at(value, "profile")
+}
+
+fn py_to_json_value_at(value: &Bound<'_, PyAny>, path: &str) -> PyResult<serde_json::Value> {
     if value.is_none() {
         return Ok(serde_json::Value::Null);
     }
@@ -5884,38 +5888,49 @@ fn py_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     }
     if let Ok(number) = value.extract::<f64>() {
         let Some(number) = serde_json::Number::from_f64(number) else {
-            return Err(py_value_error("bar profile contains non-finite float"));
+            return Err(py_value_error(format!(
+                "bar profile field=[{path}] contains non-finite float"
+            )));
         };
         return Ok(serde_json::Value::Number(number));
     }
     if let Ok(dict) = value.downcast::<PyDict>() {
         let mut object = serde_json::Map::new();
         for (key, item) in dict.iter() {
-            let key = key
-                .extract::<String>()
-                .map_err(|_| py_value_error("bar profile dict keys must be strings"))?;
-            object.insert(key, py_to_json_value(&item)?);
+            let key = key.extract::<String>().map_err(|_| {
+                py_value_error(format!(
+                    "bar profile field=[{path}] dict keys must be strings"
+                ))
+            })?;
+            let item_path = format!("{path}.{key}");
+            object.insert(key, py_to_json_value_at(&item, &item_path)?);
         }
         return Ok(serde_json::Value::Object(object));
     }
     if let Ok(list) = value.downcast::<PyList>() {
         return list
             .iter()
-            .map(|item| py_to_json_value(&item))
+            .enumerate()
+            .map(|(index, item)| py_to_json_value_at(&item, &format!("{path}[{index}]")))
             .collect::<PyResult<Vec<_>>>()
             .map(serde_json::Value::Array);
     }
     if let Ok(tuple) = value.downcast::<PyTuple>() {
         return tuple
             .iter()
-            .map(|item| py_to_json_value(&item))
+            .enumerate()
+            .map(|(index, item)| py_to_json_value_at(&item, &format!("{path}[{index}]")))
             .collect::<PyResult<Vec<_>>>()
             .map(serde_json::Value::Array);
     }
 
-    Err(py_value_error(
-        "bar profile values must be dict, list, tuple, str, int, float, bool, or None",
-    ))
+    Err(py_value_error(format!(
+        concat!(
+            "bar profile field=[{}] must be dict, list, tuple, str, int, float, bool, ",
+            "or None"
+        ),
+        path
+    )))
 }
 
 fn parse_bar_generator_spec(value: &serde_json::Value) -> PyResult<RustBarGeneratorSpec> {
@@ -5994,8 +6009,11 @@ fn parse_session_windows(
             }
             let start = json_string_value(&bounds[0], &format!("{path}[{index}][0]"))?;
             let end = json_string_value(&bounds[1], &format!("{path}[{index}][1]"))?;
-            RustSessionWindow::parse(&start, &end)
-                .map_err(|error| py_value_error(error.to_string()))
+            RustSessionWindow::parse(&start, &end).map_err(|error| {
+                py_value_error(format!(
+                    "bar profile field=[{path}[{index}]] invalid session window: {error}"
+                ))
+            })
         })
         .collect()
 }
@@ -6725,11 +6743,19 @@ fn ensure_source_stopped(py: Python<'_>, source_owner: &Option<Py<PyAny>>) -> Py
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
+    if let Ok(engine) = source.extract::<PyRef<'_, KeyValueTableMaterializer>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
     if let Ok(engine) = source.extract::<PyRef<'_, TimeSeriesEngine>>() {
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
     if let Ok(engine) = source.extract::<PyRef<'_, BarGeneratorEngine>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
+    if let Ok(engine) = source.extract::<PyRef<'_, CrossSectionalEngine>>() {
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
