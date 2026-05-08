@@ -19,7 +19,7 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyModule, PyTuple};
 use tracing::{error, info};
 use zippy_core::{
     current_log_snapshot, python_dev_version, resolve_control_endpoint, send_control_line_request,
@@ -31,16 +31,19 @@ use zippy_core::{
     Writer as CoreBusWriter, ZippyConfig, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 use zippy_engines::{
-    CrossSectionalEngine as RustCrossSectionalEngine,
+    AuctionPolicy as RustAuctionPolicy, BarGeneratorEngine as RustBarGeneratorEngine,
+    BarGeneratorSpec as RustBarGeneratorSpec, BarInputColumns as RustBarInputColumns,
+    BarSessionSpec as RustBarSessionSpec, BootstrapPolicy as RustBootstrapPolicy,
+    CrossSectionalEngine as RustCrossSectionalEngine, DtLabelPolicy as RustDtLabelPolicy,
     KeyValueTableMaterializer as RustKeyValueTableMaterializer,
     ReactiveLatestEngine as RustReactiveLatestEngine,
-    ReactiveStateEngine as RustReactiveStateEngine,
+    ReactiveStateEngine as RustReactiveStateEngine, SessionWindow as RustSessionWindow,
     StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
     StreamTableMaterializer as RustStreamTableMaterializer, StreamTablePersistConfig,
     StreamTablePersistPartitionSpec,
     StreamTablePersistPublisher as RustStreamTablePersistPublisher,
     StreamTableRetentionGuard as RustStreamTableRetentionGuard,
-    TimeSeriesEngine as RustTimeSeriesEngine,
+    TimeSeriesEngine as RustTimeSeriesEngine, VolumeSpec as RustVolumeSpec,
 };
 use zippy_gateway::{GatewayServer as RustGatewayServer, GatewayServerConfig};
 use zippy_io::{
@@ -4234,6 +4237,27 @@ struct TimeSeriesEngine {
 }
 
 #[pyclass]
+struct BarGeneratorEngine {
+    name: String,
+    input_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    profile_spec: serde_json::Value,
+    target: Vec<TargetConfig>,
+    parquet_sink: Option<ParquetSinkConfig>,
+    runtime_options: RuntimeOptions,
+    status: SharedStatus,
+    metrics: SharedMetrics,
+    archive: SharedArchive,
+    handle: SharedHandle,
+    engine: Option<RustBarGeneratorEngine>,
+    remote_source: Option<RemoteSourceConfig>,
+    segment_source: Option<SegmentSourceConfig>,
+    python_source: Option<PythonSourceConfig>,
+    downstreams: Vec<DownstreamLink>,
+    _source_owner: Option<Py<PyAny>>,
+}
+
+#[pyclass]
 struct CrossSectionalEngine {
     name: String,
     id_column: String,
@@ -5308,6 +5332,163 @@ impl TimeSeriesEngine {
 }
 
 #[pymethods]
+impl BarGeneratorEngine {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, input_schema, profile, target, *, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    fn new(
+        py: Python<'_>,
+        name: String,
+        input_schema: &Bound<'_, PyAny>,
+        profile: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        source: Option<&Bound<'_, PyAny>>,
+        master: Option<&Bound<'_, PyAny>>,
+        parquet_sink: Option<&Bound<'_, PyAny>>,
+        buffer_capacity: usize,
+        overflow_policy: Option<&Bound<'_, PyAny>>,
+        archive_buffer_capacity: usize,
+        xfast: bool,
+    ) -> PyResult<Self> {
+        let schema = Arc::new(
+            Schema::from_pyarrow_bound(input_schema)
+                .map_err(|error| py_value_error(error.to_string()))?,
+        );
+        let (bar_spec, profile_spec) = normalize_bar_profile(py, profile)?;
+        let engine = RustBarGeneratorEngine::new(&name, Arc::clone(&schema), bar_spec)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        let output_schema = engine.output_schema();
+        let target = parse_targets(target)?;
+        let parquet_sink = parse_parquet_sink(parquet_sink)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
+        let handle = Arc::new(Mutex::new(None));
+        let archive = Arc::new(Mutex::new(None));
+        let status = Arc::new(Mutex::new(EngineStatus::Created));
+        let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
+        let (source_owner, remote_source, segment_source, python_source) = register_source(
+            py,
+            source,
+            master,
+            DownstreamLink {
+                handle: Arc::clone(&handle),
+                archive: Arc::clone(&archive),
+                write_input: parquet_sink
+                    .as_ref()
+                    .map(|config| config.write_input)
+                    .unwrap_or(false),
+            },
+            schema.as_ref(),
+            xfast,
+        )?;
+
+        Ok(Self {
+            name,
+            input_schema: schema,
+            output_schema,
+            profile_spec,
+            target,
+            parquet_sink,
+            runtime_options,
+            status,
+            metrics,
+            archive,
+            handle,
+            engine: Some(engine),
+            remote_source,
+            segment_source,
+            python_source,
+            downstreams: Vec::new(),
+            _source_owner: source_owner,
+        })
+    }
+
+    fn start(&mut self) -> PyResult<()> {
+        let (handle, archive) = start_runtime_engine(
+            &self.name,
+            &self.runtime_options,
+            &self.target,
+            self.parquet_sink.as_ref(),
+            self.remote_source.as_ref(),
+            self.segment_source.as_ref(),
+            self.python_source.as_ref(),
+            &self.downstreams,
+            &mut self.engine,
+        )?;
+        *self.handle.lock().unwrap() = Some(handle);
+        *self.archive.lock().unwrap() = archive;
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        Ok(())
+    }
+
+    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        ensure_downstreams_running(&self.downstreams)?;
+        let result = write_runtime_input(
+            py,
+            &self.handle,
+            &self.archive,
+            self.parquet_sink.as_ref(),
+            value,
+            &self.input_schema,
+        );
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn output_schema(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.output_schema
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn status(&self) -> String {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        self.status.lock().unwrap().as_str().to_string()
+    }
+
+    fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+    }
+
+    fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = engine_base_config_dict(
+            py,
+            "bar_generator",
+            &self.name,
+            &self.target,
+            &self.parquet_sink,
+            &self.runtime_options,
+            engine_has_source(
+                &self._source_owner,
+                &self.remote_source,
+                &self.segment_source,
+                &self.python_source,
+            ),
+        )?;
+        dict.set_item("profile", serde_json_value_to_py(py, &self.profile_spec)?)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let result =
+            flush_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics);
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        result
+    }
+
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        ensure_source_stopped(py, &self._source_owner)?;
+        stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
+    }
+}
+
+#[pymethods]
 impl CrossSectionalEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
@@ -5539,6 +5720,7 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<StreamTableMaterializer>()?;
     module.add_class::<KeyValueTableMaterializer>()?;
     module.add_class::<TimeSeriesEngine>()?;
+    module.add_class::<BarGeneratorEngine>()?;
     module.add_class::<CrossSectionalEngine>()?;
     Ok(())
 }
@@ -5671,6 +5853,351 @@ fn parse_by_columns(by: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
         return Err(py_value_error("by must not contain empty column names"));
     }
     Ok(values)
+}
+
+fn normalize_bar_profile(
+    _py: Python<'_>,
+    profile: &Bound<'_, PyAny>,
+) -> PyResult<(RustBarGeneratorSpec, serde_json::Value)> {
+    let raw_profile = if profile.hasattr("to_bar_generator_spec")? {
+        py_to_json_value(&profile.call_method0("to_bar_generator_spec")?)?
+    } else {
+        py_to_json_value(profile)?
+    };
+    let spec = parse_bar_generator_spec(&raw_profile)?;
+    let normalized = bar_generator_spec_to_json(&spec);
+    Ok((spec, normalized))
+}
+
+fn py_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if value.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if value.is_instance_of::<PyBool>() {
+        return Ok(serde_json::Value::Bool(value.extract::<bool>()?));
+    }
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(serde_json::Value::String(text));
+    }
+    if let Ok(integer) = value.extract::<i64>() {
+        return Ok(serde_json::Value::Number(integer.into()));
+    }
+    if let Ok(number) = value.extract::<f64>() {
+        let Some(number) = serde_json::Number::from_f64(number) else {
+            return Err(py_value_error("bar profile contains non-finite float"));
+        };
+        return Ok(serde_json::Value::Number(number));
+    }
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        let mut object = serde_json::Map::new();
+        for (key, item) in dict.iter() {
+            let key = key
+                .extract::<String>()
+                .map_err(|_| py_value_error("bar profile dict keys must be strings"))?;
+            object.insert(key, py_to_json_value(&item)?);
+        }
+        return Ok(serde_json::Value::Object(object));
+    }
+    if let Ok(list) = value.downcast::<PyList>() {
+        return list
+            .iter()
+            .map(|item| py_to_json_value(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        return tuple
+            .iter()
+            .map(|item| py_to_json_value(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+
+    Err(py_value_error(
+        "bar profile values must be dict, list, tuple, str, int, float, bool, or None",
+    ))
+}
+
+fn parse_bar_generator_spec(value: &serde_json::Value) -> PyResult<RustBarGeneratorSpec> {
+    let object = json_object(value, "profile")?;
+    let frequency = json_required_string(object, "profile", "frequency")?;
+    let columns = parse_bar_input_columns(json_required_field(object, "profile", "columns")?)?;
+    let sessions = parse_bar_session_spec(json_required_field(object, "profile", "sessions")?)?;
+    let volume = parse_bar_volume_spec(json_required_field(object, "profile", "volume")?)?;
+    let auction = parse_bar_auction_policy(json_required_field(object, "profile", "auction")?)?;
+    let dt_label = parse_bar_dt_label_policy(json_required_field(object, "profile", "dt_label")?)?;
+
+    Ok(RustBarGeneratorSpec {
+        frequency,
+        columns,
+        sessions,
+        volume,
+        auction,
+        dt_label,
+    })
+}
+
+fn parse_bar_input_columns(value: &serde_json::Value) -> PyResult<RustBarInputColumns> {
+    let object = json_object(value, "columns")?;
+    Ok(RustBarInputColumns {
+        instrument: json_required_string(object, "columns", "instrument")?,
+        dt: json_required_string(object, "columns", "dt")?,
+        price: json_required_string(object, "columns", "price")?,
+        volume: json_required_string(object, "columns", "volume")?,
+        total_turnover: json_required_string(object, "columns", "total_turnover")?,
+        trading_day: json_optional_string(object, "columns", "trading_day")?,
+        num_trades: json_optional_string(object, "columns", "num_trades")?,
+        limit_up: json_optional_string(object, "columns", "limit_up")?,
+        limit_down: json_optional_string(object, "columns", "limit_down")?,
+    })
+}
+
+fn parse_bar_session_spec(value: &serde_json::Value) -> PyResult<RustBarSessionSpec> {
+    let object = json_object(value, "sessions")?;
+    let auction = match object.get("auction") {
+        Some(value) => parse_session_windows(value, "sessions.auction")?,
+        None => Vec::new(),
+    };
+    Ok(RustBarSessionSpec {
+        timezone: json_required_string(object, "sessions", "timezone")?,
+        regular: parse_session_windows(
+            json_required_field(object, "sessions", "regular")?,
+            "sessions.regular",
+        )?,
+        auction,
+    })
+}
+
+fn parse_session_windows(
+    value: &serde_json::Value,
+    path: &str,
+) -> PyResult<Vec<RustSessionWindow>> {
+    let serde_json::Value::Array(windows) = value else {
+        return Err(py_value_error(format!(
+            "bar profile field=[{path}] must be a list of session windows"
+        )));
+    };
+
+    windows
+        .iter()
+        .enumerate()
+        .map(|(index, window)| {
+            let serde_json::Value::Array(bounds) = window else {
+                return Err(py_value_error(format!(
+                    "bar profile field=[{path}[{index}]] must be a two-item window"
+                )));
+            };
+            if bounds.len() != 2 {
+                return Err(py_value_error(format!(
+                    "bar profile field=[{path}[{index}]] must contain start and end"
+                )));
+            }
+            let start = json_string_value(&bounds[0], &format!("{path}[{index}][0]"))?;
+            let end = json_string_value(&bounds[1], &format!("{path}[{index}][1]"))?;
+            RustSessionWindow::parse(&start, &end)
+                .map_err(|error| py_value_error(error.to_string()))
+        })
+        .collect()
+}
+
+fn parse_bar_volume_spec(value: &serde_json::Value) -> PyResult<RustVolumeSpec> {
+    let object = json_object(value, "volume")?;
+    let mode = json_required_string(object, "volume", "mode")?;
+    match mode.as_str() {
+        "delta" => Ok(RustVolumeSpec::Delta),
+        "cumulative" => {
+            let trading_day_column = json_required_string(object, "volume", "trading_day_column")?;
+            let bootstrap = match json_required_string(object, "volume", "bootstrap")?.as_str() {
+                "skip_first_delta" => RustBootstrapPolicy::SkipFirstDelta,
+                "from_zero" => RustBootstrapPolicy::FromZero,
+                value => {
+                    return Err(py_value_error(format!(
+                        "volume.bootstrap must be skip_first_delta or from_zero value=[{value}]"
+                    )));
+                }
+            };
+            Ok(RustVolumeSpec::Cumulative {
+                trading_day_column,
+                bootstrap,
+            })
+        }
+        value => Err(py_value_error(format!(
+            "volume.mode must be delta or cumulative value=[{value}]"
+        ))),
+    }
+}
+
+fn parse_bar_auction_policy(value: &serde_json::Value) -> PyResult<RustAuctionPolicy> {
+    let policy = match value {
+        serde_json::Value::String(value) => value.clone(),
+        serde_json::Value::Object(object) => object
+            .get("policy")
+            .or_else(|| object.get("mode"))
+            .ok_or_else(|| py_value_error("bar profile missing field=[auction.policy]"))
+            .and_then(|value| json_string_value(value, "auction.policy"))?,
+        _ => {
+            return Err(py_value_error(
+                "auction must be a string or object containing policy/mode",
+            ));
+        }
+    };
+
+    match policy.as_str() {
+        "drop" => Ok(RustAuctionPolicy::Drop),
+        "merge_to_first_regular_bar" => Ok(RustAuctionPolicy::MergeToFirstRegularBar),
+        "emit_separate_bar" => Ok(RustAuctionPolicy::EmitSeparateBar),
+        value => Err(py_value_error(format!(
+            concat!(
+                "auction must be drop, merge_to_first_regular_bar, or emit_separate_bar ",
+                "value=[{}]"
+            ),
+            value
+        ))),
+    }
+}
+
+fn parse_bar_dt_label_policy(value: &serde_json::Value) -> PyResult<RustDtLabelPolicy> {
+    let value = json_string_value(value, "dt_label")?;
+    match value.as_str() {
+        "close_dt" => Ok(RustDtLabelPolicy::CloseDt),
+        "start_dt" => Ok(RustDtLabelPolicy::StartDt),
+        value => Err(py_value_error(format!(
+            "dt_label must be close_dt or start_dt value=[{value}]"
+        ))),
+    }
+}
+
+fn json_object<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> PyResult<&'a serde_json::Map<String, serde_json::Value>> {
+    match value {
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err(py_value_error(format!(
+            "bar profile field=[{path}] must be an object"
+        ))),
+    }
+}
+
+fn json_required_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    field: &str,
+) -> PyResult<&'a serde_json::Value> {
+    object
+        .get(field)
+        .ok_or_else(|| py_value_error(format!("bar profile missing field=[{path}.{field}]")))
+}
+
+fn json_required_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    field: &str,
+) -> PyResult<String> {
+    json_string_value(
+        json_required_field(object, path, field)?,
+        &format!("{path}.{field}"),
+    )
+}
+
+fn json_optional_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+    field: &str,
+) -> PyResult<Option<String>> {
+    match object.get(field) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(value) => json_string_value(value, &format!("{path}.{field}")).map(Some),
+    }
+}
+
+fn json_string_value(value: &serde_json::Value, path: &str) -> PyResult<String> {
+    match value {
+        serde_json::Value::String(value) if !value.is_empty() => Ok(value.clone()),
+        serde_json::Value::String(_) => Err(py_value_error(format!(
+            "bar profile field=[{path}] must not be empty"
+        ))),
+        _ => Err(py_value_error(format!(
+            "bar profile field=[{path}] must be a string"
+        ))),
+    }
+}
+
+fn bar_generator_spec_to_json(spec: &RustBarGeneratorSpec) -> serde_json::Value {
+    serde_json::json!({
+        "frequency": &spec.frequency,
+        "columns": {
+            "instrument": &spec.columns.instrument,
+            "dt": &spec.columns.dt,
+            "price": &spec.columns.price,
+            "volume": &spec.columns.volume,
+            "total_turnover": &spec.columns.total_turnover,
+            "trading_day": &spec.columns.trading_day,
+            "num_trades": &spec.columns.num_trades,
+            "limit_up": &spec.columns.limit_up,
+            "limit_down": &spec.columns.limit_down,
+        },
+        "sessions": {
+            "timezone": &spec.sessions.timezone,
+            "regular": spec.sessions.regular.iter().map(session_window_to_json).collect::<Vec<_>>(),
+            "auction": spec.sessions.auction.iter().map(session_window_to_json).collect::<Vec<_>>(),
+        },
+        "volume": volume_spec_to_json(&spec.volume),
+        "auction": auction_policy_to_str(&spec.auction),
+        "dt_label": dt_label_policy_to_str(&spec.dt_label),
+    })
+}
+
+fn session_window_to_json(window: &RustSessionWindow) -> serde_json::Value {
+    serde_json::json!([
+        seconds_since_midnight_to_hms(window.start_seconds),
+        seconds_since_midnight_to_hms(window.end_seconds),
+    ])
+}
+
+fn seconds_since_midnight_to_hms(seconds: u32) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+fn volume_spec_to_json(volume: &RustVolumeSpec) -> serde_json::Value {
+    match volume {
+        RustVolumeSpec::Delta => serde_json::json!({"mode": "delta"}),
+        RustVolumeSpec::Cumulative {
+            trading_day_column,
+            bootstrap,
+        } => serde_json::json!({
+            "mode": "cumulative",
+            "trading_day_column": trading_day_column,
+            "bootstrap": bootstrap_policy_to_str(bootstrap),
+        }),
+    }
+}
+
+fn bootstrap_policy_to_str(policy: &RustBootstrapPolicy) -> &'static str {
+    match policy {
+        RustBootstrapPolicy::SkipFirstDelta => "skip_first_delta",
+        RustBootstrapPolicy::FromZero => "from_zero",
+    }
+}
+
+fn auction_policy_to_str(policy: &RustAuctionPolicy) -> &'static str {
+    match policy {
+        RustAuctionPolicy::Drop => "drop",
+        RustAuctionPolicy::MergeToFirstRegularBar => "merge_to_first_regular_bar",
+        RustAuctionPolicy::EmitSeparateBar => "emit_separate_bar",
+    }
+}
+
+fn dt_label_policy_to_str(policy: &RustDtLabelPolicy) -> &'static str {
+    match policy {
+        RustDtLabelPolicy::CloseDt => "close_dt",
+        RustDtLabelPolicy::StartDt => "start_dt",
+    }
 }
 
 fn parse_instrument_ids(
@@ -5918,6 +6445,21 @@ fn register_source(
         return Ok((Some(source.clone().unbind()), None, None, None));
     }
 
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, BarGeneratorEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream);
+        return Ok((Some(source.clone().unbind()), None, None, None));
+    }
+
     if let Ok(mut engine) = source.extract::<PyRefMut<'_, CrossSectionalEngine>>() {
         if engine.engine.is_none() {
             return Err(py_runtime_error(
@@ -6013,7 +6555,7 @@ fn register_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableMaterializer, KeyValueTableMaterializer, TimeSeriesEngine, CrossSectionalEngine, ZmqSource, SegmentStreamSource, or a Python source plugin",
+        "source must be ReactiveStateEngine, ReactiveLatestEngine, StreamTableMaterializer, KeyValueTableMaterializer, TimeSeriesEngine, BarGeneratorEngine, CrossSectionalEngine, ZmqSource, SegmentStreamSource, or a Python source plugin",
     ))
 }
 
@@ -6059,6 +6601,21 @@ fn register_timeseries_source(
         return Ok((Some(source.clone().unbind()), None, None));
     }
 
+    if let Ok(mut engine) = source.extract::<PyRefMut<'_, BarGeneratorEngine>>() {
+        if engine.engine.is_none() {
+            return Err(py_runtime_error(
+                "source engine must be linked before it is started",
+            ));
+        }
+        if engine.output_schema.as_ref() != input_schema {
+            return Err(py_value_error(
+                "source output schema must match downstream input_schema",
+            ));
+        }
+        engine.downstreams.push(downstream);
+        return Ok((Some(source.clone().unbind()), None, None));
+    }
+
     if let Ok(remote_source) = source.extract::<PyRef<'_, ZmqSource>>() {
         if remote_source.expected_schema.as_ref() != input_schema {
             return Err(py_value_error(
@@ -6078,7 +6635,7 @@ fn register_timeseries_source(
     }
 
     Err(PyTypeError::new_err(
-        "source must be a named segment stream, TimeSeriesEngine, or ZmqSource for CrossSectionalEngine",
+        "source must be a named segment stream, TimeSeriesEngine, BarGeneratorEngine, or ZmqSource for CrossSectionalEngine",
     ))
 }
 
@@ -6169,6 +6726,10 @@ fn ensure_source_stopped(py: Python<'_>, source_owner: &Option<Py<PyAny>>) -> Py
     }
 
     if let Ok(engine) = source.extract::<PyRef<'_, TimeSeriesEngine>>() {
+        return ensure_runtime_is_not_running(&engine.handle);
+    }
+
+    if let Ok(engine) = source.extract::<PyRef<'_, BarGeneratorEngine>>() {
         return ensure_runtime_is_not_running(&engine.handle);
     }
 
