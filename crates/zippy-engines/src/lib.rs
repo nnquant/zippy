@@ -9,7 +9,7 @@ pub mod timeseries;
 
 pub use bar_generator::{
     AuctionPolicy, BarGeneratorEngine, BarGeneratorSpec, BarInputColumns, BarSessionSpec,
-    BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeSpec,
+    BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeOutputDtype, VolumeSpec,
 };
 pub use cross_sectional::CrossSectionalEngine;
 pub use reactive::ReactiveStateEngine;

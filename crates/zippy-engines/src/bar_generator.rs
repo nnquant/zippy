@@ -105,6 +105,13 @@ pub enum VolumeSpec {
     },
 }
 
+/// Output data type for generated bar volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeOutputDtype {
+    Int64,
+    Float64,
+}
+
 /// Auction tick handling policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuctionPolicy {
@@ -127,6 +134,7 @@ pub struct BarGeneratorSpec {
     pub columns: BarInputColumns,
     pub sessions: BarSessionSpec,
     pub volume: VolumeSpec,
+    pub volume_output_dtype: VolumeOutputDtype,
     pub auction: AuctionPolicy,
     pub dt_label: DtLabelPolicy,
 }
@@ -185,7 +193,7 @@ impl BarGeneratorEngine {
         let highs = bars.iter().map(|bar| bar.high).collect::<Vec<_>>();
         let lows = bars.iter().map(|bar| bar.low).collect::<Vec<_>>();
         let closes = bars.iter().map(|bar| bar.close).collect::<Vec<_>>();
-        let volumes = bars.iter().map(|bar| bar.volume).collect::<Vec<_>>();
+        let volumes = volume_array_from_bars(bars, self.spec.volume_output_dtype)?;
         let total_turnovers = bars
             .iter()
             .map(|bar| bar.total_turnover)
@@ -204,7 +212,7 @@ impl BarGeneratorEngine {
             Arc::new(Float64Array::from(highs)) as ArrayRef,
             Arc::new(Float64Array::from(lows)) as ArrayRef,
             Arc::new(Float64Array::from(closes)) as ArrayRef,
-            Arc::new(Float64Array::from(volumes)) as ArrayRef,
+            volumes,
             Arc::new(Float64Array::from(total_turnovers)) as ArrayRef,
             Arc::new(Int64Array::from(num_trades)) as ArrayRef,
             Arc::new(Float64Array::from(limit_ups)) as ArrayRef,
@@ -810,6 +818,38 @@ fn sort_bars(bars: &mut [OpenBar]) {
     });
 }
 
+fn volume_array_from_bars(bars: &[OpenBar], output_dtype: VolumeOutputDtype) -> Result<ArrayRef> {
+    match output_dtype {
+        VolumeOutputDtype::Float64 => Ok(Arc::new(Float64Array::from(
+            bars.iter().map(|bar| bar.volume).collect::<Vec<_>>(),
+        )) as ArrayRef),
+        VolumeOutputDtype::Int64 => {
+            let volumes = bars
+                .iter()
+                .map(|bar| volume_to_i64(bar.volume))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(Int64Array::from(volumes)) as ArrayRef)
+        }
+    }
+}
+
+fn volume_to_i64(value: f64) -> Result<i64> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err(ZippyError::InvalidState {
+            status: "bar volume cannot be represented as int64",
+        });
+    }
+
+    let rounded = value.round();
+    if (value - rounded).abs() > f64::EPSILON {
+        return Err(ZippyError::InvalidState {
+            status: "bar volume must be integer-valued for int64 output",
+        });
+    }
+
+    Ok(rounded as i64)
+}
+
 fn local_seconds_of_day(dt_ns: i64, timezone_offset_seconds: i64) -> u32 {
     let seconds = dt_ns.div_euclid(SECOND_NS);
     (seconds + timezone_offset_seconds).rem_euclid(LOCAL_DAY_SECONDS) as u32
@@ -1136,7 +1176,14 @@ fn build_output_schema(schema: &Schema, spec: &BarGeneratorSpec) -> Result<Schem
         Arc::new(Field::new("high", DataType::Float64, false)),
         Arc::new(Field::new("low", DataType::Float64, false)),
         Arc::new(Field::new("close", DataType::Float64, false)),
-        Arc::new(Field::new("volume", DataType::Float64, false)),
+        Arc::new(Field::new(
+            "volume",
+            match spec.volume_output_dtype {
+                VolumeOutputDtype::Int64 => DataType::Int64,
+                VolumeOutputDtype::Float64 => DataType::Float64,
+            },
+            false,
+        )),
         Arc::new(Field::new("total_turnover", DataType::Float64, false)),
         Arc::new(Field::new("num_trades", DataType::Int64, true)),
         Arc::new(Field::new("limit_up", DataType::Float64, true)),

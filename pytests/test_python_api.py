@@ -10127,6 +10127,7 @@ def test_bar_profile_normalizes_to_native_spec() -> None:
             "mode": "cumulative",
             "trading_day_column": "trading_day",
             "bootstrap": "skip_first_delta",
+            "output_dtype": "int64",
         },
         "auction": "drop",
         "dt_label": "close_dt",
@@ -10135,7 +10136,14 @@ def test_bar_profile_normalizes_to_native_spec() -> None:
     spec["columns"]["instrument"] = "symbol"
     assert profile.sessions.regular == [("09:30:00", "15:00:00")]
     assert profile.columns.instrument == "instrument_id"
-    assert zippy.bar.Volume.delta().to_bar_generator_spec() == {"mode": "delta"}
+    assert zippy.bar.Volume.delta().to_bar_generator_spec() == {
+        "mode": "delta",
+        "output_dtype": "int64",
+    }
+    assert zippy.bar.Volume.delta(output_dtype="float64").to_bar_generator_spec() == {
+        "mode": "delta",
+        "output_dtype": "float64",
+    }
     assert (
         zippy.bar.Auction.merge_to_first_regular_bar().to_bar_generator_spec()
         == "merge_to_first_regular_bar"
@@ -10190,6 +10198,8 @@ def test_bar_engine_accepts_plugin_profile_protocol() -> None:
 
     assert engine.config()["engine_type"] == "bar_generator"
     assert engine.config()["profile"]["auction"] == "drop"
+    assert engine.config()["profile"]["volume"]["output_dtype"] == "int64"
+    assert engine.output_schema().field("volume").type == pa.int64()
 
 
 def test_connect_sets_default_master_for_query_tail(tmp_path: Path) -> None:

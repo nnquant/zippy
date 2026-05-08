@@ -6639,29 +6639,33 @@ class _BarVolume:
     mode: str
     trading_day_column: str | None = None
     bootstrap: str | None = None
+    output_dtype: str = "int64"
 
     @staticmethod
-    def delta() -> "_BarVolume":
-        return _BarVolume(mode="delta")
+    def delta(output_dtype: str = "int64") -> "_BarVolume":
+        return _BarVolume(mode="delta", output_dtype=output_dtype)
 
     @staticmethod
     def cumulative(
         trading_day_column: str,
         bootstrap: str = "skip_first_delta",
+        output_dtype: str = "int64",
     ) -> "_BarVolume":
         return _BarVolume(
             mode="cumulative",
             trading_day_column=trading_day_column,
             bootstrap=bootstrap,
+            output_dtype=output_dtype,
         )
 
     def to_bar_generator_spec(self) -> dict[str, object]:
         if self.mode == "delta":
-            return {"mode": "delta"}
+            return {"mode": "delta", "output_dtype": self.output_dtype}
         return {
             "mode": self.mode,
             "trading_day_column": self.trading_day_column,
             "bootstrap": self.bootstrap,
+            "output_dtype": self.output_dtype,
         }
 
 

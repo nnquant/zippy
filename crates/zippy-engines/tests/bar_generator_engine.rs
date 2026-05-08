@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, SchemaRef, SegmentTableView, ZippyError};
 use zippy_engines::{
     AuctionPolicy, BarGeneratorEngine, BarGeneratorSpec, BarInputColumns, BarSessionSpec,
-    BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeSpec,
+    BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeOutputDtype, VolumeSpec,
 };
 
 const MINUTE_NS: i64 = 60_000_000_000;
@@ -117,9 +117,16 @@ fn delta_spec() -> BarGeneratorSpec {
         },
         frequency: "1m".to_string(),
         volume: VolumeSpec::Delta,
+        volume_output_dtype: VolumeOutputDtype::Int64,
         auction: AuctionPolicy::Drop,
         dt_label: DtLabelPolicy::CloseDt,
     }
+}
+
+fn float64_volume_output_spec() -> BarGeneratorSpec {
+    let mut spec = delta_spec();
+    spec.volume_output_dtype = VolumeOutputDtype::Float64;
+    spec
 }
 
 fn cumulative_spec(bootstrap: BootstrapPolicy) -> BarGeneratorSpec {
@@ -374,9 +381,14 @@ fn tick_batch_without_optional_columns(
 
 fn f64_column(table: &SegmentTableView, name: &str) -> Vec<f64> {
     let column = table.column(name).unwrap();
-    let values = column.as_any().downcast_ref::<Float64Array>().unwrap();
+    if let Some(values) = column.as_any().downcast_ref::<Float64Array>() {
+        return (0..values.len()).map(|row| values.value(row)).collect();
+    }
+    let values = column.as_any().downcast_ref::<Int64Array>().unwrap();
 
-    (0..values.len()).map(|row| values.value(row)).collect()
+    (0..values.len())
+        .map(|row| values.value(row) as f64)
+        .collect()
 }
 
 fn string_column(table: &SegmentTableView, name: &str) -> Vec<String> {
@@ -1334,6 +1346,31 @@ fn bar_generator_uses_start_dt_label_when_configured() {
 }
 
 #[test]
+fn bar_generator_can_output_float64_volume_when_configured() {
+    let mut engine =
+        BarGeneratorEngine::new("bars", tick_schema(), float64_volume_output_spec()).unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601", "rb2601"],
+            vec![30_000_000_000, MINUTE_NS + 1_000_000_000],
+            vec![10.0, 11.0],
+            vec![2.5, 3.0],
+            vec![20.0, 33.0],
+            vec!["20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_field(
+        engine.output_schema().as_ref(),
+        "volume",
+        &DataType::Float64,
+        false,
+    );
+    assert_eq!(output.len(), 1);
+    assert_eq!(f64_column(&output[0], "volume"), vec![2.5]);
+}
+
+#[test]
 fn bar_generator_output_schema_is_stable() {
     let engine = BarGeneratorEngine::new("bars", tick_schema(), delta_spec()).unwrap();
     let output_schema = engine.output_schema();
@@ -1374,7 +1411,7 @@ fn bar_generator_output_schema_is_stable() {
     assert_field(output_schema.as_ref(), "high", &DataType::Float64, false);
     assert_field(output_schema.as_ref(), "low", &DataType::Float64, false);
     assert_field(output_schema.as_ref(), "close", &DataType::Float64, false);
-    assert_field(output_schema.as_ref(), "volume", &DataType::Float64, false);
+    assert_field(output_schema.as_ref(), "volume", &DataType::Int64, false);
     assert_field(
         output_schema.as_ref(),
         "total_turnover",

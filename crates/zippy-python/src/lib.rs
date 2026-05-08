@@ -43,7 +43,8 @@ use zippy_engines::{
     StreamTablePersistPartitionSpec,
     StreamTablePersistPublisher as RustStreamTablePersistPublisher,
     StreamTableRetentionGuard as RustStreamTableRetentionGuard,
-    TimeSeriesEngine as RustTimeSeriesEngine, VolumeSpec as RustVolumeSpec,
+    TimeSeriesEngine as RustTimeSeriesEngine, VolumeOutputDtype as RustVolumeOutputDtype,
+    VolumeSpec as RustVolumeSpec,
 };
 use zippy_gateway::{GatewayServer as RustGatewayServer, GatewayServerConfig};
 use zippy_io::{
@@ -5938,7 +5939,9 @@ fn parse_bar_generator_spec(value: &serde_json::Value) -> PyResult<RustBarGenera
     let frequency = json_required_string(object, "profile", "frequency")?;
     let columns = parse_bar_input_columns(json_required_field(object, "profile", "columns")?)?;
     let sessions = parse_bar_session_spec(json_required_field(object, "profile", "sessions")?)?;
-    let volume = parse_bar_volume_spec(json_required_field(object, "profile", "volume")?)?;
+    let volume_value = json_required_field(object, "profile", "volume")?;
+    let volume = parse_bar_volume_spec(volume_value)?;
+    let volume_output_dtype = parse_bar_volume_output_dtype(volume_value)?;
     let auction = parse_bar_auction_policy(json_required_field(object, "profile", "auction")?)?;
     let dt_label = parse_bar_dt_label_policy(json_required_field(object, "profile", "dt_label")?)?;
 
@@ -5947,6 +5950,7 @@ fn parse_bar_generator_spec(value: &serde_json::Value) -> PyResult<RustBarGenera
         columns,
         sessions,
         volume,
+        volume_output_dtype,
         auction,
         dt_label,
     })
@@ -6041,6 +6045,17 @@ fn parse_bar_volume_spec(value: &serde_json::Value) -> PyResult<RustVolumeSpec> 
         }
         value => Err(py_value_error(format!(
             "volume.mode must be delta or cumulative value=[{value}]"
+        ))),
+    }
+}
+
+fn parse_bar_volume_output_dtype(value: &serde_json::Value) -> PyResult<RustVolumeOutputDtype> {
+    let object = json_object(value, "volume")?;
+    match json_optional_string(object, "volume", "output_dtype")?.as_deref() {
+        None | Some("int64") => Ok(RustVolumeOutputDtype::Int64),
+        Some("float64") => Ok(RustVolumeOutputDtype::Float64),
+        Some(value) => Err(py_value_error(format!(
+            "volume.output_dtype must be int64 or float64 value=[{value}]"
         ))),
     }
 }
@@ -6160,7 +6175,7 @@ fn bar_generator_spec_to_json(spec: &RustBarGeneratorSpec) -> serde_json::Value 
             "regular": spec.sessions.regular.iter().map(session_window_to_json).collect::<Vec<_>>(),
             "auction": spec.sessions.auction.iter().map(session_window_to_json).collect::<Vec<_>>(),
         },
-        "volume": volume_spec_to_json(&spec.volume),
+        "volume": volume_spec_to_json(&spec.volume, spec.volume_output_dtype),
         "auction": auction_policy_to_str(&spec.auction),
         "dt_label": dt_label_policy_to_str(&spec.dt_label),
     })
@@ -6182,9 +6197,16 @@ fn seconds_since_midnight_to_hms(seconds: u32) -> String {
     )
 }
 
-fn volume_spec_to_json(volume: &RustVolumeSpec) -> serde_json::Value {
+fn volume_spec_to_json(
+    volume: &RustVolumeSpec,
+    output_dtype: RustVolumeOutputDtype,
+) -> serde_json::Value {
+    let output_dtype = volume_output_dtype_to_str(output_dtype);
     match volume {
-        RustVolumeSpec::Delta => serde_json::json!({"mode": "delta"}),
+        RustVolumeSpec::Delta => serde_json::json!({
+            "mode": "delta",
+            "output_dtype": output_dtype,
+        }),
         RustVolumeSpec::Cumulative {
             trading_day_column,
             bootstrap,
@@ -6192,7 +6214,15 @@ fn volume_spec_to_json(volume: &RustVolumeSpec) -> serde_json::Value {
             "mode": "cumulative",
             "trading_day_column": trading_day_column,
             "bootstrap": bootstrap_policy_to_str(bootstrap),
+            "output_dtype": output_dtype,
         }),
+    }
+}
+
+fn volume_output_dtype_to_str(dtype: RustVolumeOutputDtype) -> &'static str {
+    match dtype {
+        RustVolumeOutputDtype::Int64 => "int64",
+        RustVolumeOutputDtype::Float64 => "float64",
     }
 }
 
