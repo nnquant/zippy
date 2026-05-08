@@ -524,7 +524,7 @@ fn bar_generator_session_window_is_start_inclusive_end_exclusive() {
 }
 
 #[test]
-fn auction_drop_updates_cumulative_baseline_without_output_bar() {
+fn bar_generator_auction_drop_updates_cumulative_baseline_without_output_bar() {
     let mut engine = BarGeneratorEngine::new(
         "bars",
         tick_schema(),
@@ -558,7 +558,7 @@ fn auction_drop_updates_cumulative_baseline_without_output_bar() {
 }
 
 #[test]
-fn auction_merge_to_first_regular_bar_includes_auction_tick() {
+fn bar_generator_auction_merge_to_first_regular_bar_includes_auction_tick() {
     let mut engine = BarGeneratorEngine::new(
         "bars",
         tick_schema(),
@@ -594,7 +594,61 @@ fn auction_merge_to_first_regular_bar_includes_auction_tick() {
 }
 
 #[test]
-fn auction_merge_cumulative_skip_first_delta_uses_regular_window_after_empty_auction_baseline() {
+fn bar_generator_auction_merge_clears_unmatched_pending_on_flush() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        tick_schema(),
+        auction_spec(AuctionPolicy::MergeToFirstRegularBar, VolumeSpec::Delta),
+    )
+    .unwrap();
+    let output = engine
+        .on_data(tick_batch(
+            vec!["rb2601"],
+            vec![15_000_000_000],
+            vec![9.0],
+            vec![2.0],
+            vec![18.0],
+            vec!["20260508"],
+        ))
+        .unwrap();
+
+    assert!(output.is_empty());
+
+    let flushed_without_regular = engine.on_flush().unwrap();
+
+    assert!(flushed_without_regular.is_empty());
+
+    let regular_output = engine
+        .on_data(tick_batch(
+            vec!["rb2601"],
+            vec![30_000_000_000],
+            vec![10.0],
+            vec![3.0],
+            vec![30.0],
+            vec!["20260508"],
+        ))
+        .unwrap();
+
+    assert!(regular_output.is_empty());
+
+    let flushed_regular = engine.on_flush().unwrap();
+
+    assert_eq!(flushed_regular.len(), 1);
+    assert_eq!(flushed_regular[0].num_rows(), 1);
+    assert_eq!(f64_column(&flushed_regular[0], "open"), vec![10.0]);
+    assert_eq!(f64_column(&flushed_regular[0], "high"), vec![10.0]);
+    assert_eq!(f64_column(&flushed_regular[0], "low"), vec![10.0]);
+    assert_eq!(f64_column(&flushed_regular[0], "close"), vec![10.0]);
+    assert_eq!(f64_column(&flushed_regular[0], "volume"), vec![3.0]);
+    assert_eq!(
+        f64_column(&flushed_regular[0], "total_turnover"),
+        vec![30.0]
+    );
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 0);
+}
+
+#[test]
+fn bar_generator_auction_merge_cumulative_empty_baseline_uses_regular_window() {
     let mut engine = BarGeneratorEngine::new(
         "bars",
         tick_schema(),
@@ -631,7 +685,7 @@ fn auction_merge_cumulative_skip_first_delta_uses_regular_window_after_empty_auc
 }
 
 #[test]
-fn auction_emit_cumulative_skip_first_delta_uses_regular_window_after_empty_auction_baseline() {
+fn bar_generator_auction_emit_cumulative_empty_baseline_uses_regular_window() {
     let mut engine = BarGeneratorEngine::new(
         "bars",
         tick_schema(),
@@ -668,7 +722,7 @@ fn auction_emit_cumulative_skip_first_delta_uses_regular_window_after_empty_auct
 }
 
 #[test]
-fn auction_merge_cumulative_skip_first_delta_does_not_backfill_cross_minute_auction_baseline() {
+fn bar_generator_auction_merge_cumulative_cross_minute_uses_regular_window() {
     let mut spec = auction_spec(
         AuctionPolicy::MergeToFirstRegularBar,
         cumulative_skip_first_delta(),
@@ -702,7 +756,7 @@ fn auction_merge_cumulative_skip_first_delta_does_not_backfill_cross_minute_auct
 }
 
 #[test]
-fn auction_emit_cumulative_skip_first_delta_does_not_backfill_cross_minute_auction_baseline() {
+fn bar_generator_auction_emit_cumulative_cross_minute_uses_regular_window() {
     let mut spec = auction_spec(
         AuctionPolicy::EmitSeparateBar,
         cumulative_skip_first_delta(),
@@ -736,7 +790,7 @@ fn auction_emit_cumulative_skip_first_delta_does_not_backfill_cross_minute_aucti
 }
 
 #[test]
-fn auction_emit_separate_bar_outputs_auction_window_bar() {
+fn bar_generator_auction_emit_separate_bar_outputs_auction_window_bar() {
     let mut engine = BarGeneratorEngine::new(
         "bars",
         tick_schema(),

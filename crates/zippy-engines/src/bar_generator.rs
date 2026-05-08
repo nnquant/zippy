@@ -553,6 +553,8 @@ impl Engine for BarGeneratorEngine {
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
+        self.pending_auction_bars.clear();
+
         if self.open_bars.is_empty() && self.open_auction_bars.is_empty() {
             return Ok(vec![]);
         }
