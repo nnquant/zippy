@@ -2,8 +2,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -142,8 +143,8 @@ fn spawn_test_server_with_snapshot_and_lease(
 }
 
 fn wait_for_socket_ready(socket_path: &Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
         match std::os::unix::net::UnixStream::connect(socket_path) {
             Ok(stream) => {
                 drop(stream);
@@ -168,6 +169,120 @@ fn wait_for_socket_ready(socket_path: &Path) {
     }
 
     panic!("socket was not ready path=[{}]", socket_path.display());
+}
+
+fn wait_for_file(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("file did not appear path=[{}]", path.display());
+}
+
+fn run_control_plane_child_process() {
+    let Ok(role) = std::env::var("ZIPPY_CONTROL_PLANE_CHILD_ROLE") else {
+        return;
+    };
+    let socket_path = PathBuf::from(std::env::var("ZIPPY_CONTROL_PLANE_SOCKET").unwrap());
+    let ready_path = PathBuf::from(std::env::var("ZIPPY_CONTROL_PLANE_READY").unwrap());
+    let trigger_path = PathBuf::from(std::env::var("ZIPPY_CONTROL_PLANE_TRIGGER").unwrap());
+    let result_path = PathBuf::from(std::env::var("ZIPPY_CONTROL_PLANE_RESULT").unwrap());
+
+    match role.as_str() {
+        "old_writer" => {
+            let mut client = MasterClient::connect(&socket_path).unwrap();
+            client.register_process("old_os_writer").unwrap();
+            client
+                .register_stream("os_ticks", test_schema(), 64, 4096)
+                .unwrap();
+            client
+                .register_source(
+                    "old_os_source",
+                    "openctp",
+                    "os_ticks",
+                    serde_json::json!({}),
+                )
+                .unwrap();
+            client
+                .publish_segment_descriptor(
+                    "os_ticks",
+                    serde_json::json!({
+                        "magic": "zippy.segment.active",
+                        "version": 1,
+                        "schema_id": 7,
+                        "row_capacity": 64,
+                        "shm_os_id": "/tmp/zippy-os-writer-old",
+                        "payload_offset": 64,
+                        "committed_row_count_offset": 40,
+                        "segment_id": 1,
+                        "generation": 0,
+                    }),
+                )
+                .unwrap();
+            fs::write(&ready_path, b"ready").unwrap();
+            wait_for_file(&trigger_path, Duration::from_secs(2));
+            let result = client
+                .publish_segment_descriptor(
+                    "os_ticks",
+                    serde_json::json!({
+                        "magic": "zippy.segment.active",
+                        "version": 1,
+                        "schema_id": 7,
+                        "row_capacity": 64,
+                        "shm_os_id": "/tmp/zippy-os-writer-stale",
+                        "payload_offset": 64,
+                        "committed_row_count_offset": 40,
+                        "segment_id": 3,
+                        "generation": 2,
+                        "writer_epoch": 1,
+                    }),
+                )
+                .map(|_| "ok".to_string())
+                .unwrap_or_else(|error| error.to_string());
+            fs::write(&result_path, result).unwrap();
+        }
+        "new_writer" => {
+            let mut client = MasterClient::connect(&socket_path).unwrap();
+            client.register_process("new_os_writer").unwrap();
+            client
+                .register_stream("os_ticks", test_schema(), 64, 4096)
+                .unwrap();
+            client
+                .register_source(
+                    "new_os_source",
+                    "openctp",
+                    "os_ticks",
+                    serde_json::json!({}),
+                )
+                .unwrap();
+            client
+                .publish_segment_descriptor(
+                    "os_ticks",
+                    serde_json::json!({
+                        "magic": "zippy.segment.active",
+                        "version": 1,
+                        "schema_id": 7,
+                        "row_capacity": 64,
+                        "shm_os_id": "/tmp/zippy-os-writer-new",
+                        "payload_offset": 64,
+                        "committed_row_count_offset": 40,
+                        "segment_id": 2,
+                        "generation": 1,
+                    }),
+                )
+                .unwrap();
+            fs::write(&ready_path, b"ready").unwrap();
+        }
+        other => panic!("unknown control plane child role role=[{}]", other),
+    }
+}
+
+#[test]
+fn control_plane_child_process_entrypoint() {
+    run_control_plane_child_process();
 }
 
 fn send_request(socket_path: &Path, payload: &str) -> String {
@@ -433,6 +548,152 @@ fn expired_process_writer_is_reclaimed_for_new_writer() {
     server.shutdown();
     join_handle.join().unwrap();
     let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn expired_source_writer_cannot_publish_after_new_source_takeover() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut old_writer = MasterClient::connect(&socket_path).unwrap();
+    old_writer.register_process("openctp_old").unwrap();
+    old_writer
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    old_writer
+        .register_source("openctp_old", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    old_writer
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-old",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+            }),
+        )
+        .unwrap();
+
+    old_writer
+        .update_status("source", "openctp_old", "lost", None)
+        .unwrap();
+
+    let mut new_writer = MasterClient::connect(&socket_path).unwrap();
+    new_writer.register_process("openctp_new").unwrap();
+    new_writer
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    new_writer
+        .register_source("openctp_new", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    new_writer
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-new",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 2,
+                "generation": 1,
+            }),
+        )
+        .unwrap();
+    let stream = new_writer.get_stream("ticks").unwrap();
+    assert_eq!(stream.writer_epoch, 2);
+
+    let stale_error = old_writer
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-stale",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 3,
+                "generation": 2,
+                "writer_epoch": 1,
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        stale_error
+            .to_string()
+            .contains("segment descriptor publisher not authorized"),
+        "unexpected stale publish error: {stale_error}"
+    );
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn os_process_source_writer_takeover_rejects_stale_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let old_ready = temp.path().join("old.ready");
+    let new_ready = temp.path().join("new.ready");
+    let trigger = temp.path().join("publish_stale.trigger");
+    let result = temp.path().join("old.result");
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let child_exe = std::env::current_exe().unwrap();
+    let mut old_child = Command::new(&child_exe)
+        .arg("--exact")
+        .arg("control_plane_child_process_entrypoint")
+        .arg("--nocapture")
+        .env("ZIPPY_CONTROL_PLANE_CHILD_ROLE", "old_writer")
+        .env("ZIPPY_CONTROL_PLANE_SOCKET", &socket_path)
+        .env("ZIPPY_CONTROL_PLANE_READY", &old_ready)
+        .env("ZIPPY_CONTROL_PLANE_TRIGGER", &trigger)
+        .env("ZIPPY_CONTROL_PLANE_RESULT", &result)
+        .spawn()
+        .unwrap();
+    wait_for_file(&old_ready, Duration::from_secs(2));
+
+    let admin = MasterClient::connect(&socket_path).unwrap();
+    admin
+        .update_status("source", "old_os_source", "lost", None)
+        .unwrap();
+
+    let new_status = Command::new(&child_exe)
+        .arg("--exact")
+        .arg("control_plane_child_process_entrypoint")
+        .arg("--nocapture")
+        .env("ZIPPY_CONTROL_PLANE_CHILD_ROLE", "new_writer")
+        .env("ZIPPY_CONTROL_PLANE_SOCKET", &socket_path)
+        .env("ZIPPY_CONTROL_PLANE_READY", &new_ready)
+        .env("ZIPPY_CONTROL_PLANE_TRIGGER", &trigger)
+        .env("ZIPPY_CONTROL_PLANE_RESULT", &result)
+        .status()
+        .unwrap();
+    assert!(new_status.success());
+    wait_for_file(&new_ready, Duration::from_secs(2));
+
+    fs::write(&trigger, b"go").unwrap();
+    let old_status = old_child.wait().unwrap();
+    assert!(old_status.success());
+    let stale_result = fs::read_to_string(&result).unwrap();
+    assert!(
+        stale_result.contains("segment descriptor publisher not authorized"),
+        "unexpected stale publish result: {stale_result}"
+    );
+
+    server.shutdown();
+    join_handle.join().unwrap();
 }
 
 #[test]
@@ -731,6 +992,7 @@ fn master_client_exposes_sealed_segments_as_stream_metadata() {
     assert_eq!(stream.active_segment_descriptor.unwrap()["segment_id"], 2);
     assert_eq!(stream.sealed_segments.len(), 1);
     assert_eq!(stream.sealed_segments[0]["segment_id"], 1);
+    assert_eq!(stream.writer_epoch, 1);
     assert!(stream.persisted_files.is_empty());
 
     let descriptor = client.get_segment_descriptor("ticks").unwrap().unwrap();

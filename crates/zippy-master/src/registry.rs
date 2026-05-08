@@ -11,6 +11,8 @@ pub struct ProcessRecord {
     pub registered_at: u64,
     pub last_heartbeat_at: u64,
     pub lease_status: String,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,12 +29,16 @@ pub struct StreamRecord {
     #[serde(default)]
     pub persist_events: Vec<serde_json::Value>,
     #[serde(default)]
+    pub persist_revision: u64,
+    #[serde(default)]
     pub segment_reader_leases: Vec<serde_json::Value>,
     pub buffer_size: usize,
     pub frame_size: usize,
     pub writer_process_id: Option<String>,
     #[serde(default)]
     pub active_writer_source_name: Option<String>,
+    #[serde(default)]
+    pub writer_epoch: u64,
     pub reader_count: usize,
     pub status: String,
     #[serde(default)]
@@ -49,6 +55,10 @@ pub struct SourceRecord {
     pub config: serde_json::Value,
     pub status: String,
     pub metrics: serde_json::Value,
+    #[serde(default)]
+    pub writer_epoch: u64,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +380,7 @@ pub struct Registry {
     sinks: BTreeMap<String, SinkRecord>,
     next_process_id: u64,
     next_segment_reader_lease_id: u64,
+    control_revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -398,6 +409,35 @@ fn split_active_segment_descriptor(
         None => Vec::new(),
     };
     Ok((descriptor, sealed_segments))
+}
+
+fn validate_metadata_writer_epoch(
+    stream_name: &str,
+    metadata: &serde_json::Value,
+    writer_epoch: u64,
+    unauthorized: impl FnOnce() -> RegistryError,
+) -> Result<(), RegistryError> {
+    let Some(value) = metadata.get("writer_epoch") else {
+        return Ok(());
+    };
+    let Some(metadata_writer_epoch) = value.as_u64() else {
+        return Err(RegistryError::InvalidSegmentDescriptor {
+            stream_name: stream_name.to_string(),
+            reason: "writer_epoch must be an unsigned integer".to_string(),
+        });
+    };
+    if metadata_writer_epoch != writer_epoch {
+        return Err(unauthorized());
+    }
+    Ok(())
+}
+
+fn set_metadata_writer_epoch(metadata: &mut serde_json::Value, writer_epoch: u64) {
+    if let Some(object) = metadata.as_object_mut() {
+        object
+            .entry("writer_epoch")
+            .or_insert_with(|| serde_json::Value::from(writer_epoch));
+    }
 }
 
 fn persisted_created_at_millis() -> u64 {
@@ -450,6 +490,11 @@ impl Registry {
             .as_millis() as u64
     }
 
+    fn next_control_revision(&mut self) -> u64 {
+        self.control_revision = self.control_revision.saturating_add(1).max(1);
+        self.control_revision
+    }
+
     pub fn ensure_stream(
         &mut self,
         stream_name: &str,
@@ -494,21 +539,33 @@ impl Registry {
         self.next_process_id += 1;
         let process_id = format!("proc_{}", self.next_process_id);
         let now = Self::now_epoch_millis();
+        let revision = self.next_control_revision();
         let record = ProcessRecord {
             process_id: process_id.clone(),
             app: app.to_string(),
             registered_at: now,
             last_heartbeat_at: now,
             lease_status: "alive".to_string(),
+            revision,
         };
         self.processes.insert(process_id.clone(), record);
         process_id
     }
 
+    pub fn reserve_process_id(&mut self, process_id: &str) {
+        let Some(raw_id) = process_id.strip_prefix("proc_") else {
+            return;
+        };
+        let Ok(process_number) = raw_id.parse::<u64>() else {
+            return;
+        };
+        self.next_process_id = self.next_process_id.max(process_number);
+    }
+
     pub fn record_heartbeat(&mut self, process_id: &str) -> Result<(), RegistryError> {
         let process =
             self.processes
-                .get_mut(process_id)
+                .get(process_id)
                 .ok_or_else(|| RegistryError::ProcessNotFound {
                     process_id: process_id.to_string(),
                 })?;
@@ -517,8 +574,11 @@ impl Registry {
                 process_id: process_id.to_string(),
             });
         }
+        let revision = self.next_control_revision();
+        let process = self.processes.get_mut(process_id).unwrap();
         process.last_heartbeat_at = Self::now_epoch_millis();
         process.lease_status = "alive".to_string();
+        process.revision = revision;
         Ok(())
     }
 
@@ -582,7 +642,7 @@ impl Registry {
     ) -> Result<bool, RegistryError> {
         let process =
             self.processes
-                .get_mut(process_id)
+                .get(process_id)
                 .ok_or_else(|| RegistryError::ProcessNotFound {
                     process_id: process_id.to_string(),
                 })?;
@@ -593,18 +653,27 @@ impl Registry {
         if now.saturating_sub(process.last_heartbeat_at) < lease_timeout_millis {
             return Ok(false);
         }
+        let revision = self.next_control_revision();
+        let process = self.processes.get_mut(process_id).unwrap();
         process.lease_status = "expired".to_string();
+        process.revision = revision;
         Ok(true)
     }
 
     pub fn force_expire_process(&mut self, process_id: &str) -> Result<(), RegistryError> {
         let process =
             self.processes
-                .get_mut(process_id)
+                .get(process_id)
                 .ok_or_else(|| RegistryError::ProcessNotFound {
                     process_id: process_id.to_string(),
                 })?;
+        if process.lease_status == "expired" {
+            return Ok(());
+        }
+        let revision = self.next_control_revision();
+        let process = self.processes.get_mut(process_id).unwrap();
         process.lease_status = "expired".to_string();
+        process.revision = revision;
         Ok(())
     }
 
@@ -642,15 +711,16 @@ impl Registry {
             });
         }
 
-        let active_writer_source_name = self
-            .sources
-            .values()
-            .find(|source| {
-                source.output_stream == stream_name
-                    && source.status != "lost"
-                    && self.process_is_alive(&source.process_id)
-            })
-            .map(|source| source.source_name.clone());
+        let active_writer_source = self.sources.values().find(|source| {
+            source.output_stream == stream_name
+                && source.status != "lost"
+                && self.process_is_alive(&source.process_id)
+        });
+        let active_writer_source_name =
+            active_writer_source.map(|source| source.source_name.clone());
+        let writer_epoch = active_writer_source
+            .map(|source| source.writer_epoch)
+            .unwrap_or_default();
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
             schema,
@@ -660,11 +730,13 @@ impl Registry {
             sealed_segments: Vec::new(),
             persisted_files: Vec::new(),
             persist_events: Vec::new(),
+            persist_revision: 0,
             segment_reader_leases: Vec::new(),
             buffer_size,
             frame_size,
             writer_process_id: None,
             active_writer_source_name,
+            writer_epoch,
             reader_count: 0,
             status: "registered".to_string(),
             active_segment_descriptor: None,
@@ -746,6 +818,66 @@ impl Registry {
         Ok(Some((stream.descriptor_generation, descriptor)))
     }
 
+    pub fn persisted_file_update_for_process(
+        &self,
+        stream_name: &str,
+        process_id: &str,
+        after_revision: u64,
+    ) -> Result<Option<(u64, Vec<serde_json::Value>, Vec<serde_json::Value>)>, RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        if stream.persist_revision <= after_revision {
+            return Ok(None);
+        }
+        Ok(Some((
+            stream.persist_revision,
+            stream.persisted_files.clone(),
+            stream.persist_events.clone(),
+        )))
+    }
+
+    pub fn process_update_for_process(
+        &self,
+        target_process_id: &str,
+        watcher_process_id: &str,
+        after_revision: u64,
+    ) -> Result<Option<(u64, ProcessRecord)>, RegistryError> {
+        self.validate_process_alive(watcher_process_id)?;
+        let process = self.processes.get(target_process_id).ok_or_else(|| {
+            RegistryError::ProcessNotFound {
+                process_id: target_process_id.to_string(),
+            }
+        })?;
+        if process.revision <= after_revision {
+            return Ok(None);
+        }
+        Ok(Some((process.revision, process.clone())))
+    }
+
+    pub fn source_update_for_process(
+        &self,
+        source_name: &str,
+        watcher_process_id: &str,
+        after_revision: u64,
+    ) -> Result<Option<(u64, SourceRecord)>, RegistryError> {
+        self.validate_process_alive(watcher_process_id)?;
+        let source =
+            self.sources
+                .get(source_name)
+                .ok_or_else(|| RegistryError::SourceNotFound {
+                    source_name: source_name.to_string(),
+                })?;
+        if source.revision <= after_revision {
+            return Ok(None);
+        }
+        Ok(Some((source.revision, source.clone())))
+    }
+
     pub fn get_source(&self, source_name: &str) -> Option<&SourceRecord> {
         self.sources.get(source_name)
     }
@@ -767,6 +899,23 @@ impl Registry {
         config: serde_json::Value,
     ) -> Result<(), RegistryError> {
         self.validate_single_active_writer_source(source_name, output_stream)?;
+        let existing_writer_epoch = self
+            .sources
+            .get(source_name)
+            .map(|source| source.writer_epoch)
+            .unwrap_or_default();
+        let current_stream_writer_epoch = self
+            .streams
+            .get(output_stream)
+            .map(|stream| stream.writer_epoch)
+            .unwrap_or_default();
+        let source_takes_new_writer_epoch =
+            self.source_takes_new_writer_epoch(source_name, process_id, output_stream);
+        let writer_epoch = if source_takes_new_writer_epoch {
+            current_stream_writer_epoch.saturating_add(1).max(1)
+        } else {
+            existing_writer_epoch.max(current_stream_writer_epoch)
+        };
         if let Some(existing) = self.sources.get(source_name) {
             if existing.source_type != source_type
                 || existing.output_stream != output_stream
@@ -782,14 +931,18 @@ impl Registry {
                 });
             }
         }
+        let revision = self.next_control_revision();
         if let Some(existing) = self.sources.get_mut(source_name) {
             if existing.process_id != process_id {
                 existing.process_id = process_id.to_string();
                 existing.metrics = serde_json::json!({});
             }
+            existing.writer_epoch = writer_epoch;
             existing.status = "registered".to_string();
+            existing.revision = revision;
             if let Some(stream) = self.streams.get_mut(output_stream) {
                 stream.active_writer_source_name = Some(source_name.to_string());
+                stream.writer_epoch = writer_epoch;
             }
             return Ok(());
         }
@@ -803,12 +956,34 @@ impl Registry {
                 config,
                 status: "registered".to_string(),
                 metrics: serde_json::json!({}),
+                writer_epoch,
+                revision,
             },
         );
         if let Some(stream) = self.streams.get_mut(output_stream) {
             stream.active_writer_source_name = Some(source_name.to_string());
+            stream.writer_epoch = writer_epoch;
         }
         Ok(())
+    }
+
+    fn source_takes_new_writer_epoch(
+        &self,
+        source_name: &str,
+        process_id: &str,
+        output_stream: &str,
+    ) -> bool {
+        let Some(stream) = self.streams.get(output_stream) else {
+            return false;
+        };
+        match stream.active_writer_source_name.as_deref() {
+            Some(active_source_name) if active_source_name == source_name => self
+                .sources
+                .get(source_name)
+                .map(|source| source.process_id != process_id || source.status == "lost")
+                .unwrap_or(true),
+            _ => true,
+        }
     }
 
     fn validate_single_active_writer_source(
@@ -845,6 +1020,24 @@ impl Registry {
                 source.output_stream == stream_name
                     && source.process_id == process_id
                     && source.status != "lost"
+                    && source.writer_epoch == stream.writer_epoch
+            })
+            .unwrap_or(false)
+    }
+
+    fn stream_writer_process_authorized(&self, stream: &StreamRecord, process_id: &str) -> bool {
+        if stream.writer_process_id.as_deref() != Some(process_id) {
+            return false;
+        }
+        let Some(source_name) = stream.active_writer_source_name.as_deref() else {
+            return true;
+        };
+        self.sources
+            .get(source_name)
+            .map(|source| {
+                source.process_id == process_id
+                    && source.status != "lost"
+                    && source.writer_epoch == stream.writer_epoch
             })
             .unwrap_or(false)
     }
@@ -938,7 +1131,9 @@ impl Registry {
         sealed_segments: Vec<serde_json::Value>,
         persisted_files: Vec<serde_json::Value>,
         persist_events: Vec<serde_json::Value>,
+        persist_revision: u64,
         segment_reader_leases: Vec<serde_json::Value>,
+        writer_epoch: u64,
     ) -> Result<(), RegistryError> {
         let stream =
             self.streams
@@ -950,7 +1145,31 @@ impl Registry {
         stream.sealed_segments = sealed_segments;
         stream.persisted_files = persisted_files;
         stream.persist_events = persist_events;
+        stream.persist_revision = persist_revision;
         stream.segment_reader_leases = segment_reader_leases;
+        stream.writer_epoch = writer_epoch;
+        Ok(())
+    }
+
+    pub fn set_source_writer_epoch(
+        &mut self,
+        source_name: &str,
+        writer_epoch: u64,
+    ) -> Result<(), RegistryError> {
+        if !self.sources.contains_key(source_name) {
+            return Err(RegistryError::SourceNotFound {
+                source_name: source_name.to_string(),
+            });
+        }
+        let revision = self.next_control_revision();
+        let source = self.sources.get_mut(source_name).unwrap();
+        source.writer_epoch = writer_epoch;
+        source.revision = revision;
+        if let Some(stream) = self.streams.get_mut(&source.output_stream) {
+            if stream.active_writer_source_name.as_deref() == Some(source_name) {
+                stream.writer_epoch = writer_epoch;
+            }
+        }
         Ok(())
     }
 
@@ -960,16 +1179,18 @@ impl Registry {
         status: &str,
         metrics: Option<serde_json::Value>,
     ) -> Result<(), RegistryError> {
-        let source =
-            self.sources
-                .get_mut(source_name)
-                .ok_or_else(|| RegistryError::SourceNotFound {
-                    source_name: source_name.to_string(),
-                })?;
+        if !self.sources.contains_key(source_name) {
+            return Err(RegistryError::SourceNotFound {
+                source_name: source_name.to_string(),
+            });
+        }
+        let revision = self.next_control_revision();
+        let source = self.sources.get_mut(source_name).unwrap();
         source.status = status.to_string();
         if let Some(metrics) = metrics {
             source.metrics = metrics;
         }
+        source.revision = revision;
         Ok(())
     }
 
@@ -1014,6 +1235,9 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        if stream.writer_process_id.as_deref() != Some(process_id) || stream.writer_epoch == 0 {
+            stream.writer_epoch = stream.writer_epoch.saturating_add(1).max(1);
+        }
         stream.writer_process_id = Some(process_id.to_string());
         stream.status = "writer_attached".to_string();
         Ok(())
@@ -1023,7 +1247,7 @@ impl Registry {
         &mut self,
         stream_name: &str,
         process_id: &str,
-        descriptor: serde_json::Value,
+        mut descriptor: serde_json::Value,
     ) -> Result<(), RegistryError> {
         self.validate_process_alive(process_id)?;
         let stream =
@@ -1032,7 +1256,7 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
-        let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
+        let writer_owner = self.stream_writer_process_authorized(stream, process_id);
         let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
         if !writer_owner && !source_owner {
             return Err(RegistryError::SegmentDescriptorPublisherNotAuthorized {
@@ -1040,6 +1264,13 @@ impl Registry {
                 process_id: process_id.to_string(),
             });
         }
+        validate_metadata_writer_epoch(stream_name, &descriptor, stream.writer_epoch, || {
+            RegistryError::SegmentDescriptorPublisherNotAuthorized {
+                stream_name: stream_name.to_string(),
+                process_id: process_id.to_string(),
+            }
+        })?;
+        set_metadata_writer_epoch(&mut descriptor, stream.writer_epoch);
         let (active_descriptor, sealed_segments) =
             split_active_segment_descriptor(stream_name, descriptor)?;
         let stream =
@@ -1052,6 +1283,7 @@ impl Registry {
         stream.sealed_segments = sealed_segments;
         stream.descriptor_generation = stream.descriptor_generation.saturating_add(1);
         stream.writer_process_id = Some(process_id.to_string());
+        stream.writer_epoch = stream.writer_epoch.max(1);
         stream.status = "writer_attached".to_string();
         Ok(())
     }
@@ -1069,7 +1301,7 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
-        let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
+        let writer_owner = self.stream_writer_process_authorized(stream, process_id);
         let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
         let sink_owner = self.sinks.values().any(|sink| {
             sink.input_stream == stream_name
@@ -1082,9 +1314,17 @@ impl Registry {
                 process_id: process_id.to_string(),
             });
         }
+        validate_metadata_writer_epoch(stream_name, &persisted_file, stream.writer_epoch, || {
+            RegistryError::PersistedFilePublisherNotAuthorized {
+                stream_name: stream_name.to_string(),
+                process_id: process_id.to_string(),
+            }
+        })?;
 
         let schema_hash = stream.schema_hash.clone();
-        let persisted_file = normalize_persisted_file(stream_name, &schema_hash, persisted_file)?;
+        let mut persisted_file =
+            normalize_persisted_file(stream_name, &schema_hash, persisted_file)?;
+        set_metadata_writer_epoch(&mut persisted_file, stream.writer_epoch);
         let persist_file_id = persisted_file
             .as_object()
             .expect("normalized persisted file is an object")
@@ -1106,10 +1346,12 @@ impl Registry {
                     == Some(persist_file_id.as_str())
             }) {
                 *existing = persisted_file;
+                stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
                 return Ok(());
             }
         }
         stream.persisted_files.push(persisted_file);
+        stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
         Ok(())
     }
 
@@ -1139,6 +1381,7 @@ impl Registry {
                     stream_name: stream_name.to_string(),
                 })?;
         stream.persisted_files = normalized_files;
+        stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
         Ok(())
     }
 
@@ -1155,7 +1398,7 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
-        let writer_owner = stream.writer_process_id.as_deref() == Some(process_id);
+        let writer_owner = self.stream_writer_process_authorized(stream, process_id);
         let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
         let sink_owner = self.sinks.values().any(|sink| {
             sink.input_stream == stream_name
@@ -1168,6 +1411,12 @@ impl Registry {
                 process_id: process_id.to_string(),
             });
         }
+        validate_metadata_writer_epoch(stream_name, &persist_event, stream.writer_epoch, || {
+            RegistryError::PersistEventPublisherNotAuthorized {
+                stream_name: stream_name.to_string(),
+                process_id: process_id.to_string(),
+            }
+        })?;
 
         let mut persist_event = persist_event;
         let Some(object) = persist_event.as_object_mut() else {
@@ -1197,6 +1446,9 @@ impl Registry {
         object
             .entry("created_at")
             .or_insert_with(|| serde_json::Value::from(persisted_created_at_millis()));
+        object
+            .entry("writer_epoch")
+            .or_insert_with(|| serde_json::Value::from(stream.writer_epoch));
         let persist_event_id = object
             .get("persist_event_id")
             .and_then(serde_json::Value::as_str)
@@ -1216,10 +1468,12 @@ impl Registry {
                     == Some(persist_event_id.as_str())
             }) {
                 *existing = persist_event;
+                stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
                 return Ok(());
             }
         }
         stream.persist_events.push(persist_event);
+        stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
         Ok(())
     }
 
@@ -1481,11 +1735,19 @@ impl Registry {
 
     pub fn mark_records_lost_for_process(&mut self, process_id: &str) {
         let mut lost_output_streams = Vec::new();
+        let mut lost_source_names = Vec::new();
         for source in self.sources.values_mut() {
             if source.process_id == process_id {
                 source.status = "lost".to_string();
+                lost_source_names.push(source.source_name.clone());
                 lost_output_streams
                     .push((source.output_stream.clone(), source.source_name.clone()));
+            }
+        }
+        for source_name in lost_source_names {
+            let revision = self.next_control_revision();
+            if let Some(source) = self.sources.get_mut(&source_name) {
+                source.revision = revision;
             }
         }
         for (stream_name, source_name) in lost_output_streams {

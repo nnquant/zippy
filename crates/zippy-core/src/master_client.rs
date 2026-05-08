@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::hint::spin_loop;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,19 +17,27 @@ use crate::bus_frame::{
     BusFrameTiming,
 };
 use crate::bus_protocol::{
-    AcquireSegmentReaderLeaseRequest, AttachStreamRequest, ControlRequest, ControlResponse,
-    DetachReaderRequest, DetachWriterRequest, DropTableRequest, DropTableResult, GetConfigRequest,
-    GetSegmentDescriptorRequest, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
-    PublishPersistEventRequest, PublishPersistedFileRequest, PublishSegmentDescriptorRequest,
-    ReaderDescriptor, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
-    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest,
-    ReplacePersistedFilesRequest, StreamInfo, UnregisterProcessRequest, UnregisterSourceRequest,
-    UpdateRecordStatusRequest, WaitSegmentDescriptorRequest, WriterDescriptor,
+    AcquireSegmentReaderLeaseRequest, AttachStreamRequest, ControlEnvelopeRequest, ControlRequest,
+    ControlResponse, DetachReaderRequest, DetachWriterRequest, DropTableRequest, DropTableResult,
+    GetConfigRequest, GetSegmentDescriptorRequest, GetStreamRequest, HeartbeatRequest,
+    ListStreamsRequest, PublishPersistEventRequest, PublishPersistedFileRequest,
+    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    ReleaseSegmentReaderLeaseRequest, ReplacePersistedFilesRequest, StreamInfo,
+    UnregisterProcessRequest, UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
+    WriterDescriptor,
 };
 use crate::{
     canonical_schema_hash, resolve_control_endpoint, schema_metadata, send_control_line_request,
     ControlEndpoint, Result, SchemaRef, ZippyConfig, ZippyError,
 };
+
+static CONTROL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_control_request_id() -> String {
+    let request_id = CONTROL_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    format!("req_{request_id}")
+}
 
 /// Synchronous control-plane client for zippy-master.
 #[derive(Debug, Clone)]
@@ -118,6 +127,25 @@ impl MasterClient {
                 Err(ZippyError::MasterShutdownRequested { process_id, reason })
             }
             other => Err(unexpected_response("HeartbeatAccepted", other)),
+        }
+    }
+
+    pub fn wait_shutdown(&self, timeout: Duration) -> Result<bool> {
+        match self.watch_resource(WatchResource::Shutdown, 0, timeout)? {
+            None => Ok(false),
+            Some(event) => match event.resource {
+                WatchResource::Shutdown => {
+                    let reason = event
+                        .payload
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("master shutdown requested")
+                        .to_string();
+                    let process_id = self.require_process_id()?;
+                    Err(ZippyError::MasterShutdownRequested { process_id, reason })
+                }
+                other => Err(unexpected_watch_resource("Shutdown", other)),
+            },
         }
     }
 
@@ -577,30 +605,60 @@ impl MasterClient {
         after_descriptor_generation: u64,
         timeout: Duration,
     ) -> Result<Option<SegmentDescriptorUpdate>> {
+        let event = self.watch_resource(
+            WatchResource::SegmentDescriptor {
+                stream_name: stream_name.to_string(),
+            },
+            after_descriptor_generation,
+            timeout,
+        )?;
+
+        match event {
+            None => Ok(None),
+            Some(event) => match event.resource {
+                WatchResource::SegmentDescriptor { .. } => {
+                    let descriptor = event
+                        .payload
+                        .get("descriptor")
+                        .cloned()
+                        .filter(|value| !value.is_null());
+                    Ok(descriptor.map(|descriptor| SegmentDescriptorUpdate {
+                        descriptor_generation: event.revision,
+                        descriptor,
+                    }))
+                }
+                other => Err(unexpected_watch_resource("SegmentDescriptor", other)),
+            },
+        }
+    }
+
+    pub fn watch_resource(
+        &self,
+        resource: WatchResource,
+        after_revision: u64,
+        timeout: Duration,
+    ) -> Result<Option<crate::ResourceEvent>> {
         let process_id = self.require_process_id()?;
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        let response = self.send_request(ControlRequest::WaitSegmentDescriptor(
-            WaitSegmentDescriptorRequest {
-                stream_name: stream_name.to_string(),
-                process_id,
-                after_descriptor_generation,
-                timeout_ms,
-            },
-        ))?;
+        let response = self.send_request(ControlRequest::Envelope(ControlEnvelopeRequest {
+            version: crate::CONTROL_PROTOCOL_VERSION,
+            request_id: next_control_request_id(),
+            process_id: Some(process_id),
+            verb: Some("watch".to_string()),
+            resource: Some(resource),
+            revision: Some(after_revision),
+            timeout_ms: Some(timeout_ms),
+            payload: None,
+            inner: None,
+        }))?;
 
         match response {
-            ControlResponse::SegmentDescriptorChanged {
-                descriptor_generation,
-                descriptor: Some(descriptor),
-                ..
-            } => Ok(Some(SegmentDescriptorUpdate {
-                descriptor_generation,
-                descriptor,
-            })),
-            ControlResponse::SegmentDescriptorChanged {
-                descriptor: None, ..
-            } => Ok(None),
-            other => Err(unexpected_response("SegmentDescriptorChanged", other)),
+            ControlResponse::Envelope(envelope) => match *envelope.inner {
+                ControlResponse::ResourceChanged { event } => Ok(event),
+                other => Err(unexpected_response("ResourceChanged", other)),
+            },
+            ControlResponse::ResourceChanged { event } => Ok(event),
+            other => Err(unexpected_response("ResourceChanged", other)),
         }
     }
 
@@ -998,6 +1056,15 @@ fn unexpected_response(expected: &str, response: ControlResponse) -> ZippyError 
         reason: format!(
             "unexpected control response expected=[{}] actual=[{}]",
             expected, response
+        ),
+    }
+}
+
+fn unexpected_watch_resource(expected: &str, resource: WatchResource) -> ZippyError {
+    ZippyError::Io {
+        reason: format!(
+            "unexpected watch resource expected=[{}] actual=[{:?}]",
+            expected, resource
         ),
     }
 }

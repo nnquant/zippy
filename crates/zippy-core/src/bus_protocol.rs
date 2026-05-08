@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const BUS_LAYOUT_VERSION: u32 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterProcessRequest {
@@ -11,6 +12,59 @@ pub struct RegisterProcessRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub process_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatchResource {
+    Shutdown,
+    Process { process_id: String },
+    Source { source_name: String },
+    PersistedFile { stream_name: String },
+    GatewayConfig,
+    Stream { stream_name: String },
+    SegmentDescriptor { stream_name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchRequest {
+    pub process_id: String,
+    pub resource: WatchResource,
+    pub after_revision: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceEvent {
+    pub resource: WatchResource,
+    pub revision: u64,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlEnvelopeRequest {
+    pub version: u32,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verb: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<WatchResource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner: Option<Box<ControlRequest>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlEnvelopeResponse {
+    pub version: u32,
+    pub request_id: String,
+    pub inner: Box<ControlResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +176,8 @@ pub struct StreamInfo {
     pub frame_size: usize,
     pub write_seq: u64,
     pub writer_process_id: Option<String>,
+    #[serde(default)]
+    pub writer_epoch: u64,
     pub reader_count: usize,
     pub status: String,
 }
@@ -191,14 +247,6 @@ pub struct GetSegmentDescriptorRequest {
     pub process_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WaitSegmentDescriptorRequest {
-    pub stream_name: String,
-    pub process_id: String,
-    pub after_descriptor_generation: u64,
-    pub timeout_ms: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListStreamsResponse {
     pub streams: Vec<StreamInfo>,
@@ -247,8 +295,10 @@ pub struct ReaderDescriptor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
+    Envelope(ControlEnvelopeRequest),
     RegisterProcess(RegisterProcessRequest),
     Heartbeat(HeartbeatRequest),
+    Watch(WatchRequest),
     UnregisterProcess(UnregisterProcessRequest),
     RegisterStream(RegisterStreamRequest),
     RegisterSource(RegisterSourceRequest),
@@ -271,11 +321,11 @@ pub enum ControlRequest {
     AcquireSegmentReaderLease(AcquireSegmentReaderLeaseRequest),
     ReleaseSegmentReaderLease(ReleaseSegmentReaderLeaseRequest),
     GetSegmentDescriptor(GetSegmentDescriptorRequest),
-    WaitSegmentDescriptor(WaitSegmentDescriptorRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
+    Envelope(ControlEnvelopeResponse),
     ProcessRegistered {
         process_id: String,
     },
@@ -352,10 +402,8 @@ pub enum ControlResponse {
         stream_name: String,
         descriptor: Option<serde_json::Value>,
     },
-    SegmentDescriptorChanged {
-        stream_name: String,
-        descriptor_generation: u64,
-        descriptor: Option<serde_json::Value>,
+    ResourceChanged {
+        event: Option<ResourceEvent>,
     },
     Error {
         reason: String,
@@ -365,6 +413,11 @@ pub enum ControlResponse {
 impl fmt::Display for ControlResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Envelope(envelope) => write!(
+                f,
+                "control envelope version=[{}] request_id=[{}] response=[{}]",
+                envelope.version, envelope.request_id, envelope.inner
+            ),
             Self::ProcessRegistered { process_id } => {
                 write!(f, "process registered process_id=[{}]", process_id)
             }
@@ -449,12 +502,13 @@ impl fmt::Display for ControlResponse {
             ),
             Self::StreamFetched(response) => write!(
                 f,
-                "stream fetched stream_name=[{}] buffer_size=[{}] frame_size=[{}] write_seq=[{}] writer_process_id=[{:?}] reader_count=[{}] status=[{}]",
+                "stream fetched stream_name=[{}] buffer_size=[{}] frame_size=[{}] write_seq=[{}] writer_process_id=[{:?}] writer_epoch=[{}] reader_count=[{}] status=[{}]",
                 response.stream.stream_name,
                 response.stream.buffer_size,
                 response.stream.frame_size,
                 response.stream.write_seq,
                 response.stream.writer_process_id,
+                response.stream.writer_epoch,
                 response.stream.reader_count,
                 response.stream.status
             ),
@@ -519,16 +573,10 @@ impl fmt::Display for ControlResponse {
                 stream_name,
                 descriptor.is_some()
             ),
-            Self::SegmentDescriptorChanged {
-                stream_name,
-                descriptor_generation,
-                descriptor,
-            } => write!(
+            Self::ResourceChanged { event } => write!(
                 f,
-                "segment descriptor changed stream_name=[{}] descriptor_generation=[{}] has_descriptor=[{}]",
-                stream_name,
-                descriptor_generation,
-                descriptor.is_some()
+                "resource changed has_event=[{}]",
+                event.is_some()
             ),
             Self::Error { reason } => write!(f, "control error reason=[{}]", reason),
         }

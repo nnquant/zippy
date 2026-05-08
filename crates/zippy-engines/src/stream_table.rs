@@ -574,6 +574,15 @@ impl StreamTableMaterializer {
         input_schema: SchemaRef,
         row_capacity: usize,
     ) -> Result<Self> {
+        Self::new_with_row_capacity_and_writer_epoch(name, input_schema, row_capacity, None)
+    }
+
+    pub fn new_with_row_capacity_and_writer_epoch(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        row_capacity: usize,
+        writer_epoch: Option<u64>,
+    ) -> Result<Self> {
         if row_capacity == 0 {
             return Err(ZippyError::InvalidConfig {
                 reason: "stream table row_capacity must be greater than zero".to_string(),
@@ -585,9 +594,18 @@ impl StreamTableMaterializer {
             default_row_capacity: row_capacity,
         })
         .map_err(segment_error)?;
-        let partition = store
-            .open_partition_with_schema(&name, STREAM_TABLE_PARTITION, compiled_schema)
-            .map_err(segment_error)?;
+        let partition = match writer_epoch {
+            Some(writer_epoch) => store.open_partition_with_schema_and_writer_epoch(
+                &name,
+                STREAM_TABLE_PARTITION,
+                compiled_schema,
+                writer_epoch,
+            ),
+            None => {
+                store.open_partition_with_schema(&name, STREAM_TABLE_PARTITION, compiled_schema)
+            }
+        }
+        .map_err(segment_error)?;
 
         Ok(Self {
             name,

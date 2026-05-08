@@ -24,13 +24,15 @@ pub use bus_frame::{
     FLAG_HAS_INSTRUMENT_DIRECTORY, FLAG_HAS_TIMING_METADATA,
 };
 pub use bus_protocol::{
-    AttachStreamRequest, ControlRequest, ControlResponse, DetachReaderRequest, DetachWriterRequest,
-    DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
-    GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
-    PublishPersistedFileRequest, PublishSegmentDescriptorRequest, ReaderDescriptor,
-    RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest,
-    RegisterStreamRequest, ReplacePersistedFilesRequest, StreamInfo, UnregisterProcessRequest,
-    UnregisterSourceRequest, UpdateRecordStatusRequest, WriterDescriptor, BUS_LAYOUT_VERSION,
+    AttachStreamRequest, ControlEnvelopeRequest, ControlEnvelopeResponse, ControlRequest,
+    ControlResponse, DetachReaderRequest, DetachWriterRequest, DropTableRequest, DropTableResult,
+    GetConfigRequest, GetSegmentDescriptorRequest, GetStreamRequest, GetStreamResponse,
+    HeartbeatRequest, ListStreamsRequest, ListStreamsResponse, PublishPersistedFileRequest,
+    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    ReplacePersistedFilesRequest, ResourceEvent, StreamInfo, UnregisterProcessRequest,
+    UnregisterSourceRequest, UpdateRecordStatusRequest, WatchRequest, WatchResource,
+    WriterDescriptor, BUS_LAYOUT_VERSION, CONTROL_PROTOCOL_VERSION,
 };
 pub use config::{
     default_config_path, ZippyConfig, ZippyGatewayConfig, ZippyLogConfig, ZippyTableConfig,

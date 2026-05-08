@@ -1690,6 +1690,13 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    #[pyo3(signature = (timeout_ms=60_000))]
+    fn wait_shutdown(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<bool> {
+        let client = self.client.lock().unwrap().clone();
+        py.allow_threads(|| client.wait_shutdown(Duration::from_millis(timeout_ms)))
+            .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     fn unregister_process(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| self.client.lock().unwrap().unregister_process())
             .map_err(|error| py_runtime_error(error.to_string()))
@@ -7446,6 +7453,7 @@ mod tests {
             frame_size: 4096,
             write_seq: 0,
             writer_process_id: Some("proc_1".to_string()),
+            writer_epoch: 1,
             reader_count: 2,
             status: "registered".to_string(),
         };

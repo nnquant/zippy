@@ -1,9 +1,11 @@
 #![cfg(unix)]
 
 use zippy_core::bus_protocol::{
-    AttachStreamRequest, ControlRequest, ControlResponse, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    UnregisterProcessRequest, UpdateRecordStatusRequest, BUS_LAYOUT_VERSION,
+    AttachStreamRequest, ControlEnvelopeRequest, ControlRequest, ControlResponse,
+    ListStreamsRequest, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
+    RegisterSourceRequest, RegisterStreamRequest, UnregisterProcessRequest,
+    UpdateRecordStatusRequest, WatchRequest, WatchResource, BUS_LAYOUT_VERSION,
+    CONTROL_PROTOCOL_VERSION,
 };
 use zippy_core::{setup_log, LogConfig};
 use zippy_master::bus::Bus;
@@ -57,6 +59,216 @@ fn protocol_types_roundtrip_debug_repr() {
         process_id: "proc_1".to_string(),
     };
     assert!(format!("{response:?}").contains("proc_1"));
+}
+
+#[test]
+fn master_server_accepts_control_envelope_and_echoes_request_id() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let response = send_control_request(
+        &socket_path,
+        ControlRequest::Envelope(ControlEnvelopeRequest {
+            version: CONTROL_PROTOCOL_VERSION,
+            request_id: "req_control_v2_1".to_string(),
+            process_id: None,
+            verb: None,
+            resource: None,
+            revision: None,
+            timeout_ms: None,
+            payload: None,
+            inner: Some(Box::new(ControlRequest::ListStreams(ListStreamsRequest {}))),
+        }),
+    );
+
+    match response {
+        ControlResponse::Envelope(envelope) => {
+            assert_eq!(envelope.version, CONTROL_PROTOCOL_VERSION);
+            assert_eq!(envelope.request_id, "req_control_v2_1");
+            assert!(matches!(*envelope.inner, ControlResponse::StreamsListed(_)));
+        }
+        other => panic!("unexpected envelope response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_accepts_control_envelope_watch_without_inner_request() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "control_v2_client".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+
+    let response = send_control_request(
+        &socket_path,
+        ControlRequest::Envelope(ControlEnvelopeRequest {
+            version: CONTROL_PROTOCOL_VERSION,
+            request_id: "req_control_v2_watch_1".to_string(),
+            process_id: Some(process_id),
+            verb: Some("watch".to_string()),
+            resource: Some(WatchResource::GatewayConfig),
+            revision: Some(0),
+            timeout_ms: Some(1_000),
+            payload: None,
+            inner: None,
+        }),
+    );
+
+    match response {
+        ControlResponse::Envelope(envelope) => {
+            assert_eq!(envelope.version, CONTROL_PROTOCOL_VERSION);
+            assert_eq!(envelope.request_id, "req_control_v2_watch_1");
+            match *envelope.inner {
+                ControlResponse::ResourceChanged { event: Some(event) } => {
+                    assert_eq!(event.resource, WatchResource::GatewayConfig);
+                    assert_eq!(event.revision, 1);
+                }
+                other => panic!("unexpected envelope inner response {other:?}"),
+            }
+        }
+        other => panic!("unexpected envelope response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_control_envelope_register_process_is_idempotent_by_request_id() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let request = ControlRequest::Envelope(ControlEnvelopeRequest {
+        version: CONTROL_PROTOCOL_VERSION,
+        request_id: "req_register_process_once".to_string(),
+        process_id: None,
+        verb: Some("register_process".to_string()),
+        resource: None,
+        revision: None,
+        timeout_ms: None,
+        payload: Some(serde_json::json!({"app": "idempotent_client"})),
+        inner: None,
+    });
+
+    let first_response = send_control_request(&socket_path, request.clone());
+    let second_response = send_control_request(&socket_path, request);
+
+    let first_process_id = match first_response {
+        ControlResponse::Envelope(envelope) => match *envelope.inner {
+            ControlResponse::ProcessRegistered { process_id } => process_id,
+            other => panic!("unexpected first inner response {other:?}"),
+        },
+        other => panic!("unexpected first response {other:?}"),
+    };
+    let second_process_id = match second_response {
+        ControlResponse::Envelope(envelope) => match *envelope.inner {
+            ControlResponse::ProcessRegistered { process_id } => process_id,
+            other => panic!("unexpected second inner response {other:?}"),
+        },
+        other => panic!("unexpected second response {other:?}"),
+    };
+
+    assert_eq!(first_process_id, second_process_id);
+    assert_eq!(server.registry().lock().unwrap().processes_len(), 1);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_control_envelope_updates_source_status() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "openctp".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+    assert!(matches!(
+        send_control_request(
+            &socket_path,
+            ControlRequest::RegisterStream(RegisterStreamRequest {
+                stream_name: "ticks".to_string(),
+                schema: test_stream_schema(),
+                schema_hash: test_stream_schema_hash().to_string(),
+                buffer_size: 1024,
+                frame_size: 256,
+            }),
+        ),
+        ControlResponse::StreamRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &socket_path,
+            ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: "openctp_md".to_string(),
+                source_type: "openctp".to_string(),
+                process_id,
+                output_stream: "ticks".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::SourceRegistered { .. }
+    ));
+
+    let response = send_control_request(
+        &socket_path,
+        ControlRequest::Envelope(ControlEnvelopeRequest {
+            version: CONTROL_PROTOCOL_VERSION,
+            request_id: "req_update_source_status".to_string(),
+            process_id: None,
+            verb: Some("update_status".to_string()),
+            resource: None,
+            revision: None,
+            timeout_ms: None,
+            payload: Some(serde_json::json!({
+                "kind": "source",
+                "name": "openctp_md",
+                "status": "running",
+                "metrics": {"rows_total": 10}
+            })),
+            inner: None,
+        }),
+    );
+
+    match response {
+        ControlResponse::Envelope(envelope) => {
+            assert!(matches!(
+                *envelope.inner,
+                ControlResponse::StatusUpdated { .. }
+            ));
+        }
+        other => panic!("unexpected update envelope response {other:?}"),
+    }
+    {
+        let registry = server.registry();
+        let registry = registry.lock().unwrap();
+        let source = registry.get_source("openctp_md").unwrap();
+        assert_eq!(source.status, "running");
+        assert_eq!(source.metrics["rows_total"], serde_json::json!(10));
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
 }
 
 #[test]
@@ -119,9 +331,11 @@ fn registry_source_owner_publishes_segment_descriptor() {
         .publish_segment_descriptor("openctp_ticks", &process_id, descriptor.clone())
         .unwrap();
 
+    let mut expected_descriptor = descriptor;
+    expected_descriptor["writer_epoch"] = serde_json::Value::from(1);
     assert_eq!(
         registry.segment_descriptor("openctp_ticks").unwrap(),
-        Some(descriptor)
+        Some(expected_descriptor)
     );
 }
 
@@ -191,6 +405,100 @@ fn registry_source_descriptor_takes_writer_ownership_after_old_writer_lost() {
     assert_eq!(
         registry.get_stream("openctp_ticks").unwrap().status,
         "writer_attached"
+    );
+    let descriptor = registry
+        .segment_descriptor("openctp_ticks")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        descriptor
+            .get("writer_epoch")
+            .and_then(serde_json::Value::as_u64),
+        Some(3)
+    );
+}
+
+#[test]
+fn registry_rejects_stale_writer_after_new_source_takes_epoch() {
+    let mut registry = Registry::default();
+    let old_process_id = registry.register_process("openctp");
+    let new_process_id = registry.register_process("openctp");
+    registry
+        .register_stream(
+            "openctp_ticks",
+            test_stream_schema(),
+            test_stream_schema_hash(),
+            1024,
+            256,
+        )
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md_old",
+            "openctp",
+            &old_process_id,
+            "openctp_ticks",
+            serde_json::json!({"front": "old"}),
+        )
+        .unwrap();
+    registry
+        .attach_writer("openctp_ticks", &old_process_id)
+        .unwrap();
+    registry
+        .set_source_status("openctp_md_old", "lost", None)
+        .unwrap();
+    registry
+        .register_source(
+            "openctp_md_new",
+            "openctp",
+            &new_process_id,
+            "openctp_ticks",
+            serde_json::json!({"front": "new"}),
+        )
+        .unwrap();
+
+    let error = registry
+        .publish_persisted_file(
+            "openctp_ticks",
+            &old_process_id,
+            serde_json::json!({
+                "file_path": "/tmp/zippy-old.parquet",
+                "writer_epoch": 1,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        RegistryError::PersistedFilePublisherNotAuthorized {
+            stream_name: "openctp_ticks".to_string(),
+            process_id: old_process_id.clone(),
+        }
+    );
+
+    let error = registry
+        .publish_segment_descriptor(
+            "openctp_ticks",
+            &old_process_id,
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-old",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+                "writer_epoch": 1,
+            }),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        RegistryError::SegmentDescriptorPublisherNotAuthorized {
+            stream_name: "openctp_ticks".to_string(),
+            process_id: old_process_id,
+        }
     );
 }
 
@@ -499,7 +807,9 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
                 sealed_segments: Vec::new(),
                 persisted_files: Vec::new(),
                 persist_events: Vec::new(),
+                persist_revision: 0,
                 segment_reader_leases: Vec::new(),
+                writer_epoch: 0,
                 buffer_size: 1024,
                 frame_size: 256,
                 status: "registered".to_string(),
@@ -578,7 +888,9 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 sealed_segments: Vec::new(),
                 persisted_files: Vec::new(),
                 persist_events: Vec::new(),
+                persist_revision: 0,
                 segment_reader_leases: Vec::new(),
+                writer_epoch: 0,
                 buffer_size: 1024,
                 frame_size: 256,
                 status: "registered".to_string(),
@@ -591,6 +903,8 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 config: serde_json::json!({"front": "tcp://example"}),
                 status: "running".to_string(),
                 metrics: serde_json::json!({}),
+                writer_epoch: 1,
+                revision: 1,
             }],
             engines: vec![SnapshotEngineRecord {
                 engine_name: "mid_price_factor".to_string(),
@@ -1291,6 +1605,70 @@ fn master_server_graceful_shutdown_notifies_process_and_waits_for_unregister() {
 }
 
 #[test]
+fn master_server_watch_shutdown_wakes_without_heartbeat_polling() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "local_dc".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+
+    let wait_socket_path = socket_path.clone();
+    let wait_process_id = process_id.clone();
+    let wait_handle = thread::spawn(move || {
+        send_control_request(
+            &wait_socket_path,
+            ControlRequest::Watch(WatchRequest {
+                process_id: wait_process_id,
+                resource: WatchResource::Shutdown,
+                after_revision: 0,
+                timeout_ms: 1_000,
+            }),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    let shutdown_server = server.clone();
+    let shutdown_handle =
+        thread::spawn(move || shutdown_server.request_graceful_shutdown(Duration::from_secs(1)));
+
+    let response = wait_handle.join().unwrap();
+    match response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(event.resource, WatchResource::Shutdown);
+            assert_eq!(event.revision, 1);
+            assert_eq!(event.payload["process_id"], serde_json::json!(process_id));
+            assert_eq!(
+                event.payload["reason"],
+                serde_json::json!("master shutdown requested")
+            );
+        }
+        other => panic!("unexpected watch shutdown response {other:?}"),
+    }
+
+    let unregister_response = send_control_request(
+        &socket_path,
+        ControlRequest::UnregisterProcess(UnregisterProcessRequest {
+            process_id: process_id.clone(),
+        }),
+    );
+    assert!(matches!(
+        unregister_response,
+        ControlResponse::ProcessUnregistered { .. }
+    ));
+    let outcome = shutdown_handle.join().unwrap();
+    assert!(outcome.timed_out_processes.is_empty());
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
 fn master_server_graceful_shutdown_times_out_with_alive_processes() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
@@ -1307,9 +1685,111 @@ fn master_server_graceful_shutdown_times_out_with_alive_processes() {
 
     let outcome = server.request_graceful_shutdown(Duration::from_millis(20));
 
-    assert_eq!(outcome.timed_out_processes, vec![process_id]);
+    assert_eq!(outcome.timed_out_processes, vec![process_id.clone()]);
+    assert!(
+        server.is_running(),
+        "master must remain alive after strict shutdown timeout"
+    );
+    server.shutdown();
     join_handle.join().unwrap();
     let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_graceful_shutdown_timeout_keeps_writer_source_alive_in_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path.clone()),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+
+    let process_response = send_control_request(
+        &wait_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "openctp".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+    assert!(matches!(
+        send_control_request(
+            &wait_path,
+            ControlRequest::RegisterStream(RegisterStreamRequest {
+                stream_name: "ldc_ctp_ticks".to_string(),
+                schema: test_stream_schema(),
+                schema_hash: test_stream_schema_hash().to_string(),
+                buffer_size: 1024,
+                frame_size: 256,
+            }),
+        ),
+        ControlResponse::StreamRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &wait_path,
+            ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: "ldc_ctp_md_old".to_string(),
+                source_type: "openctp".to_string(),
+                process_id: process_id.clone(),
+                output_stream: "ldc_ctp_ticks".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::SourceRegistered { .. }
+    ));
+
+    let outcome = server.request_graceful_shutdown(Duration::from_millis(20));
+    assert_eq!(outcome.timed_out_processes, vec![process_id.clone()]);
+    assert!(server.is_running());
+    server.shutdown();
+    join_handle.join().unwrap();
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    let source = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source_name == "ldc_ctp_md_old")
+        .unwrap();
+    assert_eq!(source.status, "registered");
+    let stream = snapshot
+        .streams
+        .iter()
+        .find(|stream| stream.stream_name == "ldc_ctp_ticks")
+        .unwrap();
+    assert_eq!(stream.status, "registered");
+
+    let restored = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let registry = restored.registry();
+    let mut registry = registry.lock().unwrap();
+    assert_eq!(
+        registry.get_source("ldc_ctp_md_old").unwrap().status,
+        "restored"
+    );
+    assert_eq!(
+        registry.get_stream("ldc_ctp_ticks").unwrap().status,
+        "restored"
+    );
+    let new_process_id = registry.register_process("openctp");
+    assert_ne!(new_process_id, process_id);
+    registry
+        .register_source(
+            "ldc_ctp_md_new",
+            "openctp",
+            &new_process_id,
+            "ldc_ctp_ticks",
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+    let _ = fs::remove_file(wait_path);
 }
 
 #[test]
@@ -1415,6 +1895,450 @@ fn master_server_publishes_and_fetches_segment_descriptor() {
             );
         }
         other => panic!("unexpected fetch response: {:?}", other),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_watch_segment_descriptor_wakes_on_publish() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    assert!(send_register_process(&socket_path, "openctp").contains("proc_1"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
+    )
+    .contains("StreamRegistered"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterSource\":{\"source_name\":\"openctp_md\",\"source_type\":\"openctp\",\"process_id\":\"proc_1\",\"output_stream\":\"openctp_ticks\",\"config\":{}}}\n",
+    )
+    .contains("SourceRegistered"));
+    assert!(send_register_process(&socket_path, "segment_reader").contains("proc_2"));
+
+    let watch_socket_path = socket_path.clone();
+    let watch_handle = thread::spawn(move || {
+        send_control_request(
+            &watch_socket_path,
+            ControlRequest::Watch(WatchRequest {
+                process_id: "proc_2".to_string(),
+                resource: WatchResource::SegmentDescriptor {
+                    stream_name: "openctp_ticks".to_string(),
+                },
+                after_revision: 0,
+                timeout_ms: 1_000,
+            }),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    let publish_response = send_request(
+        &socket_path,
+        "{\"PublishSegmentDescriptor\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_1\",\"descriptor\":{\"magic\":\"zippy.segment.active\",\"version\":1,\"schema_id\":7,\"row_capacity\":64,\"shm_os_id\":\"/tmp/zippy-segment\",\"payload_offset\":64,\"committed_row_count_offset\":40,\"segment_id\":1,\"generation\":0}}}\n",
+    );
+    assert!(publish_response.contains("SegmentDescriptorPublished"));
+
+    let watch_response = watch_handle.join().unwrap();
+    match watch_response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(
+                event.resource,
+                WatchResource::SegmentDescriptor {
+                    stream_name: "openctp_ticks".to_string(),
+                }
+            );
+            assert_eq!(event.revision, 1);
+            assert_eq!(
+                event.payload["descriptor"]["magic"],
+                serde_json::json!("zippy.segment.active")
+            );
+        }
+        other => panic!("unexpected watch segment descriptor response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_watch_stream_wakes_on_descriptor_publish() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    assert!(send_register_process(&socket_path, "openctp").contains("proc_1"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
+    )
+    .contains("StreamRegistered"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterSource\":{\"source_name\":\"openctp_md\",\"source_type\":\"openctp\",\"process_id\":\"proc_1\",\"output_stream\":\"openctp_ticks\",\"config\":{}}}\n",
+    )
+    .contains("SourceRegistered"));
+    assert!(send_register_process(&socket_path, "stream_watcher").contains("proc_2"));
+
+    let watch_socket_path = socket_path.clone();
+    let watch_handle = thread::spawn(move || {
+        send_control_request(
+            &watch_socket_path,
+            ControlRequest::Watch(WatchRequest {
+                process_id: "proc_2".to_string(),
+                resource: WatchResource::Stream {
+                    stream_name: "openctp_ticks".to_string(),
+                },
+                after_revision: 0,
+                timeout_ms: 1_000,
+            }),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    let publish_response = send_request(
+        &socket_path,
+        "{\"PublishSegmentDescriptor\":{\"stream_name\":\"openctp_ticks\",\"process_id\":\"proc_1\",\"descriptor\":{\"magic\":\"zippy.segment.active\",\"version\":1,\"schema_id\":7,\"row_capacity\":64,\"shm_os_id\":\"/tmp/zippy-segment\",\"payload_offset\":64,\"committed_row_count_offset\":40,\"segment_id\":1,\"generation\":0}}}\n",
+    );
+    assert!(publish_response.contains("SegmentDescriptorPublished"));
+
+    let watch_response = watch_handle.join().unwrap();
+    match watch_response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(
+                event.resource,
+                WatchResource::Stream {
+                    stream_name: "openctp_ticks".to_string(),
+                }
+            );
+            assert_eq!(event.revision, 1);
+            assert_eq!(
+                event.payload["stream"]["stream_name"],
+                serde_json::json!("openctp_ticks")
+            );
+            assert_eq!(
+                event.payload["stream"]["descriptor_generation"],
+                serde_json::json!(1)
+            );
+        }
+        other => panic!("unexpected watch stream response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_watch_process_wakes_on_heartbeat() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let target_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "openctp".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = target_response else {
+        panic!("unexpected target process response {target_response:?}");
+    };
+    let watcher_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "process_watcher".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered {
+        process_id: watcher_process_id,
+    } = watcher_response
+    else {
+        panic!("unexpected watcher process response {watcher_response:?}");
+    };
+
+    let watch_socket_path = socket_path.clone();
+    let watch_process_id = process_id.clone();
+    let watch_handle = thread::spawn(move || {
+        send_control_request(
+            &watch_socket_path,
+            ControlRequest::Watch(WatchRequest {
+                process_id: watcher_process_id,
+                resource: WatchResource::Process {
+                    process_id: watch_process_id,
+                },
+                after_revision: 1,
+                timeout_ms: 1_000,
+            }),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    let heartbeat_response = send_control_request(
+        &socket_path,
+        ControlRequest::Heartbeat(zippy_core::bus_protocol::HeartbeatRequest {
+            process_id: process_id.clone(),
+        }),
+    );
+    assert!(matches!(
+        heartbeat_response,
+        ControlResponse::HeartbeatAccepted { .. }
+    ));
+
+    let watch_response = watch_handle.join().unwrap();
+    match watch_response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(
+                event.resource,
+                WatchResource::Process {
+                    process_id: process_id.clone()
+                }
+            );
+            assert!(event.revision > 1);
+            assert_eq!(
+                event.payload["process"]["process_id"],
+                serde_json::json!(process_id)
+            );
+            assert_eq!(
+                event.payload["process"]["lease_status"],
+                serde_json::json!("alive")
+            );
+        }
+        other => panic!("unexpected watch process response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_watch_source_wakes_on_status_update() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let writer_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "openctp".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = writer_response else {
+        panic!("unexpected writer response {writer_response:?}");
+    };
+    let watcher_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "source_watcher".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered {
+        process_id: watcher_process_id,
+    } = watcher_response
+    else {
+        panic!("unexpected watcher response {watcher_response:?}");
+    };
+    assert!(matches!(
+        send_control_request(
+            &socket_path,
+            ControlRequest::RegisterStream(RegisterStreamRequest {
+                stream_name: "openctp_ticks".to_string(),
+                schema: test_stream_schema(),
+                schema_hash: test_stream_schema_hash().to_string(),
+                buffer_size: 1024,
+                frame_size: 256,
+            }),
+        ),
+        ControlResponse::StreamRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &socket_path,
+            ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: "openctp_md".to_string(),
+                source_type: "openctp".to_string(),
+                process_id,
+                output_stream: "openctp_ticks".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::SourceRegistered { .. }
+    ));
+
+    let watch_socket_path = socket_path.clone();
+    let watch_handle = thread::spawn(move || {
+        send_control_request(
+            &watch_socket_path,
+            ControlRequest::Watch(WatchRequest {
+                process_id: watcher_process_id,
+                resource: WatchResource::Source {
+                    source_name: "openctp_md".to_string(),
+                },
+                after_revision: 3,
+                timeout_ms: 1_000,
+            }),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    let status_response = send_control_request(
+        &socket_path,
+        ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+            kind: "source".to_string(),
+            name: "openctp_md".to_string(),
+            status: "running".to_string(),
+            metrics: Some(serde_json::json!({"rows_total": 7})),
+        }),
+    );
+    assert!(matches!(
+        status_response,
+        ControlResponse::StatusUpdated { .. }
+    ));
+
+    let watch_response = watch_handle.join().unwrap();
+    match watch_response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(
+                event.resource,
+                WatchResource::Source {
+                    source_name: "openctp_md".to_string()
+                }
+            );
+            assert!(event.revision > 1);
+            assert_eq!(
+                event.payload["source"]["source_name"],
+                serde_json::json!("openctp_md")
+            );
+            assert_eq!(
+                event.payload["source"]["status"],
+                serde_json::json!("running")
+            );
+            assert_eq!(
+                event.payload["source"]["metrics"]["rows_total"],
+                serde_json::json!(7)
+            );
+        }
+        other => panic!("unexpected watch source response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_watch_persisted_file_wakes_on_publish() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    assert!(send_register_process(&socket_path, "openctp").contains("proc_1"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterStream\":{\"stream_name\":\"openctp_ticks\",\"buffer_size\":1024,\"frame_size\":256}}\n",
+    )
+    .contains("StreamRegistered"));
+    assert!(send_request(
+        &socket_path,
+        "{\"RegisterSource\":{\"source_name\":\"openctp_md\",\"source_type\":\"openctp\",\"process_id\":\"proc_1\",\"output_stream\":\"openctp_ticks\",\"config\":{}}}\n",
+    )
+    .contains("SourceRegistered"));
+    assert!(send_register_process(&socket_path, "persist_watcher").contains("proc_2"));
+
+    let watch_socket_path = socket_path.clone();
+    let watch_handle = thread::spawn(move || {
+        send_control_request(
+            &watch_socket_path,
+            ControlRequest::Watch(WatchRequest {
+                process_id: "proc_2".to_string(),
+                resource: WatchResource::PersistedFile {
+                    stream_name: "openctp_ticks".to_string(),
+                },
+                after_revision: 0,
+                timeout_ms: 1_000,
+            }),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(20));
+    let publish_response = send_control_request(
+        &socket_path,
+        ControlRequest::PublishPersistedFile(
+            zippy_core::bus_protocol::PublishPersistedFileRequest {
+                stream_name: "openctp_ticks".to_string(),
+                process_id: "proc_1".to_string(),
+                persisted_file: serde_json::json!({
+                    "persist_file_id": "file_1",
+                    "file_path": "/tmp/openctp_ticks/file_1.parquet",
+                }),
+            },
+        ),
+    );
+    assert!(matches!(
+        publish_response,
+        ControlResponse::PersistedFilePublished { .. }
+    ));
+
+    let watch_response = watch_handle.join().unwrap();
+    match watch_response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(
+                event.resource,
+                WatchResource::PersistedFile {
+                    stream_name: "openctp_ticks".to_string()
+                }
+            );
+            assert_eq!(event.revision, 1);
+            assert_eq!(
+                event.payload["stream_name"],
+                serde_json::json!("openctp_ticks")
+            );
+            assert_eq!(
+                event.payload["persisted_files"][0]["persist_file_id"],
+                serde_json::json!("file_1")
+            );
+        }
+        other => panic!("unexpected watch persisted file response {other:?}"),
+    }
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_server_watch_gateway_config_returns_current_config() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let process_response = send_control_request(
+        &socket_path,
+        ControlRequest::RegisterProcess(RegisterProcessRequest {
+            app: "gateway_watcher".to_string(),
+        }),
+    );
+    let ControlResponse::ProcessRegistered { process_id } = process_response else {
+        panic!("unexpected process response {process_response:?}");
+    };
+
+    let watch_response = send_control_request(
+        &socket_path,
+        ControlRequest::Watch(WatchRequest {
+            process_id,
+            resource: WatchResource::GatewayConfig,
+            after_revision: 0,
+            timeout_ms: 1_000,
+        }),
+    );
+
+    match watch_response {
+        ControlResponse::ResourceChanged { event: Some(event) } => {
+            assert_eq!(event.resource, WatchResource::GatewayConfig);
+            assert_eq!(event.revision, 1);
+            assert!(event.payload.get("config").is_some());
+        }
+        other => panic!("unexpected watch gateway config response {other:?}"),
     }
 
     server.shutdown();

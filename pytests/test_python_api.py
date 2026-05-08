@@ -6667,9 +6667,37 @@ def test_connect_starts_background_heartbeat_for_registered_process(monkeypatch)
         assert heartbeat_seen.wait(timeout=1.0)
         assert client.registered_apps == ["market_client"]
         assert client.heartbeat_count >= 1
+        assert isinstance(zippy._DEFAULT_CONTROL_AGENT, zippy._ControlAgent)
+        assert zippy._DEFAULT_CONTROL_AGENT.master is client
     finally:
         if reset_default_master is not None:
             reset_default_master()
+
+
+def test_control_agent_registers_app_and_unregisters_on_stop() -> None:
+    class FakeMasterClient:
+        def __init__(self) -> None:
+            self.registered_apps: list[str] = []
+            self.unregister_count = 0
+
+        def register_process(self, app: str) -> None:
+            self.registered_apps.append(app)
+
+        def heartbeat(self) -> None:
+            pass
+
+        def unregister_process(self) -> None:
+            self.unregister_count += 1
+
+    master = FakeMasterClient()
+    agent = zippy._ControlAgent(master, 60.0, app="market_client")
+
+    try:
+        assert master.registered_apps == ["market_client"]
+    finally:
+        agent.stop()
+
+    assert master.unregister_count == 1
 
 
 def test_heartbeat_shutdown_request_runs_hooks_and_unregisters_process() -> None:
@@ -6688,14 +6716,78 @@ def test_heartbeat_shutdown_request_runs_hooks_and_unregisters_process() -> None
     with zippy._SHUTDOWN_HOOKS_LOCK:
         zippy._SHUTDOWN_HOOKS.clear()
     unregister_hook = zippy._register_shutdown_hook(hook_seen.set)
-    heartbeat = zippy._HeartbeatHandle(FakeMasterClient(), 0.01)
+    agent = zippy._ControlAgent(FakeMasterClient(), 0.01)
 
     try:
         assert unregister_seen.wait(timeout=1.0)
         assert hook_seen.is_set()
-        assert heartbeat.last_error is None
+        assert agent.last_error is None
     finally:
-        heartbeat.stop()
+        agent.stop()
+        unregister_hook()
+        with zippy._SHUTDOWN_HOOKS_LOCK:
+            zippy._SHUTDOWN_HOOKS.clear()
+
+
+def test_heartbeat_connection_loss_runs_hooks_without_unregistering_process() -> None:
+    hook_seen = threading.Event()
+    unregister_seen = threading.Event()
+
+    class FakeMasterClient:
+        def heartbeat(self) -> None:
+            raise RuntimeError(
+                "failed to connect to zippy master uri=[/tmp/zippy-master.sock]"
+            )
+
+        def unregister_process(self) -> None:
+            unregister_seen.set()
+
+    with zippy._SHUTDOWN_HOOKS_LOCK:
+        zippy._SHUTDOWN_HOOKS.clear()
+    unregister_hook = zippy._register_shutdown_hook(hook_seen.set)
+    agent = zippy._ControlAgent(FakeMasterClient(), 0.01)
+
+    try:
+        assert hook_seen.wait(timeout=1.0)
+        assert not unregister_seen.is_set()
+        assert agent.last_error is None
+    finally:
+        agent.stop()
+        unregister_hook()
+        with zippy._SHUTDOWN_HOOKS_LOCK:
+            zippy._SHUTDOWN_HOOKS.clear()
+
+
+def test_shutdown_watch_runs_hooks_without_waiting_for_heartbeat() -> None:
+    hook_seen = threading.Event()
+    unregister_seen = threading.Event()
+    wait_seen = threading.Event()
+
+    class FakeMasterClient:
+        def heartbeat(self) -> None:
+            pass
+
+        def wait_shutdown(self, timeout_ms: int = 60_000) -> bool:
+            wait_seen.set()
+            raise RuntimeError(
+                "master shutdown requested process_id=[proc_1] reason=[master shutdown requested]"
+            )
+
+        def unregister_process(self) -> None:
+            unregister_seen.set()
+
+    with zippy._SHUTDOWN_HOOKS_LOCK:
+        zippy._SHUTDOWN_HOOKS.clear()
+    unregister_hook = zippy._register_shutdown_hook(hook_seen.set)
+    agent = zippy._ControlAgent(FakeMasterClient(), 60.0)
+
+    try:
+        assert wait_seen.wait(timeout=1.0)
+        assert unregister_seen.wait(timeout=1.0)
+        assert hook_seen.is_set()
+        assert agent.last_error is None
+    finally:
+        agent.stop()
         unregister_hook()
         with zippy._SHUTDOWN_HOOKS_LOCK:
             zippy._SHUTDOWN_HOOKS.clear()

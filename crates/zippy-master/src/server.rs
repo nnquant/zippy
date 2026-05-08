@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -14,10 +15,12 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use zippy_core::bus_protocol::{
-    DropTableResult, GetStreamResponse, ListStreamsResponse, StreamInfo,
+    DropTableResult, GetStreamResponse, ListStreamsResponse, ResourceEvent, StreamInfo,
+    WatchRequest, WatchResource,
 };
 use zippy_core::{
     ControlEndpoint, ControlRequest, ControlResponse, Result, ZippyConfig, ZippyError,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 use crate::bus::{Bus, BusError};
@@ -41,10 +44,13 @@ pub struct GracefulShutdownOutcome {
 pub struct MasterServer {
     registry: Arc<Mutex<Registry>>,
     descriptor_changed: Arc<Condvar>,
+    control_changed: Arc<Condvar>,
+    shutdown_changed: Arc<Condvar>,
     #[allow(dead_code)]
     bus: Arc<Mutex<Bus>>,
     running: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    envelope_responses: Arc<Mutex<BTreeMap<String, ControlResponse>>>,
     snapshot_lock: Arc<Mutex<()>>,
     snapshot_path: Option<PathBuf>,
     lease_timeout: Duration,
@@ -90,9 +96,12 @@ impl MasterServer {
         Self {
             registry: Arc::new(Mutex::new(Registry::default())),
             descriptor_changed: Arc::new(Condvar::new()),
+            control_changed: Arc::new(Condvar::new()),
+            shutdown_changed: Arc::new(Condvar::new()),
             bus: Arc::new(Mutex::new(Bus::default())),
             running: Arc::new(AtomicBool::new(true)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            envelope_responses: Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_lock: Arc::new(Mutex::new(())),
             snapshot_path,
             lease_timeout,
@@ -147,7 +156,7 @@ impl MasterServer {
                     )
                     .map_err(registry_error)?;
                 registry
-                    .set_stream_status(&stream.stream_name, "restored")
+                    .set_stream_status(&stream.stream_name, restored_record_status(&stream.status))
                     .map_err(registry_error)?;
                 registry
                     .set_stream_segment_metadata(
@@ -156,12 +165,16 @@ impl MasterServer {
                         stream.sealed_segments,
                         stream.persisted_files,
                         stream.persist_events,
+                        stream.persist_revision,
                         stream.segment_reader_leases,
+                        stream.writer_epoch,
                     )
                     .map_err(registry_error)?;
             }
 
             for source in snapshot.sources {
+                registry.reserve_process_id(&source.process_id);
+                let status = restored_record_status(&source.status).to_string();
                 registry
                     .register_source(
                         &source.source_name,
@@ -172,11 +185,16 @@ impl MasterServer {
                     )
                     .map_err(registry_error)?;
                 registry
-                    .set_source_status(&source.source_name, "restored", Some(source.metrics))
+                    .set_source_writer_epoch(&source.source_name, source.writer_epoch)
+                    .map_err(registry_error)?;
+                registry
+                    .set_source_status(&source.source_name, &status, Some(source.metrics))
                     .map_err(registry_error)?;
             }
 
             for engine in snapshot.engines {
+                registry.reserve_process_id(&engine.process_id);
+                let status = restored_record_status(&engine.status).to_string();
                 registry
                     .register_engine(
                         &engine.engine_name,
@@ -189,11 +207,13 @@ impl MasterServer {
                     )
                     .map_err(registry_error)?;
                 registry
-                    .set_engine_status(&engine.engine_name, "restored", Some(engine.metrics))
+                    .set_engine_status(&engine.engine_name, &status, Some(engine.metrics))
                     .map_err(registry_error)?;
             }
 
             for sink in snapshot.sinks {
+                registry.reserve_process_id(&sink.process_id);
+                let status = restored_record_status(&sink.status).to_string();
                 registry
                     .register_sink(
                         &sink.sink_name,
@@ -204,7 +224,7 @@ impl MasterServer {
                     )
                     .map_err(registry_error)?;
                 registry
-                    .set_sink_status(&sink.sink_name, "restored")
+                    .set_sink_status(&sink.sink_name, &status)
                     .map_err(registry_error)?;
             }
         }
@@ -465,6 +485,8 @@ impl MasterServer {
     pub fn request_graceful_shutdown(&self, timeout: Duration) -> GracefulShutdownOutcome {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.descriptor_changed.notify_all();
+        self.control_changed.notify_all();
+        self.shutdown_changed.notify_all();
         let deadline = Instant::now() + timeout;
         loop {
             let alive = self.registry.lock().unwrap().alive_process_ids();
@@ -482,7 +504,6 @@ impl MasterServer {
                     timed_out_processes = ?alive,
                     "timed out waiting for child processes to unregister"
                 );
-                self.running.store(false, Ordering::SeqCst);
                 return GracefulShutdownOutcome {
                     timed_out_processes: alive,
                 };
@@ -619,6 +640,728 @@ impl MasterServer {
         self.handle_stream(stream)
     }
 
+    fn handle_watch_request(&self, request: WatchRequest) -> ControlResponse {
+        match request.resource.clone() {
+            WatchResource::Shutdown => self.handle_watch_shutdown_request(request),
+            WatchResource::Process { process_id } => {
+                self.handle_watch_process_request(request, process_id)
+            }
+            WatchResource::Source { source_name } => {
+                self.handle_watch_source_request(request, source_name)
+            }
+            WatchResource::PersistedFile { stream_name } => {
+                self.handle_watch_persisted_file_request(request, stream_name)
+            }
+            WatchResource::GatewayConfig => self.handle_watch_gateway_config_request(request),
+            WatchResource::Stream { stream_name } => {
+                self.handle_watch_stream_request(request, stream_name)
+            }
+            WatchResource::SegmentDescriptor { stream_name } => {
+                self.handle_watch_segment_descriptor_request(request, stream_name)
+            }
+        }
+    }
+
+    fn handle_watch_shutdown_request(&self, request: WatchRequest) -> ControlResponse {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let registry = self.registry.lock().unwrap();
+        let validate_result = registry.validate_process_alive(&request.process_id);
+        if validate_result.is_ok() && !self.shutdown_requested.load(Ordering::SeqCst) {
+            let (_next_registry, _) = self
+                .shutdown_changed
+                .wait_timeout_while(registry, timeout, |_| {
+                    !self.shutdown_requested.load(Ordering::SeqCst)
+                })
+                .unwrap();
+        }
+
+        match validate_result {
+            Ok(())
+                if self.shutdown_requested.load(Ordering::SeqCst) && request.after_revision < 1 =>
+            {
+                tracing::info!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "changed",
+                    resource = "shutdown",
+                    process_id = request.process_id.as_str(),
+                    revision = 1,
+                    "shutdown resource changed"
+                );
+                ControlResponse::ResourceChanged {
+                    event: Some(ResourceEvent {
+                        resource: WatchResource::Shutdown,
+                        revision: 1,
+                        payload: serde_json::json!({
+                            "process_id": request.process_id,
+                            "reason": MASTER_SHUTDOWN_REASON,
+                        }),
+                    }),
+                }
+            }
+            Ok(()) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => {
+                tracing::error!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "error",
+                    resource = "shutdown",
+                    process_id = request.process_id.as_str(),
+                    error = %error,
+                    "failed to watch shutdown resource"
+                );
+                ControlResponse::Error {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn handle_watch_segment_descriptor_request(
+        &self,
+        request: WatchRequest,
+        stream_name: String,
+    ) -> ControlResponse {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let mut registry = self.registry.lock().unwrap();
+        let wait_result = registry.segment_descriptor_update_for_process(
+            &stream_name,
+            &request.process_id,
+            request.after_revision,
+        );
+        let response_result = match wait_result {
+            Ok(Some(update)) => Ok(Some(update)),
+            Ok(None) => {
+                let (next_registry, _) = self
+                    .descriptor_changed
+                    .wait_timeout_while(registry, timeout, |registry| {
+                        matches!(
+                            registry.segment_descriptor_update_for_process(
+                                &stream_name,
+                                &request.process_id,
+                                request.after_revision,
+                            ),
+                            Ok(None)
+                        )
+                    })
+                    .unwrap();
+                registry = next_registry;
+                registry.segment_descriptor_update_for_process(
+                    &stream_name,
+                    &request.process_id,
+                    request.after_revision,
+                )
+            }
+            Err(error) => Err(error),
+        };
+
+        match response_result {
+            Ok(Some((descriptor_generation, descriptor))) => {
+                tracing::info!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "changed",
+                    resource = "segment_descriptor",
+                    stream_name = stream_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    revision = descriptor_generation,
+                    "segment descriptor resource changed"
+                );
+                ControlResponse::ResourceChanged {
+                    event: Some(ResourceEvent {
+                        resource: WatchResource::SegmentDescriptor { stream_name },
+                        revision: descriptor_generation,
+                        payload: serde_json::json!({
+                            "descriptor": descriptor,
+                        }),
+                    }),
+                }
+            }
+            Ok(None) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => {
+                tracing::error!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "error",
+                    resource = "segment_descriptor",
+                    stream_name = stream_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    error = %error,
+                    "failed to watch segment descriptor resource"
+                );
+                ControlResponse::Error {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn handle_watch_process_request(
+        &self,
+        request: WatchRequest,
+        target_process_id: String,
+    ) -> ControlResponse {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let mut registry = self.registry.lock().unwrap();
+        let wait_result = registry.process_update_for_process(
+            &target_process_id,
+            &request.process_id,
+            request.after_revision,
+        );
+        let response_result = match wait_result {
+            Ok(Some(update)) => Ok(Some(update)),
+            Ok(None) => {
+                let (next_registry, _) = self
+                    .control_changed
+                    .wait_timeout_while(registry, timeout, |registry| {
+                        matches!(
+                            registry.process_update_for_process(
+                                &target_process_id,
+                                &request.process_id,
+                                request.after_revision,
+                            ),
+                            Ok(None)
+                        )
+                    })
+                    .unwrap();
+                registry = next_registry;
+                registry.process_update_for_process(
+                    &target_process_id,
+                    &request.process_id,
+                    request.after_revision,
+                )
+            }
+            Err(error) => Err(error),
+        };
+
+        match response_result {
+            Ok(Some((revision, process))) => {
+                tracing::info!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "changed",
+                    resource = "process",
+                    target_process_id = target_process_id.as_str(),
+                    process_id = request.process_id.as_str(),
+                    revision,
+                    "process resource changed"
+                );
+                ControlResponse::ResourceChanged {
+                    event: Some(ResourceEvent {
+                        resource: WatchResource::Process {
+                            process_id: target_process_id,
+                        },
+                        revision,
+                        payload: serde_json::json!({
+                            "process": process,
+                        }),
+                    }),
+                }
+            }
+            Ok(None) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => {
+                tracing::error!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "error",
+                    resource = "process",
+                    target_process_id = target_process_id.as_str(),
+                    process_id = request.process_id.as_str(),
+                    error = %error,
+                    "failed to watch process resource"
+                );
+                ControlResponse::Error {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn handle_watch_source_request(
+        &self,
+        request: WatchRequest,
+        source_name: String,
+    ) -> ControlResponse {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let mut registry = self.registry.lock().unwrap();
+        let wait_result = registry.source_update_for_process(
+            &source_name,
+            &request.process_id,
+            request.after_revision,
+        );
+        let response_result = match wait_result {
+            Ok(Some(update)) => Ok(Some(update)),
+            Ok(None) => {
+                let (next_registry, _) = self
+                    .control_changed
+                    .wait_timeout_while(registry, timeout, |registry| {
+                        matches!(
+                            registry.source_update_for_process(
+                                &source_name,
+                                &request.process_id,
+                                request.after_revision,
+                            ),
+                            Ok(None)
+                        )
+                    })
+                    .unwrap();
+                registry = next_registry;
+                registry.source_update_for_process(
+                    &source_name,
+                    &request.process_id,
+                    request.after_revision,
+                )
+            }
+            Err(error) => Err(error),
+        };
+
+        match response_result {
+            Ok(Some((revision, source))) => {
+                tracing::info!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "changed",
+                    resource = "source",
+                    source_name = source_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    revision,
+                    "source resource changed"
+                );
+                ControlResponse::ResourceChanged {
+                    event: Some(ResourceEvent {
+                        resource: WatchResource::Source { source_name },
+                        revision,
+                        payload: serde_json::json!({
+                            "source": source,
+                        }),
+                    }),
+                }
+            }
+            Ok(None) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => {
+                tracing::error!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "error",
+                    resource = "source",
+                    source_name = source_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    error = %error,
+                    "failed to watch source resource"
+                );
+                ControlResponse::Error {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn handle_watch_persisted_file_request(
+        &self,
+        request: WatchRequest,
+        stream_name: String,
+    ) -> ControlResponse {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let mut registry = self.registry.lock().unwrap();
+        let wait_result = registry.persisted_file_update_for_process(
+            &stream_name,
+            &request.process_id,
+            request.after_revision,
+        );
+        let response_result = match wait_result {
+            Ok(Some(update)) => Ok(Some(update)),
+            Ok(None) => {
+                let (next_registry, _) = self
+                    .control_changed
+                    .wait_timeout_while(registry, timeout, |registry| {
+                        matches!(
+                            registry.persisted_file_update_for_process(
+                                &stream_name,
+                                &request.process_id,
+                                request.after_revision,
+                            ),
+                            Ok(None)
+                        )
+                    })
+                    .unwrap();
+                registry = next_registry;
+                registry.persisted_file_update_for_process(
+                    &stream_name,
+                    &request.process_id,
+                    request.after_revision,
+                )
+            }
+            Err(error) => Err(error),
+        };
+
+        match response_result {
+            Ok(Some((revision, persisted_files, persist_events))) => {
+                tracing::info!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "changed",
+                    resource = "persisted_file",
+                    stream_name = stream_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    revision,
+                    "persisted file resource changed"
+                );
+                ControlResponse::ResourceChanged {
+                    event: Some(ResourceEvent {
+                        resource: WatchResource::PersistedFile {
+                            stream_name: stream_name.clone(),
+                        },
+                        revision,
+                        payload: serde_json::json!({
+                            "stream_name": stream_name,
+                            "persisted_files": persisted_files,
+                            "persist_events": persist_events,
+                        }),
+                    }),
+                }
+            }
+            Ok(None) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => {
+                tracing::error!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "error",
+                    resource = "persisted_file",
+                    stream_name = stream_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    error = %error,
+                    "failed to watch persisted file resource"
+                );
+                ControlResponse::Error {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn handle_watch_gateway_config_request(&self, request: WatchRequest) -> ControlResponse {
+        let registry = self.registry.lock().unwrap();
+        let validate_result = registry.validate_process_alive(&request.process_id);
+        drop(registry);
+        match validate_result {
+            Ok(()) if request.after_revision < 1 => ControlResponse::ResourceChanged {
+                event: Some(ResourceEvent {
+                    resource: WatchResource::GatewayConfig,
+                    revision: 1,
+                    payload: serde_json::json!({
+                        "config": self.config.to_json_value(),
+                    }),
+                }),
+            },
+            Ok(()) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => ControlResponse::Error {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_watch_stream_request(
+        &self,
+        request: WatchRequest,
+        stream_name: String,
+    ) -> ControlResponse {
+        let timeout = Duration::from_millis(request.timeout_ms);
+        let mut registry = self.registry.lock().unwrap();
+        let validate_result = registry.validate_process_alive(&request.process_id);
+        let response_result = match validate_result {
+            Ok(()) => {
+                let should_wait = registry
+                    .get_stream(&stream_name)
+                    .map(|stream| stream.descriptor_generation <= request.after_revision)
+                    .unwrap_or(false);
+                if should_wait {
+                    let (next_registry, _) = self
+                        .descriptor_changed
+                        .wait_timeout_while(registry, timeout, |registry| {
+                            registry
+                                .get_stream(&stream_name)
+                                .map(|stream| {
+                                    stream.descriptor_generation <= request.after_revision
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap();
+                    registry = next_registry;
+                }
+                registry.get_stream(&stream_name).cloned().ok_or_else(|| {
+                    crate::registry::RegistryError::StreamNotFound {
+                        stream_name: stream_name.clone(),
+                    }
+                })
+            }
+            Err(error) => Err(error),
+        };
+
+        match response_result {
+            Ok(stream) if stream.descriptor_generation > request.after_revision => {
+                let revision = stream.descriptor_generation;
+                tracing::info!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "changed",
+                    resource = "stream",
+                    stream_name = stream_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    revision,
+                    "stream resource changed"
+                );
+                ControlResponse::ResourceChanged {
+                    event: Some(ResourceEvent {
+                        resource: WatchResource::Stream { stream_name },
+                        revision,
+                        payload: serde_json::json!({
+                            "stream": StreamInfo::from(stream),
+                        }),
+                    }),
+                }
+            }
+            Ok(_) => ControlResponse::ResourceChanged { event: None },
+            Err(error) => {
+                tracing::error!(
+                    component = "master_server",
+                    event = "watch",
+                    status = "error",
+                    resource = "stream",
+                    stream_name = stream_name.as_str(),
+                    process_id = request.process_id.as_str(),
+                    error = %error,
+                    "failed to watch stream resource"
+                );
+                ControlResponse::Error {
+                    reason: error.to_string(),
+                }
+            }
+        }
+    }
+
+    fn handle_enveloped_control_request(&self, request: ControlRequest) -> ControlResponse {
+        match request {
+            ControlRequest::Envelope(_) => ControlResponse::Error {
+                reason: "nested control envelope is not supported".to_string(),
+            },
+            ControlRequest::Watch(request) => self.handle_watch_request(request),
+            ControlRequest::ListStreams(_) => {
+                let streams: Vec<_> = self
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .list_streams()
+                    .into_iter()
+                    .map(StreamInfo::from)
+                    .collect();
+                ControlResponse::StreamsListed(ListStreamsResponse { streams })
+            }
+            ControlRequest::GetConfig(_) => ControlResponse::ConfigFetched {
+                config: self.config.to_json_value(),
+            },
+            other => ControlResponse::Error {
+                reason: format!(
+                    "control envelope does not support request kind kind=[{:?}]",
+                    other
+                ),
+            },
+        }
+    }
+
+    fn handle_control_envelope_request(
+        &self,
+        envelope: zippy_core::ControlEnvelopeRequest,
+    ) -> ControlResponse {
+        if let Some(inner) = envelope.inner {
+            return self.handle_enveloped_control_request(*inner);
+        }
+
+        match envelope.verb.as_deref() {
+            Some("register_process") => {
+                if self.shutdown_requested.load(Ordering::SeqCst) {
+                    return ControlResponse::Error {
+                        reason: MASTER_SHUTDOWN_REASON.to_string(),
+                    };
+                }
+                let app = envelope
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("app"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("control_v2");
+                let process_id = self.registry.lock().unwrap().register_process(app);
+                self.control_changed.notify_all();
+                ControlResponse::ProcessRegistered { process_id }
+            }
+            Some("heartbeat") => {
+                let Some(process_id) = envelope.process_id else {
+                    return ControlResponse::Error {
+                        reason: "control envelope heartbeat requires process_id".to_string(),
+                    };
+                };
+                if self.shutdown_requested.load(Ordering::SeqCst) {
+                    return ControlResponse::ShutdownRequested {
+                        process_id,
+                        reason: MASTER_SHUTDOWN_REASON.to_string(),
+                    };
+                }
+                match self.registry.lock().unwrap().record_heartbeat(&process_id) {
+                    Ok(()) => {
+                        self.control_changed.notify_all();
+                        ControlResponse::HeartbeatAccepted { process_id }
+                    }
+                    Err(error) => ControlResponse::Error {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+            Some("update_status") => self.handle_control_envelope_update_status(envelope.payload),
+            Some("watch") => {
+                let Some(process_id) = envelope.process_id else {
+                    return ControlResponse::Error {
+                        reason: "control envelope watch requires process_id".to_string(),
+                    };
+                };
+                let Some(resource) = envelope.resource else {
+                    return ControlResponse::Error {
+                        reason: "control envelope watch requires resource".to_string(),
+                    };
+                };
+                self.handle_watch_request(WatchRequest {
+                    process_id,
+                    resource,
+                    after_revision: envelope.revision.unwrap_or_default(),
+                    timeout_ms: envelope.timeout_ms.unwrap_or_default(),
+                })
+            }
+            Some("get") if envelope.resource == Some(WatchResource::GatewayConfig) => {
+                ControlResponse::ConfigFetched {
+                    config: self.config.to_json_value(),
+                }
+            }
+            Some("get") => match envelope.resource {
+                Some(WatchResource::Stream { stream_name }) => match self
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get_stream(&stream_name)
+                    .cloned()
+                {
+                    Some(stream) => ControlResponse::StreamFetched(GetStreamResponse {
+                        stream: StreamInfo::from(stream),
+                    }),
+                    None => ControlResponse::Error {
+                        reason: format!("stream not found stream_name=[{}]", stream_name),
+                    },
+                },
+                _ => ControlResponse::Error {
+                    reason: "control envelope get requires supported resource".to_string(),
+                },
+            },
+            Some("list") => {
+                let streams: Vec<_> = self
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .list_streams()
+                    .into_iter()
+                    .map(StreamInfo::from)
+                    .collect();
+                ControlResponse::StreamsListed(ListStreamsResponse { streams })
+            }
+            Some(verb) => ControlResponse::Error {
+                reason: format!("unsupported control envelope verb verb=[{}]", verb),
+            },
+            None => ControlResponse::Error {
+                reason: "control envelope requires inner or verb".to_string(),
+            },
+        }
+    }
+
+    fn handle_control_envelope_update_status(
+        &self,
+        payload: Option<serde_json::Value>,
+    ) -> ControlResponse {
+        let Some(payload) = payload else {
+            return ControlResponse::Error {
+                reason: "control envelope update_status requires payload".to_string(),
+            };
+        };
+        let Some(kind) = payload.get("kind").and_then(serde_json::Value::as_str) else {
+            return ControlResponse::Error {
+                reason: "control envelope update_status requires payload.kind".to_string(),
+            };
+        };
+        let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) else {
+            return ControlResponse::Error {
+                reason: "control envelope update_status requires payload.name".to_string(),
+            };
+        };
+        let Some(status) = payload.get("status").and_then(serde_json::Value::as_str) else {
+            return ControlResponse::Error {
+                reason: "control envelope update_status requires payload.status".to_string(),
+            };
+        };
+        let metrics = payload.get("metrics").cloned();
+
+        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
+        let update_result = match kind {
+            "source" => {
+                let previous = registry.get_source(name).cloned();
+                let result = registry.set_source_status(name, status, metrics);
+                (
+                    result,
+                    previous.map(|record| ("source", serde_json::to_value(record).unwrap())),
+                )
+            }
+            "engine" => {
+                let previous = registry.get_engine(name).cloned();
+                let result = registry.set_engine_status(name, status, metrics);
+                (
+                    result,
+                    previous.map(|record| ("engine", serde_json::to_value(record).unwrap())),
+                )
+            }
+            "sink" => {
+                let previous = registry.get_sink(name).cloned();
+                let result = registry.set_sink_status(name, status);
+                (
+                    result,
+                    previous.map(|record| ("sink", serde_json::to_value(record).unwrap())),
+                )
+            }
+            _ => (
+                Err(crate::registry::RegistryError::InvalidRecordKind {
+                    kind: kind.to_string(),
+                }),
+                None,
+            ),
+        };
+
+        match update_result.0 {
+            Ok(()) => {
+                let snapshot = Self::snapshot_from_registry(&registry);
+                if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                    if let Some((kind, previous)) = update_result.1 {
+                        let _ = restore_previous_record(&mut registry, kind, previous);
+                    }
+                    return ControlResponse::Error {
+                        reason: error.to_string(),
+                    };
+                }
+                self.control_changed.notify_all();
+                ControlResponse::StatusUpdated {
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                }
+            }
+            Err(error) => ControlResponse::Error {
+                reason: error.to_string(),
+            },
+        }
+    }
+
     fn handle_stream<S>(&self, mut stream: S) -> Result<()>
     where
         S: Read + Write,
@@ -640,6 +1383,44 @@ impl MasterServer {
         })?;
 
         let response = match request {
+            ControlRequest::Envelope(envelope) => {
+                let request_id = envelope.request_id.clone();
+                if let Some(cached) = self
+                    .envelope_responses
+                    .lock()
+                    .unwrap()
+                    .get(&request_id)
+                    .cloned()
+                {
+                    return write_control_response(
+                        &mut stream,
+                        &ControlResponse::Envelope(zippy_core::ControlEnvelopeResponse {
+                            version: CONTROL_PROTOCOL_VERSION,
+                            request_id,
+                            inner: Box::new(cached),
+                        }),
+                    );
+                }
+                let inner = if envelope.version == CONTROL_PROTOCOL_VERSION {
+                    self.handle_control_envelope_request(envelope)
+                } else {
+                    ControlResponse::Error {
+                        reason: format!(
+                            "unsupported control protocol version version=[{}]",
+                            envelope.version
+                        ),
+                    }
+                };
+                self.envelope_responses
+                    .lock()
+                    .unwrap()
+                    .insert(request_id.clone(), inner.clone());
+                ControlResponse::Envelope(zippy_core::ControlEnvelopeResponse {
+                    version: CONTROL_PROTOCOL_VERSION,
+                    request_id,
+                    inner: Box::new(inner),
+                })
+            }
             ControlRequest::RegisterProcess(request) => {
                 if self.shutdown_requested.load(Ordering::SeqCst) {
                     ControlResponse::Error {
@@ -647,6 +1428,7 @@ impl MasterServer {
                     }
                 } else {
                     let process_id = self.registry.lock().unwrap().register_process(&request.app);
+                    self.control_changed.notify_all();
                     tracing::info!(
                         component = "master_server",
                         event = "register_process",
@@ -679,6 +1461,7 @@ impl MasterServer {
                         .record_heartbeat(&request.process_id)
                     {
                         Ok(()) => {
+                            self.control_changed.notify_all();
                             tracing::debug!(
                                 component = "master_server",
                                 event = "heartbeat",
@@ -706,6 +1489,7 @@ impl MasterServer {
                     }
                 }
             }
+            ControlRequest::Watch(request) => self.handle_watch_request(request),
             ControlRequest::UnregisterProcess(request) => {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
@@ -732,6 +1516,7 @@ impl MasterServer {
                                 process_id = request.process_id.as_str(),
                                 "unregistered process"
                             );
+                            self.control_changed.notify_all();
                             ControlResponse::ProcessUnregistered {
                                 process_id: request.process_id,
                             }
@@ -919,6 +1704,7 @@ impl MasterServer {
                             output_stream = request.output_stream.as_str(),
                             "registered source"
                         );
+                        self.control_changed.notify_all();
                         ControlResponse::SourceRegistered {
                             source_name: request.source_name,
                         }
@@ -972,6 +1758,7 @@ impl MasterServer {
                             process_id = request.process_id.as_str(),
                             "unregistered source"
                         );
+                        self.control_changed.notify_all();
                         ControlResponse::SourceUnregistered {
                             source_name: request.source_name,
                         }
@@ -1146,6 +1933,7 @@ impl MasterServer {
                             record_status = request.status.as_str(),
                             "updated record status"
                         );
+                        self.control_changed.notify_all();
                         ControlResponse::StatusUpdated {
                             kind: request.kind,
                             name: request.name,
@@ -1230,6 +2018,7 @@ impl MasterServer {
                             process_id = request.process_id.as_str(),
                             "published persisted file"
                         );
+                        self.control_changed.notify_all();
                         ControlResponse::PersistedFilePublished {
                             stream_name: request.stream_name,
                         }
@@ -1280,6 +2069,7 @@ impl MasterServer {
                             stream_name = request.stream_name.as_str(),
                             "replaced persisted files"
                         );
+                        self.control_changed.notify_all();
                         ControlResponse::PersistedFilesReplaced {
                             stream_name: request.stream_name,
                         }
@@ -1333,6 +2123,7 @@ impl MasterServer {
                             process_id = request.process_id.as_str(),
                             "published persist event"
                         );
+                        self.control_changed.notify_all();
                         ControlResponse::PersistEventPublished {
                             stream_name: request.stream_name,
                         }
@@ -1444,78 +2235,6 @@ impl MasterServer {
                             lease_id = request.lease_id.as_str(),
                             error = %error,
                             "failed to release segment reader lease"
-                        );
-                        ControlResponse::Error {
-                            reason: error.to_string(),
-                        }
-                    }
-                }
-            }
-            ControlRequest::WaitSegmentDescriptor(request) => {
-                let timeout = Duration::from_millis(request.timeout_ms);
-                let mut registry = self.registry.lock().unwrap();
-                let wait_result = registry.segment_descriptor_update_for_process(
-                    &request.stream_name,
-                    &request.process_id,
-                    request.after_descriptor_generation,
-                );
-                let response_result = match wait_result {
-                    Ok(Some(update)) => Ok(Some(update)),
-                    Ok(None) => {
-                        let (next_registry, _) = self
-                            .descriptor_changed
-                            .wait_timeout_while(registry, timeout, |registry| {
-                                matches!(
-                                    registry.segment_descriptor_update_for_process(
-                                        &request.stream_name,
-                                        &request.process_id,
-                                        request.after_descriptor_generation,
-                                    ),
-                                    Ok(None)
-                                )
-                            })
-                            .unwrap();
-                        registry = next_registry;
-                        registry.segment_descriptor_update_for_process(
-                            &request.stream_name,
-                            &request.process_id,
-                            request.after_descriptor_generation,
-                        )
-                    }
-                    Err(error) => Err(error),
-                };
-
-                match response_result {
-                    Ok(Some((descriptor_generation, descriptor))) => {
-                        tracing::info!(
-                            component = "master_server",
-                            event = "wait_segment_descriptor",
-                            status = "changed",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            descriptor_generation,
-                            "segment descriptor changed"
-                        );
-                        ControlResponse::SegmentDescriptorChanged {
-                            stream_name: request.stream_name,
-                            descriptor_generation,
-                            descriptor: Some(descriptor),
-                        }
-                    }
-                    Ok(None) => ControlResponse::SegmentDescriptorChanged {
-                        stream_name: request.stream_name,
-                        descriptor_generation: request.after_descriptor_generation,
-                        descriptor: None,
-                    },
-                    Err(error) => {
-                        tracing::error!(
-                            component = "master_server",
-                            event = "wait_segment_descriptor",
-                            status = "error",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            error = %error,
-                            "failed to wait for segment descriptor"
                         );
                         ControlResponse::Error {
                             reason: error.to_string(),
@@ -1851,6 +2570,7 @@ impl MasterServer {
                     }
                     bus.remove_stream(&table_name);
                     self.descriptor_changed.notify_all();
+                    self.control_changed.notify_all();
                     dropped_records
                 };
                 let persisted_files = drop_result
@@ -1981,6 +2701,7 @@ impl MasterServer {
             registry.mark_records_lost_for_process(process_id);
             Self::snapshot_from_registry(&registry)
         };
+        self.control_changed.notify_all();
         self.write_snapshot_from_snapshot(&snapshot)
     }
 
@@ -2094,6 +2815,7 @@ impl MasterServer {
             registry.mark_records_lost_for_process(process_id);
             Self::snapshot_from_registry(&registry)
         };
+        self.control_changed.notify_all();
         self.write_snapshot_from_snapshot(&snapshot)
     }
 
@@ -2111,7 +2833,9 @@ impl MasterServer {
                     sealed_segments: stream.sealed_segments,
                     persisted_files: stream.persisted_files,
                     persist_events: stream.persist_events,
+                    persist_revision: stream.persist_revision,
                     segment_reader_leases: stream.segment_reader_leases,
+                    writer_epoch: stream.writer_epoch,
                     buffer_size: stream.buffer_size,
                     frame_size: stream.frame_size,
                     status: stream.status,
@@ -2128,6 +2852,8 @@ impl MasterServer {
                     config: source.config,
                     status: source.status,
                     metrics: source.metrics,
+                    writer_epoch: source.writer_epoch,
+                    revision: source.revision,
                 })
                 .collect(),
             engines: registry
@@ -2375,6 +3101,13 @@ fn bus_error(error: crate::bus::BusError) -> ZippyError {
 }
 
 #[cfg(unix)]
+fn restored_record_status(status: &str) -> &str {
+    match status {
+        "lost" | "stale" => status,
+        _ => "restored",
+    }
+}
+
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     if !socket_path.exists() {
         return Ok(());
@@ -2421,6 +3154,7 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
             frame_size: stream.frame_size,
             write_seq: 0,
             writer_process_id: stream.writer_process_id,
+            writer_epoch: stream.writer_epoch,
             reader_count: stream.reader_count,
             status: stream.status,
         }

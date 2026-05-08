@@ -146,9 +146,10 @@ DEFAULT_MASTER_URI = "zippy://default"
 DEFAULT_REMOTE_GATEWAY_PORT = 17666
 _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC = 3.0
 _DEFAULT_HEARTBEAT_INTERVAL_SEC = _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC
+_SHUTDOWN_WATCH_TIMEOUT_MS = 1_000
 _DEFAULT_MASTER: MasterClient | None = None
-_DEFAULT_HEARTBEAT: _HeartbeatHandle | None = None
-_DEFAULT_HEARTBEAT_LOCK = threading.Lock()
+_DEFAULT_CONTROL_AGENT: "_ControlAgent | None" = None
+_DEFAULT_CONTROL_AGENT_LOCK = threading.Lock()
 _SHUTDOWN_HOOKS: list[callable] = []
 _SHUTDOWN_HOOKS_LOCK = threading.RLock()
 _MASTER_LOCAL_DATA_PATH: dict[int, bool] = {}
@@ -690,50 +691,129 @@ def _apply_query_plan_json(table: "Table", plan: list[dict[str, object]]) -> "Ta
     return table
 
 
-class _HeartbeatHandle:
-    def __init__(self, master: MasterClient, interval_sec: float) -> None:
+class _ControlAgent:
+    def __init__(
+        self,
+        master: MasterClient,
+        interval_sec: float,
+        *,
+        app: str | None = None,
+    ) -> None:
         self.master = master
         self.interval_sec = interval_sec
         self.last_error: Exception | None = None
+        self._registered = False
         self._stop_event = threading.Event()
+        self._shutdown_started = threading.Event()
+        if app is not None:
+            self.master.register_process(app)
+            self._registered = True
         self._thread = threading.Thread(
-            target=self._run,
+            target=self._run_heartbeat,
             name="zippy-master-heartbeat",
             daemon=True,
         )
         self._thread.start()
+        self._shutdown_thread = None
+        if callable(getattr(master, "wait_shutdown", None)):
+            self._shutdown_thread = threading.Thread(
+                target=self._run_shutdown_watch,
+                name="zippy-master-shutdown-watch",
+                daemon=True,
+            )
+            self._shutdown_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
         self._thread.join(timeout=1.0)
+        if self._shutdown_thread is not None:
+            self._shutdown_thread.join(timeout=2.0)
+        if self._registered and not self._shutdown_started.is_set():
+            try:
+                self._unregister_process()
+            except Exception as error:
+                self.last_error = error
 
-    def _run(self) -> None:
+    def _run_heartbeat(self) -> None:
         while not self._stop_event.wait(self.interval_sec):
             try:
                 self.master.heartbeat()
                 self.last_error = None
             except Exception as error:
                 self.last_error = error
-                if _is_master_shutdown_requested(error):
-                    try:
-                        _run_shutdown_hooks()
-                    except Exception as hook_error:
-                        self.last_error = hook_error
-                        return
-                    try:
-                        unregister_process = getattr(self.master, "unregister_process", None)
-                        if callable(unregister_process):
-                            unregister_process()
-                        self.last_error = None
-                    except Exception as unregister_error:
-                        self.last_error = unregister_error
-                        return
-                    self._stop_event.set()
+                if _should_stop_on_heartbeat_error(error):
+                    self._handle_shutdown_or_connection_loss(error)
                     return
+
+    def _run_shutdown_watch(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                notified = self.master.wait_shutdown(timeout_ms=_SHUTDOWN_WATCH_TIMEOUT_MS)
+                if notified:
+                    self._handle_shutdown_or_connection_loss(
+                        RuntimeError("master shutdown requested")
+                    )
+                    return
+            except Exception as error:
+                self.last_error = error
+                if _should_stop_on_heartbeat_error(error):
+                    self._handle_shutdown_or_connection_loss(error)
+                    return
+                if self._stop_event.wait(1.0):
+                    return
+
+    def _handle_shutdown_or_connection_loss(self, error: BaseException) -> None:
+        if self._shutdown_started.is_set():
+            self._stop_event.set()
+            return
+        self._shutdown_started.set()
+        try:
+            _run_shutdown_hooks()
+        except Exception as hook_error:
+            self.last_error = hook_error
+            self._stop_event.set()
+            return
+        if _is_master_shutdown_requested(error):
+            try:
+                self._unregister_process()
+                self.last_error = None
+            except Exception as unregister_error:
+                self.last_error = unregister_error
+                self._stop_event.set()
+                return
+        else:
+            self.last_error = None
+        self._stop_event.set()
+
+    def _unregister_process(self) -> None:
+        unregister_process = getattr(self.master, "unregister_process", None)
+        if callable(unregister_process):
+            unregister_process()
+        self._registered = False
 
 
 def _is_master_shutdown_requested(error: BaseException) -> bool:
     return "master shutdown requested" in str(error)
+
+
+def _is_master_connection_lost(error: BaseException) -> bool:
+    message = str(error).lower()
+    return any(
+        token in message
+        for token in (
+            "failed to connect to zippy master",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "no such file or directory",
+            "timed out",
+        )
+    )
+
+
+def _should_stop_on_heartbeat_error(error: BaseException) -> bool:
+    return _is_master_shutdown_requested(error) or _is_master_connection_lost(error)
 
 
 def _register_shutdown_hook(callback) -> callable:
@@ -809,17 +889,17 @@ def connect(
     remote_master_endpoint = _remote_master_endpoint_from_zippy_uri(raw_uri)
     if remote_master_endpoint is not None and not _NATIVE_AVAILABLE:
         client = RemoteMasterClient.from_master_endpoint(remote_master_endpoint)
+        control_agent = None
         if app is not None:
-            client.register_process(app)
-        _set_default_master(client, None, interval_sec)
+            control_agent = _ControlAgent(client, interval_sec, app=app)
+        _set_default_master(client, control_agent, interval_sec)
         return client
     client = MasterClient(control_endpoint=endpoint)
     _set_master_local_data_path(client, bool(local))
-    heartbeat = None
+    control_agent = None
     try:
         if app is not None:
-            client.register_process(app)
-            heartbeat = _HeartbeatHandle(client, interval_sec)
+            control_agent = _ControlAgent(client, interval_sec, app=app)
         else:
             client.list_streams()
     except RuntimeError as error:
@@ -829,7 +909,7 @@ def connect(
             "with the active master endpoint"
         ) from error
 
-    _set_default_master(client, heartbeat, interval_sec)
+    _set_default_master(client, control_agent, interval_sec)
     return client
 
 
@@ -1888,75 +1968,99 @@ def _wait_for_table_ready(
 
 def _set_default_master(
     client: MasterClient,
-    heartbeat: _HeartbeatHandle | None,
+    control_agent: _ControlAgent | None,
     heartbeat_interval_sec: float,
 ) -> None:
-    global _DEFAULT_HEARTBEAT
+    global _DEFAULT_CONTROL_AGENT
     global _DEFAULT_HEARTBEAT_INTERVAL_SEC
     global _DEFAULT_MASTER
 
-    with _DEFAULT_HEARTBEAT_LOCK:
-        old_heartbeat = _DEFAULT_HEARTBEAT
+    with _DEFAULT_CONTROL_AGENT_LOCK:
+        old_control_agent = _DEFAULT_CONTROL_AGENT
         _DEFAULT_MASTER = client
-        _DEFAULT_HEARTBEAT = heartbeat
+        _DEFAULT_CONTROL_AGENT = control_agent
         _DEFAULT_HEARTBEAT_INTERVAL_SEC = heartbeat_interval_sec
 
-    if old_heartbeat is not None:
-        old_heartbeat.stop()
+    if old_control_agent is not None:
+        old_control_agent.stop()
 
 
-def _ensure_default_heartbeat() -> None:
-    global _DEFAULT_HEARTBEAT
+def _ensure_default_control_agent() -> None:
+    global _DEFAULT_CONTROL_AGENT
 
-    old_heartbeat = None
-    with _DEFAULT_HEARTBEAT_LOCK:
+    old_control_agent = None
+    with _DEFAULT_CONTROL_AGENT_LOCK:
         if _DEFAULT_MASTER is None:
             return
-        if _DEFAULT_HEARTBEAT is not None and _DEFAULT_HEARTBEAT.master is _DEFAULT_MASTER:
+        if (
+            _DEFAULT_CONTROL_AGENT is not None
+            and _DEFAULT_CONTROL_AGENT.master is _DEFAULT_MASTER
+        ):
             return
 
         process_id = getattr(_DEFAULT_MASTER, "process_id", lambda: None)()
         if process_id is None:
             return
 
-        old_heartbeat = _DEFAULT_HEARTBEAT
-        _DEFAULT_HEARTBEAT = _HeartbeatHandle(
-            _DEFAULT_MASTER,
-            _DEFAULT_HEARTBEAT_INTERVAL_SEC,
-        )
+        old_control_agent = _DEFAULT_CONTROL_AGENT
+        _DEFAULT_CONTROL_AGENT = _ControlAgent(_DEFAULT_MASTER, _DEFAULT_HEARTBEAT_INTERVAL_SEC)
 
-    if old_heartbeat is not None:
-        old_heartbeat.stop()
+    if old_control_agent is not None:
+        old_control_agent.stop()
+
+
+def _ensure_default_heartbeat() -> None:
+    _ensure_default_control_agent()
 
 
 def _ensure_master_process(master: MasterClient, app: str) -> None:
+    global _DEFAULT_CONTROL_AGENT
+
     process_id = getattr(master, "process_id", None)
     register_process = getattr(master, "register_process", None)
     if process_id is None or register_process is None:
         return
 
+    if master is _DEFAULT_MASTER:
+        if process_id() is None:
+            old_control_agent = None
+            with _DEFAULT_CONTROL_AGENT_LOCK:
+                old_control_agent = _DEFAULT_CONTROL_AGENT
+                _DEFAULT_CONTROL_AGENT = _ControlAgent(
+                    master,
+                    _DEFAULT_HEARTBEAT_INTERVAL_SEC,
+                    app=app,
+                )
+            if old_control_agent is not None:
+                old_control_agent.stop()
+            return
+        _ensure_default_control_agent()
+        return
+
     if process_id() is None:
         register_process(app)
-    if master is _DEFAULT_MASTER:
-        _ensure_default_heartbeat()
+
+
+def _stop_default_control_agent() -> None:
+    global _DEFAULT_CONTROL_AGENT
+
+    with _DEFAULT_CONTROL_AGENT_LOCK:
+        control_agent = _DEFAULT_CONTROL_AGENT
+        _DEFAULT_CONTROL_AGENT = None
+
+    if control_agent is not None:
+        control_agent.stop()
 
 
 def _stop_default_heartbeat() -> None:
-    global _DEFAULT_HEARTBEAT
-
-    with _DEFAULT_HEARTBEAT_LOCK:
-        heartbeat = _DEFAULT_HEARTBEAT
-        _DEFAULT_HEARTBEAT = None
-
-    if heartbeat is not None:
-        heartbeat.stop()
+    _stop_default_control_agent()
 
 
 def _reset_default_master_for_test() -> None:
     global _DEFAULT_HEARTBEAT_INTERVAL_SEC
     global _DEFAULT_MASTER
 
-    _stop_default_heartbeat()
+    _stop_default_control_agent()
     _DEFAULT_HEARTBEAT_INTERVAL_SEC = _DEFAULT_HEARTBEAT_INTERVAL_DEFAULT_SEC
     _DEFAULT_MASTER = None
     _MASTER_LOCAL_DATA_PATH.clear()

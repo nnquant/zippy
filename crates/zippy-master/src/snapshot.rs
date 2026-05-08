@@ -20,7 +20,11 @@ pub struct SnapshotStreamRecord {
     #[serde(default)]
     pub persist_events: Vec<serde_json::Value>,
     #[serde(default)]
+    pub persist_revision: u64,
+    #[serde(default)]
     pub segment_reader_leases: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub writer_epoch: u64,
     pub buffer_size: usize,
     pub frame_size: usize,
     pub status: String,
@@ -44,7 +48,11 @@ struct SnapshotStreamRecordV1 {
     #[serde(default)]
     persist_events: Vec<serde_json::Value>,
     #[serde(default)]
+    persist_revision: u64,
+    #[serde(default)]
     segment_reader_leases: Vec<serde_json::Value>,
+    #[serde(default)]
+    writer_epoch: u64,
     #[serde(default)]
     buffer_size: Option<usize>,
     #[serde(default)]
@@ -74,7 +82,9 @@ impl<'de> Deserialize<'de> for SnapshotStreamRecord {
             sealed_segments: record.sealed_segments,
             persisted_files: record.persisted_files,
             persist_events: record.persist_events,
+            persist_revision: record.persist_revision,
             segment_reader_leases: record.segment_reader_leases,
+            writer_epoch: record.writer_epoch,
             buffer_size,
             frame_size,
             status: record.status,
@@ -102,6 +112,10 @@ pub struct SnapshotSourceRecord {
     pub config: serde_json::Value,
     pub status: String,
     pub metrics: serde_json::Value,
+    #[serde(default)]
+    pub writer_epoch: u64,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

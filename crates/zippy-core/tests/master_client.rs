@@ -17,8 +17,8 @@ use zippy_core::{
     BusFrameKind, ControlEndpoint, ControlRequest, ControlResponse, DetachReaderRequest,
     DetachWriterRequest, HeartbeatRequest, MasterClient, ReaderDescriptor, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    SchemaRef, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WriterDescriptor,
-    BUS_LAYOUT_VERSION,
+    SchemaRef, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
+    WriterDescriptor, BUS_LAYOUT_VERSION,
 };
 use zippy_shm_bridge::SharedFrameRing;
 
@@ -50,6 +50,7 @@ fn test_stream_info() -> StreamInfo {
         frame_size: 256,
         write_seq: 42,
         writer_process_id: None,
+        writer_epoch: 0,
         reader_count: 0,
         status: "registered".to_string(),
     }
@@ -155,6 +156,113 @@ fn wait_for_socket(socket_path: &Path) {
     panic!("socket did not appear path={}", socket_path.display());
 }
 
+fn fake_watch_response(
+    process_id: String,
+    resource: WatchResource,
+    after_revision: u64,
+    timeout_ms: u64,
+) -> ControlResponse {
+    match resource {
+        WatchResource::Shutdown => {
+            assert_eq!(process_id, "proc_1");
+            assert_eq!(after_revision, 0);
+            assert!(timeout_ms > 0);
+            ControlResponse::ResourceChanged { event: None }
+        }
+        WatchResource::Process { process_id } => ControlResponse::ResourceChanged {
+            event: Some(zippy_core::ResourceEvent {
+                resource: WatchResource::Process {
+                    process_id: process_id.clone(),
+                },
+                revision: after_revision + 1,
+                payload: serde_json::json!({
+                    "process": {
+                        "process_id": process_id,
+                        "lease_status": "alive",
+                    },
+                }),
+            }),
+        },
+        WatchResource::Source { source_name } => ControlResponse::ResourceChanged {
+            event: Some(zippy_core::ResourceEvent {
+                resource: WatchResource::Source {
+                    source_name: source_name.clone(),
+                },
+                revision: after_revision + 1,
+                payload: serde_json::json!({
+                    "source": {
+                        "source_name": source_name,
+                        "status": "running",
+                    },
+                }),
+            }),
+        },
+        WatchResource::PersistedFile { stream_name } => ControlResponse::ResourceChanged {
+            event: Some(zippy_core::ResourceEvent {
+                resource: WatchResource::PersistedFile {
+                    stream_name: stream_name.clone(),
+                },
+                revision: after_revision + 1,
+                payload: serde_json::json!({
+                    "stream_name": stream_name,
+                    "persisted_files": [],
+                    "persist_events": [],
+                }),
+            }),
+        },
+        WatchResource::GatewayConfig => ControlResponse::ResourceChanged {
+            event: Some(zippy_core::ResourceEvent {
+                resource: WatchResource::GatewayConfig,
+                revision: 1,
+                payload: serde_json::json!({
+                    "config": {},
+                }),
+            }),
+        },
+        WatchResource::SegmentDescriptor { stream_name } => {
+            assert_eq!(stream_name, "ticks");
+            assert_eq!(process_id, "proc_1");
+            ControlResponse::ResourceChanged {
+                event: Some(zippy_core::ResourceEvent {
+                    resource: WatchResource::SegmentDescriptor { stream_name },
+                    revision: after_revision + 1,
+                    payload: serde_json::json!({
+                        "descriptor": {
+                            "magic": "zippy.segment.active",
+                            "version": 1,
+                            "schema_id": 7,
+                            "row_capacity": 64,
+                            "shm_os_id": "/tmp/zippy-segment",
+                            "payload_offset": 64,
+                            "committed_row_count_offset": 40,
+                            "segment_id": 2,
+                            "generation": 1,
+                        },
+                    }),
+                }),
+            }
+        }
+        WatchResource::Stream { stream_name } => {
+            assert_eq!(stream_name, "ticks");
+            assert_eq!(process_id, "proc_1");
+            ControlResponse::ResourceChanged {
+                event: Some(zippy_core::ResourceEvent {
+                    resource: WatchResource::Stream {
+                        stream_name: stream_name.clone(),
+                    },
+                    revision: after_revision + 1,
+                    payload: serde_json::json!({
+                        "stream": {
+                            "stream_name": stream_name,
+                            "descriptor_generation": after_revision + 1,
+                        },
+                    }),
+                }),
+            }
+        }
+    }
+}
+
 fn spawn_fake_server(
     socket_path: &Path,
     expected_connections: usize,
@@ -175,6 +283,25 @@ fn spawn_fake_server(
 
             let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
             let response = match request {
+                ControlRequest::Envelope(envelope) => {
+                    let inner = if envelope.verb.as_deref() == Some("watch") {
+                        fake_watch_response(
+                            envelope.process_id.expect("watch process_id"),
+                            envelope.resource.expect("watch resource"),
+                            envelope.revision.unwrap_or_default(),
+                            envelope.timeout_ms.unwrap_or_default(),
+                        )
+                    } else {
+                        ControlResponse::Error {
+                            reason: "fake server does not handle envelope".to_string(),
+                        }
+                    };
+                    ControlResponse::Envelope(zippy_core::ControlEnvelopeResponse {
+                        version: envelope.version,
+                        request_id: envelope.request_id,
+                        inner: Box::new(inner),
+                    })
+                }
                 ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
                     assert_eq!(app, "local_dc");
                     ControlResponse::ProcessRegistered {
@@ -187,6 +314,12 @@ fn spawn_fake_server(
                         process_id: "proc_1".to_string(),
                     }
                 }
+                ControlRequest::Watch(request) => fake_watch_response(
+                    request.process_id,
+                    request.resource,
+                    request.after_revision,
+                    request.timeout_ms,
+                ),
                 ControlRequest::UnregisterProcess(request) => {
                     assert_eq!(request.process_id, "proc_1");
                     ControlResponse::ProcessUnregistered {
@@ -337,25 +470,6 @@ fn spawn_fake_server(
                             "committed_row_count_offset": 40,
                             "segment_id": 1,
                             "generation": 0,
-                        })),
-                    }
-                }
-                ControlRequest::WaitSegmentDescriptor(request) => {
-                    assert_eq!(request.stream_name, "ticks");
-                    assert_eq!(request.process_id, "proc_1");
-                    ControlResponse::SegmentDescriptorChanged {
-                        stream_name: request.stream_name,
-                        descriptor_generation: request.after_descriptor_generation + 1,
-                        descriptor: Some(serde_json::json!({
-                            "magic": "zippy.segment.active",
-                            "version": 1,
-                            "schema_id": 7,
-                            "row_capacity": 64,
-                            "shm_os_id": "/tmp/zippy-segment",
-                            "payload_offset": 64,
-                            "committed_row_count_offset": 40,
-                            "segment_id": 2,
-                            "generation": 1,
                         })),
                     }
                 }
@@ -910,6 +1024,59 @@ fn master_client_sends_heartbeat_for_registered_process() {
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("local_dc").unwrap();
     client.heartbeat().unwrap();
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
+}
+
+#[test]
+fn master_client_wait_shutdown_times_out_without_shutdown_request() {
+    let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("wait-shutdown");
+    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+
+    assert!(!client.wait_shutdown(Duration::from_millis(10)).unwrap());
+
+    server.join().unwrap();
+    let _ = fs::remove_dir_all(shm_dir);
+}
+
+#[test]
+fn master_client_watches_generic_stream_resource() {
+    let socket_path = unique_socket_path();
+    let (shm_dir, shm_name) = unique_shm_name("watch-stream-resource");
+    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+
+    let event = client
+        .watch_resource(
+            WatchResource::Stream {
+                stream_name: "ticks".to_string(),
+            },
+            0,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .expect("stream resource should change");
+
+    assert_eq!(
+        event.resource,
+        WatchResource::Stream {
+            stream_name: "ticks".to_string(),
+        }
+    );
+    assert_eq!(event.revision, 1);
+    assert_eq!(
+        event.payload["stream"]["stream_name"],
+        serde_json::json!("ticks")
+    );
 
     server.join().unwrap();
     let _ = fs::remove_dir_all(shm_dir);

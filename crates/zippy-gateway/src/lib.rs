@@ -27,7 +27,9 @@ use serde_json::{json, Value};
 use zippy_core::{
     ControlEndpoint, Engine, MasterClient, Result, SegmentTableView, StreamInfo, ZippyError,
 };
-use zippy_engines::{StreamTableDescriptorPublisher, StreamTableMaterializer};
+use zippy_engines::{
+    StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+};
 use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanView,
@@ -429,7 +431,7 @@ impl GatewayState {
     }
 
     fn create_writer(&self, stream_name: &str, schema: SchemaRef) -> Result<GatewayTableWriter> {
-        {
+        let writer_epoch = {
             self.with_master(|master| {
                 master.register_stream(stream_name, Arc::clone(&schema), 64, 4096)?;
                 master.register_source(
@@ -438,16 +440,21 @@ impl GatewayState {
                     stream_name,
                     json!({}),
                 )?;
-                Ok(())
-            })?;
-        }
+                Ok(master.get_stream(stream_name)?.writer_epoch)
+            })?
+        };
 
         let publisher = Arc::new(MasterDescriptorPublisher {
             master: Arc::clone(&self.master),
             stream_name: stream_name.to_string(),
         });
-        let materializer =
-            StreamTableMaterializer::new(stream_name, schema)?.with_descriptor_publisher(publisher);
+        let materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+            stream_name,
+            schema,
+            DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+            Some(writer_epoch),
+        )?
+        .with_descriptor_publisher(publisher);
         let descriptor = materializer.active_descriptor_envelope_bytes()?;
         self.with_master(|master| {
             master.publish_segment_descriptor_bytes(stream_name, &descriptor)

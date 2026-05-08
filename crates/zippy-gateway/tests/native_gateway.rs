@@ -75,6 +75,60 @@ fn native_gateway_accepts_arrow_write_batch_and_publishes_descriptor() {
 }
 
 #[test]
+fn native_gateway_binds_writer_epoch_to_master_source_epoch() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("last_price", DataType::Float64, false),
+    ]));
+    let _burn_store_id = StreamTableMaterializer::new("burn_writer_epoch", schema.clone()).unwrap();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+
+    let response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "gateway_epoch_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&batch),
+    );
+
+    assert_eq!(response["status"], "ok");
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("gateway_epoch_probe").unwrap();
+    let stream = client.get_stream("gateway_epoch_ticks").unwrap();
+    assert_eq!(stream.writer_epoch, 1);
+    let descriptor = stream.active_segment_descriptor.unwrap();
+    assert_eq!(descriptor["writer_epoch"], json!(1));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_collects_existing_segment_stream() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -109,7 +163,8 @@ fn native_gateway_collects_existing_segment_stream() {
     client
         .register_source("external_source", "test", "external_ticks", json!({}))
         .unwrap();
-    let mut materializer = StreamTableMaterializer::new("external_ticks", batch.schema()).unwrap();
+    let mut materializer =
+        master_bound_materializer(&mut client, "external_ticks", batch.schema(), 64);
     client
         .publish_segment_descriptor_bytes(
             "external_ticks",
@@ -419,8 +474,7 @@ fn native_gateway_pushes_tail_collect_into_segment_reader() {
         )
         .unwrap();
     let mut materializer =
-        StreamTableMaterializer::new_with_row_capacity("tail_external_ticks", batch.schema(), 2)
-            .unwrap();
+        master_bound_materializer(&mut client, "tail_external_ticks", batch.schema(), 2);
     materializer
         .on_data(SegmentTableView::from_record_batch(batch))
         .unwrap();
@@ -504,8 +558,7 @@ fn native_gateway_pushes_head_collect_into_segment_reader() {
         )
         .unwrap();
     let mut materializer =
-        StreamTableMaterializer::new_with_row_capacity("head_external_ticks", batch.schema(), 2)
-            .unwrap();
+        master_bound_materializer(&mut client, "head_external_ticks", batch.schema(), 2);
     materializer
         .on_data(SegmentTableView::from_record_batch(batch))
         .unwrap();
@@ -602,8 +655,7 @@ fn native_gateway_pushes_slice_collect_into_segment_reader() {
         )
         .unwrap();
     let mut materializer =
-        StreamTableMaterializer::new_with_row_capacity("slice_external_ticks", batch.schema(), 2)
-            .unwrap();
+        master_bound_materializer(&mut client, "slice_external_ticks", batch.schema(), 2);
     materializer
         .on_data(SegmentTableView::from_record_batch(batch))
         .unwrap();
@@ -800,7 +852,8 @@ fn native_gateway_reregisters_master_process_after_lease_expiry() {
     client
         .register_source("external_source", "test", "external_ticks", json!({}))
         .unwrap();
-    let mut materializer = StreamTableMaterializer::new("external_ticks", batch.schema()).unwrap();
+    let mut materializer =
+        master_bound_materializer(&mut client, "external_ticks", batch.schema(), 64);
     client
         .publish_segment_descriptor_bytes(
             "external_ticks",
@@ -881,6 +934,22 @@ fn reserve_tcp_port() -> u16 {
 
 fn loopback_control_endpoint() -> ControlEndpoint {
     ControlEndpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], reserve_tcp_port())))
+}
+
+fn master_bound_materializer(
+    client: &mut MasterClient,
+    stream_name: &str,
+    schema: std::sync::Arc<Schema>,
+    row_capacity: usize,
+) -> StreamTableMaterializer {
+    let writer_epoch = client.get_stream(stream_name).unwrap().writer_epoch;
+    StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+        stream_name,
+        schema,
+        row_capacity,
+        Some(writer_epoch),
+    )
+    .unwrap()
 }
 
 fn encode_ipc_batch(batch: &RecordBatch) -> Vec<u8> {

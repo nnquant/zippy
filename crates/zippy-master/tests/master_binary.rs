@@ -185,6 +185,7 @@ fn master_binary_serves_tcp_control_endpoint() {
     let process_id = client.register_process("tcp_binary").unwrap();
 
     assert!(process_id.starts_with("proc_"));
+    client.unregister_process().unwrap();
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);
@@ -235,6 +236,7 @@ port = {}
     let mut client = MasterClient::connect_endpoint(ControlEndpoint::Tcp(addr)).unwrap();
     let process_id = client.register_process("tcp_config_binary").unwrap();
     assert!(process_id.starts_with("proc_"));
+    client.unregister_process().unwrap();
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);

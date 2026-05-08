@@ -73,11 +73,26 @@ impl SegmentStore {
         partition: &str,
         schema: CompiledSchema,
     ) -> Result<PartitionHandle, ZippySegmentStoreError> {
+        self.open_partition_with_schema_and_writer_epoch(stream, partition, schema, self.store_id)
+    }
+
+    pub fn open_partition_with_schema_and_writer_epoch(
+        &self,
+        stream: &str,
+        partition: &str,
+        schema: CompiledSchema,
+        writer_epoch: u64,
+    ) -> Result<PartitionHandle, ZippySegmentStoreError> {
         let mut partitions = self.partitions.lock().unwrap();
         let key = (stream.to_string(), partition.to_string());
         if let Some(handle) = partitions.get(&key) {
             if handle.inner.schema.schema_id() != schema.schema_id() {
                 return Err(ZippySegmentStoreError::Schema("partition schema mismatch"));
+            }
+            if handle.inner.writer_epoch != writer_epoch {
+                return Err(ZippySegmentStoreError::Schema(
+                    "partition writer epoch mismatch",
+                ));
             }
             return Ok(handle.clone());
         }
@@ -88,6 +103,7 @@ impl SegmentStore {
             partition,
             schema,
             self.config.default_row_capacity,
+            writer_epoch,
             self.persistence.clone(),
         )?;
         partitions.insert(key, handle.clone());
@@ -285,6 +301,7 @@ impl PartitionHandle {
         partition: &str,
         schema: CompiledSchema,
         row_capacity: usize,
+        writer_epoch: u64,
         persistence: PersistenceQueue,
     ) -> Result<Self, ZippySegmentStoreError> {
         let layout = LayoutPlan::for_schema(&schema, row_capacity)
@@ -295,7 +312,7 @@ impl PartitionHandle {
             layout,
             1,
             0,
-            store_id,
+            writer_epoch,
             1,
             persistence_key,
         )
@@ -308,6 +325,7 @@ impl PartitionHandle {
                 schema,
                 _stream: stream.to_string(),
                 _partition: partition.to_string(),
+                writer_epoch,
                 persistence,
                 state: Mutex::new(PartitionState {
                     row_capacity,
@@ -434,6 +452,7 @@ struct PartitionInner {
     schema: CompiledSchema,
     _stream: String,
     _partition: String,
+    writer_epoch: u64,
     persistence: PersistenceQueue,
     state: Mutex<PartitionState>,
     broadcaster: SegmentBroadcaster,
@@ -856,7 +875,7 @@ impl PartitionWriterHandle {
                 layout,
                 next_segment_id,
                 next_generation,
-                self.handle.inner.store_id,
+                self.handle.inner.writer_epoch,
                 next_generation.saturating_add(1),
                 persistence_key,
             )
