@@ -3,6 +3,11 @@ use std::process::Command;
 
 use zippy_core::{base_version, python_dev_version, rust_dev_version};
 
+#[test]
+fn base_version_is_current_release_baseline() {
+    assert_eq!(base_version(), "0.5.0");
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

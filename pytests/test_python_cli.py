@@ -577,6 +577,15 @@ def test_stream_ls_lists_registered_streams(tmp_path) -> None:
     server.join()
 
 
+def test_stream_ls_reports_friendly_error_when_master_is_unreachable() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["stream", "ls", "--uri", unused_loopback_uri()])
+
+    assert result.exit_code != 0
+    assert "failed to connect to zippy master" in result.output
+    assert "io error reason" not in result.output
+
+
 def test_stream_show_returns_single_stream(tmp_path) -> None:
     server, control_endpoint = start_master_server(tmp_path)
     client = zippy.MasterClient(control_endpoint=control_endpoint)

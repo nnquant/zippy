@@ -8,7 +8,7 @@ import click
 
 import zippy
 
-from .cli_common import DEFAULT_CONTROL_ENDPOINT, cli_error, echo_json, resolve_control_endpoint
+from .cli_common import DEFAULT_CONTROL_ENDPOINT, cli_error, echo_json
 
 
 def _master_client(uri: str) -> zippy.MasterClient:
@@ -20,7 +20,7 @@ def _master_client(uri: str) -> zippy.MasterClient:
     :returns: Connected master client.
     :rtype: zippy.MasterClient
     """
-    return zippy.MasterClient(uri=resolve_control_endpoint(uri))
+    return zippy.connect(uri=uri)
 
 
 @click.group("stream")

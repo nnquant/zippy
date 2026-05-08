@@ -9940,6 +9940,31 @@ def test_remote_collect_sends_optimized_plan(monkeypatch) -> None:
     assert [item["op"] for item in sent_plans[0]] == ["filter", "select"]
 
 
+def test_remote_gateway_request_timeout_reports_request_phase(monkeypatch) -> None:
+    class TimeoutSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def sendall(self, payload: bytes) -> None:
+            assert payload
+
+        def recv(self, size: int) -> bytes:
+            raise TimeoutError("timed out")
+
+    def fake_create_connection(address: tuple[str, int], timeout: float):
+        assert address == ("127.0.0.1", 17691)
+        assert timeout == 0.1
+        return TimeoutSocket()
+
+    monkeypatch.setattr(zippy.socket, "create_connection", fake_create_connection)
+
+    with pytest.raises(RuntimeError, match="remote gateway request timed out"):
+        zippy._remote_request("127.0.0.1:17691", {"kind": "collect"}, timeout_sec=0.1)
+
+
 def test_remote_profile_merges_gateway_collect_metrics(monkeypatch) -> None:
     schema = pa.schema(
         [

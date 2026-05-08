@@ -13,6 +13,7 @@ from pathlib import Path
 
 _NATIVE_IMPORT_ERROR: BaseException | None = None
 _NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
+_DEFAULT_REMOTE_GATEWAY_TIMEOUT_SEC = 60.0
 
 
 def _native_unavailable(name: str):
@@ -122,7 +123,7 @@ if not _NATIVE_AVAILABLE:
     ZmqSource = _native_unavailable("ZmqSource")
     ZmqStreamPublisher = _native_unavailable("ZmqStreamPublisher")
     ZmqSubscriber = _native_unavailable("ZmqSubscriber")
-    __version__ = "0.1.0+pure"
+    __version__ = "0.5.0+pure"
 
     def run_master_daemon(*args, **kwargs) -> None:
         del args, kwargs
@@ -2070,6 +2071,19 @@ def _remote_gateway_token(master: object) -> str | None:
     return None
 
 
+def _remote_gateway_timeout_sec() -> float:
+    value = os.environ.get("ZIPPY_REMOTE_GATEWAY_TIMEOUT_SEC")
+    if not value:
+        return _DEFAULT_REMOTE_GATEWAY_TIMEOUT_SEC
+    try:
+        timeout_sec = float(value)
+    except ValueError as error:
+        raise ValueError("ZIPPY_REMOTE_GATEWAY_TIMEOUT_SEC must be a number") from error
+    if timeout_sec <= 0:
+        raise ValueError("ZIPPY_REMOTE_GATEWAY_TIMEOUT_SEC must be positive")
+    return timeout_sec
+
+
 def _is_remote_master(master: object) -> bool:
     return _remote_gateway_endpoint_for_data(master) is not None
 
@@ -2112,19 +2126,34 @@ def _remote_request(
     payload: bytes = b"",
     *,
     token: str | None = None,
-    timeout_sec: float = 5.0,
+    timeout_sec: float | None = None,
 ) -> tuple[dict[str, object], bytes]:
     host, port = _parse_remote_endpoint(endpoint)
+    timeout_sec = _remote_gateway_timeout_sec() if timeout_sec is None else float(timeout_sec)
     if token is not None:
         header = dict(header)
         header["token"] = token
     try:
-        with socket.create_connection((host, port), timeout=timeout_sec) as sock:
-            _send_remote_frame(sock, header, payload)
-            response, response_payload = _recv_remote_frame(sock)
+        sock = socket.create_connection((host, port), timeout=timeout_sec)
     except OSError as error:
         raise RuntimeError(
             "failed to connect remote gateway "
+            f"endpoint=[{endpoint}] host=[{host}] port=[{port}] timeout_sec=[{timeout_sec}] "
+            f"error=[{error}]"
+        ) from error
+    try:
+        with sock:
+            _send_remote_frame(sock, header, payload)
+            response, response_payload = _recv_remote_frame(sock)
+    except TimeoutError as error:
+        raise RuntimeError(
+            "remote gateway request timed out "
+            f"endpoint=[{endpoint}] host=[{host}] port=[{port}] timeout_sec=[{timeout_sec}] "
+            f"kind=[{header.get('kind')}]"
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            "remote gateway request failed "
             f"endpoint=[{endpoint}] host=[{host}] port=[{port}] error=[{error}]"
         ) from error
     if response.get("status") != "ok":
