@@ -140,7 +140,16 @@ impl Engine for BarGeneratorEngine {
         Arc::clone(&self.output_schema)
     }
 
-    fn on_data(&mut self, _table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        if table.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "input batch schema does not match engine input schema engine=[{}]",
+                    self.name
+                ),
+            });
+        }
+
         Ok(vec![])
     }
 
@@ -169,8 +178,10 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
             reason: "regular sessions must not be empty".to_string(),
         });
     }
+    validate_session_windows("regular", &spec.sessions.regular)?;
+    validate_session_windows("auction", &spec.sessions.auction)?;
 
-    validate_utf8_column(schema, &spec.columns.instrument, "instrument")?;
+    validate_instrument_column(schema, &spec.columns.instrument)?;
     validate_dt_column(schema, &spec.columns.dt)?;
     validate_float64_column(schema, &spec.columns.price, "price")?;
     validate_float64_column(schema, &spec.columns.volume, "volume")?;
@@ -197,6 +208,36 @@ fn validate_spec(schema: &Schema, spec: &BarGeneratorSpec) -> Result<()> {
 
     if let Some(column) = &spec.columns.limit_down {
         validate_float64_column(schema, column, "limit_down")?;
+    }
+
+    Ok(())
+}
+
+fn validate_session_windows(kind: &str, windows: &[SessionWindow]) -> Result<()> {
+    for (index, window) in windows.iter().enumerate() {
+        if window.start_seconds >= 86_400 || window.end_seconds > 86_400 {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    concat!(
+                        "session window must be inside trading day kind=[{}] index=[{}] ",
+                        "start_seconds=[{}] end_seconds=[{}]"
+                    ),
+                    kind, index, window.start_seconds, window.end_seconds
+                ),
+            });
+        }
+
+        if window.start_seconds >= window.end_seconds {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    concat!(
+                        "session window start must be before end kind=[{}] index=[{}] ",
+                        "start_seconds=[{}] end_seconds=[{}]"
+                    ),
+                    kind, index, window.start_seconds, window.end_seconds
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -231,6 +272,28 @@ fn build_output_schema(schema: &Schema, spec: &BarGeneratorSpec) -> Result<Schem
         Arc::new(Field::new("start_dt", timestamp_type.clone(), false)),
         Arc::new(Field::new("close_dt", timestamp_type, false)),
     ])))
+}
+
+fn validate_instrument_column(schema: &Schema, column: &str) -> Result<()> {
+    let field = schema
+        .field_with_name(column)
+        .map_err(|_| ZippyError::SchemaMismatch {
+            reason: format!("missing utf8 instrument field field=[{}]", column),
+        })?;
+
+    if field.data_type() != &DataType::Utf8 {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("instrument field must be utf8 field=[{}]", column),
+        });
+    }
+
+    if field.is_nullable() {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("instrument field must be non-nullable field=[{}]", column),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_utf8_column(schema: &Schema, column: &str, role: &str) -> Result<()> {
