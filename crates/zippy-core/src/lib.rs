@@ -1,4 +1,3 @@
-pub mod bus_frame;
 pub mod bus_protocol;
 pub mod config;
 pub mod control_transport;
@@ -18,21 +17,15 @@ pub mod table;
 pub mod types;
 pub mod version;
 
-pub use bus_frame::{
-    encode_bus_frame, encode_bus_frame_with_timing, parse_bus_frame, patch_bus_frame_publish_done,
-    BusFrameKind, BusFrameTiming, ParsedBusFrame, BUS_FRAME_MAGIC, BUS_FRAME_VERSION,
-    FLAG_HAS_INSTRUMENT_DIRECTORY, FLAG_HAS_TIMING_METADATA,
-};
 pub use bus_protocol::{
-    AttachStreamRequest, ControlEnvelopeRequest, ControlEnvelopeResponse, ControlRequest,
-    ControlResponse, DetachReaderRequest, DetachWriterRequest, DropTableRequest, DropTableResult,
-    GetConfigRequest, GetSegmentDescriptorRequest, GetStreamRequest, GetStreamResponse,
-    HeartbeatRequest, ListStreamsRequest, ListStreamsResponse, PublishPersistedFileRequest,
-    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
+    ControlEnvelopeRequest, ControlEnvelopeResponse, ControlRequest, ControlResponse,
+    DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
+    GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
+    PublishPersistedFileRequest, PublishSegmentDescriptorRequest, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
     ReplacePersistedFilesRequest, ResourceEvent, StreamInfo, UnregisterProcessRequest,
     UnregisterSourceRequest, UpdateRecordStatusRequest, WatchRequest, WatchResource,
-    WriterDescriptor, BUS_LAYOUT_VERSION, CONTROL_PROTOCOL_VERSION,
+    CONTROL_PROTOCOL_VERSION,
 };
 pub use config::{
     default_config_path, ZippyConfig, ZippyGatewayConfig, ZippyLogConfig, ZippyTableConfig,
@@ -49,7 +42,7 @@ pub use endpoint::{
 pub use engine::{Engine, SchemaRef};
 pub use error::{Result, ZippyError};
 pub use logging::{current_log_snapshot, setup_log, LogConfig, LogSnapshot};
-pub use master_client::{MasterClient, Reader, TimedReadBatch, Writer};
+pub use master_client::MasterClient;
 pub use metrics::{EngineMetrics, EngineMetricsDelta, EngineMetricsSnapshot};
 pub use publisher::Publisher;
 pub use queue::BoundedQueue;

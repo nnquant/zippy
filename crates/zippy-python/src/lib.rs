@@ -2,7 +2,7 @@
 
 mod native_source_bridge;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::hint::spin_loop;
@@ -20,27 +20,27 @@ use arrow::record_batch::RecordBatch;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyTuple};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use zippy_core::{
-    current_log_snapshot, python_dev_version, resolve_control_endpoint, send_control_line_request,
-    setup_log as setup_core_log, spawn_engine_with_publisher, ControlEndpoint, ControlRequest,
-    DropTableResult, Engine, EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus,
-    LateDataPolicy, LogConfig, MasterClient as CoreMasterClient, OverflowPolicy,
-    Publisher as CorePublisher, Reader as CoreBusReader, SegmentTableView, Source, SourceEvent,
-    SourceHandle, SourceMode as RustSourceMode, SourceSink, StreamHello, StreamInfo,
-    Writer as CoreBusWriter, ZippyConfig, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
+    current_log_snapshot, python_dev_version, resolve_control_endpoint,
+    setup_log as setup_core_log, spawn_engine_with_publisher, ControlEndpoint, DropTableResult,
+    Engine, EngineConfig, EngineHandle, EngineMetricsSnapshot, EngineStatus, LateDataPolicy,
+    LogConfig, MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
+    SegmentTableView, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode, SourceSink,
+    StreamHello, StreamInfo, ZippyConfig, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
 };
 use zippy_engines::{
     CrossSectionalEngine as RustCrossSectionalEngine,
     KeyValueTableMaterializer as RustKeyValueTableMaterializer,
     ReactiveLatestEngine as RustReactiveLatestEngine,
     ReactiveStateEngine as RustReactiveStateEngine,
+    ReactiveStateFailurePolicy as RustReactiveStateFailurePolicy,
     StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
     StreamTableMaterializer as RustStreamTableMaterializer, StreamTablePersistConfig,
     StreamTablePersistPartitionSpec,
     StreamTablePersistPublisher as RustStreamTablePersistPublisher,
     StreamTableRetentionGuard as RustStreamTableRetentionGuard,
-    TimeSeriesEngine as RustTimeSeriesEngine,
+    TimeSeriesEngine as RustTimeSeriesEngine, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
 use zippy_gateway::{GatewayServer as RustGatewayServer, GatewayServerConfig};
 use zippy_io::{
@@ -161,53 +161,6 @@ fn serde_json_option_to_py(
         Some(value) => serde_json_value_to_py(py, value),
         None => Ok(py.None()),
     }
-}
-
-fn send_master_control_request(
-    py: Python<'_>,
-    control_endpoint: &str,
-    request: &Bound<'_, PyAny>,
-    expected_response_key: &str,
-) -> PyResult<()> {
-    let payload = python_json_dumps(py, request)?;
-    let endpoint = resolve_control_endpoint_value(control_endpoint)?;
-    let request = serde_json::from_str::<ControlRequest>(&payload)
-        .map_err(|error| py_runtime_error(error.to_string()))?;
-    let response = py
-        .allow_threads(|| send_control_line_request(&endpoint, request))
-        .map_err(|error| py_runtime_error(error.to_string()))?;
-    let response_text =
-        serde_json::to_string(&response).map_err(|error| py_runtime_error(error.to_string()))?;
-    let response = python_json_loads(py, &response_text)?;
-    let response = response
-        .downcast::<PyDict>()
-        .map_err(|_| py_runtime_error("invalid control response"))?;
-
-    if let Some((key, value)) = response.iter().next() {
-        let key = key
-            .extract::<String>()
-            .map_err(|error| py_value_error(error.to_string()))?;
-        if key == "Error" {
-            let error = value
-                .downcast::<PyDict>()
-                .map_err(|_| py_runtime_error("invalid control error response"))?;
-            let reason = error
-                .get_item("reason")?
-                .ok_or_else(|| py_runtime_error("control error response is missing reason"))?
-                .extract::<String>()
-                .map_err(|error| py_value_error(error.to_string()))?;
-            return Err(py_runtime_error(reason));
-        }
-
-        if key == expected_response_key {
-            return Ok(());
-        }
-    }
-
-    Err(py_runtime_error(format!(
-        "unexpected control response expected_key=[{}]",
-        expected_response_key
-    )))
 }
 
 type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
@@ -456,35 +409,47 @@ impl Source for PythonSourceBridge {
         let schema = Arc::clone(&self.output_schema);
         let segment_schema =
             compile_segment_schema_from_arrow(schema.as_ref()).map_err(map_python_source_error)?;
-        let runtime_handle = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
-            let owner_bound = owner.bind(py);
-            if owner_bound.hasattr("_zippy_start_native")? {
-                let capsule = create_native_source_sink_capsule(
-                    py,
-                    Arc::clone(&sink),
-                    Arc::clone(&schema),
-                    segment_schema,
-                )?;
-                owner_bound
-                    .call_method1("_zippy_start_native", (capsule,))
-                    .map(|value| value.unbind())
-            } else {
-                let sink_proxy = Py::new(py, SourceSinkProxy { sink, schema })?;
-                owner_bound
-                    .call_method1("_zippy_start", (sink_proxy,))
-                    .map(|value| value.unbind())
-            }
-        })
-        .map_err(map_python_source_error)?;
+        let (runtime_handle, native_capsule_keepalive) =
+            Python::with_gil(|py| -> PyResult<(Py<PyAny>, Option<Py<PyAny>>)> {
+                let owner_bound = owner.bind(py);
+                if owner_bound.hasattr("_zippy_start_native")? {
+                    let capsule = create_native_source_sink_capsule(
+                        py,
+                        Arc::clone(&sink),
+                        Arc::clone(&schema),
+                        segment_schema,
+                    )?;
+                    let capsule_keepalive = capsule.clone().into_any().unbind();
+                    let runtime_handle = owner_bound
+                        .call_method1("_zippy_start_native", (capsule,))
+                        .map(|value| value.unbind())?;
+                    Ok((runtime_handle, Some(capsule_keepalive)))
+                } else {
+                    let sink_proxy = Py::new(py, SourceSinkProxy { sink, schema })?;
+                    let runtime_handle = owner_bound
+                        .call_method1("_zippy_start", (sink_proxy,))
+                        .map(|value| value.unbind())?;
+                    Ok((runtime_handle, None))
+                }
+            })
+            .map_err(map_python_source_error)?;
 
         let join_handle_object = Python::with_gil(|py| runtime_handle.clone_ref(py));
+        let join_capsule_keepalive = Python::with_gil(|py| {
+            native_capsule_keepalive
+                .as_ref()
+                .map(|capsule| capsule.clone_ref(py))
+        });
         let join_handle = thread::spawn(move || -> zippy_core::Result<()> {
+            let _capsule_keepalive = join_capsule_keepalive;
             Python::with_gil(|py| join_handle_object.bind(py).call_method0("join").map(|_| ()))
                 .map_err(map_python_source_error)
         });
 
         let stop_handle_object = Python::with_gil(|py| runtime_handle.clone_ref(py));
+        let stop_capsule_keepalive = native_capsule_keepalive;
         let stop_fn: Box<dyn FnMut() -> zippy_core::Result<()> + Send> = Box::new(move || {
+            let _capsule_keepalive = &stop_capsule_keepalive;
             Python::with_gil(|py| stop_handle_object.bind(py).call_method0("stop").map(|_| ()))
                 .map_err(map_python_source_error)
         });
@@ -1037,7 +1002,7 @@ fn string_map_from_json_value(
 
 #[pyclass]
 struct TsEmaSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     span: usize,
     output: String,
@@ -1049,7 +1014,7 @@ impl TsEmaSpec {
     #[pyo3(signature = (id_column, value_column, span, output))]
     fn new(id_column: String, value_column: String, span: usize, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             span,
             output,
@@ -1059,7 +1024,7 @@ impl TsEmaSpec {
 
 #[pyclass]
 struct TsReturnSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     period: usize,
     output: String,
@@ -1071,7 +1036,7 @@ impl TsReturnSpec {
     #[pyo3(signature = (id_column, value_column, period, output))]
     fn new(id_column: String, value_column: String, period: usize, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             period,
             output,
@@ -1081,7 +1046,7 @@ impl TsReturnSpec {
 
 #[pyclass]
 struct TsMeanSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     window: usize,
     output: String,
@@ -1093,7 +1058,7 @@ impl TsMeanSpec {
     #[pyo3(signature = (id_column, value_column, window, output))]
     fn new(id_column: String, value_column: String, window: usize, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             window,
             output,
@@ -1103,7 +1068,7 @@ impl TsMeanSpec {
 
 #[pyclass]
 struct TsStdSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     window: usize,
     output: String,
@@ -1115,7 +1080,7 @@ impl TsStdSpec {
     #[pyo3(signature = (id_column, value_column, window, output))]
     fn new(id_column: String, value_column: String, window: usize, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             window,
             output,
@@ -1125,7 +1090,7 @@ impl TsStdSpec {
 
 #[pyclass]
 struct TsDelaySpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     period: usize,
     output: String,
@@ -1137,7 +1102,7 @@ impl TsDelaySpec {
     #[pyo3(signature = (id_column, value_column, period, output))]
     fn new(id_column: String, value_column: String, period: usize, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             period,
             output,
@@ -1147,7 +1112,7 @@ impl TsDelaySpec {
 
 #[pyclass]
 struct TsDiffSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     period: usize,
     output: String,
@@ -1159,7 +1124,7 @@ impl TsDiffSpec {
     #[pyo3(signature = (id_column, value_column, period, output))]
     fn new(id_column: String, value_column: String, period: usize, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             period,
             output,
@@ -1169,7 +1134,7 @@ impl TsDiffSpec {
 
 #[pyclass]
 struct AbsSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     output: String,
 }
@@ -1180,7 +1145,7 @@ impl AbsSpec {
     #[pyo3(signature = (id_column, value_column, output))]
     fn new(id_column: String, value_column: String, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             output,
         }
@@ -1189,7 +1154,7 @@ impl AbsSpec {
 
 #[pyclass]
 struct LogSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     output: String,
 }
@@ -1200,7 +1165,7 @@ impl LogSpec {
     #[pyo3(signature = (id_column, value_column, output))]
     fn new(id_column: String, value_column: String, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             output,
         }
@@ -1209,7 +1174,7 @@ impl LogSpec {
 
 #[pyclass]
 struct ClipSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     min: f64,
     max: f64,
@@ -1222,7 +1187,7 @@ impl ClipSpec {
     #[pyo3(signature = (id_column, value_column, min, max, output))]
     fn new(id_column: String, value_column: String, min: f64, max: f64, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             min,
             max,
@@ -1233,7 +1198,7 @@ impl ClipSpec {
 
 #[pyclass]
 struct CastSpec {
-    _id_column: String,
+    id_column: String,
     value_column: String,
     dtype: String,
     output: String,
@@ -1245,7 +1210,7 @@ impl CastSpec {
     #[pyo3(signature = (id_column, value_column, dtype, output))]
     fn new(id_column: String, value_column: String, dtype: String, output: String) -> Self {
         Self {
-            _id_column: id_column,
+            id_column,
             value_column,
             dtype,
             output,
@@ -1737,21 +1702,18 @@ impl MasterClient {
         output_stream: String,
         config: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let process_id = self.require_process_id()?;
-        let request = PyDict::new_bound(py);
-        let payload = PyDict::new_bound(py);
-        payload.set_item("source_name", source_name)?;
-        payload.set_item("source_type", source_type)?;
-        payload.set_item("process_id", process_id)?;
-        payload.set_item("output_stream", output_stream)?;
-        payload.set_item("config", config)?;
-        request.set_item("RegisterSource", payload)?;
-        send_master_control_request(
-            py,
-            &self.control_endpoint,
-            request.as_any(),
-            "SourceRegistered",
-        )
+        let config_text = python_json_dumps(py, config)?;
+        let config = serde_json::from_str::<serde_json::Value>(&config_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client.lock().unwrap().register_source(
+                &source_name,
+                &source_type,
+                &output_stream,
+                config,
+            )
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
     }
 
     fn unregister_source(&self, py: Python<'_>, source_name: String) -> PyResult<()> {
@@ -1771,27 +1733,20 @@ impl MasterClient {
         sink_names: Vec<String>,
         config: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let process_id = self.require_process_id()?;
-        let request = PyDict::new_bound(py);
-        let payload = PyDict::new_bound(py);
-        let sink_name_values = PyList::empty_bound(py);
-        for sink_name in sink_names {
-            sink_name_values.append(sink_name)?;
-        }
-        payload.set_item("engine_name", engine_name)?;
-        payload.set_item("engine_type", engine_type)?;
-        payload.set_item("process_id", process_id)?;
-        payload.set_item("input_stream", input_stream)?;
-        payload.set_item("output_stream", output_stream)?;
-        payload.set_item("sink_names", sink_name_values)?;
-        payload.set_item("config", config)?;
-        request.set_item("RegisterEngine", payload)?;
-        send_master_control_request(
-            py,
-            &self.control_endpoint,
-            request.as_any(),
-            "EngineRegistered",
-        )
+        let config_text = python_json_dumps(py, config)?;
+        let config = serde_json::from_str::<serde_json::Value>(&config_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client.lock().unwrap().register_engine(
+                &engine_name,
+                &engine_type,
+                &input_stream,
+                &output_stream,
+                sink_names,
+                config,
+            )
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
     }
 
     #[pyo3(signature = (sink_name, sink_type, input_stream, config))]
@@ -1803,21 +1758,16 @@ impl MasterClient {
         input_stream: String,
         config: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let process_id = self.require_process_id()?;
-        let request = PyDict::new_bound(py);
-        let payload = PyDict::new_bound(py);
-        payload.set_item("sink_name", sink_name)?;
-        payload.set_item("sink_type", sink_type)?;
-        payload.set_item("process_id", process_id)?;
-        payload.set_item("input_stream", input_stream)?;
-        payload.set_item("config", config)?;
-        request.set_item("RegisterSink", payload)?;
-        send_master_control_request(
-            py,
-            &self.control_endpoint,
-            request.as_any(),
-            "SinkRegistered",
-        )
+        let config_text = python_json_dumps(py, config)?;
+        let config = serde_json::from_str::<serde_json::Value>(&config_text)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .register_sink(&sink_name, &sink_type, &input_stream, config)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
     }
 
     #[pyo3(signature = (kind, name, status, metrics=None))]
@@ -1829,22 +1779,23 @@ impl MasterClient {
         status: String,
         metrics: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let request = PyDict::new_bound(py);
-        let payload = PyDict::new_bound(py);
-        payload.set_item("kind", kind)?;
-        payload.set_item("name", name)?;
-        payload.set_item("status", status)?;
-        match metrics {
-            Some(metrics) => payload.set_item("metrics", metrics)?,
-            None => payload.set_item("metrics", py.None())?,
-        }
-        request.set_item("UpdateStatus", payload)?;
-        send_master_control_request(
-            py,
-            &self.control_endpoint,
-            request.as_any(),
-            "StatusUpdated",
-        )
+        let metrics = match metrics {
+            Some(metrics) => {
+                let metrics_text = python_json_dumps(py, metrics)?;
+                Some(
+                    serde_json::from_str::<serde_json::Value>(&metrics_text)
+                        .map_err(|error| py_value_error(error.to_string()))?,
+                )
+            }
+            None => None,
+        };
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .update_status(&kind, &name, &status, metrics)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
     }
 
     fn publish_segment_descriptor(
@@ -1968,50 +1919,6 @@ impl MasterClient {
         Ok(python_json_loads(py, &descriptor_text)?.into_py(py))
     }
 
-    fn write_to(&self, stream_name: String) -> PyResult<BusWriter> {
-        let schema = self
-            .schemas
-            .lock()
-            .unwrap()
-            .get(&stream_name)
-            .cloned()
-            .ok_or_else(|| py_runtime_error("stream schema is not registered in this client"))?;
-        let writer = self
-            .client
-            .lock()
-            .unwrap()
-            .write_to(&stream_name)
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        Ok(BusWriter {
-            writer: Arc::new(Mutex::new(Some(writer))),
-            schema,
-        })
-    }
-
-    #[pyo3(signature = (stream_name, instrument_ids=None, xfast=false))]
-    fn read_from(
-        &self,
-        stream_name: String,
-        instrument_ids: Option<&Bound<'_, PyAny>>,
-        xfast: bool,
-    ) -> PyResult<BusReader> {
-        let instrument_ids = parse_instrument_ids(instrument_ids)?;
-        let reader = attach_bus_reader_with(
-            &self.client,
-            &stream_name,
-            instrument_ids,
-            xfast,
-            |client, stream_name, xfast| client.read_from_with_xfast(stream_name, xfast),
-            |client, stream_name, instrument_ids, xfast| {
-                client.read_from_filtered_with_xfast(stream_name, instrument_ids, xfast)
-            },
-        )
-        .map_err(|error| py_runtime_error(error.to_string()))?;
-        Ok(BusReader {
-            reader: Arc::new(Mutex::new(Some(reader))),
-        })
-    }
-
     fn list_streams(&self, py: Python<'_>) -> PyResult<PyObject> {
         let streams = self
             .client
@@ -2049,7 +1956,9 @@ impl MasterClient {
             )?;
             dict.set_item("buffer_size", stream.buffer_size)?;
             dict.set_item("frame_size", stream.frame_size)?;
+            dict.set_item("write_seq", stream.write_seq)?;
             dict.set_item("writer_process_id", stream.writer_process_id)?;
+            dict.set_item("writer_epoch", stream.writer_epoch)?;
             dict.set_item("reader_count", stream.reader_count)?;
             dict.set_item("status", stream.status)?;
             records.append(dict)?;
@@ -2092,7 +2001,9 @@ impl MasterClient {
         )?;
         dict.set_item("buffer_size", stream.buffer_size)?;
         dict.set_item("frame_size", stream.frame_size)?;
+        dict.set_item("write_seq", stream.write_seq)?;
         dict.set_item("writer_process_id", stream.writer_process_id)?;
+        dict.set_item("writer_epoch", stream.writer_epoch)?;
         dict.set_item("reader_count", stream.reader_count)?;
         dict.set_item("status", stream.status)?;
         Ok(dict.into_py(py))
@@ -2236,6 +2147,11 @@ fn stream_info_to_pydict<'py>(
         serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
     )?;
     dict.set_item(
+        "active_segment_preflight",
+        serde_json_option_to_py(py, stream.active_segment_preflight.as_ref())?,
+    )?;
+    dict.set_item("segment_row_capacity", stream.segment_row_capacity)?;
+    dict.set_item(
         "sealed_segments",
         serde_json_value_to_py(py, &stream.sealed_segments.clone().into())?,
     )?;
@@ -2253,7 +2169,9 @@ fn stream_info_to_pydict<'py>(
     )?;
     dict.set_item("buffer_size", stream.buffer_size)?;
     dict.set_item("frame_size", stream.frame_size)?;
+    dict.set_item("write_seq", stream.write_seq)?;
     dict.set_item("writer_process_id", stream.writer_process_id.clone())?;
+    dict.set_item("writer_epoch", stream.writer_epoch)?;
     dict.set_item("reader_count", stream.reader_count)?;
     dict.set_item("status", &stream.status)?;
     Ok(dict)
@@ -2279,6 +2197,33 @@ struct Query {
     master: SharedMasterClient,
     schema: Arc<Schema>,
     segment_schema: CompiledSchema,
+    snapshot_leases: Arc<Mutex<QuerySnapshotLeases>>,
+}
+
+const MAX_QUERY_SNAPSHOT_LEASES: usize = 16;
+static NEXT_QUERY_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct QuerySnapshotLeases {
+    order: VecDeque<String>,
+    leases: HashMap<String, SegmentReaderLeaseSet>,
+}
+
+impl QuerySnapshotLeases {
+    fn insert(&mut self, snapshot_id: String, leases: SegmentReaderLeaseSet) {
+        if self.leases.contains_key(&snapshot_id) {
+            self.order.retain(|existing| existing != &snapshot_id);
+        }
+        self.order.push_back(snapshot_id.clone());
+        self.leases.insert(snapshot_id, leases);
+
+        while self.order.len() > MAX_QUERY_SNAPSHOT_LEASES {
+            let Some(oldest_snapshot_id) = self.order.pop_front() else {
+                break;
+            };
+            self.leases.remove(&oldest_snapshot_id);
+        }
+    }
 }
 
 struct SegmentReaderLeaseGuard {
@@ -2355,20 +2300,6 @@ impl SegmentReaderLeaseSet {
         )?);
         Ok(Self { _leases: leases })
     }
-
-    fn acquire_for_active(
-        master: SharedMasterClient,
-        source: &str,
-        active_descriptor: &serde_json::Value,
-    ) -> zippy_core::Result<Self> {
-        Ok(Self {
-            _leases: vec![SegmentReaderLeaseGuard::acquire(
-                master,
-                source,
-                active_descriptor,
-            )?],
-        })
-    }
 }
 
 #[pymethods]
@@ -2397,6 +2328,7 @@ impl Query {
             master: shared_master,
             schema,
             segment_schema,
+            snapshot_leases: Arc::new(Mutex::new(QuerySnapshotLeases::default())),
         })
     }
 
@@ -2488,29 +2420,60 @@ impl Query {
     }
 
     fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let stream = py
-            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        ensure_stream_live_readable(&stream)?;
-        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
-            return Err(py_runtime_error(format!(
-                "segment descriptor is not published source=[{}]",
-                self.source
-            )));
-        };
-        let segment_schema = self.segment_schema.clone();
-        let master = Arc::clone(&self.master);
-        let source = self.source.clone();
-        let active_segment_control = py
-            .allow_threads(|| {
-                let _leases =
-                    SegmentReaderLeaseSet::acquire_for_active(master, &source, &descriptor)?;
-                active_segment_control_snapshot(&descriptor, segment_schema)
-            })
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        let snapshot = query_snapshot_value(&stream, descriptor, active_segment_control)
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        serde_json_value_to_py(py, &snapshot)
+        for attempt in 0..2 {
+            let stream = py
+                .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+            ensure_stream_live_readable(&stream)?;
+            let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+                return Err(py_runtime_error(format!(
+                    "segment descriptor is not published source=[{}]",
+                    self.source
+                )));
+            };
+            let segment_schema = self.segment_schema.clone();
+            let master = Arc::clone(&self.master);
+            let source = self.source.clone();
+            let snapshot_state = py.allow_threads(|| {
+                let leases = SegmentReaderLeaseSet::acquire_for_descriptors(
+                    master,
+                    &source,
+                    &descriptor,
+                    &stream.sealed_segments,
+                )?;
+                let active_segment_control =
+                    active_segment_control_snapshot(&descriptor, segment_schema)?;
+                Ok::<_, ZippyError>((leases, active_segment_control))
+            });
+            match snapshot_state {
+                Ok((leases, active_segment_control)) => {
+                    let mut snapshot =
+                        query_snapshot_value(&stream, descriptor, active_segment_control)
+                            .map_err(|error| py_runtime_error(error.to_string()))?;
+                    let snapshot_id = format!(
+                        "{}-{}",
+                        self.source,
+                        NEXT_QUERY_SNAPSHOT_ID.fetch_add(1, Ordering::SeqCst)
+                    );
+                    if let Some(object) = snapshot.as_object_mut() {
+                        object.insert(
+                            "snapshot_id".to_string(),
+                            serde_json::Value::String(snapshot_id.clone()),
+                        );
+                    }
+                    self.snapshot_leases
+                        .lock()
+                        .unwrap()
+                        .insert(snapshot_id, leases);
+                    return serde_json_value_to_py(py, &snapshot);
+                }
+                Err(error) if attempt == 0 && is_segment_reader_lease_target_not_found(&error) => {
+                    continue;
+                }
+                Err(error) => return Err(py_runtime_error(error.to_string())),
+            }
+        }
+        Err(py_runtime_error("snapshot retry exhausted"))
     }
 
     fn scan_live(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -2912,13 +2875,13 @@ struct DescriptorUpdate {
 
 #[derive(Debug, Default)]
 struct DescriptorUpdateSlot {
-    update: Mutex<Option<DescriptorUpdate>>,
+    updates: Mutex<VecDeque<DescriptorUpdate>>,
     changed: Condvar,
 }
 
 impl DescriptorUpdateSlot {
     fn set(&self, update: DescriptorUpdate) {
-        *self.update.lock().unwrap() = Some(update);
+        self.updates.lock().unwrap().push_back(update);
         self.changed.notify_all();
     }
 
@@ -2935,7 +2898,7 @@ impl DescriptorUpdateSlot {
             return None;
         }
 
-        let mut guard = self.update.lock().unwrap();
+        let mut guard = self.updates.lock().unwrap();
         Self::take_distinct_update(&mut guard, current_descriptor_text)
     }
 
@@ -2945,7 +2908,7 @@ impl DescriptorUpdateSlot {
         timeout: Duration,
     ) -> Option<DescriptorUpdate> {
         let deadline = Instant::now() + timeout;
-        let mut guard = self.update.lock().unwrap();
+        let mut guard = self.updates.lock().unwrap();
         loop {
             if let Some(update) = Self::take_distinct_update(&mut guard, current_descriptor_text) {
                 return Some(update);
@@ -2965,13 +2928,20 @@ impl DescriptorUpdateSlot {
     }
 
     fn take_distinct_update(
-        guard: &mut Option<DescriptorUpdate>,
+        guard: &mut VecDeque<DescriptorUpdate>,
         current_descriptor_text: &str,
     ) -> Option<DescriptorUpdate> {
-        match guard.take() {
-            Some(update) if update.text != current_descriptor_text => Some(update),
-            _ => None,
+        while let Some(update) = guard.pop_front() {
+            if update.text != current_descriptor_text {
+                return Some(update);
+            }
         }
+        None
+    }
+
+    #[cfg(test)]
+    fn pending_update_count(&self) -> usize {
+        self.updates.lock().unwrap().len()
     }
 }
 
@@ -3493,7 +3463,7 @@ impl StreamSubscriber {
         Ok(())
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let join_handle = self.join_handle.lock().unwrap().take();
         if let Some(join_handle) = join_handle {
@@ -3861,8 +3831,13 @@ struct SegmentTestWriter {
 #[pymethods]
 impl SegmentTestWriter {
     #[new]
-    #[pyo3(signature = (stream_name, schema, row_capacity=32))]
-    fn new(stream_name: String, schema: &Bound<'_, PyAny>, row_capacity: usize) -> PyResult<Self> {
+    #[pyo3(signature = (stream_name, schema, row_capacity=32, writer_epoch=None))]
+    fn new(
+        stream_name: String,
+        schema: &Bound<'_, PyAny>,
+        row_capacity: usize,
+        writer_epoch: Option<u64>,
+    ) -> PyResult<Self> {
         if row_capacity == 0 {
             return Err(py_value_error("row_capacity must be greater than zero"));
         }
@@ -3874,9 +3849,16 @@ impl SegmentTestWriter {
             default_row_capacity: row_capacity,
         })
         .map_err(|error| py_runtime_error(error.to_string()))?;
-        let partition = store
-            .open_partition_with_schema(&stream_name, "all", segment_schema)
-            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let partition = match writer_epoch {
+            Some(writer_epoch) => store.open_partition_with_schema_and_writer_epoch(
+                &stream_name,
+                "all",
+                segment_schema,
+                writer_epoch,
+            ),
+            None => store.open_partition_with_schema(&stream_name, "all", segment_schema),
+        }
+        .map_err(|error| py_runtime_error(error.to_string()))?;
 
         Ok(Self {
             _store: store,
@@ -3910,91 +3892,6 @@ impl SegmentTestWriter {
             .writer()
             .rollover_without_persistence()
             .map(|_| ())
-            .map_err(|error| py_runtime_error(error.to_string()))
-    }
-}
-
-#[pyclass]
-struct BusWriter {
-    writer: Arc<Mutex<Option<CoreBusWriter>>>,
-    schema: Arc<Schema>,
-}
-
-#[pymethods]
-impl BusWriter {
-    fn write(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = value_to_record_batches(py, value, self.schema.as_ref())?;
-        let mut guard = self.writer.lock().unwrap();
-        let writer = guard
-            .as_mut()
-            .ok_or_else(|| py_runtime_error("bus writer is closed"))?;
-        for batch in batches {
-            writer
-                .write(batch)
-                .map_err(|error| py_runtime_error(error.to_string()))?;
-        }
-        Ok(())
-    }
-
-    fn flush(&self) -> PyResult<()> {
-        let mut guard = self.writer.lock().unwrap();
-        let writer = guard
-            .as_mut()
-            .ok_or_else(|| py_runtime_error("bus writer is closed"))?;
-        writer
-            .flush()
-            .map_err(|error| py_runtime_error(error.to_string()))
-    }
-
-    fn close(&self) -> PyResult<()> {
-        let mut guard = self.writer.lock().unwrap();
-        let mut writer = guard
-            .take()
-            .ok_or_else(|| py_runtime_error("bus writer is closed"))?;
-        writer
-            .close()
-            .map_err(|error| py_runtime_error(error.to_string()))
-    }
-}
-
-#[pyclass]
-struct BusReader {
-    reader: Arc<Mutex<Option<CoreBusReader>>>,
-}
-
-#[pymethods]
-impl BusReader {
-    #[pyo3(signature = (timeout_ms=1000))]
-    fn read(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<PyObject> {
-        let mut guard = self.reader.lock().unwrap();
-        let reader = guard
-            .as_mut()
-            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
-        let batch = reader
-            .read(Some(timeout_ms))
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        batch
-            .to_pyarrow(py)
-            .map_err(|error| py_value_error(error.to_string()))
-    }
-
-    fn seek_latest(&self) -> PyResult<()> {
-        let mut guard = self.reader.lock().unwrap();
-        let reader = guard
-            .as_mut()
-            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
-        reader
-            .seek_latest()
-            .map_err(|error| py_runtime_error(error.to_string()))
-    }
-
-    fn close(&self) -> PyResult<()> {
-        let mut guard = self.reader.lock().unwrap();
-        let mut reader = guard
-            .take()
-            .ok_or_else(|| py_runtime_error("bus reader is closed"))?;
-        reader
-            .close()
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 }
@@ -4128,6 +4025,12 @@ fn descriptor_segment_identity(descriptor: &serde_json::Value) -> zippy_core::Re
     Ok((segment_id, generation))
 }
 
+fn is_segment_reader_lease_target_not_found(error: &ZippyError) -> bool {
+    error
+        .to_string()
+        .contains("segment reader lease target not found")
+}
+
 fn build_active_segment_reader(
     descriptor: &serde_json::Value,
     segment_schema: &CompiledSchema,
@@ -4177,6 +4080,7 @@ struct ReactiveStateEngine {
     name: String,
     id_column: String,
     id_filter: Option<Vec<String>>,
+    state_failure_policy: String,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
@@ -4308,7 +4212,7 @@ struct KeyValueTableMaterializer {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4317,6 +4221,7 @@ impl ReactiveStateEngine {
         factors: Vec<Py<PyAny>>,
         target: &Bound<'_, PyAny>,
         id_filter: Option<&Bound<'_, PyAny>>,
+        state_failure_policy: &str,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
@@ -4330,13 +4235,15 @@ impl ReactiveStateEngine {
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let id_filter = parse_id_filter(id_filter)?;
+        let state_failure_policy_enum = parse_reactive_state_failure_policy(state_failure_policy)?;
         let factor_specs = build_reactive_specs(py, &schema, &id_column, factors)?;
-        let engine = RustReactiveStateEngine::new_with_id_filter(
+        let engine = RustReactiveStateEngine::new_with_id_filter_and_state_failure_policy(
             &name,
             Arc::clone(&schema),
             factor_specs,
             &id_column,
             id_filter.clone(),
+            state_failure_policy_enum,
         )
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
@@ -4372,6 +4279,7 @@ impl ReactiveStateEngine {
             name,
             id_column,
             id_filter,
+            state_failure_policy: state_failure_policy_enum.as_str().to_string(),
             input_schema: schema,
             output_schema,
             target,
@@ -4456,6 +4364,7 @@ impl ReactiveStateEngine {
         )?;
         dict.set_item("id_column", &self.id_column)?;
         dict.set_item("id_filter", self.id_filter.clone())?;
+        dict.set_item("state_failure_policy", &self.state_failure_policy)?;
         Ok(dict.into_any().unbind())
     }
 
@@ -4466,7 +4375,7 @@ impl ReactiveStateEngine {
         result
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
         stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
@@ -4659,7 +4568,7 @@ impl ReactiveLatestEngine {
         result
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
         stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
@@ -4669,7 +4578,7 @@ impl ReactiveLatestEngine {
 impl StreamTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4684,6 +4593,7 @@ impl StreamTableMaterializer {
         xfast: bool,
         descriptor_publisher: Option<Py<PyAny>>,
         row_capacity: Option<usize>,
+        writer_epoch: Option<u64>,
         retention_segments: Option<usize>,
         retention_guard: Option<Py<PyAny>>,
         dt_column: Option<String>,
@@ -4697,14 +4607,13 @@ impl StreamTableMaterializer {
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
-        let mut engine = match row_capacity {
-            Some(row_capacity) => RustStreamTableMaterializer::new_with_row_capacity(
-                &name,
-                Arc::clone(&schema),
-                row_capacity,
-            ),
-            None => RustStreamTableMaterializer::new(&name, Arc::clone(&schema)),
-        }
+        let row_capacity = row_capacity.unwrap_or(DEFAULT_STREAM_TABLE_ROW_CAPACITY);
+        let mut engine = RustStreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+            &name,
+            Arc::clone(&schema),
+            row_capacity,
+            writer_epoch,
+        )
         .map_err(|error| py_value_error(error.to_string()))?;
         if let Some(retention_segments) = retention_segments {
             engine = engine.with_retention_segments(retention_segments);
@@ -4897,7 +4806,7 @@ impl StreamTableMaterializer {
         result
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
         stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
@@ -4907,7 +4816,7 @@ impl StreamTableMaterializer {
 impl KeyValueTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, retention_guard=None, replacement_retention_snapshots=None))]
+    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_guard=None, replacement_retention_snapshots=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4923,6 +4832,7 @@ impl KeyValueTableMaterializer {
         xfast: bool,
         descriptor_publisher: Option<Py<PyAny>>,
         row_capacity: Option<usize>,
+        writer_epoch: Option<u64>,
         retention_guard: Option<Py<PyAny>>,
         replacement_retention_snapshots: Option<usize>,
     ) -> PyResult<Self> {
@@ -4931,15 +4841,14 @@ impl KeyValueTableMaterializer {
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let by = parse_by_columns(by)?;
-        let mut engine = match row_capacity {
-            Some(row_capacity) => RustKeyValueTableMaterializer::new_with_row_capacity(
-                &name,
-                Arc::clone(&schema),
-                by.clone(),
-                row_capacity,
-            ),
-            None => RustKeyValueTableMaterializer::new(&name, Arc::clone(&schema), by.clone()),
-        }
+        let row_capacity = row_capacity.unwrap_or(DEFAULT_STREAM_TABLE_ROW_CAPACITY);
+        let mut engine = RustKeyValueTableMaterializer::new_with_row_capacity_and_writer_epoch(
+            &name,
+            Arc::clone(&schema),
+            by.clone(),
+            row_capacity,
+            writer_epoch,
+        )
         .map_err(|error| py_value_error(error.to_string()))?;
         if let Some(callback) = descriptor_publisher {
             if !callback.bind(py).is_callable() {
@@ -5110,7 +5019,7 @@ impl KeyValueTableMaterializer {
         result
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
         stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
@@ -5308,7 +5217,7 @@ impl TimeSeriesEngine {
         result
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
         stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
@@ -5492,7 +5401,7 @@ impl CrossSectionalEngine {
         result
     }
 
-    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
         ensure_source_stopped(py, &self._source_owner)?;
         stop_runtime_engine(py, &self.handle, &self.archive, &self.status, &self.metrics)
     }
@@ -5537,8 +5446,6 @@ fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<GatewayServer>()?;
     module.add_class::<Query>()?;
     module.add_class::<StreamSubscriber>()?;
-    module.add_class::<BusWriter>()?;
-    module.add_class::<BusReader>()?;
     module.add_class::<SegmentStreamSource>()?;
     module.add_class::<SegmentTestWriter>()?;
     module.add_class::<ReactiveStateEngine>()?;
@@ -5656,6 +5563,12 @@ fn parse_id_filter(id_filter: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<
     if values.is_empty() {
         return Err(py_value_error("id_filter must not be empty"));
     }
+    if let Some(value) = values.iter().find(|value| value.trim().is_empty()) {
+        return Err(py_value_error(format!(
+            "id_filter contains empty value value=[{}]",
+            value
+        )));
+    }
 
     Ok(Some(values))
 }
@@ -5707,25 +5620,6 @@ fn parse_instrument_ids(
         return Err(py_value_error("instrument filter contains empty value"));
     }
     Ok(Some(vec![value]))
-}
-
-fn attach_bus_reader_with<F, G>(
-    client: &SharedMasterClient,
-    stream_name: &str,
-    instrument_ids: Option<Vec<String>>,
-    xfast: bool,
-    read_from: F,
-    read_from_filtered: G,
-) -> zippy_core::Result<CoreBusReader>
-where
-    F: FnOnce(&mut CoreMasterClient, &str, bool) -> zippy_core::Result<CoreBusReader>,
-    G: FnOnce(&mut CoreMasterClient, &str, Vec<String>, bool) -> zippy_core::Result<CoreBusReader>,
-{
-    let mut guard = client.lock().unwrap();
-    match instrument_ids {
-        None => read_from(&mut guard, stream_name, xfast),
-        Some(instrument_ids) => read_from_filtered(&mut guard, stream_name, instrument_ids, xfast),
-    }
 }
 
 fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
@@ -6225,15 +6119,13 @@ fn start_runtime_engine<E: Engine>(
     downstreams: &[DownstreamLink],
     engine: &mut Option<E>,
 ) -> PyResult<(EngineHandle, Option<ArchiveHandle>)> {
-    let archive = parquet_sink
+    let mut archive = parquet_sink
         .cloned()
         .map(|config| ArchiveHandle::spawn(config, runtime_options.archive_buffer_capacity));
     let publisher = match build_publisher(targets, parquet_sink, archive.clone(), downstreams) {
         Ok(publisher) => publisher,
         Err(error) => {
-            if let Some(archive) = archive {
-                let _ = archive.close();
-            }
+            close_archive_after_start_failure(name, &mut archive);
             return Err(error);
         }
     };
@@ -6244,24 +6136,29 @@ fn start_runtime_engine<E: Engine>(
         late_data_policy: Default::default(),
         xfast: runtime_options.xfast,
     };
-    config
-        .validate()
-        .map_err(|error| py_runtime_error(error.to_string()))?;
+    if let Err(error) = config.validate() {
+        close_archive_after_start_failure(name, &mut archive);
+        return Err(py_runtime_error(error.to_string()));
+    }
     if engine.is_none() {
+        close_archive_after_start_failure(name, &mut archive);
         return Err(py_runtime_error("engine already started"));
     }
 
     let handle = match (remote_source, segment_source, python_source) {
         (Some(remote_source), None, None) => {
-            let source = Box::new(
-                RustZmqSource::connect(
-                    &format!("{name}_source"),
-                    &remote_source.endpoint,
-                    remote_source.expected_schema.clone(),
-                    remote_source.mode,
-                )
-                .map_err(|error| py_runtime_error(error.to_string()))?,
-            );
+            let source = match RustZmqSource::connect(
+                &format!("{name}_source"),
+                &remote_source.endpoint,
+                remote_source.expected_schema.clone(),
+                remote_source.mode,
+            ) {
+                Ok(source) => Box::new(source),
+                Err(error) => {
+                    close_archive_after_start_failure(name, &mut archive);
+                    return Err(py_runtime_error(error.to_string()));
+                }
+            };
             start_prepared_source_runtime(source, config, publisher, engine)
         }
         (None, Some(segment_source), None) => {
@@ -6292,6 +6189,7 @@ fn start_runtime_engine<E: Engine>(
             spawn_engine_with_publisher(engine, config, publisher)
         }
         _ => {
+            close_archive_after_start_failure(name, &mut archive);
             return Err(py_runtime_error(
                 "engine cannot use more than one external source at the same time",
             ));
@@ -6307,6 +6205,7 @@ fn start_runtime_engine<E: Engine>(
                 error = %error,
                 "python runtime bridge start failed"
             );
+            close_archive_after_start_failure(name, &mut archive);
             return Err(py_runtime_error(error.to_string()));
         }
     };
@@ -6319,6 +6218,20 @@ fn start_runtime_engine<E: Engine>(
     );
 
     Ok((handle, archive))
+}
+
+fn close_archive_after_start_failure(name: &str, archive: &mut Option<ArchiveHandle>) {
+    if let Some(archive) = archive.take() {
+        if let Err(error) = archive.close() {
+            warn!(
+                component = "python_bridge",
+                engine = name,
+                event = "archive_start_cleanup_failed",
+                error = %error,
+                "python runtime bridge failed to close archive after start failure"
+            );
+        }
+    }
 }
 
 fn write_runtime_input(
@@ -6382,10 +6295,12 @@ fn stop_runtime_engine(
     status: &SharedStatus,
     metrics: &SharedMetrics,
 ) -> PyResult<()> {
-    let mut guard = handle.lock().unwrap();
-    let mut runtime = match guard.take() {
-        Some(handle) => handle,
-        None => return Err(py_runtime_error("engine not started")),
+    let mut runtime = {
+        let mut guard = handle.lock().unwrap();
+        match guard.take() {
+            Some(handle) => handle,
+            None => return Err(py_runtime_error("engine not started")),
+        }
     };
 
     let stop_result = match py.allow_threads(|| runtime.stop()) {
@@ -6469,6 +6384,16 @@ fn parse_late_data_policy(value: &str) -> PyResult<LateDataPolicy> {
         "drop_with_metric" => Ok(LateDataPolicy::DropWithMetric),
         _ => Err(py_value_error(
             "late_data_policy must be 'reject' or 'drop_with_metric'",
+        )),
+    }
+}
+
+fn parse_reactive_state_failure_policy(value: &str) -> PyResult<RustReactiveStateFailurePolicy> {
+    match value {
+        "fail_fast" => Ok(RustReactiveStateFailurePolicy::FailFast),
+        "rollback" => Ok(RustReactiveStateFailurePolicy::Rollback),
+        _ => Err(py_value_error(
+            "state_failure_policy must be 'fail_fast' or 'rollback'",
         )),
     }
 }
@@ -6807,56 +6732,94 @@ fn build_reactive_spec(
     factor: &Bound<'_, PyAny>,
 ) -> PyResult<Box<dyn zippy_operators::ReactiveFactor>> {
     if let Ok(spec) = factor.extract::<PyRef<'_, TsEmaSpec>>() {
-        return RustTsEmaSpec::new(id_column, &spec.value_column, spec.span, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustTsEmaSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            spec.span,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, TsReturnSpec>>() {
-        return RustTsReturnSpec::new(id_column, &spec.value_column, spec.period, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustTsReturnSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            spec.period,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, TsMeanSpec>>() {
-        return RustTsMeanSpec::new(id_column, &spec.value_column, spec.window, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustTsMeanSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            spec.window,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, TsStdSpec>>() {
-        return RustTsStdSpec::new(id_column, &spec.value_column, spec.window, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustTsStdSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            spec.window,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, TsDelaySpec>>() {
-        return RustTsDelaySpec::new(id_column, &spec.value_column, spec.period, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustTsDelaySpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            spec.period,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, TsDiffSpec>>() {
-        return RustTsDiffSpec::new(id_column, &spec.value_column, spec.period, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustTsDiffSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            spec.period,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, AbsSpec>>() {
-        return RustAbsSpec::new(id_column, &spec.value_column, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustAbsSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, LogSpec>>() {
-        return RustLogSpec::new(id_column, &spec.value_column, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustLogSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, ClipSpec>>() {
         return RustClipSpec::new(
-            id_column,
+            reactive_factor_id_column(id_column, &spec.id_column),
             &spec.value_column,
             spec.min,
             spec.max,
@@ -6867,9 +6830,14 @@ fn build_reactive_spec(
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, CastSpec>>() {
-        return RustCastSpec::new(id_column, &spec.value_column, &spec.dtype, &spec.output)
-            .build()
-            .map_err(|error| py_value_error(error.to_string()));
+        return RustCastSpec::new(
+            reactive_factor_id_column(id_column, &spec.id_column),
+            &spec.value_column,
+            &spec.dtype,
+            &spec.output,
+        )
+        .build()
+        .map_err(|error| py_value_error(error.to_string()));
     }
 
     if let Ok(spec) = factor.extract::<PyRef<'_, ExpressionFactor>>() {
@@ -6883,6 +6851,14 @@ fn build_reactive_spec(
     Err(PyTypeError::new_err(
         "factors must contain TsEmaSpec, TsReturnSpec, TsMeanSpec, TsStdSpec, TsDelaySpec, TsDiffSpec, AbsSpec, LogSpec, ClipSpec, CastSpec, or ExpressionFactor",
     ))
+}
+
+fn reactive_factor_id_column<'a>(engine_id_column: &'a str, factor_id_column: &'a str) -> &'a str {
+    if factor_id_column.is_empty() {
+        engine_id_column
+    } else {
+        factor_id_column
+    }
 }
 
 fn build_aggregation_specs(
@@ -7148,12 +7124,40 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use pyo3::types::PyList;
+    use std::process::Command;
+    use std::sync::Once;
     use zippy_engines::{
         ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
     };
     use zippy_operators::{AggFirstSpec as RustAggFirstSpec, TsEmaSpec as RustTsEmaSpec};
 
     const MINUTE_NS: i64 = 60_000_000_000;
+    static PYTHON_TEST_INIT: Once = Once::new();
+
+    fn prepare_python_for_tests() {
+        PYTHON_TEST_INIT.call_once(|| {
+            if std::env::var_os("PYTHONHOME").is_none() {
+                if let Some(home) = python_base_prefix_for_tests() {
+                    std::env::set_var("PYTHONHOME", home);
+                }
+            }
+            pyo3::prepare_freethreaded_python();
+        });
+    }
+
+    fn python_base_prefix_for_tests() -> Option<String> {
+        let python = std::env::var_os("PYO3_PYTHON")?;
+        let output = Command::new(python)
+            .arg("-c")
+            .arg("import sys; print(sys.base_prefix)")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let home = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!home.is_empty()).then_some(home)
+    }
 
     fn tick_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -7214,7 +7218,7 @@ mod tests {
             "current",
         )
         .is_none());
-        assert!(descriptor_updates.update.lock().unwrap().is_some());
+        assert_eq!(descriptor_updates.pending_update_count(), 1);
 
         let update = take_descriptor_update_after_poll(
             SubscriberReadOutcome::Empty,
@@ -7224,7 +7228,39 @@ mod tests {
         .expect("empty segment poll should consume pending descriptor update");
 
         assert_eq!(update.text, "next");
-        assert!(descriptor_updates.update.lock().unwrap().is_none());
+        assert_eq!(descriptor_updates.pending_update_count(), 0);
+    }
+
+    #[test]
+    fn descriptor_update_slot_preserves_multiple_generations_in_order() {
+        let descriptor_updates = DescriptorUpdateSlot::default();
+        descriptor_updates.set(DescriptorUpdate {
+            descriptor_generation: 2,
+            text: "next-2".to_string(),
+            descriptor: serde_json::json!({"generation": 2}),
+        });
+        descriptor_updates.set(DescriptorUpdate {
+            descriptor_generation: 3,
+            text: "next-3".to_string(),
+            descriptor: serde_json::json!({"generation": 3}),
+        });
+
+        let first = take_descriptor_update_after_poll(
+            SubscriberReadOutcome::Empty,
+            &descriptor_updates,
+            "current",
+        )
+        .expect("first queued descriptor update should be returned");
+        let second = take_descriptor_update_after_poll(
+            SubscriberReadOutcome::Empty,
+            &descriptor_updates,
+            "next-2",
+        )
+        .expect("second queued descriptor update should be returned");
+
+        assert_eq!(first.descriptor_generation, 2);
+        assert_eq!(second.descriptor_generation, 3);
+        assert_eq!(descriptor_updates.pending_update_count(), 0);
     }
 
     #[test]
@@ -7297,7 +7333,7 @@ mod tests {
             SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
             other => panic!("expected current rows before descriptor switch got [{other:?}]"),
         }
-        assert!(descriptor_updates.update.lock().unwrap().is_some());
+        assert_eq!(descriptor_updates.pending_update_count(), 1);
 
         match driver.poll_next().unwrap() {
             SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 2),
@@ -7435,6 +7471,8 @@ mod tests {
             data_path: "segment".to_string(),
             descriptor_generation: 7,
             active_segment_descriptor: None,
+            active_segment_preflight: None,
+            segment_row_capacity: None,
             sealed_segments: vec![serde_json::json!({
                 "magic": "zippy.segment.active",
                 "version": 1,
@@ -7493,8 +7531,8 @@ mod tests {
     }
 
     #[test]
-    fn normalize_and_dispatch_bus_reader_respects_instrument_ids() {
-        pyo3::prepare_freethreaded_python();
+    fn parse_instrument_ids_normalizes_scalar_and_sequences() {
+        prepare_python_for_tests();
         Python::with_gil(|py| {
             let empty = PyList::empty_bound(py);
             assert_eq!(parse_instrument_ids(Some(empty.as_any())).unwrap(), None);
@@ -7525,77 +7563,6 @@ mod tests {
             let empty_string = pyo3::types::PyString::new_bound(py, "");
             assert!(parse_instrument_ids(Some(empty_string.as_any())).is_err());
         });
-
-        let client: SharedMasterClient = Arc::new(Mutex::new(
-            CoreMasterClient::connect("/tmp/zippy-python-test").unwrap(),
-        ));
-        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let unfiltered_read_calls = Arc::clone(&calls);
-        let unfiltered_filtered_calls = Arc::clone(&calls);
-        let unfiltered_result = attach_bus_reader_with(
-            &client,
-            "ticks",
-            None,
-            false,
-            move |_, stream_name, xfast| {
-                unfiltered_read_calls
-                    .lock()
-                    .unwrap()
-                    .push(format!("read_from:[{}]:[{}]", stream_name, xfast));
-                Err(ZippyError::Io {
-                    reason: "stop".to_string(),
-                })
-            },
-            move |_, stream_name, instrument_ids, xfast| {
-                unfiltered_filtered_calls.lock().unwrap().push(format!(
-                    "read_from_filtered:[{}]:{:?}:[{}]",
-                    stream_name, instrument_ids, xfast
-                ));
-                Err(ZippyError::Io {
-                    reason: "stop".to_string(),
-                })
-            },
-        );
-        assert!(unfiltered_result.is_err());
-        assert_eq!(
-            calls.lock().unwrap().as_slice(),
-            &["read_from:[ticks]:[false]".to_string()]
-        );
-
-        calls.lock().unwrap().clear();
-
-        let filtered_read_calls = Arc::clone(&calls);
-        let filtered_filtered_calls = Arc::clone(&calls);
-        let filtered_result = attach_bus_reader_with(
-            &client,
-            "ticks",
-            Some(vec!["IF2606".to_string()]),
-            true,
-            move |_, stream_name, xfast| {
-                filtered_read_calls
-                    .lock()
-                    .unwrap()
-                    .push(format!("read_from:[{}]:[{}]", stream_name, xfast));
-                Err(ZippyError::Io {
-                    reason: "stop".to_string(),
-                })
-            },
-            move |_, stream_name, instrument_ids, xfast| {
-                filtered_filtered_calls.lock().unwrap().push(format!(
-                    "read_from_filtered:[{}]:{:?}:[{}]",
-                    stream_name, instrument_ids, xfast
-                ));
-                Err(ZippyError::Io {
-                    reason: "stop".to_string(),
-                })
-            },
-        );
-        assert!(filtered_result.is_err());
-        assert_eq!(
-            calls.lock().unwrap().as_slice(),
-            &["read_from_filtered:[ticks]:[\"IF2606\"]:[true]".to_string()]
-        );
     }
 
     #[test]

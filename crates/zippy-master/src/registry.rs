@@ -1,12 +1,20 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::File;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+type PersistedFileUpdate = Option<(u64, Vec<serde_json::Value>, Vec<serde_json::Value>)>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessRecord {
     pub process_id: String,
+    #[serde(default)]
+    pub process_token: String,
     pub app: String,
     pub registered_at: u64,
     pub last_heartbeat_at: u64,
@@ -18,6 +26,8 @@ pub struct ProcessRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamRecord {
     pub stream_name: String,
+    #[serde(default)]
+    pub owner_process_id: Option<String>,
     pub schema: serde_json::Value,
     pub schema_hash: String,
     pub data_path: String,
@@ -92,6 +102,9 @@ pub enum RegistryError {
     ProcessLeaseExpired {
         process_id: String,
     },
+    ProcessTokenInvalid {
+        process_id: String,
+    },
     StreamNotFound {
         stream_name: String,
     },
@@ -154,6 +167,11 @@ pub enum RegistryError {
         stream_name: String,
         lease_id: String,
     },
+    SegmentReaderLeaseTargetNotFound {
+        stream_name: String,
+        source_segment_id: u64,
+        source_generation: u64,
+    },
     SegmentReaderLeaseNotOwnedByProcess {
         stream_name: String,
         lease_id: String,
@@ -201,6 +219,9 @@ impl fmt::Display for RegistryError {
             }
             Self::ProcessLeaseExpired { process_id } => {
                 write!(f, "process lease expired process_id=[{}]", process_id)
+            }
+            Self::ProcessTokenInvalid { process_id } => {
+                write!(f, "process token invalid process_id=[{}]", process_id)
             }
             Self::StreamNotFound { stream_name } => {
                 write!(f, "stream not found stream_name=[{}]", stream_name)
@@ -316,6 +337,15 @@ impl fmt::Display for RegistryError {
                 "segment reader lease not found stream_name=[{}] lease_id=[{}]",
                 stream_name, lease_id
             ),
+            Self::SegmentReaderLeaseTargetNotFound {
+                stream_name,
+                source_segment_id,
+                source_generation,
+            } => write!(
+                f,
+                "segment reader lease target not found stream_name=[{}] source_segment_id=[{}] source_generation=[{}]",
+                stream_name, source_segment_id, source_generation
+            ),
             Self::SegmentReaderLeaseNotOwnedByProcess {
                 stream_name,
                 lease_id,
@@ -367,6 +397,25 @@ impl fmt::Display for RegistryError {
             }
         }
     }
+}
+
+fn generate_process_token(process_id: &str, app: &str) -> String {
+    if let Some(token) = random_token_from_os() {
+        return token;
+    }
+    let now = Registry::now_epoch_millis();
+    let mut hasher = DefaultHasher::new();
+    process_id.hash(&mut hasher);
+    app.hash(&mut hasher);
+    now.hash(&mut hasher);
+    format!("{:016x}{:016x}", hasher.finish(), now)
+}
+
+fn random_token_from_os() -> Option<String> {
+    let mut bytes = [0_u8; 32];
+    let mut file = File::open("/dev/urandom").ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 impl std::error::Error for RegistryError {}
@@ -470,16 +519,120 @@ fn normalize_persisted_file(
             reason: "persisted_file.file_path must not be empty".to_string(),
         });
     }
-    object
-        .entry("stream_name")
-        .or_insert_with(|| serde_json::Value::String(stream_name.to_string()));
-    object
-        .entry("schema_hash")
-        .or_insert_with(|| serde_json::Value::String(schema_hash.to_string()));
+    if let Some(existing_stream_name) = object
+        .get("stream_name")
+        .and_then(serde_json::Value::as_str)
+    {
+        if existing_stream_name != stream_name {
+            return Err(RegistryError::InvalidPersistedFile {
+                stream_name: stream_name.to_string(),
+                reason: format!(
+                    "persisted_file.stream_name mismatch expected=[{}] actual=[{}]",
+                    stream_name, existing_stream_name
+                ),
+            });
+        }
+    }
+    if let Some(existing_schema_hash) = object
+        .get("schema_hash")
+        .and_then(serde_json::Value::as_str)
+    {
+        if existing_schema_hash != schema_hash {
+            return Err(RegistryError::InvalidPersistedFile {
+                stream_name: stream_name.to_string(),
+                reason: format!(
+                    "persisted_file.schema_hash mismatch expected=[{}] actual=[{}]",
+                    schema_hash, existing_schema_hash
+                ),
+            });
+        }
+    }
+    object.insert(
+        "stream_name".to_string(),
+        serde_json::Value::String(stream_name.to_string()),
+    );
+    object.insert(
+        "schema_hash".to_string(),
+        serde_json::Value::String(schema_hash.to_string()),
+    );
     object
         .entry("created_at")
         .or_insert_with(|| serde_json::Value::from(persisted_created_at_millis()));
     Ok(persisted_file)
+}
+
+fn stream_has_segment_identity(
+    stream: &StreamRecord,
+    source_segment_id: u64,
+    source_generation: u64,
+) -> bool {
+    let expected = (source_segment_id, source_generation);
+    stream
+        .active_segment_descriptor
+        .as_ref()
+        .and_then(active_segment_identity)
+        == Some(expected)
+        || stream
+            .sealed_segments
+            .iter()
+            .filter_map(active_segment_identity)
+            .any(|identity| identity == expected)
+        || stream
+            .persisted_files
+            .iter()
+            .flat_map(persisted_segment_identities)
+            .any(|identity| identity == expected)
+        || stream
+            .active_segment_descriptor
+            .as_ref()
+            .into_iter()
+            .flat_map(retained_replacement_segment_identities)
+            .any(|identity| identity == expected)
+}
+
+fn active_segment_identity(value: &serde_json::Value) -> Option<(u64, u64)> {
+    Some((
+        value
+            .get("segment_id")
+            .and_then(serde_json::Value::as_u64)?,
+        value
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)?,
+    ))
+}
+
+fn persisted_segment_identities(value: &serde_json::Value) -> Vec<(u64, u64)> {
+    if let Some(source_segments) = value
+        .get("source_segments")
+        .and_then(serde_json::Value::as_array)
+    {
+        return source_segments
+            .iter()
+            .filter_map(persisted_segment_identity)
+            .collect();
+    }
+    persisted_segment_identity(value).into_iter().collect()
+}
+
+fn persisted_segment_identity(value: &serde_json::Value) -> Option<(u64, u64)> {
+    Some((
+        value
+            .get("source_segment_id")
+            .and_then(serde_json::Value::as_u64)?,
+        value
+            .get("source_generation")
+            .and_then(serde_json::Value::as_u64)?,
+    ))
+}
+
+fn retained_replacement_segment_identities(value: &serde_json::Value) -> Vec<(u64, u64)> {
+    value
+        .get("retained_replacement_segments")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(active_segment_identity)
+        .collect()
 }
 
 impl Registry {
@@ -538,10 +691,12 @@ impl Registry {
     pub fn register_process(&mut self, app: &str) -> String {
         self.next_process_id += 1;
         let process_id = format!("proc_{}", self.next_process_id);
+        let process_token = generate_process_token(&process_id, app);
         let now = Self::now_epoch_millis();
         let revision = self.next_control_revision();
         let record = ProcessRecord {
             process_id: process_id.clone(),
+            process_token,
             app: app.to_string(),
             registered_at: now,
             last_heartbeat_at: now,
@@ -550,6 +705,12 @@ impl Registry {
         };
         self.processes.insert(process_id.clone(), record);
         process_id
+    }
+
+    pub fn get_process_token(&self, process_id: &str) -> Option<&str> {
+        self.processes
+            .get(process_id)
+            .map(|process| process.process_token.as_str())
     }
 
     pub fn reserve_process_id(&mut self, process_id: &str) {
@@ -629,6 +790,30 @@ impl Registry {
                 })?;
         if process.lease_status != "alive" {
             return Err(RegistryError::ProcessLeaseExpired {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_process_capability(
+        &self,
+        process_id: &str,
+        process_token: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let Some(process_token) = process_token else {
+            return Err(RegistryError::ProcessTokenInvalid {
+                process_id: process_id.to_string(),
+            });
+        };
+        let stored_token = self
+            .processes
+            .get(process_id)
+            .map(|process| process.process_token.as_str())
+            .unwrap_or_default();
+        if stored_token.is_empty() || stored_token != process_token {
+            return Err(RegistryError::ProcessTokenInvalid {
                 process_id: process_id.to_string(),
             });
         }
@@ -723,6 +908,7 @@ impl Registry {
             .unwrap_or_default();
         let record = StreamRecord {
             stream_name: stream_name.to_string(),
+            owner_process_id: None,
             schema,
             schema_hash: schema_hash.to_string(),
             data_path: "segment".to_string(),
@@ -743,6 +929,24 @@ impl Registry {
             reader_process_ids: BTreeMap::new(),
         };
         self.streams.insert(stream_name.to_string(), record);
+        Ok(())
+    }
+
+    pub fn set_stream_owner(
+        &mut self,
+        stream_name: &str,
+        process_id: &str,
+    ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
+        let stream =
+            self.streams
+                .get_mut(stream_name)
+                .ok_or_else(|| RegistryError::StreamNotFound {
+                    stream_name: stream_name.to_string(),
+                })?;
+        if stream.owner_process_id.is_none() {
+            stream.owner_process_id = Some(process_id.to_string());
+        }
         Ok(())
     }
 
@@ -823,7 +1027,7 @@ impl Registry {
         stream_name: &str,
         process_id: &str,
         after_revision: u64,
-    ) -> Result<Option<(u64, Vec<serde_json::Value>, Vec<serde_json::Value>)>, RegistryError> {
+    ) -> Result<PersistedFileUpdate, RegistryError> {
         self.validate_process_alive(process_id)?;
         let stream =
             self.streams
@@ -1124,6 +1328,7 @@ impl Registry {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_stream_segment_metadata(
         &mut self,
         stream_name: &str,
@@ -1229,6 +1434,7 @@ impl Registry {
         stream_name: &str,
         process_id: &str,
     ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
         let stream =
             self.streams
                 .get_mut(stream_name)
@@ -1515,6 +1721,21 @@ impl Registry {
         source_generation: u64,
     ) -> Result<String, RegistryError> {
         self.validate_process_alive(process_id)?;
+        {
+            let stream =
+                self.streams
+                    .get(stream_name)
+                    .ok_or_else(|| RegistryError::StreamNotFound {
+                        stream_name: stream_name.to_string(),
+                    })?;
+            if !stream_has_segment_identity(stream, source_segment_id, source_generation) {
+                return Err(RegistryError::SegmentReaderLeaseTargetNotFound {
+                    stream_name: stream_name.to_string(),
+                    source_segment_id,
+                    source_generation,
+                });
+            }
+        }
         self.next_segment_reader_lease_id = self.next_segment_reader_lease_id.saturating_add(1);
         let lease_id = format!("segment-lease-{}", self.next_segment_reader_lease_id);
         let stream =
@@ -1630,6 +1851,7 @@ impl Registry {
         process_id: &str,
         reader_id: &str,
     ) -> Result<(), RegistryError> {
+        self.validate_process_alive(process_id)?;
         let stream =
             self.streams
                 .get_mut(stream_name)
@@ -1710,6 +1932,22 @@ impl Registry {
 
     pub fn list_sinks(&self) -> Vec<SinkRecord> {
         self.sinks.values().cloned().collect()
+    }
+
+    pub fn sources_for_stream(&self, stream_name: &str) -> Vec<SourceRecord> {
+        self.sources
+            .values()
+            .filter(|source| source.output_stream == stream_name)
+            .cloned()
+            .collect()
+    }
+
+    pub fn sinks_for_stream(&self, stream_name: &str) -> Vec<SinkRecord> {
+        self.sinks
+            .values()
+            .filter(|sink| sink.input_stream == stream_name)
+            .cloned()
+            .collect()
     }
 
     pub fn streams_for_writer_process(&self, process_id: &str) -> Vec<String> {
@@ -1818,6 +2056,13 @@ impl Registry {
         };
         if stream.active_writer_source_name.as_deref() == Some(source_name) {
             stream.active_writer_source_name = None;
+            stream.writer_process_id = None;
+            stream.active_segment_descriptor = None;
+            stream.status = if stream.reader_count > 0 {
+                "reader_attached".to_string()
+            } else {
+                "registered".to_string()
+            };
         }
     }
 

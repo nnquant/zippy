@@ -9,7 +9,7 @@ use zippy_core::{
     spawn_engine, Engine, EngineConfig, EngineMetricsSnapshot, LateDataPolicy, OverflowPolicy,
     SegmentTableView, ZippyError,
 };
-use zippy_engines::ReactiveStateEngine;
+use zippy_engines::{ReactiveStateEngine, ReactiveStateFailurePolicy};
 use zippy_operators::{CastSpec, ExpressionSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
 
 fn input_schema() -> Arc<Schema> {
@@ -175,6 +175,84 @@ fn reactive_engine_keeps_factor_state_across_on_data_calls() {
         &float64_values(second.column_at(3)),
         vec![Some(0.9), Some(0.5625)].as_slice(),
     );
+}
+
+#[test]
+fn reactive_engine_fail_fast_policy_does_not_retain_rollback_state() {
+    let factors = vec![TsReturnSpec::new("id", "value", 1, "ret_1")
+        .build()
+        .unwrap()];
+    let mut engine = ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+
+    engine.begin_transaction();
+    let failed_outputs = engine
+        .on_data(batch(vec!["a"], vec![10.0]))
+        .expect("batch should evaluate before simulated publish failure");
+    engine.rollback_transaction().unwrap();
+
+    let retried_outputs = engine
+        .on_data(batch(vec!["a"], vec![10.0]))
+        .expect("retry should evaluate after rollback");
+
+    assert_float_options_eq(&float64_values(failed_outputs[0].column_at(2)), &[None]);
+    assert_float_options_eq(
+        &float64_values(retried_outputs[0].column_at(2)),
+        &[Some(0.0)],
+    );
+}
+
+#[test]
+fn reactive_engine_rollback_policy_restores_stateful_factor_state() {
+    let factors = vec![TsReturnSpec::new("id", "value", 1, "ret_1")
+        .build()
+        .unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_state_failure_policy(
+        "reactive",
+        input_schema(),
+        factors,
+        ReactiveStateFailurePolicy::Rollback,
+    )
+    .unwrap();
+
+    engine.begin_transaction();
+    let failed_outputs = engine
+        .on_data(batch(vec!["a"], vec![10.0]))
+        .expect("batch should evaluate before simulated publish failure");
+    engine.rollback_transaction().unwrap();
+
+    let retried_outputs = engine
+        .on_data(batch(vec!["a"], vec![10.0]))
+        .expect("retry should evaluate after rollback");
+
+    assert_float_options_eq(&float64_values(failed_outputs[0].column_at(2)), &[None]);
+    assert_float_options_eq(&float64_values(retried_outputs[0].column_at(2)), &[None]);
+}
+
+#[test]
+fn reactive_engine_rollback_policy_restores_expression_factor_state() {
+    let factors = vec![ExpressionSpec::new("TS_RETURN(value, 1)", "ret_1")
+        .build_reactive_factor(input_schema().as_ref(), "id")
+        .unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_state_failure_policy(
+        "reactive",
+        input_schema(),
+        factors,
+        ReactiveStateFailurePolicy::Rollback,
+    )
+    .unwrap();
+
+    engine.begin_transaction();
+    let failed_outputs = engine
+        .on_data(batch(vec!["a"], vec![10.0]))
+        .expect("batch should evaluate before simulated publish failure");
+    engine.rollback_transaction().unwrap();
+
+    let retried_outputs = engine
+        .on_data(batch(vec!["a"], vec![10.0]))
+        .expect("retry should evaluate after rollback");
+
+    assert_float_options_eq(&float64_values(failed_outputs[0].column_at(2)), &[None]);
+    assert_float_options_eq(&float64_values(retried_outputs[0].column_at(2)), &[None]);
 }
 
 #[test]

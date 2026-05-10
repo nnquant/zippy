@@ -14,6 +14,11 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_TABLE_PERSIST_PARTITION_DT_COLUMN",
     "ZIPPY_TABLE_PERSIST_PARTITION_ID_COLUMN",
     "ZIPPY_TABLE_PERSIST_PARTITION_DT_PART",
+    "ZIPPY_TABLE_PERSIST_COMPACTION",
+    "ZIPPY_TABLE_PERSIST_COMPACTION_INTERVAL_SEC",
+    "ZIPPY_TABLE_PERSIST_COMPACTION_MIN_FILES",
+    "ZIPPY_TABLE_PERSIST_COMPACTION_DELETE_SOURCES",
+    "ZIPPY_TABLE_PERSIST_COMPACTION_SORT_COLUMN",
     "ZIPPY_GATEWAY",
     "ZIPPY_GATEWAY_ENDPOINT",
     "ZIPPY_GATEWAY_HOST",
@@ -23,6 +28,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_MASTER_HOST",
     "ZIPPY_MASTER_PORT",
     "ZIPPY_MASTER_SHUTDOWN_TIMEOUT_MS",
+    "ZIPPY_MASTER_TOKEN",
 ];
 
 #[test]
@@ -48,6 +54,13 @@ dt_column = "dt"
 id_column = "instrument_id"
 dt_part = "%Y%m%d"
 
+[table.persist.compaction]
+enabled = false
+interval_sec = 600.0
+min_files = 10
+delete_sources = true
+sort_column = "dt"
+
 [gateway]
 enabled = false
 endpoint = "127.0.0.1:17666"
@@ -72,6 +85,11 @@ shutdown_timeout_ms = 3000
             ("ZIPPY_TABLE_PERSIST_PARTITION_DT_COLUMN", "recv_ts"),
             ("ZIPPY_TABLE_PERSIST_PARTITION_ID_COLUMN", "symbol"),
             ("ZIPPY_TABLE_PERSIST_PARTITION_DT_PART", "%Y%m"),
+            ("ZIPPY_TABLE_PERSIST_COMPACTION", "true"),
+            ("ZIPPY_TABLE_PERSIST_COMPACTION_INTERVAL_SEC", "120.5"),
+            ("ZIPPY_TABLE_PERSIST_COMPACTION_MIN_FILES", "6"),
+            ("ZIPPY_TABLE_PERSIST_COMPACTION_DELETE_SOURCES", "false"),
+            ("ZIPPY_TABLE_PERSIST_COMPACTION_SORT_COLUMN", "recv_ts"),
             ("ZIPPY_GATEWAY", "true"),
             ("ZIPPY_GATEWAY_ENDPOINT", "127.0.0.1:27666"),
             ("ZIPPY_GATEWAY_TOKEN", "from-env-token"),
@@ -103,6 +121,14 @@ shutdown_timeout_ms = 3000
             assert_eq!(
                 config.table.persist.partition.dt_part.as_deref(),
                 Some("%Y%m")
+            );
+            assert!(config.table.persist.compaction.enabled);
+            assert_eq!(config.table.persist.compaction.interval_sec, 120.5);
+            assert_eq!(config.table.persist.compaction.min_files, 6);
+            assert!(!config.table.persist.compaction.delete_sources);
+            assert_eq!(
+                config.table.persist.compaction.sort_column.as_deref(),
+                Some("recv_ts")
             );
             assert!(config.gateway.enabled);
             assert_eq!(config.gateway.endpoint.as_deref(), Some("127.0.0.1:27666"));

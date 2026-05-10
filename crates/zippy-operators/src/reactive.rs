@@ -21,8 +21,9 @@ pub(crate) enum StatefulFloatKind {
     Return { period: usize },
 }
 
-pub(crate) struct StatefulFloatById {
+pub struct StatefulFloatById {
     state: StatefulFloatState,
+    undo_log: Option<StatefulFloatUndoLog>,
 }
 
 enum StatefulFloatState {
@@ -37,6 +38,16 @@ enum StatefulFloatState {
     },
 }
 
+#[derive(Default)]
+struct StatefulFloatUndoLog {
+    entries: HashMap<String, StatefulFloatUndoEntry>,
+}
+
+enum StatefulFloatUndoEntry {
+    Ema(Option<f64>),
+    Window(Option<VecDeque<f64>>),
+}
+
 /// Evaluate a stateful factor against rows in input order.
 pub trait ReactiveFactor: Send {
     /// Return the output field definition for this factor.
@@ -44,6 +55,17 @@ pub trait ReactiveFactor: Send {
 
     /// Evaluate the factor for each row in the batch.
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef>;
+
+    /// Start recording dirty-key undo entries for this factor.
+    fn begin_transaction(&mut self) {}
+
+    /// Commit pending dirty-key undo entries.
+    fn commit_transaction(&mut self) {}
+
+    /// Restore pending dirty-key undo entries.
+    fn rollback_transaction(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Builder for a per-id exponential moving average factor.
@@ -147,7 +169,10 @@ impl StatefulFloatById {
             },
         };
 
-        Self { state }
+        Self {
+            state,
+            undo_log: None,
+        }
     }
 
     pub(crate) fn evaluate_optional(
@@ -158,6 +183,8 @@ impl StatefulFloatById {
         let Some(value) = input else {
             return Ok(None);
         };
+
+        self.record_undo(id);
 
         match &mut self.state {
             StatefulFloatState::Ema { alpha, state_by_id } => {
@@ -229,7 +256,12 @@ impl StatefulFloatById {
                             None
                         } else {
                             let base = *history.front().expect("history length checked above");
-                            Some((value / base) - 1.0)
+                            if base == 0.0 {
+                                None
+                            } else {
+                                let ret = (value / base) - 1.0;
+                                ret.is_finite().then_some(ret)
+                            }
                         };
                         history.push_back(value);
                         trim_history(history, *size);
@@ -240,6 +272,81 @@ impl StatefulFloatById {
                 Ok(output)
             }
         }
+    }
+
+    pub fn begin_transaction(&mut self) {
+        if self.undo_log.is_none() {
+            self.undo_log = Some(StatefulFloatUndoLog::default());
+        }
+    }
+
+    pub fn commit_transaction(&mut self) {
+        self.undo_log = None;
+    }
+
+    pub fn rollback_transaction(&mut self) -> Result<()> {
+        let Some(undo_log) = self.undo_log.take() else {
+            return Ok(());
+        };
+
+        match &mut self.state {
+            StatefulFloatState::Ema { state_by_id, .. } => {
+                for (id, entry) in undo_log.entries {
+                    match entry {
+                        StatefulFloatUndoEntry::Ema(Some(previous)) => {
+                            state_by_id.insert(id, previous);
+                        }
+                        StatefulFloatUndoEntry::Ema(None) => {
+                            state_by_id.remove(&id);
+                        }
+                        StatefulFloatUndoEntry::Window(_) => {
+                            return Err(ZippyError::InvalidState {
+                                status: "reactive undo log type mismatch",
+                            });
+                        }
+                    }
+                }
+            }
+            StatefulFloatState::Window { history_by_id, .. } => {
+                for (id, entry) in undo_log.entries {
+                    match entry {
+                        StatefulFloatUndoEntry::Window(Some(previous)) => {
+                            history_by_id.insert(id, previous);
+                        }
+                        StatefulFloatUndoEntry::Window(None) => {
+                            history_by_id.remove(&id);
+                        }
+                        StatefulFloatUndoEntry::Ema(_) => {
+                            return Err(ZippyError::InvalidState {
+                                status: "reactive undo log type mismatch",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_undo(&mut self, id: &str) {
+        let Some(undo_log) = self.undo_log.as_mut() else {
+            return;
+        };
+
+        if undo_log.entries.contains_key(id) {
+            return;
+        }
+
+        let entry = match &self.state {
+            StatefulFloatState::Ema { state_by_id, .. } => {
+                StatefulFloatUndoEntry::Ema(state_by_id.get(id).copied())
+            }
+            StatefulFloatState::Window { history_by_id, .. } => {
+                StatefulFloatUndoEntry::Window(history_by_id.get(id).cloned())
+            }
+        };
+        undo_log.entries.insert(id.to_string(), entry);
     }
 }
 
@@ -527,6 +634,18 @@ impl ReactiveFactor for TsEmaFactor {
 
         Ok(Arc::new(builder.finish()))
     }
+
+    fn begin_transaction(&mut self) {
+        self.state.begin_transaction();
+    }
+
+    fn commit_transaction(&mut self) {
+        self.state.commit_transaction();
+    }
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        self.state.rollback_transaction()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -564,6 +683,18 @@ impl ReactiveFactor for WindowHistoryFactor {
         }
 
         Ok(Arc::new(builder.finish()))
+    }
+
+    fn begin_transaction(&mut self) {
+        self.state.begin_transaction();
+    }
+
+    fn commit_transaction(&mut self) {
+        self.state.commit_transaction();
+    }
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        self.state.rollback_transaction()
     }
 }
 
@@ -768,6 +899,18 @@ fn extract_columns<'a>(
         return Err(ZippyError::SchemaMismatch {
             reason: format!("value field contains nulls field=[{}]", value_field),
         });
+    }
+
+    for index in 0..value_array.len() {
+        let value = value_array.value(index);
+        if !value.is_finite() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "value field contains non-finite float field=[{}] row=[{}] value=[{}]",
+                    value_field, index, value
+                ),
+            });
+        }
     }
 
     Ok((id_array, value_array))

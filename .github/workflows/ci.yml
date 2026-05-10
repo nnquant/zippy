@@ -54,5 +54,14 @@ jobs:
       - name: install python extension
         run: uv run maturin develop --manifest-path crates/zippy-python/Cargo.toml
 
+      - name: check python formatting
+        run: uv run --extra dev black --check python pytests
+
+      - name: run python ruff
+        run: uv run --extra dev ruff check python pytests
+
+      - name: run python mypy
+        run: uv run --extra dev mypy
+
       - name: run python tests
         run: uv run --extra dev pytest pytests -v

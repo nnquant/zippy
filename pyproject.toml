@@ -12,9 +12,45 @@ dependencies = ["click>=8.1.0", "polars>=1.25.0", "pyarrow>=18.0.0"]
 zippy = "zippy.cli:main"
 
 [project.optional-dependencies]
-dev = ["maturin>=1.7,<2.0", "pytest>=8.3.0"]
+dev = [
+    "black>=24.10.0",
+    "maturin>=1.7,<2.0",
+    "mypy>=1.13.0",
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
 
 [tool.maturin]
 module-name = "zippy._internal"
 python-source = "python"
 manifest-path = "crates/zippy-python/Cargo.toml"
+features = ["extension-module"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["python"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.11"
+files = [
+    "python/zippy/__main__.py",
+    "python/zippy/_internal.pyi",
+    "python/zippy/cli.py",
+    "python/zippy/cli_common.py",
+    "python/zippy/cli_gateway.py",
+    "python/zippy/cli_master.py",
+    "python/zippy/cli_stream.py",
+]
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = false
+disallow_untyped_defs = false
+check_untyped_defs = false

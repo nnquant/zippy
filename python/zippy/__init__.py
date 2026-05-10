@@ -51,10 +51,8 @@ if _NATIVE_AVAILABLE:
         from ._internal import MasterClient
         from ._internal import MasterServer
         from ._internal import run_master_daemon
-        from ._internal import BusReader
         from ._internal import KeyValueTableMaterializer as _KeyValueTableMaterializer
         from ._internal import SegmentStreamSource
-        from ._internal import BusWriter
         from ._internal import NullPublisher
         from ._internal import ParquetSink
         from ._internal import Query as _NativeQuery
@@ -101,10 +99,8 @@ if not _NATIVE_AVAILABLE:
     LogSpec = _native_unavailable("LogSpec")
     MasterClient = _native_unavailable("MasterClient")
     MasterServer = _native_unavailable("MasterServer")
-    BusReader = _native_unavailable("BusReader")
     _KeyValueTableMaterializer = _native_unavailable("KeyValueTableMaterializer")
     SegmentStreamSource = _native_unavailable("SegmentStreamSource")
-    BusWriter = _native_unavailable("BusWriter")
     NullPublisher = _native_unavailable("NullPublisher")
     ParquetSink = _native_unavailable("ParquetSink")
     _NativeQuery = _native_unavailable("Query")
@@ -174,6 +170,13 @@ _BUILTIN_CONFIG: dict[str, object] = {
                 "dt_column": None,
                 "id_column": None,
                 "dt_part": None,
+            },
+            "compaction": {
+                "enabled": False,
+                "interval_sec": 300.0,
+                "min_files": 8,
+                "delete_sources": True,
+                "sort_column": None,
             },
         },
     },
@@ -653,10 +656,113 @@ def _query_plan_to_json(plan_ops: list[tuple[str, object]]) -> list[dict[str, ob
         elif kind == "rename":
             plan.append({"op": "rename", "mapping": dict(value)})
         elif kind == "join":
-            raise ValueError("remote query join is not supported in this gateway version")
+            other = value["other"]
+            plan.append(
+                {
+                    "op": "join",
+                    "right_source": getattr(other, "source", None),
+                    "on": list(value["on"]),
+                    "how": value["how"],
+                    "suffix": value["suffix"],
+                }
+            )
         else:
             raise ValueError(f"unsupported table plan operation=[{kind}]")
     return plan
+
+
+def _remote_filter_expr_supported(expr: object) -> bool:
+    if not isinstance(expr, _QueryExpr):
+        return False
+    if expr._kind != "binary":
+        return False
+    op = str(expr._value)
+    left, right = expr._args
+    if op in {"and", "or"}:
+        return _remote_filter_expr_supported(left) and _remote_filter_expr_supported(right)
+    if op not in {"eq", "ne", "gt", "ge", "lt", "le"}:
+        return False
+    return _simple_column_literal_pair(left, right) is not None or (
+        _simple_column_literal_pair(right, left) is not None
+    )
+
+
+def _remote_select_exprs_supported(exprs: object) -> bool:
+    if not isinstance(exprs, list):
+        return False
+    return all(
+        isinstance(expr, str) or (isinstance(expr, _QueryExpr) and expr._kind == "col")
+        for expr in exprs
+    )
+
+
+def _remote_sort_spec_supported(spec: object) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    keys = spec.get("by")
+    if not isinstance(keys, list):
+        return False
+    return _remote_select_exprs_supported(keys)
+
+
+def _remote_gateway_op_supported(kind: str, value: object) -> bool:
+    if kind == "filter":
+        return _remote_filter_expr_supported(value)
+    if kind == "select":
+        return _remote_select_exprs_supported(value)
+    if kind == "sort":
+        return _remote_sort_spec_supported(value)
+    return kind in {"drop", "rename", "head", "tail", "slice"}
+
+
+def _remote_gateway_plan_split(
+    plan_ops: list[tuple[str, object]],
+) -> tuple[list[tuple[str, object]], list[tuple[str, object]]]:
+    remote_ops: list[tuple[str, object]] = []
+    for index, (kind, value) in enumerate(plan_ops):
+        if kind == "filter" and _remote_filter_expr_supported(value):
+            remote_ops.append((kind, value))
+            continue
+        if kind == "select" and _remote_select_exprs_supported(value):
+            remote_ops.append((kind, value))
+            continue
+        if kind == "sort" and _remote_sort_spec_supported(value):
+            remote_ops.append((kind, value))
+            continue
+        if kind == "drop":
+            remote_ops.append((kind, value))
+            continue
+        if kind == "rename":
+            remote_ops.append((kind, value))
+            continue
+        if kind == "head":
+            remote_ops.append((kind, value))
+            return remote_ops, plan_ops[index + 1 :]
+        if kind == "tail":
+            remote_ops.append((kind, value))
+            return remote_ops, plan_ops[index + 1 :]
+        if kind == "slice":
+            remote_ops.append((kind, value))
+            return remote_ops, plan_ops[index + 1 :]
+        return remote_ops, plan_ops[index:]
+    return remote_ops, []
+
+
+def _remote_gateway_capability_summary(
+    remote_plan: list[tuple[str, object]],
+    residual_plan: list[tuple[str, object]],
+) -> dict[str, object]:
+    unsupported_ops = [
+        kind for kind, value in residual_plan if not _remote_gateway_op_supported(kind, value)
+    ]
+    return {
+        "executor": "remote",
+        "gateway_plan_mode": "prefix",
+        "gateway_plan_ops": [kind for kind, _ in remote_plan],
+        "gateway_residual_ops": [kind for kind, _ in residual_plan],
+        "unsupported_gateway_ops": unsupported_ops,
+        "residual_execution": "client",
+    }
 
 
 def _apply_query_plan_json(table: "Table", plan: list[dict[str, object]]) -> "Table":
@@ -1093,6 +1199,21 @@ def _build_table_alerts(info: dict[str, object]) -> list[dict[str, object]]:
                 ),
             }
         )
+    else:
+        preflight = info.get("active_segment_preflight")
+        if isinstance(preflight, dict) and not _active_segment_preflight_ok(preflight):
+            alerts.append(
+                {
+                    "severity": "error",
+                    "kind": str(preflight.get("kind") or "active_segment_unreadable"),
+                    "table_name": table_name,
+                    "stream_status": stream_status,
+                    "message": str(
+                        preflight.get("message")
+                        or f"active segment preflight failed table_name=[{table_name}]"
+                    ),
+                }
+            )
 
     for event in info.get("persist_events", []) or []:
         if not isinstance(event, dict):
@@ -1109,6 +1230,12 @@ def _build_table_alerts(info: dict[str, object]) -> list[dict[str, object]]:
         alerts.append(alert)
 
     return alerts
+
+
+def _active_segment_preflight_ok(preflight: dict[str, object]) -> bool:
+    status = preflight.get("status")
+    readable = preflight.get("readable")
+    return status == "ok" and readable is not False
 
 
 def _persist_failed_alert_message(table_name: str, event: dict[str, object]) -> str:
@@ -1165,6 +1292,7 @@ def _compact_table(
     *,
     min_files: int = 2,
     delete_sources: bool = True,
+    sort_column: str | None = None,
     master: MasterClient | None = None,
 ) -> dict[str, object]:
     """
@@ -1176,6 +1304,8 @@ def _compact_table(
     :type min_files: int
     :param delete_sources: Whether to delete source parquet files after metadata replacement.
     :type delete_sources: bool
+    :param sort_column: Optional column used to sort compacted parquet rows.
+    :type sort_column: str | None
     :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
     :type master: MasterClient | None
     :returns: Compaction summary.
@@ -1207,11 +1337,16 @@ def _compact_table(
     for group_files in groups.values():
         if len(group_files) < min_files:
             continue
-        compacted_file = _compact_persisted_file_group(table_name, stream, group_files)
+        compacted_file = _compact_persisted_file_group(
+            table_name,
+            stream,
+            group_files,
+            sort_column=sort_column,
+        )
         compacted_files.append(compacted_file)
         for item in group_files:
             compacted_source_keys.add(_persisted_file_compaction_key(item))
-            source_paths.append(Path(str(item["file_path"])))
+            source_paths.append(_validated_persisted_file_local_path(item))
 
     if not compacted_files:
         return {
@@ -1259,6 +1394,7 @@ def _compact_tables(
     *,
     min_files: int = 2,
     delete_sources: bool = True,
+    sort_column: str | None = None,
     continue_on_error: bool = False,
     master: MasterClient | None = None,
 ) -> dict[str, object]:
@@ -1272,6 +1408,8 @@ def _compact_tables(
     :type min_files: int
     :param delete_sources: Whether to delete source parquet files after metadata replacement.
     :type delete_sources: bool
+    :param sort_column: Optional column used to sort compacted parquet rows.
+    :type sort_column: str | None
     :param continue_on_error: Whether to keep compacting other tables after one table fails.
     :type continue_on_error: bool
     :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
@@ -1289,14 +1427,14 @@ def _compact_tables(
 
     for table_name in resolved_table_names:
         try:
-            table_results.append(
-                _compact_table(
-                    table_name,
-                    min_files=min_files,
-                    delete_sources=delete_sources,
-                    master=master_client,
-                )
-            )
+            kwargs: dict[str, object] = {
+                "min_files": min_files,
+                "delete_sources": delete_sources,
+                "master": master_client,
+            }
+            if sort_column is not None:
+                kwargs["sort_column"] = sort_column
+            table_results.append(_compact_table(table_name, **kwargs))
         except Exception as error:
             if not continue_on_error:
                 raise
@@ -1346,163 +1484,6 @@ def _resolve_compaction_table_names(
     return list(dict.fromkeys(names))
 
 
-class _CompactionWorker:
-    """
-    Background worker for low-frequency persisted parquet compaction.
-
-    The worker is intentionally separate from StreamTable writers. Writers publish
-    persisted metadata; this worker periodically reads master catalog state and
-    performs metadata-replacing compaction through ops APIs.
-
-    :param table_names: Optional table name or iterable of table names. ``None`` means
-        discover persisted tables from master on every iteration.
-    :type table_names: object
-    :param interval_sec: Seconds between compaction passes.
-    :type interval_sec: float
-    :param min_files: Minimum files in one partition group before compaction.
-    :type min_files: int
-    :param delete_sources: Whether to delete source parquet files after metadata replacement.
-    :type delete_sources: bool
-    :param master: Master client used for catalog operations.
-    :type master: MasterClient
-    """
-
-    def __init__(
-        self,
-        table_names: object = None,
-        *,
-        interval_sec: float = 60.0,
-        min_files: int = 4,
-        delete_sources: bool = True,
-        master: MasterClient,
-    ) -> None:
-        interval = float(interval_sec)
-        if interval <= 0:
-            raise ValueError("interval_sec must be positive")
-        if min_files < 2:
-            raise ValueError("min_files must be at least 2")
-
-        self.table_names = _freeze_compaction_table_names(table_names)
-        self.interval_sec = interval
-        self.min_files = int(min_files)
-        self.delete_sources = bool(delete_sources)
-        self.master = master
-        self._stop_event = threading.Event()
-        self._lock = threading.Lock()
-        self._reports: list[dict[str, object]] = []
-        self._errors: list[dict[str, str]] = []
-        self._thread = threading.Thread(
-            target=self._run,
-            name="zippy-compaction-worker",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        """
-        Request the compaction worker to stop.
-
-        :returns: None
-        :rtype: None
-        """
-        self._stop_event.set()
-
-    def join(self, timeout: float | None = None) -> None:
-        """
-        Wait until the worker thread exits.
-
-        :param timeout: Optional maximum seconds to wait.
-        :type timeout: float | None
-        :returns: None
-        :rtype: None
-        """
-        self._thread.join(timeout=timeout)
-
-    def is_alive(self) -> bool:
-        """
-        Return whether the worker thread is alive.
-
-        :returns: True if the thread is alive.
-        :rtype: bool
-        """
-        return self._thread.is_alive()
-
-    def latest_report(self) -> dict[str, object] | None:
-        """
-        Return the latest successful compaction pass report.
-
-        :returns: Latest report, or ``None`` before the first pass completes.
-        :rtype: dict[str, object] | None
-        """
-        with self._lock:
-            if not self._reports:
-                return None
-            return dict(self._reports[-1])
-
-    def reports(self) -> list[dict[str, object]]:
-        """
-        Return all successful compaction pass reports recorded by this worker.
-
-        :returns: Report list snapshot.
-        :rtype: list[dict[str, object]]
-        """
-        with self._lock:
-            return [dict(report) for report in self._reports]
-
-    def errors(self) -> list[dict[str, str]]:
-        """
-        Return unexpected worker-level errors.
-
-        Per-table compaction errors are stored inside each report's ``table_errors``.
-
-        :returns: Error list snapshot.
-        :rtype: list[dict[str, str]]
-        """
-        with self._lock:
-            return [dict(error) for error in self._errors]
-
-    def run_once(self) -> dict[str, object]:
-        """
-        Run one compaction pass synchronously.
-
-        :returns: Compaction pass report.
-        :rtype: dict[str, object]
-        """
-        return _compact_tables(
-            self.table_names,
-            min_files=self.min_files,
-            delete_sources=self.delete_sources,
-            continue_on_error=True,
-            master=self.master,
-        )
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                report = self.run_once()
-            except Exception as error:
-                with self._lock:
-                    self._errors.append({"error": str(error)})
-            else:
-                with self._lock:
-                    self._reports.append(report)
-
-            if self._stop_event.wait(self.interval_sec):
-                break
-
-
-def _freeze_compaction_table_names(table_names: object) -> object:
-    if table_names is None or isinstance(table_names, str):
-        return table_names
-    try:
-        names = tuple(str(item) for item in table_names)  # type: ignore[operator]
-    except TypeError as error:
-        raise TypeError("table_names must be a table name or iterable of table names") from error
-    if not names:
-        raise ValueError("table_names must not be empty")
-    return names
-
-
 def _persisted_compaction_groups(
     stream: dict[str, object],
     persisted_files: list[dict[str, object]],
@@ -1513,7 +1494,7 @@ def _persisted_compaction_groups(
         identities = _persisted_segment_identities(item)
         if identities and identities & live_identities:
             continue
-        path = Path(str(item["file_path"]))
+        path = _validated_persisted_file_local_path(item)
         if not path.exists():
             continue
         key = _persisted_compaction_group_key(item, path)
@@ -1537,25 +1518,127 @@ def _compact_persisted_file_group(
     table_name: str,
     stream: dict[str, object],
     group_files: list[dict[str, object]],
+    *,
+    sort_column: str | None = None,
 ) -> dict[str, object]:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    import polars as pl
 
-    tables = [_read_persisted_parquet_file(item["file_path"]) for item in group_files]
-    table = pa.concat_tables([table for table in tables if table.num_rows > 0])
+    frames = []
+    for file_index, item in enumerate(group_files):
+        file_path = _validated_persisted_file_path(item)
+        frames.append(
+            pl.scan_parquet(file_path)
+            .with_row_index("__zippy_compact_row_index")
+            .with_columns(pl.lit(file_index).alias("__zippy_compact_file_index"))
+        )
+    if not frames:
+        raise RuntimeError("compaction group must not be empty")
+
+    lazy_frame = pl.concat(frames, how="vertical")
+    schema = lazy_frame.collect_schema()
+    sort_columns = _resolve_compaction_sort_columns(
+        group_files,
+        schema.names(),
+        sort_column=sort_column,
+    )
+    stable_sort_columns = [
+        *sort_columns,
+        "__zippy_compact_file_index",
+        "__zippy_compact_row_index",
+    ]
+    table = (
+        lazy_frame.sort(stable_sort_columns)
+        .drop(["__zippy_compact_file_index", "__zippy_compact_row_index"])
+        .collect()
+    )
     first_file = group_files[0]
-    target_dir = Path(str(first_file["file_path"])).parent
+    target_dir = _validated_persisted_file_local_path(first_file).parent
     target_path = target_dir / _compacted_parquet_file_name(table_name, group_files)
     temp_path = target_path.with_name(f"{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}")
-    pq.write_table(table, temp_path)
+    table.write_parquet(temp_path)
     os.replace(temp_path, target_path)
     return _compacted_persisted_file_metadata(
         table_name,
         stream,
         group_files,
         target_path,
-        table.num_rows,
+        table.height,
+        stats=_compacted_table_stats(table, sort_columns),
+        sort_columns=sort_columns,
     )
+
+
+def _resolve_compaction_sort_columns(
+    group_files: list[dict[str, object]],
+    available_columns: list[str],
+    *,
+    sort_column: str | None = None,
+) -> list[str]:
+    available = set(available_columns)
+    requested = _optional_config_string(sort_column)
+    if requested is None:
+        requested = _compaction_partition_dt_column(group_files)
+    if requested is None:
+        for candidate in ("dt", "event_ts", "localtime_ns"):
+            if candidate in available:
+                requested = candidate
+                break
+    if requested is None:
+        return []
+    if requested not in available:
+        raise RuntimeError(f"compaction sort column not found column=[{requested}]")
+
+    columns = [requested]
+    for tie_breaker in ("localtime_ns", "seq"):
+        if tie_breaker in available and tie_breaker not in columns:
+            columns.append(tie_breaker)
+    return columns
+
+
+def _compaction_partition_dt_column(group_files: list[dict[str, object]]) -> str | None:
+    for item in group_files:
+        partition_spec = item.get("partition_spec")
+        if not isinstance(partition_spec, dict):
+            continue
+        dt_column = _optional_config_string(partition_spec.get("dt_column"))
+        if dt_column is not None:
+            return dt_column
+    return None
+
+
+def _compacted_table_stats(table: object, sort_columns: list[str]) -> dict[str, object]:
+    if not sort_columns:
+        return {}
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    arrow_table = table.to_arrow()
+    stats: dict[str, object] = {}
+    for column in sort_columns:
+        if column not in arrow_table.column_names:
+            continue
+        values = arrow_table.column(column)
+        if pa.types.is_timestamp(values.type):
+            values = pc.cast(values, pa.int64())
+        min_max = pc.min_max(values).as_py()
+        if not isinstance(min_max, dict):
+            continue
+        min_value = _json_safe_scalar(min_max.get("min"))
+        max_value = _json_safe_scalar(min_max.get("max"))
+        if min_value is None or max_value is None:
+            continue
+        stats[column] = {"min": min_value, "max": max_value}
+    return stats
+
+
+def _json_safe_scalar(value: object) -> object | None:
+    if value is None:
+        return None
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _compacted_parquet_file_name(
@@ -1576,6 +1659,9 @@ def _compacted_persisted_file_metadata(
     group_files: list[dict[str, object]],
     target_path: Path,
     row_count: int,
+    *,
+    stats: dict[str, object],
+    sort_columns: list[str],
 ) -> dict[str, object]:
     first_file = group_files[0]
     source_segments = [
@@ -1604,11 +1690,23 @@ def _compacted_persisted_file_metadata(
             item.get("persist_file_id") or item.get("file_path") for item in group_files
         ],
     }
+    if stats:
+        metadata["stats"] = stats
+    if sort_columns:
+        metadata["sort_columns"] = sort_columns
+    primary_sort_column = sort_columns[0] if sort_columns else None
+    primary_stats = stats.get(primary_sort_column) if primary_sort_column else None
+    if primary_sort_column in {"dt", "event_ts"} and isinstance(primary_stats, dict):
+        metadata["min_event_ts"] = primary_stats.get("min")
+        metadata["max_event_ts"] = primary_stats.get("max")
+    if primary_sort_column == "seq" and isinstance(primary_stats, dict):
+        metadata["min_seq"] = primary_stats.get("min")
+        metadata["max_seq"] = primary_stats.get("max")
     if source_segments:
         metadata["source_segments"] = source_segments
         metadata["source_segment_id"] = source_segments[0]["source_segment_id"]
         metadata["source_generation"] = source_segments[0]["source_generation"]
-    for key in ("partition", "partition_path", "partition_spec"):
+    for key in ("partition", "partition_path", "partition_spec", "persist_data_root"):
         if key in first_file:
             metadata[key] = first_file[key]
     return metadata
@@ -1725,6 +1823,7 @@ class Ops:
         *,
         min_files: int = 2,
         delete_sources: bool = True,
+        sort_column: str | None = None,
         master: MasterClient | None = None,
     ) -> dict[str, object]:
         """
@@ -1736,6 +1835,8 @@ class Ops:
         :type min_files: int
         :param delete_sources: Whether to delete source parquet files after metadata replacement.
         :type delete_sources: bool
+        :param sort_column: Optional column used to sort compacted parquet rows.
+        :type sort_column: str | None
         :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
         :type master: MasterClient | None
         :returns: Compaction summary.
@@ -1745,6 +1846,7 @@ class Ops:
             table_name,
             min_files=min_files,
             delete_sources=delete_sources,
+            sort_column=sort_column,
             master=master,
         )
 
@@ -1754,6 +1856,7 @@ class Ops:
         *,
         min_files: int = 2,
         delete_sources: bool = True,
+        sort_column: str | None = None,
         continue_on_error: bool = False,
         master: MasterClient | None = None,
     ) -> dict[str, object]:
@@ -1767,6 +1870,8 @@ class Ops:
         :type min_files: int
         :param delete_sources: Whether to delete source parquet files after metadata replacement.
         :type delete_sources: bool
+        :param sort_column: Optional column used to sort compacted parquet rows.
+        :type sort_column: str | None
         :param continue_on_error: Whether to keep compacting other tables after one table fails.
         :type continue_on_error: bool
         :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
@@ -1778,46 +1883,9 @@ class Ops:
             table_names,
             min_files=min_files,
             delete_sources=delete_sources,
+            sort_column=sort_column,
             continue_on_error=continue_on_error,
             master=master,
-        )
-
-    def start_compaction_worker(
-        self,
-        table_names: object = None,
-        *,
-        interval_sec: float = 60.0,
-        min_files: int = 4,
-        delete_sources: bool = True,
-        master: MasterClient | None = None,
-    ):
-        """
-        Start a background worker that periodically compacts persisted parquet files.
-
-        This worker is an ops-side runtime helper. StreamTable writers remain responsible
-        only for writing persisted files and publishing metadata; compaction reads master
-        catalog state and replaces persisted metadata through the control plane.
-
-        :param table_names: Table name, iterable of table names, or ``None`` to discover
-            persisted tables from master on every pass.
-        :type table_names: object
-        :param interval_sec: Seconds between compaction passes.
-        :type interval_sec: float
-        :param min_files: Minimum files in one partition group before compaction.
-        :type min_files: int
-        :param delete_sources: Whether to delete source parquet files after metadata replacement.
-        :type delete_sources: bool
-        :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
-        :type master: MasterClient | None
-        :returns: Background compaction worker handle.
-        :rtype: object
-        """
-        return _CompactionWorker(
-            table_names,
-            interval_sec=interval_sec,
-            min_files=min_files,
-            delete_sources=delete_sources,
-            master=master or _default_master(),
         )
 
 
@@ -1947,7 +2015,15 @@ def _wait_for_table_ready(
         else:
             if stream.get("data_path") != "segment":
                 return
-            if stream.get("status") != "stale" and stream.get("active_segment_descriptor"):
+            preflight = stream.get("active_segment_preflight")
+            preflight_ready = not isinstance(preflight, dict) or _active_segment_preflight_ok(
+                preflight
+            )
+            if (
+                stream.get("status") != "stale"
+                and stream.get("active_segment_descriptor")
+                and preflight_ready
+            ):
                 return
             last_error = RuntimeError(
                 "table is not ready " f"source=[{source}] status=[{stream.get('status')}]"
@@ -1992,10 +2068,7 @@ def _ensure_default_control_agent() -> None:
     with _DEFAULT_CONTROL_AGENT_LOCK:
         if _DEFAULT_MASTER is None:
             return
-        if (
-            _DEFAULT_CONTROL_AGENT is not None
-            and _DEFAULT_CONTROL_AGENT.master is _DEFAULT_MASTER
-        ):
+        if _DEFAULT_CONTROL_AGENT is not None and _DEFAULT_CONTROL_AGENT.master is _DEFAULT_MASTER:
             return
 
         process_id = getattr(_DEFAULT_MASTER, "process_id", lambda: None)()
@@ -2255,7 +2328,17 @@ def _remote_request(
             f"endpoint=[{endpoint}] host=[{host}] port=[{port}] timeout_sec=[{timeout_sec}] "
             f"kind=[{header.get('kind')}]"
         ) from error
+    except RuntimeError as error:
+        if token is None and "connection closed while reading frame" in str(error):
+            raise RuntimeError(
+                "remote gateway request failed reason=[unauthorized remote gateway request]"
+            ) from error
+        raise
     except OSError as error:
+        if token is None and isinstance(error, ConnectionResetError):
+            raise RuntimeError(
+                "remote gateway request failed reason=[unauthorized remote gateway request]"
+            ) from error
         raise RuntimeError(
             "remote gateway request failed "
             f"endpoint=[{endpoint}] host=[{host}] port=[{port}] error=[{error}]"
@@ -2483,6 +2566,7 @@ class _RemoteQuery:
         self.endpoint = endpoint or _remote_gateway_endpoint(master)
         self.token = token if token is not None else _remote_gateway_token(master)
         self._last_collect_metrics: dict[str, object] = {}
+        self._snapshot_ids: set[str] = set()
         if self.endpoint is None:
             raise RuntimeError(f"remote gateway endpoint missing source=[{source}]")
 
@@ -2509,27 +2593,53 @@ class _RemoteQuery:
         return dict(response.get("stream", {}))
 
     def snapshot(self) -> dict[str, object]:
+        response, _ = _remote_request(
+            self.endpoint,
+            {"kind": "create_snapshot", "source": self.source},
+            token=self.token,
+        )
+        snapshot = response.get("snapshot")
+        if isinstance(snapshot, dict):
+            snapshot = dict(snapshot)
+            snapshot_id = snapshot.get("snapshot_id")
+            if snapshot_id is not None:
+                self._snapshot_ids.add(str(snapshot_id))
+            return snapshot
+        snapshot_id = response.get("snapshot_id")
+        if snapshot_id is None:
+            raise RuntimeError(
+                f"remote gateway snapshot response missing snapshot_id source=[{self.source}]"
+            )
+        self._snapshot_ids.add(str(snapshot_id))
         return {
             "stream_name": self.source,
             "data_path": "remote_gateway",
             "remote_gateway_endpoint": self.endpoint,
+            "snapshot_id": str(snapshot_id),
         }
 
     def tail(self, n: int):
-        table = self.collect_plan([], snapshot=True)
+        table = self.collect_plan([], snapshot=self.snapshot())
         if n == 0:
             return table.slice(0, 0)
         return table.slice(max(0, table.num_rows - n), n)
 
-    def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool):
+    def collect_plan(self, plan: list[dict[str, object]], *, snapshot: object):
+        header = {
+            "kind": "collect",
+            "source": str(self.source),
+            "plan": plan,
+        }
+        if isinstance(snapshot, dict):
+            snapshot_id = snapshot.get("snapshot_id")
+            if snapshot_id is None:
+                raise RuntimeError(f"remote snapshot missing snapshot_id source=[{self.source}]")
+            header["snapshot_id"] = str(snapshot_id)
+        else:
+            header["snapshot"] = bool(snapshot)
         response, payload = _remote_request(
             self.endpoint,
-            {
-                "kind": "collect",
-                "source": str(self.source),
-                "plan": plan,
-                "snapshot": bool(snapshot),
-            },
+            header,
             token=self.token,
         )
         metrics = response.get("metrics", {})
@@ -2538,6 +2648,27 @@ class _RemoteQuery:
 
     def last_collect_metrics(self) -> dict[str, object]:
         return dict(self._last_collect_metrics)
+
+    def release_snapshot(self, snapshot_id: str) -> None:
+        if snapshot_id not in self._snapshot_ids:
+            return
+        self._snapshot_ids.discard(snapshot_id)
+        _remote_request(
+            self.endpoint,
+            {
+                "kind": "release_snapshot",
+                "source": str(self.source),
+                "snapshot_id": snapshot_id,
+            },
+            token=self.token,
+        )
+
+    def __del__(self) -> None:
+        for snapshot_id in list(getattr(self, "_snapshot_ids", ())):
+            try:
+                self.release_snapshot(snapshot_id)
+            except Exception:
+                pass
 
 
 class RemoteGatewayWriter:
@@ -2590,6 +2721,14 @@ class RemoteGatewayWriter:
         if self._closed:
             return
         self.flush()
+        _remote_request(
+            self.endpoint,
+            {
+                "kind": "close_writer",
+                "stream_name": self.stream_name,
+            },
+            token=self.token,
+        )
         self._closed = True
 
     def _flush_interval_elapsed(self) -> bool:
@@ -3231,10 +3370,15 @@ class Table:
     def _collect_query(self, metrics: dict[str, object] | None):
         remote_collect = getattr(self._inner, "collect_plan", None)
         if callable(remote_collect):
+            optimized_plan = self._optimized_plan_ops()
+            remote_plan, residual_plan = _remote_gateway_plan_split(optimized_plan)
+            snapshot = self.snapshot() if self._snapshot_enabled else False
             result = remote_collect(
-                _query_plan_to_json(self._optimized_plan_ops()),
-                snapshot=self._snapshot_enabled,
+                _query_plan_to_json(remote_plan),
+                snapshot=snapshot,
             )
+            if residual_plan:
+                result = _apply_query_plan_ops_to_arrow(result, residual_plan)
             if metrics is not None:
                 metrics["returned_rows"] = result.num_rows
                 _merge_remote_collect_metrics(metrics, self._inner)
@@ -3289,7 +3433,7 @@ class Table:
         schema = self.schema()
         optimized_plan = self._optimized_plan_ops()
         pushdown_plan = self._pushdown_plan_summary(schema, optimized_plan)
-        return {
+        explanation = {
             "source": self.source,
             "snapshot": self._snapshot_enabled,
             "executor": self._executor_kind(),
@@ -3305,6 +3449,21 @@ class Table:
             "pushdown_plan": pushdown_plan,
             "residual_plan": _query_plan_to_json(self._residual_plan_ops(optimized_plan)),
         }
+        if explanation["executor"] == "remote":
+            remote_plan, remote_residual_plan = _remote_gateway_plan_split(optimized_plan)
+            explanation["gateway_plan"] = _query_plan_to_json(remote_plan)
+            explanation["gateway_residual_plan"] = _query_plan_to_json(remote_residual_plan)
+            explanation["capability"] = _remote_gateway_capability_summary(
+                remote_plan,
+                remote_residual_plan,
+            )
+        else:
+            explanation["capability"] = {
+                "executor": "local",
+                "residual_execution": "local",
+                "unsupported_gateway_ops": [],
+            }
+        return explanation
 
     def to_pyarrow(self):
         """
@@ -3389,7 +3548,7 @@ class Table:
         :raises RuntimeError: If no persisted files are registered for this source.
         """
         files = self.persisted_files()
-        paths = [str(item["file_path"]) for item in files if item.get("file_path")]
+        paths = [_validated_persisted_file_path(item) for item in files if item.get("file_path")]
         if not paths:
             raise RuntimeError(f"persisted files are not registered source=[{self.source}]")
         import pyarrow.dataset as ds
@@ -3540,34 +3699,48 @@ class Table:
         return {"offset": offset, "length": None if length is None else int(length)}
 
     def _collect_tail_pushdown(self, n: int, metrics: dict[str, object] | None = None):
-        snapshot = self.snapshot()
-        live = self._tail_live_snapshot(snapshot, n)
-        _record_live_scan(metrics, live)
-        if n <= 0 or live.num_rows >= n:
-            return live
+        for attempt in range(2):
+            snapshot = self.snapshot()
+            try:
+                live = self._tail_live_snapshot(snapshot, n)
+            except RuntimeError as error:
+                if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                    continue
+                raise
+            _record_live_scan(metrics, live)
+            if n <= 0 or live.num_rows >= n:
+                return live
 
-        persisted = _tail_persisted_rows(snapshot, n - live.num_rows, metrics=metrics)
-        table = _concat_query_tables([persisted, live], self.schema())
-        if table.num_rows > n:
-            return table.slice(table.num_rows - n)
-        return table
+            persisted = _tail_persisted_rows(snapshot, n - live.num_rows, metrics=metrics)
+            table = _concat_query_tables([persisted, live], self.schema())
+            if table.num_rows > n:
+                return table.slice(table.num_rows - n)
+            return table
+        raise RuntimeError("snapshot retry exhausted")
 
     def _collect_head_pushdown(self, n: int, metrics: dict[str, object] | None = None):
-        snapshot = self.snapshot()
-        schema = self.schema()
-        if n <= 0:
-            return _concat_query_tables([], schema)
+        for attempt in range(2):
+            snapshot = self.snapshot()
+            schema = self.schema()
+            if n <= 0:
+                return _concat_query_tables([], schema)
 
-        persisted = _head_persisted_rows(snapshot, n, metrics=metrics)
-        if persisted is not None and persisted.num_rows >= n:
-            return persisted.slice(0, n)
+            persisted = _head_persisted_rows(snapshot, n, metrics=metrics)
+            if persisted is not None and persisted.num_rows >= n:
+                return persisted.slice(0, n)
 
-        remaining = n - (0 if persisted is None else persisted.num_rows)
-        live = self._slice_live_snapshot(snapshot, 0, remaining, metrics=metrics)
-        table = _concat_query_tables([persisted, live], schema)
-        if table.num_rows > n:
-            return table.slice(0, n)
-        return table
+            remaining = n - (0 if persisted is None else persisted.num_rows)
+            try:
+                live = self._slice_live_snapshot(snapshot, 0, remaining, metrics=metrics)
+            except RuntimeError as error:
+                if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                    continue
+                raise
+            table = _concat_query_tables([persisted, live], schema)
+            if table.num_rows > n:
+                return table.slice(0, n)
+            return table
+        raise RuntimeError("snapshot retry exhausted")
 
     def _collect_slice_pushdown(
         self,
@@ -3575,84 +3748,57 @@ class Table:
         length: int | None,
         metrics: dict[str, object] | None = None,
     ):
-        snapshot = self.snapshot()
-        schema = self.schema()
-        if length == 0:
-            return _concat_query_tables([], schema)
+        for attempt in range(2):
+            snapshot = self.snapshot()
+            schema = self.schema()
+            if length == 0:
+                return _concat_query_tables([], schema)
 
-        persisted, persisted_row_count, collected_rows = _slice_persisted_rows(
-            snapshot,
-            offset,
-            length,
-            metrics=metrics,
-        )
-        if length is not None and collected_rows >= length:
-            if persisted is not None:
-                return persisted.slice(0, length)
-            return _concat_query_tables([], schema)
+            persisted, persisted_row_count, collected_rows = _slice_persisted_rows(
+                snapshot,
+                offset,
+                length,
+                metrics=metrics,
+            )
+            if length is not None and collected_rows >= length:
+                if persisted is not None:
+                    return persisted.slice(0, length)
+                return _concat_query_tables([], schema)
 
-        live_offset = max(0, offset - persisted_row_count)
-        live_length = None if length is None else length - collected_rows
-        live = self._slice_live_snapshot(
-            snapshot,
-            live_offset,
-            live_length,
-            metrics=metrics,
-        )
-        table = _concat_query_tables([persisted, live], schema)
-        if length is not None and table.num_rows > length:
-            return table.slice(0, length)
-        return table
+            live_offset = max(0, offset - persisted_row_count)
+            live_length = None if length is None else length - collected_rows
+            try:
+                live = self._slice_live_snapshot(
+                    snapshot,
+                    live_offset,
+                    live_length,
+                    metrics=metrics,
+                )
+            except RuntimeError as error:
+                if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                    continue
+                raise
+            table = _concat_query_tables([persisted, live], schema)
+            if length is not None and table.num_rows > length:
+                return table.slice(0, length)
+            return table
+        raise RuntimeError("snapshot retry exhausted")
 
     def _apply_query_plan(self, table):
         plan_ops = self._optimized_plan_ops()
-        if not plan_ops:
-            return table
-
-        import polars as pl
-
-        source_schema = table.schema
-        frame = pl.from_arrow(table).lazy()
-        for kind, value in plan_ops:
-            if kind == "filter":
-                frame = frame.filter(_compile_query_expr_to_polars(value))
-            elif kind == "select":
-                frame = frame.select([_compile_query_expr_to_polars(expr) for expr in value])
-            elif kind == "with_columns":
-                frame = frame.with_columns([_compile_query_expr_to_polars(expr) for expr in value])
-            elif kind == "join":
-                other = value["other"]
-                right_frame = pl.from_arrow(other.collect()).lazy()
-                frame = frame.join(
-                    right_frame,
-                    on=value["on"],
-                    how=value["how"],
-                    suffix=value["suffix"],
-                )
-            elif kind == "tail":
-                frame = frame.tail(int(value))
-            elif kind == "head":
-                frame = frame.head(int(value))
-            elif kind == "slice":
-                frame = frame.slice(int(value["offset"]), value["length"])
-            elif kind == "sort":
-                frame = frame.sort(
-                    [_compile_query_expr_to_polars(expr) for expr in value["by"]],
-                    descending=value["descending"],
-                )
-            elif kind == "drop":
-                frame = frame.drop(list(value))
-            elif kind == "rename":
-                frame = frame.rename(dict(value))
-            else:
-                raise ValueError(f"unsupported table plan operation=[{kind}]")
-        return _restore_query_schema_types(frame.collect().to_arrow(), source_schema)
+        return _apply_query_plan_ops_to_arrow(table, plan_ops)
 
     def _scan_live_snapshot(self, snapshot: dict[str, object]):
         scan_snapshot = getattr(self._inner, "scan_snapshot", None)
         if callable(scan_snapshot):
             return scan_snapshot(snapshot)
         return self._inner.scan_live()
+
+    def _reset_snapshot_after_lease_target_error(self, error: RuntimeError) -> bool:
+        if "segment reader lease target not found" not in str(error):
+            return False
+        self._fixed_snapshot = None
+        return True
 
     def _tail_live_snapshot(self, snapshot: dict[str, object], n: int):
         tail_snapshot = getattr(self._inner, "tail_snapshot", None)
@@ -3892,7 +4038,7 @@ def _tail_persisted_rows(
     tables = []
     row_count = 0
     for item in reversed(sorted(files, key=_persisted_file_order_key)):
-        table = _read_persisted_parquet_file(item["file_path"])
+        table = _read_persisted_parquet_file(_validated_persisted_file_path(item))
         _record_persisted_file_scan(metrics, item, table)
         if table.num_rows == 0:
             continue
@@ -3926,7 +4072,7 @@ def _head_persisted_rows(
     tables = []
     remaining = n
     for item in sorted(files, key=_persisted_file_order_key):
-        table = _read_persisted_parquet_file(item["file_path"])
+        table = _read_persisted_parquet_file(_validated_persisted_file_path(item))
         _record_persisted_file_scan(metrics, item, table)
         if table.num_rows == 0:
             continue
@@ -3965,7 +4111,7 @@ def _slice_persisted_rows(
         if requested_end is not None and absolute_position >= requested_end:
             break
 
-        table = _read_persisted_parquet_file(item["file_path"])
+        table = _read_persisted_parquet_file(_validated_persisted_file_path(item))
         _record_persisted_file_scan(metrics, item, table)
         file_row_count = table.num_rows
         file_start = absolute_position
@@ -4020,7 +4166,7 @@ def _collect_persisted_rows(
     tables = []
     for item in sorted(files, key=_persisted_file_order_key):
         table = _read_persisted_parquet_file(
-            item["file_path"],
+            _validated_persisted_file_path(item),
             columns=columns,
             filters=filters,
         )
@@ -4038,6 +4184,28 @@ def _read_persisted_parquet_file(
     import pyarrow.parquet as pq
 
     return pq.read_table(str(file_path), columns=columns, filters=filters, partitioning=None)
+
+
+def _validated_persisted_file_path(item: dict[str, object]) -> str:
+    file_path = str(item["file_path"])
+    persist_root = item.get("persist_data_root")
+    if persist_root is None:
+        raise RuntimeError("persisted_file.persist_data_root must be a string")
+    path = Path(file_path).expanduser().resolve(strict=True)
+    root = Path(str(persist_root)).expanduser().resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"persisted file outside persist data root path=[{path}] root=[{root}]"
+        ) from exc
+    if not path.is_file():
+        raise RuntimeError(f"persisted file path is not a file path=[{path}]")
+    return str(path)
+
+
+def _validated_persisted_file_local_path(item: dict[str, object]) -> Path:
+    return Path(_validated_persisted_file_path(item))
 
 
 def _record_persisted_file_scan(
@@ -4073,6 +4241,53 @@ def _merge_remote_collect_metrics(metrics: dict[str, object], remote_query: obje
             metrics[key] = gateway_metrics[key]
     if "elapsed_ms" in gateway_metrics:
         metrics["gateway_elapsed_ms"] = gateway_metrics["elapsed_ms"]
+
+
+def _apply_query_plan_ops_to_arrow(
+    table: object,
+    plan_ops: list[tuple[str, object]],
+):
+    if not plan_ops:
+        return table
+
+    import polars as pl
+
+    source_schema = table.schema
+    frame = pl.from_arrow(table).lazy()
+    for kind, value in plan_ops:
+        if kind == "filter":
+            frame = frame.filter(_compile_query_expr_to_polars(value))
+        elif kind == "select":
+            frame = frame.select([_compile_query_expr_to_polars(expr) for expr in value])
+        elif kind == "with_columns":
+            frame = frame.with_columns([_compile_query_expr_to_polars(expr) for expr in value])
+        elif kind == "join":
+            other = value["other"]
+            right_frame = pl.from_arrow(other.collect()).lazy()
+            frame = frame.join(
+                right_frame,
+                on=value["on"],
+                how=value["how"],
+                suffix=value["suffix"],
+            )
+        elif kind == "tail":
+            frame = frame.tail(int(value))
+        elif kind == "head":
+            frame = frame.head(int(value))
+        elif kind == "slice":
+            frame = frame.slice(int(value["offset"]), value["length"])
+        elif kind == "sort":
+            frame = frame.sort(
+                [_compile_query_expr_to_polars(expr) for expr in value["by"]],
+                descending=value["descending"],
+            )
+        elif kind == "drop":
+            frame = frame.drop(list(value))
+        elif kind == "rename":
+            frame = frame.rename(dict(value))
+        else:
+            raise ValueError(f"unsupported table plan operation=[{kind}]")
+    return _restore_query_schema_types(frame.collect().to_arrow(), source_schema)
 
 
 def _persisted_file_matches_filters(
@@ -4354,36 +4569,6 @@ def _int_order_value(value: object) -> int:
         return int(value)
     except (TypeError, ValueError):
         return -1
-
-
-def read_from(
-    stream_name: str,
-    instrument_ids: list[str] | tuple[str, ...] | str | None = None,
-    master: MasterClient | None = None,
-    *,
-    xfast: bool = False,
-) -> BusReader:
-    """
-    Attach a bus reader using the default master connection.
-
-    :param stream_name: Named stream to read.
-    :type stream_name: str
-    :param instrument_ids: Optional instrument filter.
-    :type instrument_ids: list[str] | tuple[str, ...] | str | None
-    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
-    :type master: MasterClient | None
-    :param xfast: Spin instead of sleeping in the low-level bus reader.
-    :type xfast: bool
-    :returns: Bus reader attached to the stream.
-    :rtype: BusReader
-    """
-    selected_master = master or _default_master()
-    _ensure_master_process(selected_master, f"read_from.{stream_name}")
-    return selected_master.read_from(
-        stream_name,
-        instrument_ids=instrument_ids,
-        xfast=xfast,
-    )
 
 
 class Row:
@@ -4753,7 +4938,10 @@ def subscribe(
         if filter is not None and instrument_ids is not None:
             raise ValueError("filter and instrument_ids cannot be used together")
         remote_filter = filter
-        if remote_filter is None and instrument_ids is not None:
+        if filter is not None:
+            instrument_values = _instrument_ids_from_query_filter(filter)
+            remote_filter = col("instrument_id").is_in(instrument_values or [])
+        elif instrument_ids is not None:
             values = [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
             remote_filter = col("instrument_id").is_in(values)
         return RemoteStreamSubscriber(
@@ -4835,6 +5023,8 @@ def subscribe_table(
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
+        if filter is not None:
+            _pyarrow_filters_from_query_filter(filter)
         return RemoteStreamSubscriber(
             source,
             endpoint=remote_endpoint,
@@ -6010,47 +6200,60 @@ class Session:
             raise ValueError("ReactiveLatestEngine stream_table does not support persist=True")
         _ensure_master_process(self.master, self.app or self.name)
         self.master.register_stream(table_name, output_schema, 64, 4096)
-        self._register_materializer_source(table_name)
-        if latest_by is not None:
-            materializer = _KeyValueTableMaterializer(
-                name=table_name,
-                input_schema=output_schema,
-                by=latest_by,
-                source=engine,
-                target=NullPublisher(),
-                descriptor_publisher=self._descriptor_publisher(table_name),
-                row_capacity=table_options["row_capacity"],
-                retention_guard=self._retention_guard(table_name),
-                replacement_retention_snapshots=table_options["replacement_retention_snapshots"],
-            )
-        else:
-            materializer = _StreamTableMaterializer(
-                name=table_name,
-                input_schema=output_schema,
-                source=engine,
-                target=NullPublisher(),
-                descriptor_publisher=self._descriptor_publisher(table_name),
-                row_capacity=table_options["row_capacity"],
-                retention_segments=table_options["retention_segments"],
-                retention_guard=self._retention_guard(table_name),
-                dt_column=table_options["dt_column"],
-                id_column=table_options["id_column"],
-                dt_part=table_options["dt_part"],
-                persist_path=table_options["persist_path"],
-                persist_publisher=(
-                    self._persist_publisher(table_name)
-                    if table_options["persist_path"] is not None
-                    else None
-                ),
-            )
-        self.master.publish_segment_descriptor(table_name, materializer.active_descriptor())
+        source_name = self._register_materializer_source(table_name, table_options)
+        try:
+            writer_epoch = _stream_writer_epoch(self.master, table_name)
+            if latest_by is not None:
+                materializer = _KeyValueTableMaterializer(
+                    name=table_name,
+                    input_schema=output_schema,
+                    by=latest_by,
+                    source=engine,
+                    target=NullPublisher(),
+                    descriptor_publisher=self._descriptor_publisher(table_name),
+                    row_capacity=table_options["row_capacity"],
+                    writer_epoch=writer_epoch,
+                    retention_guard=self._retention_guard(table_name),
+                    replacement_retention_snapshots=table_options[
+                        "replacement_retention_snapshots"
+                    ],
+                )
+            else:
+                materializer = _StreamTableMaterializer(
+                    name=table_name,
+                    input_schema=output_schema,
+                    source=engine,
+                    target=NullPublisher(),
+                    descriptor_publisher=self._descriptor_publisher(table_name),
+                    row_capacity=table_options["row_capacity"],
+                    writer_epoch=writer_epoch,
+                    retention_segments=table_options["retention_segments"],
+                    retention_guard=self._retention_guard(table_name),
+                    dt_column=table_options["dt_column"],
+                    id_column=table_options["id_column"],
+                    dt_part=table_options["dt_part"],
+                    persist_path=table_options["persist_path"],
+                    persist_publisher=(
+                        self._persist_publisher(table_name)
+                        if table_options["persist_path"] is not None
+                        else None
+                    ),
+                )
+            self.master.publish_segment_descriptor(table_name, materializer.active_descriptor())
+        except BaseException:
+            self._unregister_materializer_source_name(source_name)
+            raise
         self._needs_master_process = True
         return materializer
 
-    def _register_materializer_source(self, table_name: str) -> None:
+    def _register_materializer_source(
+        self,
+        table_name: str,
+        table_options: dict[str, object],
+    ) -> str | None:
         register_source = getattr(self.master, "register_source", None)
         if register_source is None:
-            return
+            return None
 
         process_id = None
         get_process_id = getattr(self.master, "process_id", None)
@@ -6062,10 +6265,27 @@ class Session:
             source_name,
             "session_engine_output",
             table_name,
-            {"session": self.name},
+            _stream_table_source_config(table_options, session=self.name),
         )
         if source_name not in self._materializer_source_names:
             self._materializer_source_names.append(source_name)
+        return source_name
+
+    def _unregister_materializer_source_name(self, source_name: str | None) -> None:
+        if source_name is None:
+            return
+        unregister_source = getattr(self.master, "unregister_source", None)
+        if unregister_source is None:
+            if source_name in self._materializer_source_names:
+                self._materializer_source_names.remove(source_name)
+            return
+        try:
+            unregister_source(source_name)
+        except RuntimeError as error:
+            if "source not found" not in str(error):
+                raise
+        if source_name in self._materializer_source_names:
+            self._materializer_source_names.remove(source_name)
 
     def _unregister_materializer_sources(self) -> None:
         unregister_source = getattr(self.master, "unregister_source", None)
@@ -6281,35 +6501,44 @@ class Pipeline:
             source_name,
             self._source_type,
             name,
-            {},
+            _stream_table_source_config(table_options),
         )
         self._registered_source_name = source_name
-        self._engine = _StreamTableMaterializer(
-            name=name,
-            input_schema=schema,
-            source=self._source,
-            target=NullPublisher(),
-            descriptor_publisher=self._descriptor_publisher(name),
-            row_capacity=table_options["row_capacity"],
-            retention_segments=table_options["retention_segments"],
-            retention_guard=self._retention_guard(name),
-            dt_column=table_options["dt_column"],
-            id_column=table_options["id_column"],
-            dt_part=table_options["dt_part"],
-            persist_path=table_options["persist_path"],
-            persist_publisher=(
-                self._persist_publisher(name) if table_options["persist_path"] is not None else None
-            ),
-            # Windows file-backed mappings can be deleted as soon as the
-            # upstream source retires a segment, so default to a table-owned
-            # live segment there unless callers opt in at the native layer.
-            descriptor_forwarding=(
-                table_options["persist_path"] is None
-                and table_options["retention_segments"] is None
-                and os.name != "nt"
-            ),
-        )
-        self.master.publish_segment_descriptor(name, self._engine.active_descriptor())
+        try:
+            writer_epoch = _stream_writer_epoch(self.master, name)
+            self._engine = _StreamTableMaterializer(
+                name=name,
+                input_schema=schema,
+                source=self._source,
+                target=NullPublisher(),
+                descriptor_publisher=self._descriptor_publisher(name),
+                row_capacity=table_options["row_capacity"],
+                writer_epoch=writer_epoch,
+                retention_segments=table_options["retention_segments"],
+                retention_guard=self._retention_guard(name),
+                dt_column=table_options["dt_column"],
+                id_column=table_options["id_column"],
+                dt_part=table_options["dt_part"],
+                persist_path=table_options["persist_path"],
+                persist_publisher=(
+                    self._persist_publisher(name)
+                    if table_options["persist_path"] is not None
+                    else None
+                ),
+                # Windows file-backed mappings can be deleted as soon as the
+                # upstream source retires a segment, so default to a table-owned
+                # live segment there unless callers opt in at the native layer.
+                descriptor_forwarding=(
+                    table_options["persist_path"] is None
+                    and table_options["retention_segments"] is None
+                    and os.name != "nt"
+                ),
+            )
+            self.master.publish_segment_descriptor(name, self._engine.active_descriptor())
+        except BaseException:
+            self._engine = None
+            self._unregister_registered_source()
+            raise
         return self
 
     def start(self) -> "Pipeline":
@@ -6493,6 +6722,38 @@ def _master_config(master: MasterClient) -> dict[str, object]:
     return get_config()
 
 
+def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:
+    get_stream = getattr(master, "get_stream", None)
+    if get_stream is None:
+        return None
+    stream = get_stream(table_name)
+    if not isinstance(stream, dict):
+        stream = dict(stream)
+    writer_epoch = stream.get("writer_epoch")
+    if writer_epoch is None:
+        return None
+    try:
+        writer_epoch_int = int(writer_epoch)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"invalid stream writer_epoch table_name=[{table_name}] writer_epoch=[{writer_epoch}]"
+        ) from exc
+    if writer_epoch_int <= 0:
+        return None
+    return writer_epoch_int
+
+
+def _stream_table_source_config(
+    table_options: dict[str, object],
+    **extra: object,
+) -> dict[str, object]:
+    config = dict(extra)
+    persist_data_root = table_options.get("persist_data_root")
+    if persist_data_root is not None:
+        config["persist_data_root"] = str(persist_data_root)
+    return config
+
+
 def _resolve_stream_table_options(
     *,
     name: str,
@@ -6544,6 +6805,7 @@ def _resolve_stream_table_options(
     _validate_partition_options(dt_column=dt_column, id_column=id_column, dt_part=dt_part)
 
     if persist_path is not None:
+        path = _persist_path(persist_path)
         return {
             "row_capacity": row_capacity,
             "retention_segments": retention_segments,
@@ -6551,7 +6813,8 @@ def _resolve_stream_table_options(
             "dt_column": dt_column,
             "id_column": id_column,
             "dt_part": dt_part,
-            "persist_path": _persist_path(persist_path),
+            "persist_path": path,
+            "persist_data_root": path,
         }
 
     if persist is _USE_MASTER_CONFIG:
@@ -6572,6 +6835,7 @@ def _resolve_stream_table_options(
             "id_column": id_column,
             "dt_part": dt_part,
             "persist_path": None,
+            "persist_data_root": None,
         }
     if persist != "parquet":
         raise ValueError("persist must be 'parquet' or None")
@@ -6585,6 +6849,7 @@ def _resolve_stream_table_options(
         "id_column": id_column,
         "dt_part": dt_part,
         "persist_path": str(root / name),
+        "persist_data_root": str(root),
     }
 
 
@@ -6873,8 +7138,6 @@ __all__ = [
     "MasterClient",
     "MasterServer",
     "run_master_daemon",
-    "BusReader",
-    "BusWriter",
     "NullPublisher",
     "OverflowPolicy",
     "ParquetPersist",
@@ -6937,7 +7200,6 @@ __all__ = [
     "master",
     "ops",
     "read_table",
-    "read_from",
     "replay",
     "subscribe",
     "subscribe_table",

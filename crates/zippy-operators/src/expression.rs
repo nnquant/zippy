@@ -175,6 +175,32 @@ impl ReactiveFactor for PlannedExpressionFactor {
 
         build_output_array(self.plan.output_field.data_type(), output_values)
     }
+
+    fn begin_transaction(&mut self) {
+        for state in &mut self.node_states {
+            if let Some(state) = state.as_mut() {
+                state.begin_transaction();
+            }
+        }
+    }
+
+    fn commit_transaction(&mut self) {
+        for state in &mut self.node_states {
+            if let Some(state) = state.as_mut() {
+                state.commit_transaction();
+            }
+        }
+    }
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        for state in &mut self.node_states {
+            if let Some(state) = state.as_mut() {
+                state.rollback_transaction()?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Typed DAG plan for a reactive expression.

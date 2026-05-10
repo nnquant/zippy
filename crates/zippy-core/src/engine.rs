@@ -12,6 +12,14 @@ pub trait Engine: Send + 'static {
     fn output_schema(&self) -> SchemaRef;
     fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>>;
 
+    fn begin_transaction(&mut self) {}
+
+    fn commit_transaction(&mut self) {}
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         Ok(vec![])
     }

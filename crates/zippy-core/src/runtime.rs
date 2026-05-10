@@ -359,14 +359,23 @@ where
                 match command {
                     Command::Data(table) => {
                         metrics_clone.inc_processed_batch(table.num_rows());
+                        engine.begin_transaction();
                         match engine.on_data(table) {
                             Ok(outputs) => {
                                 metrics_clone.apply_delta(engine.drain_metrics());
                                 metrics_clone.inc_output_batches(outputs.len());
-                                publish_tables(&mut publisher, &metrics_clone, &outputs)?;
+                                if let Err(err) =
+                                    publish_tables(&mut publisher, &metrics_clone, &outputs)
+                                {
+                                    let err = rollback_engine_transaction(&mut engine, err);
+                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
+                                    return Err(err);
+                                }
+                                engine.commit_transaction();
                             }
                             Err(err) => {
                                 metrics_clone.apply_delta(engine.drain_metrics());
+                                let err = rollback_engine_transaction(&mut engine, err);
                                 *status_clone.lock().unwrap() = EngineStatus::Failed;
                                 return Err(err);
                             }
@@ -1098,12 +1107,33 @@ where
     P: Publisher,
 {
     metrics.inc_processed_batch(table.num_rows());
-    let outputs = engine.on_data(table).inspect_err(|_| {
+    engine.begin_transaction();
+    let result = (|| -> Result<()> {
+        let outputs = engine.on_data(table).inspect_err(|_| {
+            metrics.apply_delta(engine.drain_metrics());
+        })?;
         metrics.apply_delta(engine.drain_metrics());
-    })?;
-    metrics.apply_delta(engine.drain_metrics());
-    metrics.inc_output_batches(outputs.len());
-    publish_tables(publisher, metrics, &outputs)
+        metrics.inc_output_batches(outputs.len());
+        publish_tables(publisher, metrics, &outputs)
+    })();
+
+    match result {
+        Ok(()) => {
+            engine.commit_transaction();
+            Ok(())
+        }
+        Err(err) => Err(rollback_engine_transaction(engine, err)),
+    }
+}
+
+fn rollback_engine_transaction<E>(engine: &mut E, err: ZippyError) -> ZippyError
+where
+    E: Engine,
+{
+    match engine.rollback_transaction() {
+        Ok(()) => err,
+        Err(rollback_err) => rollback_err,
+    }
 }
 
 fn process_flush_event<E, P>(

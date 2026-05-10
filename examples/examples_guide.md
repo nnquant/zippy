@@ -101,8 +101,8 @@ uv run zippy stream ls --uri default
 - `zp.ops.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
 - `zp.ops.compact_table(...)`：低频合并 persisted parquet 小文件，按 partition 分组
   生成 compacted parquet，并替换 master 中的 persisted metadata。
-- `zp.ops.compact_tables(...)` / `zp.ops.start_compaction_worker(...)`：批量或后台执行
-  低频 compaction；该类运维任务不属于写入热路径。
+- `zp.ops.compact_tables(...)`：批量执行低频 compaction；周期 compaction 由 master
+  根据 `[table.persist.compaction]` 配置统一调度，不在 Python 侧单独启动后台 worker。
 - `zp.GatewayServer(...)`：native Rust 跨平台数据面服务。日常由 master 根据
   `[gateway]` 配置自动启动和管理；Python 侧这个类只保留为调试/测试胶水。Windows
   侧继续使用 `connect()`、`get_writer()`、`subscribe_table()` 和 `read_table()`，

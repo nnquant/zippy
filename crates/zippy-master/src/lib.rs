@@ -1,7 +1,5 @@
-pub mod bus;
 pub mod daemon;
 pub mod registry;
-pub mod ring;
 pub mod server;
 pub mod snapshot;
 

@@ -708,14 +708,18 @@ impl<P> Publisher for CountingPublisher<P>
 where
     P: Publisher,
 {
-    fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
+    fn publish_table(&mut self, table: &SegmentTableView) -> Result<()> {
         self.counters
             .output_batches_total
             .fetch_add(1, Ordering::Relaxed);
         self.counters
             .output_rows_total
-            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-        self.inner.publish(batch)
+            .fetch_add(table.num_rows() as u64, Ordering::Relaxed);
+        self.inner.publish_table(table)
+    }
+
+    fn publish(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.publish_table(&SegmentTableView::from_record_batch(batch.clone()))
     }
 
     fn flush(&mut self) -> Result<()> {

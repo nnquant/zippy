@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const BUS_LAYOUT_VERSION: u32 = 1;
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +11,8 @@ pub struct RegisterProcessRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,8 @@ pub enum WatchResource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchRequest {
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub resource: WatchResource,
     pub after_revision: u64,
     pub timeout_ms: u64,
@@ -46,6 +49,10 @@ pub struct ControlEnvelopeRequest {
     pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verb: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,10 +77,18 @@ pub struct ControlEnvelopeResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnregisterProcessRequest {
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterStreamRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub stream_name: String,
     #[serde(default = "default_stream_schema")]
     pub schema: serde_json::Value,
@@ -95,6 +110,8 @@ pub struct RegisterSourceRequest {
     pub source_name: String,
     pub source_type: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub output_stream: String,
     pub config: serde_json::Value,
 }
@@ -103,6 +120,8 @@ pub struct RegisterSourceRequest {
 pub struct UnregisterSourceRequest {
     pub source_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +129,8 @@ pub struct RegisterEngineRequest {
     pub engine_name: String,
     pub engine_type: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub input_stream: String,
     pub output_stream: String,
     pub sink_names: Vec<String>,
@@ -121,38 +142,24 @@ pub struct RegisterSinkRequest {
     pub sink_name: String,
     pub sink_type: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub input_stream: String,
     pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateRecordStatusRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub kind: String,
     pub name: String,
     pub status: String,
     pub metrics: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttachStreamRequest {
-    pub stream_name: String,
-    pub process_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instrument_ids: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetachWriterRequest {
-    pub stream_name: String,
-    pub process_id: String,
-    pub writer_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DetachReaderRequest {
-    pub stream_name: String,
-    pub process_id: String,
-    pub reader_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +171,10 @@ pub struct StreamInfo {
     pub descriptor_generation: u64,
     #[serde(default)]
     pub active_segment_descriptor: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_segment_preflight: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_row_capacity: Option<usize>,
     #[serde(default)]
     pub sealed_segments: Vec<serde_json::Value>,
     #[serde(default)]
@@ -195,6 +206,12 @@ pub struct GetConfigRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DropTableRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub table_name: String,
     pub drop_persisted: bool,
 }
@@ -203,6 +220,8 @@ pub struct DropTableRequest {
 pub struct PublishSegmentDescriptorRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub descriptor: serde_json::Value,
 }
 
@@ -210,12 +229,20 @@ pub struct PublishSegmentDescriptorRequest {
 pub struct PublishPersistedFileRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub persisted_file: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplacePersistedFilesRequest {
     pub stream_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     pub persisted_files: Vec<serde_json::Value>,
 }
 
@@ -223,6 +250,8 @@ pub struct ReplacePersistedFilesRequest {
 pub struct PublishPersistEventRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub persist_event: serde_json::Value,
 }
 
@@ -230,6 +259,8 @@ pub struct PublishPersistEventRequest {
 pub struct AcquireSegmentReaderLeaseRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub source_segment_id: u64,
     pub source_generation: u64,
 }
@@ -238,6 +269,8 @@ pub struct AcquireSegmentReaderLeaseRequest {
 pub struct ReleaseSegmentReaderLeaseRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
     pub lease_id: String,
 }
 
@@ -245,6 +278,8 @@ pub struct ReleaseSegmentReaderLeaseRequest {
 pub struct GetSegmentDescriptorRequest {
     pub stream_name: String,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,32 +302,6 @@ pub struct DropTableResult {
     pub persisted_files_deleted: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriterDescriptor {
-    pub stream_name: String,
-    pub buffer_size: usize,
-    pub frame_size: usize,
-    pub layout_version: u32,
-    pub shm_name: String,
-    pub writer_id: String,
-    pub process_id: String,
-    pub next_write_seq: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReaderDescriptor {
-    pub stream_name: String,
-    pub buffer_size: usize,
-    pub frame_size: usize,
-    pub layout_version: u32,
-    pub shm_name: String,
-    pub reader_id: String,
-    pub process_id: String,
-    pub next_read_seq: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instrument_filter: Option<Vec<String>>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
     Envelope(ControlEnvelopeRequest),
@@ -306,10 +315,6 @@ pub enum ControlRequest {
     RegisterEngine(RegisterEngineRequest),
     RegisterSink(RegisterSinkRequest),
     UpdateStatus(UpdateRecordStatusRequest),
-    WriteTo(AttachStreamRequest),
-    ReadFrom(AttachStreamRequest),
-    CloseWriter(DetachWriterRequest),
-    CloseReader(DetachReaderRequest),
     ListStreams(ListStreamsRequest),
     GetStream(GetStreamRequest),
     GetConfig(GetConfigRequest),
@@ -328,6 +333,7 @@ pub enum ControlResponse {
     Envelope(ControlEnvelopeResponse),
     ProcessRegistered {
         process_id: String,
+        process_token: String,
     },
     HeartbeatAccepted {
         process_id: String,
@@ -357,20 +363,6 @@ pub enum ControlResponse {
     StatusUpdated {
         kind: String,
         name: String,
-    },
-    WriterAttached {
-        descriptor: WriterDescriptor,
-    },
-    ReaderAttached {
-        descriptor: ReaderDescriptor,
-    },
-    WriterDetached {
-        stream_name: String,
-        writer_id: String,
-    },
-    ReaderDetached {
-        stream_name: String,
-        reader_id: String,
     },
     StreamsListed(ListStreamsResponse),
     StreamFetched(GetStreamResponse),
@@ -418,7 +410,7 @@ impl fmt::Display for ControlResponse {
                 "control envelope version=[{}] request_id=[{}] response=[{}]",
                 envelope.version, envelope.request_id, envelope.inner
             ),
-            Self::ProcessRegistered { process_id } => {
+            Self::ProcessRegistered { process_id, .. } => {
                 write!(f, "process registered process_id=[{}]", process_id)
             }
             Self::HeartbeatAccepted { process_id } => {
@@ -450,51 +442,6 @@ impl fmt::Display for ControlResponse {
             Self::StatusUpdated { kind, name } => {
                 write!(f, "status updated kind=[{}] name=[{}]", kind, name)
             }
-            Self::WriterAttached { descriptor } => write!(
-                f,
-                "writer attached stream_name=[{}] writer_id=[{}] process_id=[{}] buffer_size=[{}] frame_size=[{}] layout_version=[{}] shm_name=[{}] next_write_seq=[{}]",
-                descriptor.stream_name,
-                descriptor.writer_id,
-                descriptor.process_id,
-                descriptor.buffer_size,
-                descriptor.frame_size,
-                descriptor.layout_version,
-                descriptor.shm_name,
-                descriptor.next_write_seq
-            ),
-            Self::ReaderAttached { descriptor } => write!(
-                f,
-                "reader attached stream_name=[{}] reader_id=[{}] process_id=[{}] buffer_size=[{}] frame_size=[{}] layout_version=[{}] shm_name=[{}] next_read_seq=[{}] instrument_filter=[{}]",
-                descriptor.stream_name,
-                descriptor.reader_id,
-                descriptor.process_id,
-                descriptor.buffer_size,
-                descriptor.frame_size,
-                descriptor.layout_version,
-                descriptor.shm_name,
-                descriptor.next_read_seq,
-                descriptor
-                    .instrument_filter
-                    .as_ref()
-                    .map(|filters| filters.join(","))
-                    .unwrap_or_default()
-            ),
-            Self::WriterDetached {
-                stream_name,
-                writer_id,
-            } => write!(
-                f,
-                "writer detached stream_name=[{}] writer_id=[{}]",
-                stream_name, writer_id
-            ),
-            Self::ReaderDetached {
-                stream_name,
-                reader_id,
-            } => write!(
-                f,
-                "reader detached stream_name=[{}] reader_id=[{}]",
-                stream_name, reader_id
-            ),
             Self::StreamsListed(response) => write!(
                 f,
                 "streams listed count=[{}]",

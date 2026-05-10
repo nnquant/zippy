@@ -1042,6 +1042,38 @@ fn stream_table_materializer_persists_sealed_segment_and_publishes_metadata() {
 }
 
 #[test]
+fn stream_table_persist_metadata_carries_writer_epoch() {
+    let persist_root = temp_persist_root("metadata-writer-epoch");
+    let persist_publisher = Arc::new(RecordingPersistPublisher::default());
+    let mut materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+        "ticks",
+        input_schema(),
+        2,
+        Some(42),
+    )
+    .unwrap()
+    .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+    .with_persist_publisher(persist_publisher.clone());
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(input_batch_with_rows(
+            3,
+        )))
+        .unwrap();
+
+    materializer
+        .wait_for_persisted_files_for_test(1, Duration::from_secs(2))
+        .unwrap();
+
+    let files = persist_publisher.files.lock().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["stream_name"], "ticks");
+    assert_eq!(files[0]["writer_epoch"], 42);
+
+    let _ = fs::remove_dir_all(persist_root);
+}
+
+#[test]
 fn stream_table_stop_persists_active_segment_and_publishes_metadata() {
     let persist_root = temp_persist_root("stop-active");
     let persist_publisher = Arc::new(RecordingPersistPublisher::default());

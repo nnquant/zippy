@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{Cursor, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Cursor;
+use std::net::{TcpListener as StdTcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::{
     and, concat_batches, filter_record_batch, lexsort_to_indices, or, take, SortColumn, SortOptions,
@@ -24,8 +24,16 @@ use parquet::arrow::{
     ProjectionMask,
 };
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use zippy_core::bus_protocol::{
+    AcquireSegmentReaderLeaseRequest, ReleaseSegmentReaderLeaseRequest,
+};
 use zippy_core::{
-    ControlEndpoint, Engine, MasterClient, Result, SegmentTableView, StreamInfo, ZippyError,
+    canonical_schema_hash, schema_metadata, send_control_line_request, ControlEndpoint,
+    ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
+    ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
+    RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
+    UnregisterSourceRequest, ZippyError,
 };
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
@@ -34,6 +42,15 @@ use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanView,
 };
+
+const MAX_GATEWAY_HEADER_BYTES: usize = 64 * 1024;
+const MAX_GATEWAY_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_GATEWAY_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_GATEWAY_SUBSCRIBERS: usize = 256;
+const DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS: usize = 64;
+const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Native Rust GatewayServer configuration.
 #[derive(Debug, Clone)]
@@ -48,21 +65,30 @@ pub struct GatewayServerConfig {
 pub struct GatewayServer {
     endpoint: String,
     state: Arc<GatewayState>,
-    join_handle: Option<JoinHandle<()>>,
-    heartbeat_handle: Option<JoinHandle<()>>,
+    runtime: Option<GatewayRuntime>,
 }
 
 struct GatewayState {
-    master_endpoint: ControlEndpoint,
-    master: Arc<Mutex<Option<MasterClient>>>,
+    master: Arc<GatewayAsyncMasterClient>,
     token: Option<String>,
     max_write_rows: Option<usize>,
     writers: Mutex<BTreeMap<String, GatewayTableWriter>>,
-    metrics: Mutex<GatewayMetrics>,
+    snapshots: Mutex<HashMap<String, GatewaySnapshot>>,
+    snapshot_counter: AtomicU64,
+    metrics: Arc<Mutex<GatewayMetrics>>,
     stopped: AtomicBool,
+    connection_limit: Arc<tokio::sync::Semaphore>,
+    blocking_limit: Arc<tokio::sync::Semaphore>,
+    subscriber_limit: Arc<tokio::sync::Semaphore>,
+}
+
+struct GatewayRuntime {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    join_handle: JoinHandle<()>,
 }
 
 struct GatewayTableWriter {
+    source_name: String,
     materializer: StreamTableMaterializer,
 }
 
@@ -77,6 +103,54 @@ struct GatewayScannedBatch {
     scanned_rows: usize,
     scanned_live_rows: usize,
     scanned_files: Vec<String>,
+}
+
+struct GatewaySnapshot {
+    source: String,
+    stream: StreamInfo,
+    active_descriptor: Option<Value>,
+    active_committed_row_high_watermark: Option<usize>,
+    _leases: Vec<SegmentReaderLeaseGuard>,
+}
+
+#[derive(Clone)]
+struct GatewaySnapshotView {
+    source: String,
+    stream: StreamInfo,
+    active_descriptor: Option<Value>,
+    active_committed_row_high_watermark: Option<usize>,
+}
+
+#[derive(Clone)]
+struct GatewayMasterProcess {
+    process_id: String,
+    process_token: String,
+}
+
+struct GatewayAsyncMasterClient {
+    endpoint: ControlEndpoint,
+    process: Mutex<Option<GatewayMasterProcess>>,
+    async_register_lock: tokio::sync::Mutex<()>,
+    metrics: Arc<Mutex<GatewayMetrics>>,
+}
+
+struct GatewayFrameHeader {
+    header: Value,
+    payload_len: usize,
+}
+
+#[derive(Clone)]
+struct GatewaySubscribeRequest {
+    source: String,
+    filter: Option<Value>,
+    batch_size: Option<usize>,
+    count: Option<usize>,
+    throttle: Option<Duration>,
+}
+
+struct GatewaySubscribeFetch {
+    next_sent_row_count: usize,
+    batch: Option<RecordBatch>,
 }
 
 #[derive(Clone, Copy)]
@@ -110,7 +184,7 @@ impl GatewayRowRangePushdown {
 }
 
 struct SegmentReaderLeaseGuard {
-    master: Arc<Mutex<Option<MasterClient>>>,
+    master: Arc<GatewayAsyncMasterClient>,
     source: String,
     lease_id: Option<String>,
 }
@@ -125,10 +199,20 @@ struct GatewayMetrics {
     write_rejections_total: u64,
     collect_requests_total: u64,
     subscribe_clients_total: u64,
+    master_async_requests_total: u64,
+    master_process_reregistrations_total: u64,
+    connections_active: u64,
+    connections_rejected_total: u64,
+    blocking_requests_active: u64,
+    blocking_requests_rejected_total: u64,
+    subscribe_clients_active: u64,
+    subscribe_clients_rejected_total: u64,
+    request_timeouts_total: u64,
+    payload_timeouts_total: u64,
 }
 
 struct MasterDescriptorPublisher {
-    master: Arc<Mutex<Option<MasterClient>>>,
+    master: Arc<GatewayAsyncMasterClient>,
     stream_name: String,
 }
 
@@ -142,25 +226,39 @@ impl GatewayServer {
                 });
             }
         }
+        let metrics = Arc::new(Mutex::new(GatewayMetrics::default()));
+        let master = Arc::new(GatewayAsyncMasterClient::new(
+            config.master_endpoint.clone(),
+            Arc::clone(&metrics),
+        ));
         Ok(Self {
             endpoint: normalize_endpoint(&config.endpoint),
             state: Arc::new(GatewayState {
-                master_endpoint: config.master_endpoint,
-                master: Arc::new(Mutex::new(None)),
+                master,
                 token: config.token,
                 max_write_rows: config.max_write_rows,
                 writers: Mutex::new(BTreeMap::new()),
-                metrics: Mutex::new(GatewayMetrics::default()),
+                snapshots: Mutex::new(HashMap::new()),
+                snapshot_counter: AtomicU64::new(0),
+                metrics,
                 stopped: AtomicBool::new(false),
+                connection_limit: Arc::new(tokio::sync::Semaphore::new(
+                    DEFAULT_MAX_GATEWAY_CONNECTIONS,
+                )),
+                blocking_limit: Arc::new(tokio::sync::Semaphore::new(
+                    DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS,
+                )),
+                subscriber_limit: Arc::new(tokio::sync::Semaphore::new(
+                    DEFAULT_MAX_GATEWAY_SUBSCRIBERS,
+                )),
             }),
-            join_handle: None,
-            heartbeat_handle: None,
+            runtime: None,
         })
     }
 
     /// Start serving TCP requests in a background thread.
     pub fn start(mut self) -> Result<Self> {
-        let listener = TcpListener::bind(&self.endpoint).map_err(|error| ZippyError::Io {
+        let listener = StdTcpListener::bind(&self.endpoint).map_err(|error| ZippyError::Io {
             reason: format!(
                 "failed to bind gateway endpoint=[{}] error=[{}]",
                 self.endpoint, error
@@ -181,10 +279,34 @@ impl GatewayServer {
             })?
             .to_string();
 
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .enable_time()
+            .thread_name("zippy-gateway")
+            .build()
+            .map_err(|error| ZippyError::Io {
+                reason: format!("failed to build gateway tokio runtime error=[{}]", error),
+            })?;
+        let listener = {
+            let _runtime_guard = runtime.enter();
+            tokio::net::TcpListener::from_std(listener).map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to create tokio gateway listener endpoint=[{}] error=[{}]",
+                    self.endpoint, error
+                ),
+            })?
+        };
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let state = Arc::clone(&self.state);
-        self.join_handle = Some(thread::spawn(move || serve_loop(listener, state)));
-        let state = Arc::clone(&self.state);
-        self.heartbeat_handle = Some(thread::spawn(move || heartbeat_loop(state)));
+        let join_handle = thread::spawn(move || {
+            runtime.block_on(async move {
+                async_serve_loop(listener, state, shutdown_rx).await;
+            });
+        });
+        self.runtime = Some(GatewayRuntime {
+            shutdown,
+            join_handle,
+        });
         Ok(self)
     }
 
@@ -207,6 +329,16 @@ impl GatewayServer {
             "write_rejections_total": metrics.write_rejections_total,
             "collect_requests_total": metrics.collect_requests_total,
             "subscribe_clients_total": metrics.subscribe_clients_total,
+            "master_async_requests_total": metrics.master_async_requests_total,
+            "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
+            "connections_active": metrics.connections_active,
+            "connections_rejected_total": metrics.connections_rejected_total,
+            "blocking_requests_active": metrics.blocking_requests_active,
+            "blocking_requests_rejected_total": metrics.blocking_requests_rejected_total,
+            "subscribe_clients_active": metrics.subscribe_clients_active,
+            "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
+            "request_timeouts_total": metrics.request_timeouts_total,
+            "payload_timeouts_total": metrics.payload_timeouts_total,
         })
     }
 
@@ -217,18 +349,14 @@ impl GatewayServer {
 
     fn shutdown(&mut self) {
         self.state.stopped.store(true, Ordering::SeqCst);
+        if let Some(runtime) = self.runtime.as_ref() {
+            let _ = runtime.shutdown.send(true);
+        }
         let _ = TcpStream::connect(&self.endpoint);
-        if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+        if let Some(runtime) = self.runtime.take() {
+            let _ = runtime.join_handle.join();
         }
-        if let Some(handle) = self.heartbeat_handle.take() {
-            let _ = handle.join();
-        }
-        let mut writers = self.state.writers.lock().unwrap();
-        for writer in writers.values_mut() {
-            let _ = writer.materializer.on_stop();
-        }
-        writers.clear();
+        self.state.close_all_writers();
     }
 }
 
@@ -240,25 +368,307 @@ impl Drop for GatewayServer {
 
 impl StreamTableDescriptorPublisher for MasterDescriptorPublisher {
     fn publish(&self, descriptor_envelope: Vec<u8>) -> Result<()> {
-        let mut master = self.master.lock().unwrap();
-        let master = master.as_mut().ok_or_else(|| ZippyError::InvalidState {
-            status: "gateway master client is not initialized",
-        })?;
-        master.publish_segment_descriptor_bytes(&self.stream_name, &descriptor_envelope)
+        self.master
+            .publish_segment_descriptor_bytes_blocking(&self.stream_name, &descriptor_envelope)
+    }
+}
+
+impl GatewayAsyncMasterClient {
+    fn new(endpoint: ControlEndpoint, metrics: Arc<Mutex<GatewayMetrics>>) -> Self {
+        Self {
+            endpoint,
+            process: Mutex::new(None),
+            async_register_lock: tokio::sync::Mutex::new(()),
+            metrics,
+        }
+    }
+
+    async fn heartbeat(&self) -> Result<()> {
+        self.with_process_async(|process| {
+            ControlRequest::Heartbeat(HeartbeatRequest {
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+            })
+        })
+        .await
+        .and_then(|response| match response {
+            ControlResponse::HeartbeatAccepted { .. } => Ok(()),
+            ControlResponse::ShutdownRequested { process_id, reason } => {
+                Err(ZippyError::MasterShutdownRequested { process_id, reason })
+            }
+            other => Err(unexpected_response("HeartbeatAccepted", other)),
+        })
+    }
+
+    fn register_stream_blocking(
+        &self,
+        stream_name: &str,
+        schema: SchemaRef,
+        buffer_size: usize,
+        frame_size: usize,
+    ) -> Result<()> {
+        let schema_hash = canonical_schema_hash(&schema);
+        let schema = schema_metadata(&schema);
+        self.with_process_blocking(|process| {
+            ControlRequest::RegisterStream(RegisterStreamRequest {
+                process_id: Some(process.process_id),
+                process_token: Some(process.process_token),
+                token: None,
+                stream_name: stream_name.to_string(),
+                schema: schema.clone(),
+                schema_hash: schema_hash.clone(),
+                buffer_size,
+                frame_size,
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::StreamRegistered { .. } => Ok(()),
+            other => Err(unexpected_response("StreamRegistered", other)),
+        })
+    }
+
+    fn register_source_blocking(
+        &self,
+        source_name: &str,
+        source_type: &str,
+        output_stream: &str,
+        config: Value,
+    ) -> Result<()> {
+        self.with_process_blocking(|process| {
+            ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: source_name.to_string(),
+                source_type: source_type.to_string(),
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+                output_stream: output_stream.to_string(),
+                config: config.clone(),
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::SourceRegistered { .. } => Ok(()),
+            other => Err(unexpected_response("SourceRegistered", other)),
+        })
+    }
+
+    fn unregister_source_blocking(&self, source_name: &str) -> Result<()> {
+        self.with_process_blocking(|process| {
+            ControlRequest::UnregisterSource(UnregisterSourceRequest {
+                source_name: source_name.to_string(),
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::SourceUnregistered { .. } => Ok(()),
+            other => Err(unexpected_response("SourceUnregistered", other)),
+        })
+    }
+
+    fn get_stream_blocking(&self, source: &str) -> Result<StreamInfo> {
+        self.send_request_blocking(ControlRequest::GetStream(GetStreamRequest {
+            stream_name: source.to_string(),
+        }))
+        .and_then(|response| match response {
+            ControlResponse::StreamFetched(response) => Ok(response.stream),
+            other => Err(unexpected_response("StreamFetched", other)),
+        })
+    }
+
+    fn list_streams_blocking(&self) -> Result<Vec<StreamInfo>> {
+        self.send_request_blocking(ControlRequest::ListStreams(ListStreamsRequest {}))
+            .and_then(|response| match response {
+                ControlResponse::StreamsListed(response) => Ok(response.streams),
+                other => Err(unexpected_response("StreamsListed", other)),
+            })
+    }
+
+    fn publish_segment_descriptor_bytes_blocking(
+        &self,
+        stream_name: &str,
+        descriptor: &[u8],
+    ) -> Result<()> {
+        let descriptor = serde_json::from_slice::<Value>(descriptor).map_err(json_zippy_error)?;
+        self.with_process_blocking(|process| {
+            ControlRequest::PublishSegmentDescriptor(PublishSegmentDescriptorRequest {
+                stream_name: stream_name.to_string(),
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+                descriptor: descriptor.clone(),
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::SegmentDescriptorPublished { .. } => Ok(()),
+            other => Err(unexpected_response("SegmentDescriptorPublished", other)),
+        })
+    }
+
+    fn acquire_segment_reader_lease_blocking(
+        &self,
+        stream_name: &str,
+        source_segment_id: u64,
+        source_generation: u64,
+    ) -> Result<String> {
+        self.with_process_blocking(|process| {
+            ControlRequest::AcquireSegmentReaderLease(AcquireSegmentReaderLeaseRequest {
+                stream_name: stream_name.to_string(),
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+                source_segment_id,
+                source_generation,
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::SegmentReaderLeaseAcquired { lease_id, .. } => Ok(lease_id),
+            other => Err(unexpected_response("SegmentReaderLeaseAcquired", other)),
+        })
+    }
+
+    fn release_segment_reader_lease_blocking(
+        &self,
+        stream_name: &str,
+        lease_id: &str,
+    ) -> Result<()> {
+        self.with_process_blocking(|process| {
+            ControlRequest::ReleaseSegmentReaderLease(ReleaseSegmentReaderLeaseRequest {
+                stream_name: stream_name.to_string(),
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+                lease_id: lease_id.to_string(),
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::SegmentReaderLeaseReleased { .. } => Ok(()),
+            other => Err(unexpected_response("SegmentReaderLeaseReleased", other)),
+        })
+    }
+
+    async fn with_process_async(
+        &self,
+        request: impl Fn(GatewayMasterProcess) -> ControlRequest,
+    ) -> Result<ControlResponse> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            let process = self.ensure_process_async().await?;
+            match self.send_request_async(request(process)).await {
+                Ok(response) => return Ok(response),
+                Err(error) if gateway_master_process_invalid(&error) => {
+                    self.clear_process();
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("gateway async master retry must store the last error"))
+    }
+
+    fn with_process_blocking(
+        &self,
+        request: impl Fn(GatewayMasterProcess) -> ControlRequest,
+    ) -> Result<ControlResponse> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            let process = self.ensure_process_blocking()?;
+            match self.send_request_blocking(request(process)) {
+                Ok(response) => return Ok(response),
+                Err(error) if gateway_master_process_invalid(&error) => {
+                    self.clear_process();
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("gateway blocking master retry must store the last error"))
+    }
+
+    async fn ensure_process_async(&self) -> Result<GatewayMasterProcess> {
+        if let Some(process) = self.process.lock().unwrap().clone() {
+            return Ok(process);
+        }
+        let _guard = self.async_register_lock.lock().await;
+        if let Some(process) = self.process.lock().unwrap().clone() {
+            return Ok(process);
+        }
+        let response = self
+            .send_request_async(ControlRequest::RegisterProcess(RegisterProcessRequest {
+                app: "zippy_gateway".to_string(),
+            }))
+            .await?;
+        let process = match response {
+            ControlResponse::ProcessRegistered {
+                process_id,
+                process_token,
+            } => GatewayMasterProcess {
+                process_id,
+                process_token,
+            },
+            other => return Err(unexpected_response("ProcessRegistered", other)),
+        };
+        self.metrics
+            .lock()
+            .unwrap()
+            .master_process_reregistrations_total += 1;
+        *self.process.lock().unwrap() = Some(process.clone());
+        Ok(process)
+    }
+
+    fn ensure_process_blocking(&self) -> Result<GatewayMasterProcess> {
+        let mut guard = self.process.lock().unwrap();
+        if let Some(process) = guard.clone() {
+            return Ok(process);
+        }
+        let response =
+            self.send_request_blocking(ControlRequest::RegisterProcess(RegisterProcessRequest {
+                app: "zippy_gateway".to_string(),
+            }))?;
+        let process = match response {
+            ControlResponse::ProcessRegistered {
+                process_id,
+                process_token,
+            } => GatewayMasterProcess {
+                process_id,
+                process_token,
+            },
+            other => return Err(unexpected_response("ProcessRegistered", other)),
+        };
+        self.metrics
+            .lock()
+            .unwrap()
+            .master_process_reregistrations_total += 1;
+        *guard = Some(process.clone());
+        Ok(process)
+    }
+
+    fn clear_process(&self) {
+        *self.process.lock().unwrap() = None;
+    }
+
+    async fn send_request_async(&self, request: ControlRequest) -> Result<ControlResponse> {
+        self.metrics.lock().unwrap().master_async_requests_total += 1;
+        send_control_request_async(&self.endpoint, request).await
+    }
+
+    fn send_request_blocking(&self, request: ControlRequest) -> Result<ControlResponse> {
+        self.metrics.lock().unwrap().master_async_requests_total += 1;
+        send_control_line_request(&self.endpoint, request)
     }
 }
 
 impl GatewayState {
-    fn handle_request(&self, header: Value, payload: Vec<u8>) -> Result<(Value, Vec<u8>)> {
-        self.increment_metric(|metrics| metrics.requests_total += 1);
-        self.authorize(&header)?;
+    fn handle_authorized_request(
+        &self,
+        header: Value,
+        payload: Vec<u8>,
+    ) -> Result<(Value, Vec<u8>)> {
         match header
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
             "write_batch" => self.handle_write_batch(header, payload),
+            "close_writer" => self.handle_close_writer(header),
             "collect" => self.handle_collect(header),
+            "create_snapshot" => self.handle_create_snapshot(header),
+            "release_snapshot" => self.handle_release_snapshot(header),
             "get_stream" => self.handle_get_stream(header),
             "list_streams" => self.handle_list_streams(),
             "metrics" => Ok((
@@ -301,6 +711,103 @@ impl GatewayState {
         Ok((json!({"status": "ok"}), vec![]))
     }
 
+    fn handle_close_writer(&self, header: Value) -> Result<(Value, Vec<u8>)> {
+        let stream_name = header
+            .get("stream_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "close_writer requires stream_name".to_string(),
+            })?;
+        self.close_writer(stream_name)?;
+        Ok((json!({"status": "ok"}), vec![]))
+    }
+
+    fn handle_create_snapshot(&self, header: Value) -> Result<(Value, Vec<u8>)> {
+        let source = header
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "create_snapshot requires source".to_string(),
+            })?;
+        let stream = self.master.get_stream_blocking(source)?;
+        if stream.data_path != "segment" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "gateway snapshot source is not a segment stream data_path=[{}]",
+                    stream.data_path
+                ),
+            });
+        }
+        if stream.status == "stale" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "stream is stale source=[{}] status=[{}]",
+                    source, stream.status
+                ),
+            });
+        }
+
+        let mut leases = Vec::new();
+        for descriptor in &stream.sealed_segments {
+            leases.push(self.acquire_segment_reader_lease(source, descriptor)?);
+        }
+        let mut pinned_active_high_watermark = None;
+        let active_descriptor = stream.active_segment_descriptor.clone();
+        if let Some(descriptor) = &active_descriptor {
+            leases.push(self.acquire_segment_reader_lease(source, descriptor)?);
+            let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+            pinned_active_high_watermark = Some(active_committed_row_high_watermark(
+                descriptor,
+                segment_schema,
+            )?);
+        } else if stream.persisted_files.is_empty() && stream.sealed_segments.is_empty() {
+            return Err(ZippyError::Io {
+                reason: format!("segment descriptor is not published source=[{}]", source),
+            });
+        }
+
+        let snapshot_id = format!(
+            "snapshot-{}",
+            self.snapshot_counter.fetch_add(1, Ordering::SeqCst) + 1
+        );
+        let snapshot = GatewaySnapshot {
+            source: source.to_string(),
+            stream: stream.clone(),
+            active_descriptor,
+            active_committed_row_high_watermark: pinned_active_high_watermark,
+            _leases: leases,
+        };
+        self.snapshots
+            .lock()
+            .unwrap()
+            .insert(snapshot_id.clone(), snapshot);
+
+        Ok((
+            json!({
+                "status": "ok",
+                "snapshot": {
+                    "snapshot_id": snapshot_id,
+                    "stream_name": source,
+                    "data_path": "remote_gateway",
+                    "descriptor_generation": stream.descriptor_generation,
+                    "writer_epoch": stream.writer_epoch,
+                }
+            }),
+            vec![],
+        ))
+    }
+
+    fn handle_release_snapshot(&self, header: Value) -> Result<(Value, Vec<u8>)> {
+        let snapshot_id = header
+            .get("snapshot_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "release_snapshot requires snapshot_id".to_string(),
+            })?;
+        self.snapshots.lock().unwrap().remove(snapshot_id);
+        Ok((json!({"status": "ok"}), vec![]))
+    }
+
     fn handle_collect(&self, header: Value) -> Result<(Value, Vec<u8>)> {
         let started = Instant::now();
         self.increment_metric(|metrics| metrics.collect_requests_total += 1);
@@ -326,37 +833,54 @@ impl GatewayState {
                 &plan[row_range_residual_start..],
             )?,
         };
+        let snapshot_id = header.get("snapshot_id").and_then(Value::as_str);
         let batch = {
             let writers = self.writers.lock().unwrap();
-            writers
-                .get(source)
-                .map(|writer| writer.materializer.active_record_batch())
-                .transpose()?
+            if snapshot_id.is_some() {
+                None
+            } else {
+                writers
+                    .get(source)
+                    .map(|writer| writer.materializer.active_record_batch())
+                    .transpose()?
+            }
         };
         let mut row_range_pushed = false;
         let mut scan_pushdown_applied = false;
-        let scanned = match batch {
-            Some(batch) => GatewayScannedBatch {
-                scanned_rows: batch.num_rows(),
-                scanned_live_rows: batch.num_rows(),
-                scanned_files: Vec::new(),
-                batch,
-            },
-            None => match row_range_pushdown {
-                Some((pushdown, _)) => {
-                    row_range_pushed = true;
-                    scan_pushdown_applied = true;
-                    self.collect_stream_source_row_range(
-                        source,
-                        pushdown,
-                        &requested_scan_pushdown,
-                    )?
-                }
-                None => {
-                    scan_pushdown_applied = true;
-                    self.collect_stream_source(source, &requested_scan_pushdown)?
-                }
-            },
+        let scanned = if let Some(snapshot_id) = snapshot_id {
+            scan_pushdown_applied = true;
+            let mut scanned =
+                self.collect_snapshot_source(source, snapshot_id, &requested_scan_pushdown)?;
+            if let Some((pushdown, _)) = row_range_pushdown {
+                row_range_pushed = true;
+                let row_range_op = pushdown.to_plan_op();
+                scanned.batch = apply_collect_plan(scanned.batch, &[row_range_op])?;
+            }
+            scanned
+        } else {
+            match batch {
+                Some(batch) => GatewayScannedBatch {
+                    scanned_rows: batch.num_rows(),
+                    scanned_live_rows: batch.num_rows(),
+                    scanned_files: Vec::new(),
+                    batch,
+                },
+                None => match row_range_pushdown {
+                    Some((pushdown, _)) => {
+                        row_range_pushed = true;
+                        scan_pushdown_applied = true;
+                        self.collect_stream_source_row_range(
+                            source,
+                            pushdown,
+                            &requested_scan_pushdown,
+                        )?
+                    }
+                    None => {
+                        scan_pushdown_applied = true;
+                        self.collect_stream_source(source, &requested_scan_pushdown)?
+                    }
+                },
+            }
         };
         let residual_plan = if scan_pushdown_applied {
             &plan[scan_residual_start..]
@@ -416,6 +940,81 @@ impl GatewayState {
         ))
     }
 
+    fn collect_snapshot_source(
+        &self,
+        source: &str,
+        snapshot_id: &str,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
+        let snapshot = {
+            let snapshots = self.snapshots.lock().unwrap();
+            let snapshot = snapshots
+                .get(snapshot_id)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: format!("remote snapshot not found snapshot_id=[{}]", snapshot_id),
+                })?;
+            GatewaySnapshotView {
+                source: snapshot.source.clone(),
+                stream: snapshot.stream.clone(),
+                active_descriptor: snapshot.active_descriptor.clone(),
+                active_committed_row_high_watermark: snapshot.active_committed_row_high_watermark,
+            }
+        };
+        if snapshot.source != source {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "remote snapshot source mismatch snapshot_id=[{}] expected=[{}] got=[{}]",
+                    snapshot_id, snapshot.source, source
+                ),
+            });
+        }
+
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&snapshot.stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_live_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let mut batches = persisted_file_record_batches(
+            &snapshot.stream,
+            scan_pushdown,
+            &mut scanned_rows,
+            &mut scanned_files,
+        )?;
+        if let Some(descriptor) = &snapshot.active_descriptor {
+            let Some(active_committed_row_high_watermark) =
+                snapshot.active_committed_row_high_watermark
+            else {
+                return Err(ZippyError::Io {
+                    reason: format!(
+                        "remote snapshot missing active high watermark snapshot_id=[{}]",
+                        snapshot_id
+                    ),
+                });
+            };
+            let segment_schema =
+                compile_segment_schema_from_stream_metadata(&snapshot.stream.schema)?;
+            let mut live_batches = live_segment_record_batches(
+                descriptor,
+                &snapshot.stream.sealed_segments,
+                segment_schema,
+                active_committed_row_high_watermark,
+                scan_pushdown,
+                &mut scanned_live_rows,
+            )?;
+            scanned_rows = scanned_rows.saturating_add(scanned_live_rows);
+            batches.append(&mut live_batches);
+        }
+
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(
+                schema_for_scan_pushdown(&schema, scan_pushdown)?,
+                batches,
+            )?,
+            scanned_rows,
+            scanned_live_rows,
+            scanned_files,
+        })
+    }
+
     fn write_batch(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
         let mut writers = self.writers.lock().unwrap();
         if !writers.contains_key(stream_name) {
@@ -430,19 +1029,37 @@ impl GatewayState {
         Ok(())
     }
 
-    fn create_writer(&self, stream_name: &str, schema: SchemaRef) -> Result<GatewayTableWriter> {
-        let writer_epoch = {
-            self.with_master(|master| {
-                master.register_stream(stream_name, Arc::clone(&schema), 64, 4096)?;
-                master.register_source(
-                    &format!("gateway.{}", stream_name),
-                    "gateway",
-                    stream_name,
-                    json!({}),
-                )?;
-                Ok(master.get_stream(stream_name)?.writer_epoch)
-            })?
+    fn close_writer(&self, stream_name: &str) -> Result<()> {
+        let writer = self.writers.lock().unwrap().remove(stream_name);
+        if let Some(writer) = writer {
+            self.close_table_writer(writer)?;
+        }
+        Ok(())
+    }
+
+    fn close_all_writers(&self) {
+        let writers = {
+            let mut guard = self.writers.lock().unwrap();
+            std::mem::take(&mut *guard)
         };
+        for writer in writers.into_values() {
+            let _ = self.close_table_writer(writer);
+        }
+    }
+
+    fn close_table_writer(&self, mut writer: GatewayTableWriter) -> Result<()> {
+        let stop_result = writer.materializer.on_stop();
+        let unregister_result = self.master.unregister_source_blocking(&writer.source_name);
+        stop_result.and(unregister_result)
+    }
+
+    fn create_writer(&self, stream_name: &str, schema: SchemaRef) -> Result<GatewayTableWriter> {
+        let source_name = format!("gateway.{}", stream_name);
+        self.master
+            .register_stream_blocking(stream_name, Arc::clone(&schema), 64, 4096)?;
+        self.master
+            .register_source_blocking(&source_name, "gateway", stream_name, json!({}))?;
+        let writer_epoch = self.master.get_stream_blocking(stream_name)?.writer_epoch;
 
         let publisher = Arc::new(MasterDescriptorPublisher {
             master: Arc::clone(&self.master),
@@ -456,10 +1073,12 @@ impl GatewayState {
         )?
         .with_descriptor_publisher(publisher);
         let descriptor = materializer.active_descriptor_envelope_bytes()?;
-        self.with_master(|master| {
-            master.publish_segment_descriptor_bytes(stream_name, &descriptor)
-        })?;
-        Ok(GatewayTableWriter { materializer })
+        self.master
+            .publish_segment_descriptor_bytes_blocking(stream_name, &descriptor)?;
+        Ok(GatewayTableWriter {
+            source_name,
+            materializer,
+        })
     }
 
     fn handle_get_stream(&self, header: Value) -> Result<(Value, Vec<u8>)> {
@@ -469,7 +1088,7 @@ impl GatewayState {
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "get_stream requires source".to_string(),
             })?;
-        let stream = self.with_master(|master| master.get_stream(source))?;
+        let stream = self.master.get_stream_blocking(source)?;
         let schema_payload = {
             let writers = self.writers.lock().unwrap();
             writers
@@ -487,7 +1106,7 @@ impl GatewayState {
     }
 
     fn handle_list_streams(&self) -> Result<(Value, Vec<u8>)> {
-        let streams = self.with_master(|master| master.list_streams())?;
+        let streams = self.master.list_streams_blocking()?;
         Ok((json!({"status": "ok", "streams": streams}), vec![]))
     }
 
@@ -515,6 +1134,16 @@ impl GatewayState {
             "write_rejections_total": metrics.write_rejections_total,
             "collect_requests_total": metrics.collect_requests_total,
             "subscribe_clients_total": metrics.subscribe_clients_total,
+            "master_async_requests_total": metrics.master_async_requests_total,
+            "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
+            "connections_active": metrics.connections_active,
+            "connections_rejected_total": metrics.connections_rejected_total,
+            "blocking_requests_active": metrics.blocking_requests_active,
+            "blocking_requests_rejected_total": metrics.blocking_requests_rejected_total,
+            "subscribe_clients_active": metrics.subscribe_clients_active,
+            "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
+            "request_timeouts_total": metrics.request_timeouts_total,
+            "payload_timeouts_total": metrics.payload_timeouts_total,
         })
     }
 
@@ -523,18 +1152,15 @@ impl GatewayState {
         update(&mut metrics);
     }
 
-    fn handle_subscribe_table_stream(&self, stream: &mut TcpStream, header: Value) -> Result<()> {
+    fn parse_subscribe_table_request(&self, header: Value) -> Result<GatewaySubscribeRequest> {
         let source = header
             .get("source")
             .and_then(Value::as_str)
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "subscribe_table requires source".to_string(),
-            })?;
-        if !header.get("filter").unwrap_or(&Value::Null).is_null() {
-            return Err(ZippyError::InvalidConfig {
-                reason: "native gateway subscribe_table filter is not implemented".to_string(),
-            });
-        }
+            })?
+            .to_string();
+        let filter = subscribe_filter_plan(header.get("filter").unwrap_or(&Value::Null));
         let batch_size = header
             .get("batch_size")
             .and_then(Value::as_u64)
@@ -549,92 +1175,82 @@ impl GatewayState {
             .get("throttle_ms")
             .and_then(Value::as_u64)
             .map(Duration::from_millis);
-        self.increment_metric(|metrics| metrics.subscribe_clients_total += 1);
-        write_frame(stream, &json!({"status": "ok", "kind": "subscribed"}), &[])?;
-
-        let mut sent_row_count = 0usize;
-        while !self.stopped.load(Ordering::SeqCst) {
-            let batch = {
-                let writers = self.writers.lock().unwrap();
-                writers
-                    .get(source)
-                    .map(|writer| writer.materializer.active_record_batch())
-                    .transpose()?
-            };
-            let batch = match batch {
-                Some(batch) => Some(batch),
-                None => match self.collect_stream_source(source, &GatewayScanPushdown::default()) {
-                    Ok(scanned) => Some(scanned.batch),
-                    Err(_) => None,
-                },
-            };
-            let Some(batch) = batch else {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            };
-            let total_rows = batch.num_rows();
-            if total_rows < sent_row_count {
-                sent_row_count = 0;
-            }
-            let next_batch = if let Some(count) = count {
-                if total_rows == sent_row_count {
-                    None
-                } else {
-                    let row_count = count.min(total_rows);
-                    Some(batch.slice(total_rows - row_count, row_count))
-                }
-            } else if total_rows > sent_row_count {
-                let row_count = batch_size
-                    .map(|value| value.min(total_rows - sent_row_count))
-                    .unwrap_or(total_rows - sent_row_count);
-                Some(batch.slice(sent_row_count, row_count))
-            } else {
-                None
-            };
-
-            let Some(next_batch) = next_batch else {
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            };
-            if next_batch.num_rows() > 0 {
-                write_frame(
-                    stream,
-                    &json!({"status": "ok", "kind": "table"}),
-                    &encode_ipc_table(&next_batch)?,
-                )?;
-            }
-            sent_row_count = if count.is_some() {
-                total_rows
-            } else {
-                sent_row_count + next_batch.num_rows()
-            };
-            if let Some(throttle) = throttle {
-                thread::sleep(throttle);
-            }
-        }
-        Ok(())
+        Ok(GatewaySubscribeRequest {
+            source,
+            filter,
+            batch_size,
+            count,
+            throttle,
+        })
     }
 
-    fn with_master<T>(&self, mut f: impl FnMut(&mut MasterClient) -> Result<T>) -> Result<T> {
-        let mut guard = self.master.lock().unwrap();
-        let mut last_error = None;
-        for _ in 0..2 {
-            if guard.is_none() {
-                let mut client = MasterClient::connect_endpoint(self.master_endpoint.clone())?;
-                client.register_process("zippy_gateway")?;
-                *guard = Some(client);
-            }
-            let result = f(guard.as_mut().expect("master client initialized"));
-            match result {
-                Ok(value) => return Ok(value),
-                Err(error) if gateway_master_process_invalid(&error) => {
-                    *guard = None;
-                    last_error = Some(error);
+    fn fetch_subscribe_table_batch(
+        &self,
+        request: &GatewaySubscribeRequest,
+        sent_row_count: usize,
+    ) -> Result<GatewaySubscribeFetch> {
+        let batch = {
+            let writers = self.writers.lock().unwrap();
+            writers
+                .get(&request.source)
+                .map(|writer| writer.materializer.active_record_batch())
+                .transpose()?
+        };
+        let batch = match batch {
+            Some(batch) => Some(batch),
+            None => {
+                match self.collect_stream_source(&request.source, &GatewayScanPushdown::default()) {
+                    Ok(scanned) => Some(scanned.batch),
+                    Err(_) => None,
                 }
-                Err(error) => return Err(error),
             }
-        }
-        Err(last_error.expect("gateway master process retry must store the last error"))
+        };
+        let Some(batch) = batch else {
+            return Ok(GatewaySubscribeFetch {
+                next_sent_row_count: sent_row_count,
+                batch: None,
+            });
+        };
+        let total_rows = batch.num_rows();
+        let sent_row_count = if total_rows < sent_row_count {
+            0
+        } else {
+            sent_row_count
+        };
+        let mut next_sent_row_count = sent_row_count;
+        let next_batch = if let Some(count) = request.count {
+            if total_rows == sent_row_count {
+                None
+            } else {
+                next_sent_row_count = total_rows;
+                let batch = apply_optional_subscribe_filter(batch, request.filter.as_ref())?;
+                let row_count = count.min(batch.num_rows());
+                if row_count == 0 {
+                    None
+                } else {
+                    Some(batch.slice(batch.num_rows() - row_count, row_count))
+                }
+            }
+        } else if total_rows > sent_row_count {
+            let row_count = request
+                .batch_size
+                .map(|value| value.min(total_rows - sent_row_count))
+                .unwrap_or(total_rows - sent_row_count);
+            next_sent_row_count = sent_row_count + row_count;
+            let batch = batch.slice(sent_row_count, row_count);
+            let batch = apply_optional_subscribe_filter(batch, request.filter.as_ref())?;
+            if batch.num_rows() == 0 {
+                None
+            } else {
+                Some(batch)
+            }
+        } else {
+            None
+        };
+        Ok(GatewaySubscribeFetch {
+            next_sent_row_count,
+            batch: next_batch,
+        })
     }
 
     fn collect_stream_source(
@@ -642,7 +1258,7 @@ impl GatewayState {
         source: &str,
         scan_pushdown: &GatewayScanPushdown,
     ) -> Result<GatewayScannedBatch> {
-        let stream = self.with_master(|master| master.get_stream(source))?;
+        let stream = self.master.get_stream_blocking(source)?;
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
                 reason: format!(
@@ -728,7 +1344,7 @@ impl GatewayState {
         pushdown: GatewayRowRangePushdown,
         scan_pushdown: &GatewayScanPushdown,
     ) -> Result<GatewayScannedBatch> {
-        let stream = self.with_master(|master| master.get_stream(source))?;
+        let stream = self.master.get_stream_blocking(source)?;
         if stream_has_persisted_files(&stream) {
             if let GatewayRowRangePushdown::Tail(n) = pushdown {
                 return self.collect_stream_source_tail(source, &stream, n, scan_pushdown);
@@ -920,9 +1536,9 @@ impl GatewayState {
         descriptor: &Value,
     ) -> Result<SegmentReaderLeaseGuard> {
         let (segment_id, generation) = descriptor_segment_identity(descriptor)?;
-        let lease_id = self.with_master(|master| {
-            master.acquire_segment_reader_lease(source, segment_id, generation)
-        })?;
+        let lease_id = self
+            .master
+            .acquire_segment_reader_lease_blocking(source, segment_id, generation)?;
         Ok(SegmentReaderLeaseGuard {
             master: Arc::clone(&self.master),
             source: source.to_string(),
@@ -941,112 +1557,392 @@ impl Drop for SegmentReaderLeaseGuard {
         let Some(lease_id) = self.lease_id.take() else {
             return;
         };
-        let mut guard = self.master.lock().unwrap();
-        let Some(master) = guard.as_mut() else {
-            return;
-        };
-        let _ = master.release_segment_reader_lease(&self.source, &lease_id);
+        let _ = self
+            .master
+            .release_segment_reader_lease_blocking(&self.source, &lease_id);
     }
 }
 
-fn serve_loop(listener: TcpListener, state: Arc<GatewayState>) {
-    while !state.stopped.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
+async fn async_serve_loop(
+    listener: tokio::net::TcpListener,
+    state: Arc<GatewayState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let heartbeat = tokio::spawn(heartbeat_loop_async(Arc::clone(&state), shutdown.clone()));
+    loop {
+        if state.stopped.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let Ok((mut stream, _)) = accepted else {
+                    break;
+                };
+                let Ok(connection_permit) = state.connection_limit.clone().try_acquire_owned() else {
+                    state.increment_metric(|metrics| metrics.connections_rejected_total += 1);
+                    let _ = write_frame_async(
+                        &mut stream,
+                        &json!({
+                            "status": "error",
+                            "reason": "gateway connection limit exceeded",
+                        }),
+                        &[],
+                    )
+                    .await;
+                    continue;
+                };
+                state.increment_metric(|metrics| metrics.connections_active += 1);
                 let state = Arc::clone(&state);
-                thread::spawn(move || handle_client(stream, state));
+                tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
+                    handle_client_async(stream, Arc::clone(&state)).await;
+                    state.increment_metric(|metrics| {
+                        metrics.connections_active =
+                            metrics.connections_active.saturating_sub(1);
+                    });
+                });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
+        }
+    }
+    heartbeat.abort();
+    let _ = heartbeat.await;
+}
+
+async fn heartbeat_loop_async(
+    state: Arc<GatewayState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
             }
-            Err(_) => break,
+            _ = interval.tick() => {
+                if state.stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = state.master.heartbeat().await;
+            }
         }
     }
 }
 
-fn heartbeat_loop(state: Arc<GatewayState>) {
-    while !state.stopped.load(Ordering::SeqCst) {
-        let mut elapsed = Duration::ZERO;
-        while elapsed < Duration::from_secs(1) {
-            thread::sleep(Duration::from_millis(100));
-            if state.stopped.load(Ordering::SeqCst) {
-                return;
-            }
-            elapsed += Duration::from_millis(100);
-        }
-
-        let mut guard = state.master.lock().unwrap();
-        let Some(master) = guard.as_mut() else {
-            continue;
-        };
-        if let Err(error) = master.heartbeat() {
-            if gateway_master_process_invalid(&error) {
-                *guard = None;
-            }
-        }
-    }
-}
-
-fn handle_client(mut stream: TcpStream, state: Arc<GatewayState>) {
-    let result = match read_frame(&mut stream) {
-        Ok((header, _payload))
-            if header.get("kind").and_then(Value::as_str) == Some("subscribe_table") =>
-        {
+async fn handle_client_async(mut stream: tokio::net::TcpStream, state: Arc<GatewayState>) {
+    let result = match read_frame_header_async(&mut stream).await {
+        Ok(frame) => {
             state.increment_metric(|metrics| metrics.requests_total += 1);
-            match state
-                .authorize(&header)
-                .and_then(|_| state.handle_subscribe_table_stream(&mut stream, header))
-            {
-                Ok(()) => return,
+            match state.authorize(&frame.header) {
                 Err(error) => Err(error),
+                Ok(())
+                    if frame.header.get("kind").and_then(Value::as_str)
+                        == Some("subscribe_table") =>
+                {
+                    if frame.payload_len != 0 {
+                        Err(ZippyError::InvalidConfig {
+                            reason: "subscribe_table request must not include payload".to_string(),
+                        })
+                    } else {
+                        match handle_subscribe_table_stream_async(
+                            &mut stream,
+                            Arc::clone(&state),
+                            frame.header,
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                Ok(()) => match read_frame_payload_async(&mut stream, frame.payload_len).await {
+                    Ok(payload) => {
+                        let state_for_request = Arc::clone(&state);
+                        run_blocking_request(Arc::clone(&state), move || {
+                            state_for_request.handle_authorized_request(frame.header, payload)
+                        })
+                        .await
+                    }
+                    Err(error) => Err(error),
+                },
             }
         }
-        Ok((header, payload)) => state.handle_request(header, payload),
         Err(error) => Err(error),
     };
     let (header, payload) = match result {
         Ok(response) => response,
         Err(error) => {
-            state.increment_metric(|metrics| metrics.errors_total += 1);
+            record_gateway_error_metric(&state, &error);
             (
                 json!({"status": "error", "reason": error.to_string()}),
                 vec![],
             )
         }
     };
-    let _ = write_frame(&mut stream, &header, &payload);
+    let _ = write_frame_async(&mut stream, &header, &payload).await;
 }
 
-fn read_frame(stream: &mut TcpStream) -> Result<(Value, Vec<u8>)> {
-    let mut prefix = [0u8; 12];
-    stream.read_exact(&mut prefix).map_err(io_error)?;
-    let header_len = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
-    let payload_len = u64::from_be_bytes(prefix[4..12].try_into().unwrap()) as usize;
-    let mut header = vec![0u8; header_len];
-    stream.read_exact(&mut header).map_err(io_error)?;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).map_err(io_error)?;
+async fn handle_subscribe_table_stream_async(
+    stream: &mut tokio::net::TcpStream,
+    state: Arc<GatewayState>,
+    header: Value,
+) -> Result<()> {
+    let request = state.parse_subscribe_table_request(header)?;
+    let Ok(subscriber_permit) = state.subscriber_limit.clone().try_acquire_owned() else {
+        state.increment_metric(|metrics| metrics.subscribe_clients_rejected_total += 1);
+        return Err(ZippyError::Io {
+            reason: "gateway subscriber limit exceeded".to_string(),
+        });
+    };
+    let _subscriber_permit = subscriber_permit;
+    state.increment_metric(|metrics| {
+        metrics.subscribe_clients_total += 1;
+        metrics.subscribe_clients_active += 1;
+    });
+
+    let result = async {
+        write_frame_async(stream, &json!({"status": "ok", "kind": "subscribed"}), &[]).await?;
+        let mut sent_row_count = 0usize;
+        while !state.stopped.load(Ordering::SeqCst) {
+            let request_for_fetch = request.clone();
+            let state_for_fetch = Arc::clone(&state);
+            let fetch = run_blocking_request(Arc::clone(&state), move || {
+                state_for_fetch.fetch_subscribe_table_batch(&request_for_fetch, sent_row_count)
+            })
+            .await?;
+            sent_row_count = fetch.next_sent_row_count;
+            let Some(next_batch) = fetch.batch else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            };
+            if next_batch.num_rows() > 0 {
+                let payload =
+                    run_blocking_request(Arc::clone(&state), move || encode_ipc_table(&next_batch))
+                        .await?;
+                write_frame_async(stream, &json!({"status": "ok", "kind": "table"}), &payload)
+                    .await?;
+            }
+            if let Some(throttle) = request.throttle {
+                tokio::time::sleep(throttle).await;
+            }
+        }
+        Ok(())
     }
+    .await;
+
+    state.increment_metric(|metrics| {
+        metrics.subscribe_clients_active = metrics.subscribe_clients_active.saturating_sub(1);
+    });
+    result
+}
+
+async fn run_blocking_request<T: Send + 'static>(
+    state: Arc<GatewayState>,
+    task: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let Ok(permit) = state.blocking_limit.clone().try_acquire_owned() else {
+        state.increment_metric(|metrics| metrics.blocking_requests_rejected_total += 1);
+        return Err(ZippyError::Io {
+            reason: "gateway blocking request limit exceeded".to_string(),
+        });
+    };
+    state.increment_metric(|metrics| metrics.blocking_requests_active += 1);
+    let task_result = tokio::task::spawn_blocking(task).await;
+    drop(permit);
+    state.increment_metric(|metrics| {
+        metrics.blocking_requests_active = metrics.blocking_requests_active.saturating_sub(1);
+    });
+    task_result.map_err(|error| ZippyError::Io {
+        reason: format!("gateway blocking request failed error=[{}]", error),
+    })?
+}
+
+async fn read_frame_header_async(stream: &mut tokio::net::TcpStream) -> Result<GatewayFrameHeader> {
+    let mut prefix = [0u8; 12];
+    timeout_io(
+        DEFAULT_GATEWAY_HEADER_TIMEOUT,
+        "gateway header read timed out timeout_ms=[5000]",
+        stream.read_exact(&mut prefix),
+    )
+    .await?;
+    let header_len = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
+    let payload_len = u64::from_be_bytes(prefix[4..12].try_into().unwrap());
+    if header_len > MAX_GATEWAY_HEADER_BYTES {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "gateway header length exceeds limit header_len=[{}] max_header_bytes=[{}]",
+                header_len, MAX_GATEWAY_HEADER_BYTES
+            ),
+        });
+    }
+    if payload_len > MAX_GATEWAY_PAYLOAD_BYTES as u64 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "gateway payload length exceeds limit payload_len=[{}] max_payload_bytes=[{}]",
+                payload_len, MAX_GATEWAY_PAYLOAD_BYTES
+            ),
+        });
+    }
+    let mut header = vec![0u8; header_len];
+    timeout_io(
+        DEFAULT_GATEWAY_HEADER_TIMEOUT,
+        "gateway header read timed out timeout_ms=[5000]",
+        stream.read_exact(&mut header),
+    )
+    .await?;
     let header = serde_json::from_slice::<Value>(&header).map_err(|error| ZippyError::Io {
         reason: format!("failed to decode gateway header error=[{}]", error),
     })?;
-    Ok((header, payload))
+    Ok(GatewayFrameHeader {
+        header,
+        payload_len: payload_len as usize,
+    })
 }
 
-fn write_frame(stream: &mut TcpStream, header: &Value, payload: &[u8]) -> Result<()> {
+async fn read_frame_payload_async(
+    stream: &mut tokio::net::TcpStream,
+    payload_len: usize,
+) -> Result<Vec<u8>> {
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        timeout_io(
+            DEFAULT_GATEWAY_PAYLOAD_TIMEOUT,
+            "gateway payload read timed out timeout_ms=[30000]",
+            stream.read_exact(&mut payload),
+        )
+        .await?;
+    }
+    Ok(payload)
+}
+
+async fn write_frame_async(
+    stream: &mut tokio::net::TcpStream,
+    header: &Value,
+    payload: &[u8],
+) -> Result<()> {
     let header = serde_json::to_vec(header).map_err(|error| ZippyError::Io {
         reason: format!("failed to encode gateway header error=[{}]", error),
     })?;
-    stream
-        .write_all(&(header.len() as u32).to_be_bytes())
-        .map_err(io_error)?;
-    stream
-        .write_all(&(payload.len() as u64).to_be_bytes())
-        .map_err(io_error)?;
-    stream.write_all(&header).map_err(io_error)?;
-    stream.write_all(payload).map_err(io_error)?;
+    timeout_io(
+        DEFAULT_GATEWAY_WRITE_TIMEOUT,
+        "gateway frame write timed out timeout_ms=[30000]",
+        stream.write_all(&(header.len() as u32).to_be_bytes()),
+    )
+    .await?;
+    timeout_io(
+        DEFAULT_GATEWAY_WRITE_TIMEOUT,
+        "gateway frame write timed out timeout_ms=[30000]",
+        stream.write_all(&(payload.len() as u64).to_be_bytes()),
+    )
+    .await?;
+    timeout_io(
+        DEFAULT_GATEWAY_WRITE_TIMEOUT,
+        "gateway frame write timed out timeout_ms=[30000]",
+        stream.write_all(&header),
+    )
+    .await?;
+    timeout_io(
+        DEFAULT_GATEWAY_WRITE_TIMEOUT,
+        "gateway frame write timed out timeout_ms=[30000]",
+        stream.write_all(payload),
+    )
+    .await?;
     Ok(())
+}
+
+async fn timeout_io<T>(
+    timeout: Duration,
+    timeout_reason: &'static str,
+    future: impl std::future::Future<Output = std::io::Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(io_error(error)),
+        Err(_) => Err(ZippyError::Io {
+            reason: timeout_reason.to_string(),
+        }),
+    }
+}
+
+async fn send_control_request_async(
+    endpoint: &ControlEndpoint,
+    request: ControlRequest,
+) -> Result<ControlResponse> {
+    match endpoint {
+        #[cfg(unix)]
+        ControlEndpoint::Unix(path) => {
+            let stream = tokio::net::UnixStream::connect(path)
+                .await
+                .map_err(io_error)?;
+            send_control_line_over_async_stream(stream, request).await
+        }
+        #[cfg(not(unix))]
+        ControlEndpoint::Unix(path) => Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "unix control endpoint is not supported on this platform path=[{}]",
+                path.display()
+            ),
+        }),
+        ControlEndpoint::Tcp(addr) => {
+            let stream =
+                tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| ZippyError::Io {
+                        reason: format!("gateway master tcp connect timed out addr=[{}]", addr),
+                    })?
+                    .map_err(io_error)?;
+            stream.set_nodelay(true).map_err(io_error)?;
+            send_control_line_over_async_stream(stream, request).await
+        }
+    }
+}
+
+async fn send_control_line_over_async_stream<S>(
+    mut stream: S,
+    request: ControlRequest,
+) -> Result<ControlResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let payload = serde_json::to_string(&request).map_err(json_zippy_error)?;
+    stream
+        .write_all(payload.as_bytes())
+        .await
+        .map_err(io_error)?;
+    stream.write_all(b"\n").await.map_err(io_error)?;
+    stream.flush().await.map_err(io_error)?;
+
+    let mut response_line = String::new();
+    let mut reader = tokio::io::BufReader::new(stream);
+    reader
+        .read_line(&mut response_line)
+        .await
+        .map_err(io_error)?;
+    let response = serde_json::from_str::<ControlResponse>(response_line.trim_end())
+        .map_err(json_zippy_error)?;
+    match response {
+        ControlResponse::Error { reason } => Err(ZippyError::Io { reason }),
+        other => Ok(other),
+    }
+}
+
+fn record_gateway_error_metric(state: &GatewayState, error: &ZippyError) {
+    let message = error.to_string();
+    state.increment_metric(|metrics| {
+        metrics.errors_total += 1;
+        if message.contains("payload read timed out") {
+            metrics.payload_timeouts_total += 1;
+        } else if message.contains("timed out") {
+            metrics.request_timeouts_total += 1;
+        }
+    });
 }
 
 fn decode_ipc_batches(payload: &[u8]) -> Result<Vec<RecordBatch>> {
@@ -1347,14 +2243,48 @@ fn non_overlapping_persisted_files(stream: &StreamInfo) -> Vec<&Value> {
 }
 
 fn persisted_file_path(value: &Value) -> Result<String> {
-    value
+    let file_path = value
         .get("file_path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
-        .map(str::to_string)
         .ok_or_else(|| ZippyError::InvalidConfig {
             reason: "persisted file metadata missing file_path".to_string(),
-        })
+        })?;
+    let Some(persist_root) = value.get("persist_data_root").and_then(Value::as_str) else {
+        return Ok(file_path.to_string());
+    };
+    let root = fs::canonicalize(persist_root).map_err(|error| ZippyError::InvalidConfig {
+        reason: format!(
+            "failed to canonicalize persisted file root path=[{}] error=[{}]",
+            persist_root, error
+        ),
+    })?;
+    let path = PathBuf::from(file_path);
+    let canonical_path = fs::canonicalize(&path).map_err(|error| ZippyError::InvalidConfig {
+        reason: format!(
+            "failed to canonicalize persisted file path=[{}] error=[{}]",
+            path.display(),
+            error
+        ),
+    })?;
+    if !canonical_path.starts_with(&root) {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "persisted file outside persist data root path=[{}] root=[{}]",
+                canonical_path.display(),
+                root.display()
+            ),
+        });
+    }
+    if !canonical_path.is_file() {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!(
+                "persisted file path is not a file path=[{}]",
+                canonical_path.display()
+            ),
+        });
+    }
+    Ok(canonical_path.to_string_lossy().to_string())
 }
 
 fn live_segment_identities(stream: &StreamInfo) -> std::collections::BTreeSet<(u64, u64)> {
@@ -1460,6 +2390,7 @@ fn live_segment_record_batches(
     Ok(batches)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tail_live_segment_record_batches_with_leases(
     state: &GatewayState,
     source: &str,
@@ -1511,6 +2442,7 @@ fn tail_live_segment_record_batches_with_leases(
     Ok(batches_reversed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn head_live_segment_record_batches_with_leases(
     state: &GatewayState,
     source: &str,
@@ -1566,6 +2498,7 @@ fn head_live_segment_record_batches_with_leases(
     Ok(batches)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn slice_live_segment_record_batches_with_leases(
     state: &GatewayState,
     source: &str,
@@ -1605,7 +2538,7 @@ fn slice_live_segment_record_batches_with_leases(
         }
     }
 
-    if !length.is_some_and(|value| collected_rows >= value) {
+    if length.is_none_or(|value| collected_rows < value) {
         leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
         let active_committed_row_high_watermark =
             active_committed_row_high_watermark(descriptor, segment_schema.clone())?;
@@ -1964,6 +2897,15 @@ fn json_zippy_error(error: serde_json::Error) -> ZippyError {
     }
 }
 
+fn unexpected_response(expected: &str, response: ControlResponse) -> ZippyError {
+    ZippyError::Io {
+        reason: format!(
+            "unexpected control response expected=[{}] actual=[{}]",
+            expected, response
+        ),
+    }
+}
+
 fn segment_zippy_error(error: zippy_segment_store::ZippySegmentStoreError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
@@ -1995,6 +2937,23 @@ fn apply_collect_plan(mut batch: RecordBatch, plan: &[Value]) -> Result<RecordBa
         }
     }
     Ok(batch)
+}
+
+fn subscribe_filter_plan(filter: &Value) -> Option<Value> {
+    if filter.is_null() {
+        return None;
+    }
+    Some(json!({"op": "filter", "expr": filter.clone()}))
+}
+
+fn apply_optional_subscribe_filter(
+    batch: RecordBatch,
+    filter: Option<&Value>,
+) -> Result<RecordBatch> {
+    let Some(filter) = filter else {
+        return Ok(batch);
+    };
+    apply_filter(batch, filter)
 }
 
 fn collect_plan_row_range_prefix(
@@ -2183,6 +3142,9 @@ fn evaluate_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<BooleanArra
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "filter expression requires kind".to_string(),
             })?;
+    if kind == "is_in" {
+        return evaluate_is_in_filter_expr(batch, expr);
+    }
     if kind != "binary" {
         return Err(ZippyError::InvalidConfig {
             reason: format!(
@@ -2218,6 +3180,127 @@ fn evaluate_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<BooleanArra
         return Ok(mask);
     }
     compare_filter_expr(batch, op, &args[0], &args[1])
+}
+
+fn evaluate_is_in_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<BooleanArray> {
+    let args = expr
+        .get("args")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() == 2)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "is_in expression requires two args".to_string(),
+        })?;
+    let column_name =
+        query_expr_column_name(&args[0])?.ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "is_in expression requires column target".to_string(),
+        })?;
+    let values = args[1]
+        .get("value")
+        .and_then(Value::as_array)
+        .filter(|_| query_expr_kind(&args[1]) == Some("literal"))
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "is_in expression requires literal value list".to_string(),
+        })?;
+    let column_index =
+        batch
+            .schema()
+            .index_of(column_name)
+            .map_err(|error| ZippyError::SchemaMismatch {
+                reason: format!(
+                    "filter column not found column=[{}] error=[{}]",
+                    column_name, error
+                ),
+            })?;
+    let column = batch.column(column_index);
+    let mask = match column.data_type() {
+        DataType::Utf8 => {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| ZippyError::InvalidConfig {
+                            reason: "string is_in literal values must be strings".to_string(),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let column = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 array must downcast to StringArray");
+            BooleanArray::from(
+                (0..column.len())
+                    .map(|index| {
+                        !column.is_null(index) && values.iter().any(|v| v == column.value(index))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        DataType::Float64 => {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value.as_f64().ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: "float is_in literal values must be numeric".to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let column = column
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 array must downcast to Float64Array");
+            BooleanArray::from(
+                (0..column.len())
+                    .map(|index| !column.is_null(index) && values.contains(&column.value(index)))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        DataType::Int64 => {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value.as_i64().ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: "int is_in literal values must be integers".to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let column = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 array must downcast to Int64Array");
+            BooleanArray::from(
+                (0..column.len())
+                    .map(|index| !column.is_null(index) && values.contains(&column.value(index)))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        DataType::Boolean => {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value.as_bool().ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: "boolean is_in literal values must be boolean".to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let column = column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("boolean array must downcast to BooleanArray");
+            BooleanArray::from(
+                (0..column.len())
+                    .map(|index| !column.is_null(index) && values.contains(&column.value(index)))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        other => {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!("unsupported gateway is_in filter type=[{:?}]", other),
+            });
+        }
+    };
+    Ok(mask)
 }
 
 fn compare_filter_expr(

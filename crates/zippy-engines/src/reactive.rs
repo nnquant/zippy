@@ -10,6 +10,25 @@ use zippy_operators::ReactiveFactor;
 
 use crate::table_view::{project_columns, string_array};
 
+/// Failure handling policy for stateful reactive factor state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactiveStateFailurePolicy {
+    /// Treat publish failures as fatal and discard the engine instance.
+    FailFast,
+    /// Keep a dirty-key undo log so in-process publish failures can roll back touched state.
+    Rollback,
+}
+
+impl ReactiveStateFailurePolicy {
+    /// Return the stable configuration string for this policy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FailFast => "fail_fast",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
 /// Stateful engine that appends reactive factor outputs to each input batch.
 pub struct ReactiveStateEngine {
     name: String,
@@ -20,6 +39,8 @@ pub struct ReactiveStateEngine {
     id_field: Option<String>,
     id_column_index: Option<usize>,
     pending_filtered_rows: u64,
+    state_failure_policy: ReactiveStateFailurePolicy,
+    transaction_active: bool,
 }
 
 impl ReactiveStateEngine {
@@ -38,18 +59,34 @@ impl ReactiveStateEngine {
         input_schema: SchemaRef,
         factors: Vec<Box<dyn ReactiveFactor>>,
     ) -> Result<Self> {
-        let output_schema = build_output_schema(&input_schema, &factors)?;
-
-        Ok(Self {
-            name: name.into(),
-            input_schema: Arc::clone(&input_schema),
-            output_schema,
+        Self::new_with_state_failure_policy(
+            name,
+            input_schema,
             factors,
-            id_filter: None,
-            id_field: None,
-            id_column_index: None,
-            pending_filtered_rows: 0,
-        })
+            ReactiveStateFailurePolicy::FailFast,
+        )
+    }
+
+    /// Create a new reactive state engine with explicit state failure handling.
+    ///
+    /// :param state_failure_policy: Controls whether state rollback is tracked.
+    /// :type state_failure_policy: ReactiveStateFailurePolicy
+    /// :returns: Initialized engine with stable output schema ordering.
+    /// :rtype: Result<ReactiveStateEngine>
+    pub fn new_with_state_failure_policy(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        factors: Vec<Box<dyn ReactiveFactor>>,
+        state_failure_policy: ReactiveStateFailurePolicy,
+    ) -> Result<Self> {
+        Self::new_with_id_filter_and_state_failure_policy(
+            name,
+            input_schema,
+            factors,
+            "",
+            None,
+            state_failure_policy,
+        )
     }
 
     /// Create a new reactive state engine with an optional id whitelist.
@@ -73,8 +110,36 @@ impl ReactiveStateEngine {
         id_field: &str,
         id_filter: Option<Vec<String>>,
     ) -> Result<Self> {
+        Self::new_with_id_filter_and_state_failure_policy(
+            name,
+            input_schema,
+            factors,
+            id_field,
+            id_filter,
+            ReactiveStateFailurePolicy::FailFast,
+        )
+    }
+
+    /// Create a new reactive state engine with id filtering and explicit failure handling.
+    ///
+    /// :param state_failure_policy: Controls whether state rollback is tracked.
+    /// :type state_failure_policy: ReactiveStateFailurePolicy
+    /// :returns: Initialized engine with stable output schema ordering.
+    /// :rtype: Result<ReactiveStateEngine>
+    pub fn new_with_id_filter_and_state_failure_policy(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        factors: Vec<Box<dyn ReactiveFactor>>,
+        id_field: &str,
+        id_filter: Option<Vec<String>>,
+        state_failure_policy: ReactiveStateFailurePolicy,
+    ) -> Result<Self> {
         let output_schema = build_output_schema(&input_schema, &factors)?;
-        let id_column_index = validate_id_field(input_schema.as_ref(), id_field)?;
+        let id_column_index = if id_field.is_empty() {
+            None
+        } else {
+            Some(validate_id_field(input_schema.as_ref(), id_field)?)
+        };
         let id_filter = normalize_id_filter(id_filter)?;
 
         Ok(Self {
@@ -83,10 +148,17 @@ impl ReactiveStateEngine {
             output_schema,
             factors,
             id_filter,
-            id_field: Some(id_field.to_string()),
-            id_column_index: Some(id_column_index),
+            id_field: (!id_field.is_empty()).then(|| id_field.to_string()),
+            id_column_index,
             pending_filtered_rows: 0,
+            state_failure_policy,
+            transaction_active: false,
         })
+    }
+
+    /// Return the configured state failure policy.
+    pub fn state_failure_policy(&self) -> ReactiveStateFailurePolicy {
+        self.state_failure_policy
     }
 }
 
@@ -114,6 +186,83 @@ impl Engine for ReactiveStateEngine {
     }
 
     fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        let local_transaction = self.state_failure_policy == ReactiveStateFailurePolicy::Rollback
+            && !self.transaction_active;
+        if local_transaction {
+            self.begin_transaction();
+        }
+
+        let result = self.evaluate_table(table);
+
+        if local_transaction {
+            match result {
+                Ok(outputs) => {
+                    self.commit_transaction();
+                    Ok(outputs)
+                }
+                Err(err) => {
+                    self.rollback_transaction()?;
+                    Err(err)
+                }
+            }
+        } else {
+            result
+        }
+    }
+
+    fn begin_transaction(&mut self) {
+        if self.state_failure_policy != ReactiveStateFailurePolicy::Rollback
+            || self.transaction_active
+        {
+            return;
+        }
+
+        for factor in &mut self.factors {
+            factor.begin_transaction();
+        }
+        self.transaction_active = true;
+    }
+
+    fn commit_transaction(&mut self) {
+        if self.state_failure_policy != ReactiveStateFailurePolicy::Rollback
+            || !self.transaction_active
+        {
+            return;
+        }
+
+        for factor in &mut self.factors {
+            factor.commit_transaction();
+        }
+        self.transaction_active = false;
+    }
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        if self.state_failure_policy != ReactiveStateFailurePolicy::Rollback
+            || !self.transaction_active
+        {
+            return Ok(());
+        }
+
+        for factor in &mut self.factors {
+            factor.rollback_transaction()?;
+        }
+        self.transaction_active = false;
+
+        Ok(())
+    }
+
+    fn drain_metrics(&mut self) -> EngineMetricsDelta {
+        let delta = EngineMetricsDelta {
+            late_rows_total: 0,
+            filtered_rows_total: self.pending_filtered_rows,
+        };
+        self.pending_filtered_rows = 0;
+        delta
+    }
+}
+
+impl ReactiveStateEngine {
+    fn evaluate_table(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
         if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
@@ -156,18 +305,6 @@ impl Engine for ReactiveStateEngine {
 
         Ok(vec![SegmentTableView::from_record_batch(output)])
     }
-
-    fn drain_metrics(&mut self) -> EngineMetricsDelta {
-        let delta = EngineMetricsDelta {
-            late_rows_total: 0,
-            filtered_rows_total: self.pending_filtered_rows,
-        };
-        self.pending_filtered_rows = 0;
-        delta
-    }
-}
-
-impl ReactiveStateEngine {
     fn filter_by_id_whitelist(&mut self, table: &SegmentTableView) -> Result<Vec<ArrayRef>> {
         let columns = project_columns(table, &self.input_schema)?;
         let Some(id_filter) = &self.id_filter else {

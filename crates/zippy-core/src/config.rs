@@ -9,11 +9,13 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_TABLE_ROW_CAPACITY: usize = 65_536;
 pub const DEFAULT_TABLE_PERSIST_METHOD: &str = "parquet";
 pub const DEFAULT_TABLE_PERSIST_DATA_DIR: &str = "data";
+pub const DEFAULT_TABLE_PERSIST_COMPACTION_INTERVAL_SEC: f64 = 300.0;
+pub const DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES: usize = 8;
 pub const DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%m%d%H"];
 
 /// Process-wide Zippy runtime configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZippyConfig {
     #[serde(default)]
     pub master: ZippyMasterConfig,
@@ -29,6 +31,8 @@ pub struct ZippyMasterConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub shutdown_timeout_ms: u64,
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
 }
 
 impl Default for ZippyMasterConfig {
@@ -37,6 +41,7 @@ impl Default for ZippyMasterConfig {
             host: None,
             port: None,
             shutdown_timeout_ms: DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS,
+            token: None,
         }
     }
 }
@@ -48,7 +53,7 @@ pub struct ZippyLogConfig {
 }
 
 /// Stream table defaults.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZippyTableConfig {
     pub row_capacity: usize,
     pub retention_segments: Option<usize>,
@@ -56,12 +61,14 @@ pub struct ZippyTableConfig {
 }
 
 /// Stream table persistence defaults.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZippyTablePersistConfig {
     pub enabled: bool,
     pub method: String,
     pub data_dir: String,
     pub partition: ZippyTablePersistPartitionConfig,
+    #[serde(default)]
+    pub compaction: ZippyTablePersistCompactionConfig,
 }
 
 /// Stream table persistence partition defaults.
@@ -70,6 +77,28 @@ pub struct ZippyTablePersistPartitionConfig {
     pub dt_column: Option<String>,
     pub id_column: Option<String>,
     pub dt_part: Option<String>,
+}
+
+/// Stream table persisted parquet compaction defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ZippyTablePersistCompactionConfig {
+    pub enabled: bool,
+    pub interval_sec: f64,
+    pub min_files: usize,
+    pub delete_sources: bool,
+    pub sort_column: Option<String>,
+}
+
+impl Default for ZippyTablePersistCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_sec: DEFAULT_TABLE_PERSIST_COMPACTION_INTERVAL_SEC,
+            min_files: DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES,
+            delete_sources: true,
+            sort_column: None,
+        }
+    }
 }
 
 /// GatewayServer capability advertised by master for cross-platform data access.
@@ -109,6 +138,7 @@ struct PartialMasterConfig {
     host: Option<String>,
     port: Option<u16>,
     shutdown_timeout_ms: Option<u64>,
+    token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +159,7 @@ struct PartialTablePersistConfig {
     method: Option<String>,
     data_dir: Option<String>,
     partition: Option<PartialTablePersistPartitionConfig>,
+    compaction: Option<PartialTablePersistCompactionConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +167,15 @@ struct PartialTablePersistPartitionConfig {
     dt_column: Option<String>,
     id_column: Option<String>,
     dt_part: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialTablePersistCompactionConfig {
+    enabled: Option<bool>,
+    interval_sec: Option<f64>,
+    min_files: Option<usize>,
+    delete_sources: Option<bool>,
+    sort_column: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +207,7 @@ impl Default for ZippyConfig {
                         id_column: None,
                         dt_part: None,
                     },
+                    compaction: ZippyTablePersistCompactionConfig::default(),
                 },
             },
             gateway: ZippyGatewayConfig::default(),
@@ -217,6 +258,9 @@ impl ZippyConfig {
             if let Some(shutdown_timeout_ms) = master.shutdown_timeout_ms {
                 self.master.shutdown_timeout_ms = shutdown_timeout_ms;
             }
+            if let Some(token) = master.token {
+                self.master.token = Some(non_empty(token, "master.token")?);
+            }
         }
         if let Some(log) = partial.log {
             if let Some(level) = log.level {
@@ -252,6 +296,26 @@ impl ZippyConfig {
                     if let Some(dt_part) = partition.dt_part {
                         self.table.persist.partition.dt_part =
                             Some(non_empty(dt_part, "table.persist.partition.dt_part")?);
+                    }
+                }
+                if let Some(compaction) = persist.compaction {
+                    if let Some(enabled) = compaction.enabled {
+                        self.table.persist.compaction.enabled = enabled;
+                    }
+                    if let Some(interval_sec) = compaction.interval_sec {
+                        self.table.persist.compaction.interval_sec = interval_sec;
+                    }
+                    if let Some(min_files) = compaction.min_files {
+                        self.table.persist.compaction.min_files = min_files;
+                    }
+                    if let Some(delete_sources) = compaction.delete_sources {
+                        self.table.persist.compaction.delete_sources = delete_sources;
+                    }
+                    if let Some(sort_column) = compaction.sort_column {
+                        self.table.persist.compaction.sort_column = Some(non_empty(
+                            sort_column,
+                            "table.persist.compaction.sort_column",
+                        )?);
                     }
                 }
             }
@@ -307,6 +371,9 @@ impl ZippyConfig {
                         ),
                     })?;
         }
+        if let Some(token) = env_string("ZIPPY_MASTER_TOKEN") {
+            self.master.token = Some(non_empty(token, "ZIPPY_MASTER_TOKEN")?);
+        }
         if let Some(level) = env_string("ZIPPY_LOG_LEVEL") {
             self.log.level = non_empty(level, "ZIPPY_LOG_LEVEL")?;
         }
@@ -357,6 +424,42 @@ impl ZippyConfig {
         if let Some(dt_part) = env_string("ZIPPY_TABLE_PERSIST_PARTITION_DT_PART") {
             self.table.persist.partition.dt_part =
                 Some(non_empty(dt_part, "ZIPPY_TABLE_PERSIST_PARTITION_DT_PART")?);
+        }
+        if let Some(value) = env_string("ZIPPY_TABLE_PERSIST_COMPACTION") {
+            self.table.persist.compaction.enabled =
+                parse_bool_env("ZIPPY_TABLE_PERSIST_COMPACTION", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_TABLE_PERSIST_COMPACTION_INTERVAL_SEC") {
+            self.table.persist.compaction.interval_sec =
+                value
+                    .parse::<f64>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                            "env var must parse as f64 name=[ZIPPY_TABLE_PERSIST_COMPACTION_INTERVAL_SEC] error=[{}]",
+                            error
+                        ),
+                    })?;
+        }
+        if let Some(value) = env_string("ZIPPY_TABLE_PERSIST_COMPACTION_MIN_FILES") {
+            self.table.persist.compaction.min_files =
+                value
+                    .parse::<usize>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                            "env var must parse as usize name=[ZIPPY_TABLE_PERSIST_COMPACTION_MIN_FILES] error=[{}]",
+                            error
+                        ),
+                    })?;
+        }
+        if let Some(value) = env_string("ZIPPY_TABLE_PERSIST_COMPACTION_DELETE_SOURCES") {
+            self.table.persist.compaction.delete_sources =
+                parse_bool_env("ZIPPY_TABLE_PERSIST_COMPACTION_DELETE_SOURCES", &value)?;
+        }
+        if let Some(sort_column) = env_string("ZIPPY_TABLE_PERSIST_COMPACTION_SORT_COLUMN") {
+            self.table.persist.compaction.sort_column = Some(non_empty(
+                sort_column,
+                "ZIPPY_TABLE_PERSIST_COMPACTION_SORT_COLUMN",
+            )?);
         }
         if let Some(value) = env_string("ZIPPY_GATEWAY") {
             self.gateway.enabled = parse_bool_env("ZIPPY_GATEWAY", &value)?;
@@ -417,6 +520,7 @@ impl ZippyConfig {
             });
         }
         validate_persist_partition(&self.table.persist.partition)?;
+        validate_persist_compaction(&self.table.persist.compaction)?;
         validate_host_port("master", self.master.host.as_ref(), self.master.port)?;
         if self.master.shutdown_timeout_ms == 0 {
             return Err(ZippyError::InvalidConfig {
@@ -519,6 +623,20 @@ fn validate_persist_partition(partition: &ZippyTablePersistPartitionConfig) -> R
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_persist_compaction(compaction: &ZippyTablePersistCompactionConfig) -> Result<()> {
+    if compaction.interval_sec <= 0.0 || !compaction.interval_sec.is_finite() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "table persist compaction interval_sec must be positive".to_string(),
+        });
+    }
+    if compaction.min_files < 2 {
+        return Err(ZippyError::InvalidConfig {
+            reason: "table persist compaction min_files must be at least 2".to_string(),
+        });
     }
     Ok(())
 }

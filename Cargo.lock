@@ -1052,6 +1052,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mio"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
+dependencies = [
+ "libc",
+ "wasi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1543,6 +1554,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
+name = "socket2"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1654,6 +1675,32 @@ checksum = "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tokio"
+version = "1.52.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+dependencies = [
+ "bytes",
+ "libc",
+ "mio",
+ "pin-project-lite",
+ "socket2",
+ "tokio-macros",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2112,7 +2159,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zippy-segment-store",
- "zippy-shm-bridge",
 ]
 
 [[package]]
@@ -2138,6 +2184,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "zippy-core",
  "zippy-engines",
@@ -2161,6 +2208,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "libc",
+ "parquet",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2168,7 +2216,7 @@ dependencies = [
  "tracing",
  "zippy-core",
  "zippy-gateway",
- "zippy-shm-bridge",
+ "zippy-segment-store",
 ]
 
 [[package]]
@@ -2211,6 +2259,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "pyo3",
+ "pyo3-build-config",
  "serde_json",
  "tracing",
  "zippy-core",
@@ -2234,14 +2283,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "zippy-shm-bridge"
-version = "0.1.0"
-dependencies = [
- "libc",
  "windows-sys 0.59.0",
 ]
 

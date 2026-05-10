@@ -8,19 +8,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::Schema;
 use zippy_core::{
-    canonical_schema_hash, encode_bus_frame, parse_bus_frame, schema_metadata, AttachStreamRequest,
-    BusFrameKind, ControlEndpoint, ControlRequest, ControlResponse, DetachReaderRequest,
-    DetachWriterRequest, HeartbeatRequest, MasterClient, ReaderDescriptor, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
-    SchemaRef, StreamInfo, UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
-    WriterDescriptor, BUS_LAYOUT_VERSION,
+    canonical_schema_hash, schema_metadata, ControlEndpoint, ControlRequest, ControlResponse,
+    HeartbeatRequest, MasterClient, RegisterEngineRequest, RegisterProcessRequest,
+    RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest, SchemaRef, StreamInfo,
+    UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
 };
-use zippy_shm_bridge::SharedFrameRing;
 
 fn empty_schema() -> SchemaRef {
     std::sync::Arc::new(Schema::empty())
@@ -42,6 +36,8 @@ fn test_stream_info() -> StreamInfo {
         data_path: "segment".to_string(),
         descriptor_generation: 0,
         active_segment_descriptor: None,
+        active_segment_preflight: None,
+        segment_row_capacity: None,
         sealed_segments: Vec::new(),
         persisted_files: Vec::new(),
         persist_events: Vec::new(),
@@ -54,22 +50,6 @@ fn test_stream_info() -> StreamInfo {
         reader_count: 0,
         status: "registered".to_string(),
     }
-}
-
-fn instrument_schema() -> SchemaRef {
-    std::sync::Arc::new(Schema::new(vec![Field::new(
-        "instrument_id",
-        DataType::Utf8,
-        false,
-    )]))
-}
-
-fn non_instrument_schema() -> SchemaRef {
-    std::sync::Arc::new(Schema::new(vec![Field::new(
-        "mid_price",
-        DataType::Float64,
-        false,
-    )]))
 }
 
 #[test]
@@ -85,6 +65,7 @@ fn master_client_register_process_over_tcp() {
         assert!(matches!(request, ControlRequest::RegisterProcess(_)));
         let response = serde_json::to_string(&ControlResponse::ProcessRegistered {
             process_id: "proc_tcp".to_string(),
+            process_token: "token_1".to_string(),
         })
         .unwrap();
         stream.write_all(response.as_bytes()).unwrap();
@@ -98,52 +79,12 @@ fn master_client_register_process_over_tcp() {
     handle.join().unwrap();
 }
 
-fn invalid_instrument_type_schema() -> SchemaRef {
-    std::sync::Arc::new(Schema::new(vec![Field::new(
-        "instrument_id",
-        DataType::Int64,
-        false,
-    )]))
-}
-
-fn nullable_instrument_schema() -> SchemaRef {
-    std::sync::Arc::new(Schema::new(vec![Field::new(
-        "instrument_id",
-        DataType::Utf8,
-        true,
-    )]))
-}
-
-fn encode_arrow_payload(batch: &RecordBatch) -> Vec<u8> {
-    let mut payload = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut payload, &batch.schema()).unwrap();
-    writer.write(batch).unwrap();
-    writer.finish().unwrap();
-    payload
-}
-
 fn unique_socket_path() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("zippy-master-client-test-{nanos}.sock"))
-}
-
-fn unique_shm_dir(label: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("zippy-master-client-{label}-{nanos}"))
-}
-
-fn unique_shm_name(label: &str) -> (PathBuf, String) {
-    let shm_dir = unique_shm_dir(label);
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    (shm_dir, shm_name)
 }
 
 fn wait_for_socket(socket_path: &Path) {
@@ -263,11 +204,7 @@ fn fake_watch_response(
     }
 }
 
-fn spawn_fake_server(
-    socket_path: &Path,
-    expected_connections: usize,
-    shm_name: String,
-) -> thread::JoinHandle<()> {
+fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread::JoinHandle<()> {
     let socket_path = socket_path.to_path_buf();
     thread::spawn(move || {
         if socket_path.exists() {
@@ -306,9 +243,10 @@ fn spawn_fake_server(
                     assert_eq!(app, "local_dc");
                     ControlResponse::ProcessRegistered {
                         process_id: "proc_1".to_string(),
+                        process_token: "token_1".to_string(),
                     }
                 }
-                ControlRequest::Heartbeat(HeartbeatRequest { process_id }) => {
+                ControlRequest::Heartbeat(HeartbeatRequest { process_id, .. }) => {
                     assert_eq!(process_id, "proc_1");
                     ControlResponse::HeartbeatAccepted {
                         process_id: "proc_1".to_string(),
@@ -332,6 +270,7 @@ fn spawn_fake_server(
                     schema_hash,
                     buffer_size,
                     frame_size,
+                    ..
                 }) => {
                     assert_eq!(stream_name, "ticks");
                     assert_eq!(schema, empty_schema_metadata());
@@ -353,6 +292,7 @@ fn spawn_fake_server(
                 ControlRequest::UnregisterSource(UnregisterSourceRequest {
                     source_name,
                     process_id,
+                    ..
                 }) => {
                     assert_eq!(source_name, "openctp_md");
                     assert_eq!(process_id, "proc_1");
@@ -387,6 +327,7 @@ fn spawn_fake_server(
                     name,
                     status,
                     metrics,
+                    ..
                 }) => {
                     assert_eq!(kind, "engine");
                     assert_eq!(name, "mid_price_factor");
@@ -473,55 +414,6 @@ fn spawn_fake_server(
                         })),
                     }
                 }
-                ControlRequest::WriteTo(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids: _,
-                }) => ControlResponse::WriterAttached {
-                    descriptor: WriterDescriptor {
-                        stream_name,
-                        buffer_size: 1024,
-                        frame_size: 256,
-                        layout_version: BUS_LAYOUT_VERSION,
-                        shm_name: shm_name.clone(),
-                        writer_id: "ticks_writer".to_string(),
-                        process_id,
-                        next_write_seq: 1,
-                    },
-                },
-                ControlRequest::ReadFrom(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => ControlResponse::ReaderAttached {
-                    descriptor: ReaderDescriptor {
-                        stream_name,
-                        buffer_size: 1024,
-                        frame_size: 256,
-                        layout_version: BUS_LAYOUT_VERSION,
-                        shm_name: shm_name.clone(),
-                        reader_id: "reader_1".to_string(),
-                        process_id,
-                        next_read_seq: 1,
-                        instrument_filter: instrument_ids,
-                    },
-                },
-                ControlRequest::CloseWriter(DetachWriterRequest {
-                    stream_name,
-                    writer_id,
-                    ..
-                }) => ControlResponse::WriterDetached {
-                    stream_name,
-                    writer_id,
-                },
-                ControlRequest::CloseReader(DetachReaderRequest {
-                    stream_name,
-                    reader_id,
-                    ..
-                }) => ControlResponse::ReaderDetached {
-                    stream_name,
-                    reader_id,
-                },
                 ControlRequest::ListStreams(_) => {
                     ControlResponse::StreamsListed(zippy_core::ListStreamsResponse {
                         streams: vec![test_stream_info()],
@@ -577,8 +469,7 @@ fn spawn_fake_server(
 #[test]
 fn master_client_gets_config() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("get-config");
-    let server = spawn_fake_server(&socket_path, 1, shm_name);
+    let server = spawn_fake_server(&socket_path, 1);
     wait_for_socket(&socket_path);
 
     let client = MasterClient::connect(&socket_path).unwrap();
@@ -591,385 +482,12 @@ fn master_client_gets_config() {
     assert_eq!(config.table.persist.data_dir, "data");
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn master_client_registers_process_and_fetches_writer_descriptor() {
-    let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("basic-attach");
-    let server = spawn_fake_server(&socket_path, 4, shm_name);
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    let process_id = client.register_process("local_dc").unwrap();
-    assert_eq!(process_id, "proc_1");
-    assert_eq!(client.process_id(), Some("proc_1"));
-
-    client
-        .register_stream("ticks", empty_schema(), 1024, 256)
-        .unwrap();
-    let writer = client.write_to("ticks").unwrap();
-    let reader = client.read_from("ticks").unwrap();
-
-    assert_eq!(writer.descriptor().stream_name, "ticks");
-    assert_eq!(writer.descriptor().process_id, "proc_1");
-    assert_eq!(reader.descriptor().stream_name, "ticks");
-    assert_eq!(reader.descriptor().process_id, "proc_1");
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn master_client_sends_instrument_filter_when_attaching_reader() {
-    let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("reader-filter");
-    let server = thread::spawn({
-        let socket_path = socket_path.clone();
-        let shm_name = shm_name.clone();
-        move || {
-            if socket_path.exists() {
-                let _ = fs::remove_file(&socket_path);
-            }
-
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            for stream in listener.incoming().take(2) {
-                let mut stream = stream.unwrap();
-                let mut line = String::new();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                reader.read_line(&mut line).unwrap();
-
-                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-                let response = match request {
-                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
-                        assert_eq!(app, "local_dc");
-                        ControlResponse::ProcessRegistered {
-                            process_id: "proc_1".to_string(),
-                        }
-                    }
-                    ControlRequest::ReadFrom(AttachStreamRequest {
-                        stream_name,
-                        process_id,
-                        instrument_ids,
-                    }) => {
-                        assert_eq!(stream_name, "ticks");
-                        assert_eq!(process_id, "proc_1");
-                        assert_eq!(
-                            instrument_ids,
-                            Some(vec!["IF2606".to_string(), "IH2606".to_string()])
-                        );
-                        ControlResponse::ReaderAttached {
-                            descriptor: ReaderDescriptor {
-                                stream_name,
-                                buffer_size: 1024,
-                                frame_size: 256,
-                                layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: shm_name.clone(),
-                                reader_id: "reader_1".to_string(),
-                                process_id,
-                                next_read_seq: 1,
-                                instrument_filter: Some(vec![
-                                    "IF2606".to_string(),
-                                    "IH2606".to_string(),
-                                ]),
-                            },
-                        }
-                    }
-                    other => panic!("unexpected request: {other:?}"),
-                };
-
-                let payload = serde_json::to_string(&response).unwrap();
-                stream.write_all(payload.as_bytes()).unwrap();
-                stream.write_all(b"\n").unwrap();
-                stream.flush().unwrap();
-            }
-
-            let _ = fs::remove_file(&socket_path);
-        }
-    });
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let reader = client
-        .read_from_filtered("ticks", vec!["IF2606".to_string(), "IH2606".to_string()])
-        .unwrap();
-
-    assert_eq!(
-        reader.descriptor().instrument_filter,
-        Some(vec!["IF2606".to_string(), "IH2606".to_string()])
-    );
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn master_client_normalizes_empty_instrument_filter_when_attaching_reader() {
-    let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("reader-empty-filter");
-    let server = thread::spawn({
-        let socket_path = socket_path.clone();
-        let shm_name = shm_name.clone();
-        move || {
-            if socket_path.exists() {
-                let _ = fs::remove_file(&socket_path);
-            }
-
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            for stream in listener.incoming().take(2) {
-                let mut stream = stream.unwrap();
-                let mut line = String::new();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                reader.read_line(&mut line).unwrap();
-
-                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-                let response = match request {
-                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
-                        assert_eq!(app, "local_dc");
-                        ControlResponse::ProcessRegistered {
-                            process_id: "proc_1".to_string(),
-                        }
-                    }
-                    ControlRequest::ReadFrom(AttachStreamRequest {
-                        stream_name,
-                        process_id,
-                        instrument_ids,
-                    }) => {
-                        assert_eq!(stream_name, "ticks");
-                        assert_eq!(process_id, "proc_1");
-                        assert_eq!(instrument_ids, None);
-                        ControlResponse::ReaderAttached {
-                            descriptor: ReaderDescriptor {
-                                stream_name,
-                                buffer_size: 1024,
-                                frame_size: 256,
-                                layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: shm_name.clone(),
-                                reader_id: "reader_1".to_string(),
-                                process_id,
-                                next_read_seq: 1,
-                                instrument_filter: None,
-                            },
-                        }
-                    }
-                    other => panic!("unexpected request: {other:?}"),
-                };
-
-                let payload = serde_json::to_string(&response).unwrap();
-                stream.write_all(payload.as_bytes()).unwrap();
-                stream.write_all(b"\n").unwrap();
-                stream.flush().unwrap();
-            }
-
-            let _ = fs::remove_file(&socket_path);
-        }
-    });
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let reader = client.read_from_filtered("ticks", Vec::new()).unwrap();
-
-    assert_eq!(reader.descriptor().instrument_filter, None);
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn master_client_rejects_empty_string_instrument_filter_when_attaching_reader() {
-    let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("reader-empty-value");
-    let server = spawn_fake_server(&socket_path, 1, shm_name);
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let error = match client.read_from_filtered("ticks", vec!["".to_string()]) {
-        Ok(_) => panic!("expected empty string filter to be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("instrument filter contains empty value"),
-        "unexpected error: {error}"
-    );
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn master_client_rejects_invalid_descriptor_instrument_filter() {
-    let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("reader-invalid-descriptor");
-    let server = thread::spawn({
-        let socket_path = socket_path.clone();
-        let shm_name = shm_name.clone();
-        move || {
-            if socket_path.exists() {
-                let _ = fs::remove_file(&socket_path);
-            }
-
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            for stream in listener.incoming().take(2) {
-                let mut stream = stream.unwrap();
-                let mut line = String::new();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                reader.read_line(&mut line).unwrap();
-
-                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-                let response = match request {
-                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
-                        assert_eq!(app, "local_dc");
-                        ControlResponse::ProcessRegistered {
-                            process_id: "proc_1".to_string(),
-                        }
-                    }
-                    ControlRequest::ReadFrom(AttachStreamRequest {
-                        stream_name,
-                        process_id,
-                        instrument_ids,
-                    }) => {
-                        assert_eq!(stream_name, "ticks");
-                        assert_eq!(process_id, "proc_1");
-                        assert_eq!(instrument_ids, None);
-                        ControlResponse::ReaderAttached {
-                            descriptor: ReaderDescriptor {
-                                stream_name,
-                                buffer_size: 1024,
-                                frame_size: 256,
-                                layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: shm_name.clone(),
-                                reader_id: "reader_1".to_string(),
-                                process_id,
-                                next_read_seq: 1,
-                                instrument_filter: Some(vec!["IF2606".to_string(), "".to_string()]),
-                            },
-                        }
-                    }
-                    other => panic!("unexpected request: {other:?}"),
-                };
-
-                let payload = serde_json::to_string(&response).unwrap();
-                stream.write_all(payload.as_bytes()).unwrap();
-                stream.write_all(b"\n").unwrap();
-                stream.flush().unwrap();
-            }
-
-            let _ = fs::remove_file(&socket_path);
-        }
-    });
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let error = match client.read_from("ticks") {
-        Ok(_) => panic!("expected invalid descriptor filter to be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("descriptor instrument filter contains empty value"),
-        "unexpected error: {error}"
-    );
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn master_client_rejects_missing_descriptor_filter_for_filtered_reader() {
-    let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("reader-missing-descriptor");
-    let server = thread::spawn({
-        let socket_path = socket_path.clone();
-        let shm_name = shm_name.clone();
-        move || {
-            if socket_path.exists() {
-                let _ = fs::remove_file(&socket_path);
-            }
-
-            let listener = UnixListener::bind(&socket_path).unwrap();
-            for stream in listener.incoming().take(2) {
-                let mut stream = stream.unwrap();
-                let mut line = String::new();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                reader.read_line(&mut line).unwrap();
-
-                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-                let response = match request {
-                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
-                        assert_eq!(app, "local_dc");
-                        ControlResponse::ProcessRegistered {
-                            process_id: "proc_1".to_string(),
-                        }
-                    }
-                    ControlRequest::ReadFrom(AttachStreamRequest {
-                        stream_name,
-                        process_id,
-                        instrument_ids,
-                    }) => {
-                        assert_eq!(stream_name, "ticks");
-                        assert_eq!(process_id, "proc_1");
-                        assert_eq!(instrument_ids, Some(vec!["IF2606".to_string()]));
-                        ControlResponse::ReaderAttached {
-                            descriptor: ReaderDescriptor {
-                                stream_name,
-                                buffer_size: 1024,
-                                frame_size: 256,
-                                layout_version: BUS_LAYOUT_VERSION,
-                                shm_name: shm_name.clone(),
-                                reader_id: "reader_1".to_string(),
-                                process_id,
-                                next_read_seq: 1,
-                                instrument_filter: None,
-                            },
-                        }
-                    }
-                    other => panic!("unexpected request: {other:?}"),
-                };
-
-                let payload = serde_json::to_string(&response).unwrap();
-                stream.write_all(payload.as_bytes()).unwrap();
-                stream.write_all(b"\n").unwrap();
-                stream.flush().unwrap();
-            }
-
-            let _ = fs::remove_file(&socket_path);
-        }
-    });
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let error = match client.read_from_filtered("ticks", vec!["IF2606".to_string()]) {
-        Ok(_) => panic!("expected mismatched descriptor filter to be rejected"),
-        Err(error) => error,
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("descriptor instrument filter mismatch"),
-        "unexpected error: {error}"
-    );
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_lists_streams() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("list-streams");
-    let server = spawn_fake_server(&socket_path, 3, shm_name);
+    let server = spawn_fake_server(&socket_path, 3);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -987,14 +505,12 @@ fn master_client_lists_streams() {
     assert_eq!(streams[0].status, "registered");
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_gets_single_stream() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("get-stream");
-    let server = spawn_fake_server(&socket_path, 3, shm_name);
+    let server = spawn_fake_server(&socket_path, 3);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1011,14 +527,12 @@ fn master_client_gets_single_stream() {
     assert_eq!(stream.status, "registered");
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_sends_heartbeat_for_registered_process() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("heartbeat");
-    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    let server = spawn_fake_server(&socket_path, 2);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1026,14 +540,12 @@ fn master_client_sends_heartbeat_for_registered_process() {
     client.heartbeat().unwrap();
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_wait_shutdown_times_out_without_shutdown_request() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("wait-shutdown");
-    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    let server = spawn_fake_server(&socket_path, 2);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1042,14 +554,12 @@ fn master_client_wait_shutdown_times_out_without_shutdown_request() {
     assert!(!client.wait_shutdown(Duration::from_millis(10)).unwrap());
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_watches_generic_stream_resource() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("watch-stream-resource");
-    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    let server = spawn_fake_server(&socket_path, 2);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1079,14 +589,12 @@ fn master_client_watches_generic_stream_resource() {
     );
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_unregisters_registered_process() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("unregister-process");
-    let server = spawn_fake_server(&socket_path, 2, shm_name);
+    let server = spawn_fake_server(&socket_path, 2);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1096,14 +604,12 @@ fn master_client_unregisters_registered_process() {
     assert_eq!(client.process_id(), None);
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_registers_control_plane_entities_and_updates_status() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("control-plane");
-    let server = spawn_fake_server(&socket_path, 5, shm_name);
+    let server = spawn_fake_server(&socket_path, 5);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1152,14 +658,12 @@ fn master_client_registers_control_plane_entities_and_updates_status() {
         .unwrap();
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn master_client_unregisters_source_for_registered_process() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("unregister-source");
-    let server = spawn_fake_server(&socket_path, 3, shm_name);
+    let server = spawn_fake_server(&socket_path, 3);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -1177,12 +681,14 @@ fn master_client_unregisters_source_for_registered_process() {
     client.unregister_source("openctp_md").unwrap();
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }
 
 #[test]
 fn control_request_serialization_uses_buffer_and_frame_sizes() {
     let request = ControlRequest::RegisterStream(RegisterStreamRequest {
+        process_id: None,
+        process_token: None,
+        token: None,
         stream_name: "ticks".to_string(),
         schema: empty_schema_metadata(),
         schema_hash: empty_schema_hash(),
@@ -1200,8 +706,7 @@ fn control_request_serialization_uses_buffer_and_frame_sizes() {
 #[test]
 fn master_client_publishes_and_fetches_segment_descriptor() {
     let socket_path = unique_socket_path();
-    let (shm_dir, shm_name) = unique_shm_name("segment-descriptor");
-    let server = spawn_fake_server(&socket_path, 5, shm_name);
+    let server = spawn_fake_server(&socket_path, 8);
     wait_for_socket(&socket_path);
 
     let descriptor = serde_json::json!({
@@ -1243,70 +748,6 @@ fn master_client_publishes_and_fetches_segment_descriptor() {
     assert_eq!(fetched, Some(descriptor));
 
     server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn attach_stream_request_omits_filter_fields_when_not_set() {
-    let request = ControlRequest::ReadFrom(AttachStreamRequest {
-        stream_name: "ticks".to_string(),
-        process_id: "proc_1".to_string(),
-        instrument_ids: None,
-    });
-    let response = ControlResponse::ReaderAttached {
-        descriptor: ReaderDescriptor {
-            stream_name: "ticks".to_string(),
-            buffer_size: 1024,
-            frame_size: 256,
-            layout_version: BUS_LAYOUT_VERSION,
-            shm_name: "shm_ticks".to_string(),
-            reader_id: "reader_1".to_string(),
-            process_id: "proc_1".to_string(),
-            next_read_seq: 1,
-            instrument_filter: None,
-        },
-    };
-
-    let request_json = serde_json::to_string(&request).unwrap();
-    let response_json = serde_json::to_string(&response).unwrap();
-
-    assert!(!request_json.contains("instrument_ids"));
-    assert!(!response_json.contains("instrument_filter"));
-    assert!(!request_json.contains(":null"));
-    assert!(!response_json.contains(":null"));
-}
-
-#[test]
-fn control_response_display_uses_buffer_and_frame_sizes() {
-    let writer_output = format!(
-        "{}",
-        ControlResponse::WriterAttached {
-            descriptor: WriterDescriptor {
-                stream_name: "ticks".to_string(),
-                buffer_size: 1024,
-                frame_size: 256,
-                layout_version: BUS_LAYOUT_VERSION,
-                shm_name: "shm_ticks".to_string(),
-                writer_id: "writer_1".to_string(),
-                process_id: "proc_1".to_string(),
-                next_write_seq: 1,
-            },
-        }
-    );
-    assert!(writer_output.contains("buffer_size=[1024]"));
-    assert!(writer_output.contains("frame_size=[256]"));
-    assert!(!writer_output.contains("ring_capacity"));
-
-    let stream_output = format!(
-        "{}",
-        ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
-            stream: test_stream_info(),
-        })
-    );
-    assert!(stream_output.contains("buffer_size=[1024]"));
-    assert!(stream_output.contains("frame_size=[256]"));
-    assert!(stream_output.contains("write_seq=[42]"));
-    assert!(!stream_output.contains("ring_capacity"));
 }
 
 #[test]
@@ -1319,762 +760,4 @@ fn stream_info_serialization_includes_write_seq() {
     assert!(json.contains("\"buffer_size\":1024"));
     assert!(json.contains("\"frame_size\":256"));
     assert!(!json.contains("ring_capacity"));
-}
-
-#[test]
-fn writer_and_reader_hot_path_do_not_create_seq_ipc_files() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-frame-ring-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(4) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::RegisterStream(RegisterStreamRequest { stream_name, .. }) => {
-                    ControlResponse::StreamRegistered { stream_name }
-                }
-                ControlRequest::WriteTo(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(instrument_ids, None);
-                    ControlResponse::WriterAttached {
-                        descriptor: WriterDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            writer_id: "ticks_writer".to_string(),
-                            process_id,
-                            next_write_seq: 1,
-                        },
-                    }
-                }
-                ControlRequest::ReadFrom(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(instrument_ids, None);
-                    ControlResponse::ReaderAttached {
-                        descriptor: ReaderDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            reader_id: "reader_1".to_string(),
-                            process_id,
-                            next_read_seq: 1,
-                            instrument_filter: None,
-                        },
-                    }
-                }
-                _ => panic!("unexpected request"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    client
-        .register_stream("ticks", empty_schema(), 4, 4096)
-        .unwrap();
-
-    let mut writer = client.write_to("ticks").unwrap();
-    let mut reader = client.read_from("ticks").unwrap();
-
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        std::sync::Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "instrument_id",
-            arrow::datatypes::DataType::Utf8,
-            false,
-        )])),
-        vec![std::sync::Arc::new(StringArray::from(vec!["IF2606"]))],
-    )
-    .unwrap();
-    writer.write(batch.clone()).unwrap();
-    let received = reader.read(Some(1000)).unwrap();
-
-    assert_eq!(received.num_rows(), batch.num_rows());
-    let entry_names = fs::read_dir(&shm_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    assert!(
-        entry_names.iter().all(|name| !name.starts_with("seq_")),
-        "seq_*.ipc files should not be created path=[{}] entries={entry_names:?}",
-        shm_dir.display()
-    );
-    assert!(
-        entry_names.iter().any(|name| name == "ticks.mmap"),
-        "mmap backing file should exist path=[{}] entries={entry_names:?}",
-        shm_dir.display()
-    );
-
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn filtered_reader_rejects_legacy_frame_payloads() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-legacy-frame-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::ReadFrom(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(stream_name, "ticks");
-                    assert_eq!(process_id, "proc_1");
-                    assert_eq!(instrument_ids, Some(vec!["IF2606".to_string()]));
-                    ControlResponse::ReaderAttached {
-                        descriptor: ReaderDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            reader_id: "reader_1".to_string(),
-                            process_id,
-                            next_read_seq: 1,
-                            instrument_filter: Some(vec!["IF2606".to_string()]),
-                        },
-                    }
-                }
-                ControlRequest::CloseReader(DetachReaderRequest {
-                    stream_name,
-                    reader_id,
-                    ..
-                }) => ControlResponse::ReaderDetached {
-                    stream_name,
-                    reader_id,
-                },
-                other => panic!("unexpected request: {other:?}"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let mut reader = client
-        .read_from_filtered("ticks", vec!["IF2606".to_string()])
-        .unwrap();
-
-    let mut ring = SharedFrameRing::create_or_open(&shm_name, 4, 4096).unwrap();
-    let batch = RecordBatch::try_new(
-        instrument_schema(),
-        vec![std::sync::Arc::new(StringArray::from(vec!["IF2606"]))],
-    )
-    .unwrap();
-    ring.publish(&encode_arrow_payload(&batch)).unwrap();
-
-    let error = reader.read(Some(1000)).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("filtered reader requires enveloped bus frame"),
-        "unexpected error: {error}"
-    );
-
-    reader.close().unwrap();
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn unfiltered_reader_accepts_legacy_frame_payloads() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-legacy-unfiltered-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::ReadFrom(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(stream_name, "ticks");
-                    assert_eq!(process_id, "proc_1");
-                    assert_eq!(instrument_ids, None);
-                    ControlResponse::ReaderAttached {
-                        descriptor: ReaderDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            reader_id: "reader_1".to_string(),
-                            process_id,
-                            next_read_seq: 1,
-                            instrument_filter: None,
-                        },
-                    }
-                }
-                ControlRequest::CloseReader(DetachReaderRequest {
-                    stream_name,
-                    reader_id,
-                    ..
-                }) => ControlResponse::ReaderDetached {
-                    stream_name,
-                    reader_id,
-                },
-                other => panic!("unexpected request: {other:?}"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let mut reader = client.read_from("ticks").unwrap();
-
-    let mut ring = SharedFrameRing::create_or_open(&shm_name, 4, 4096).unwrap();
-    let batch = RecordBatch::try_new(
-        instrument_schema(),
-        vec![std::sync::Arc::new(StringArray::from(vec!["IF2606"]))],
-    )
-    .unwrap();
-    ring.publish(&encode_arrow_payload(&batch)).unwrap();
-
-    let received = reader.read(Some(1000)).unwrap();
-    assert_eq!(format!("{received:?}"), format!("{batch:?}"));
-
-    reader.close().unwrap();
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn filtered_reader_skips_enveloped_frame_without_directory_until_match() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-filtered-skip-no-dir-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::ReadFrom(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(stream_name, "ticks");
-                    assert_eq!(process_id, "proc_1");
-                    assert_eq!(instrument_ids, Some(vec!["IF2606".to_string()]));
-                    ControlResponse::ReaderAttached {
-                        descriptor: ReaderDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            reader_id: "reader_1".to_string(),
-                            process_id,
-                            next_read_seq: 1,
-                            instrument_filter: Some(vec!["IF2606".to_string()]),
-                        },
-                    }
-                }
-                ControlRequest::CloseReader(DetachReaderRequest {
-                    stream_name,
-                    reader_id,
-                    ..
-                }) => ControlResponse::ReaderDetached {
-                    stream_name,
-                    reader_id,
-                },
-                other => panic!("unexpected request: {other:?}"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let mut reader = client
-        .read_from_filtered("ticks", vec!["IF2606".to_string()])
-        .unwrap();
-
-    let mut ring = SharedFrameRing::create_or_open(&shm_name, 4, 4096).unwrap();
-    let no_directory_batch = RecordBatch::try_new(
-        non_instrument_schema(),
-        vec![std::sync::Arc::new(Float64Array::from(vec![3210.5]))],
-    )
-    .unwrap();
-    let no_directory_payload = encode_arrow_payload(&no_directory_batch);
-    let no_directory_frame = encode_bus_frame::<String>(&[], &no_directory_payload).unwrap();
-    ring.publish(&no_directory_frame).unwrap();
-
-    let matching_batch = RecordBatch::try_new(
-        instrument_schema(),
-        vec![std::sync::Arc::new(StringArray::from(vec!["IF2606"]))],
-    )
-    .unwrap();
-    let matching_payload = encode_arrow_payload(&matching_batch);
-    let matching_frame = encode_bus_frame(&["IF2606".to_string()], &matching_payload).unwrap();
-    ring.publish(&matching_frame).unwrap();
-
-    let received = reader.read(Some(1000)).unwrap();
-    assert_eq!(format!("{received:?}"), format!("{matching_batch:?}"));
-
-    reader.close().unwrap();
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn writer_writes_enveloped_frame_without_directory_for_non_instrument_batch() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-no-directory-frame-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::WriteTo(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(stream_name, "ticks");
-                    assert_eq!(process_id, "proc_1");
-                    assert_eq!(instrument_ids, None);
-                    ControlResponse::WriterAttached {
-                        descriptor: WriterDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            writer_id: "ticks_writer".to_string(),
-                            process_id,
-                            next_write_seq: 1,
-                        },
-                    }
-                }
-                ControlRequest::CloseWriter(DetachWriterRequest {
-                    stream_name,
-                    writer_id,
-                    ..
-                }) => ControlResponse::WriterDetached {
-                    stream_name,
-                    writer_id,
-                },
-                other => panic!("unexpected request: {other:?}"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let mut writer = client.write_to("ticks").unwrap();
-
-    let batch = RecordBatch::try_new(
-        non_instrument_schema(),
-        vec![std::sync::Arc::new(Float64Array::from(vec![3210.5]))],
-    )
-    .unwrap();
-    let write_result = writer.write(batch.clone());
-    assert!(
-        write_result.is_ok(),
-        "writer should allow non-instrument batches error={write_result:?}"
-    );
-
-    let ring = SharedFrameRing::create_or_open(&shm_name, 4, 4096).unwrap();
-    let read_result = ring.read(1).unwrap();
-    let frame = match read_result {
-        zippy_shm_bridge::ReadResult::Ready(frame) => frame,
-        other => panic!("expected ready frame got {other:?}"),
-    };
-    let parsed = parse_bus_frame(&frame.payload).unwrap();
-    assert_eq!(parsed.kind, BusFrameKind::EnvelopedWithoutDirectory);
-    let timing = parsed
-        .timing
-        .expect("writer should attach timing metadata to bus frame");
-    assert!(timing.target_publish_enter_ns > 0);
-    assert!(timing.writer_enter_ns >= timing.target_publish_enter_ns);
-    assert!(timing.writer_enter_ns > 0);
-    assert!(timing.arrow_encoded_ns >= timing.writer_enter_ns);
-    assert!(timing.instrument_ids_done_ns >= timing.arrow_encoded_ns);
-    assert!(timing.publish_start_ns >= timing.instrument_ids_done_ns);
-    assert!(timing.publish_start_ns > 0);
-    assert!(timing.publish_done_ns >= timing.publish_start_ns);
-    let decoded = encode_arrow_payload(&batch);
-    assert_eq!(parsed.arrow_payload, decoded.as_slice());
-
-    writer.close().unwrap();
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn writer_rejects_instrument_column_with_wrong_type() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-invalid-instrument-type-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::WriteTo(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(stream_name, "ticks");
-                    assert_eq!(process_id, "proc_1");
-                    assert_eq!(instrument_ids, None);
-                    ControlResponse::WriterAttached {
-                        descriptor: WriterDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            writer_id: "ticks_writer".to_string(),
-                            process_id,
-                            next_write_seq: 1,
-                        },
-                    }
-                }
-                ControlRequest::CloseWriter(DetachWriterRequest {
-                    stream_name,
-                    writer_id,
-                    ..
-                }) => ControlResponse::WriterDetached {
-                    stream_name,
-                    writer_id,
-                },
-                other => panic!("unexpected request: {other:?}"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let mut writer = client.write_to("ticks").unwrap();
-
-    let batch = RecordBatch::try_new(
-        invalid_instrument_type_schema(),
-        vec![std::sync::Arc::new(Int64Array::from(vec![2606]))],
-    )
-    .unwrap();
-    let error = writer.write(batch).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("instrument_id column must be utf8"),
-        "unexpected error: {error}"
-    );
-
-    writer.close().unwrap();
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
-}
-
-#[test]
-fn writer_rejects_instrument_column_with_nulls() {
-    let socket_path = unique_socket_path();
-    let shm_dir = std::env::temp_dir().join(format!(
-        "zippy-master-client-invalid-instrument-null-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&shm_dir).unwrap();
-    let mmap_path = shm_dir.join("ticks.mmap");
-    let shm_name = mmap_path.to_string_lossy().into_owned();
-    let shm_name_for_server = shm_name.clone();
-
-    let socket_path_for_server = socket_path.clone();
-    let server = thread::spawn(move || {
-        if socket_path_for_server.exists() {
-            let _ = fs::remove_file(&socket_path_for_server);
-        }
-
-        let listener = UnixListener::bind(&socket_path_for_server).unwrap();
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.unwrap();
-            let mut line = String::new();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            reader.read_line(&mut line).unwrap();
-
-            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
-            let response = match request {
-                ControlRequest::RegisterProcess(_) => ControlResponse::ProcessRegistered {
-                    process_id: "proc_1".to_string(),
-                },
-                ControlRequest::WriteTo(AttachStreamRequest {
-                    stream_name,
-                    process_id,
-                    instrument_ids,
-                }) => {
-                    assert_eq!(stream_name, "ticks");
-                    assert_eq!(process_id, "proc_1");
-                    assert_eq!(instrument_ids, None);
-                    ControlResponse::WriterAttached {
-                        descriptor: WriterDescriptor {
-                            stream_name,
-                            buffer_size: 4,
-                            frame_size: 4096,
-                            layout_version: BUS_LAYOUT_VERSION,
-                            shm_name: shm_name_for_server.clone(),
-                            writer_id: "ticks_writer".to_string(),
-                            process_id,
-                            next_write_seq: 1,
-                        },
-                    }
-                }
-                ControlRequest::CloseWriter(DetachWriterRequest {
-                    stream_name,
-                    writer_id,
-                    ..
-                }) => ControlResponse::WriterDetached {
-                    stream_name,
-                    writer_id,
-                },
-                other => panic!("unexpected request: {other:?}"),
-            };
-
-            let payload = serde_json::to_string(&response).unwrap();
-            stream.write_all(payload.as_bytes()).unwrap();
-            stream.write_all(b"\n").unwrap();
-            stream.flush().unwrap();
-        }
-
-        let _ = fs::remove_file(&socket_path_for_server);
-    });
-
-    wait_for_socket(&socket_path);
-
-    let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("local_dc").unwrap();
-    let mut writer = client.write_to("ticks").unwrap();
-
-    let batch = RecordBatch::try_new(
-        nullable_instrument_schema(),
-        vec![std::sync::Arc::new(StringArray::from(vec![
-            Some("IF2606"),
-            None,
-        ]))],
-    )
-    .unwrap();
-    let error = writer.write(batch).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("instrument_id column contains null"),
-        "unexpected error: {error}"
-    );
-
-    writer.close().unwrap();
-    server.join().unwrap();
-    let _ = fs::remove_dir_all(shm_dir);
 }

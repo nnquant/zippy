@@ -14,7 +14,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use serde_json::json;
 use zippy_core::{
-    connect_control_endpoint, ControlEndpoint, Engine, MasterClient, SegmentTableView,
+    connect_control_endpoint, ControlEndpoint, Engine, MasterClient, SegmentTableView, ZippyConfig,
 };
 use zippy_engines::StreamTableMaterializer;
 use zippy_gateway::{GatewayServer, GatewayServerConfig};
@@ -68,6 +68,30 @@ fn native_gateway_accepts_arrow_write_batch_and_publishes_descriptor() {
     let stream = client.get_stream("native_gateway_ticks").unwrap();
     assert_eq!(stream.stream_name, "native_gateway_ticks");
     assert!(stream.active_segment_descriptor.is_some());
+    assert_eq!(stream.buffer_size, 64);
+    assert_eq!(stream.segment_row_capacity, Some(65_536));
+    assert_eq!(
+        stream
+            .active_segment_preflight
+            .as_ref()
+            .and_then(|preflight| preflight.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("ok")
+    );
+
+    let gateway_stream_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "get_stream",
+            "source": "native_gateway_ticks",
+            "token": "dev-token",
+        }),
+        vec![],
+    );
+    assert_eq!(
+        gateway_stream_response["stream"]["active_segment_preflight"]["status"],
+        json!("ok")
+    );
 
     gateway.stop();
     master.shutdown();
@@ -122,6 +146,220 @@ fn native_gateway_binds_writer_epoch_to_master_source_epoch() {
     assert_eq!(stream.writer_epoch, 1);
     let descriptor = stream.active_segment_descriptor.unwrap();
     assert_eq!(descriptor["writer_epoch"], json!(1));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_rejects_bad_token_before_reading_payload() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "auth_ticks",
+            "token": "bad-token",
+        }),
+        1024 * 1024,
+    );
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+
+    let response = response.expect("gateway must reject unauthorized header without payload");
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("unauthorized"));
+}
+
+#[test]
+fn native_gateway_rejects_oversized_payload_length_before_allocation() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "oversized_ticks",
+            "token": "dev-token",
+        }),
+        128 * 1024 * 1024,
+    );
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+
+    match response {
+        Ok(response) => {
+            assert_eq!(response["status"], "error");
+            assert!(response["reason"]
+                .as_str()
+                .unwrap()
+                .contains("payload length"));
+        }
+        Err(error) => {
+            assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+    }
+}
+
+#[test]
+fn native_gateway_runtime_starts_and_stops_cleanly() {
+    for _ in 0..3 {
+        let master_endpoint = loopback_control_endpoint();
+        let (master, master_thread) = spawn_master(master_endpoint.clone());
+        let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+        let gateway = GatewayServer::new(GatewayServerConfig {
+            endpoint: gateway_endpoint,
+            master_endpoint: master_endpoint.clone(),
+            token: Some("dev-token".to_string()),
+            max_write_rows: Some(1024),
+        })
+        .unwrap()
+        .start()
+        .unwrap();
+
+        let response = send_gateway_frame(
+            gateway.endpoint(),
+            json!({"kind": "metrics", "token": "dev-token"}),
+            vec![],
+        );
+
+        assert_eq!(response["status"], "ok");
+
+        gateway.stop();
+        master.shutdown();
+        master_thread.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn native_gateway_idle_connection_does_not_block_metrics_request() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let idle_stream = TcpStream::connect(gateway.endpoint()).unwrap();
+    for _ in 0..50 {
+        if gateway.metrics()["connections_active"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        gateway.metrics()["connections_active"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+
+    let response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({"kind": "metrics", "token": "dev-token"}),
+        vec![],
+    );
+
+    assert_eq!(response["status"], "ok");
+    drop(idle_stream);
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_reports_async_master_control_requests() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+    let response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "async_master_metrics_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(response["status"], "ok");
+
+    let response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "get_stream",
+            "source": "async_master_metrics_ticks",
+            "token": "dev-token",
+        }),
+        vec![],
+    );
+    assert_eq!(response["status"], "ok");
+
+    let metrics = gateway.metrics();
+    assert!(metrics["master_async_requests_total"].as_u64().unwrap() >= 1);
 
     gateway.stop();
     master.shutdown();
@@ -230,11 +468,120 @@ fn native_gateway_collects_existing_segment_stream() {
 }
 
 #[test]
+fn native_gateway_collect_uses_pinned_snapshot_high_watermark() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("seq", DataType::Int64, false),
+    ]));
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("snapshot_writer").unwrap();
+    client
+        .register_stream("snapshot_ticks", schema.clone(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("snapshot_source", "test", "snapshot_ticks", json!({}))
+        .unwrap();
+    let mut materializer = master_bound_materializer(&mut client, "snapshot_ticks", schema, 64);
+    client
+        .publish_segment_descriptor_bytes(
+            "snapshot_ticks",
+            &materializer.active_descriptor_envelope_bytes().unwrap(),
+        )
+        .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(
+            RecordBatch::try_new(
+                materializer.output_schema(),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+                    std::sync::Arc::new(Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    materializer.on_flush().unwrap();
+
+    let response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "create_snapshot",
+            "source": "snapshot_ticks",
+            "token": "dev-token",
+        }),
+        vec![],
+    );
+    assert_eq!(response["status"], "ok");
+    let snapshot_id = response["snapshot"]["snapshot_id"].as_str().unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(
+            RecordBatch::try_new(
+                materializer.output_schema(),
+                vec![
+                    std::sync::Arc::new(StringArray::from(vec!["IF2607"])),
+                    std::sync::Arc::new(Int64Array::from(vec![2])),
+                ],
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    materializer.on_flush().unwrap();
+
+    let (response, payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "snapshot_ticks",
+            "snapshot_id": snapshot_id,
+            "token": "dev-token",
+            "plan": [],
+        }),
+        vec![],
+    );
+
+    assert_eq!(response["status"], "ok");
+    let collected = decode_ipc_batch(&payload);
+    assert_eq!(collected.num_rows(), 1);
+    let instruments = collected
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let seq = collected
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(instruments.value(0), "IF2606");
+    assert_eq!(seq.value(0), 1);
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment() {
     let temp = tempfile::tempdir().unwrap();
     let parquet_path = temp.path().join("ticks.parquet");
     let master_endpoint = loopback_control_endpoint();
-    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let (master, master_thread) =
+        spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
     let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
     let gateway = GatewayServer::new(GatewayServerConfig {
         endpoint: gateway_endpoint.clone(),
@@ -329,7 +676,8 @@ fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
     let old_path = temp.path().join("segment-1.parquet");
     let new_path = temp.path().join("segment-2.parquet");
     let master_endpoint = loopback_control_endpoint();
-    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let (master, master_thread) =
+        spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
     let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
     let gateway = GatewayServer::new(GatewayServerConfig {
         endpoint: gateway_endpoint.clone(),
@@ -903,8 +1251,24 @@ fn native_gateway_reregisters_master_process_after_lease_expiry() {
 fn spawn_master(
     endpoint: ControlEndpoint,
 ) -> (MasterServer, thread::JoinHandle<zippy_core::Result<()>>) {
+    spawn_master_with_config(endpoint, ZippyConfig::default())
+}
+
+fn spawn_master_with_persist_root(
+    endpoint: ControlEndpoint,
+    persist_root: &Path,
+) -> (MasterServer, thread::JoinHandle<zippy_core::Result<()>>) {
+    let mut config = ZippyConfig::default();
+    config.table.persist.data_dir = persist_root.to_string_lossy().to_string();
+    spawn_master_with_config(endpoint, config)
+}
+
+fn spawn_master_with_config(
+    endpoint: ControlEndpoint,
+    config: ZippyConfig,
+) -> (MasterServer, thread::JoinHandle<zippy_core::Result<()>>) {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let server = MasterServer::default();
+    let server = MasterServer::with_config(config);
     let server_for_thread = server.clone();
     let handle = thread::spawn(move || {
         server_for_thread.serve_endpoint_with_ready(&endpoint, Some(ready_tx))
@@ -1007,6 +1371,31 @@ fn send_gateway_frame_with_payload(
         serde_json::from_slice(&response_header).unwrap(),
         response_payload,
     )
+}
+
+fn send_gateway_header_without_payload(
+    endpoint: &str,
+    header: serde_json::Value,
+    payload_len: u64,
+) -> std::io::Result<serde_json::Value> {
+    let mut stream = TcpStream::connect(endpoint)?;
+    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    stream.write_all(&(header_bytes.len() as u32).to_be_bytes())?;
+    stream.write_all(&payload_len.to_be_bytes())?;
+    stream.write_all(&header_bytes)?;
+
+    let mut prefix = [0u8; 12];
+    stream.read_exact(&mut prefix)?;
+    let header_len = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
+    let payload_len = u64::from_be_bytes(prefix[4..12].try_into().unwrap()) as usize;
+    let mut response_header = vec![0u8; header_len];
+    stream.read_exact(&mut response_header)?;
+    if payload_len > 0 {
+        let mut response_payload = vec![0u8; payload_len];
+        stream.read_exact(&mut response_payload)?;
+    }
+    Ok(serde_json::from_slice(&response_header).unwrap())
 }
 
 fn decode_ipc_batch(payload: &[u8]) -> RecordBatch {

@@ -20,6 +20,7 @@ fn tcp_control_transport_roundtrips_json_line() {
         assert!(matches!(request, ControlRequest::RegisterProcess(_)));
         let response = serde_json::to_string(&ControlResponse::ProcessRegistered {
             process_id: "proc_test".to_string(),
+            process_token: "token_test".to_string(),
         })
         .unwrap();
         stream.write_all(response.as_bytes()).unwrap();
@@ -35,7 +36,7 @@ fn tcp_control_transport_roundtrips_json_line() {
     .unwrap();
 
     match response {
-        ControlResponse::ProcessRegistered { process_id } => {
+        ControlResponse::ProcessRegistered { process_id, .. } => {
             assert_eq!(process_id, "proc_test");
         }
         other => panic!("unexpected response: {other:?}"),

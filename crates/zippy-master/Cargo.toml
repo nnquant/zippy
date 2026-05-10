@@ -4,15 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+arrow.workspace = true
+parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-gateway = { path = "../zippy-gateway" }
-zippy-shm-bridge = { path = "../../vendor/zippy-shm-bridge" }
+zippy-segment-store = { path = "../zippy-segment-store" }
 
 [dev-dependencies]
-arrow.workspace = true
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]

@@ -127,6 +127,7 @@ pub trait StreamTablePersistPublisher: Send + Sync {
 struct StreamTablePersistTask {
     sealed: SealedSegmentHandle,
     source_generation: serde_json::Value,
+    writer_epoch: u64,
     identity: SegmentIdentity,
 }
 
@@ -331,6 +332,7 @@ impl StreamTablePersistWorker {
                                     let event = persist_metadata_sync_failure_event(
                                         &stream_name,
                                         task.identity,
+                                        task.writer_epoch,
                                         outcome.attempts,
                                         error,
                                     );
@@ -378,6 +380,7 @@ impl StreamTablePersistWorker {
                             let event = persist_failure_event(
                                 &stream_name,
                                 task.identity,
+                                task.writer_epoch,
                                 config.max_attempts as u64,
                                 &error,
                             );
@@ -694,6 +697,16 @@ impl StreamTableMaterializer {
             .unwrap_or_else(|| self.active_descriptor_value())?;
         descriptor["sealed_segments"] =
             serde_json::Value::Array(self.sealed_segment_descriptors.clone());
+        let retained_replacements = self
+            .replacement_retained_snapshots
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !retained_replacements.is_empty() {
+            descriptor["retained_replacement_segments"] =
+                serde_json::Value::Array(retained_replacements);
+        }
         serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
             reason: error.to_string(),
         })
@@ -1026,6 +1039,10 @@ impl StreamTableMaterializer {
             .get("generation")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        let writer_epoch = sealed_descriptor
+            .get("writer_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
         let identity = descriptor_segment_identity(sealed_descriptor).unwrap_or((
             sealed.segment_id(),
             source_generation.as_u64().unwrap_or_default(),
@@ -1033,6 +1050,7 @@ impl StreamTableMaterializer {
         worker.enqueue(StreamTablePersistTask {
             sealed,
             source_generation,
+            writer_epoch,
             identity,
         })
     }
@@ -1216,13 +1234,24 @@ impl KeyValueTableMaterializer {
         by: Vec<impl Into<String>>,
         row_capacity: usize,
     ) -> Result<Self> {
+        Self::new_with_row_capacity_and_writer_epoch(name, input_schema, by, row_capacity, None)
+    }
+
+    pub fn new_with_row_capacity_and_writer_epoch(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        by: Vec<impl Into<String>>,
+        row_capacity: usize,
+        writer_epoch: Option<u64>,
+    ) -> Result<Self> {
         let name = name.into();
         let by = by.into_iter().map(Into::into).collect::<Vec<_>>();
         validate_latest_by_columns(input_schema.as_ref(), &by)?;
-        let table = StreamTableMaterializer::new_with_row_capacity(
+        let table = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
             name.clone(),
             Arc::clone(&input_schema),
             row_capacity,
+            writer_epoch,
         )?;
 
         Ok(Self {
@@ -1437,6 +1466,7 @@ fn write_sealed_segment_parquet(
     stream_name: &str,
     sealed: &SealedSegmentHandle,
     source_generation: serde_json::Value,
+    writer_epoch: u64,
     config: &StreamTablePersistConfig,
 ) -> Result<Vec<serde_json::Value>> {
     let batch = sealed.as_record_batch().map_err(|error| ZippyError::Io {
@@ -1480,6 +1510,7 @@ fn write_sealed_segment_parquet(
             "row_count": partition.batch.num_rows(),
             "source_segment_id": sealed.segment_id(),
             "source_generation": source_generation.clone(),
+            "writer_epoch": writer_epoch,
             "partition": partition_values_json(&partition.values.raw),
             "partition_path": partition_values_json(&partition.values.encoded),
             "partition_spec": partition_spec_json(config.partition_spec.as_ref()),
@@ -1500,6 +1531,7 @@ fn write_and_publish_persisted_files(
         stream_name,
         &task.sealed,
         task.source_generation.clone(),
+        task.writer_epoch,
         config,
     )?;
     write_persist_metadata_sidecars(config.root(), &persisted_files)?;
@@ -1553,6 +1585,7 @@ fn persist_file_id(
 fn persist_failure_event(
     stream_name: &str,
     identity: SegmentIdentity,
+    writer_epoch: u64,
     attempts: u64,
     error: &str,
 ) -> serde_json::Value {
@@ -1562,6 +1595,7 @@ fn persist_failure_event(
         "persist_event_type": "persist_failed",
         "source_segment_id": identity.0,
         "source_generation": identity.1,
+        "writer_epoch": writer_epoch,
         "attempts": attempts,
         "error": error,
         "created_at": current_time_millis(),
@@ -1571,6 +1605,7 @@ fn persist_failure_event(
 fn persist_metadata_sync_failure_event(
     stream_name: &str,
     identity: SegmentIdentity,
+    writer_epoch: u64,
     attempts: u64,
     error: &str,
 ) -> serde_json::Value {
@@ -1580,6 +1615,7 @@ fn persist_metadata_sync_failure_event(
         "persist_event_type": "persist_metadata_sync_failed",
         "source_segment_id": identity.0,
         "source_generation": identity.1,
+        "writer_epoch": writer_epoch,
         "attempts": attempts,
         "error": error,
         "created_at": current_time_millis(),

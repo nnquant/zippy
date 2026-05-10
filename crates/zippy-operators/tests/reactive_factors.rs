@@ -132,6 +132,44 @@ fn return_outputs_null_during_warmup() {
 }
 
 #[test]
+fn return_outputs_null_when_base_is_zero() {
+    let ret_spec = TsReturnSpec::new("id", "value", 1, "ret_1");
+    let mut ret = ret_spec.build().unwrap();
+
+    let values = float64_values(
+        &ret.evaluate(&batch(vec!["x", "x", "x"], vec![0.0, 10.0, 15.0]))
+            .unwrap(),
+    );
+
+    assert_float_options_eq(&values, &[None, None, Some(0.5)]);
+}
+
+#[test]
+fn reactive_factors_reject_non_finite_float_inputs() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let specs = [
+            TsEmaSpec::new("id", "value", 2, "ema").build().unwrap(),
+            TsReturnSpec::new("id", "value", 1, "ret").build().unwrap(),
+            LogSpec::new("id", "value", "log").build().unwrap(),
+            CastSpec::new("id", "value", "int64", "value_i64")
+                .build()
+                .unwrap(),
+        ];
+
+        for mut factor in specs {
+            let error = factor.evaluate(&batch(vec!["x"], vec![value])).unwrap_err();
+
+            match error {
+                ZippyError::SchemaMismatch { reason } => {
+                    assert!(reason.contains("non-finite"));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn evaluate_returns_schema_mismatch_for_wrong_value_type() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),

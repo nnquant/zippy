@@ -1,31 +1,15 @@
-use std::collections::BTreeSet;
-use std::hint::spin_loop;
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use arrow::array::{Array, StringArray};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
-use zippy_shm_bridge::{ReadResult as SharedReadResult, SharedFrameRing};
-
-use crate::bus_frame::{
-    encode_bus_frame_with_timing, parse_bus_frame, patch_bus_frame_publish_done, BusFrameKind,
-    BusFrameTiming,
-};
 use crate::bus_protocol::{
-    AcquireSegmentReaderLeaseRequest, AttachStreamRequest, ControlEnvelopeRequest, ControlRequest,
-    ControlResponse, DetachReaderRequest, DetachWriterRequest, DropTableRequest, DropTableResult,
-    GetConfigRequest, GetSegmentDescriptorRequest, GetStreamRequest, HeartbeatRequest,
-    ListStreamsRequest, PublishPersistEventRequest, PublishPersistedFileRequest,
-    PublishSegmentDescriptorRequest, ReaderDescriptor, RegisterEngineRequest,
+    AcquireSegmentReaderLeaseRequest, ControlEnvelopeRequest, ControlRequest, ControlResponse,
+    DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
+    GetStreamRequest, HeartbeatRequest, ListStreamsRequest, PublishPersistEventRequest,
+    PublishPersistedFileRequest, PublishSegmentDescriptorRequest, RegisterEngineRequest,
     RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
     ReleaseSegmentReaderLeaseRequest, ReplacePersistedFilesRequest, StreamInfo,
     UnregisterProcessRequest, UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
-    WriterDescriptor,
 };
 use crate::{
     canonical_schema_hash, resolve_control_endpoint, schema_metadata, send_control_line_request,
@@ -44,31 +28,8 @@ fn next_control_request_id() -> String {
 pub struct MasterClient {
     endpoint: ControlEndpoint,
     process_id: Option<String>,
-}
-
-pub struct Writer {
-    endpoint: ControlEndpoint,
-    descriptor: WriterDescriptor,
-    next_write_seq: u64,
-    ring: SharedFrameRing,
-    closed: bool,
-}
-
-pub struct Reader {
-    endpoint: ControlEndpoint,
-    descriptor: ReaderDescriptor,
-    instrument_filter: Option<BTreeSet<String>>,
-    xfast: bool,
-    next_read_seq: u64,
-    ring: SharedFrameRing,
-    closed: bool,
-}
-
-pub struct TimedReadBatch {
-    pub batch: RecordBatch,
-    pub bus_timing: Option<BusFrameTiming>,
-    pub frame_ready_ns: i64,
-    pub read_return_ns: i64,
+    process_token: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +51,8 @@ impl MasterClient {
         Ok(Self {
             endpoint,
             process_id: None,
+            process_token: None,
+            token: None,
         })
     }
 
@@ -101,6 +64,14 @@ impl MasterClient {
         self.process_id.as_deref()
     }
 
+    pub fn process_token(&self) -> Option<&str> {
+        self.process_token.as_deref()
+    }
+
+    pub fn set_token(&mut self, token: impl Into<String>) {
+        self.token = Some(token.into());
+    }
+
     pub fn register_process(&mut self, app: &str) -> Result<String> {
         let response =
             self.send_request(ControlRequest::RegisterProcess(RegisterProcessRequest {
@@ -108,8 +79,12 @@ impl MasterClient {
             }))?;
 
         match response {
-            ControlResponse::ProcessRegistered { process_id } => {
+            ControlResponse::ProcessRegistered {
+                process_id,
+                process_token,
+            } => {
                 self.process_id = Some(process_id.clone());
+                self.process_token = Some(process_token);
                 Ok(process_id)
             }
             other => Err(unexpected_response("ProcessRegistered", other)),
@@ -118,8 +93,11 @@ impl MasterClient {
 
     pub fn heartbeat(&self) -> Result<()> {
         let process_id = self.require_process_id()?;
-        let response =
-            self.send_request(ControlRequest::Heartbeat(HeartbeatRequest { process_id }))?;
+        let process_token = Some(self.require_process_token()?);
+        let response = self.send_request(ControlRequest::Heartbeat(HeartbeatRequest {
+            process_id,
+            process_token,
+        }))?;
 
         match response {
             ControlResponse::HeartbeatAccepted { .. } => Ok(()),
@@ -151,15 +129,18 @@ impl MasterClient {
 
     pub fn unregister_process(&mut self) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response = self.send_request(ControlRequest::UnregisterProcess(
             UnregisterProcessRequest {
                 process_id: process_id.clone(),
+                process_token,
             },
         ))?;
 
         match response {
             ControlResponse::ProcessUnregistered { .. } => {
                 self.process_id = None;
+                self.process_token = None;
                 Ok(())
             }
             other => Err(unexpected_response("ProcessUnregistered", other)),
@@ -175,8 +156,12 @@ impl MasterClient {
     ) -> Result<()> {
         let schema_hash = canonical_schema_hash(&schema);
         let schema = schema_metadata(&schema);
+        let (process_id, process_token) = self.optional_process_capability_or_token()?;
         let response =
             self.send_request(ControlRequest::RegisterStream(RegisterStreamRequest {
+                process_id,
+                process_token,
+                token: self.token.clone(),
                 stream_name: stream_name.to_string(),
                 schema,
                 schema_hash,
@@ -198,11 +183,13 @@ impl MasterClient {
         config: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response =
             self.send_request(ControlRequest::RegisterSource(RegisterSourceRequest {
                 source_name: source_name.to_string(),
                 source_type: source_type.to_string(),
                 process_id,
+                process_token,
                 output_stream: output_stream.to_string(),
                 config,
             }))?;
@@ -215,10 +202,12 @@ impl MasterClient {
 
     pub fn unregister_source(&mut self, source_name: &str) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response =
             self.send_request(ControlRequest::UnregisterSource(UnregisterSourceRequest {
                 source_name: source_name.to_string(),
                 process_id,
+                process_token,
             }))?;
 
         match response {
@@ -237,11 +226,13 @@ impl MasterClient {
         config: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response =
             self.send_request(ControlRequest::RegisterEngine(RegisterEngineRequest {
                 engine_name: engine_name.to_string(),
                 engine_type: engine_type.to_string(),
                 process_id,
+                process_token,
                 input_stream: input_stream.to_string(),
                 output_stream: output_stream.to_string(),
                 sink_names,
@@ -262,10 +253,12 @@ impl MasterClient {
         config: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response = self.send_request(ControlRequest::RegisterSink(RegisterSinkRequest {
             sink_name: sink_name.to_string(),
             sink_type: sink_type.to_string(),
             process_id,
+            process_token,
             input_stream: input_stream.to_string(),
             config,
         }))?;
@@ -283,8 +276,12 @@ impl MasterClient {
         status: &str,
         metrics: Option<serde_json::Value>,
     ) -> Result<()> {
+        let (process_id, process_token) = self.optional_process_capability_or_token()?;
         let response =
             self.send_request(ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+                process_id,
+                process_token,
+                token: self.token.clone(),
                 kind: kind.to_string(),
                 name: name.to_string(),
                 status: status.to_string(),
@@ -294,122 +291,6 @@ impl MasterClient {
         match response {
             ControlResponse::StatusUpdated { .. } => Ok(()),
             other => Err(unexpected_response("StatusUpdated", other)),
-        }
-    }
-
-    pub fn write_to(&mut self, stream_name: &str) -> Result<Writer> {
-        let process_id = self.require_process_id()?;
-        let response = self.send_request(ControlRequest::WriteTo(AttachStreamRequest {
-            stream_name: stream_name.to_string(),
-            process_id,
-            instrument_ids: None,
-        }))?;
-
-        match response {
-            ControlResponse::WriterAttached { descriptor } => {
-                let ring = open_shared_ring(
-                    &descriptor.shm_name,
-                    descriptor.buffer_size,
-                    descriptor.frame_size,
-                )?;
-                let next_write_seq = descriptor
-                    .next_write_seq
-                    .max(ring.next_seq().map_err(shared_ring_error)?);
-                Ok(Writer {
-                    endpoint: self.endpoint.clone(),
-                    next_write_seq,
-                    ring,
-                    descriptor,
-                    closed: false,
-                })
-            }
-            other => Err(unexpected_response("WriterAttached", other)),
-        }
-    }
-
-    pub fn read_from(&mut self, stream_name: &str) -> Result<Reader> {
-        self.attach_reader(stream_name, None, false)
-    }
-
-    pub fn read_from_filtered(
-        &mut self,
-        stream_name: &str,
-        instrument_ids: Vec<String>,
-    ) -> Result<Reader> {
-        self.attach_reader(
-            stream_name,
-            normalize_instrument_filter(Some(instrument_ids))?,
-            false,
-        )
-    }
-
-    pub fn read_from_with_xfast(&mut self, stream_name: &str, xfast: bool) -> Result<Reader> {
-        self.attach_reader(stream_name, None, xfast)
-    }
-
-    pub fn read_from_filtered_with_xfast(
-        &mut self,
-        stream_name: &str,
-        instrument_ids: Vec<String>,
-        xfast: bool,
-    ) -> Result<Reader> {
-        self.attach_reader(
-            stream_name,
-            normalize_instrument_filter(Some(instrument_ids))?,
-            xfast,
-        )
-    }
-
-    fn attach_reader(
-        &mut self,
-        stream_name: &str,
-        instrument_ids: Option<Vec<String>>,
-        xfast: bool,
-    ) -> Result<Reader> {
-        let requested_filter = instrument_filter_request_set(&instrument_ids);
-        let process_id = self.require_process_id()?;
-        let response = self.send_request(ControlRequest::ReadFrom(AttachStreamRequest {
-            stream_name: stream_name.to_string(),
-            process_id,
-            instrument_ids,
-        }))?;
-
-        match response {
-            ControlResponse::ReaderAttached { descriptor } => {
-                let ring = open_shared_ring(
-                    &descriptor.shm_name,
-                    descriptor.buffer_size,
-                    descriptor.frame_size,
-                )?;
-                let next_read_seq = descriptor
-                    .next_read_seq
-                    .max(ring.seek_latest().map_err(shared_ring_error)?);
-                let descriptor_filter = instrument_filter_set(&descriptor.instrument_filter)?;
-                if let Some(requested_filter) = &requested_filter {
-                    match &descriptor_filter {
-                        Some(returned_filter) if returned_filter == requested_filter => {}
-                        _ => {
-                            return Err(ZippyError::Io {
-                                reason: format!(
-                                    "descriptor instrument filter mismatch requested=[{}] actual=[{}]",
-                                    format_instrument_filter_set(Some(requested_filter)),
-                                    format_instrument_filter_set(descriptor_filter.as_ref())
-                                ),
-                            });
-                        }
-                    }
-                }
-                Ok(Reader {
-                    endpoint: self.endpoint.clone(),
-                    instrument_filter: descriptor_filter,
-                    xfast,
-                    next_read_seq,
-                    ring,
-                    descriptor,
-                    closed: false,
-                })
-            }
-            other => Err(unexpected_response("ReaderAttached", other)),
         }
     }
 
@@ -448,6 +329,9 @@ impl MasterClient {
 
     pub fn drop_table(&self, table_name: &str, drop_persisted: bool) -> Result<DropTableResult> {
         let response = self.send_request(ControlRequest::DropTable(DropTableRequest {
+            process_id: self.process_id.clone(),
+            process_token: self.process_token.clone(),
+            token: self.token.clone(),
             table_name: table_name.to_string(),
             drop_persisted,
         }))?;
@@ -464,10 +348,13 @@ impl MasterClient {
         descriptor: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
+        let descriptor = self.with_stream_writer_epoch_if_missing(stream_name, descriptor)?;
         let response = self.send_request(ControlRequest::PublishSegmentDescriptor(
             PublishSegmentDescriptorRequest {
                 stream_name: stream_name.to_string(),
                 process_id,
+                process_token,
                 descriptor,
             },
         ))?;
@@ -494,10 +381,14 @@ impl MasterClient {
         persisted_file: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
+        let persisted_file =
+            self.with_stream_writer_epoch_if_missing(stream_name, persisted_file)?;
         let response = self.send_request(ControlRequest::PublishPersistedFile(
             PublishPersistedFileRequest {
                 stream_name: stream_name.to_string(),
                 process_id,
+                process_token,
                 persisted_file,
             },
         ))?;
@@ -513,9 +404,18 @@ impl MasterClient {
         stream_name: &str,
         persisted_files: Vec<serde_json::Value>,
     ) -> Result<()> {
+        let persisted_files = persisted_files
+            .into_iter()
+            .map(|persisted_file| {
+                self.with_stream_writer_epoch_if_missing(stream_name, persisted_file)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let response = self.send_request(ControlRequest::ReplacePersistedFiles(
             ReplacePersistedFilesRequest {
                 stream_name: stream_name.to_string(),
+                process_id: self.process_id.clone(),
+                process_token: self.process_token.clone(),
+                token: self.token.clone(),
                 persisted_files,
             },
         ))?;
@@ -532,10 +432,13 @@ impl MasterClient {
         persist_event: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
+        let persist_event = self.with_stream_writer_epoch_if_missing(stream_name, persist_event)?;
         let response = self.send_request(ControlRequest::PublishPersistEvent(
             PublishPersistEventRequest {
                 stream_name: stream_name.to_string(),
                 process_id,
+                process_token,
                 persist_event,
             },
         ))?;
@@ -553,10 +456,12 @@ impl MasterClient {
         source_generation: u64,
     ) -> Result<String> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response = self.send_request(ControlRequest::AcquireSegmentReaderLease(
             AcquireSegmentReaderLeaseRequest {
                 stream_name: stream_name.to_string(),
                 process_id,
+                process_token,
                 source_segment_id,
                 source_generation,
             },
@@ -570,10 +475,12 @@ impl MasterClient {
 
     pub fn release_segment_reader_lease(&self, stream_name: &str, lease_id: &str) -> Result<()> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response = self.send_request(ControlRequest::ReleaseSegmentReaderLease(
             ReleaseSegmentReaderLeaseRequest {
                 stream_name: stream_name.to_string(),
                 process_id,
+                process_token,
                 lease_id: lease_id.to_string(),
             },
         ))?;
@@ -586,10 +493,12 @@ impl MasterClient {
 
     pub fn get_segment_descriptor(&self, stream_name: &str) -> Result<Option<serde_json::Value>> {
         let process_id = self.require_process_id()?;
+        let process_token = Some(self.require_process_token()?);
         let response = self.send_request(ControlRequest::GetSegmentDescriptor(
             GetSegmentDescriptorRequest {
                 stream_name: stream_name.to_string(),
                 process_id,
+                process_token,
             },
         ))?;
 
@@ -639,11 +548,14 @@ impl MasterClient {
         timeout: Duration,
     ) -> Result<Option<crate::ResourceEvent>> {
         let process_id = self.require_process_id()?;
+        let process_token = self.require_process_token()?;
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         let response = self.send_request(ControlRequest::Envelope(ControlEnvelopeRequest {
             version: crate::CONTROL_PROTOCOL_VERSION,
             request_id: next_control_request_id(),
             process_id: Some(process_id),
+            process_token: Some(process_token),
+            token: self.token.clone(),
             verb: Some("watch".to_string()),
             resource: Some(resource),
             revision: Some(after_revision),
@@ -668,384 +580,51 @@ impl MasterClient {
         })
     }
 
+    fn require_process_token(&self) -> Result<String> {
+        self.process_token.clone().ok_or(ZippyError::InvalidState {
+            status: "master client process token missing",
+        })
+    }
+
+    fn optional_process_capability_or_token(&self) -> Result<(Option<String>, Option<String>)> {
+        match self.process_id.as_ref() {
+            Some(process_id) => Ok((
+                Some(process_id.clone()),
+                Some(self.require_process_token()?),
+            )),
+            None if self.token.is_some() => Ok((None, None)),
+            None => Err(ZippyError::InvalidState {
+                status: "master client process not registered",
+            }),
+        }
+    }
+
+    fn with_stream_writer_epoch_if_missing(
+        &self,
+        stream_name: &str,
+        mut metadata: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if metadata.get("writer_epoch").is_some() {
+            return Ok(metadata);
+        }
+
+        let writer_epoch = self.get_stream(stream_name)?.writer_epoch;
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "writer_epoch".to_string(),
+                serde_json::Value::from(writer_epoch),
+            );
+        }
+
+        Ok(metadata)
+    }
+
     fn send_request(&self, request: ControlRequest) -> Result<ControlResponse> {
         send_control_line_request(&self.endpoint, request)
     }
 }
 
-impl Writer {
-    pub fn descriptor(&self) -> &WriterDescriptor {
-        &self.descriptor
-    }
-
-    pub fn write(&mut self, batch: RecordBatch) -> Result<()> {
-        let target_publish_enter_ns = sample_localtime_ns();
-        self.write_with_target_publish_enter_ns(batch, target_publish_enter_ns)
-    }
-
-    pub fn write_with_target_publish_enter_ns(
-        &mut self,
-        batch: RecordBatch,
-        target_publish_enter_ns: i64,
-    ) -> Result<()> {
-        let writer_enter_ns = sample_localtime_ns();
-        let arrow_payload = encode_batch(&batch)?;
-        let arrow_encoded_ns = sample_localtime_ns();
-        let instrument_ids = extract_instrument_ids(&batch)?;
-        let instrument_ids_done_ns = sample_localtime_ns();
-        let publish_start_ns = sample_localtime_ns();
-        let frame = match instrument_ids {
-            Some(ids) => encode_bus_frame_with_timing(
-                &ids,
-                &arrow_payload,
-                Some(BusFrameTiming {
-                    target_publish_enter_ns,
-                    writer_enter_ns,
-                    arrow_encoded_ns,
-                    instrument_ids_done_ns,
-                    publish_start_ns,
-                    publish_done_ns: 0,
-                }),
-            )?,
-            None => encode_bus_frame_with_timing::<String>(
-                &[],
-                &arrow_payload,
-                Some(BusFrameTiming {
-                    target_publish_enter_ns,
-                    writer_enter_ns,
-                    arrow_encoded_ns,
-                    instrument_ids_done_ns,
-                    publish_start_ns,
-                    publish_done_ns: 0,
-                }),
-            )?,
-        };
-        let published_seq = self
-            .ring
-            .publish_with_builder(frame.len(), |payload| {
-                payload.copy_from_slice(&frame);
-                let publish_done_ns = sample_localtime_ns();
-                patch_bus_frame_publish_done(payload, publish_done_ns)
-                    .expect("timing frame patch should succeed");
-            })
-            .map_err(shared_ring_error)?;
-        self.next_write_seq = published_seq + 1;
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    pub fn close(&mut self) -> Result<()> {
-        if self.closed {
-            return Ok(());
-        }
-
-        let response = send_control_request(
-            &self.endpoint,
-            ControlRequest::CloseWriter(DetachWriterRequest {
-                stream_name: self.descriptor.stream_name.clone(),
-                process_id: self.descriptor.process_id.clone(),
-                writer_id: self.descriptor.writer_id.clone(),
-            }),
-        )?;
-
-        match response {
-            ControlResponse::WriterDetached { .. } => {
-                self.closed = true;
-                Ok(())
-            }
-            other => Err(unexpected_response("WriterDetached", other)),
-        }
-    }
-}
-
-impl Drop for Writer {
-    fn drop(&mut self) {
-        let _ = self.close();
-    }
-}
-
-impl Reader {
-    pub fn descriptor(&self) -> &ReaderDescriptor {
-        &self.descriptor
-    }
-
-    pub fn read(&mut self, timeout_ms: Option<u64>) -> Result<RecordBatch> {
-        Ok(self.read_with_timing(timeout_ms)?.batch)
-    }
-
-    pub fn read_with_timing(&mut self, timeout_ms: Option<u64>) -> Result<TimedReadBatch> {
-        let deadline = timeout_ms.map(|timeout| Instant::now() + Duration::from_millis(timeout));
-
-        loop {
-            match self
-                .ring
-                .read(self.next_read_seq)
-                .map_err(shared_ring_error)?
-            {
-                SharedReadResult::Ready(frame) => {
-                    let parsed = parse_bus_frame(&frame.payload)?;
-                    if let Some(filter) = &self.instrument_filter {
-                        match &parsed.kind {
-                            BusFrameKind::Legacy => {
-                                return Err(ZippyError::Io {
-                                    reason: format!(
-                                        "filtered reader requires enveloped bus frame reader_id=[{}] stream_name=[{}] seq=[{}]",
-                                        self.descriptor.reader_id,
-                                        self.descriptor.stream_name,
-                                        self.next_read_seq
-                                    ),
-                                });
-                            }
-                            BusFrameKind::EnvelopedWithoutDirectory => {
-                                self.next_read_seq += 1;
-                                continue;
-                            }
-                            BusFrameKind::EnvelopedWithDirectory { instrument_ids } => {
-                                if !instrument_filter_matches(filter, instrument_ids) {
-                                    self.next_read_seq += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-
-                    let frame_ready_ns = sample_localtime_ns();
-                    let batch = decode_batch(parsed.arrow_payload)?;
-                    let read_return_ns = sample_localtime_ns();
-                    self.next_read_seq += 1;
-                    return Ok(TimedReadBatch {
-                        batch,
-                        bus_timing: parsed.timing,
-                        frame_ready_ns,
-                        read_return_ns,
-                    });
-                }
-                SharedReadResult::Lagged {
-                    oldest_seq,
-                    latest_seq,
-                } => {
-                    return Err(ZippyError::Io {
-                        reason: format!(
-                            "reader lagged reader_id=[{}] requested_seq=[{}] oldest_available_seq=[{}] latest_write_seq=[{}]",
-                            self.descriptor.reader_id,
-                            self.next_read_seq,
-                            oldest_seq,
-                            latest_seq
-                        ),
-                    });
-                }
-                SharedReadResult::Pending => {}
-            }
-
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    return Err(ZippyError::Io {
-                        reason: format!(
-                            "reader timed out reader_id=[{}] stream_name=[{}] next_read_seq=[{}]",
-                            self.descriptor.reader_id,
-                            self.descriptor.stream_name,
-                            self.next_read_seq
-                        ),
-                    });
-                }
-            }
-
-            if self.xfast {
-                spin_loop();
-            } else {
-                thread::sleep(Duration::from_micros(10));
-            }
-        }
-    }
-
-    pub fn seek_latest(&mut self) -> Result<()> {
-        self.next_read_seq = self.ring.seek_latest().map_err(shared_ring_error)?;
-        Ok(())
-    }
-
-    pub fn close(&mut self) -> Result<()> {
-        if self.closed {
-            return Ok(());
-        }
-
-        let response = send_control_request(
-            &self.endpoint,
-            ControlRequest::CloseReader(DetachReaderRequest {
-                stream_name: self.descriptor.stream_name.clone(),
-                process_id: self.descriptor.process_id.clone(),
-                reader_id: self.descriptor.reader_id.clone(),
-            }),
-        )?;
-
-        match response {
-            ControlResponse::ReaderDetached { .. } => {
-                self.closed = true;
-                Ok(())
-            }
-            other => Err(unexpected_response("ReaderDetached", other)),
-        }
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        let _ = self.close();
-    }
-}
-
-fn sample_localtime_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time must be after unix epoch")
-        .as_nanos() as i64
-}
-
-fn send_control_request(
-    endpoint: &ControlEndpoint,
-    request: ControlRequest,
-) -> Result<ControlResponse> {
-    send_control_line_request(endpoint, request)
-}
-
-fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    {
-        let mut writer =
-            StreamWriter::try_new(&mut payload, &batch.schema()).map_err(arrow_error)?;
-        writer.write(batch).map_err(arrow_error)?;
-        writer.finish().map_err(arrow_error)?;
-    }
-    Ok(payload)
-}
-
-fn decode_batch(payload: &[u8]) -> Result<RecordBatch> {
-    let mut reader =
-        StreamReader::try_new(Cursor::new(payload.to_vec()), None).map_err(arrow_error)?;
-    match reader.next() {
-        Some(batch) => batch.map_err(arrow_error),
-        None => Err(ZippyError::Io {
-            reason: "missing record batch payload=[empty]".to_string(),
-        }),
-    }
-}
-
-fn open_shared_ring(
-    shm_name: &str,
-    buffer_size: usize,
-    frame_size: usize,
-) -> Result<SharedFrameRing> {
-    SharedFrameRing::create_or_open(shm_name, buffer_size, frame_size).map_err(shared_ring_error)
-}
-
-fn normalize_instrument_filter(instrument_ids: Option<Vec<String>>) -> Result<Option<Vec<String>>> {
-    match instrument_ids {
-        Some(ids) if ids.is_empty() => Ok(None),
-        Some(ids) => {
-            if ids.iter().any(|id| id.is_empty()) {
-                return Err(ZippyError::Io {
-                    reason: "instrument filter contains empty value".to_string(),
-                });
-            }
-            Ok(Some(ids))
-        }
-        None => Ok(None),
-    }
-}
-
-fn instrument_filter_request_set(instrument_ids: &Option<Vec<String>>) -> Option<BTreeSet<String>> {
-    instrument_ids
-        .as_ref()
-        .map(|ids| ids.iter().cloned().collect())
-}
-
-fn instrument_filter_set(instrument_ids: &Option<Vec<String>>) -> Result<Option<BTreeSet<String>>> {
-    match instrument_ids {
-        Some(ids) => {
-            if ids.iter().any(|id| id.is_empty()) {
-                return Err(ZippyError::Io {
-                    reason: "descriptor instrument filter contains empty value".to_string(),
-                });
-            }
-
-            let normalized = ids.iter().cloned().collect::<BTreeSet<_>>();
-            if normalized.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(normalized))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-fn format_instrument_filter_set(filter: Option<&BTreeSet<String>>) -> String {
-    match filter {
-        Some(filter) => filter.iter().cloned().collect::<Vec<_>>().join(","),
-        None => "unfiltered".to_string(),
-    }
-}
-
-fn instrument_filter_matches(filter: &BTreeSet<String>, instrument_ids: &[&str]) -> bool {
-    instrument_ids
-        .iter()
-        .any(|instrument_id| filter.contains(*instrument_id))
-}
-
-fn extract_instrument_ids(batch: &RecordBatch) -> Result<Option<Vec<String>>> {
-    let Ok(instrument_column_index) = batch.schema().index_of("instrument_id") else {
-        return Ok(None);
-    };
-    let instrument_column = batch.column(instrument_column_index);
-    let Some(instrument_ids) = instrument_column.as_any().downcast_ref::<StringArray>() else {
-        return Err(ZippyError::Io {
-            reason: format!(
-                "instrument_id column must be utf8 actual_type=[{:?}]",
-                instrument_column.data_type()
-            ),
-        });
-    };
-
-    let mut unique_instrument_ids = BTreeSet::new();
-    for row_index in 0..instrument_ids.len() {
-        if instrument_ids.is_null(row_index) {
-            return Err(ZippyError::Io {
-                reason: format!(
-                    "instrument_id column contains null row_index=[{}]",
-                    row_index
-                ),
-            });
-        }
-        let instrument_id = instrument_ids.value(row_index);
-        if instrument_id.is_empty() {
-            return Err(ZippyError::Io {
-                reason: format!(
-                    "instrument_id column contains empty value row_index=[{}]",
-                    row_index
-                ),
-            });
-        }
-        unique_instrument_ids.insert(instrument_id.to_string());
-    }
-
-    Ok(Some(unique_instrument_ids.into_iter().collect()))
-}
-
 fn json_error(error: serde_json::Error) -> ZippyError {
-    ZippyError::Io {
-        reason: error.to_string(),
-    }
-}
-
-fn arrow_error(error: arrow::error::ArrowError) -> ZippyError {
-    ZippyError::Io {
-        reason: error.to_string(),
-    }
-}
-
-fn shared_ring_error(error: zippy_shm_bridge::SharedFrameRingError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
     }

@@ -295,9 +295,7 @@ def run_gateway(
             max_write_rows=max_write_rows,
         ).start()
         host, port = _endpoint_host_port(gateway.endpoint)
-        click.echo(
-            f"gateway started host=[{host}] port=[{port}] endpoint=[{gateway.endpoint}]"
-        )
+        click.echo(f"gateway started host=[{host}] port=[{port}] endpoint=[{gateway.endpoint}]")
         if once:
             return
 
@@ -364,8 +362,7 @@ def smoke_gateway(
         echo_json(result)
     else:
         click.echo(
-            "gateway smoke ok "
-            f"stream_name=[{result['stream_name']}] rows=[{result['rows']}]"
+            "gateway smoke ok " f"stream_name=[{result['stream_name']}] rows=[{result['rows']}]"
         )
 
 

@@ -6,12 +6,8 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use zippy_core::{canonical_schema_hash, MasterClient, SchemaRef, ZippyConfig};
-use zippy_master::bus::Bus;
-use zippy_master::ring::{ReadError, RingWriteError, StreamRing};
 use zippy_master::server::MasterServer;
 use zippy_master::snapshot::SnapshotStore;
 
@@ -27,28 +23,6 @@ fn incompatible_schema() -> SchemaRef {
         Field::new("instrument_id", DataType::Utf8, false),
         Field::new("bid_price", DataType::Float64, false),
     ]))
-}
-
-fn test_batch() -> RecordBatch {
-    RecordBatch::try_new(
-        test_schema(),
-        vec![
-            std::sync::Arc::new(StringArray::from(vec!["IF2606", "IH2606"])),
-            std::sync::Arc::new(Float64Array::from(vec![3210.5, 2987.0])),
-        ],
-    )
-    .unwrap()
-}
-
-fn batch_with_rows(instrument_ids: Vec<&str>, mid_prices: Vec<f64>) -> RecordBatch {
-    RecordBatch::try_new(
-        test_schema(),
-        vec![
-            std::sync::Arc::new(StringArray::from(instrument_ids)),
-            std::sync::Arc::new(Float64Array::from(mid_prices)),
-        ],
-    )
-    .unwrap()
 }
 
 fn unique_socket_path() -> PathBuf {
@@ -87,6 +61,32 @@ fn spawn_test_server_with_lease(
     (server, join_handle)
 }
 
+fn seed_sealed_segment_identity(
+    server: &MasterServer,
+    stream_name: &str,
+    segment_id: u64,
+    generation: u64,
+) {
+    let registry_handle = server.registry();
+    let mut registry = registry_handle.lock().unwrap();
+    let stream = registry.get_stream(stream_name).unwrap().clone();
+    registry
+        .set_stream_segment_metadata(
+            stream_name,
+            stream.descriptor_generation.saturating_add(1),
+            vec![serde_json::json!({
+                "segment_id": segment_id,
+                "generation": generation,
+            })],
+            stream.persisted_files,
+            stream.persist_events,
+            stream.persist_revision,
+            stream.segment_reader_leases,
+            stream.writer_epoch,
+        )
+        .unwrap();
+}
+
 fn spawn_test_server_with_config(
     socket_path: &Path,
     config: ZippyConfig,
@@ -102,14 +102,22 @@ fn spawn_test_server_with_config(
     (server, join_handle)
 }
 
-fn spawn_test_server_with_snapshot(
+fn persist_root_config(persist_root: &Path) -> ZippyConfig {
+    let mut config = ZippyConfig::default();
+    config.table.persist.data_dir = persist_root.to_string_lossy().to_string();
+    config
+}
+
+fn spawn_test_server_with_snapshot_and_config(
     socket_path: &Path,
     snapshot_path: PathBuf,
+    config: ZippyConfig,
 ) -> (MasterServer, thread::JoinHandle<()>) {
-    let server = MasterServer::with_runtime_config(
+    let server = MasterServer::with_runtime_config_and_config(
         Some(snapshot_path),
         Duration::from_secs(10),
         Duration::from_secs(2),
+        config,
     );
     let handle_server = server.clone();
     let socket_path = socket_path.to_path_buf();
@@ -285,19 +293,6 @@ fn control_plane_child_process_entrypoint() {
     run_control_plane_child_process();
 }
 
-fn send_request(socket_path: &Path, payload: &str) -> String {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    let mut stream = UnixStream::connect(socket_path).unwrap();
-    stream.write_all(payload.as_bytes()).unwrap();
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    response
-}
-
 #[test]
 fn master_client_fetches_master_runtime_config() {
     let socket_path = unique_socket_path();
@@ -319,78 +314,6 @@ fn master_client_fetches_master_runtime_config() {
 
     server.shutdown();
     handle.join().unwrap();
-}
-
-#[test]
-fn frame_ring_new_reader_on_existing_stream_starts_after_latest_frame() {
-    let mut ring = StreamRing::new(4, 1024).unwrap();
-    ring.publish_frame(b"a").unwrap();
-    ring.publish_frame(b"b").unwrap();
-
-    let reader = ring.attach_reader_at_latest();
-    assert_eq!(reader.next_read_seq, 3);
-    assert!(ring.read_frames(&reader.reader_id).unwrap().is_empty());
-
-    ring.publish_frame(b"c").unwrap();
-
-    let frames = ring.read_frames(&reader.reader_id).unwrap();
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].seq, 3);
-    assert_eq!(frames[0].bytes, b"c");
-}
-
-#[test]
-fn frame_ring_reports_lagged_reader_after_overwrite() {
-    let mut ring = StreamRing::new(2, 1024).unwrap();
-    let reader = ring.attach_reader();
-    ring.publish_frame(b"a").unwrap();
-    ring.publish_frame(b"b").unwrap();
-    ring.publish_frame(b"c").unwrap();
-
-    let error = ring.read_frames(&reader.reader_id).unwrap_err();
-    assert!(matches!(error, ReadError::ReaderLagged(_)));
-}
-
-#[test]
-fn frame_ring_rejects_frame_larger_than_frame_size() {
-    let mut ring = StreamRing::new(2, 2).unwrap();
-
-    let error = ring.publish_frame(b"abc").unwrap_err();
-    assert!(matches!(
-        error,
-        RingWriteError::FrameTooLarge {
-            frame_len: 3,
-            frame_size: 2,
-        }
-    ));
-}
-
-#[test]
-fn writer_and_reader_roundtrip_batches_through_master_bus() {
-    let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server(&socket_path);
-
-    let mut client_a = MasterClient::connect(&socket_path).unwrap();
-    let mut client_b = MasterClient::connect(&socket_path).unwrap();
-    client_a.register_process("writer").unwrap();
-    client_b.register_process("reader").unwrap();
-    client_a
-        .register_stream("ticks", test_schema(), 64, 4096)
-        .unwrap();
-
-    let batch = test_batch();
-    let mut writer = client_a.write_to("ticks").unwrap();
-    let mut reader = client_b.read_from("ticks").unwrap();
-
-    writer.write(batch.clone()).unwrap();
-    let received = reader.read(Some(1000)).unwrap();
-    assert_eq!(received.num_rows(), batch.num_rows());
-    assert_eq!(received.num_columns(), batch.num_columns());
-    assert_eq!(format!("{received:?}"), format!("{batch:?}"));
-
-    server.shutdown();
-    join_handle.join().unwrap();
-    let _ = fs::remove_file(socket_path);
 }
 
 #[test]
@@ -452,33 +375,59 @@ fn master_client_rejects_same_stream_with_different_schema() {
 }
 
 #[test]
-fn filtered_reader_skips_non_matching_frames_until_match() {
+fn unregistering_active_source_detaches_writer_and_clears_descriptor() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
 
-    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
-    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
-    writer_client.register_process("writer").unwrap();
-    reader_client.register_process("reader").unwrap();
-    writer_client
-        .register_stream("ticks", test_schema(), 64, 4096)
+    let mut old = MasterClient::connect(&socket_path).unwrap();
+    old.register_process("old_source").unwrap();
+    old.register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
-
-    let mut writer = writer_client.write_to("ticks").unwrap();
-    let mut reader = reader_client
-        .read_from_filtered("ticks", vec!["IF2606".to_string()])
+    old.register_source("openctp_old", "openctp", "ticks", serde_json::json!({}))
         .unwrap();
+    old.publish_segment_descriptor(
+        "ticks",
+        serde_json::json!({
+            "magic": "zippy.segment.active",
+            "version": 1,
+            "schema_id": 7,
+            "row_capacity": 64,
+            "shm_os_id": "/tmp/zippy-old-source",
+            "payload_offset": 64,
+            "committed_row_count_offset": 40,
+            "segment_id": 1,
+            "generation": 0,
+        }),
+    )
+    .unwrap();
+    old.unregister_source("openctp_old").unwrap();
 
-    let non_matching_batch = batch_with_rows(vec!["IH2606"], vec![2987.0]);
-    let matching_batch = batch_with_rows(vec!["IF2606", "IH2606"], vec![3210.5, 2987.0]);
+    let stream = old.get_stream("ticks").unwrap();
+    assert_eq!(stream.writer_process_id, None);
+    assert_eq!(stream.active_segment_descriptor, None);
+    assert_eq!(stream.status, "registered");
 
-    writer.write(non_matching_batch).unwrap();
-    writer.write(matching_batch.clone()).unwrap();
-
-    let received = reader.read(Some(1000)).unwrap();
-    assert_eq!(received.num_rows(), matching_batch.num_rows());
-    assert_eq!(received.num_columns(), matching_batch.num_columns());
-    assert_eq!(format!("{received:?}"), format!("{matching_batch:?}"));
+    let mut new = MasterClient::connect(&socket_path).unwrap();
+    new.register_process("new_source").unwrap();
+    new.register_source("openctp_new", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    new.publish_segment_descriptor(
+        "ticks",
+        serde_json::json!({
+            "magic": "zippy.segment.active",
+            "version": 1,
+            "schema_id": 7,
+            "row_capacity": 64,
+            "shm_os_id": "/tmp/zippy-new-source",
+            "payload_offset": 64,
+            "committed_row_count_offset": 40,
+            "segment_id": 2,
+            "generation": 0,
+        }),
+    )
+    .unwrap();
+    let stream = new.get_stream("ticks").unwrap();
+    assert_eq!(stream.writer_process_id.as_deref(), new.process_id());
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -486,21 +435,66 @@ fn filtered_reader_skips_non_matching_frames_until_match() {
 }
 
 #[test]
-fn closing_writer_allows_restarting_same_stream_writer() {
+fn get_stream_reports_unreadable_active_segment_preflight() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
-    client.register_process("writer").unwrap();
+    client.register_process("preflight_writer").unwrap();
     client
         .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    client
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 2,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "file:/tmp/zippy-missing-active-segment-for-preflight",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+            }),
+        )
+        .unwrap();
 
-    let mut first_writer = client.write_to("ticks").unwrap();
-    first_writer.close().unwrap();
+    let stream = client.get_stream("ticks").unwrap();
+    let stream_json = serde_json::to_value(stream).unwrap();
+    let preflight = stream_json
+        .get("active_segment_preflight")
+        .expect("stream metadata should include active segment preflight");
 
-    let second_writer = client.write_to("ticks").unwrap();
-    assert_eq!(second_writer.descriptor().stream_name, "ticks");
+    assert_eq!(
+        stream_json
+            .get("segment_row_capacity")
+            .and_then(serde_json::Value::as_u64),
+        Some(64)
+    );
+    assert_eq!(
+        preflight.get("status").and_then(serde_json::Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        preflight
+            .get("row_capacity")
+            .and_then(serde_json::Value::as_u64),
+        Some(64)
+    );
+    assert_eq!(
+        preflight.get("kind").and_then(serde_json::Value::as_str),
+        Some("active_segment_unreadable")
+    );
+    assert!(preflight
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .contains("failed to open active segment"));
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -508,42 +502,57 @@ fn closing_writer_allows_restarting_same_stream_writer() {
 }
 
 #[test]
-fn expired_process_writer_is_reclaimed_for_new_writer() {
+fn get_stream_reports_invalid_active_descriptor_preflight() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server(&socket_path);
 
-    let mut first = MasterClient::connect(&socket_path).unwrap();
-    first.register_process("writer_a").unwrap();
-    first
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("preflight_writer").unwrap();
+    client
         .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
-    let _writer = first.write_to("ticks").unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    client
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 2,
+                "schema_id": 7,
+                "shm_os_id": "file:/tmp/zippy-missing-active-segment-for-preflight",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+            }),
+        )
+        .unwrap();
 
-    let response = send_request(
-        &socket_path,
-        "{\"ExpireProcessForTest\":{\"process_id\":\"proc_1\"}}\n",
+    let stream = client.get_stream("ticks").unwrap();
+    let stream_json = serde_json::to_value(stream).unwrap();
+    let preflight = stream_json
+        .get("active_segment_preflight")
+        .expect("stream metadata should include active segment preflight");
+
+    assert!(
+        stream_json.get("segment_row_capacity").is_none(),
+        "invalid descriptor must not expose segment_row_capacity"
     );
-    assert!(response.contains("proc_1"));
-
-    let mut second = MasterClient::connect(&socket_path).unwrap();
-    second.register_process("writer_b").unwrap();
-    second
-        .register_stream("ticks", test_schema(), 64, 4096)
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    let second_writer = loop {
-        match second.write_to("ticks") {
-            Ok(writer) => break writer,
-            Err(error)
-                if error.to_string().contains("writer already attached")
-                    && std::time::Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => panic!("failed to reclaim writer lease error=[{error}]"),
-        }
-    };
-    assert_eq!(second_writer.descriptor().process_id, "proc_2");
+    assert_eq!(
+        preflight.get("status").and_then(serde_json::Value::as_str),
+        Some("error")
+    );
+    assert_eq!(
+        preflight.get("kind").and_then(serde_json::Value::as_str),
+        Some("active_descriptor_invalid")
+    );
+    assert!(preflight
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .contains("missing row_capacity"));
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -664,7 +673,8 @@ fn os_process_source_writer_takeover_rejects_stale_publish() {
         .unwrap();
     wait_for_file(&old_ready, Duration::from_secs(2));
 
-    let admin = MasterClient::connect(&socket_path).unwrap();
+    let mut admin = MasterClient::connect(&socket_path).unwrap();
+    admin.set_token(server.token());
     admin
         .update_status("source", "old_os_source", "lost", None)
         .unwrap();
@@ -697,83 +707,6 @@ fn os_process_source_writer_takeover_rejects_stale_publish() {
 }
 
 #[test]
-#[ignore = "control-plane writer lease reaper is outside task 4 frame ring hot path scope"]
-fn lease_reaper_reclaims_expired_writer_for_new_writer() {
-    let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server_with_lease(
-        &socket_path,
-        Duration::from_millis(50),
-        Duration::from_millis(10),
-    );
-
-    let mut first = MasterClient::connect(&socket_path).unwrap();
-    first.register_process("writer_a").unwrap();
-    first
-        .register_stream("ticks", test_schema(), 64, 4096)
-        .unwrap();
-    let _writer = first.write_to("ticks").unwrap();
-
-    thread::sleep(Duration::from_millis(120));
-
-    let mut second = MasterClient::connect(&socket_path).unwrap();
-    second.register_process("writer_b").unwrap();
-    second
-        .register_stream("ticks", test_schema(), 64, 4096)
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    let second_writer = loop {
-        match second.write_to("ticks") {
-            Ok(writer) => break writer,
-            Err(error)
-                if error.to_string().contains("writer already attached")
-                    && std::time::Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => panic!("failed to reclaim writer lease error=[{error}]"),
-        }
-    };
-    assert_eq!(second_writer.descriptor().process_id, "proc_2");
-
-    server.shutdown();
-    join_handle.join().unwrap();
-    let _ = fs::remove_file(socket_path);
-}
-
-#[test]
-fn lease_reaper_reclaims_expired_reader_attachments() {
-    let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server_with_lease(
-        &socket_path,
-        Duration::from_millis(50),
-        Duration::from_millis(10),
-    );
-
-    let mut writer = MasterClient::connect(&socket_path).unwrap();
-    writer.register_process("writer").unwrap();
-    writer
-        .register_stream("ticks", test_schema(), 64, 4096)
-        .unwrap();
-    let _writer = writer.write_to("ticks").unwrap();
-
-    let mut reader = MasterClient::connect(&socket_path).unwrap();
-    reader.register_process("reader").unwrap();
-    let _reader = reader.read_from("ticks").unwrap();
-
-    thread::sleep(Duration::from_millis(120));
-
-    let stream_response = send_request(
-        &socket_path,
-        "{\"GetStream\":{\"stream_name\":\"ticks\"}}\n",
-    );
-    assert!(stream_response.contains("\"reader_count\":0"));
-
-    server.shutdown();
-    join_handle.join().unwrap();
-    let _ = fs::remove_file(socket_path);
-}
-
-#[test]
 fn lease_reaper_reclaims_expired_segment_reader_leases() {
     let socket_path = unique_socket_path();
     let (server, join_handle) = spawn_test_server_with_lease(
@@ -787,6 +720,7 @@ fn lease_reaper_reclaims_expired_segment_reader_leases() {
     writer
         .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
+    seed_sealed_segment_identity(&server, "ticks", 1, 0);
 
     let mut reader = MasterClient::connect(&socket_path).unwrap();
     reader.register_process("query_reader").unwrap();
@@ -840,6 +774,7 @@ fn lease_reaper_persists_expired_segment_reader_lease_cleanup_to_snapshot() {
     writer
         .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
+    seed_sealed_segment_identity(&server, "ticks", 1, 0);
 
     let mut reader = MasterClient::connect(&socket_path).unwrap();
     reader.register_process("query_reader").unwrap();
@@ -1007,7 +942,16 @@ fn master_client_exposes_sealed_segments_as_stream_metadata() {
 #[test]
 fn master_client_publishes_persisted_file_metadata() {
     let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server(&socket_path);
+    let temp = tempfile::tempdir().unwrap();
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let parquet_file = persist_root
+        .join("trading_day=20260426")
+        .join("part-000001.parquet");
+    fs::create_dir_all(parquet_file.parent().unwrap()).unwrap();
+    fs::write(&parquet_file, b"not really parquet").unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_config(&socket_path, persist_root_config(&persist_root));
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("persist_writer").unwrap();
@@ -1022,7 +966,7 @@ fn master_client_publishes_persisted_file_metadata() {
         .publish_persisted_file(
             "ticks",
             serde_json::json!({
-                "file_path": "/data/ctp_ticks/trading_day=20260426/part-000001.parquet",
+                "file_path": parquet_file.to_string_lossy(),
                 "row_count": 1024,
                 "min_seq": 1,
                 "max_seq": 1024,
@@ -1051,7 +995,13 @@ fn master_client_publishes_persisted_file_metadata() {
 #[test]
 fn master_client_upserts_persisted_file_metadata_by_persist_file_id() {
     let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server(&socket_path);
+    let temp = tempfile::tempdir().unwrap();
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let parquet_file = persist_root.join("part-000000.parquet");
+    fs::write(&parquet_file, b"not really parquet").unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_config(&socket_path, persist_root_config(&persist_root));
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("persist_writer").unwrap();
@@ -1068,7 +1018,7 @@ fn master_client_upserts_persisted_file_metadata_by_persist_file_id() {
             "ticks",
             serde_json::json!({
                 "persist_file_id": persist_file_id,
-                "file_path": "/data/ctp_ticks/part-000000.parquet",
+                "file_path": parquet_file.to_string_lossy(),
                 "row_count": 1024,
                 "source_segment_id": 1,
                 "source_generation": 0,
@@ -1081,7 +1031,7 @@ fn master_client_upserts_persisted_file_metadata_by_persist_file_id() {
             "ticks",
             serde_json::json!({
                 "persist_file_id": persist_file_id,
-                "file_path": "/data/ctp_ticks/part-000000.parquet",
+                "file_path": parquet_file.to_string_lossy(),
                 "row_count": 1024,
                 "source_segment_id": 1,
                 "source_generation": 0,
@@ -1098,6 +1048,169 @@ fn master_client_upserts_persisted_file_metadata_by_persist_file_id() {
         persist_file_id
     );
     assert_eq!(stream.persisted_files[0]["retry_attempt"], 2);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_rejects_persisted_file_outside_configured_data_root() {
+    let socket_path = unique_socket_path();
+    let temp = tempfile::tempdir().unwrap();
+    let persist_root = temp.path().join("persisted");
+    let outside_root = temp.path().join("outside");
+    fs::create_dir_all(&persist_root).unwrap();
+    fs::create_dir_all(&outside_root).unwrap();
+    let outside_file = outside_root.join("attacker.parquet");
+    fs::write(&outside_file, b"not really parquet").unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_config(&socket_path, persist_root_config(&persist_root));
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("persist_writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+
+    let error = client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": outside_file,
+                "row_count": 1,
+                "source_segment_id": 1
+            }),
+        )
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside persist data root"),
+        "unexpected outside-root error: {error}"
+    );
+    assert!(client
+        .get_stream("ticks")
+        .unwrap()
+        .persisted_files
+        .is_empty());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn master_rejects_spoofed_persisted_file_stream_and_schema_metadata() {
+    let socket_path = unique_socket_path();
+    let temp = tempfile::tempdir().unwrap();
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let parquet_file = persist_root.join("part-000001.parquet");
+    fs::write(&parquet_file, b"not really parquet").unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_config(&socket_path, persist_root_config(&persist_root));
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("persist_writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+
+    let stream_error = client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": parquet_file,
+                "stream_name": "other_table",
+                "row_count": 1,
+                "source_segment_id": 1
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        stream_error
+            .to_string()
+            .contains("persisted_file.stream_name mismatch"),
+        "unexpected stream spoof error: {stream_error}"
+    );
+
+    let schema_error = client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": parquet_file,
+                "schema_hash": "wrong_hash",
+                "row_count": 1,
+                "source_segment_id": 1
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        schema_error
+            .to_string()
+            .contains("persisted_file.schema_hash mismatch"),
+        "unexpected schema spoof error: {schema_error}"
+    );
+    assert!(client
+        .get_stream("ticks")
+        .unwrap()
+        .persisted_files
+        .is_empty());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
+fn drop_table_prevalidates_persisted_files_before_removing_registry_state() {
+    let socket_path = unique_socket_path();
+    let temp = tempfile::tempdir().unwrap();
+    let persist_root = temp.path().join("persisted");
+    let bad_path = persist_root.join("bad-directory.parquet");
+    fs::create_dir_all(&bad_path).unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_config(&socket_path, persist_root_config(&persist_root));
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("drop_table_test").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    server
+        .registry()
+        .lock()
+        .unwrap()
+        .set_stream_persisted_files(
+            "ticks",
+            vec![serde_json::json!({
+                "file_path": bad_path,
+                "stream_name": "ticks",
+                "schema_hash": canonical_schema_hash(&test_schema()),
+                "row_count": 1
+            })],
+        )
+        .unwrap();
+
+    let error = client.drop_table("ticks", true).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("persisted table path is not a file"),
+        "unexpected drop prevalidation error: {error}"
+    );
+    assert!(
+        client.get_stream("ticks").is_ok(),
+        "stream registry state must remain committed when persisted delete prevalidation fails"
+    );
+    assert!(bad_path.exists());
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -1156,6 +1269,7 @@ fn master_client_acquires_and_releases_segment_reader_lease() {
     client
         .register_stream("ticks", test_schema(), 64, 4096)
         .unwrap();
+    seed_sealed_segment_identity(&server, "ticks", 1, 0);
 
     let lease_id = client.acquire_segment_reader_lease("ticks", 1, 0).unwrap();
     let stream = client.get_stream("ticks").unwrap();
@@ -1184,8 +1298,11 @@ fn master_client_drop_table_removes_catalog_dependencies_and_persisted_files() {
     fs::create_dir_all(&persist_dir).unwrap();
     let parquet_file = persist_dir.join("ticks-segment-00000000000000000001.parquet");
     fs::write(&parquet_file, b"persisted rows").unwrap();
-    let (server, join_handle) =
-        spawn_test_server_with_snapshot(&socket_path, snapshot_path.clone());
+    let (server, join_handle) = spawn_test_server_with_snapshot_and_config(
+        &socket_path,
+        snapshot_path.clone(),
+        persist_root_config(temp.path().join("tables").as_path()),
+    );
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
     client.register_process("drop_table_test").unwrap();
@@ -1236,61 +1353,6 @@ fn master_client_drop_table_removes_catalog_dependencies_and_persisted_files() {
     assert!(snapshot.sources.is_empty());
     assert!(snapshot.engines.is_empty());
     assert!(snapshot.sinks.is_empty());
-
-    server.shutdown();
-    join_handle.join().unwrap();
-    let _ = fs::remove_file(socket_path);
-}
-
-#[test]
-fn bus_read_from_returns_latest_next_read_seq() {
-    let mut bus = Bus::default();
-    bus.ensure_stream_with_sizes("ticks", 4, 1024).unwrap();
-
-    let writer = bus.write_to("ticks", "proc_1").unwrap();
-    assert_eq!(writer.next_write_seq, 1);
-
-    bus.publish_test_frame("ticks", b"abc").unwrap();
-
-    let reader = bus.read_from("ticks", "proc_2", None).unwrap();
-    assert_eq!(reader.next_read_seq, 2);
-}
-
-#[test]
-fn late_reader_skips_existing_frames_with_frame_ring_hot_path() {
-    let socket_path = unique_socket_path();
-    let (server, join_handle) = spawn_test_server(&socket_path);
-
-    let mut writer_client = MasterClient::connect(&socket_path).unwrap();
-    writer_client.register_process("writer").unwrap();
-    writer_client
-        .register_stream("ticks", test_schema(), 64, 4096)
-        .unwrap();
-    let mut writer = writer_client.write_to("ticks").unwrap();
-    writer.write(test_batch()).unwrap();
-
-    let mut reader_client = MasterClient::connect(&socket_path).unwrap();
-    reader_client.register_process("reader").unwrap();
-    let mut reader = reader_client.read_from("ticks").unwrap();
-
-    let timeout_error = reader.read(Some(50)).unwrap_err();
-    assert!(
-        timeout_error.to_string().contains("reader timed out"),
-        "unexpected error: {timeout_error}"
-    );
-
-    let next_batch = RecordBatch::try_new(
-        test_schema(),
-        vec![
-            std::sync::Arc::new(StringArray::from(vec!["TL2606"])),
-            std::sync::Arc::new(Float64Array::from(vec![102.25])),
-        ],
-    )
-    .unwrap();
-    writer.write(next_batch.clone()).unwrap();
-
-    let received = reader.read(Some(1000)).unwrap();
-    assert_eq!(format!("{received:?}"), format!("{next_batch:?}"));
 
     server.shutdown();
     join_handle.join().unwrap();

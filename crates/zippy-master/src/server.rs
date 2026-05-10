@@ -1,5 +1,7 @@
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,12 @@ use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+use arrow::compute::{concat_batches, lexsort_to_indices, take, SortColumn, SortOptions};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
 use zippy_core::bus_protocol::{
     DropTableResult, GetStreamResponse, ListStreamsResponse, ResourceEvent, StreamInfo,
     WatchRequest, WatchResource,
@@ -22,9 +30,9 @@ use zippy_core::{
     ControlEndpoint, ControlRequest, ControlResponse, Result, ZippyConfig, ZippyError,
     CONTROL_PROTOCOL_VERSION,
 };
+use zippy_segment_store::ShmRegion;
 
-use crate::bus::{Bus, BusError};
-use crate::registry::Registry;
+use crate::registry::{Registry, RegistryError, StreamRecord};
 use crate::snapshot::{
     RegistrySnapshot, SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord,
     SnapshotStore, SnapshotStreamRecord,
@@ -33,6 +41,7 @@ use crate::snapshot::{
 const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(2);
 const MASTER_ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const COMPACTION_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 const MASTER_SHUTDOWN_REASON: &str = "master shutdown requested";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,8 +55,6 @@ pub struct MasterServer {
     descriptor_changed: Arc<Condvar>,
     control_changed: Arc<Condvar>,
     shutdown_changed: Arc<Condvar>,
-    #[allow(dead_code)]
-    bus: Arc<Mutex<Bus>>,
     running: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     envelope_responses: Arc<Mutex<BTreeMap<String, ControlResponse>>>,
@@ -56,6 +63,8 @@ pub struct MasterServer {
     lease_timeout: Duration,
     lease_reaper_interval: Duration,
     config: ZippyConfig,
+    token: String,
+    token_generated: bool,
 }
 
 impl Default for MasterServer {
@@ -93,12 +102,15 @@ impl MasterServer {
         lease_reaper_interval: Duration,
         config: ZippyConfig,
     ) -> Self {
+        let (token, token_generated) = match config.master.token.clone() {
+            Some(token) => (token, false),
+            None => (generate_control_token("master"), true),
+        };
         Self {
             registry: Arc::new(Mutex::new(Registry::default())),
             descriptor_changed: Arc::new(Condvar::new()),
             control_changed: Arc::new(Condvar::new()),
             shutdown_changed: Arc::new(Condvar::new()),
-            bus: Arc::new(Mutex::new(Bus::default())),
             running: Arc::new(AtomicBool::new(true)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             envelope_responses: Arc::new(Mutex::new(BTreeMap::new())),
@@ -107,6 +119,24 @@ impl MasterServer {
             lease_timeout,
             lease_reaper_interval,
             config,
+            token,
+            token_generated,
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn log_generated_token(&self) {
+        if self.token_generated {
+            tracing::info!(
+                component = "master",
+                event = "master_token_generated",
+                status = "ready",
+                token = self.token.as_str(),
+                "master generated control token"
+            );
         }
     }
 
@@ -136,16 +166,9 @@ impl MasterServer {
         );
 
         {
-            let mut bus = server.bus.lock().unwrap();
             let mut registry = server.registry.lock().unwrap();
 
             for stream in snapshot.streams {
-                bus.ensure_stream_with_sizes(
-                    &stream.stream_name,
-                    stream.buffer_size,
-                    stream.frame_size,
-                )
-                .map_err(bus_error)?;
                 registry
                     .ensure_stream(
                         &stream.stream_name,
@@ -352,6 +375,8 @@ impl MasterServer {
             let _ = ready_tx.send(Ok(()));
         }
 
+        self.log_generated_token();
+
         tracing::info!(
             component = "master",
             event = "master_listening",
@@ -361,6 +386,7 @@ impl MasterServer {
         );
 
         self.start_lease_reaper();
+        self.start_compaction_worker();
 
         let accept_result = loop {
             if !self.running.load(Ordering::SeqCst) {
@@ -558,6 +584,8 @@ impl MasterServer {
             let _ = ready_tx.send(Ok(()));
         }
 
+        self.log_generated_token();
+
         tracing::info!(
             component = "master",
             event = "master_listening",
@@ -567,6 +595,7 @@ impl MasterServer {
         );
 
         self.start_lease_reaper();
+        self.start_compaction_worker();
 
         let accept_result = loop {
             if !self.running.load(Ordering::SeqCst) {
@@ -665,7 +694,8 @@ impl MasterServer {
     fn handle_watch_shutdown_request(&self, request: WatchRequest) -> ControlResponse {
         let timeout = Duration::from_millis(request.timeout_ms);
         let registry = self.registry.lock().unwrap();
-        let validate_result = registry.validate_process_alive(&request.process_id);
+        let validate_result = registry
+            .validate_process_capability(&request.process_id, request.process_token.as_deref());
         if validate_result.is_ok() && !self.shutdown_requested.load(Ordering::SeqCst) {
             let (_next_registry, _) = self
                 .shutdown_changed
@@ -1041,7 +1071,8 @@ impl MasterServer {
 
     fn handle_watch_gateway_config_request(&self, request: WatchRequest) -> ControlResponse {
         let registry = self.registry.lock().unwrap();
-        let validate_result = registry.validate_process_alive(&request.process_id);
+        let validate_result = registry
+            .validate_process_capability(&request.process_id, request.process_token.as_deref());
         drop(registry);
         match validate_result {
             Ok(()) if request.after_revision < 1 => ControlResponse::ResourceChanged {
@@ -1067,7 +1098,8 @@ impl MasterServer {
     ) -> ControlResponse {
         let timeout = Duration::from_millis(request.timeout_ms);
         let mut registry = self.registry.lock().unwrap();
-        let validate_result = registry.validate_process_alive(&request.process_id);
+        let validate_result = registry
+            .validate_process_capability(&request.process_id, request.process_token.as_deref());
         let response_result = match validate_result {
             Ok(()) => {
                 let should_wait = registry
@@ -1115,7 +1147,7 @@ impl MasterServer {
                         resource: WatchResource::Stream { stream_name },
                         revision,
                         payload: serde_json::json!({
-                            "stream": StreamInfo::from(stream),
+                            "stream": stream_info_with_active_preflight(stream),
                         }),
                     }),
                 }
@@ -1152,7 +1184,7 @@ impl MasterServer {
                     .unwrap()
                     .list_streams()
                     .into_iter()
-                    .map(StreamInfo::from)
+                    .map(stream_info_with_active_preflight)
                     .collect();
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
@@ -1190,8 +1222,18 @@ impl MasterServer {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("control_v2");
                 let process_id = self.registry.lock().unwrap().register_process(app);
+                let process_token = self
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .get_process_token(&process_id)
+                    .unwrap_or_default()
+                    .to_string();
                 self.control_changed.notify_all();
-                ControlResponse::ProcessRegistered { process_id }
+                ControlResponse::ProcessRegistered {
+                    process_id,
+                    process_token,
+                }
             }
             Some("heartbeat") => {
                 let Some(process_id) = envelope.process_id else {
@@ -1199,6 +1241,12 @@ impl MasterServer {
                         reason: "control envelope heartbeat requires process_id".to_string(),
                     };
                 };
+                if let Some(response) = self.require_process_capability_response(
+                    &process_id,
+                    envelope.process_token.as_deref(),
+                ) {
+                    return response;
+                }
                 if self.shutdown_requested.load(Ordering::SeqCst) {
                     return ControlResponse::ShutdownRequested {
                         process_id,
@@ -1215,7 +1263,12 @@ impl MasterServer {
                     },
                 }
             }
-            Some("update_status") => self.handle_control_envelope_update_status(envelope.payload),
+            Some("update_status") => self.handle_control_envelope_update_status(
+                envelope.process_id,
+                envelope.process_token,
+                envelope.token,
+                envelope.payload,
+            ),
             Some("watch") => {
                 let Some(process_id) = envelope.process_id else {
                     return ControlResponse::Error {
@@ -1227,8 +1280,15 @@ impl MasterServer {
                         reason: "control envelope watch requires resource".to_string(),
                     };
                 };
+                if let Some(response) = self.require_process_capability_response(
+                    &process_id,
+                    envelope.process_token.as_deref(),
+                ) {
+                    return response;
+                }
                 self.handle_watch_request(WatchRequest {
                     process_id,
+                    process_token: envelope.process_token,
                     resource,
                     after_revision: envelope.revision.unwrap_or_default(),
                     timeout_ms: envelope.timeout_ms.unwrap_or_default(),
@@ -1248,7 +1308,7 @@ impl MasterServer {
                     .cloned()
                 {
                     Some(stream) => ControlResponse::StreamFetched(GetStreamResponse {
-                        stream: StreamInfo::from(stream),
+                        stream: stream_info_with_active_preflight(stream),
                     }),
                     None => ControlResponse::Error {
                         reason: format!("stream not found stream_name=[{}]", stream_name),
@@ -1265,7 +1325,7 @@ impl MasterServer {
                     .unwrap()
                     .list_streams()
                     .into_iter()
-                    .map(StreamInfo::from)
+                    .map(stream_info_with_active_preflight)
                     .collect();
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
@@ -1280,6 +1340,9 @@ impl MasterServer {
 
     fn handle_control_envelope_update_status(
         &self,
+        process_id: Option<String>,
+        process_token: Option<String>,
+        token: Option<String>,
         payload: Option<serde_json::Value>,
     ) -> ControlResponse {
         let Some(payload) = payload else {
@@ -1303,6 +1366,41 @@ impl MasterServer {
             };
         };
         let metrics = payload.get("metrics").cloned();
+        if !self.token_matches(token.as_deref()) {
+            let Some(process_id) = process_id.as_deref() else {
+                return ControlResponse::Error {
+                    reason: "control envelope update_status requires process_id".to_string(),
+                };
+            };
+            if let Err(error) =
+                self.validate_process_capability(process_id, process_token.as_deref())
+            {
+                return ControlResponse::Error {
+                    reason: error.to_string(),
+                };
+            }
+            let registry = self.registry.lock().unwrap();
+            let owner_process_id = match kind {
+                "source" => registry
+                    .get_source(name)
+                    .map(|record| record.process_id.as_str()),
+                "engine" => registry
+                    .get_engine(name)
+                    .map(|record| record.process_id.as_str()),
+                "sink" => registry
+                    .get_sink(name)
+                    .map(|record| record.process_id.as_str()),
+                _ => None,
+            };
+            if owner_process_id != Some(process_id) {
+                return ControlResponse::Error {
+                    reason: format!(
+                        "status update not authorized kind=[{}] name=[{}] process_id=[{}]",
+                        kind, name, process_id
+                    ),
+                };
+            }
+        }
 
         let _snapshot_guard = self.snapshot_lock.lock().unwrap();
         let mut registry = self.registry.lock().unwrap();
@@ -1360,6 +1458,33 @@ impl MasterServer {
                 reason: error.to_string(),
             },
         }
+    }
+
+    fn validate_process_capability(
+        &self,
+        process_id: &str,
+        process_token: Option<&str>,
+    ) -> std::result::Result<(), RegistryError> {
+        self.registry
+            .lock()
+            .unwrap()
+            .validate_process_capability(process_id, process_token)
+    }
+
+    fn token_matches(&self, token: Option<&str>) -> bool {
+        token == Some(self.token.as_str())
+    }
+
+    fn require_process_capability_response(
+        &self,
+        process_id: &str,
+        process_token: Option<&str>,
+    ) -> Option<ControlResponse> {
+        self.validate_process_capability(process_id, process_token)
+            .err()
+            .map(|error| ControlResponse::Error {
+                reason: error.to_string(),
+            })
     }
 
     fn handle_stream<S>(&self, mut stream: S) -> Result<()>
@@ -1428,6 +1553,13 @@ impl MasterServer {
                     }
                 } else {
                     let process_id = self.registry.lock().unwrap().register_process(&request.app);
+                    let process_token = self
+                        .registry
+                        .lock()
+                        .unwrap()
+                        .get_process_token(&process_id)
+                        .unwrap_or_default()
+                        .to_string();
                     self.control_changed.notify_all();
                     tracing::info!(
                         component = "master_server",
@@ -1437,10 +1569,19 @@ impl MasterServer {
                         app = request.app.as_str(),
                         "registered process"
                     );
-                    ControlResponse::ProcessRegistered { process_id }
+                    ControlResponse::ProcessRegistered {
+                        process_id,
+                        process_token,
+                    }
                 }
             }
             ControlRequest::Heartbeat(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 if self.shutdown_requested.load(Ordering::SeqCst) {
                     tracing::info!(
                         component = "master_server",
@@ -1491,6 +1632,12 @@ impl MasterServer {
             }
             ControlRequest::Watch(request) => self.handle_watch_request(request),
             ControlRequest::UnregisterProcess(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 match registry.unregister_process(&request.process_id) {
@@ -1538,8 +1685,24 @@ impl MasterServer {
                 }
             }
             ControlRequest::RegisterStream(request) => {
+                let token_authorized = self.token_matches(request.token.as_deref());
+                if !token_authorized {
+                    let Some(process_id) = request.process_id.as_deref() else {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: "register_stream requires process_id".to_string(),
+                            },
+                        );
+                    };
+                    if let Some(response) = self.require_process_capability_response(
+                        process_id,
+                        request.process_token.as_deref(),
+                    ) {
+                        return write_control_response(&mut stream, &response);
+                    }
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
-                let mut bus = self.bus.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 if let Err(error) = validate_register_stream_request(
                     &registry,
@@ -1565,91 +1728,69 @@ impl MasterServer {
                         },
                     );
                 }
-                match bus.ensure_stream_with_sizes(
+                match registry.ensure_stream(
                     &request.stream_name,
+                    request.schema.clone(),
+                    &request.schema_hash,
                     request.buffer_size,
                     request.frame_size,
                 ) {
-                    Ok(bus_created) => match registry.ensure_stream(
-                        &request.stream_name,
-                        request.schema.clone(),
-                        &request.schema_hash,
-                        request.buffer_size,
-                        request.frame_size,
-                    ) {
-                        Ok(registry_created) => {
-                            let existing = !(bus_created || registry_created);
-                            tracing::info!(
-                                component = "master_server",
-                                event = "register_stream",
-                                status = "success",
-                                stream_name = request.stream_name.as_str(),
-                                buffer_size = request.buffer_size,
-                                frame_size = request.frame_size,
-                                existing = existing,
-                                "{}",
-                                if existing {
-                                    "stream already registered"
-                                } else {
-                                    "registered stream"
-                                }
-                            );
-                            if !existing {
-                                let snapshot = Self::snapshot_from_registry(&registry);
-                                if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                                    if registry_created {
-                                        registry.unregister_stream(&request.stream_name);
-                                    }
-                                    if bus_created {
-                                        bus.remove_stream(&request.stream_name);
-                                    }
-                                    tracing::error!(
-                                        component = "master_server",
-                                        event = "snapshot_write_failure",
-                                        status = "error",
-                                        stream_name = request.stream_name.as_str(),
-                                        error = %error,
-                                        "failed to persist stream snapshot"
-                                    );
-                                    return write_control_response(
-                                        &mut stream,
-                                        &ControlResponse::Error {
-                                            reason: error.to_string(),
-                                        },
-                                    );
-                                }
-                            }
-                            ControlResponse::StreamRegistered {
-                                stream_name: request.stream_name,
+                    Ok(registry_created) => {
+                        if let Some(process_id) = request.process_id.as_deref() {
+                            if let Err(error) =
+                                registry.set_stream_owner(&request.stream_name, process_id)
+                            {
+                                return write_control_response(
+                                    &mut stream,
+                                    &ControlResponse::Error {
+                                        reason: error.to_string(),
+                                    },
+                                );
                             }
                         }
-                        Err(error) => {
-                            tracing::error!(
-                                component = "master_server",
-                                event = "register_stream",
-                                status = "error",
-                                stream_name = request.stream_name.as_str(),
-                                buffer_size = request.buffer_size,
-                                frame_size = request.frame_size,
-                                error = %error,
-                                "failed to register stream"
-                            );
-                            if bus_created {
-                                bus.remove_stream(&request.stream_name);
+                        let existing = !registry_created;
+                        tracing::info!(
+                            component = "master_server",
+                            event = "register_stream",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            buffer_size = request.buffer_size,
+                            frame_size = request.frame_size,
+                            existing = existing,
+                            "{}",
+                            if existing {
+                                "stream already registered"
+                            } else {
+                                "registered stream"
                             }
-                            ControlResponse::Error {
-                                reason: error.to_string(),
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        let error = normalize_register_stream_bus_error(
-                            &registry,
-                            &request.stream_name,
-                            request.buffer_size,
-                            request.frame_size,
-                            error,
                         );
+                        if !existing {
+                            let snapshot = Self::snapshot_from_registry(&registry);
+                            if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                                if registry_created {
+                                    registry.unregister_stream(&request.stream_name);
+                                }
+                                tracing::error!(
+                                    component = "master_server",
+                                    event = "snapshot_write_failure",
+                                    status = "error",
+                                    stream_name = request.stream_name.as_str(),
+                                    error = %error,
+                                    "failed to persist stream snapshot"
+                                );
+                                return write_control_response(
+                                    &mut stream,
+                                    &ControlResponse::Error {
+                                        reason: error.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                        ControlResponse::StreamRegistered {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    Err(error) => {
                         tracing::error!(
                             component = "master_server",
                             event = "register_stream",
@@ -1667,6 +1808,12 @@ impl MasterServer {
                 }
             }
             ControlRequest::RegisterSource(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 match registry.register_source(
@@ -1715,26 +1862,22 @@ impl MasterServer {
                 }
             }
             ControlRequest::UnregisterSource(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                let previous_registry = registry.clone();
                 match registry
                     .unregister_source_for_process(&request.source_name, &request.process_id)
                 {
-                    Ok(source) => {
+                    Ok(_source) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            let _ = registry.register_source(
-                                &source.source_name,
-                                &source.source_type,
-                                &source.process_id,
-                                &source.output_stream,
-                                source.config,
-                            );
-                            let _ = registry.set_source_status(
-                                &source.source_name,
-                                &source.status,
-                                Some(source.metrics),
-                            );
+                            *registry = previous_registry;
                             tracing::error!(
                                 component = "master_server",
                                 event = "snapshot_write_failure",
@@ -1769,6 +1912,12 @@ impl MasterServer {
                 }
             }
             ControlRequest::RegisterEngine(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 match registry.register_engine(
@@ -1819,6 +1968,12 @@ impl MasterServer {
                 }
             }
             ControlRequest::RegisterSink(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 match registry.register_sink(
@@ -1866,6 +2021,46 @@ impl MasterServer {
                 }
             }
             ControlRequest::UpdateStatus(request) => {
+                if !self.token_matches(request.token.as_deref()) {
+                    let Some(process_id) = request.process_id.as_deref() else {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: "update_status requires process_id".to_string(),
+                            },
+                        );
+                    };
+                    if let Some(response) = self.require_process_capability_response(
+                        process_id,
+                        request.process_token.as_deref(),
+                    ) {
+                        return write_control_response(&mut stream, &response);
+                    }
+                    let registry = self.registry.lock().unwrap();
+                    let owner_process_id = match request.kind.as_str() {
+                        "source" => registry
+                            .get_source(&request.name)
+                            .map(|record| record.process_id.as_str()),
+                        "engine" => registry
+                            .get_engine(&request.name)
+                            .map(|record| record.process_id.as_str()),
+                        "sink" => registry
+                            .get_sink(&request.name)
+                            .map(|record| record.process_id.as_str()),
+                        _ => None,
+                    };
+                    if owner_process_id != Some(process_id) {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: format!(
+                                    "status update not authorized kind=[{}] name=[{}] process_id=[{}]",
+                                    request.kind, request.name, process_id
+                                ),
+                            },
+                        );
+                    }
+                }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let update_result = match request.kind.as_str() {
@@ -1945,6 +2140,12 @@ impl MasterServer {
                 }
             }
             ControlRequest::PublishSegmentDescriptor(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let publish_result = {
                     let mut registry = self.registry.lock().unwrap();
                     registry.publish_segment_descriptor(
@@ -1985,6 +2186,35 @@ impl MasterServer {
                 }
             }
             ControlRequest::PublishPersistedFile(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
+                let persist_data_root = {
+                    let registry = self.registry.lock().unwrap();
+                    persist_data_root_for_process(
+                        &registry,
+                        &request.stream_name,
+                        &request.process_id,
+                    )
+                };
+                let persisted_file = match normalize_persisted_file_path(
+                    &self.config,
+                    persist_data_root.as_deref(),
+                    request.persisted_file,
+                ) {
+                    Ok(persisted_file) => persisted_file,
+                    Err(error) => {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: error.to_string(),
+                            },
+                        );
+                    }
+                };
                 let mut registry = self.registry.lock().unwrap();
                 let previous_persisted_files = registry
                     .get_stream(&request.stream_name)
@@ -1993,7 +2223,7 @@ impl MasterServer {
                 let publish_result = registry.publish_persisted_file(
                     &request.stream_name,
                     &request.process_id,
-                    request.persisted_file,
+                    persisted_file,
                 );
                 match publish_result {
                     Ok(()) => {
@@ -2040,13 +2270,70 @@ impl MasterServer {
                 }
             }
             ControlRequest::ReplacePersistedFiles(request) => {
+                if !self.token_matches(request.token.as_deref()) {
+                    let Some(process_id) = request.process_id.as_deref() else {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: "replace_persisted_files requires process_id".to_string(),
+                            },
+                        );
+                    };
+                    if let Some(response) = self.require_process_capability_response(
+                        process_id,
+                        request.process_token.as_deref(),
+                    ) {
+                        return write_control_response(&mut stream, &response);
+                    }
+                    let registry = self.registry.lock().unwrap();
+                    let authorized = registry
+                        .get_stream(&request.stream_name)
+                        .map(|stream| {
+                            stream.writer_process_id.as_deref() == Some(process_id)
+                                || stream.owner_process_id.as_deref() == Some(process_id)
+                        })
+                        .unwrap_or(false)
+                        || registry
+                            .sources_for_stream(&request.stream_name)
+                            .iter()
+                            .any(|source| {
+                                source.process_id == process_id && source.status != "lost"
+                            })
+                        || registry
+                            .sinks_for_stream(&request.stream_name)
+                            .iter()
+                            .any(|sink| sink.process_id == process_id && sink.status != "lost");
+                    if !authorized {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: format!(
+                                    "replace persisted files not authorized stream_name=[{}] process_id=[{}]",
+                                    request.stream_name, process_id
+                                ),
+                            },
+                        );
+                    }
+                }
+                let persisted_files =
+                    match normalize_persisted_file_paths(&self.config, request.persisted_files) {
+                        Ok(persisted_files) => persisted_files,
+                        Err(error) => {
+                            return write_control_response(
+                                &mut stream,
+                                &ControlResponse::Error {
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                    };
                 let mut registry = self.registry.lock().unwrap();
                 let previous_persisted_files = registry
                     .get_stream(&request.stream_name)
                     .map(|stream| stream.persisted_files.clone())
                     .unwrap_or_default();
                 let replace_result =
-                    registry.replace_persisted_files(&request.stream_name, request.persisted_files);
+                    registry.replace_persisted_files(&request.stream_name, persisted_files);
                 match replace_result {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
@@ -2090,6 +2377,12 @@ impl MasterServer {
                 }
             }
             ControlRequest::PublishPersistEvent(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let mut registry = self.registry.lock().unwrap();
                 let previous_persist_events = registry
                     .get_stream(&request.stream_name)
@@ -2145,7 +2438,15 @@ impl MasterServer {
                 }
             }
             ControlRequest::AcquireSegmentReaderLease(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                let previous_registry = registry.clone();
                 let acquire_result = registry.acquire_segment_reader_lease(
                     &request.stream_name,
                     &request.process_id,
@@ -2156,6 +2457,7 @@ impl MasterServer {
                     Ok(lease_id) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            *registry = previous_registry;
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
@@ -2194,7 +2496,15 @@ impl MasterServer {
                 }
             }
             ControlRequest::ReleaseSegmentReaderLease(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                let previous_registry = registry.clone();
                 let release_result = registry.release_segment_reader_lease(
                     &request.stream_name,
                     &request.process_id,
@@ -2204,6 +2514,7 @@ impl MasterServer {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            *registry = previous_registry;
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
@@ -2243,6 +2554,12 @@ impl MasterServer {
                 }
             }
             ControlRequest::GetSegmentDescriptor(request) => {
+                if let Some(response) = self.require_process_capability_response(
+                    &request.process_id,
+                    request.process_token.as_deref(),
+                ) {
+                    return write_control_response(&mut stream, &response);
+                }
                 let registry = self.registry.lock().unwrap();
                 match registry
                     .segment_descriptor_for_process(&request.stream_name, &request.process_id)
@@ -2278,227 +2595,6 @@ impl MasterServer {
                     }
                 }
             }
-            ControlRequest::WriteTo(request) => {
-                let mut bus = self.bus.lock().unwrap();
-                let mut registry = self.registry.lock().unwrap();
-                match bus.write_to(&request.stream_name, &request.process_id) {
-                    Ok(descriptor) => {
-                        if let Err(error) =
-                            registry.attach_writer(&request.stream_name, &request.process_id)
-                        {
-                            let _ = bus.detach_writer(&request.stream_name, &descriptor.writer_id);
-                            tracing::error!(
-                                component = "master_server",
-                                event = "write_to",
-                                status = "error",
-                                stream_name = request.stream_name.as_str(),
-                                process_id = request.process_id.as_str(),
-                                error = %error,
-                                "failed to attach writer"
-                            );
-                            return write_control_response(
-                                &mut stream,
-                                &ControlResponse::Error {
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
-                        tracing::info!(
-                            component = "master_server",
-                            event = "write_to",
-                            status = "success",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            "attached writer"
-                        );
-                        ControlResponse::WriterAttached { descriptor }
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            component = "master_server",
-                            event = "write_to",
-                            status = "error",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            error = %error,
-                            "failed to attach writer"
-                        );
-                        ControlResponse::Error {
-                            reason: format!("{}", error),
-                        }
-                    }
-                }
-            }
-            ControlRequest::ReadFrom(request) => {
-                let mut bus = self.bus.lock().unwrap();
-                let mut registry = self.registry.lock().unwrap();
-                match bus.read_from(
-                    &request.stream_name,
-                    &request.process_id,
-                    request.instrument_ids.clone(),
-                ) {
-                    Ok(descriptor) => {
-                        if let Err(error) = registry.attach_reader(
-                            &request.stream_name,
-                            &request.process_id,
-                            &descriptor.reader_id,
-                        ) {
-                            let _ = bus.detach_reader(&request.stream_name, &descriptor.reader_id);
-                            tracing::error!(
-                                component = "master_server",
-                                event = "read_from",
-                                status = "error",
-                                stream_name = request.stream_name.as_str(),
-                                process_id = request.process_id.as_str(),
-                                error = %error,
-                                "failed to attach reader"
-                            );
-                            return write_control_response(
-                                &mut stream,
-                                &ControlResponse::Error {
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
-                        tracing::info!(
-                            component = "master_server",
-                            event = "read_from",
-                            status = "success",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            "attached reader"
-                        );
-                        ControlResponse::ReaderAttached { descriptor }
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            component = "master_server",
-                            event = "read_from",
-                            status = "error",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            error = %error,
-                            "failed to attach reader"
-                        );
-                        ControlResponse::Error {
-                            reason: format!("{}", error),
-                        }
-                    }
-                }
-            }
-            ControlRequest::CloseWriter(request) => {
-                let mut bus = self.bus.lock().unwrap();
-                let mut registry = self.registry.lock().unwrap();
-                match registry.validate_writer_owner(&request.stream_name, &request.process_id) {
-                    Err(error) => {
-                        tracing::error!(
-                            component = "master_server",
-                            event = "close_writer",
-                            status = "error",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            writer_id = request.writer_id.as_str(),
-                            error = %error,
-                            "failed to detach writer"
-                        );
-                        ControlResponse::Error {
-                            reason: error.to_string(),
-                        }
-                    }
-                    Ok(()) => match bus.detach_writer(&request.stream_name, &request.writer_id) {
-                        Ok(()) => {
-                            let _ = registry.detach_writer(&request.stream_name);
-                            tracing::info!(
-                                component = "master_server",
-                                event = "close_writer",
-                                status = "success",
-                                stream_name = request.stream_name.as_str(),
-                                process_id = request.process_id.as_str(),
-                                writer_id = request.writer_id.as_str(),
-                                "detached writer"
-                            );
-                            ControlResponse::WriterDetached {
-                                stream_name: request.stream_name,
-                                writer_id: request.writer_id,
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                component = "master_server",
-                                event = "close_writer",
-                                status = "error",
-                                stream_name = request.stream_name.as_str(),
-                                process_id = request.process_id.as_str(),
-                                writer_id = request.writer_id.as_str(),
-                                error = %error,
-                                "failed to detach writer"
-                            );
-                            ControlResponse::Error {
-                                reason: format!("{}", error),
-                            }
-                        }
-                    },
-                }
-            }
-            ControlRequest::CloseReader(request) => {
-                let mut bus = self.bus.lock().unwrap();
-                let mut registry = self.registry.lock().unwrap();
-                match registry.validate_reader_owner(
-                    &request.stream_name,
-                    &request.reader_id,
-                    &request.process_id,
-                ) {
-                    Err(error) => {
-                        tracing::error!(
-                            component = "master_server",
-                            event = "close_reader",
-                            status = "error",
-                            stream_name = request.stream_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            reader_id = request.reader_id.as_str(),
-                            error = %error,
-                            "failed to detach reader"
-                        );
-                        ControlResponse::Error {
-                            reason: error.to_string(),
-                        }
-                    }
-                    Ok(()) => match bus.detach_reader(&request.stream_name, &request.reader_id) {
-                        Ok(()) => {
-                            let _ =
-                                registry.detach_reader(&request.stream_name, &request.reader_id);
-                            tracing::info!(
-                                component = "master_server",
-                                event = "close_reader",
-                                status = "success",
-                                stream_name = request.stream_name.as_str(),
-                                process_id = request.process_id.as_str(),
-                                reader_id = request.reader_id.as_str(),
-                                "detached reader"
-                            );
-                            ControlResponse::ReaderDetached {
-                                stream_name: request.stream_name,
-                                reader_id: request.reader_id,
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                component = "master_server",
-                                event = "close_reader",
-                                status = "error",
-                                stream_name = request.stream_name.as_str(),
-                                process_id = request.process_id.as_str(),
-                                reader_id = request.reader_id.as_str(),
-                                error = %error,
-                                "failed to detach reader"
-                            );
-                            ControlResponse::Error {
-                                reason: format!("{}", error),
-                            }
-                        }
-                    },
-                }
-            }
             ControlRequest::ListStreams(_) => {
                 let streams: Vec<_> = self
                     .registry
@@ -2506,7 +2602,7 @@ impl MasterServer {
                     .unwrap()
                     .list_streams()
                     .into_iter()
-                    .map(StreamInfo::from)
+                    .map(stream_info_with_active_preflight)
                     .collect();
                 tracing::info!(
                     component = "master_server",
@@ -2533,7 +2629,7 @@ impl MasterServer {
                         "fetched stream"
                     );
                     ControlResponse::StreamFetched(GetStreamResponse {
-                        stream: StreamInfo::from(stream),
+                        stream: stream_info_with_active_preflight(stream),
                     })
                 }
                 None => {
@@ -2551,10 +2647,72 @@ impl MasterServer {
                 }
             },
             ControlRequest::DropTable(request) => {
+                if !self.token_matches(request.token.as_deref()) {
+                    let Some(process_id) = request.process_id.as_deref() else {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: "drop_table requires process_id or token".to_string(),
+                            },
+                        );
+                    };
+                    if let Some(response) = self.require_process_capability_response(
+                        process_id,
+                        request.process_token.as_deref(),
+                    ) {
+                        return write_control_response(&mut stream, &response);
+                    }
+                    let registry = self.registry.lock().unwrap();
+                    let authorized =
+                        registry
+                            .get_stream(&request.table_name)
+                            .map(|stream| {
+                                stream.owner_process_id.as_deref() == Some(process_id)
+                                    || stream.writer_process_id.as_deref() == Some(process_id)
+                            })
+                            .unwrap_or(false)
+                            || registry.sources_for_stream(&request.table_name).iter().any(
+                                |source| source.process_id == process_id && source.status != "lost",
+                            )
+                            || registry
+                                .sinks_for_stream(&request.table_name)
+                                .iter()
+                                .any(|sink| sink.process_id == process_id && sink.status != "lost");
+                    if !authorized {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: format!(
+                                    "drop_table not authorized table_name=[{}] process_id=[{}]",
+                                    request.table_name, process_id
+                                ),
+                            },
+                        );
+                    }
+                }
                 let table_name = request.table_name.clone();
+                let persisted_files_to_delete = {
+                    let registry = self.registry.lock().unwrap();
+                    registry
+                        .get_stream(&table_name)
+                        .map(|stream| stream.persisted_files.clone())
+                        .unwrap_or_default()
+                };
+                if request.drop_persisted {
+                    if let Err(error) = prevalidate_persisted_files_for_delete(
+                        &self.config,
+                        &persisted_files_to_delete,
+                    ) {
+                        return write_control_response(
+                            &mut stream,
+                            &ControlResponse::Error {
+                                reason: error.to_string(),
+                            },
+                        );
+                    }
+                }
                 let drop_result = {
                     let _snapshot_guard = self.snapshot_lock.lock().unwrap();
-                    let mut bus = self.bus.lock().unwrap();
                     let mut registry = self.registry.lock().unwrap();
                     let previous_registry = registry.clone();
                     let dropped_records = registry.drop_table(&table_name);
@@ -2568,18 +2726,12 @@ impl MasterServer {
                             },
                         );
                     }
-                    bus.remove_stream(&table_name);
                     self.descriptor_changed.notify_all();
                     self.control_changed.notify_all();
                     dropped_records
                 };
-                let persisted_files = drop_result
-                    .stream
-                    .as_ref()
-                    .map(|stream| stream.persisted_files.clone())
-                    .unwrap_or_default();
                 let persisted_files_deleted = if request.drop_persisted {
-                    match delete_persisted_files(&persisted_files) {
+                    match delete_persisted_files(&self.config, &persisted_files_to_delete) {
                         Ok(deleted) => deleted,
                         Err(error) => {
                             return write_control_response(
@@ -2664,7 +2816,6 @@ impl MasterServer {
     #[cfg(debug_assertions)]
     fn expire_process_for_test_internal(&self, process_id: &str) -> Result<()> {
         let snapshot = {
-            let mut bus = self.bus.lock().unwrap();
             let mut registry = self.registry.lock().unwrap();
             registry
                 .force_expire_process(process_id)
@@ -2672,12 +2823,6 @@ impl MasterServer {
 
             let stale_streams = registry.streams_for_writer_process(process_id);
             for stream_name in stale_streams {
-                let writer_id = format!("{stream_name}_writer");
-                match bus.detach_writer(&stream_name, &writer_id) {
-                    Ok(()) => {}
-                    Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                    Err(error) => return Err(bus_error(error)),
-                }
                 registry
                     .detach_writer(&stream_name)
                     .map_err(registry_error)?;
@@ -2688,11 +2833,6 @@ impl MasterServer {
 
             let stale_readers = registry.readers_for_process(process_id);
             for (stream_name, reader_id) in stale_readers {
-                match bus.detach_reader(&stream_name, &reader_id) {
-                    Ok(()) => {}
-                    Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                    Err(error) => return Err(bus_error(error)),
-                }
                 registry
                     .detach_reader(&stream_name, &reader_id)
                     .map_err(registry_error)?;
@@ -2735,9 +2875,128 @@ impl MasterServer {
         });
     }
 
+    fn start_compaction_worker(&self) {
+        let config = self.config.table.persist.compaction.clone();
+        if !config.enabled {
+            return;
+        }
+        let server = self.clone();
+        thread::spawn(move || {
+            tracing::info!(
+                component = "master",
+                event = "compaction_worker_started",
+                status = "started",
+                interval_sec = config.interval_sec,
+                min_files = config.min_files as u64,
+                sort_column = config.sort_column.as_deref().unwrap_or(""),
+                "started persisted parquet compaction worker"
+            );
+
+            while server.is_running() {
+                if let Err(error) = server.compact_persisted_tables_once() {
+                    tracing::error!(
+                        component = "master",
+                        event = "compaction_worker_pass",
+                        status = "error",
+                        error = %error,
+                        "persisted parquet compaction pass failed"
+                    );
+                }
+
+                let mut slept = Duration::ZERO;
+                let interval = Duration::from_secs_f64(config.interval_sec);
+                while server.is_running() && slept < interval {
+                    let remaining = interval.saturating_sub(slept);
+                    let sleep_for = remaining.min(COMPACTION_SHUTDOWN_POLL);
+                    thread::sleep(sleep_for);
+                    slept += sleep_for;
+                }
+            }
+        });
+    }
+
+    fn compact_persisted_tables_once(&self) -> Result<()> {
+        let streams = self.registry.lock().unwrap().list_streams();
+        for stream in streams {
+            let groups = compaction_groups(&stream.persisted_files, &stream);
+            for group_files in groups.values() {
+                if group_files.len() < self.config.table.persist.compaction.min_files {
+                    continue;
+                }
+                let compacted_file = compact_persisted_file_group(
+                    &stream.stream_name,
+                    &stream.schema_hash,
+                    group_files,
+                    self.config.table.persist.compaction.sort_column.as_deref(),
+                )?;
+                self.replace_compacted_persisted_files(
+                    &stream.stream_name,
+                    group_files,
+                    compacted_file,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn replace_compacted_persisted_files(
+        &self,
+        stream_name: &str,
+        source_files: &[serde_json::Value],
+        compacted_file: serde_json::Value,
+    ) -> Result<()> {
+        let source_keys = source_files
+            .iter()
+            .map(persisted_file_compaction_key)
+            .collect::<HashSet<_>>();
+        let source_paths = source_files
+            .iter()
+            .filter_map(|item| item.get("file_path").and_then(serde_json::Value::as_str))
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
+        let previous_persisted_files = registry
+            .get_stream(stream_name)
+            .map(|stream| stream.persisted_files.clone())
+            .unwrap_or_default();
+        let mut next_files = previous_persisted_files
+            .iter()
+            .filter(|item| !source_keys.contains(&persisted_file_compaction_key(item)))
+            .cloned()
+            .collect::<Vec<_>>();
+        next_files.push(compacted_file);
+        next_files.sort_by_key(persisted_file_order_key);
+        registry
+            .replace_persisted_files(stream_name, next_files)
+            .map_err(registry_error)?;
+        let snapshot = Self::snapshot_from_registry(&registry);
+        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+            let _ = registry.set_stream_persisted_files(stream_name, previous_persisted_files);
+            return Err(error);
+        }
+        self.control_changed.notify_all();
+        drop(registry);
+
+        if self.config.table.persist.compaction.delete_sources {
+            for path in source_paths {
+                if let Err(error) = fs::remove_file(&path) {
+                    tracing::warn!(
+                        component = "master",
+                        event = "compaction_delete_source",
+                        status = "error",
+                        file_path = path.display().to_string(),
+                        error = %error,
+                        "failed to delete compacted source parquet"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn expire_process_attachments(&self, process_id: &str) -> Result<()> {
         let snapshot = {
-            let mut bus = self.bus.lock().unwrap();
             let mut registry = self.registry.lock().unwrap();
             let claimed = registry
                 .claim_expired_process(process_id, self.lease_timeout.as_millis() as u64)
@@ -2756,12 +3015,6 @@ impl MasterServer {
 
             let stale_streams = registry.streams_for_writer_process(process_id);
             for stream_name in stale_streams {
-                let writer_id = format!("{stream_name}_writer");
-                match bus.detach_writer(&stream_name, &writer_id) {
-                    Ok(()) => {}
-                    Err(BusError::WriterNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                    Err(error) => return Err(bus_error(error)),
-                }
                 registry
                     .detach_writer(&stream_name)
                     .map_err(registry_error)?;
@@ -2774,18 +3027,12 @@ impl MasterServer {
                     status = "success",
                     process_id = process_id,
                     stream_name = stream_name.as_str(),
-                    writer_id = writer_id.as_str(),
                     "reclaimed stale writer"
                 );
             }
 
             let stale_readers = registry.readers_for_process(process_id);
             for (stream_name, reader_id) in stale_readers {
-                match bus.detach_reader(&stream_name, &reader_id) {
-                    Ok(()) => {}
-                    Err(BusError::ReaderNotFound { .. } | BusError::StreamNotFound { .. }) => {}
-                    Err(error) => return Err(bus_error(error)),
-                }
                 registry
                     .detach_reader(&stream_name, &reader_id)
                     .map_err(registry_error)?;
@@ -2946,17 +3193,138 @@ fn restore_previous_record(
     }
 }
 
-fn delete_persisted_files(persisted_files: &[serde_json::Value]) -> Result<usize> {
+fn normalize_persisted_file_paths(
+    config: &ZippyConfig,
+    persisted_files: Vec<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>> {
+    persisted_files
+        .into_iter()
+        .map(|persisted_file| normalize_persisted_file_path(config, None, persisted_file))
+        .collect()
+}
+
+fn normalize_persisted_file_path(
+    config: &ZippyConfig,
+    persist_data_root: Option<&str>,
+    mut persisted_file: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let root = match persist_data_root {
+        Some(root) => canonical_persist_data_root_value(root)?,
+        None => canonical_persist_data_root(config)?,
+    };
+    let path = persisted_file_canonical_path(&root, &persisted_file)?;
+    let Some(object) = persisted_file.as_object_mut() else {
+        return Err(ZippyError::Io {
+            reason: "persisted_file must be an object".to_string(),
+        });
+    };
+    object.insert(
+        "file_path".to_string(),
+        serde_json::Value::String(path.to_string_lossy().to_string()),
+    );
+    object.insert(
+        "persist_data_root".to_string(),
+        serde_json::Value::String(root.to_string_lossy().to_string()),
+    );
+    Ok(persisted_file)
+}
+
+fn persist_data_root_for_process(
+    registry: &Registry,
+    stream_name: &str,
+    process_id: &str,
+) -> Option<String> {
+    registry
+        .sources_for_stream(stream_name)
+        .into_iter()
+        .find(|source| source.process_id == process_id && source.status != "lost")
+        .and_then(|source| {
+            source
+                .config
+                .get("persist_data_root")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn prevalidate_persisted_files_for_delete(
+    config: &ZippyConfig,
+    persisted_files: &[serde_json::Value],
+) -> Result<()> {
+    let root = canonical_persist_data_root(config)?;
+    for persisted_file in persisted_files {
+        let _ = persisted_file_canonical_path(&root, persisted_file)?;
+    }
+    Ok(())
+}
+
+fn canonical_persist_data_root(config: &ZippyConfig) -> Result<PathBuf> {
+    canonical_persist_data_root_value(&config.table.persist.data_dir)
+}
+
+fn canonical_persist_data_root_value(path: &str) -> Result<PathBuf> {
+    fs::canonicalize(path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to canonicalize persist data root path=[{}] error=[{}]",
+            path, error
+        ),
+    })
+}
+
+fn persisted_file_canonical_path(
+    persist_root: &Path,
+    persisted_file: &serde_json::Value,
+) -> Result<PathBuf> {
+    let Some(file_path) = persisted_file
+        .get("file_path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Err(ZippyError::Io {
+            reason: "persisted_file.file_path must be a string".to_string(),
+        });
+    };
+    if file_path.is_empty() {
+        return Err(ZippyError::Io {
+            reason: "persisted_file.file_path must not be empty".to_string(),
+        });
+    }
+    let path = PathBuf::from(file_path);
+    let canonical_path = fs::canonicalize(&path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to canonicalize persisted table file path=[{}] error=[{}]",
+            path.display(),
+            error
+        ),
+    })?;
+    if !canonical_path.starts_with(persist_root) {
+        return Err(ZippyError::Io {
+            reason: format!(
+                "persisted table file outside persist data root path=[{}] root=[{}]",
+                canonical_path.display(),
+                persist_root.display()
+            ),
+        });
+    }
+    if !canonical_path.is_file() {
+        return Err(ZippyError::Io {
+            reason: format!(
+                "persisted table path is not a file path=[{}]",
+                canonical_path.display()
+            ),
+        });
+    }
+    Ok(canonical_path)
+}
+
+fn delete_persisted_files(
+    config: &ZippyConfig,
+    persisted_files: &[serde_json::Value],
+) -> Result<usize> {
+    let root = canonical_persist_data_root(config)?;
     let mut deleted = 0;
     let mut parent_dirs = Vec::new();
     for persisted_file in persisted_files {
-        let Some(file_path) = persisted_file
-            .get("file_path")
-            .and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        let path = PathBuf::from(file_path);
+        let path = persisted_file_canonical_path(&root, persisted_file)?;
         match fs::remove_file(&path) {
             Ok(()) => {
                 deleted += 1;
@@ -2986,10 +3354,564 @@ fn delete_persisted_files(persisted_files: &[serde_json::Value]) -> Result<usize
     });
     parent_dirs.dedup();
     for parent in parent_dirs {
+        if parent == root {
+            continue;
+        }
         let _ = fs::remove_dir(parent);
     }
 
     Ok(deleted)
+}
+
+fn compaction_groups(
+    persisted_files: &[serde_json::Value],
+    stream: &StreamRecord,
+) -> BTreeMap<String, Vec<serde_json::Value>> {
+    let live_identities = live_segment_identities(stream);
+    let mut groups = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for item in persisted_files {
+        let Some(file_path) = item.get("file_path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let path = PathBuf::from(file_path);
+        if !path.exists() {
+            continue;
+        }
+        let identities = persisted_segment_identities(item);
+        if identities
+            .iter()
+            .any(|identity| live_identities.contains(identity))
+        {
+            continue;
+        }
+        let key = persisted_compaction_group_key(item, &path);
+        groups.entry(key).or_default().push(item.clone());
+    }
+    for group_files in groups.values_mut() {
+        group_files.sort_by_key(persisted_file_order_key);
+    }
+    groups
+}
+
+fn compact_persisted_file_group(
+    stream_name: &str,
+    schema_hash: &str,
+    group_files: &[serde_json::Value],
+    configured_sort_column: Option<&str>,
+) -> Result<serde_json::Value> {
+    if group_files.is_empty() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "compaction group must not be empty".to_string(),
+        });
+    }
+    let batches = group_files
+        .iter()
+        .map(read_persisted_parquet_batch)
+        .collect::<Result<Vec<_>>>()?;
+    let schema = batches[0].schema();
+    let batch = concat_batches(&schema, batches.iter()).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to concatenate compacted parquet batches error=[{}]",
+            error
+        ),
+    })?;
+    let sort_columns =
+        resolve_compaction_sort_columns(&batch, group_files, configured_sort_column)?;
+    let batch = if sort_columns.is_empty() {
+        batch
+    } else {
+        sort_record_batch(&batch, &sort_columns)?
+    };
+    let first_file_path = group_files[0]
+        .get("file_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "persisted file missing file_path".to_string(),
+        })?;
+    let target_dir =
+        Path::new(first_file_path)
+            .parent()
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: format!(
+                    "persisted file path has no parent path=[{}]",
+                    first_file_path
+                ),
+            })?;
+    let digest = compact_group_digest(group_files);
+    let target_path = target_dir.join(format!(
+        "compact-{}-{:016x}.parquet",
+        safe_file_token(stream_name),
+        digest
+    ));
+    let temp_path = target_path.with_file_name(format!(
+        "{}.tmp-{}",
+        target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("compact.parquet"),
+        persisted_created_at_millis_for_compaction()
+    ));
+    write_record_batch_parquet(&temp_path, &batch)?;
+    fs::rename(&temp_path, &target_path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to rename compacted parquet temp_path=[{}] target_path=[{}] error=[{}]",
+            temp_path.display(),
+            target_path.display(),
+            error
+        ),
+    })?;
+
+    Ok(compacted_persisted_file_metadata(
+        stream_name,
+        schema_hash,
+        group_files,
+        &target_path,
+        batch.num_rows(),
+        &sort_columns,
+        &batch,
+        digest,
+    ))
+}
+
+fn read_persisted_parquet_batch(item: &serde_json::Value) -> Result<RecordBatch> {
+    let file_path = item
+        .get("file_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "persisted file missing file_path".to_string(),
+        })?;
+    let file = File::open(file_path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to open persisted parquet file path=[{}] error=[{}]",
+            file_path, error
+        ),
+    })?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to create persisted parquet reader path=[{}] error=[{}]",
+                file_path, error
+            ),
+        })?
+        .build()
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to build persisted parquet reader path=[{}] error=[{}]",
+                file_path, error
+            ),
+        })?;
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to read persisted parquet file path=[{}] error=[{}]",
+                file_path, error
+            ),
+        })?;
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| ZippyError::Io {
+            reason: format!("persisted parquet file is empty path=[{}]", file_path),
+        })?;
+    concat_batches(&schema, batches.iter()).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to concatenate persisted parquet file path=[{}] error=[{}]",
+            file_path, error
+        ),
+    })
+}
+
+fn resolve_compaction_sort_columns(
+    batch: &RecordBatch,
+    group_files: &[serde_json::Value],
+    configured_sort_column: Option<&str>,
+) -> Result<Vec<String>> {
+    let requested = configured_sort_column
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| partition_dt_column(group_files))
+        .or_else(|| {
+            ["dt", "event_ts", "localtime_ns"]
+                .into_iter()
+                .find(|candidate| batch.schema().index_of(candidate).is_ok())
+                .map(str::to_string)
+        });
+    let Some(requested) = requested else {
+        return Ok(Vec::new());
+    };
+    if batch.schema().index_of(&requested).is_err() {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("compaction sort column not found column=[{}]", requested),
+        });
+    }
+    let mut columns = vec![requested.clone()];
+    for tie_breaker in ["localtime_ns", "seq"] {
+        if tie_breaker != requested && batch.schema().index_of(tie_breaker).is_ok() {
+            columns.push(tie_breaker.to_string());
+        }
+    }
+    Ok(columns)
+}
+
+fn sort_record_batch(batch: &RecordBatch, sort_column_names: &[String]) -> Result<RecordBatch> {
+    let sort_columns = sort_column_names
+        .iter()
+        .map(|column_name| {
+            let column_index = batch.schema().index_of(column_name).map_err(|error| {
+                ZippyError::SchemaMismatch {
+                    reason: format!(
+                        "compaction sort column not found column=[{}] error=[{}]",
+                        column_name, error
+                    ),
+                }
+            })?;
+            Ok(SortColumn {
+                values: batch.column(column_index).clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let indices = lexsort_to_indices(&sort_columns, None).map_err(|error| ZippyError::Io {
+        reason: format!("failed to sort compacted parquet batch error=[{}]", error),
+    })?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            take(column.as_ref(), &indices, None).map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to reorder compacted parquet column error=[{}]",
+                    error
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|error| ZippyError::Io {
+        reason: format!("failed to build compacted sorted batch error=[{}]", error),
+    })
+}
+
+fn write_record_batch_parquet(target_path: &Path, batch: &RecordBatch) -> Result<()> {
+    let file = File::create(target_path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to create compacted parquet file path=[{}] error=[{}]",
+            target_path.display(),
+            error
+        ),
+    })?;
+    let mut writer =
+        ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to create compacted parquet writer path=[{}] error=[{}]",
+                target_path.display(),
+                error
+            ),
+        })?;
+    writer.write(batch).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to write compacted parquet path=[{}] error=[{}]",
+            target_path.display(),
+            error
+        ),
+    })?;
+    writer.close().map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to close compacted parquet path=[{}] error=[{}]",
+            target_path.display(),
+            error
+        ),
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compacted_persisted_file_metadata(
+    stream_name: &str,
+    schema_hash: &str,
+    group_files: &[serde_json::Value],
+    target_path: &Path,
+    row_count: usize,
+    sort_columns: &[String],
+    batch: &RecordBatch,
+    digest: u64,
+) -> serde_json::Value {
+    let mut metadata = serde_json::json!({
+        "persist_file_id": format!("compact:{}:{:016x}", stream_name, digest),
+        "stream_name": stream_name,
+        "schema_hash": schema_hash,
+        "file_path": target_path.to_string_lossy(),
+        "row_count": row_count,
+        "created_at": persisted_created_at_millis_for_compaction(),
+        "compacted": true,
+        "compacted_file_count": group_files.len(),
+        "compacted_source_file_ids": group_files
+            .iter()
+            .map(|item| item.get("persist_file_id").cloned().unwrap_or_else(|| {
+                item.get("file_path").cloned().unwrap_or(serde_json::Value::Null)
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(first_file) = group_files.first() {
+        for key in ["partition", "partition_path", "partition_spec"] {
+            if let Some(value) = first_file.get(key) {
+                metadata[key] = value.clone();
+            }
+        }
+    }
+    let source_segments = group_files
+        .iter()
+        .flat_map(persisted_segment_identities)
+        .map(|(segment_id, generation)| {
+            serde_json::json!({
+                "source_segment_id": segment_id,
+                "source_generation": generation,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !source_segments.is_empty() {
+        metadata["source_segments"] = serde_json::Value::Array(source_segments.clone());
+        metadata["source_segment_id"] = source_segments[0]["source_segment_id"].clone();
+        metadata["source_generation"] = source_segments[0]["source_generation"].clone();
+    }
+    if !sort_columns.is_empty() {
+        metadata["sort_columns"] = serde_json::json!(sort_columns);
+    }
+    let stats = compaction_stats(batch, sort_columns);
+    if !stats.is_null() {
+        metadata["stats"] = stats.clone();
+    }
+    if matches!(
+        sort_columns.first().map(String::as_str),
+        Some("dt" | "event_ts")
+    ) {
+        if let Some(primary_stats) = sort_columns
+            .first()
+            .and_then(|column| stats.get(column))
+            .and_then(serde_json::Value::as_object)
+        {
+            if let Some(min) = primary_stats.get("min") {
+                metadata["min_event_ts"] = min.clone();
+            }
+            if let Some(max) = primary_stats.get("max") {
+                metadata["max_event_ts"] = max.clone();
+            }
+        }
+    }
+    metadata
+}
+
+fn compaction_stats(batch: &RecordBatch, sort_columns: &[String]) -> serde_json::Value {
+    let mut stats = serde_json::Map::new();
+    for column_name in sort_columns {
+        let Ok(column_index) = batch.schema().index_of(column_name) else {
+            continue;
+        };
+        let column = batch.column(column_index);
+        if let Some((min, max)) = numeric_min_max(column) {
+            stats.insert(
+                column_name.clone(),
+                serde_json::json!({
+                    "min": min,
+                    "max": max,
+                }),
+            );
+        }
+    }
+    if stats.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(stats)
+    }
+}
+
+fn numeric_min_max(column: &ArrayRef) -> Option<(serde_json::Value, serde_json::Value)> {
+    match column.data_type() {
+        DataType::Int64 | DataType::Timestamp(_, _) => {
+            let values = column.as_any().downcast_ref::<Int64Array>()?;
+            let mut min = None::<i64>;
+            let mut max = None::<i64>;
+            for index in 0..values.len() {
+                if values.is_null(index) {
+                    continue;
+                }
+                let value = values.value(index);
+                min = Some(min.map_or(value, |current| current.min(value)));
+                max = Some(max.map_or(value, |current| current.max(value)));
+            }
+            Some((serde_json::json!(min?), serde_json::json!(max?)))
+        }
+        DataType::Float64 => {
+            let values = column.as_any().downcast_ref::<Float64Array>()?;
+            let mut min = None::<f64>;
+            let mut max = None::<f64>;
+            for index in 0..values.len() {
+                if values.is_null(index) {
+                    continue;
+                }
+                let value = values.value(index);
+                min = Some(min.map_or(value, |current| current.min(value)));
+                max = Some(max.map_or(value, |current| current.max(value)));
+            }
+            Some((serde_json::json!(min?), serde_json::json!(max?)))
+        }
+        _ => None,
+    }
+}
+
+fn live_segment_identities(stream: &StreamRecord) -> HashSet<(u64, u64)> {
+    let mut identities = HashSet::new();
+    if let Some(identity) = stream
+        .active_segment_descriptor
+        .as_ref()
+        .and_then(segment_identity_from_value)
+    {
+        identities.insert(identity);
+    }
+    for segment in &stream.sealed_segments {
+        if let Some(identity) = segment_identity_from_value(segment) {
+            identities.insert(identity);
+        }
+    }
+    identities
+}
+
+fn persisted_segment_identities(value: &serde_json::Value) -> Vec<(u64, u64)> {
+    if let Some(source_segments) = value
+        .get("source_segments")
+        .and_then(serde_json::Value::as_array)
+    {
+        return source_segments
+            .iter()
+            .filter_map(segment_identity_from_value)
+            .collect();
+    }
+    segment_identity_from_value(value).into_iter().collect()
+}
+
+fn segment_identity_from_value(value: &serde_json::Value) -> Option<(u64, u64)> {
+    Some((
+        value
+            .get("source_segment_id")
+            .and_then(serde_json::Value::as_u64)?,
+        value
+            .get("source_generation")
+            .and_then(serde_json::Value::as_u64)?,
+    ))
+}
+
+fn persisted_compaction_group_key(item: &serde_json::Value, path: &Path) -> String {
+    if let Some(partition_path) = item
+        .get("partition_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("partition_path:{partition_path}");
+    }
+    if let Some(partition) = item.get("partition") {
+        if partition.is_object() {
+            return format!("partition:{partition}");
+        }
+    }
+    format!(
+        "parent:{}",
+        path.parent()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+    )
+}
+
+fn partition_dt_column(group_files: &[serde_json::Value]) -> Option<String> {
+    group_files.iter().find_map(|item| {
+        item.get("partition_spec")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|partition_spec| partition_spec.get("dt_column"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn persisted_file_compaction_key(item: &serde_json::Value) -> (String, String) {
+    item.get("persist_file_id")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| ("id".to_string(), value.to_string()))
+        .unwrap_or_else(|| {
+            (
+                "path".to_string(),
+                item.get("file_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+}
+
+fn persisted_file_order_key(item: &serde_json::Value) -> (u64, u64, u64, String) {
+    (
+        item.get("source_segment_id")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        item.get("source_generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        item.get("created_at")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        item.get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+fn compact_group_digest(group_files: &[serde_json::Value]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for item in group_files {
+        persisted_file_compaction_key(item).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn safe_file_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn persisted_created_at_millis_for_compaction() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn generate_control_token(label: &str) -> String {
+    if let Some(token) = random_token_from_os() {
+        return token;
+    }
+    let now = persisted_created_at_millis_for_compaction();
+    let mut hasher = DefaultHasher::new();
+    label.hash(&mut hasher);
+    now.hash(&mut hasher);
+    thread::current().id().hash(&mut hasher);
+    format!("{:016x}{:016x}", hasher.finish(), now)
+}
+
+fn random_token_from_os() -> Option<String> {
+    let mut bytes = [0_u8; 32];
+    let mut file = File::open("/dev/urandom").ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn write_control_response(stream: &mut impl Write, response: &ControlResponse) -> Result<()> {
@@ -3039,43 +3961,6 @@ fn validate_register_stream_request(
     Ok(())
 }
 
-fn normalize_register_stream_bus_error(
-    registry: &Registry,
-    stream_name: &str,
-    buffer_size: usize,
-    frame_size: usize,
-    error: crate::bus::BusError,
-) -> ZippyError {
-    match error {
-        BusError::InvalidBufferOrFrameSize { .. } => {
-            registry_error(crate::registry::RegistryError::InvalidStreamConfig {
-                stream_name: stream_name.to_string(),
-                buffer_size,
-                frame_size,
-            })
-        }
-        BusError::StreamConfigMismatch { .. } => {
-            if let Some(existing) = registry.get_stream(stream_name) {
-                registry_error(crate::registry::RegistryError::StreamConfigMismatch {
-                    stream_name: stream_name.to_string(),
-                    existing_buffer_size: existing.buffer_size,
-                    existing_frame_size: existing.frame_size,
-                    requested_buffer_size: buffer_size,
-                    requested_frame_size: frame_size,
-                })
-            } else {
-                ZippyError::Io {
-                    reason: format!(
-                        "stream configuration mismatch stream_name=[{}] requested_buffer_size=[{}] requested_frame_size=[{}] bus state differs from registry",
-                        stream_name, buffer_size, frame_size
-                    ),
-                }
-            }
-        }
-        other => bus_error(other),
-    }
-}
-
 fn io_error(error: std::io::Error) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
@@ -3089,12 +3974,6 @@ fn json_error(error: serde_json::Error) -> ZippyError {
 }
 
 fn registry_error(error: crate::registry::RegistryError) -> ZippyError {
-    ZippyError::Io {
-        reason: error.to_string(),
-    }
-}
-
-fn bus_error(error: crate::bus::BusError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
     }
@@ -3146,6 +4025,8 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
             data_path: stream.data_path,
             descriptor_generation: stream.descriptor_generation,
             active_segment_descriptor: stream.active_segment_descriptor,
+            active_segment_preflight: None,
+            segment_row_capacity: None,
             sealed_segments: stream.sealed_segments,
             persisted_files: stream.persisted_files,
             persist_events: stream.persist_events,
@@ -3159,6 +4040,106 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
             status: stream.status,
         }
     }
+}
+
+fn stream_info_with_active_preflight(stream: crate::registry::StreamRecord) -> StreamInfo {
+    let mut info = StreamInfo::from(stream);
+    if let Some(descriptor) = info.active_segment_descriptor.as_ref() {
+        info.segment_row_capacity = descriptor_row_capacity(descriptor);
+        info.active_segment_preflight = Some(active_segment_preflight(descriptor));
+    }
+    info
+}
+
+fn active_segment_preflight(descriptor: &serde_json::Value) -> serde_json::Value {
+    let row_capacity = descriptor_row_capacity(descriptor);
+    if row_capacity.is_none() {
+        return active_segment_preflight_error(
+            "active_descriptor_invalid",
+            "active segment descriptor missing row_capacity",
+        );
+    }
+    let Some(shm_os_id) = descriptor
+        .get("shm_os_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return active_segment_preflight_error(
+            "active_descriptor_invalid",
+            "active segment descriptor missing shm_os_id",
+        );
+    };
+    let Some(committed_row_count_offset) = descriptor
+        .get("committed_row_count_offset")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return active_segment_preflight_error(
+            "active_descriptor_invalid",
+            "active segment descriptor missing committed_row_count_offset",
+        );
+    };
+
+    match read_active_segment_committed_row_count(shm_os_id, committed_row_count_offset) {
+        Ok(committed_row_count) => serde_json::json!({
+            "status": "ok",
+            "kind": "active_segment_readable",
+            "readable": true,
+            "shm_os_id": shm_os_id,
+            "row_capacity": row_capacity,
+            "committed_row_count": committed_row_count,
+            "message": format!("active segment is readable shm_os_id=[{}]", shm_os_id),
+        }),
+        Err(reason) => active_segment_preflight_error(
+            "active_segment_unreadable",
+            &format!(
+                "failed to open active segment shm_os_id=[{}] reason=[{}]",
+                shm_os_id, reason
+            ),
+        )
+        .with_row_capacity(row_capacity),
+    }
+}
+
+fn active_segment_preflight_error(kind: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "kind": kind,
+        "readable": false,
+        "message": message,
+    })
+}
+
+trait ActiveSegmentPreflightExt {
+    fn with_row_capacity(self, row_capacity: Option<usize>) -> serde_json::Value;
+}
+
+impl ActiveSegmentPreflightExt for serde_json::Value {
+    fn with_row_capacity(mut self, row_capacity: Option<usize>) -> serde_json::Value {
+        if let Some(object) = self.as_object_mut() {
+            object.insert("row_capacity".to_string(), serde_json::json!(row_capacity));
+        }
+        self
+    }
+}
+
+fn descriptor_row_capacity(descriptor: &serde_json::Value) -> Option<usize> {
+    descriptor
+        .get("row_capacity")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn read_active_segment_committed_row_count(
+    shm_os_id: &str,
+    committed_row_count_offset: usize,
+) -> std::result::Result<u64, String> {
+    let region = ShmRegion::open(shm_os_id).map_err(|error| error.to_string())?;
+    let mut bytes = [0_u8; 8];
+    region
+        .read_at(committed_row_count_offset, &mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[cfg(unix)]

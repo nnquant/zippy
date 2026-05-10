@@ -7,7 +7,7 @@ pub mod testing;
 pub mod timeseries;
 
 pub use cross_sectional::CrossSectionalEngine;
-pub use reactive::ReactiveStateEngine;
+pub use reactive::{ReactiveStateEngine, ReactiveStateFailurePolicy};
 pub use reactive_latest::ReactiveLatestEngine;
 pub use stream_table::{
     KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,

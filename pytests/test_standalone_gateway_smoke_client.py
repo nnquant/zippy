@@ -12,7 +12,6 @@ from pathlib import Path
 import pyarrow as pa
 import zippy
 
-
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
     / "examples"
@@ -224,13 +223,13 @@ schema = pa.schema([
 zp.connect("zippy://127.0.0.1:28990/default", app="pure_python_remote_child")
 writer = zp.get_writer({stream_name!r}, schema=schema, batch_size=1)
 writer.write({{"instrument_id": "IF2606", "last_price": 4102.5}})
-writer.close()
 table = (
     zp.read_table({stream_name!r})
     .filter(zp.col("instrument_id") == "IF2606")
     .select("instrument_id", "last_price")
     .collect()
 )
+writer.close()
 print(json.dumps({{"rows": table.num_rows, "data": table.to_pydict()}}, sort_keys=True))
 """
     try:

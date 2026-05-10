@@ -173,6 +173,32 @@ fn timeseries_engine_flushes_open_windows() {
 }
 
 #[test]
+fn timeseries_engine_repeated_flush_does_not_emit_duplicate_window() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        specs(),
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    engine
+        .on_data(batch(vec!["a"], vec![1_000_000_000], vec![10.0], vec![1.0]))
+        .unwrap();
+
+    let first_flush = engine.on_flush().unwrap();
+    let second_flush = engine.on_flush().unwrap();
+
+    assert_eq!(first_flush.len(), 1);
+    assert!(second_flush.is_empty());
+}
+
+#[test]
 fn timeseries_engine_accepts_shanghai_timestamp_input_schema() {
     let engine = TimeSeriesEngine::new(
         "bars",

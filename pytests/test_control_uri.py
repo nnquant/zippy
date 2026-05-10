@@ -13,10 +13,7 @@ def test_resolve_uri_passes_through_tcp_endpoint() -> None:
 
 
 def test_resolve_uri_maps_remote_zippy_uri_to_tcp_master_endpoint() -> None:
-    assert (
-        zippy._resolve_uri("zippy://127.0.0.1:17690/default")
-        == "tcp://127.0.0.1:17690"
-    )
+    assert zippy._resolve_uri("zippy://127.0.0.1:17690/default") == "tcp://127.0.0.1:17690"
 
 
 def test_resolve_uri_maps_localhost_zippy_uri_to_tcp_master_endpoint() -> None:

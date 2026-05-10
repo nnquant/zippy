@@ -120,6 +120,42 @@ impl Publisher for FailingPublisher {
     }
 }
 
+struct TransactionTrackingEngine {
+    schema: Arc<Schema>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Engine for TransactionTrackingEngine {
+    fn name(&self) -> &str {
+        "transaction-tracking-engine"
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    fn on_data(&mut self, batch: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        Ok(vec![batch])
+    }
+
+    fn begin_transaction(&mut self) {
+        self.events.lock().unwrap().push("begin");
+    }
+
+    fn commit_transaction(&mut self) {
+        self.events.lock().unwrap().push("commit");
+    }
+
+    fn rollback_transaction(&mut self) -> Result<()> {
+        self.events.lock().unwrap().push("rollback");
+        Ok(())
+    }
+}
+
 struct BlockingFailingDataEngine {
     schema: Arc<Schema>,
     started_tx: Sender<f64>,
@@ -712,4 +748,31 @@ fn publish_failure_marks_engine_failed_and_updates_metrics() {
         ZippyError::InvalidState { status } => assert_eq!(status, "failed"),
         other => panic!("unexpected flush error: {other:?}"),
     }
+}
+
+#[test]
+fn publish_failure_rolls_back_engine_transaction() {
+    let schema = price_schema();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let engine = TransactionTrackingEngine {
+        schema: schema.clone(),
+        events: Arc::clone(&events),
+    };
+    let handle = spawn_engine_with_publisher(
+        engine,
+        EngineConfig {
+            name: "publish-failure-rollback-engine".to_string(),
+            buffer_capacity: 16,
+            overflow_policy: Default::default(),
+            late_data_policy: Default::default(),
+            xfast: false,
+        },
+        FailingPublisher,
+    )
+    .unwrap();
+
+    handle.write(single_price_batch(schema, 1.0)).unwrap();
+    wait_for_status(&handle, EngineStatus::Failed);
+
+    assert_eq!(*events.lock().unwrap(), vec!["begin", "rollback"]);
 }

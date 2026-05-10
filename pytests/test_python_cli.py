@@ -31,9 +31,7 @@ def unused_loopback_uri() -> str:
 
 def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
     control_endpoint = (
-        unused_loopback_uri()
-        if os.name == "nt"
-        else str(tmp_path / "zippy-master-cli.sock")
+        unused_loopback_uri() if os.name == "nt" else str(tmp_path / "zippy-master-cli.sock")
     )
     server = zippy.MasterServer(control_endpoint=control_endpoint)
     server.start()
@@ -56,6 +54,21 @@ def test_cli_root_help() -> None:
     assert "master" in result.output
     assert "gateway" in result.output
     assert "stream" in result.output
+
+
+def test_python_module_entrypoint_shows_root_help() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "zippy", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "zippy management CLI." in result.stdout
+    assert "master" in result.stdout
+    assert "gateway" in result.stdout
+    assert "stream" in result.stdout
 
 
 def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,10 +128,14 @@ def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch)
         ("start", "127.0.0.1:17666"),
         ("stop", "127.0.0.1:17666"),
     ]
-    assert "gateway started host=[127.0.0.1] port=[17666] endpoint=[127.0.0.1:17666]" in result.output
+    assert (
+        "gateway started host=[127.0.0.1] port=[17666] endpoint=[127.0.0.1:17666]" in result.output
+    )
 
 
-def test_gateway_run_uses_config_host_and_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_gateway_run_uses_config_host_and_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     events: list[tuple[str, object]] = []
     config_path = tmp_path / "zippy-config.toml"
     config_path.write_text(
@@ -236,7 +253,9 @@ def test_gateway_run_derives_endpoint_from_master_uri(monkeypatch: pytest.Monkey
         ("start", "127.0.0.1:27691"),
         ("stop", "127.0.0.1:27691"),
     ]
-    assert "gateway started host=[127.0.0.1] port=[27691] endpoint=[127.0.0.1:27691]" in result.output
+    assert (
+        "gateway started host=[127.0.0.1] port=[27691] endpoint=[127.0.0.1:27691]" in result.output
+    )
 
 
 def test_gateway_smoke_runs_cross_process_probe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -328,7 +347,9 @@ def test_gateway_smoke_client_uses_existing_remote_uri(monkeypatch: pytest.Monke
     assert "windows_smoke_ticks" in result.output
 
 
-def test_master_run_returns_click_error_when_server_start_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_master_run_returns_click_error_when_server_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def failing_run_master_daemon(control_endpoint: str) -> None:
         assert control_endpoint
         raise RuntimeError("failed to bind control socket")
@@ -479,7 +500,9 @@ def test_master_run_forwards_config_path(monkeypatch: pytest.MonkeyPatch) -> Non
     assert events == [(str(Path("/tmp/custom-master.sock")), "/tmp/zippy-config.toml")]
 
 
-def test_master_run_uses_config_host_and_port(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_master_run_uses_config_host_and_port(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     events: list[tuple[str, str]] = []
     config_path = tmp_path / "zippy-config.toml"
     config_path.write_text(
@@ -501,7 +524,10 @@ port = 27690
 
     assert result.exit_code == 0
     assert events == [("tcp://0.0.0.0:27690", str(config_path))]
-    assert "master starting host=[0.0.0.0] port=[27690] endpoint=[tcp://0.0.0.0:27690]" in result.output
+    assert (
+        "master starting host=[0.0.0.0] port=[27690] endpoint=[tcp://0.0.0.0:27690]"
+        in result.output
+    )
 
 
 def test_master_run_exits_cleanly_on_sigint(tmp_path: Path) -> None:

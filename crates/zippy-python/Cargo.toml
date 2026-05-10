@@ -5,11 +5,14 @@ edition.workspace = true
 
 [lib]
 name = "zippy_internal"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 arrow = { workspace = true, features = ["pyarrow"] }
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 serde_json.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
@@ -19,3 +22,6 @@ zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
 zippy-master = { path = "../zippy-master" }
 zippy-operators = { path = "../zippy-operators" }
 zippy-segment-store = { path = "../zippy-segment-store" }
+
+[build-dependencies]
+pyo3-build-config = "0.22"
