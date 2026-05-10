@@ -400,6 +400,7 @@ class ReactiveStateEngine:
             | ReactiveLatestEngine
             | StreamTableMaterializer
             | TimeSeriesEngine
+            | BarGeneratorEngine
             | CrossSectionalEngine
             | ZmqSource
             | SegmentStreamSource
@@ -436,6 +437,7 @@ class ReactiveLatestEngine:
             | ReactiveLatestEngine
             | StreamTableMaterializer
             | TimeSeriesEngine
+            | BarGeneratorEngine
             | ZmqSource
             | SegmentStreamSource
             | None
@@ -469,6 +471,7 @@ class StreamTableMaterializer:
             | ReactiveLatestEngine
             | StreamTableMaterializer
             | TimeSeriesEngine
+            | BarGeneratorEngine
             | ZmqSource
             | SegmentStreamSource
             | None
@@ -515,6 +518,7 @@ class KeyValueTableMaterializer:
             | StreamTableMaterializer
             | KeyValueTableMaterializer
             | TimeSeriesEngine
+            | BarGeneratorEngine
             | CrossSectionalEngine
             | ZmqSource
             | SegmentStreamSource
@@ -564,6 +568,53 @@ class TimeSeriesEngine:
             | ReactiveLatestEngine
             | StreamTableMaterializer
             | TimeSeriesEngine
+            | BarGeneratorEngine
+            | ZmqSource
+            | SegmentStreamSource
+            | None
+        ) = None,
+        master: MasterClient | None = None,
+        parquet_sink: ParquetSink | None = None,
+        buffer_capacity: int = 1024,
+        overflow_policy: _OverflowPolicyValue | None = None,
+        archive_buffer_capacity: int = 1024,
+        xfast: bool = False,
+    ) -> None: ...
+
+    def start(self) -> None: ...
+
+    def write(self, value: WriteValue) -> None: ...
+
+    def output_schema(self) -> pa.Schema: ...
+
+    def status(self) -> str: ...
+
+    def metrics(self) -> dict[str, int]: ...
+
+    def config(self) -> dict[str, object]: ...
+
+    def flush(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class BarGeneratorEngine:
+    def __init__(
+        self,
+        name: str,
+        input_schema: pa.Schema,
+        profile: object,
+        target: PublisherTarget,
+        *,
+        source: (
+            str
+            | ReactiveStateEngine
+            | ReactiveLatestEngine
+            | StreamTableMaterializer
+            | KeyValueTableMaterializer
+            | TimeSeriesEngine
+            | BarGeneratorEngine
+            | CrossSectionalEngine
             | ZmqSource
             | SegmentStreamSource
             | None
@@ -596,7 +647,7 @@ class CrossSectionalEngine:
         factors: list[CrossSectionalFactor],
         target: PublisherTarget,
         *,
-        source: str | TimeSeriesEngine | ZmqSource | None = None,
+        source: str | TimeSeriesEngine | BarGeneratorEngine | ZmqSource | None = None,
         master: MasterClient | None = None,
         parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,

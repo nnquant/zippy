@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -39,6 +40,7 @@ if _NATIVE_AVAILABLE:
         from ._internal import AggMinSpec
         from ._internal import AggSumSpec
         from ._internal import AggVwapSpec
+        from ._internal import BarGeneratorEngine
         from ._internal import CastSpec
         from ._internal import ClipSpec
         from ._internal import CSDemeanSpec
@@ -88,6 +90,7 @@ if not _NATIVE_AVAILABLE:
     AggMinSpec = _native_unavailable("AggMinSpec")
     AggSumSpec = _native_unavailable("AggSumSpec")
     AggVwapSpec = _native_unavailable("AggVwapSpec")
+    BarGeneratorEngine = _native_unavailable("BarGeneratorEngine")
     CastSpec = _native_unavailable("CastSpec")
     ClipSpec = _native_unavailable("ClipSpec")
     CSDemeanSpec = _native_unavailable("CSDemeanSpec")
@@ -6960,6 +6963,132 @@ class SourceMode:
         raise TypeError("SourceMode cannot be instantiated")
 
 
+@dataclass(frozen=True)
+class _BarInputColumns:
+    instrument: str
+    dt: str
+    price: str
+    volume: str
+    total_turnover: str
+    trading_day: str | None = None
+    num_trades: str | None = None
+    limit_up: str | None = None
+    limit_down: str | None = None
+
+    def to_bar_generator_spec(self) -> dict[str, str | None]:
+        return {
+            "instrument": self.instrument,
+            "dt": self.dt,
+            "price": self.price,
+            "volume": self.volume,
+            "total_turnover": self.total_turnover,
+            "trading_day": self.trading_day,
+            "num_trades": self.num_trades,
+            "limit_up": self.limit_up,
+            "limit_down": self.limit_down,
+        }
+
+
+@dataclass(frozen=True)
+class _BarTradingSessions:
+    timezone: str
+    regular: list[tuple[str, str]]
+    auction: list[tuple[str, str]]
+
+    def to_bar_generator_spec(self) -> dict[str, object]:
+        return {
+            "timezone": self.timezone,
+            "regular": list(self.regular),
+            "auction": list(self.auction),
+        }
+
+
+@dataclass(frozen=True)
+class _BarVolume:
+    mode: str
+    trading_day_column: str | None = None
+    bootstrap: str | None = None
+    output_dtype: str = "int64"
+
+    @staticmethod
+    def delta(output_dtype: str = "int64") -> "_BarVolume":
+        return _BarVolume(mode="delta", output_dtype=output_dtype)
+
+    @staticmethod
+    def cumulative(
+        trading_day_column: str,
+        bootstrap: str = "skip_first_delta",
+        output_dtype: str = "int64",
+    ) -> "_BarVolume":
+        return _BarVolume(
+            mode="cumulative",
+            trading_day_column=trading_day_column,
+            bootstrap=bootstrap,
+            output_dtype=output_dtype,
+        )
+
+    def to_bar_generator_spec(self) -> dict[str, object]:
+        if self.mode == "delta":
+            return {"mode": "delta", "output_dtype": self.output_dtype}
+        return {
+            "mode": self.mode,
+            "trading_day_column": self.trading_day_column,
+            "bootstrap": self.bootstrap,
+            "output_dtype": self.output_dtype,
+        }
+
+
+@dataclass(frozen=True)
+class _BarAuction:
+    mode: str
+
+    @staticmethod
+    def drop() -> "_BarAuction":
+        return _BarAuction("drop")
+
+    @staticmethod
+    def merge_to_first_regular_bar() -> "_BarAuction":
+        return _BarAuction("merge_to_first_regular_bar")
+
+    @staticmethod
+    def emit_separate_bar() -> "_BarAuction":
+        return _BarAuction("emit_separate_bar")
+
+    def to_bar_generator_spec(self) -> str:
+        return self.mode
+
+
+@dataclass(frozen=True)
+class _BarGeneratorProfile:
+    frequency: str
+    columns: _BarInputColumns
+    sessions: _BarTradingSessions
+    volume: _BarVolume
+    auction: _BarAuction
+    dt_label: str = "close_dt"
+
+    def to_bar_generator_spec(self) -> dict[str, object]:
+        return {
+            "frequency": self.frequency,
+            "columns": self.columns.to_bar_generator_spec(),
+            "sessions": self.sessions.to_bar_generator_spec(),
+            "volume": self.volume.to_bar_generator_spec(),
+            "auction": self.auction.to_bar_generator_spec(),
+            "dt_label": self.dt_label,
+        }
+
+
+class _BarNamespace:
+    InputColumns = _BarInputColumns
+    TradingSessions = _BarTradingSessions
+    Volume = _BarVolume
+    Auction = _BarAuction
+    BarGeneratorProfile = _BarGeneratorProfile
+
+
+bar = _BarNamespace()
+
+
 class Duration:
     """Represent a positive time duration in nanoseconds for Python APIs."""
 
@@ -7124,6 +7253,7 @@ __all__ = [
     "AggMinSpec",
     "AggSumSpec",
     "AggVwapSpec",
+    "BarGeneratorEngine",
     "CastSpec",
     "ClipSpec",
     "CSDemeanSpec",
@@ -7190,6 +7320,7 @@ __all__ = [
     "ZmqStreamPublisher",
     "ZmqSubscriber",
     "__version__",
+    "bar",
     "col",
     "compare_replay",
     "config",

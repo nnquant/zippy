@@ -11078,6 +11078,128 @@ def test_archive_compatibility_aliases_are_removed() -> None:
     assert not hasattr(zippy.MasterClient, "publish_archive_file")
 
 
+def test_bar_profile_normalizes_to_native_spec() -> None:
+    profile = zippy.bar.BarGeneratorProfile(
+        frequency="1m",
+        columns=zippy.bar.InputColumns(
+            instrument="instrument_id",
+            dt="dt",
+            price="last_price",
+            volume="volume",
+            total_turnover="turnover",
+            trading_day="trading_day",
+            num_trades=None,
+            limit_up="upper_limit_price",
+            limit_down="lower_limit_price",
+        ),
+        sessions=zippy.bar.TradingSessions(
+            timezone="Asia/Shanghai",
+            regular=[("09:30:00", "15:00:00")],
+            auction=[],
+        ),
+        volume=zippy.bar.Volume.cumulative("trading_day"),
+        auction=zippy.bar.Auction.drop(),
+        dt_label="close_dt",
+    )
+
+    spec = profile.to_bar_generator_spec()
+    assert spec == {
+        "frequency": "1m",
+        "columns": {
+            "instrument": "instrument_id",
+            "dt": "dt",
+            "price": "last_price",
+            "volume": "volume",
+            "total_turnover": "turnover",
+            "trading_day": "trading_day",
+            "num_trades": None,
+            "limit_up": "upper_limit_price",
+            "limit_down": "lower_limit_price",
+        },
+        "sessions": {
+            "timezone": "Asia/Shanghai",
+            "regular": [("09:30:00", "15:00:00")],
+            "auction": [],
+        },
+        "volume": {
+            "mode": "cumulative",
+            "trading_day_column": "trading_day",
+            "bootstrap": "skip_first_delta",
+            "output_dtype": "int64",
+        },
+        "auction": "drop",
+        "dt_label": "close_dt",
+    }
+    spec["sessions"]["regular"].append(("21:00:00", "23:00:00"))
+    spec["columns"]["instrument"] = "symbol"
+    assert profile.sessions.regular == [("09:30:00", "15:00:00")]
+    assert profile.columns.instrument == "instrument_id"
+    assert zippy.bar.Volume.delta().to_bar_generator_spec() == {
+        "mode": "delta",
+        "output_dtype": "int64",
+    }
+    assert zippy.bar.Volume.delta(output_dtype="float64").to_bar_generator_spec() == {
+        "mode": "delta",
+        "output_dtype": "float64",
+    }
+    assert (
+        zippy.bar.Auction.merge_to_first_regular_bar().to_bar_generator_spec()
+        == "merge_to_first_regular_bar"
+    )
+    assert zippy.bar.Auction.emit_separate_bar().to_bar_generator_spec() == "emit_separate_bar"
+    assert "BarGeneratorProfile" not in zippy.__all__
+    assert not hasattr(zippy, "BarGeneratorProfile")
+
+
+def test_bar_engine_accepts_plugin_profile_protocol() -> None:
+    class PluginProfile:
+        def to_bar_generator_spec(self) -> dict[str, object]:
+            return {
+                "frequency": "1m",
+                "columns": {
+                    "instrument": "instrument_id",
+                    "dt": "dt",
+                    "price": "last_price",
+                    "volume": "volume",
+                    "total_turnover": "turnover",
+                    "trading_day": "trading_day",
+                    "num_trades": None,
+                    "limit_up": None,
+                    "limit_down": None,
+                },
+                "sessions": {
+                    "timezone": "Asia/Shanghai",
+                    "regular": [("09:30:00", "15:00:00")],
+                    "auction": [],
+                },
+                "volume": {"mode": "delta"},
+                "auction": "drop",
+                "dt_label": "close_dt",
+            }
+
+    schema = pa.schema(
+        [
+            pa.field("instrument_id", pa.string(), nullable=False),
+            pa.field("dt", pa.timestamp("ns", tz="Asia/Shanghai"), nullable=False),
+            pa.field("last_price", pa.float64(), nullable=False),
+            pa.field("volume", pa.float64(), nullable=False),
+            pa.field("turnover", pa.float64(), nullable=False),
+            pa.field("trading_day", pa.string(), nullable=False),
+        ]
+    )
+    engine = zippy.BarGeneratorEngine(
+        name="bars",
+        input_schema=schema,
+        profile=PluginProfile(),
+        target=zippy.NullPublisher(),
+    )
+
+    assert engine.config()["engine_type"] == "bar_generator"
+    assert engine.config()["profile"]["auction"] == "drop"
+    assert engine.config()["profile"]["volume"]["output_dtype"] == "int64"
+    assert engine.output_schema().field("volume").type == pa.int64()
+
+
 def test_connect_sets_default_master_for_query_tail(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
