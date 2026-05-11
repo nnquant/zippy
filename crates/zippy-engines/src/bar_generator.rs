@@ -185,8 +185,8 @@ impl BarGeneratorEngine {
         let dts = bars
             .iter()
             .map(|bar| match self.spec.dt_label {
-                DtLabelPolicy::CloseDt => bar.close_dt,
-                DtLabelPolicy::StartDt => bar.start_dt,
+                DtLabelPolicy::CloseDt => bar.end_dt,
+                DtLabelPolicy::StartDt => bar.window_start_dt,
             })
             .collect::<Vec<_>>();
         let opens = bars.iter().map(|bar| bar.open).collect::<Vec<_>>();
@@ -203,6 +203,7 @@ impl BarGeneratorEngine {
         let limit_downs = bars.iter().map(|bar| bar.limit_down).collect::<Vec<_>>();
         let start_dts = bars.iter().map(|bar| bar.start_dt).collect::<Vec<_>>();
         let close_dts = bars.iter().map(|bar| bar.close_dt).collect::<Vec<_>>();
+        let end_dts = bars.iter().map(|bar| bar.end_dt).collect::<Vec<_>>();
         let timezone = self.spec.sessions.timezone.clone();
         let columns = vec![
             Arc::new(StringArray::from(instruments)) as ArrayRef,
@@ -219,7 +220,9 @@ impl BarGeneratorEngine {
             Arc::new(Float64Array::from(limit_downs)) as ArrayRef,
             Arc::new(TimestampNanosecondArray::from(start_dts).with_timezone(timezone.clone()))
                 as ArrayRef,
-            Arc::new(TimestampNanosecondArray::from(close_dts).with_timezone(timezone)) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(close_dts).with_timezone(timezone.clone()))
+                as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(end_dts).with_timezone(timezone)) as ArrayRef,
         ];
 
         RecordBatch::try_new(Arc::clone(&self.output_schema), columns).map_err(|error| {
@@ -345,8 +348,8 @@ impl BarGeneratorEngine {
                         window_end,
                         self.timezone_offset_seconds,
                     ) {
-                        auction_bar.start_dt = window_start;
-                        auction_bar.close_dt = window_end;
+                        auction_bar.window_start_dt = window_start;
+                        auction_bar.end_dt = window_end;
                         auction_bar.update(&tick);
                         Some(auction_bar)
                     } else {
@@ -357,8 +360,8 @@ impl BarGeneratorEngine {
         } else {
             OpenBar::from_tick(&tick, window_start, window_end)
         };
-        incoming_bar.start_dt = window_start;
-        incoming_bar.close_dt = window_end;
+        incoming_bar.window_start_dt = window_start;
+        incoming_bar.end_dt = window_end;
 
         self.insert_regular_bar(incoming_bar, current_window_start, completed);
 
@@ -385,7 +388,7 @@ impl BarGeneratorEngine {
                 tick.volume = delta.volume;
                 tick.total_turnover = delta.total_turnover;
 
-                let Some((start_dt, close_dt)) = auction_window_bounds(
+                let Some((window_start_dt, end_dt)) = auction_window_bounds(
                     &self.spec.sessions,
                     tick.dt,
                     self.timezone_offset_seconds,
@@ -403,13 +406,13 @@ impl BarGeneratorEngine {
                     None => {
                         self.pending_auction_bars.insert(
                             tick.instrument.clone(),
-                            OpenBar::from_tick(&tick, start_dt, close_dt),
+                            OpenBar::from_tick(&tick, window_start_dt, end_dt),
                         );
                     }
                 }
             }
             AuctionPolicy::EmitSeparateBar => {
-                let Some((start_dt, close_dt)) = auction_window_bounds(
+                let Some((window_start_dt, end_dt)) = auction_window_bounds(
                     &self.spec.sessions,
                     tick.dt,
                     self.timezone_offset_seconds,
@@ -425,8 +428,8 @@ impl BarGeneratorEngine {
 
                 let key = AuctionBarKey {
                     instrument: tick.instrument.clone(),
-                    start_dt,
-                    close_dt,
+                    window_start_dt,
+                    end_dt,
                 };
                 match self.open_auction_bars.remove(&key) {
                     Some(mut auction_bar) => {
@@ -435,7 +438,7 @@ impl BarGeneratorEngine {
                     }
                     None => {
                         self.open_auction_bars
-                            .insert(key, OpenBar::from_tick(&tick, start_dt, close_dt));
+                            .insert(key, OpenBar::from_tick(&tick, window_start_dt, end_dt));
                     }
                 }
             }
@@ -452,7 +455,7 @@ impl BarGeneratorEngine {
         let completed_keys = self
             .open_auction_bars
             .keys()
-            .filter(|key| key.close_dt <= current_window_start)
+            .filter(|key| key.end_dt <= current_window_start)
             .cloned()
             .collect::<Vec<_>>();
 
@@ -471,20 +474,20 @@ impl BarGeneratorEngine {
     ) {
         let instrument = incoming_bar.instrument.clone();
         match self.open_bars.remove(&instrument) {
-            Some(mut open_bar) if open_bar.start_dt == incoming_bar.start_dt => {
+            Some(mut open_bar) if open_bar.window_start_dt == incoming_bar.window_start_dt => {
                 open_bar.merge_from_bar(&incoming_bar);
                 self.open_bars.insert(instrument, open_bar);
             }
             Some(open_bar) => {
                 completed.push(open_bar);
-                if incoming_bar.close_dt <= current_window_start {
+                if incoming_bar.end_dt <= current_window_start {
                     completed.push(incoming_bar);
                 } else {
                     self.open_bars.insert(instrument, incoming_bar);
                 }
             }
             None => {
-                if incoming_bar.close_dt <= current_window_start {
+                if incoming_bar.end_dt <= current_window_start {
                     completed.push(incoming_bar);
                 } else {
                     self.open_bars.insert(instrument, incoming_bar);
@@ -689,6 +692,8 @@ impl TickRow {
 #[derive(Clone)]
 struct OpenBar {
     instrument: String,
+    window_start_dt: i64,
+    end_dt: i64,
     start_dt: i64,
     close_dt: i64,
     open: f64,
@@ -721,16 +726,18 @@ struct CumulativeDelta {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AuctionBarKey {
     instrument: String,
-    start_dt: i64,
-    close_dt: i64,
+    window_start_dt: i64,
+    end_dt: i64,
 }
 
 impl OpenBar {
-    fn from_tick(tick: &TickRow, start_dt: i64, close_dt: i64) -> Self {
+    fn from_tick(tick: &TickRow, window_start_dt: i64, end_dt: i64) -> Self {
         Self {
             instrument: tick.instrument.clone(),
-            start_dt,
-            close_dt,
+            window_start_dt,
+            end_dt,
+            start_dt: tick.dt,
+            close_dt: tick.dt,
             open: tick.price,
             high: tick.price,
             low: tick.price,
@@ -747,6 +754,7 @@ impl OpenBar {
         self.high = self.high.max(tick.price);
         self.low = self.low.min(tick.price);
         self.close = tick.price;
+        self.close_dt = tick.dt;
         self.volume += tick.volume;
         self.total_turnover += tick.total_turnover;
         self.num_trades = sum_optional_i64(self.num_trades, tick.num_trades);
@@ -758,6 +766,8 @@ impl OpenBar {
         self.high = self.high.max(bar.high);
         self.low = self.low.min(bar.low);
         self.close = bar.close;
+        self.close_dt = bar.close_dt;
+        self.end_dt = bar.end_dt;
         self.volume += bar.volume;
         self.total_turnover += bar.total_turnover;
         self.num_trades = sum_optional_i64(self.num_trades, bar.num_trades);
@@ -804,17 +814,17 @@ fn auction_window_bounds(
     } else {
         (day_start - LOCAL_DAY_NS, day_start)
     };
-    let start_dt = start_day + i64::from(window.start_seconds) * SECOND_NS;
-    let close_dt = close_day + i64::from(window.end_seconds) * SECOND_NS;
+    let window_start_dt = start_day + i64::from(window.start_seconds) * SECOND_NS;
+    let end_dt = close_day + i64::from(window.end_seconds) * SECOND_NS;
 
-    Some((start_dt, close_dt))
+    Some((window_start_dt, end_dt))
 }
 
 fn sort_bars(bars: &mut [OpenBar]) {
     bars.sort_by(|left, right| {
-        (left.close_dt, left.start_dt, left.instrument.as_str()).cmp(&(
-            right.close_dt,
-            right.start_dt,
+        (left.end_dt, left.window_start_dt, left.instrument.as_str()).cmp(&(
+            right.end_dt,
+            right.window_start_dt,
             right.instrument.as_str(),
         ))
     });
@@ -870,8 +880,8 @@ fn auction_bar_matches_regular_window(
     regular_window_end: i64,
     timezone_offset_seconds: i64,
 ) -> bool {
-    auction_bar.close_dt <= regular_window_end
-        && local_day_start_ns(auction_bar.close_dt, timezone_offset_seconds)
+    auction_bar.end_dt <= regular_window_end
+        && local_day_start_ns(auction_bar.end_dt, timezone_offset_seconds)
             == local_day_start_ns(regular_window_start, timezone_offset_seconds)
 }
 
@@ -1183,7 +1193,8 @@ fn build_output_schema(schema: &Schema, spec: &BarGeneratorSpec) -> Result<Schem
         Arc::new(Field::new("limit_up", DataType::Float64, true)),
         Arc::new(Field::new("limit_down", DataType::Float64, true)),
         Arc::new(Field::new("start_dt", timestamp_type.clone(), false)),
-        Arc::new(Field::new("close_dt", timestamp_type, false)),
+        Arc::new(Field::new("close_dt", timestamp_type.clone(), false)),
+        Arc::new(Field::new("end_dt", timestamp_type, false)),
     ])))
 }
 

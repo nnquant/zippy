@@ -11599,6 +11599,7 @@ def test_bar_engine_accepts_plugin_profile_protocol() -> None:
     assert engine.config()["profile"]["auction"] == "drop"
     assert engine.config()["profile"]["volume"]["output_dtype"] == "int64"
     assert engine.output_schema().field("volume").type == pa.int64()
+    assert engine.output_schema().field("end_dt").type == pa.timestamp("ns", tz="Asia/Shanghai")
 
 
 def test_connect_sets_default_master_for_query_tail(tmp_path: Path) -> None:
