@@ -2,20 +2,34 @@ from __future__ import annotations
 
 import atexit
 from collections import Counter
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 import socket
 import struct
 import tempfile
 import threading
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _NATIVE_IMPORT_ERROR: BaseException | None = None
 _NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
 _DEFAULT_REMOTE_GATEWAY_TIMEOUT_SEC = 60.0
+_TEMPORAL_LITERAL_RE = re.compile(
+    r"^(?P<year>\d{4})"
+    r"(?:(?P<dash_month>-?)(?P<month>\d{2})"
+    r"(?:(?P<dash_day>-?)(?P<day>\d{2})"
+    r"(?:(?:[ T])(?P<hour>\d{2}):(?P<minute>\d{2})"
+    r"(?::(?P<second>\d{2})(?:\.(?P<fraction>\d{1,9}))?)?"
+    r"(?P<tz>Z|[+-]\d{2}:?\d{2})?)?)?)?$"
+)
 
 
 def _native_unavailable(name: str):
@@ -195,6 +209,30 @@ _BUILTIN_CONFIG: dict[str, object] = {
 }
 
 
+@dataclass(frozen=True)
+class _TemporalInstantLiteral:
+    """
+    Typed instant literal used after schema-aware query normalization.
+    """
+
+    epoch_ns: int
+    timezone: str | None
+    unit: str
+
+
+@dataclass(frozen=True)
+class _TemporalRangeLiteral:
+    """
+    Parsed temporal literal with an inclusive start and exclusive end.
+    """
+
+    start_ns: int
+    end_ns: int
+    timezone: str | None
+    unit: str
+    resolution: str
+
+
 class _QueryExpr:
     """
     Internal query expression AST node compiled to a Polars expression at execution time.
@@ -327,6 +365,241 @@ def _literal(value: object) -> _QueryExpr:
     return _QueryExpr("literal", value)
 
 
+def _temporal_field_info(schema: object | None, column: str) -> dict[str, object] | None:
+    if schema is None or column not in getattr(schema, "names", []):
+        return None
+    field = schema.field(column)
+    dtype = field.type
+    import pyarrow as pa
+
+    if pa.types.is_timestamp(dtype):
+        return {"kind": "timestamp", "unit": str(dtype.unit), "timezone": dtype.tz}
+    if pa.types.is_date32(dtype) or pa.types.is_date64(dtype):
+        return {"kind": "date", "unit": "ns", "timezone": None}
+    return None
+
+
+def _timezone_from_name(name: str | None):
+    if name is None:
+        return None
+    if name.upper() == "UTC":
+        return timezone.utc
+    return ZoneInfo(name)
+
+
+def _datetime_to_epoch_ns(value: datetime) -> int:
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    utc_value = aware.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = utc_value - epoch
+    return ((delta.days * 86_400 + delta.seconds) * 1_000_000_000) + delta.microseconds * 1_000
+
+
+def _temporal_instant_to_datetime(value: _TemporalInstantLiteral) -> datetime:
+    seconds, nanos = divmod(value.epoch_ns, 1_000_000_000)
+    dt = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=nanos // 1_000)
+    tz = _timezone_from_name(value.timezone)
+    if tz is not None:
+        return dt.astimezone(tz)
+    return dt.replace(tzinfo=None)
+
+
+def _parse_temporal_string_literal(
+    value: str,
+    field_info: dict[str, object],
+) -> _TemporalRangeLiteral:
+    match = _TEMPORAL_LITERAL_RE.match(value)
+    if match is None:
+        raise ValueError(f"invalid temporal literal value=[{value}]")
+    parts = match.groupdict()
+    if parts["month"] is None:
+        raise ValueError(f"invalid temporal literal value=[{value}]")
+    if parts["day"] is not None:
+        if parts["dash_month"] == "-" and parts["dash_day"] != "-":
+            raise ValueError(f"invalid temporal literal value=[{value}]")
+        if parts["dash_month"] == "" and parts["dash_day"] != "":
+            raise ValueError(f"invalid temporal literal value=[{value}]")
+
+    year = int(parts["year"])
+    month = int(parts["month"])
+    day = int(parts["day"] or "1")
+    hour = int(parts["hour"] or "0")
+    minute = int(parts["minute"] or "0")
+    second = int(parts["second"] or "0")
+    fraction = parts["fraction"] or ""
+    tz_text = parts["tz"]
+    field_tz = str(field_info.get("timezone") or "") or None
+    tz = _timezone_from_name(field_tz)
+    if tz_text == "Z":
+        tz = timezone.utc
+    elif tz_text:
+        compact = tz_text.replace(":", "")
+        sign = 1 if compact[0] == "+" else -1
+        offset_hour = int(compact[1:3])
+        offset_minute = int(compact[3:5])
+        tz = timezone(sign * timedelta(hours=offset_hour, minutes=offset_minute))
+
+    if parts["day"] is None:
+        resolution = "month"
+        end_year = year + (1 if month == 12 else 0)
+        end_month = 1 if month == 12 else month + 1
+        start = datetime(year, month, 1, tzinfo=tz)
+        end = datetime(end_year, end_month, 1, tzinfo=tz)
+    elif parts["hour"] is None:
+        resolution = "day"
+        start = datetime(year, month, day, tzinfo=tz)
+        end = start + timedelta(days=1)
+    elif parts["second"] is None:
+        resolution = "minute"
+        start = datetime(year, month, day, hour, minute, tzinfo=tz)
+        end = start + timedelta(minutes=1)
+    elif not fraction:
+        resolution = "second"
+        start = datetime(year, month, day, hour, minute, second, tzinfo=tz)
+        end = start + timedelta(seconds=1)
+    else:
+        resolution = "fraction"
+        padded = (fraction + "0" * 9)[:9]
+        start = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            int(padded[:6]),
+            tzinfo=tz,
+        )
+        start_ns = _datetime_to_epoch_ns(start) + int(padded[6:])
+        increment_ns = 10 ** (9 - len(fraction))
+        return _TemporalRangeLiteral(
+            start_ns=start_ns,
+            end_ns=start_ns + increment_ns,
+            timezone=field_tz,
+            unit=str(field_info.get("unit") or "ns"),
+            resolution=resolution,
+        )
+    return _TemporalRangeLiteral(
+        start_ns=_datetime_to_epoch_ns(start),
+        end_ns=_datetime_to_epoch_ns(end),
+        timezone=field_tz,
+        unit=str(field_info.get("unit") or "ns"),
+        resolution=resolution,
+    )
+
+
+def _temporal_range_for_literal(
+    value: object,
+    field_info: dict[str, object],
+) -> _TemporalRangeLiteral | None:
+    field_tz = str(field_info.get("timezone") or "") or None
+    unit = str(field_info.get("unit") or "ns")
+    tz = _timezone_from_name(field_tz)
+    if type(value).__module__.startswith("pandas."):
+        epoch_ns = getattr(value, "value", None)
+        if isinstance(epoch_ns, int):
+            return _TemporalRangeLiteral(epoch_ns, epoch_ns + 1, field_tz, unit, "instant")
+        to_pydatetime = getattr(value, "to_pydatetime", None)
+        if callable(to_pydatetime):
+            return _temporal_range_for_literal(to_pydatetime(), field_info)
+    if isinstance(value, datetime):
+        localized = value
+        if localized.tzinfo is None:
+            localized = localized.replace(tzinfo=tz)
+        elif tz is not None:
+            localized = localized.astimezone(tz)
+        start_ns = _datetime_to_epoch_ns(localized)
+        return _TemporalRangeLiteral(start_ns, start_ns + 1_000, field_tz, unit, "instant")
+    if isinstance(value, date):
+        start = datetime(value.year, value.month, value.day, tzinfo=tz)
+        end = start + timedelta(days=1)
+        return _TemporalRangeLiteral(
+            _datetime_to_epoch_ns(start),
+            _datetime_to_epoch_ns(end),
+            field_tz,
+            unit,
+            "day",
+        )
+    if isinstance(value, str):
+        return _parse_temporal_string_literal(value, field_info)
+    return None
+
+
+def _instant_literal(range_literal: _TemporalRangeLiteral, endpoint: str) -> _QueryExpr:
+    epoch_ns = range_literal.start_ns if endpoint == "start" else range_literal.end_ns
+    return _literal(
+        _TemporalInstantLiteral(
+            epoch_ns=epoch_ns,
+            timezone=range_literal.timezone,
+            unit=range_literal.unit,
+        )
+    )
+
+
+def _normalize_temporal_filter_expr(expr: object, schema: object | None) -> object:
+    if schema is None or not isinstance(expr, _QueryExpr):
+        return expr
+    if expr._kind != "binary":
+        return expr
+    op = str(expr._value)
+    left, right = expr._args
+    if op in {"and", "or"}:
+        return _QueryExpr(
+            "binary",
+            op,
+            (
+                _normalize_temporal_filter_expr(left, schema),
+                _normalize_temporal_filter_expr(right, schema),
+            ),
+        )
+    pair = _simple_column_literal_pair(left, right)
+    reverse = False
+    if pair is None:
+        pair = _simple_column_literal_pair(right, left)
+        reverse = pair is not None
+    if pair is None:
+        return expr
+    column, value = pair
+    field_info = _temporal_field_info(schema, column)
+    if field_info is None:
+        return expr
+    range_literal = _temporal_range_for_literal(value, field_info)
+    if range_literal is None:
+        return expr
+    if reverse:
+        op = {"eq": "eq", "ne": "ne", "gt": "lt", "ge": "le", "lt": "gt", "le": "ge"}[op]
+    column_expr = col(column)
+    start = _instant_literal(range_literal, "start")
+    end = _instant_literal(range_literal, "end")
+    if op == "eq":
+        return (column_expr >= start) & (column_expr < end)
+    if op == "ne":
+        return (column_expr < start) | (column_expr >= end)
+    if op == "ge":
+        return column_expr >= start
+    if op == "gt":
+        return column_expr >= end
+    if op == "lt":
+        return column_expr < start
+    if op == "le":
+        return column_expr < end
+    return expr
+
+
+def _normalize_temporal_plan_ops(
+    plan_ops: list[tuple[str, object]],
+    schema: object | None,
+) -> list[tuple[str, object]]:
+    return [
+        (
+            (kind, _normalize_temporal_filter_expr(value, schema))
+            if kind == "filter"
+            else (kind, value)
+        )
+        for kind, value in plan_ops
+    ]
+
+
 def _compile_query_expr_to_polars(expr: object):
     import polars as pl
 
@@ -338,6 +611,11 @@ def _compile_query_expr_to_polars(expr: object):
     if expr._kind == "col":
         return pl.col(str(expr._value))
     if expr._kind == "literal":
+        if isinstance(expr._value, _TemporalInstantLiteral):
+            return pl.lit(
+                expr._value.epoch_ns,
+                dtype=pl.Datetime("ns", expr._value.timezone),
+            )
         return pl.lit(expr._value)
     if expr._kind == "alias":
         return _compile_query_expr_to_polars(expr._args[0]).alias(str(expr._value))
@@ -523,6 +801,14 @@ def _query_expr_to_json(expr: object) -> dict[str, object]:
     if expr._kind == "col":
         return {"kind": "col", "value": expr._value}
     if expr._kind == "literal":
+        if isinstance(expr._value, _TemporalInstantLiteral):
+            return {
+                "kind": "literal",
+                "literal_type": "timestamp_ns",
+                "value": expr._value.epoch_ns,
+                "timezone": expr._value.timezone,
+                "unit": expr._value.unit,
+            }
         return {"kind": "literal", "value": expr._value}
     if expr._kind == "alias":
         return {
@@ -568,6 +854,16 @@ def _query_expr_from_json(payload: dict[str, object]) -> object:
     if kind == "col":
         return col(str(payload["value"]))
     if kind == "literal":
+        if payload.get("literal_type") == "timestamp_ns":
+            return lit(
+                _TemporalInstantLiteral(
+                    epoch_ns=int(payload["value"]),
+                    timezone=(
+                        None if payload.get("timezone") is None else str(payload.get("timezone"))
+                    ),
+                    unit=str(payload.get("unit") or "ns"),
+                )
+            )
         return lit(payload.get("value"))
     if kind == "alias":
         return _literal(_query_expr_from_json(payload["arg"])).alias(str(payload["value"]))
@@ -3379,9 +3675,10 @@ class Table:
         return {"result": result, "metrics": metrics}
 
     def _collect_query(self, metrics: dict[str, object] | None):
+        schema = self.schema()
+        optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         remote_collect = getattr(self._inner, "collect_plan", None)
         if callable(remote_collect):
-            optimized_plan = self._optimized_plan_ops()
             remote_plan, residual_plan = _remote_gateway_plan_split(optimized_plan)
             snapshot = self.snapshot() if self._snapshot_enabled else False
             result = remote_collect(
@@ -3412,9 +3709,8 @@ class Table:
             )
 
         snapshot = self.snapshot()
-        schema = self.schema()
-        read_columns = self._source_read_columns(schema)
-        pushdown_filters = self._pushdown_filters(schema)
+        read_columns = self._source_read_columns(schema, optimized_plan)
+        pushdown_filters = self._pushdown_filters(schema, optimized_plan)
         persisted = _collect_persisted_rows(
             snapshot,
             columns=read_columns,
@@ -3429,7 +3725,7 @@ class Table:
             [persisted, live],
             _schema_for_query_columns(schema, read_columns),
         )
-        return self._apply_query_plan(table)
+        return self._apply_query_plan(table, optimized_plan)
 
     def explain(self) -> dict[str, object]:
         """
@@ -3442,7 +3738,7 @@ class Table:
         :rtype: dict[str, object]
         """
         schema = self.schema()
-        optimized_plan = self._optimized_plan_ops()
+        optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         pushdown_plan = self._pushdown_plan_summary(schema, optimized_plan)
         explanation = {
             "source": self.source,
@@ -3621,7 +3917,7 @@ class Table:
 
     def _new_query_metrics(self) -> dict[str, object]:
         schema = self.schema()
-        optimized_plan = self._optimized_plan_ops()
+        optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         return {
             "executor": self._executor_kind(),
             "original_plan": _query_plan_to_json(self._plan_ops),
@@ -3795,8 +4091,8 @@ class Table:
             return table
         raise RuntimeError("snapshot retry exhausted")
 
-    def _apply_query_plan(self, table):
-        plan_ops = self._optimized_plan_ops()
+    def _apply_query_plan(self, table, plan_ops: list[tuple[str, object]] | None = None):
+        plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
         return _apply_query_plan_ops_to_arrow(table, plan_ops)
 
     def _scan_live_snapshot(self, snapshot: dict[str, object]):
@@ -3866,6 +4162,7 @@ class Table:
         plan_ops: list[tuple[str, object]] | None = None,
     ) -> list[tuple[str, str, object]] | None:
         plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
+        plan_ops = _normalize_temporal_plan_ops(plan_ops, schema)
         filters = [value for kind, value in plan_ops if kind == "filter"]
         predicate = _combine_filter_ops(filters)
         pyarrow_filters = _predicate_to_pyarrow_filters(predicate)
@@ -4366,7 +4663,7 @@ def _range_may_match_filter(
     try:
         left_min = float(min_value)
         left_max = float(max_value)
-        right = float(value)
+        right = float(_filter_value_for_range(value))
     except (TypeError, ValueError):
         return True
     if op == "==":
@@ -4384,6 +4681,12 @@ def _range_may_match_filter(
     if op == "in" and isinstance(value, (list, tuple, set)):
         return any(left_min <= float(item) <= left_max for item in value)
     return True
+
+
+def _filter_value_for_range(value: object) -> object:
+    if isinstance(value, _TemporalInstantLiteral):
+        return value.epoch_ns
+    return value
 
 
 def _partition_value_matches_filter(partition_value: object, op: str, value: object) -> bool:
@@ -4469,6 +4772,7 @@ def _filter_query_table(table: object, filters: object | None):
         if column not in table.column_names:
             return table
         column_values = table[column]
+        value = _filter_value_for_arrow(value, column_values.type)
         if op == "==":
             current = pc.equal(column_values, value)
         elif op == "!=":
@@ -4489,6 +4793,28 @@ def _filter_query_table(table: object, filters: object | None):
     if mask is None:
         return table
     return table.filter(mask)
+
+
+def _filter_value_for_arrow(value: object, data_type: object | None = None) -> object:
+    if isinstance(value, _TemporalInstantLiteral):
+        import pyarrow as pa
+
+        if data_type is not None and pa.types.is_timestamp(data_type):
+            unit = data_type.unit
+            converted = value.epoch_ns
+            if unit == "s":
+                converted = value.epoch_ns // 1_000_000_000
+            elif unit == "ms":
+                converted = value.epoch_ns // 1_000_000
+            elif unit == "us":
+                converted = value.epoch_ns // 1_000
+            return pa.scalar(converted, type=data_type)
+        if data_type is not None and pa.types.is_date32(data_type):
+            return pa.scalar(value.epoch_ns // 86_400_000_000_000, type=data_type)
+        if data_type is not None and pa.types.is_date64(data_type):
+            return pa.scalar(value.epoch_ns // 1_000_000, type=data_type)
+        return _temporal_instant_to_datetime(value)
+    return value
 
 
 def _restore_query_schema_types(table: object, source_schema: object):

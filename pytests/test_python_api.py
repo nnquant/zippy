@@ -2,7 +2,7 @@ import argparse
 import json
 import importlib.util
 import tomllib
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import os
 from pathlib import Path
 import signal
@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pyarrow as pa
@@ -8574,6 +8575,358 @@ def test_query_expr_plan_filters_projects_and_computes_with_polars_backend(
     ]
 
 
+def test_temporal_string_filter_formats_use_resolution_ranges(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="Asia/Shanghai")),
+            ("instrument_id", pa.string()),
+        ]
+    )
+    tz = ZoneInfo("Asia/Shanghai")
+    live_batch = pa.record_batch(
+        {
+            "dt": [
+                datetime(2026, 5, 1, 9, 29, 59, tzinfo=tz),
+                datetime(2026, 5, 11, 9, 30, 0, tzinfo=tz),
+                datetime(2026, 5, 11, 9, 30, 30, tzinfo=tz),
+                datetime(2026, 5, 11, 9, 31, 0, tzinfo=tz),
+                datetime(2026, 6, 1, 0, 0, 0, tzinfo=tz),
+            ],
+            "instrument_id": ["a", "b", "c", "d", "e"],
+        },
+        schema=schema,
+    )
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 5,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ticks", master=object(), snapshot=False)
+
+    assert (
+        query.filter(zippy.col("dt") == "2026-05-11 09:30:00")
+        .select("instrument_id")
+        .collect()
+        .column("instrument_id")
+        .to_pylist()
+    ) == ["b"]
+    assert (
+        query.filter(zippy.col("dt") == "2026-05-11 09:30")
+        .select("instrument_id")
+        .collect()
+        .column("instrument_id")
+        .to_pylist()
+    ) == ["b", "c"]
+    assert (
+        query.filter(zippy.col("dt") == "2026-05-11")
+        .select("instrument_id")
+        .collect()
+        .column("instrument_id")
+        .to_pylist()
+    ) == ["b", "c", "d"]
+    assert (
+        query.filter(zippy.col("dt") == "20260511")
+        .select("instrument_id")
+        .collect()
+        .column("instrument_id")
+        .to_pylist()
+    ) == ["b", "c", "d"]
+    assert (
+        query.filter(zippy.col("dt") == "2026-05")
+        .select("instrument_id")
+        .collect()
+        .column("instrument_id")
+        .to_pylist()
+    ) == ["a", "b", "c", "d"]
+    assert (
+        query.filter(zippy.col("dt") == "202605")
+        .select("instrument_id")
+        .collect()
+        .column("instrument_id")
+        .to_pylist()
+    ) == ["a", "b", "c", "d"]
+
+
+def test_temporal_string_filter_comparison_boundaries(monkeypatch) -> None:
+    schema = pa.schema([("dt", pa.timestamp("ns", tz="UTC")), ("seq", pa.int64())])
+    live_batch = pa.record_batch(
+        {
+            "dt": [
+                datetime(2026, 4, 30, 23, 59, 59, tzinfo=timezone.utc),
+                datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc),
+                datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc),
+            ],
+            "seq": [1, 2, 3],
+        },
+        schema=schema,
+    )
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 3,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    query = zippy.read_table("ticks", master=object(), snapshot=False)
+
+    assert query.filter(zippy.col("dt") >= "2026-05").collect().column("seq").to_pylist() == [
+        2,
+        3,
+    ]
+    assert query.filter(zippy.col("dt") > "2026-05").collect().column("seq").to_pylist() == [3]
+    assert query.filter(zippy.col("dt") < "2026-05").collect().column("seq").to_pylist() == [1]
+    assert query.filter(zippy.col("dt") <= "2026-05").collect().column("seq").to_pylist() == [
+        1,
+        2,
+    ]
+    assert query.filter(zippy.col("dt") != "2026-05").collect().column("seq").to_pylist() == [
+        1,
+        3,
+    ]
+
+
+def test_temporal_string_filter_skips_non_matching_persisted_files(monkeypatch) -> None:
+    schema = pa.schema([("dt", pa.timestamp("ns", tz="UTC")), ("seq", pa.int64())])
+    read_files: list[str] = []
+    may_file = "/tmp/may.parquet"
+    june_file = "/tmp/june.parquet"
+
+    def epoch_ns(value: datetime) -> int:
+        return int(value.timestamp() * 1_000_000_000)
+
+    may_start = epoch_ns(datetime(2026, 5, 1, tzinfo=timezone.utc))
+    may_end = epoch_ns(datetime(2026, 5, 31, 23, 59, 59, tzinfo=timezone.utc))
+    june_start = epoch_ns(datetime(2026, 6, 1, tzinfo=timezone.utc))
+    june_end = epoch_ns(datetime(2026, 6, 30, 23, 59, 59, tzinfo=timezone.utc))
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [
+                    {
+                        "file_path": may_file,
+                        "persist_data_root": "/tmp",
+                        "min_event_ts": may_start,
+                        "max_event_ts": may_end,
+                    },
+                    {
+                        "file_path": june_file,
+                        "persist_data_root": "/tmp",
+                        "min_event_ts": june_start,
+                        "max_event_ts": june_end,
+                    },
+                ],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        del columns, filters
+        read_files.append(str(file_path))
+        return pa.table(
+            {"dt": [datetime(2026, 5, 11, tzinfo=timezone.utc)], "seq": [1]},
+            schema=schema,
+        )
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    monkeypatch.setattr(zippy, "_read_persisted_parquet_file", fake_read_persisted_parquet_file)
+    _allow_fake_persisted_paths(monkeypatch)
+
+    result = (
+        zippy.read_table("ticks", master=object(), snapshot=False)
+        .filter(zippy.col("dt") == "2026-05")
+        .collect()
+    )
+
+    assert result.column("seq").to_pylist() == [1]
+    assert read_files == [may_file]
+
+
+def test_temporal_looking_string_on_string_column_remains_string_filter(monkeypatch) -> None:
+    schema = pa.schema([("instrument_id", pa.string())])
+    live_batch = pa.record_batch({"instrument_id": ["2026-05", "IF2606"]}, schema=schema)
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 2,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    result = (
+        zippy.read_table("symbols", master=object(), snapshot=False)
+        .filter(zippy.col("instrument_id") == "2026-05")
+        .collect()
+    )
+
+    assert result.column("instrument_id").to_pylist() == ["2026-05"]
+
+
+def test_invalid_temporal_string_on_timestamp_column_raises_clear_error(monkeypatch) -> None:
+    schema = pa.schema([("dt", pa.timestamp("ns", tz="UTC"))])
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 0,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [])
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    with pytest.raises(ValueError, match="invalid temporal literal"):
+        (
+            zippy.read_table("ticks", master=object(), snapshot=False)
+            .filter(zippy.col("dt") == "05/11/26")
+            .collect()
+        )
+
+
+def test_python_datetime_date_and_optional_pandas_timestamp_temporal_filters(
+    monkeypatch,
+) -> None:
+    schema = pa.schema([("dt", pa.timestamp("ns", tz="UTC")), ("seq", pa.int64())])
+    live_batch = pa.record_batch(
+        {
+            "dt": [
+                datetime(2026, 5, 11, 0, 0, 0, tzinfo=timezone.utc),
+                datetime(2026, 5, 11, 9, 30, 0, tzinfo=timezone.utc),
+                datetime(2026, 5, 12, 0, 0, 0, tzinfo=timezone.utc),
+            ],
+            "seq": [1, 2, 3],
+        },
+        schema=schema,
+    )
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 3,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    query = zippy.read_table("ticks", master=object(), snapshot=False)
+
+    assert query.filter(zippy.col("dt") == date(2026, 5, 11)).collect().column(
+        "seq"
+    ).to_pylist() == [
+        1,
+        2,
+    ]
+    assert query.filter(
+        zippy.col("dt") == datetime(2026, 5, 11, 9, 30, 0, tzinfo=timezone.utc)
+    ).collect().column("seq").to_pylist() == [2]
+
+    pd = pytest.importorskip("pandas")
+    assert query.filter(zippy.col("dt") == pd.Timestamp("2026-05-11T09:30:00Z")).collect().column(
+        "seq"
+    ).to_pylist() == [2]
+
+
 def _start_native_gateway_stack(
     *,
     token: str | None = None,
@@ -10673,6 +11026,54 @@ def test_remote_collect_sends_optimized_plan(monkeypatch) -> None:
     )
 
     assert [item["op"] for item in sent_plans[0]] == ["filter", "select"]
+
+
+def test_remote_collect_sends_temporal_string_filter_as_typed_boundaries(monkeypatch) -> None:
+    schema = pa.schema([("dt", pa.timestamp("ns", tz="Asia/Shanghai"))])
+    sent_plans: list[list[dict[str, object]]] = []
+
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, endpoint: str, token: str | None) -> None:
+            self.source = source
+            self.master = master
+            self.endpoint = endpoint
+            self.token = token
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool) -> pa.Table:
+            sent_plans.append(plan)
+            return pa.table({"dt": []}, schema=schema)
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self._process_id = None
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def get_config(self) -> dict[str, object]:
+            return {"gateway": {"enabled": True, "endpoint": "127.0.0.1:17691", "token": None}}
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+
+    zippy.read_table("ticks", master=FakeMaster(), snapshot=False).filter(
+        zippy.col("dt") == "2026-05"
+    ).collect()
+
+    expr = sent_plans[0][0]["expr"]
+    assert expr["op"] == "and"
+    left, right = expr["args"]
+    assert left["op"] == "ge"
+    assert right["op"] == "lt"
+    assert left["args"][1]["literal_type"] == "timestamp_ns"
+    assert right["args"][1]["literal_type"] == "timestamp_ns"
+    assert left["args"][1]["timezone"] == "Asia/Shanghai"
 
 
 def test_remote_collect_reuses_pinned_snapshot(monkeypatch) -> None:

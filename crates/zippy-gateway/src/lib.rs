@@ -10,7 +10,11 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::{
     and, concat_batches, filter_record_batch, lexsort_to_indices, or, take, SortColumn, SortOptions,
@@ -3358,23 +3362,19 @@ fn column_literal_filter_pair<'a>(
 ) -> Result<Option<(&'a str, &'a Value, bool)>> {
     if let Some(column_name) = query_expr_column_name(left)? {
         if query_expr_kind(right) == Some("literal") {
-            return Ok(Some((
-                column_name,
-                right.get("value").unwrap_or(&Value::Null),
-                false,
-            )));
+            return Ok(Some((column_name, right, false)));
         }
     }
     if let Some(column_name) = query_expr_column_name(right)? {
         if query_expr_kind(left) == Some("literal") {
-            return Ok(Some((
-                column_name,
-                left.get("value").unwrap_or(&Value::Null),
-                true,
-            )));
+            return Ok(Some((column_name, left, true)));
         }
     }
     Ok(None)
+}
+
+fn literal_value(expr: &Value) -> &Value {
+    expr.get("value").unwrap_or(&Value::Null)
 }
 
 fn query_expr_kind(expr: &Value) -> Option<&str> {
@@ -3413,7 +3413,7 @@ fn reverse_filter_op(op: &str) -> Result<String> {
 fn literal_array_for_type(data_type: &DataType, value: &Value, len: usize) -> Result<ArrayRef> {
     match data_type {
         DataType::Utf8 => {
-            let value = value
+            let value = literal_value(value)
                 .as_str()
                 .ok_or_else(|| ZippyError::InvalidConfig {
                     reason: "string filter literal must be a string".to_string(),
@@ -3422,27 +3422,111 @@ fn literal_array_for_type(data_type: &DataType, value: &Value, len: usize) -> Re
             Ok(Arc::new(StringArray::from(vec![value; len])))
         }
         DataType::Float64 => {
-            let value = value.as_f64().ok_or_else(|| ZippyError::InvalidConfig {
-                reason: "float filter literal must be numeric".to_string(),
-            })?;
+            let value = literal_value(value)
+                .as_f64()
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "float filter literal must be numeric".to_string(),
+                })?;
             Ok(Arc::new(Float64Array::from(vec![value; len])))
         }
         DataType::Int64 => {
-            let value = value.as_i64().ok_or_else(|| ZippyError::InvalidConfig {
-                reason: "int filter literal must be integer".to_string(),
-            })?;
+            let value = literal_value(value)
+                .as_i64()
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "int filter literal must be integer".to_string(),
+                })?;
             Ok(Arc::new(Int64Array::from(vec![value; len])))
         }
         DataType::Boolean => {
-            let value = value.as_bool().ok_or_else(|| ZippyError::InvalidConfig {
-                reason: "boolean filter literal must be boolean".to_string(),
-            })?;
+            let value =
+                literal_value(value)
+                    .as_bool()
+                    .ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: "boolean filter literal must be boolean".to_string(),
+                    })?;
             Ok(Arc::new(BooleanArray::from(vec![value; len])))
+        }
+        DataType::Timestamp(unit, timezone) => {
+            let literal_type = value.get("literal_type").and_then(Value::as_str);
+            if literal_type != Some("timestamp_ns") {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "timestamp filter literal must be typed timestamp_ns".to_string(),
+                });
+            }
+            let epoch_ns = value.get("value").and_then(Value::as_i64).ok_or_else(|| {
+                ZippyError::InvalidConfig {
+                    reason: "timestamp filter literal value must be integer epoch ns".to_string(),
+                }
+            })?;
+            let converted = match unit {
+                TimeUnit::Second => epoch_ns / 1_000_000_000,
+                TimeUnit::Millisecond => epoch_ns / 1_000_000,
+                TimeUnit::Microsecond => epoch_ns / 1_000,
+                TimeUnit::Nanosecond => epoch_ns,
+            };
+            let array: ArrayRef = match unit {
+                TimeUnit::Second => {
+                    let array = TimestampSecondArray::from(vec![converted; len]);
+                    match timezone {
+                        Some(tz) => Arc::new(array.with_timezone(tz.clone())) as ArrayRef,
+                        None => Arc::new(array) as ArrayRef,
+                    }
+                }
+                TimeUnit::Millisecond => {
+                    let array = TimestampMillisecondArray::from(vec![converted; len]);
+                    match timezone {
+                        Some(tz) => Arc::new(array.with_timezone(tz.clone())) as ArrayRef,
+                        None => Arc::new(array) as ArrayRef,
+                    }
+                }
+                TimeUnit::Microsecond => {
+                    let array = TimestampMicrosecondArray::from(vec![converted; len]);
+                    match timezone {
+                        Some(tz) => Arc::new(array.with_timezone(tz.clone())) as ArrayRef,
+                        None => Arc::new(array) as ArrayRef,
+                    }
+                }
+                TimeUnit::Nanosecond => {
+                    let array = TimestampNanosecondArray::from(vec![converted; len]);
+                    match timezone {
+                        Some(tz) => Arc::new(array.with_timezone(tz.clone())) as ArrayRef,
+                        None => Arc::new(array) as ArrayRef,
+                    }
+                }
+            };
+            Ok(array)
+        }
+        DataType::Date32 => {
+            let epoch_ns = typed_timestamp_ns_literal(value)?;
+            let days = epoch_ns / 86_400_000_000_000;
+            let days = i32::try_from(days).map_err(|error| ZippyError::InvalidConfig {
+                reason: format!("date32 filter literal overflow error=[{}]", error),
+            })?;
+            Ok(Arc::new(Date32Array::from(vec![days; len])))
+        }
+        DataType::Date64 => {
+            let epoch_ns = typed_timestamp_ns_literal(value)?;
+            Ok(Arc::new(Date64Array::from(vec![epoch_ns / 1_000_000; len])))
         }
         other => Err(ZippyError::InvalidConfig {
             reason: format!("unsupported gateway filter literal type=[{:?}]", other),
         }),
     }
+}
+
+fn typed_timestamp_ns_literal(value: &Value) -> Result<i64> {
+    let literal_type = value.get("literal_type").and_then(Value::as_str);
+    if literal_type != Some("timestamp_ns") {
+        return Err(ZippyError::InvalidConfig {
+            reason: "temporal filter literal must be typed timestamp_ns".to_string(),
+        });
+    }
+    value
+        .get("value")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "temporal filter literal value must be integer epoch ns".to_string(),
+        })
 }
 
 fn apply_head(batch: RecordBatch, op: &Value) -> Result<RecordBatch> {
@@ -3659,4 +3743,63 @@ fn io_error(error: std::io::Error) -> ZippyError {
 
 pub fn crate_name() -> &'static str {
     "zippy-gateway"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, TimestampNanosecondArray};
+
+    #[test]
+    fn gateway_filter_accepts_typed_timestamp_literal() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "dt",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
+                false,
+            ),
+            Field::new("seq", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![
+                        1778459399000000000_i64,
+                        1778459400000000000_i64,
+                    ])
+                    .with_timezone("Asia/Shanghai"),
+                ) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let op = json!({
+            "op": "filter",
+            "expr": {
+                "kind": "binary",
+                "op": "ge",
+                "args": [
+                    {"kind": "col", "value": "dt"},
+                    {
+                        "kind": "literal",
+                        "literal_type": "timestamp_ns",
+                        "value": 1778459400000000000_i64,
+                        "timezone": "Asia/Shanghai",
+                        "unit": "ns"
+                    }
+                ]
+            }
+        });
+
+        let result = apply_filter(batch, &op).unwrap();
+
+        let seq = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(seq.value(0), 2);
+    }
 }
