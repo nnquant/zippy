@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
@@ -2130,6 +2131,13 @@ def _stop_default_control_agent() -> None:
 
 def _stop_default_heartbeat() -> None:
     _stop_default_control_agent()
+
+
+def _cleanup_default_control_agent_at_exit() -> None:
+    _stop_default_control_agent()
+
+
+atexit.register(_cleanup_default_control_agent_at_exit)
 
 
 def _reset_default_master_for_test() -> None:

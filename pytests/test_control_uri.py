@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
+import time
 
 import zippy
 
@@ -120,6 +123,56 @@ def test_native_master_client_roundtrips_localhost_remote_zippy_uri() -> None:
         server.join()
 
 
+def test_connect_app_unhandled_exception_exits_without_native_fatal() -> None:
+    uri = f"tcp://{_unused_loopback_addr()}"
+    master_process = subprocess.Popen(
+        [sys.executable, "-m", "zippy", "master", "run", uri],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_tcp_uri(uri, master_process)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import time\n"
+                    "import zippy\n"
+                    f"zippy.connect({uri!r}, app='pytest_unhandled_exit')\n"
+                    "time.sleep(0.2)\n"
+                    "raise RuntimeError('intentional subprocess failure')\n"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    finally:
+        _stop_process(master_process)
+
+    assert result.returncode != 0
+    assert "intentional subprocess failure" in result.stderr
+    assert "FATAL: exception not rethrown" not in result.stderr
+
+
+def test_process_exit_cleanup_stops_default_control_agent(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeControlAgent:
+        def stop(self) -> None:
+            events.append("stop")
+
+    monkeypatch.setattr(zippy, "_DEFAULT_CONTROL_AGENT", FakeControlAgent())
+
+    zippy._cleanup_default_control_agent_at_exit()
+
+    assert events == ["stop"]
+    assert zippy._DEFAULT_CONTROL_AGENT is None
+
+
 def _unused_loopback_addr() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -131,3 +184,34 @@ def _unused_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _wait_for_tcp_uri(uri: str, process: subprocess.Popen[str]) -> None:
+    host, port_text = uri.removeprefix("tcp://").split(":")
+    deadline = time.monotonic() + 5.0
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stdout, stderr = process.communicate(timeout=1.0)
+            raise RuntimeError(
+                "master process exited before ready "
+                f"returncode=[{process.returncode}] stdout=[{stdout}] stderr=[{stderr}]"
+            )
+        try:
+            with socket.create_connection((host, int(port_text)), timeout=0.1):
+                return
+        except OSError as error:
+            last_error = error
+            time.sleep(0.05)
+    raise TimeoutError(f"timed out waiting for master uri=[{uri}] error=[{last_error}]")
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate(timeout=5.0)
