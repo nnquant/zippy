@@ -351,6 +351,46 @@ fn tick_batch_with_nullable_trading_day(
     SegmentTableView::from_record_batch(batch)
 }
 
+fn tick_batch_with_nullable_market_data(
+    instruments: Vec<&str>,
+    dts: Vec<i64>,
+    prices: Vec<Option<f64>>,
+    volumes: Vec<Option<f64>>,
+    turnovers: Vec<Option<f64>>,
+    trading_days: Vec<&str>,
+) -> SegmentTableView {
+    let row_count = instruments.len();
+    assert_eq!(dts.len(), row_count);
+    assert_eq!(prices.len(), row_count);
+    assert_eq!(volumes.len(), row_count);
+    assert_eq!(turnovers.len(), row_count);
+    assert_eq!(trading_days.len(), row_count);
+
+    let mut fields = tick_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    fields[2] = Field::new("last_price", DataType::Float64, true);
+    fields[3] = Field::new("volume", DataType::Float64, true);
+    fields[4] = Field::new("turnover", DataType::Float64, true);
+    let schema = Arc::new(Schema::new(fields));
+    let columns = vec![
+        Arc::new(StringArray::from(instruments)) as ArrayRef,
+        Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
+        Arc::new(Float64Array::from(prices)) as ArrayRef,
+        Arc::new(Float64Array::from(volumes)) as ArrayRef,
+        Arc::new(Float64Array::from(turnovers)) as ArrayRef,
+        Arc::new(StringArray::from(trading_days)) as ArrayRef,
+        Arc::new(Int64Array::from(vec![Some(1); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(999.0); row_count])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![Some(1.0); row_count])) as ArrayRef,
+    ];
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+
+    SegmentTableView::from_record_batch(batch)
+}
+
 fn tick_batch_without_optional_columns(
     instruments: Vec<&str>,
     dts: Vec<i64>,
@@ -512,6 +552,36 @@ fn bar_generator_drops_non_session_ticks_without_updating_state() {
     assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "volume"), vec![1.0]);
     assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn bar_generator_filters_null_price_volume_and_turnover_rows() {
+    let input = tick_batch_with_nullable_market_data(
+        vec!["rb2601", "rb2601", "rb2601", "rb2601", "rb2601"],
+        vec![
+            30_000_000_000,
+            40_000_000_000,
+            45_000_000_000,
+            50_000_000_000,
+            MINUTE_NS + 1_000_000_000,
+        ],
+        vec![Some(10.0), None, Some(12.0), Some(13.0), Some(11.0)],
+        vec![Some(2.0), Some(99.0), None, Some(3.0), Some(5.0)],
+        vec![Some(20.0), Some(990.0), Some(1_200.0), None, Some(55.0)],
+        vec!["20260508", "20260508", "20260508", "20260508", "20260508"],
+    );
+    let mut engine = BarGeneratorEngine::new("bars", input.schema(), delta_spec()).unwrap();
+    let output = engine.on_data(input).unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "high"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "low"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "close"), vec![10.0]);
+    assert_eq!(f64_column(&output[0], "volume"), vec![2.0]);
+    assert_eq!(f64_column(&output[0], "total_turnover"), vec![20.0]);
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 3);
 }
 
 #[test]

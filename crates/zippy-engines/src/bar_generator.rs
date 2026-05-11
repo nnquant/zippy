@@ -544,14 +544,11 @@ impl Engine for BarGeneratorEngine {
             "instrument",
         )?;
         let dts = checked_timestamp_array(&dt_array, &self.spec.columns.dt)?;
-        let prices = checked_float64_array(&price_array, &self.spec.columns.price, "price")?;
+        let prices = checked_float64_array(&price_array, &self.spec.columns.price)?;
         let volumes =
             checked_numeric_f64_array(&volume_array, &self.spec.columns.volume, "volume")?;
-        let total_turnovers = checked_float64_array(
-            &total_turnover_array,
-            &self.spec.columns.total_turnover,
-            "total_turnover",
-        )?;
+        let total_turnovers =
+            checked_float64_array(&total_turnover_array, &self.spec.columns.total_turnover)?;
         let trading_days = match (&trading_day_array, &self.spec.volume) {
             (
                 Some(array),
@@ -579,6 +576,11 @@ impl Engine for BarGeneratorEngine {
         let mut completed = Vec::new();
 
         for row_index in 0..table.num_rows() {
+            if has_missing_market_data(prices, volumes, total_turnovers, row_index) {
+                self.pending_filtered_rows += 1;
+                continue;
+            }
+
             let tick = TickRow::from_arrays(TickRowArrays {
                 instruments,
                 dts,
@@ -917,17 +919,8 @@ fn checked_timestamp_array<'a>(
     Ok(values)
 }
 
-fn checked_float64_array<'a>(
-    array: &'a ArrayRef,
-    column: &str,
-    role: &str,
-) -> Result<&'a Float64Array> {
+fn checked_float64_array<'a>(array: &'a ArrayRef, column: &str) -> Result<&'a Float64Array> {
     let values = float64_array(array, column)?;
-    if values.null_count() > 0 {
-        return Err(ZippyError::SchemaMismatch {
-            reason: format!("{} field contains nulls field=[{}]", role, column),
-        });
-    }
 
     Ok(values)
 }
@@ -943,13 +936,6 @@ impl NumericF64Array<'_> {
         match self {
             Self::Float64(values) => values.is_null(row_index),
             Self::Int64(values) => values.is_null(row_index),
-        }
-    }
-
-    fn null_count(self) -> usize {
-        match self {
-            Self::Float64(values) => values.null_count(),
-            Self::Int64(values) => values.null_count(),
         }
     }
 
@@ -976,13 +962,21 @@ fn checked_numeric_f64_array<'a>(
         });
     };
 
-    if values.null_count() > 0 {
-        return Err(ZippyError::SchemaMismatch {
-            reason: format!("{} field contains nulls field=[{}]", role, column),
-        });
-    }
-
     Ok(values)
+}
+
+fn has_missing_market_data(
+    prices: &Float64Array,
+    volumes: NumericF64Array<'_>,
+    total_turnovers: &Float64Array,
+    row_index: usize,
+) -> bool {
+    prices.is_null(row_index)
+        || volumes.is_null(row_index)
+        || total_turnovers.is_null(row_index)
+        || !prices.value(row_index).is_finite()
+        || !volumes.value(row_index).is_finite()
+        || !total_turnovers.value(row_index).is_finite()
 }
 
 fn optional_int64_values<'a>(
