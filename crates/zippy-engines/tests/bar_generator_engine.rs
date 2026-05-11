@@ -19,6 +19,10 @@ const SHANGHAI_2026_05_08_09_25_00_NS: i64 = 1_778_203_500_000_000_000;
 const SHANGHAI_2026_05_08_09_30_00_NS: i64 = 1_778_203_800_000_000_000;
 const SHANGHAI_2026_05_08_09_30_30_NS: i64 = 1_778_203_830_000_000_000;
 const SHANGHAI_2026_05_08_09_31_00_NS: i64 = 1_778_203_860_000_000_000;
+const SHANGHAI_2026_05_08_10_14_30_NS: i64 = 1_778_206_470_000_000_000;
+const SHANGHAI_2026_05_08_10_20_30_NS: i64 = 1_778_206_830_000_000_000;
+const SHANGHAI_2026_05_08_10_21_00_NS: i64 = 1_778_206_860_000_000_000;
+const SHANGHAI_2026_05_08_10_31_00_NS: i64 = 1_778_207_460_000_000_000;
 const SHANGHAI_2026_05_08_21_00_00_NS: i64 = 1_778_245_200_000_000_000;
 const SHANGHAI_2026_05_08_21_01_00_NS: i64 = 1_778_245_260_000_000_000;
 const SHANGHAI_2026_05_09_01_00_00_NS: i64 = 1_778_259_600_000_000_000;
@@ -270,6 +274,16 @@ fn shanghai_regular_spec() -> BarGeneratorSpec {
     let mut spec = delta_spec();
     spec.sessions.timezone = "Asia/Shanghai".to_string();
     spec.sessions.regular = vec![SessionWindow::parse("09:30:00", "15:00:00").unwrap()];
+    spec
+}
+
+fn shanghai_continuous_morning_spec() -> BarGeneratorSpec {
+    let mut spec = delta_spec();
+    spec.sessions.timezone = "Asia/Shanghai".to_string();
+    spec.sessions.regular = vec![
+        SessionWindow::parse("09:00:00", "11:30:00").unwrap(),
+        SessionWindow::parse("13:30:00", "15:00:00").unwrap(),
+    ];
     spec
 }
 
@@ -824,6 +838,60 @@ fn bar_generator_uses_profile_timezone_for_real_shanghai_epoch() {
         vec![SHANGHAI_2026_05_08_09_31_00_NS]
     );
     assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
+}
+
+#[test]
+fn bar_generator_continuous_morning_session_keeps_cffex_ticks_without_empty_break_bars() {
+    let mut engine = BarGeneratorEngine::new(
+        "bars",
+        shanghai_tick_schema(),
+        shanghai_continuous_morning_spec(),
+    )
+    .unwrap();
+
+    let output = engine
+        .on_data(shanghai_tick_batch(
+            vec!["rb2601", "IF2606", "IF2606", "rb2601"],
+            vec![
+                SHANGHAI_2026_05_08_10_14_30_NS,
+                SHANGHAI_2026_05_08_10_20_30_NS,
+                SHANGHAI_2026_05_08_10_21_00_NS,
+                SHANGHAI_2026_05_08_10_31_00_NS,
+            ],
+            vec![3300.0, 4100.0, 4101.0, 3301.0],
+            vec![9.0, 2.0, 3.0, 10.0],
+            vec![29_700.0, 8_200.0, 12_303.0, 33_010.0],
+            vec!["20260508", "20260508", "20260508", "20260508"],
+        ))
+        .unwrap();
+
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 2);
+    assert_eq!(
+        string_column(&output[0], "instrument_id"),
+        vec!["rb2601", "IF2606"]
+    );
+    assert_eq!(
+        ts_column(&output[0], "start_dt"),
+        vec![
+            SHANGHAI_2026_05_08_10_14_30_NS - 30 * SECOND_NS,
+            SHANGHAI_2026_05_08_10_20_30_NS - 30 * SECOND_NS,
+        ]
+    );
+    assert_eq!(f64_column(&output[0], "open"), vec![3300.0, 4100.0]);
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].num_rows(), 2);
+    assert_eq!(
+        ts_column(&flushed[0], "start_dt"),
+        vec![
+            SHANGHAI_2026_05_08_10_21_00_NS,
+            SHANGHAI_2026_05_08_10_31_00_NS,
+        ]
+    );
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 0);
 }
 
 #[test]
