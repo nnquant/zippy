@@ -2052,6 +2052,11 @@ impl MasterClient {
             .map(ToOwned::to_owned))
     }
 
+    fn set_token(&self, token: String) -> PyResult<()> {
+        self.client.lock().unwrap().set_token(token);
+        Ok(())
+    }
+
     fn control_endpoint(&self) -> PyResult<String> {
         Ok(self.control_endpoint.clone())
     }

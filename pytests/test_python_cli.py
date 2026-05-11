@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from click.testing import CliRunner
+import json
 import os
+from pathlib import Path
 import signal
 import socket
 import subprocess
-import pytest
-import pyarrow as pa
-from pathlib import Path
 import sys
 import time
+
+from click.testing import CliRunner
+import pyarrow as pa
+import pytest
 
 import zippy
 from zippy.cli import main
@@ -29,11 +31,14 @@ def unused_loopback_uri() -> str:
     return f"tcp://{host}:{port}"
 
 
-def start_master_server(tmp_path: Path) -> tuple[zippy.MasterServer, str]:
+def start_master_server(
+    tmp_path: Path,
+    config: dict[str, object] | None = None,
+) -> tuple[zippy.MasterServer, str]:
     control_endpoint = (
         unused_loopback_uri() if os.name == "nt" else str(tmp_path / "zippy-master-cli.sock")
     )
-    server = zippy.MasterServer(control_endpoint=control_endpoint)
+    server = zippy.MasterServer(control_endpoint=control_endpoint, config=config)
     server.start()
     return server, control_endpoint
 
@@ -54,6 +59,7 @@ def test_cli_root_help() -> None:
     assert "master" in result.output
     assert "gateway" in result.output
     assert "stream" in result.output
+    assert "table" in result.output
 
 
 def test_python_module_entrypoint_shows_root_help() -> None:
@@ -69,6 +75,7 @@ def test_python_module_entrypoint_shows_root_help() -> None:
     assert "master" in result.stdout
     assert "gateway" in result.stdout
     assert "stream" in result.stdout
+    assert "table" in result.stdout
 
 
 def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -635,6 +642,169 @@ def test_stream_show_returns_single_stream(tmp_path) -> None:
     assert "frame_size: 4096" in result.output
     assert "ring_capacity" not in result.output
     assert "status: registered" in result.output
+
+    server.stop()
+    server.join()
+
+
+def test_table_ls_lists_registered_tables(tmp_path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream(
+        "openctp_ticks",
+        pa.schema([("instrument_id", pa.string())]),
+        64,
+        4096,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["table", "ls", "--uri", control_endpoint])
+
+    assert result.exit_code == 0
+    assert "openctp_ticks" in result.output
+    assert "BUFFER SIZE" in result.output
+    assert "FRAME SIZE" in result.output
+    assert "SCHEMA HASH" in result.output
+    assert "ring_capacity" not in result.output
+
+    server.stop()
+    server.join()
+
+
+def test_table_info_returns_single_table_as_json(tmp_path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream(
+        "openctp_ticks",
+        pa.schema([("instrument_id", pa.string())]),
+        64,
+        4096,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["table", "info", "openctp_ticks", "--uri", control_endpoint, "--json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["stream_name"] == "openctp_ticks"
+    assert payload["buffer_size"] == 64
+    assert payload["frame_size"] == 4096
+    assert payload["schema"]["fields"][0]["name"] == "instrument_id"
+
+    server.stop()
+    server.join()
+
+
+def test_table_schema_prints_registered_table_schema(tmp_path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream(
+        "openctp_ticks",
+        pa.schema([("instrument_id", pa.string()), ("dt", pa.timestamp("ns", tz="UTC"))]),
+        64,
+        4096,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["table", "schema", "openctp_ticks", "--uri", control_endpoint],
+    )
+
+    assert result.exit_code == 0
+    assert "FIELD" in result.output
+    assert "DATA TYPE" in result.output
+    assert "instrument_id" in result.output
+    assert "Utf8" in result.output
+    assert "dt" in result.output
+    assert "timestamp_ns_tz" in result.output
+    assert "UTC" in result.output
+
+    server.stop()
+    server.join()
+
+
+def test_table_drop_requires_confirmation(tmp_path) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream(
+        "openctp_ticks",
+        pa.schema([("instrument_id", pa.string())]),
+        64,
+        4096,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["table", "drop", "openctp_ticks", "--uri", control_endpoint],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0
+    assert "drop aborted" in result.output
+    assert client.get_stream("openctp_ticks")["stream_name"] == "openctp_ticks"
+
+    server.stop()
+    server.join()
+
+
+def test_table_drop_removes_table_with_yes_and_keep_persisted(tmp_path) -> None:
+    server, control_endpoint = start_master_server(
+        tmp_path,
+        config={
+            "master": {"token": "dev-token"},
+            "table": {"persist": {"data_dir": str(tmp_path)}},
+        },
+    )
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    parquet_file = tmp_path / "tables" / "openctp_ticks" / "part-000001.parquet"
+    parquet_file.parent.mkdir(parents=True)
+    parquet_file.write_bytes(b"persisted rows")
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    client.register_process("writer")
+    client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    client.register_source("openctp_md", "openctp", "openctp_ticks", {})
+    client.publish_persisted_file(
+        "openctp_ticks",
+        {
+            "file_path": str(parquet_file),
+            "row_count": 1,
+            "source_segment_id": 1,
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "table",
+            "drop",
+            "openctp_ticks",
+            "--uri",
+            control_endpoint,
+            "--keep-persisted",
+            "--token",
+            "dev-token",
+            "--yes",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["table_name"] == "openctp_ticks"
+    assert payload["dropped"] is True
+    assert payload["persisted_files_deleted"] == 0
+    assert parquet_file.exists()
+    assert client.list_streams() == []
 
     server.stop()
     server.join()
