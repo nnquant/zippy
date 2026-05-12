@@ -2564,7 +2564,7 @@ fn tail_persisted_file_record_batches(
     scanned_files: &mut Vec<String>,
 ) -> Result<Vec<RecordBatch>> {
     let mut remaining = n;
-    let mut batches_reversed = Vec::new();
+    let mut file_groups_reversed = Vec::new();
     for persisted_file in non_overlapping_persisted_files(stream).into_iter().rev() {
         if remaining == 0 {
             break;
@@ -2580,17 +2580,19 @@ fn tail_persisted_file_record_batches(
             .map(RecordBatch::num_rows)
             .sum::<usize>();
         scanned_files.push(file_path);
+        let mut filtered_batches = Vec::new();
         remaining = remaining.saturating_sub(raw_rows);
         for batch in file_batches {
             let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
             if batch.num_rows() > 0 {
-                batches_reversed.push(batch);
+                filtered_batches.push(batch);
             }
         }
+        file_groups_reversed.push(filtered_batches);
     }
     scanned_files.reverse();
-    batches_reversed.reverse();
-    Ok(batches_reversed)
+    file_groups_reversed.reverse();
+    Ok(file_groups_reversed.into_iter().flatten().collect())
 }
 
 fn read_parquet_record_batches(
@@ -4338,6 +4340,75 @@ mod tests {
         assert_eq!(first.num_rows(), 2);
         assert_eq!(second.num_rows(), 1);
         assert!(end.is_none());
+    }
+
+    #[test]
+    fn tail_persisted_file_batches_preserve_batch_order_within_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("tail-order.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let values = (0_i64..(PERSISTED_PARQUET_SCAN_BATCH_SIZE as i64 + 2)).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values)) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let stream = StreamInfo {
+            stream_name: "tail_order_ticks".to_string(),
+            schema: schema_metadata(&batch.schema()),
+            schema_hash: canonical_schema_hash(&batch.schema()),
+            data_path: "segment".to_string(),
+            descriptor_generation: 0,
+            active_segment_descriptor: None,
+            active_segment_preflight: None,
+            segment_row_capacity: Some(4096),
+            sealed_segments: Vec::new(),
+            persisted_files: vec![json!({
+                "file_path": parquet_path.to_string_lossy(),
+                "row_count": batch.num_rows(),
+                "source_segment_id": 1,
+                "source_generation": 0
+            })],
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: None,
+            writer_epoch: 0,
+            reader_count: 0,
+            status: "active".to_string(),
+        };
+        let mut scanned_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let batches = tail_persisted_file_record_batches(
+            &stream,
+            PERSISTED_PARQUET_SCAN_BATCH_SIZE + 1,
+            &GatewayScanPushdown::default(),
+            &mut scanned_rows,
+            &mut scanned_files,
+        )
+        .unwrap();
+        let collected = concat_record_batches(batch.schema(), batches).unwrap();
+        let seq = collected
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+
+        assert_eq!(seq[0], 1);
+        assert_eq!(
+            seq.last().copied(),
+            Some(PERSISTED_PARQUET_SCAN_BATCH_SIZE as i64 + 1)
+        );
+        assert!(seq.windows(2).all(|window| window[0] < window[1]));
     }
 
     #[test]
