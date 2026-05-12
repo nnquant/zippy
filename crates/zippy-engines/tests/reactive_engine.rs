@@ -10,7 +10,10 @@ use zippy_core::{
     SegmentTableView, ZippyError,
 };
 use zippy_engines::{ReactiveStateEngine, ReactiveStateFailurePolicy};
-use zippy_operators::{CastSpec, ExpressionSpec, TsDiffSpec, TsEmaSpec, TsReturnSpec};
+use zippy_operators::{
+    CastSpec, ExpressionSpec, ReactiveFactor, ReactiveFactorContext, TsDiffSpec, TsEmaSpec,
+    TsReturnSpec,
+};
 
 fn input_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -85,6 +88,65 @@ fn column_names(table: &SegmentTableView) -> Vec<String> {
         .iter()
         .map(|field| field.name().to_string())
         .collect()
+}
+
+struct ContextOnlyFactor {
+    output: Field,
+}
+
+impl ReactiveFactor for ContextOnlyFactor {
+    fn output_field(&self) -> Field {
+        self.output.clone()
+    }
+
+    fn evaluate(&mut self, _batch: &RecordBatch) -> zippy_core::Result<ArrayRef> {
+        panic!("engine should call evaluate_with_context for reactive factors");
+    }
+
+    fn evaluate_with_context(
+        &mut self,
+        ctx: &ReactiveFactorContext<'_>,
+    ) -> zippy_core::Result<ArrayRef> {
+        let values = ctx
+            .column_by_name("value")?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        Ok(Arc::new(Float64Array::from(
+            (0..ctx.num_rows())
+                .map(|row| values.value(row) + 1.0)
+                .collect::<Vec<_>>(),
+        )) as ArrayRef)
+    }
+}
+
+#[test]
+fn reactive_engine_uses_context_evaluation_path() {
+    let mut engine = ReactiveStateEngine::new(
+        "reactive",
+        input_schema(),
+        vec![Box::new(ContextOnlyFactor {
+            output: Field::new("value_plus_one", DataType::Float64, false),
+        })],
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["a", "b"], vec![10.0, 20.0]))
+        .unwrap();
+    let output = &outputs[0];
+
+    assert_eq!(
+        column_names(output),
+        vec!["id", "value", "value_plus_one"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        float64_values(output.column_at(2)),
+        vec![Some(11.0), Some(21.0)]
+    );
 }
 
 #[test]
