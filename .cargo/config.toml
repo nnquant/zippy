@@ -1,5 +1,2 @@
-[env]
-PYO3_PYTHON = { value = ".venv/bin/python", relative = true, force = false }
-
 [target.'cfg(unix)']
 runner = "scripts/cargo-test-python-lib-runner.sh"

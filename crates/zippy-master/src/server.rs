@@ -4022,7 +4022,6 @@ fn registry_error(error: crate::registry::RegistryError) -> ZippyError {
     }
 }
 
-#[cfg(unix)]
 fn restored_record_status(status: &str) -> &str {
     match status {
         "lost" | "stale" => status,
@@ -4030,6 +4029,7 @@ fn restored_record_status(status: &str) -> &str {
     }
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
     if !socket_path.exists() {
         return Ok(());
