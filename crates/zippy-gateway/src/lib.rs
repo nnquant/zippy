@@ -137,10 +137,49 @@ struct GatewayCollectStreamPlan {
     source: String,
     snapshot_id: Option<String>,
     plan: Vec<Value>,
-    row_range_pushdown: Option<(GatewayRowRangePushdown, usize)>,
-    scan_residual_start: usize,
-    scan_pushdown: GatewayScanPushdown,
     chunk_rows: usize,
+}
+
+enum GatewayCollectStreamProducer {
+    Materialized {
+        batch: RecordBatch,
+        chunk_rows: usize,
+        offset: usize,
+    },
+}
+
+impl GatewayCollectStreamProducer {
+    fn materialized(batch: RecordBatch, chunk_rows: usize) -> Self {
+        Self::Materialized {
+            batch,
+            chunk_rows: chunk_rows.max(1),
+            offset: 0,
+        }
+    }
+
+    fn schema(&self) -> SchemaRef {
+        match self {
+            Self::Materialized { batch, .. } => batch.schema(),
+        }
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self {
+            Self::Materialized {
+                batch,
+                chunk_rows,
+                offset,
+            } => {
+                if *offset >= batch.num_rows() {
+                    return Ok(None);
+                }
+                let rows = (*chunk_rows).min(batch.num_rows() - *offset);
+                let chunk = batch.slice(*offset, rows);
+                *offset += rows;
+                Ok(Some(chunk))
+            }
+        }
+    }
 }
 
 struct GatewayScannedBatch {
@@ -766,6 +805,33 @@ impl GatewayState {
             })?;
         self.close_writer(stream_name)?;
         Ok((json!({"status": "ok"}), vec![]))
+    }
+
+    fn collect_stream_producer(
+        &self,
+        stream_plan: GatewayCollectStreamPlan,
+    ) -> Result<GatewayCollectStreamProducer> {
+        let mut collect_header = json!({
+            "kind": "collect",
+            "source": stream_plan.source,
+            "plan": stream_plan.plan,
+        });
+        if let Some(snapshot_id) = stream_plan.snapshot_id {
+            collect_header["snapshot_id"] = json!(snapshot_id);
+        }
+        let (_response, payload) = self.handle_collect(collect_header)?;
+        let batches = decode_ipc_batches(&payload)?;
+        let batch = concat_record_batches(
+            batches
+                .first()
+                .map(RecordBatch::schema)
+                .unwrap_or_else(|| Arc::new(Schema::empty())),
+            batches,
+        )?;
+        Ok(GatewayCollectStreamProducer::materialized(
+            batch,
+            stream_plan.chunk_rows,
+        ))
     }
 
     fn handle_create_snapshot(&self, header: Value) -> Result<(Value, Vec<u8>)> {
@@ -1785,41 +1851,13 @@ async fn handle_collect_stream_async(
 ) -> Result<()> {
     let stream_plan = collect_stream_plan_from_header(header)?;
     let chunk_rows = stream_plan.chunk_rows;
-    let _streamable_prefix = (
-        stream_plan.scan_residual_start,
-        stream_plan
-            .row_range_pushdown
-            .as_ref()
-            .map(|(pushdown, start)| (pushdown.op_name(), *start)),
-        stream_plan.scan_pushdown.filters.len(),
-        stream_plan
-            .scan_pushdown
-            .projection_columns
-            .as_ref()
-            .map(Vec::len),
-    );
-    let collect_header = json!({
-        "source": stream_plan.source,
-        "snapshot_id": stream_plan.snapshot_id,
-        "plan": stream_plan.plan,
-    });
     let state_for_request = Arc::clone(&state);
-    let (response, payload) = run_blocking_request(Arc::clone(&state), move || {
-        state_for_request.handle_collect(collect_header)
+    let mut producer = run_blocking_request(Arc::clone(&state), move || {
+        state_for_request.collect_stream_producer(stream_plan)
     })
     .await?;
-    let batches = decode_ipc_batches(&payload)?;
-    let schema = batches
-        .first()
-        .map(RecordBatch::schema)
-        .ok_or_else(|| ZippyError::Io {
-            reason: "collect_stream produced no schema".to_string(),
-        })?;
+    let schema = producer.schema();
     let schema_payload = encode_ipc_schema(&schema)?;
-    let metrics = response
-        .get("metrics")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     write_frame_async(
         stream,
         &json!({
@@ -1832,26 +1870,26 @@ async fn handle_collect_stream_async(
     .await?;
 
     let mut chunk_index = 0usize;
-    for batch in batches {
-        let mut offset = 0usize;
-        while offset < batch.num_rows() {
-            let rows = chunk_rows.min(batch.num_rows() - offset);
-            let chunk = batch.slice(offset, rows);
-            let payload = encode_ipc_table(&chunk)?;
-            write_frame_async(
-                stream,
-                &json!({
-                    "status": "ok",
-                    "kind": "collect_chunk",
-                    "chunk_index": chunk_index,
-                    "rows": rows,
-                }),
-                &payload,
-            )
-            .await?;
-            offset += rows;
-            chunk_index += 1;
-        }
+    loop {
+        let next = producer.next_batch()?;
+        let Some(next_batch) = next else {
+            break;
+        };
+        let rows = next_batch.num_rows();
+        let payload =
+            run_blocking_request(Arc::clone(&state), move || encode_ipc_table(&next_batch)).await?;
+        write_frame_async(
+            stream,
+            &json!({
+                "status": "ok",
+                "kind": "collect_chunk",
+                "chunk_index": chunk_index,
+                "rows": rows,
+            }),
+            &payload,
+        )
+        .await?;
+        chunk_index += 1;
     }
 
     write_frame_async(
@@ -1860,7 +1898,7 @@ async fn handle_collect_stream_async(
             "status": "ok",
             "kind": "collect_end",
             "chunks": chunk_index,
-            "metrics": metrics,
+            "metrics": {"streaming": true},
         }),
         &[],
     )
@@ -2147,12 +2185,7 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
     let streamable_projection_count =
         collect_plan_streamable_projection_count(&plan[scan_residual_start..])?;
     let residual_start = scan_residual_start + streamable_projection_count;
-    let scan_pushdown = GatewayScanPushdown {
-        filters: plan[row_range_residual_start..scan_residual_start].to_vec(),
-        projection_columns: collect_plan_scan_projection_columns(
-            &plan[row_range_residual_start..],
-        )?,
-    };
+    collect_plan_scan_projection_columns(&plan[row_range_residual_start..])?;
     if residual_start < plan.len() {
         return Err(ZippyError::InvalidConfig {
             reason: concat!(
@@ -2175,9 +2208,6 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
             .and_then(Value::as_str)
             .map(ToString::to_string),
         plan,
-        row_range_pushdown,
-        scan_residual_start,
-        scan_pushdown,
         chunk_rows,
     })
 }
@@ -4015,6 +4045,25 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, TimestampNanosecondArray};
     use parquet::arrow::ArrowWriter;
+
+    #[test]
+    fn materialized_stream_producer_splits_batches_by_chunk_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let mut producer = GatewayCollectStreamProducer::materialized(batch, 2);
+
+        let first = producer.next_batch().unwrap().unwrap();
+        let second = producer.next_batch().unwrap().unwrap();
+        let end = producer.next_batch().unwrap();
+
+        assert_eq!(first.num_rows(), 2);
+        assert_eq!(second.num_rows(), 1);
+        assert!(end.is_none());
+    }
 
     #[test]
     fn gateway_filter_accepts_typed_timestamp_literal() {
