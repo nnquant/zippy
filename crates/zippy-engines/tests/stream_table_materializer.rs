@@ -310,6 +310,38 @@ fn key_value_table_materializer_replaces_active_snapshot_by_key() {
 }
 
 #[test]
+fn key_value_table_materializer_keeps_last_row_for_duplicate_key_in_same_batch() {
+    let mut materializer =
+        KeyValueTableMaterializer::new("ticks_latest", input_schema(), vec!["instrument_id"])
+            .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606", "IH2606", "IF2606"],
+            vec![4102.5, 2711.0, 4103.5],
+        )))
+        .unwrap();
+
+    let active = materializer.active_record_batch().unwrap();
+    let instrument_ids = active
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let last_prices = active
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    assert_eq!(active.num_rows(), 2);
+    assert_eq!(instrument_ids.value(0), "IF2606");
+    assert_eq!(last_prices.value(0), 4103.5);
+    assert_eq!(instrument_ids.value(1), "IH2606");
+    assert_eq!(last_prices.value(1), 2711.0);
+}
+
+#[test]
 fn key_value_table_materializer_publishes_new_segment_for_snapshot_replace() {
     let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
         "ticks_latest",
