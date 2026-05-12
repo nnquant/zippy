@@ -142,10 +142,16 @@
 - latest key 仍使用 `BTreeMap<Vec<String>, usize>` 保持 deterministic order；跨 engine 的 id
   interning 留给 P004/P005 的 shared id registry 设计。
 
-### P007 Reactive rolling window state
+### P007 Reactive factor context and rolling window state
 
 变更：
 
+- 新增 `ReactiveFactorContext`，用轻量 schema/columns view 表达当前 factor 可见输入。
+- `ReactiveStateEngine` 的 factor loop 改为调用 `evaluate_with_context()`；context-native factor
+  不再需要每个 factor 构造中间 `RecordBatch`。
+- `ReactiveFactor` 保留旧 `evaluate(&RecordBatch)` 作为 fallback，外部 factor 不需要同轮迁移。
+- 内置 `TsEma`、rolling window、unary float、cast、row expression 和 planned expression factor
+  已迁移到 context-native evaluation。
 - `StatefulFloatById` 的窗口状态从裸 `VecDeque<f64>` 改为内部 `WindowHistory`。
 - `WindowHistory` 在 push/trim 时维护 running `sum` 和 `sum_squares`。
 - rolling mean 从每行扫描窗口求和改为 O(1) 读取 running sum。
@@ -156,9 +162,10 @@
 
 边界：
 
-- 本轮没有改 `ReactiveStateEngine` 每个 factor 构造中间 `RecordBatch` 的方式。
 - 每行 id 仍会转成 `String` 存入 per-factor `HashMap`。
-- factor evaluation context、列追加式 batch builder 和 id interning 仍需后续专项。
+- context 只消除 built-in context-native factor 的中间 batch；未覆写 `evaluate_with_context()` 的
+  第三方 factor 仍会通过 fallback materialize `RecordBatch`。
+- id interning / borrowed key state 仍需后续专项。
 
 ### P008 RowSpan projection batch export
 
