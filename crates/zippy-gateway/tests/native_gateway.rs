@@ -818,6 +818,214 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
 }
 
 #[test]
+fn native_gateway_collect_stream_applies_filter_then_final_select_for_persisted_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet_path = temp.path().join("ticks.parquet");
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) =
+        spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606", "IH2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5, 2801.0])),
+        ],
+    )
+    .unwrap();
+    write_parquet_batch(&parquet_path, &batch);
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client
+        .register_process("stream_filter_select_writer")
+        .unwrap();
+    client
+        .register_stream("stream_filter_select_ticks", batch.schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "stream_filter_select_source",
+            "test",
+            "stream_filter_select_ticks",
+            json!({}),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "stream_filter_select_ticks",
+            json!({
+                "file_path": parquet_path.to_string_lossy(),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_filter_select_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": [
+                {"op": "filter", "expr": {
+                    "kind": "binary",
+                    "op": "eq",
+                    "args": [
+                        {"kind": "col", "value": "instrument_id"},
+                        {"kind": "literal", "value": "IF2606"}
+                    ]
+                }},
+                {"op": "select", "exprs": [{"kind": "col", "value": "last_price"}]}
+            ]
+        }),
+        vec![],
+    );
+
+    let chunks = frames
+        .iter()
+        .filter(|(header, _)| header["kind"] == "collect_chunk")
+        .map(|(_, payload)| decode_ipc_batch(payload))
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].num_rows(), 1);
+    assert_eq!(
+        chunks[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["last_price"]
+    );
+    let prices = chunks[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(prices.value(0), 4102.5);
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_collect_stream_keeps_mixed_persisted_and_live_on_materialized_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let parquet_path = temp.path().join("persisted.parquet");
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) =
+        spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+    let persisted_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![std::sync::Arc::new(Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    let live_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![std::sync::Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap();
+    write_parquet_batch(&parquet_path, &persisted_batch);
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("stream_mixed_writer").unwrap();
+    client
+        .register_stream(
+            "stream_mixed_ticks",
+            std::sync::Arc::clone(&schema),
+            64,
+            4096,
+        )
+        .unwrap();
+    client
+        .register_source(
+            "stream_mixed_source",
+            "test",
+            "stream_mixed_ticks",
+            json!({}),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "stream_mixed_ticks",
+            json!({
+                "file_path": parquet_path.to_string_lossy(),
+                "row_count": 1,
+                "source_segment_id": 0,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+    let mut materializer = master_bound_materializer(&mut client, "stream_mixed_ticks", schema, 64);
+    client
+        .publish_segment_descriptor_bytes(
+            "stream_mixed_ticks",
+            &materializer.active_descriptor_envelope_bytes().unwrap(),
+        )
+        .unwrap();
+    materializer
+        .on_data(SegmentTableView::from_record_batch(live_batch))
+        .unwrap();
+    materializer.on_flush().unwrap();
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_mixed_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": [{"op": "select", "exprs": [{"kind": "col", "value": "seq"}]}]
+        }),
+        vec![],
+    );
+
+    let streamed_values = streamed_i64_values(&frames);
+    assert_eq!(streamed_values, vec![1, 2]);
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["scanned_files"],
+        json!(1)
+    );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["scanned_file_paths"],
+        json!([parquet_path.to_string_lossy()])
+    );
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
     let temp = tempfile::tempdir().unwrap();
     let old_path = temp.path().join("segment-1.parquet");
@@ -1732,4 +1940,21 @@ fn send_gateway_header_without_payload(
 fn decode_ipc_batch(payload: &[u8]) -> RecordBatch {
     let mut reader = StreamReader::try_new(Cursor::new(payload), None).unwrap();
     reader.next().unwrap().unwrap()
+}
+
+fn streamed_i64_values(frames: &[(serde_json::Value, Vec<u8>)]) -> Vec<i64> {
+    frames
+        .iter()
+        .filter(|(header, _)| header["kind"] == "collect_chunk")
+        .flat_map(|(_, payload)| {
+            let batch = decode_ipc_batch(payload);
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
 }

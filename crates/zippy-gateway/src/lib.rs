@@ -139,6 +139,7 @@ struct GatewayCollectStreamPlan {
     plan: Vec<Value>,
     row_range_pushdown: Option<(GatewayRowRangePushdown, usize)>,
     scan_pushdown: GatewayScanPushdown,
+    output_projection_columns: Option<Vec<String>>,
     chunk_rows: usize,
 }
 
@@ -146,6 +147,7 @@ struct GatewayCollectStreamPlan {
 struct GatewayCollectStreamMetrics {
     streaming: bool,
     scanned_files: usize,
+    scanned_file_paths: Vec<String>,
     scanned_rows: usize,
     returned_rows: usize,
     scan_elapsed_ms: f64,
@@ -161,6 +163,7 @@ impl GatewayCollectStreamMetrics {
         json!({
             "streaming": self.streaming,
             "scanned_files": self.scanned_files,
+            "scanned_file_paths": self.scanned_file_paths,
             "scanned_rows": self.scanned_rows,
             "returned_rows": self.returned_rows,
             "scan_elapsed_ms": self.scan_elapsed_ms,
@@ -215,27 +218,34 @@ impl GatewayCollectStreamProducer {
     fn persisted_serial(
         stream: &StreamInfo,
         scan_pushdown: &GatewayScanPushdown,
+        output_projection_columns: Option<&[String]>,
         chunk_rows: usize,
     ) -> Result<Self> {
         let scan_started = Instant::now();
         let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let scan_schema = schema_for_scan_pushdown(&schema, scan_pushdown)?;
         let mut scanned_rows = 0usize;
         let mut scanned_files = Vec::new();
+        // Task 5 replaces this eager serial scan with bounded pending file results.
         let batches = persisted_file_record_batches(
             stream,
             scan_pushdown,
             &mut scanned_rows,
             &mut scanned_files,
-        )?;
+        )?
+        .into_iter()
+        .map(|batch| project_record_batch(&batch, output_projection_columns))
+        .collect::<Result<Vec<_>>>()?;
         let metrics = GatewayCollectStreamMetrics {
             streaming: true,
             scanned_files: scanned_files.len(),
+            scanned_file_paths: scanned_files,
             scanned_rows,
             scan_elapsed_ms: scan_started.elapsed().as_secs_f64() * 1000.0,
             ..GatewayCollectStreamMetrics::default()
         };
         Ok(Self::Persisted {
-            schema: schema_for_scan_pushdown(&schema, scan_pushdown)?,
+            schema: schema_for_projection_columns(&scan_schema, output_projection_columns)?,
             batches: batches.into(),
             chunk_rows: chunk_rows.max(1),
             current_batch: None,
@@ -944,10 +954,11 @@ impl GatewayState {
                 .contains_key(&stream_plan.source);
             if !has_active_writer {
                 let stream = self.master.get_stream_blocking(&stream_plan.source)?;
-                if stream_has_persisted_files(&stream) {
+                if stream_is_persisted_only(&stream) {
                     return GatewayCollectStreamProducer::persisted_serial(
                         &stream,
                         &stream_plan.scan_pushdown,
+                        stream_plan.output_projection_columns.as_deref(),
                         stream_plan.chunk_rows,
                     );
                 }
@@ -967,6 +978,7 @@ impl GatewayState {
             .cloned()
             .unwrap_or_else(|| json!({}));
         if let Some(object) = metrics.as_object_mut() {
+            normalize_collect_stream_metrics(object);
             object.insert("streaming".to_string(), json!(true));
         } else {
             metrics = json!({
@@ -2321,6 +2333,18 @@ fn record_gateway_error_metric(state: &GatewayState, error: &ZippyError) {
     });
 }
 
+fn normalize_collect_stream_metrics(object: &mut serde_json::Map<String, Value>) {
+    let Some(scanned_files) = object
+        .get("scanned_files")
+        .and_then(Value::as_array)
+        .cloned()
+    else {
+        return;
+    };
+    object.insert("scanned_file_paths".to_string(), json!(scanned_files));
+    object.insert("scanned_files".to_string(), json!(scanned_files.len()));
+}
+
 fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStreamPlan> {
     let source = header
         .get("source")
@@ -2347,6 +2371,8 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
     let streamable_projection_count =
         collect_plan_streamable_projection_count(&plan[scan_residual_start..])?;
     let residual_start = scan_residual_start + streamable_projection_count;
+    let output_projection_columns =
+        collect_plan_projection_columns(&plan[scan_residual_start..residual_start]);
     if residual_start < plan.len() {
         return Err(ZippyError::InvalidConfig {
             reason: concat!(
@@ -2371,6 +2397,7 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
         plan,
         row_range_pushdown,
         scan_pushdown,
+        output_projection_columns,
         chunk_rows,
     })
 }
@@ -2643,7 +2670,14 @@ fn schema_for_scan_pushdown(
     schema: &SchemaRef,
     scan_pushdown: &GatewayScanPushdown,
 ) -> Result<SchemaRef> {
-    let Some(projection_columns) = scan_pushdown.projection_columns.as_deref() else {
+    schema_for_projection_columns(schema, scan_pushdown.projection_columns.as_deref())
+}
+
+fn schema_for_projection_columns(
+    schema: &SchemaRef,
+    projection_columns: Option<&[String]>,
+) -> Result<SchemaRef> {
+    let Some(projection_columns) = projection_columns else {
         return Ok(Arc::clone(schema));
     };
     let mut fields = Vec::with_capacity(projection_columns.len());
@@ -2666,6 +2700,12 @@ fn stream_has_persisted_files(stream: &StreamInfo) -> bool {
         .persisted_files
         .iter()
         .any(|item| persisted_file_path(item).is_ok())
+}
+
+fn stream_is_persisted_only(stream: &StreamInfo) -> bool {
+    stream_has_persisted_files(stream)
+        && stream.active_segment_descriptor.is_none()
+        && stream.sealed_segments.is_empty()
 }
 
 fn non_overlapping_persisted_files(stream: &StreamInfo) -> Vec<&Value> {
