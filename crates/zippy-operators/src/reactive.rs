@@ -5,7 +5,7 @@ use arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, Float64Builder, Int32Array, Int64Array,
     StringArray, StringBuilder,
 };
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Result, ZippyError};
 
@@ -48,6 +48,98 @@ enum StatefulFloatUndoEntry {
     Window(Option<WindowHistory>),
 }
 
+/// Lightweight read-only view over the columns visible to a reactive factor.
+pub struct ReactiveFactorContext<'a> {
+    schema: Arc<Schema>,
+    columns: &'a [ArrayRef],
+    row_count: usize,
+}
+
+impl<'a> ReactiveFactorContext<'a> {
+    /// Create a factor context from a schema and matching columns.
+    pub fn new(schema: &Arc<Schema>, columns: &'a [ArrayRef]) -> Result<Self> {
+        if schema.fields().len() != columns.len() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "reactive factor context schema column count mismatch schema_columns=[{}] columns=[{}]",
+                    schema.fields().len(),
+                    columns.len()
+                ),
+            });
+        }
+
+        let row_count = columns.first().map_or(0, |column| column.len());
+        for (index, column) in columns.iter().enumerate() {
+            if column.len() != row_count {
+                return Err(ZippyError::SchemaMismatch {
+                    reason: format!(
+                        "reactive factor context column length mismatch column_index=[{}] expected=[{}] actual=[{}]",
+                        index,
+                        row_count,
+                        column.len()
+                    ),
+                });
+            }
+        }
+
+        Ok(Self {
+            schema: Arc::clone(schema),
+            columns,
+            row_count,
+        })
+    }
+
+    /// Create a factor context from an existing record batch.
+    pub fn from_batch(batch: &'a RecordBatch) -> Self {
+        Self {
+            schema: batch.schema(),
+            columns: batch.columns(),
+            row_count: batch.num_rows(),
+        }
+    }
+
+    /// Return the row count shared by all columns.
+    pub fn num_rows(&self) -> usize {
+        self.row_count
+    }
+
+    /// Return the schema visible to the factor.
+    pub fn schema(&self) -> &Schema {
+        self.schema.as_ref()
+    }
+
+    /// Resolve a field name to a column index.
+    pub fn index_of(&self, field: &str) -> Result<usize> {
+        self.schema.index_of(field).map_err(|_| ZippyError::SchemaMismatch {
+            reason: format!("missing reactive factor field field=[{}]", field),
+        })
+    }
+
+    /// Return a column by index.
+    pub fn column(&self, index: usize) -> Result<&'a ArrayRef> {
+        self.columns
+            .get(index)
+            .ok_or_else(|| ZippyError::SchemaMismatch {
+                reason: format!("reactive factor column index out of bounds index=[{}]", index),
+            })
+    }
+
+    /// Return a column by field name.
+    pub fn column_by_name(&self, field: &str) -> Result<&'a ArrayRef> {
+        let index = self.index_of(field)?;
+        self.column(index)
+    }
+
+    /// Materialize this context as a RecordBatch for compatibility fallback.
+    pub fn record_batch(&self) -> Result<RecordBatch> {
+        RecordBatch::try_new(Arc::clone(&self.schema), self.columns.to_vec()).map_err(|error| {
+            ZippyError::Io {
+                reason: format!("failed to build reactive context fallback batch error=[{}]", error),
+            }
+        })
+    }
+}
+
 /// Evaluate a stateful factor against rows in input order.
 pub trait ReactiveFactor: Send {
     /// Return the output field definition for this factor.
@@ -55,6 +147,12 @@ pub trait ReactiveFactor: Send {
 
     /// Evaluate the factor for each row in the batch.
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef>;
+
+    /// Evaluate the factor against a lightweight column context.
+    fn evaluate_with_context(&mut self, context: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let batch = context.record_batch()?;
+        self.evaluate(&batch)
+    }
 
     /// Start recording dirty-key undo entries for this factor.
     fn begin_transaction(&mut self) {}
@@ -940,7 +1038,47 @@ fn extract_columns<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::WindowHistory;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::{ReactiveFactorContext, WindowHistory};
+
+    #[test]
+    fn reactive_factor_context_resolves_columns_by_name() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let columns = vec![
+            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0, 2.0])) as ArrayRef,
+        ];
+        let ctx = ReactiveFactorContext::new(&schema, &columns).unwrap();
+
+        assert_eq!(ctx.num_rows(), 2);
+        assert_eq!(ctx.index_of("value").unwrap(), 1);
+        assert_eq!(ctx.column_by_name("id").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reactive_factor_context_rejects_mismatched_column_lengths() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let columns = vec![
+            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![1.0])) as ArrayRef,
+        ];
+
+        let error = match ReactiveFactorContext::new(&schema, &columns) {
+            Ok(_) => panic!("context should reject mismatched column lengths"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("column length mismatch"));
+    }
 
     #[test]
     fn window_history_maintains_running_sum_and_squares_when_trimmed() {
