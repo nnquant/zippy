@@ -322,36 +322,35 @@ impl LatestColumnStore {
 
         match self {
             Self::Int64 { field_name, .. } => {
-                let values =
-                    array
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| ZippyError::SchemaMismatch {
-                            reason: format!("int64 latest field downcast failed field=[{}]", field_name),
-                        })?;
+                let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    ZippyError::SchemaMismatch {
+                        reason: format!(
+                            "int64 latest field downcast failed field=[{}]",
+                            field_name
+                        ),
+                    }
+                })?;
                 Ok(LatestCellValue::Int64(values.value(row_index)))
             }
             Self::Float64 { field_name, .. } => {
-                let values =
-                    array
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .ok_or_else(|| ZippyError::SchemaMismatch {
-                            reason: format!(
-                                "float64 latest field downcast failed field=[{}]",
-                                field_name
-                            ),
-                        })?;
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| ZippyError::SchemaMismatch {
+                        reason: format!(
+                            "float64 latest field downcast failed field=[{}]",
+                            field_name
+                        ),
+                    })?;
                 Ok(LatestCellValue::Float64(values.value(row_index)))
             }
             Self::Utf8 { field_name, .. } => {
-                let values =
-                    array
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| ZippyError::SchemaMismatch {
-                            reason: format!("utf8 latest field downcast failed field=[{}]", field_name),
-                        })?;
+                let values = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| ZippyError::SchemaMismatch {
+                        reason: format!("utf8 latest field downcast failed field=[{}]", field_name),
+                    })?;
                 Ok(LatestCellValue::Utf8(values.value(row_index).to_string()))
             }
             Self::TimestampNanosecond { field_name, .. } => {
@@ -364,7 +363,9 @@ impl LatestColumnStore {
                             field_name
                         ),
                     })?;
-                Ok(LatestCellValue::TimestampNanosecond(values.value(row_index)))
+                Ok(LatestCellValue::TimestampNanosecond(
+                    values.value(row_index),
+                ))
             }
         }
     }
@@ -594,8 +595,7 @@ mod tests {
                     Arc::new(StringArray::from(exchange_ids)) as ArrayRef,
                     Arc::new(Float64Array::from(prices)) as ArrayRef,
                     Arc::new(Int64Array::from(volumes)) as ArrayRef,
-                    Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC"))
-                        as ArrayRef,
+                    Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
                 ],
             )
             .unwrap(),
