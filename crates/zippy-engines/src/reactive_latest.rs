@@ -1,20 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, StringArray};
-use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, EngineMetricsDelta, Result, SchemaRef, SegmentTableView, ZippyError};
 
-use crate::table_view::{record_batch_from_table_rows, string_array};
+use crate::latest_state::LatestColumnarState;
 
 /// Maintains the latest input row for each configured key.
 pub struct ReactiveLatestEngine {
     name: String,
     input_schema: SchemaRef,
-    by: Vec<String>,
-    latest_rows: BTreeMap<Vec<String>, OwnedRow>,
+    state: LatestColumnarState,
 }
 
 impl ReactiveLatestEngine {
@@ -26,33 +22,18 @@ impl ReactiveLatestEngine {
     ) -> Result<Self> {
         let by = by.into_iter().map(Into::into).collect::<Vec<_>>();
         validate_by_columns(input_schema.as_ref(), &by)?;
+        let state = LatestColumnarState::new(Arc::clone(&input_schema), by)?;
 
         Ok(Self {
             name: name.into(),
             input_schema,
-            by,
-            latest_rows: BTreeMap::new(),
+            state,
         })
     }
 
     /// Return the grouping columns used to identify latest rows.
     pub fn by(&self) -> &[String] {
-        &self.by
-    }
-
-    fn build_rows_batch<'a>(
-        &self,
-        rows: impl Iterator<Item = &'a OwnedRow>,
-        stage_label: &str,
-    ) -> Result<RecordBatch> {
-        concat_batches(&self.input_schema, rows.map(|row| &row.batch)).map_err(|error| {
-            ZippyError::Io {
-                reason: format!(
-                    "failed to build reactive latest {} batch error=[{}]",
-                    stage_label, error
-                ),
-            }
-        })
+        self.state.key_fields()
     }
 }
 
@@ -82,47 +63,25 @@ impl Engine for ReactiveLatestEngine {
             return Ok(vec![]);
         }
 
-        let updates = collect_latest_updates(&table, &self.input_schema, &self.by)?;
-
-        let output = self.build_rows_batch(
-            updates
-                .updated_keys
-                .iter()
-                .filter_map(|key| updates.rows.get(key)),
-            "updates",
-        )?;
-
-        for (key, row) in updates.rows {
-            self.latest_rows.insert(key, row);
-        }
-
-        if output.num_rows() == 0 {
+        let update = self.state.apply_batch(&table)?;
+        if update.is_empty() {
             return Ok(vec![]);
         }
+        let output = self.state.materialize_update(&update)?;
         Ok(vec![SegmentTableView::from_record_batch(output)])
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
-        if self.latest_rows.is_empty() {
+        if self.state.is_empty() {
             return Ok(vec![]);
         }
-        let output = self.build_rows_batch(self.latest_rows.values(), "snapshot")?;
+        let output = self.state.materialize_snapshot()?;
         Ok(vec![SegmentTableView::from_record_batch(output)])
     }
 
     fn drain_metrics(&mut self) -> EngineMetricsDelta {
         EngineMetricsDelta::default()
     }
-}
-
-#[derive(Clone)]
-struct OwnedRow {
-    batch: RecordBatch,
-}
-
-struct LatestBatchUpdates {
-    rows: BTreeMap<Vec<String>, OwnedRow>,
-    updated_keys: BTreeSet<Vec<String>>,
 }
 
 fn validate_by_columns(schema: &Schema, by: &[String]) -> Result<()> {
@@ -155,118 +114,4 @@ fn validate_by_columns(schema: &Schema, by: &[String]) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn build_key(columns: &[&StringArray], fields: &[String], row_index: usize) -> Result<Vec<String>> {
-    columns
-        .iter()
-        .zip(fields)
-        .map(|(column, field)| {
-            if column.is_null(row_index) {
-                return Err(ZippyError::SchemaMismatch {
-                    reason: format!("reactive latest by field contains null field=[{}]", field),
-                });
-            }
-            Ok(column.value(row_index).to_string())
-        })
-        .collect()
-}
-
-fn collect_latest_updates(
-    table: &SegmentTableView,
-    schema: &SchemaRef,
-    by: &[String],
-) -> Result<LatestBatchUpdates> {
-    let by_arrays = by
-        .iter()
-        .map(|field| table.column(field))
-        .collect::<Result<Vec<_>>>()?;
-    let by_columns = by_arrays
-        .iter()
-        .zip(by)
-        .map(|(column, field)| string_array(column, field))
-        .collect::<Result<Vec<_>>>()?;
-
-    collect_latest_updates_with_columns(table, schema, by, &by_columns)
-}
-
-fn collect_latest_updates_with_columns(
-    table: &SegmentTableView,
-    schema: &SchemaRef,
-    by: &[String],
-    by_columns: &[&StringArray],
-) -> Result<LatestBatchUpdates> {
-    let mut rows = BTreeMap::new();
-    let mut updated_keys = BTreeSet::new();
-
-    for row_index in 0..table.num_rows() {
-        let key = build_key(by_columns, by, row_index)?;
-        let row = extract_owned_row(table, schema, row_index)?;
-        rows.insert(key.clone(), row);
-        updated_keys.insert(key);
-    }
-
-    Ok(LatestBatchUpdates { rows, updated_keys })
-}
-
-fn extract_owned_row(
-    table: &SegmentTableView,
-    schema: &SchemaRef,
-    row_index: usize,
-) -> Result<OwnedRow> {
-    let batch =
-        record_batch_from_table_rows(table, schema, &[row_index as u32], "reactive latest")?;
-    Ok(OwnedRow { batch })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{ArrayRef, Float64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-
-    use super::collect_latest_updates;
-    use zippy_core::SegmentTableView;
-
-    fn input_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("instrument_id", DataType::Utf8, false),
-            Field::new("last_price", DataType::Float64, false),
-        ]))
-    }
-
-    fn batch(instrument_ids: Vec<&str>, last_prices: Vec<f64>) -> SegmentTableView {
-        SegmentTableView::from_record_batch(
-            RecordBatch::try_new(
-                input_schema(),
-                vec![
-                    Arc::new(StringArray::from(instrument_ids)) as ArrayRef,
-                    Arc::new(Float64Array::from(last_prices)) as ArrayRef,
-                ],
-            )
-            .unwrap(),
-        )
-    }
-
-    #[test]
-    fn collect_latest_updates_keeps_last_row_per_key_in_batch() {
-        let schema = input_schema();
-        let table = batch(
-            vec!["IF2606", "IH2606", "IF2606"],
-            vec![3912.4, 2740.8, 3913.2],
-        );
-        let by = vec!["instrument_id".to_string()];
-
-        let updates = collect_latest_updates(&table, &schema, &by).unwrap();
-
-        assert_eq!(updates.rows.len(), 2);
-        assert_eq!(
-            updates.updated_keys,
-            [vec!["IF2606".to_string()], vec!["IH2606".to_string()]]
-                .into_iter()
-                .collect()
-        );
-    }
 }
