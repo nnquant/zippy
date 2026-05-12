@@ -10,7 +10,7 @@ use arrow::{
         Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
         UInt32Array,
     },
-    compute::{concat_batches, take},
+    compute::take,
     datatypes::{DataType, Fields, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
@@ -21,7 +21,7 @@ use zippy_segment_store::{
     SealedSegmentHandle, SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
 
-use crate::table_view::record_batch_from_table_rows;
+use crate::latest_state::LatestColumnarState;
 
 const STREAM_TABLE_PARTITION: &str = "all";
 pub const DEFAULT_STREAM_TABLE_ROW_CAPACITY: usize = 65_536;
@@ -53,7 +53,7 @@ pub struct KeyValueTableMaterializer {
     name: String,
     input_schema: SchemaRef,
     by: Vec<String>,
-    latest_rows: BTreeMap<Vec<String>, KeyValueOwnedRow>,
+    latest_state: LatestColumnarState,
     table: StreamTableMaterializer,
 }
 
@@ -101,11 +101,6 @@ pub enum StreamTableDateTimePart {
 
 struct PersistPartitionBatch {
     values: PersistPartitionValues,
-    batch: RecordBatch,
-}
-
-#[derive(Clone)]
-struct KeyValueOwnedRow {
     batch: RecordBatch,
 }
 
@@ -1365,6 +1360,7 @@ impl KeyValueTableMaterializer {
         let name = name.into();
         let by = by.into_iter().map(Into::into).collect::<Vec<_>>();
         validate_latest_by_columns(input_schema.as_ref(), &by)?;
+        let latest_state = LatestColumnarState::new(Arc::clone(&input_schema), by.clone())?;
         let table = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
             name.clone(),
             Arc::clone(&input_schema),
@@ -1376,7 +1372,7 @@ impl KeyValueTableMaterializer {
             name,
             input_schema,
             by,
-            latest_rows: BTreeMap::new(),
+            latest_state,
             table,
         })
     }
@@ -1422,42 +1418,11 @@ impl KeyValueTableMaterializer {
         self.table.active_record_batch()
     }
 
-    fn update_latest_rows(&mut self, table: &SegmentTableView) -> Result<()> {
-        let by_arrays = self
-            .by
-            .iter()
-            .map(|field| table.column(field))
-            .collect::<Result<Vec<_>>>()?;
-        let by_columns = by_arrays
-            .iter()
-            .zip(&self.by)
-            .map(|(column, field)| latest_string_array(column, field))
-            .collect::<Result<Vec<_>>>()?;
-
-        for row_index in 0..table.num_rows() {
-            let key = latest_build_key(&by_columns, &self.by, row_index)?;
-            let row = latest_extract_owned_row(table, &self.input_schema, row_index)?;
-            self.latest_rows.insert(key, row);
-        }
-
-        Ok(())
-    }
-
     fn build_snapshot_batch(&self) -> Result<RecordBatch> {
-        if self.latest_rows.is_empty() {
+        if self.latest_state.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.input_schema)));
         }
-
-        concat_batches(
-            &self.input_schema,
-            self.latest_rows.values().map(|row| &row.batch),
-        )
-        .map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to build key-value table snapshot batch error=[{}]",
-                error
-            ),
-        })
+        self.latest_state.materialize_snapshot()
     }
 }
 
@@ -1487,7 +1452,10 @@ impl Engine for KeyValueTableMaterializer {
             return Ok(vec![]);
         }
 
-        self.update_latest_rows(&table)?;
+        let update = self.latest_state.apply_batch(&table)?;
+        if update.is_empty() {
+            return Ok(vec![]);
+        }
         let snapshot = self.build_snapshot_batch()?;
         let view = SegmentTableView::from_record_batch(snapshot);
         self.table.replace_with_table(&view)?;
@@ -1496,7 +1464,7 @@ impl Engine for KeyValueTableMaterializer {
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
         self.table.on_flush()?;
-        if self.latest_rows.is_empty() {
+        if self.latest_state.is_empty() {
             return Ok(vec![]);
         }
         Ok(vec![SegmentTableView::from_record_batch(
@@ -1540,44 +1508,6 @@ fn validate_latest_by_columns(schema: &Schema, by: &[String]) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn latest_string_array<'a>(array: &'a ArrayRef, field: &str) -> Result<&'a StringArray> {
-    array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ZippyError::SchemaMismatch {
-            reason: format!("key-value table by field must be utf8 field=[{}]", field),
-        })
-}
-
-fn latest_build_key(
-    columns: &[&StringArray],
-    fields: &[String],
-    row_index: usize,
-) -> Result<Vec<String>> {
-    columns
-        .iter()
-        .zip(fields)
-        .map(|(column, field)| {
-            if column.is_null(row_index) {
-                return Err(ZippyError::SchemaMismatch {
-                    reason: format!("key-value table by field contains null field=[{}]", field),
-                });
-            }
-            Ok(column.value(row_index).to_string())
-        })
-        .collect()
-}
-
-fn latest_extract_owned_row(
-    table: &SegmentTableView,
-    schema: &SchemaRef,
-    row_index: usize,
-) -> Result<KeyValueOwnedRow> {
-    let batch =
-        record_batch_from_table_rows(table, schema, &[row_index as u32], "key-value table")?;
-    Ok(KeyValueOwnedRow { batch })
 }
 
 fn write_sealed_segment_parquet(
