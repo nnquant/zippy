@@ -6,7 +6,7 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, EngineMetricsDelta, Result, SchemaRef, SegmentTableView, ZippyError};
-use zippy_operators::ReactiveFactor;
+use zippy_operators::{ReactiveFactor, ReactiveFactorContext};
 
 use crate::table_view::{project_columns, string_array};
 
@@ -280,15 +280,9 @@ impl ReactiveStateEngine {
         let mut current_schema = Arc::clone(&self.input_schema);
 
         for factor in &mut self.factors {
-            let current_batch = RecordBatch::try_new(Arc::clone(&current_schema), columns.clone())
-                .map_err(|error| ZippyError::Io {
-                    reason: format!(
-                        "failed to build reactive intermediate batch error=[{}]",
-                        error
-                    ),
-                })?;
+            let context = ReactiveFactorContext::new(&current_schema, &columns)?;
             let output_field = factor.output_field();
-            let output_column: ArrayRef = factor.evaluate(&current_batch)?;
+            let output_column: ArrayRef = factor.evaluate_with_context(&context)?;
             columns.push(output_column);
 
             let mut fields = current_schema.fields().iter().cloned().collect::<Vec<_>>();
