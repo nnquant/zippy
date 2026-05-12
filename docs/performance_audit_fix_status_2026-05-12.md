@@ -12,14 +12,14 @@
 | 问题 | 状态 | 本轮处理 |
 | --- | --- | --- |
 | P001 性能门禁没有运行真实压测和尾延迟阈值 | 已修复基础门禁 | `zippy-perf` 增加 p95/p99/queue depth 阈值，新增 nightly/manual performance workflow。 |
-| P002 Gateway collect 一次性整批执行 | 部分修复，剩余继续处理 | `collect(stream=True)` 显式启用 Gateway `collect_stream` 多帧协议；默认 `collect()` 保持旧路径。 |
+| P002 Gateway collect 一次性整批执行 | 已修复 streaming 路径，live zero-copy 留待 P008 | `collect(stream=True)` 走 Gateway 多帧 streaming collect；默认 `collect()` 保持旧路径。 |
 | P003 StreamTable Arrow batch 按行写入 | 已修复典型路径 | 非空 Arrow batch 走 columnar append；含 null batch 保留原逐行语义。 |
 | P004 TimeSeriesEngine 全量 clone 和按行 key 分配 | 部分修复，剩余继续处理 | 无 id filter 的常见路径不再物化全量 row index Vec；状态 clone、String key 分配和 id interning 留待专项。 |
 | P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 非递减输入不再分配并排序全量 row index Vec；OwnedRow/concat 和多因子重复扫描留待专项。 |
 | P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 全量 snapshot replace 留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch，只物化请求列；zero-copy/chunked reader 留待专项。 |
-| P009 persisted parquet scan 串行与 filter 读后执行 | 部分修复，剩余继续处理 | persisted parquet 读取改为按 reader batch 逐块过滤，避免每文件过滤前先 concat；并行 scan/row-group pruning 留待专项。 |
+| P009 persisted parquet scan 串行与 filter 读后执行 | 已修复 streaming persisted scan 基础路径，row-group pruning 留待后续 | persisted streaming collect 支持按文件有界并行扫描、确定性输出顺序和逐 batch filter/project。 |
 | P010 Gateway write 全局 writers mutex 包住 flush | 部分修复，剩余继续处理 | writer map 改为 per-stream writer handle；已有 writer 的 `on_data/on_flush` 不再持有全局 map 锁。 |
 | P011 subscribe 固定 sleep 轮询 | 部分修复，剩余继续处理 | 本 gateway 写入成功后通知 subscribe idle wait；跨进程 active-segment notification 留待专项。 |
 | P012 benchmark 场景不能代表目标容量 | 部分修复，剩余跳过 | performance workflow 覆盖 3 个核心 profile；JSON 报告补充 git sha、target 和启动时间；完整容量矩阵仍需专项。 |
@@ -56,13 +56,22 @@
   - `collect_start`：返回 schema payload；
   - 多个 `collect_chunk`：每个 payload 是一个 Arrow IPC table chunk；
   - `collect_end`：返回 metrics。
+- `collect(stream=True)` 在 start 前拒绝 residual plan，提示使用默认 `collect()`。
+- persisted-only stream 直接从 parquet producer 输出 chunk；materialized live/snapshot/mixed segment 路径
+  保守 fallback 到现有 collect 后再切 chunk。
+- persisted stream 支持 `filter* -> select?` 和 `row_range -> select?` 的 streaming 语义；`row_range -> filter`
+  这类不可安全交换的计划继续 start 前拒绝。
 - `chunk_rows` 可由请求指定；本轮测试用 `chunk_rows=1` 验证多 chunk 行为。
+- streaming metrics 覆盖 `streaming`、`returned_rows`、`encode_elapsed_ms`、`write_elapsed_ms`、
+  `scanned_files`、`scanned_file_paths`、`row_range_pushdown` 和 `max_pending_file_results`。
+- Python 客户端会把 start 前普通 error frame 和 start 后 `collect_error` frame 都抛成清晰的
+  `RuntimeError`。
 
 边界：
 
-- 本轮修复的是协议和客户端显式 opt-in。Gateway 内部当前仍复用现有 collect 计算路径生成结果后再切
-  chunk，下一步还要把 scan/filter/project/encode 改成真正分块流水线。
 - 默认 collect 没变，避免破坏已有客户端和测试。
+- live active/sealed segment 仍没有 zero-copy/chunked reader；这部分留到 P008 的 segment/Arrow 读侧专项。
+- streaming collect 的并发、pending 和 chunk 大小目前是内部常量，后续需要暴露配置。
 
 ### P003 StreamTable columnar materialization
 
@@ -161,7 +170,7 @@
 - Utf8 和 nullable 列仍会在列投影时分配新 Arrow array。
 - query/subscribe 侧还需要逐块 reader，而不是先把大 span 一次性导出成单个 batch。
 
-### P009 Persisted parquet chunked filtering
+### P009 Persisted parquet streaming scan
 
 变更：
 
@@ -169,13 +178,19 @@
 - 普通 persisted scan 不再把每个 parquet 文件先 concat 成单个 batch 后过滤，而是逐 reader batch
   执行 projection/filter，再把非空结果交给上层统一 concat。
 - tail persisted scan 保留从新到旧读取文件和最终正序输出语义，同时按 chunk 过滤。
-- 旧单 batch parquet helper 已移除，避免热路径回到“先 concat 再过滤”。
+- `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，每批最多 4 个文件并行。
+- `OrderedGatewayFileResults` 按 file index 缓冲完成结果，保证并发扫描后输出仍按 catalog 顺序确定。
+- ordered result buffer 拒绝 duplicate/stale/gap，worker panic 映射为 `ZippyError`。
+- head/slice streaming 路径复用有界并行扫描后在 producer 层 skip/take；tail streaming 路径继续使用
+  tail helper 避免全量扫描。
+- tail helper 修复了单文件跨多个 parquet reader batch 时的 batch 顺序反转问题。
 
 边界：
 
-- 本轮没有引入 bounded scan pool；多个 persisted 文件仍按确定性顺序串行读取。
 - filter 仍是 Arrow batch 读后执行，还没有使用 parquet row-group statistics pruning。
 - `scanned_rows` 仍表示 projection 后、filter 前的实际扫描行数，指标语义保持不变。
+- 当前 bounded parallel 仍在 producer 构造阶段完成文件扫描，尚不是端到端背压式逐文件流式拉取。
+- parallelism、pending file results 和 parquet reader batch size 仍需后续配置化。
 
 ### P010 Gateway per-stream writer lock
 
@@ -242,7 +257,7 @@
 
 这些项目不适合在本轮直接改代码，因为它们会改变架构边界或核心状态模型：
 
-- Gateway 查询协议：P002、P009 剩余项。
+- Gateway 查询协议：P002/P009 的限流配置化、背压式逐文件拉取和 row-group pruning。
 - engine 状态存储模型：P004/P005/P006/P007 剩余项。
 - segment/Arrow 读侧内存模型：P008 剩余项。
 - Gateway 写入调度和订阅调度：P010、P011 剩余项。
@@ -251,7 +266,7 @@
 
 建议后续拆成六个专项：
 
-1. Gateway streaming collect + persisted parallel scan。
+1. Gateway streaming collect 配置化 + parquet row-group pruning。
 2. Engine columnar state model。
 3. Segment Arrow zero-copy/chunked reader。
 4. Gateway per-stream writer actor + notification-driven subscribe。
@@ -260,6 +275,12 @@
 
 ## 本轮验证
 
+- `cargo test -p zippy-gateway --lib`：通过。
+- `cargo test -p zippy-gateway --test native_gateway -- --test-threads=1`：通过。
+- `cargo clippy -p zippy-gateway --all-targets -- -D warnings`：通过。
+- `cargo fmt --check`：通过。
+- `uv run black --check python/zippy/__init__.py pytests/test_python_api.py`：通过。
+- `uv run pytest pytests/test_python_api.py -q -k "remote_collect_stream"`：2 个测试通过。
 - `cargo test -p zippy-engines -p zippy-operators -p zippy-segment-store -p zippy-gateway -p zippy-perf`：
   全部通过。
 - `cargo clippy -p zippy-engines -p zippy-operators -p zippy-segment-store -p zippy-gateway -p zippy-perf --all-targets -- -D warnings`：
