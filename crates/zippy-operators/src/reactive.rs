@@ -706,19 +706,12 @@ impl ReactiveFactor for TsEmaFactor {
 
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
         let (ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        let mut builder = Float64Builder::with_capacity(batch.num_rows());
+        self.evaluate_arrays(ids, values)
+    }
 
-        for index in 0..batch.num_rows() {
-            let id = ids.value(index);
-            let value = values.value(index);
-            let next = self
-                .state
-                .evaluate_optional(id, Some(value))?
-                .expect("ema emits a value for non-null input");
-            builder.append_value(next);
-        }
-
-        Ok(Arc::new(builder.finish()))
+    fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let (ids, values) = extract_context_columns(ctx, &self.id_field, &self.value_field)?;
+        self.evaluate_arrays(ids, values)
     }
 
     fn begin_transaction(&mut self) {
@@ -731,6 +724,24 @@ impl ReactiveFactor for TsEmaFactor {
 
     fn rollback_transaction(&mut self) -> Result<()> {
         self.state.rollback_transaction()
+    }
+}
+
+impl TsEmaFactor {
+    fn evaluate_arrays(&mut self, ids: &StringArray, values: &Float64Array) -> Result<ArrayRef> {
+        let mut builder = Float64Builder::with_capacity(values.len());
+
+        for index in 0..values.len() {
+            let id = ids.value(index);
+            let value = values.value(index);
+            let next = self
+                .state
+                .evaluate_optional(id, Some(value))?
+                .expect("ema emits a value for non-null input");
+            builder.append_value(next);
+        }
+
+        Ok(Arc::new(builder.finish()))
     }
 }
 
@@ -797,18 +808,12 @@ impl ReactiveFactor for WindowHistoryFactor {
 
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
         let (ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        let mut builder = Float64Builder::with_capacity(batch.num_rows());
+        self.evaluate_arrays(ids, values)
+    }
 
-        for index in 0..batch.num_rows() {
-            let id = ids.value(index);
-            let value = values.value(index);
-            match self.state.evaluate_optional(id, Some(value))? {
-                Some(value) => builder.append_value(value),
-                None => builder.append_null(),
-            }
-        }
-
-        Ok(Arc::new(builder.finish()))
+    fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let (ids, values) = extract_context_columns(ctx, &self.id_field, &self.value_field)?;
+        self.evaluate_arrays(ids, values)
     }
 
     fn begin_transaction(&mut self) {
@@ -821,6 +826,23 @@ impl ReactiveFactor for WindowHistoryFactor {
 
     fn rollback_transaction(&mut self) -> Result<()> {
         self.state.rollback_transaction()
+    }
+}
+
+impl WindowHistoryFactor {
+    fn evaluate_arrays(&mut self, ids: &StringArray, values: &Float64Array) -> Result<ArrayRef> {
+        let mut builder = Float64Builder::with_capacity(values.len());
+
+        for index in 0..values.len() {
+            let id = ids.value(index);
+            let value = values.value(index);
+            match self.state.evaluate_optional(id, Some(value))? {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
+        }
+
+        Ok(Arc::new(builder.finish()))
     }
 }
 
@@ -844,9 +866,20 @@ impl ReactiveFactor for UnaryFloatFactor {
 
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
         let (_ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
-        let mut builder = Float64Builder::with_capacity(batch.num_rows());
+        self.evaluate_values(values)
+    }
 
-        for index in 0..batch.num_rows() {
+    fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let (_ids, values) = extract_context_columns(ctx, &self.id_field, &self.value_field)?;
+        self.evaluate_values(values)
+    }
+}
+
+impl UnaryFloatFactor {
+    fn evaluate_values(&self, values: &Float64Array) -> Result<ArrayRef> {
+        let mut builder = Float64Builder::with_capacity(values.len());
+
+        for index in 0..values.len() {
             let value = values.value(index);
             let next = match self.kind {
                 UnaryFloatKind::Abs => value.abs(),
@@ -915,7 +948,17 @@ impl ReactiveFactor for CastFactor {
 
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<ArrayRef> {
         let (_ids, values) = extract_columns(batch, &self.id_field, &self.value_field)?;
+        self.evaluate_values(values)
+    }
 
+    fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let (_ids, values) = extract_context_columns(ctx, &self.id_field, &self.value_field)?;
+        self.evaluate_values(values)
+    }
+}
+
+impl CastFactor {
+    fn evaluate_values(&self, values: &Float64Array) -> Result<ArrayRef> {
         match self.kind {
             CastKind::Float64 => Ok(Arc::new(Float64Array::from(
                 (0..values.len())
@@ -975,6 +1018,30 @@ fn build_window_history_factor(
     }))
 }
 
+fn extract_context_columns<'a>(
+    ctx: &'a ReactiveFactorContext<'_>,
+    id_field: &str,
+    value_field: &str,
+) -> Result<(&'a StringArray, &'a Float64Array)> {
+    let id_array = ctx
+        .column_by_name(id_field)?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ZippyError::SchemaMismatch {
+            reason: format!("id field must be utf8 field=[{}]", id_field),
+        })?;
+    let value_array = ctx
+        .column_by_name(value_field)?
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| ZippyError::SchemaMismatch {
+            reason: format!("value field must be float64 field=[{}]", value_field),
+        })?;
+
+    validate_id_value_arrays(id_array, value_array, id_field, value_field)?;
+    Ok((id_array, value_array))
+}
+
 fn extract_columns<'a>(
     batch: &'a RecordBatch,
     id_field: &str,
@@ -1009,6 +1076,16 @@ fn extract_columns<'a>(
             reason: format!("value field must be float64 field=[{}]", value_field),
         })?;
 
+    validate_id_value_arrays(id_array, value_array, id_field, value_field)?;
+    Ok((id_array, value_array))
+}
+
+fn validate_id_value_arrays(
+    id_array: &StringArray,
+    value_array: &Float64Array,
+    id_field: &str,
+    value_field: &str,
+) -> Result<()> {
     if id_array.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {
             reason: format!("id field contains nulls field=[{}]", id_field),
@@ -1033,7 +1110,7 @@ fn extract_columns<'a>(
         }
     }
 
-    Ok((id_array, value_array))
+    Ok(())
 }
 
 #[cfg(test)]
