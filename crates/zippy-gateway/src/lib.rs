@@ -133,6 +133,16 @@ struct GatewayScanPushdown {
     projection_columns: Option<Vec<String>>,
 }
 
+struct GatewayCollectStreamPlan {
+    source: String,
+    snapshot_id: Option<String>,
+    plan: Vec<Value>,
+    row_range_pushdown: Option<(GatewayRowRangePushdown, usize)>,
+    scan_residual_start: usize,
+    scan_pushdown: GatewayScanPushdown,
+    chunk_rows: usize,
+}
+
 struct GatewayScannedBatch {
     batch: RecordBatch,
     scanned_rows: usize,
@@ -1773,15 +1783,29 @@ async fn handle_collect_stream_async(
     state: Arc<GatewayState>,
     header: Value,
 ) -> Result<()> {
-    let chunk_rows = header
-        .get("chunk_rows")
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(65_536);
+    let stream_plan = collect_stream_plan_from_header(header)?;
+    let chunk_rows = stream_plan.chunk_rows;
+    let _streamable_prefix = (
+        stream_plan.scan_residual_start,
+        stream_plan
+            .row_range_pushdown
+            .as_ref()
+            .map(|(pushdown, start)| (pushdown.op_name(), *start)),
+        stream_plan.scan_pushdown.filters.len(),
+        stream_plan
+            .scan_pushdown
+            .projection_columns
+            .as_ref()
+            .map(Vec::len),
+    );
+    let collect_header = json!({
+        "source": stream_plan.source,
+        "snapshot_id": stream_plan.snapshot_id,
+        "plan": stream_plan.plan,
+    });
     let state_for_request = Arc::clone(&state);
     let (response, payload) = run_blocking_request(Arc::clone(&state), move || {
-        state_for_request.handle_collect(header)
+        state_for_request.handle_collect(collect_header)
     })
     .await?;
     let batches = decode_ipc_batches(&payload)?;
@@ -2101,6 +2125,61 @@ fn record_gateway_error_metric(state: &GatewayState, error: &ZippyError) {
             metrics.request_timeouts_total += 1;
         }
     });
+}
+
+fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStreamPlan> {
+    let source = header
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "collect_stream requires source".to_string(),
+        })?
+        .to_string();
+    let plan = header
+        .get("plan")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let row_range_pushdown = collect_plan_row_range_prefix(&plan)?;
+    let row_range_residual_start = row_range_pushdown.map_or(0, |(_, start)| start);
+    let pushed_filter_count = collect_plan_leading_filter_count(&plan[row_range_residual_start..]);
+    let scan_residual_start = row_range_residual_start + pushed_filter_count;
+    let streamable_projection_count =
+        collect_plan_streamable_projection_count(&plan[scan_residual_start..])?;
+    let residual_start = scan_residual_start + streamable_projection_count;
+    let scan_pushdown = GatewayScanPushdown {
+        filters: plan[row_range_residual_start..scan_residual_start].to_vec(),
+        projection_columns: collect_plan_scan_projection_columns(
+            &plan[row_range_residual_start..],
+        )?,
+    };
+    if residual_start < plan.len() {
+        return Err(ZippyError::InvalidConfig {
+            reason: concat!(
+                "collect(stream=True) requires a fully streamable plan; ",
+                "use collect() for residual operations"
+            )
+            .to_string(),
+        });
+    }
+    let chunk_rows = header
+        .get("chunk_rows")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(65_536);
+    Ok(GatewayCollectStreamPlan {
+        source,
+        snapshot_id: header
+            .get("snapshot_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        plan,
+        row_range_pushdown,
+        scan_residual_start,
+        scan_pushdown,
+        chunk_rows,
+    })
 }
 
 fn decode_ipc_batches(payload: &[u8]) -> Result<Vec<RecordBatch>> {
@@ -3162,6 +3241,30 @@ fn collect_plan_leading_filter_count(plan: &[Value]) -> usize {
     plan.iter()
         .take_while(|op| op.get("op").and_then(Value::as_str) == Some("filter"))
         .count()
+}
+
+fn collect_plan_streamable_projection_count(plan: &[Value]) -> Result<usize> {
+    let Some(op) = plan.first() else {
+        return Ok(0);
+    };
+    if op.get("op").and_then(Value::as_str) != Some("select") {
+        return Ok(0);
+    }
+    let exprs =
+        op.get("exprs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: "select plan requires exprs".to_string(),
+            })?;
+    let all_columns = exprs.iter().all(|expr| {
+        expr.get("kind").and_then(Value::as_str) == Some("col")
+            && expr.get("value").and_then(Value::as_str).is_some()
+    });
+    if all_columns {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
 }
 
 fn collect_plan_projection_columns(plan: &[Value]) -> Option<Vec<String>> {
