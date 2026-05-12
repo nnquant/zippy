@@ -3378,10 +3378,7 @@ fn compaction_groups(
             continue;
         }
         let identities = persisted_segment_identities(item);
-        if identities
-            .iter()
-            .any(|identity| live_identities.contains(identity))
-        {
+        if segment_identities_overlap(&identities, &live_identities) {
             continue;
         }
         let key = persisted_compaction_group_key(item, &path);
@@ -3665,11 +3662,15 @@ fn compacted_persisted_file_metadata(
     let source_segments = group_files
         .iter()
         .flat_map(persisted_segment_identities)
-        .map(|(segment_id, generation)| {
-            serde_json::json!({
-                "source_segment_id": segment_id,
-                "source_generation": generation,
-            })
+        .map(|identity| {
+            let mut source_segment = serde_json::json!({
+                "source_segment_id": identity.segment_id,
+                "source_generation": identity.generation,
+            });
+            if let Some(writer_epoch) = identity.writer_epoch {
+                source_segment["writer_epoch"] = serde_json::json!(writer_epoch);
+            }
+            source_segment
         })
         .collect::<Vec<_>>();
     if !source_segments.is_empty() {
@@ -3762,45 +3763,87 @@ fn numeric_min_max(column: &ArrayRef) -> Option<(serde_json::Value, serde_json::
     }
 }
 
-fn live_segment_identities(stream: &StreamRecord) -> HashSet<(u64, u64)> {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct SegmentIdentity {
+    segment_id: u64,
+    generation: u64,
+    writer_epoch: Option<u64>,
+}
+
+fn live_segment_identities(stream: &StreamRecord) -> HashSet<SegmentIdentity> {
     let mut identities = HashSet::new();
     if let Some(identity) = stream
         .active_segment_descriptor
         .as_ref()
-        .and_then(segment_identity_from_value)
+        .and_then(descriptor_segment_identity_from_value)
     {
         identities.insert(identity);
     }
     for segment in &stream.sealed_segments {
-        if let Some(identity) = segment_identity_from_value(segment) {
+        if let Some(identity) = descriptor_segment_identity_from_value(segment) {
             identities.insert(identity);
         }
     }
     identities
 }
 
-fn persisted_segment_identities(value: &serde_json::Value) -> Vec<(u64, u64)> {
+fn persisted_segment_identities(value: &serde_json::Value) -> Vec<SegmentIdentity> {
     if let Some(source_segments) = value
         .get("source_segments")
         .and_then(serde_json::Value::as_array)
     {
         return source_segments
             .iter()
-            .filter_map(segment_identity_from_value)
+            .filter_map(persisted_segment_identity_from_value)
             .collect();
     }
-    segment_identity_from_value(value).into_iter().collect()
+    persisted_segment_identity_from_value(value)
+        .into_iter()
+        .collect()
 }
 
-fn segment_identity_from_value(value: &serde_json::Value) -> Option<(u64, u64)> {
-    Some((
-        value
-            .get("source_segment_id")
+fn descriptor_segment_identity_from_value(value: &serde_json::Value) -> Option<SegmentIdentity> {
+    segment_identity_from_value(value, "segment_id", "generation")
+}
+
+fn persisted_segment_identity_from_value(value: &serde_json::Value) -> Option<SegmentIdentity> {
+    segment_identity_from_value(value, "source_segment_id", "source_generation")
+}
+
+fn segment_identity_from_value(
+    value: &serde_json::Value,
+    segment_key: &str,
+    generation_key: &str,
+) -> Option<SegmentIdentity> {
+    Some(SegmentIdentity {
+        segment_id: value.get(segment_key).and_then(serde_json::Value::as_u64)?,
+        generation: value
+            .get(generation_key)
             .and_then(serde_json::Value::as_u64)?,
-        value
-            .get("source_generation")
-            .and_then(serde_json::Value::as_u64)?,
-    ))
+        writer_epoch: value
+            .get("writer_epoch")
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn segment_identities_overlap(
+    persisted: &[SegmentIdentity],
+    live: &HashSet<SegmentIdentity>,
+) -> bool {
+    persisted.iter().any(|persisted_identity| {
+        live.iter()
+            .any(|live_identity| segment_identity_matches(*persisted_identity, *live_identity))
+    })
+}
+
+fn segment_identity_matches(left: SegmentIdentity, right: SegmentIdentity) -> bool {
+    if left.segment_id != right.segment_id || left.generation != right.generation {
+        return false;
+    }
+    match (left.writer_epoch, right.writer_epoch) {
+        (Some(left_epoch), Some(right_epoch)) => left_epoch == right_epoch,
+        _ => true,
+    }
 }
 
 fn persisted_compaction_group_key(item: &serde_json::Value, path: &Path) -> String {
@@ -4240,5 +4283,74 @@ mod tests {
     #[test]
     fn accept_loop_idle_sleep_stays_below_control_plane_latency_budget() {
         assert!(MASTER_ACCEPT_IDLE_SLEEP <= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn compaction_groups_keep_persisted_file_when_writer_epoch_differs_from_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("segment-1-epoch-1.parquet");
+        std::fs::write(&file_path, []).unwrap();
+        let stream = stream_record_for_segment_identity_test(serde_json::json!({
+            "segment_id": 1,
+            "generation": 0,
+            "writer_epoch": 2,
+        }));
+        let persisted_files = vec![serde_json::json!({
+            "file_path": file_path.to_string_lossy(),
+            "source_segment_id": 1,
+            "source_generation": 0,
+            "writer_epoch": 1,
+        })];
+
+        let groups = compaction_groups(&persisted_files, &stream);
+
+        assert_eq!(
+            groups.values().map(Vec::len).sum::<usize>(),
+            1,
+            "different writer_epoch identifies a different writer lifetime"
+        );
+    }
+
+    #[test]
+    fn compaction_groups_skip_persisted_file_when_writer_epoch_matches_live() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("segment-1-epoch-2.parquet");
+        std::fs::write(&file_path, []).unwrap();
+        let stream = stream_record_for_segment_identity_test(serde_json::json!({
+            "segment_id": 1,
+            "generation": 0,
+            "writer_epoch": 2,
+        }));
+        let persisted_files = vec![serde_json::json!({
+            "file_path": file_path.to_string_lossy(),
+            "source_segment_id": 1,
+            "source_generation": 0,
+            "writer_epoch": 2,
+        })];
+
+        let groups = compaction_groups(&persisted_files, &stream);
+
+        assert!(groups.is_empty());
+    }
+
+    fn stream_record_for_segment_identity_test(
+        active_segment_descriptor: serde_json::Value,
+    ) -> StreamRecord {
+        serde_json::from_value(serde_json::json!({
+            "stream_name": "ctp_ticks",
+            "schema": {},
+            "schema_hash": "schema-a",
+            "data_path": "",
+            "descriptor_generation": 1,
+            "buffer_size": 1024,
+            "frame_size": 256,
+            "writer_process_id": null,
+            "writer_epoch": 2,
+            "reader_count": 0,
+            "status": "active",
+            "active_segment_descriptor": active_segment_descriptor,
+            "reader_process_ids": {},
+        }))
+        .unwrap()
     }
 }

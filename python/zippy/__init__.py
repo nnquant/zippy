@@ -1792,7 +1792,7 @@ def _persisted_compaction_groups(
     live_identities = _live_segment_identities(stream)
     for item in persisted_files:
         identities = _persisted_segment_identities(item)
-        if identities and identities & live_identities:
+        if identities and _segment_identities_overlap(identities, live_identities):
             continue
         path = _validated_persisted_file_local_path(item)
         if not path.exists():
@@ -1964,14 +1964,19 @@ def _compacted_persisted_file_metadata(
     sort_columns: list[str],
 ) -> dict[str, object]:
     first_file = group_files[0]
-    source_segments = [
-        {
-            "source_segment_id": identity[0],
-            "source_generation": identity[1],
-        }
-        for item in group_files
-        for identity in sorted(_persisted_segment_identities(item))
-    ]
+    source_segments = []
+    for item in group_files:
+        for identity in sorted(
+            _persisted_segment_identities(item),
+            key=_segment_identity_order_key,
+        ):
+            source_segment = {
+                "source_segment_id": identity[0],
+                "source_generation": identity[1],
+            }
+            if identity[2] is not None:
+                source_segment["writer_epoch"] = identity[2]
+            source_segments.append(source_segment)
     digest = hashlib.sha1(
         "|".join(
             str(item.get("persist_file_id") or item.get("file_path")) for item in group_files
@@ -4723,11 +4728,11 @@ def _non_overlapping_persisted_files(
         for item in snapshot.get("persisted_files", [])
         if isinstance(item, dict)
         and item.get("file_path")
-        and not (_persisted_segment_identities(item) & live_identities)
+        and not _segment_identities_overlap(_persisted_segment_identities(item), live_identities)
     ]
 
 
-def _persisted_segment_identities(value: dict[str, object]) -> set[tuple[int, int]]:
+def _persisted_segment_identities(value: dict[str, object]) -> set[tuple[int, int, int | None]]:
     source_segments = value.get("source_segments")
     if isinstance(source_segments, list):
         identities = {
@@ -4857,8 +4862,8 @@ def _schema_for_query_columns(schema: object | None, columns: list[str] | None):
     return pa.schema(fields)
 
 
-def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int]]:
-    identities: set[tuple[int, int]] = set()
+def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int, int | None]]:
+    identities: set[tuple[int, int, int | None]] = set()
     active_identity = _descriptor_segment_identity(snapshot.get("active_segment_descriptor"))
     if active_identity is not None:
         identities.add(active_identity)
@@ -4870,17 +4875,25 @@ def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int]
     return identities
 
 
-def _descriptor_segment_identity(value: object) -> tuple[int, int] | None:
+def _descriptor_segment_identity(value: object) -> tuple[int, int, int | None] | None:
     if not isinstance(value, dict):
         return None
-    return _segment_identity(value.get("segment_id"), value.get("generation"))
+    return _segment_identity_with_writer_epoch(value, "segment_id", "generation")
 
 
-def _persisted_segment_identity(value: dict[str, object]) -> tuple[int, int] | None:
-    return _segment_identity(
-        value.get("source_segment_id"),
-        value.get("source_generation"),
-    )
+def _persisted_segment_identity(value: dict[str, object]) -> tuple[int, int, int | None] | None:
+    return _segment_identity_with_writer_epoch(value, "source_segment_id", "source_generation")
+
+
+def _segment_identity_with_writer_epoch(
+    value: dict[str, object],
+    segment_key: str,
+    generation_key: str,
+) -> tuple[int, int, int | None] | None:
+    identity = _segment_identity(value.get(segment_key), value.get(generation_key))
+    if identity is None:
+        return None
+    return (identity[0], identity[1], _writer_epoch_identity(value.get("writer_epoch")))
 
 
 def _segment_identity(segment_id: object, generation: object) -> tuple[int, int] | None:
@@ -4890,6 +4903,41 @@ def _segment_identity(segment_id: object, generation: object) -> tuple[int, int]
         return (int(segment_id), int(generation))
     except (TypeError, ValueError):
         return None
+
+
+def _writer_epoch_identity(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _segment_identities_overlap(
+    left: set[tuple[int, int, int | None]],
+    right: set[tuple[int, int, int | None]],
+) -> bool:
+    return any(
+        _segment_identity_matches(left_identity, right_identity)
+        for left_identity in left
+        for right_identity in right
+    )
+
+
+def _segment_identity_matches(
+    left: tuple[int, int, int | None],
+    right: tuple[int, int, int | None],
+) -> bool:
+    if left[0] != right[0] or left[1] != right[1]:
+        return False
+    if left[2] is None or right[2] is None:
+        return True
+    return left[2] == right[2]
+
+
+def _segment_identity_order_key(value: tuple[int, int, int | None]) -> tuple[int, int, int]:
+    return (value[0], value[1], -1 if value[2] is None else value[2])
 
 
 def _persisted_file_order_key(value: dict[str, object]) -> tuple[int, int, int, str]:

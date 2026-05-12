@@ -8444,6 +8444,82 @@ def test_query_collect_and_reader_merge_persisted_and_live_without_duplicates(
     ]
 
 
+def test_query_collect_keeps_persisted_file_when_writer_epoch_differs_from_live(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    persisted_file = tmp_path / "segment-1-epoch-1.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2604"],
+                "last_price": [4099.5],
+            },
+            schema=schema,
+        ),
+        persisted_file,
+    )
+    live_batch = pa.record_batch(
+        {
+            "instrument_id": ["IF2606"],
+            "last_price": [4101.5],
+        },
+        schema=schema,
+    )
+    snapshot = {
+        "stream_name": "ctp_ticks",
+        "schema_hash": "abc",
+        "active_segment_descriptor": {
+            "segment_id": 1,
+            "generation": 0,
+            "writer_epoch": 2,
+        },
+        "active_committed_row_high_watermark": 1,
+        "sealed_segments": [],
+        "persisted_files": [
+            {
+                "file_path": str(persisted_file),
+                "persist_data_root": str(tmp_path),
+                "row_count": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "writer_epoch": 1,
+            },
+        ],
+        "descriptor_generation": 3,
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def scan_live(self) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, [live_batch])
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    query = zippy.read_table("ctp_ticks", master=explicit_master)
+
+    collected = query.collect()
+
+    assert collected.column("instrument_id").to_pylist() == ["IF2604", "IF2606"]
+    assert collected.column("last_price").to_pylist() == [4099.5, 4101.5]
+
+
 def test_query_conversion_helpers_use_collect(monkeypatch) -> None:
     schema = pa.schema(
         [
