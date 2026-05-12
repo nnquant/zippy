@@ -9,7 +9,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Result, ZippyError};
 
-use crate::reactive::{ReactiveFactor, StatefulFloatById, StatefulFloatKind};
+use crate::reactive::{
+    ReactiveFactor, ReactiveFactorContext, StatefulFloatById, StatefulFloatKind,
+};
 
 const EXPRESSION_LOG_INPUT_MUST_BE_POSITIVE: &str = "expression log input must be positive";
 const EXPRESSION_CLIP_BOUNDS_INVALID: &str = "expression clip bounds invalid";
@@ -87,6 +89,16 @@ impl ReactiveFactor for ExpressionFactor {
 
         build_output_array(self.output_field.data_type(), values)
     }
+
+    fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let mut values = Vec::with_capacity(ctx.num_rows());
+
+        for row in 0..ctx.num_rows() {
+            values.push(evaluate_expr_context(&self.ast, ctx, row)?);
+        }
+
+        build_output_array(self.output_field.data_type(), values)
+    }
 }
 
 struct PlannedExpressionFactor {
@@ -146,6 +158,66 @@ impl ReactiveFactor for PlannedExpressionFactor {
                 let value = match &node.kind {
                     ReactivePlanNodeKind::Input { field } => {
                         extract_batch_value(batch, field, row)?
+                    }
+                    ReactivePlanNodeKind::Literal(PlanLiteral::Number(value)) => {
+                        EvalValue::Float64(*value)
+                    }
+                    ReactivePlanNodeKind::Literal(PlanLiteral::String(value)) => {
+                        EvalValue::String(value.clone())
+                    }
+                    ReactivePlanNodeKind::ColumnOp { op, inputs } => {
+                        evaluate_planned_column_op(*op, inputs, &row_values)?
+                    }
+                    ReactivePlanNodeKind::TsOp { op: _, inputs } => {
+                        let input = row_values[inputs[0].as_usize()].clone();
+                        let state = self.node_states[node.id.as_usize()]
+                            .as_mut()
+                            .expect("ts state initialized for ts nodes");
+                        match state.evaluate_optional(id, input.as_f64()?)? {
+                            Some(value) => EvalValue::Float64(value),
+                            None => EvalValue::Null,
+                        }
+                    }
+                };
+                row_values.push(value);
+            }
+
+            output_values.push(row_values[self.plan.output_node.as_usize()].clone());
+        }
+
+        build_output_array(self.plan.output_field.data_type(), output_values)
+    }
+
+    fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
+        let id_index = ctx.index_of(self.plan.id_field()).map_err(|_| {
+            ZippyError::SchemaMismatch {
+                reason: format!("missing utf8 id field field=[{}]", self.plan.id_field()),
+            }
+        })?;
+        let id_array = ctx
+            .column(id_index)?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ZippyError::SchemaMismatch {
+                reason: format!("id field must be utf8 field=[{}]", self.plan.id_field()),
+            })?;
+
+        if id_array.null_count() > 0 {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!("id field contains nulls field=[{}]", self.plan.id_field()),
+            });
+        }
+
+        let mut output_values = Vec::with_capacity(ctx.num_rows());
+
+        for row in 0..ctx.num_rows() {
+            let id = id_array.value(row);
+            let mut row_values = Vec::with_capacity(self.plan.nodes.len());
+
+            for node in &self.plan.nodes {
+                let value = match &node.kind {
+                    ReactivePlanNodeKind::Input { field } => {
+                        extract_context_value(ctx, field, row)?
                     }
                     ReactivePlanNodeKind::Literal(PlanLiteral::Number(value)) => {
                         EvalValue::Float64(*value)
@@ -1366,6 +1438,104 @@ fn evaluate_expr(expr: &TypedExpr, batch: &RecordBatch, row: usize) -> Result<Ev
     }
 }
 
+fn evaluate_expr_context(
+    expr: &TypedExpr,
+    ctx: &ReactiveFactorContext<'_>,
+    row: usize,
+) -> Result<EvalValue> {
+    match &expr.kind {
+        TypedExprKind::Number(value) => Ok(EvalValue::Float64(*value)),
+        TypedExprKind::String(value) => Ok(EvalValue::String(value.clone())),
+        TypedExprKind::Identifier(name) => extract_context_value(ctx, name, row),
+        TypedExprKind::UnaryNeg(inner) => {
+            let value = evaluate_expr_context(inner, ctx, row)?;
+            match value.as_f64()? {
+                Some(value) => Ok(EvalValue::Float64(-value)),
+                None => Ok(EvalValue::Null),
+            }
+        }
+        TypedExprKind::Binary { op, left, right } => {
+            let left = evaluate_expr_context(left, ctx, row)?;
+            let right = evaluate_expr_context(right, ctx, row)?;
+            let Some(left) = left.as_f64()? else {
+                return Ok(EvalValue::Null);
+            };
+            let Some(right) = right.as_f64()? else {
+                return Ok(EvalValue::Null);
+            };
+
+            let value = match op {
+                BinaryOp::Add => left + right,
+                BinaryOp::Sub => left - right,
+                BinaryOp::Mul => left * right,
+                BinaryOp::Div => {
+                    if right == 0.0 {
+                        return Ok(EvalValue::Null);
+                    }
+                    left / right
+                }
+            };
+
+            Ok(EvalValue::Float64(value))
+        }
+        TypedExprKind::Function { kind, args } => match kind {
+            FunctionKind::Abs => {
+                let value = evaluate_expr_context(&args[0], ctx, row)?;
+                match value.as_f64()? {
+                    Some(value) => Ok(EvalValue::Float64(value.abs())),
+                    None => Ok(EvalValue::Null),
+                }
+            }
+            FunctionKind::Log => {
+                let value = evaluate_expr_context(&args[0], ctx, row)?;
+                match value.as_f64()? {
+                    Some(value) => {
+                        if value <= 0.0 {
+                            return Err(ZippyError::InvalidState {
+                                status: EXPRESSION_LOG_INPUT_MUST_BE_POSITIVE,
+                            });
+                        }
+                        Ok(EvalValue::Float64(value.ln()))
+                    }
+                    None => Ok(EvalValue::Null),
+                }
+            }
+            FunctionKind::Clip => {
+                let value = evaluate_expr_context(&args[0], ctx, row)?;
+                let min = evaluate_expr_context(&args[1], ctx, row)?;
+                let max = evaluate_expr_context(&args[2], ctx, row)?;
+
+                let Some(value) = value.as_f64()? else {
+                    return Ok(EvalValue::Null);
+                };
+                let Some(min) = min.as_f64()? else {
+                    return Ok(EvalValue::Null);
+                };
+                let Some(max) = max.as_f64()? else {
+                    return Ok(EvalValue::Null);
+                };
+                if min > max {
+                    return Err(ZippyError::InvalidState {
+                        status: EXPRESSION_CLIP_BOUNDS_INVALID,
+                    });
+                }
+
+                Ok(EvalValue::Float64(value.clamp(min, max)))
+            }
+            FunctionKind::Cast(kind) => {
+                let value = evaluate_expr_context(&args[0], ctx, row)?;
+                cast_value(*kind, value)
+            }
+            FunctionKind::TsEma { .. }
+            | FunctionKind::TsMean { .. }
+            | FunctionKind::TsStd { .. }
+            | FunctionKind::TsDelay { .. }
+            | FunctionKind::TsDiff { .. }
+            | FunctionKind::TsReturn { .. } => Err(kind.reactive_planner_error()),
+        },
+    }
+}
+
 fn cast_value(kind: CastKind, value: EvalValue) -> Result<EvalValue> {
     match kind {
         CastKind::Float64 => match value.as_f64()? {
@@ -1493,11 +1663,34 @@ fn extract_batch_value(batch: &RecordBatch, name: &str, row: usize) -> Result<Ev
     let field = schema.field(index);
     let array = batch.column(index);
 
+    extract_array_value(array, field.data_type(), name, row)
+}
+
+fn extract_context_value(
+    ctx: &ReactiveFactorContext<'_>,
+    name: &str,
+    row: usize,
+) -> Result<EvalValue> {
+    let index = ctx.index_of(name).map_err(|_| ZippyError::SchemaMismatch {
+        reason: format!("missing expression field field=[{}]", name),
+    })?;
+    let field = ctx.schema().field(index);
+    let array = ctx.column(index)?;
+
+    extract_array_value(array, field.data_type(), name, row)
+}
+
+fn extract_array_value(
+    array: &ArrayRef,
+    data_type: &DataType,
+    name: &str,
+    row: usize,
+) -> Result<EvalValue> {
     if array.is_null(row) {
         return Ok(EvalValue::Null);
     }
 
-    match field.data_type() {
+    match data_type {
         DataType::Float64 => Ok(EvalValue::Float64(
             array
                 .as_any()
