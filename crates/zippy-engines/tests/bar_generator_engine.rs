@@ -507,8 +507,8 @@ fn bar_generator_emits_completed_delta_bar_on_minute_transition() {
     assert_eq!(output[0].num_rows(), 1);
     assert_eq!(string_column(&output[0], "instrument_id"), vec!["rb2601"]);
     assert_eq!(ts_column(&output[0], "start_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&output[0], "close_dt"), vec![45 * SECOND_NS]);
-    assert_eq!(ts_column(&output[0], "end_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&output[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&output[0], "end_dt"), vec![45 * SECOND_NS]);
     assert_eq!(ts_column(&output[0], "dt"), vec![MINUTE_NS]);
     assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&output[0], "high"), vec![12.0]);
@@ -833,11 +833,11 @@ fn bar_generator_uses_profile_timezone_for_real_shanghai_epoch() {
     );
     assert_eq!(
         ts_column(&output[0], "close_dt"),
-        vec![SHANGHAI_2026_05_08_09_30_30_NS]
+        vec![SHANGHAI_2026_05_08_09_31_00_NS]
     );
     assert_eq!(
         ts_column(&output[0], "end_dt"),
-        vec![SHANGHAI_2026_05_08_09_31_00_NS]
+        vec![SHANGHAI_2026_05_08_09_30_30_NS]
     );
     assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
 }
@@ -964,11 +964,11 @@ fn bar_generator_auction_bounds_support_cross_midnight_window() {
     );
     assert_eq!(
         ts_column(&output[0], "close_dt"),
-        vec![SHANGHAI_2026_05_09_01_00_00_NS]
+        vec![SHANGHAI_2026_05_09_02_30_00_NS]
     );
     assert_eq!(
         ts_column(&output[0], "end_dt"),
-        vec![SHANGHAI_2026_05_09_02_30_00_NS]
+        vec![SHANGHAI_2026_05_09_01_00_00_NS]
     );
     assert_eq!(f64_column(&output[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&output[0], "close"), vec![11.0]);
@@ -1035,8 +1035,8 @@ fn bar_generator_auction_merge_to_first_regular_bar_includes_auction_tick() {
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].num_rows(), 1);
     assert_eq!(ts_column(&flushed[0], "start_dt"), vec![15 * SECOND_NS]);
-    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![45 * SECOND_NS]);
-    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![45 * SECOND_NS]);
     assert_eq!(f64_column(&flushed[0], "open"), vec![9.0]);
     assert_eq!(f64_column(&flushed[0], "high"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "low"), vec![8.0]);
@@ -1175,8 +1175,8 @@ fn bar_generator_auction_merge_cumulative_empty_baseline_uses_regular_window() {
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].num_rows(), 1);
     assert_eq!(ts_column(&flushed[0], "start_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![30 * SECOND_NS]);
     assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "close"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0]);
@@ -1213,8 +1213,8 @@ fn bar_generator_auction_emit_cumulative_empty_baseline_uses_regular_window() {
     assert_eq!(flushed.len(), 1);
     assert_eq!(flushed[0].num_rows(), 1);
     assert_eq!(ts_column(&flushed[0], "start_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![30 * SECOND_NS]);
     assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "close"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0]);
@@ -1252,11 +1252,11 @@ fn bar_generator_auction_merge_cumulative_cross_minute_uses_regular_window() {
         ts_column(&flushed[0], "start_dt"),
         vec![MINUTE_NS + 30 * SECOND_NS]
     );
+    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![2 * MINUTE_NS]);
     assert_eq!(
-        ts_column(&flushed[0], "close_dt"),
+        ts_column(&flushed[0], "end_dt"),
         vec![MINUTE_NS + 30 * SECOND_NS]
     );
-    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![2 * MINUTE_NS]);
     assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0]);
     assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![33.0]);
@@ -1293,11 +1293,11 @@ fn bar_generator_auction_emit_cumulative_cross_minute_uses_regular_window() {
         ts_column(&flushed[0], "start_dt"),
         vec![MINUTE_NS + 30 * SECOND_NS]
     );
+    assert_eq!(ts_column(&flushed[0], "close_dt"), vec![2 * MINUTE_NS]);
     assert_eq!(
-        ts_column(&flushed[0], "close_dt"),
+        ts_column(&flushed[0], "end_dt"),
         vec![MINUTE_NS + 30 * SECOND_NS]
     );
-    assert_eq!(ts_column(&flushed[0], "end_dt"), vec![2 * MINUTE_NS]);
     assert_eq!(f64_column(&flushed[0], "open"), vec![10.0]);
     assert_eq!(f64_column(&flushed[0], "volume"), vec![3.0]);
     assert_eq!(f64_column(&flushed[0], "total_turnover"), vec![33.0]);
@@ -1339,11 +1339,11 @@ fn bar_generator_auction_emit_separate_bar_outputs_auction_window_bar() {
     );
     assert_eq!(
         ts_column(&flushed[0], "close_dt"),
-        vec![15_000_000_000, 30_000_000_000]
+        vec![20_000_000_000, MINUTE_NS]
     );
     assert_eq!(
         ts_column(&flushed[0], "end_dt"),
-        vec![20_000_000_000, MINUTE_NS]
+        vec![15_000_000_000, 30_000_000_000]
     );
     assert_eq!(f64_column(&flushed[0], "open"), vec![9.0, 10.0]);
     assert_eq!(f64_column(&flushed[0], "close"), vec![9.0, 10.0]);
@@ -1382,11 +1382,11 @@ fn bar_generator_auction_emit_separate_bar_streams_before_regular_tick() {
     );
     assert_eq!(
         ts_column(&output[0], "close_dt"),
-        vec![SHANGHAI_2026_05_08_09_20_30_NS]
+        vec![SHANGHAI_2026_05_08_09_25_00_NS]
     );
     assert_eq!(
         ts_column(&output[0], "end_dt"),
-        vec![SHANGHAI_2026_05_08_09_25_00_NS]
+        vec![SHANGHAI_2026_05_08_09_20_30_NS]
     );
     assert_eq!(f64_column(&output[0], "open"), vec![9.0]);
     assert_eq!(f64_column(&output[0], "volume"), vec![2.0]);
@@ -1514,8 +1514,8 @@ fn bar_generator_uses_start_dt_label_when_configured() {
     assert_eq!(output[0].num_rows(), 1);
     assert_eq!(ts_column(&output[0], "dt"), vec![0]);
     assert_eq!(ts_column(&output[0], "start_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&output[0], "close_dt"), vec![30 * SECOND_NS]);
-    assert_eq!(ts_column(&output[0], "end_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&output[0], "close_dt"), vec![MINUTE_NS]);
+    assert_eq!(ts_column(&output[0], "end_dt"), vec![30 * SECOND_NS]);
 }
 
 #[test]

@@ -154,11 +154,11 @@ num_trades, limit_up, limit_down, start_dt, close_dt, end_dt
 
 ```text
 start_dt = 第一根 tick 的精确时间，例如 09:30:00.500
-close_dt = 最后一根 tick 的精确时间，例如 09:30:58.000
-end_dt = 分钟窗口结束边界，例如 09:31:00
+close_dt = 分钟窗口结束边界，例如 09:31:00
+end_dt = 最后一根 tick 的精确时间，例如 09:30:58.000
 ```
 
-默认 `dt_label="close_dt"`，即 `dt` 使用窗口结束边界 `end_dt`。若 profile 指定
+默认 `dt_label="close_dt"`，即 `dt` 使用窗口结束边界 `close_dt`。若 profile 指定
 `start_dt`，则 `dt` 使用窗口起点。`dt` 是 K 线标签时间，不是 tick 精确时间。
 
 ### 非交易时段 tick
@@ -178,8 +178,8 @@ end_dt = 分钟窗口结束边界，例如 09:31:00
 - `drop`：不输出竞价 K 线，但可以更新累计成交基线，避免开盘第一根普通 K 线误吃竞价成交。
 - `merge_to_first_regular_bar`：竞价成交归入下一根普通分钟 K 线，例如 A 股 9:25 开盘价归入
   9:31 第一根分钟 K。
-- `emit_separate_bar`：为竞价单独输出一根 bar，`start_dt/close_dt` 来自竞价 tick，
-  `end_dt` 来自 profile 的竞价区间结束边界。
+- `emit_separate_bar`：为竞价单独输出一根 bar，`start_dt/end_dt` 来自竞价 tick，
+  `close_dt` 来自 profile 的竞价区间结束边界。
 
 OpenCTP 期货默认使用 `drop`。A 股插件可以默认或显式选择 `merge_to_first_regular_bar`。
 
@@ -270,7 +270,7 @@ Rust 测试：
 - 盘中冷启动 `skip_first_delta` 不制造假成交量。
 - `from_zero` replay 模式从第一条 tick 产生增量。
 - 集合竞价三种 policy。
-- `dt_label` 的 `close_dt` 和 `start_dt`，以及窗口边界 `end_dt`。
+- `dt_label` 的 `close_dt` 和 `start_dt`，以及最后 tick 时间 `end_dt`。
 - 缺少 `num_trades/limit_up/limit_down` 时输出 nullable 列。
 - 输入 schema 错误和 profile 错误。
 
