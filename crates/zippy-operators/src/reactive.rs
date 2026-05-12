@@ -110,9 +110,11 @@ impl<'a> ReactiveFactorContext<'a> {
 
     /// Resolve a field name to a column index.
     pub fn index_of(&self, field: &str) -> Result<usize> {
-        self.schema.index_of(field).map_err(|_| ZippyError::SchemaMismatch {
-            reason: format!("missing reactive factor field field=[{}]", field),
-        })
+        self.schema
+            .index_of(field)
+            .map_err(|_| ZippyError::SchemaMismatch {
+                reason: format!("missing reactive factor field field=[{}]", field),
+            })
     }
 
     /// Return a column by index.
@@ -120,7 +122,10 @@ impl<'a> ReactiveFactorContext<'a> {
         self.columns
             .get(index)
             .ok_or_else(|| ZippyError::SchemaMismatch {
-                reason: format!("reactive factor column index out of bounds index=[{}]", index),
+                reason: format!(
+                    "reactive factor column index out of bounds index=[{}]",
+                    index
+                ),
             })
     }
 
@@ -134,7 +139,10 @@ impl<'a> ReactiveFactorContext<'a> {
     pub fn record_batch(&self) -> Result<RecordBatch> {
         RecordBatch::try_new(Arc::clone(&self.schema), self.columns.to_vec()).map_err(|error| {
             ZippyError::Io {
-                reason: format!("failed to build reactive context fallback batch error=[{}]", error),
+                reason: format!(
+                    "failed to build reactive context fallback batch error=[{}]",
+                    error
+                ),
             }
         })
     }

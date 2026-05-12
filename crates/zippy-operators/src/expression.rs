@@ -189,11 +189,11 @@ impl ReactiveFactor for PlannedExpressionFactor {
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
-        let id_index = ctx.index_of(self.plan.id_field()).map_err(|_| {
-            ZippyError::SchemaMismatch {
-                reason: format!("missing utf8 id field field=[{}]", self.plan.id_field()),
-            }
-        })?;
+        let id_index =
+            ctx.index_of(self.plan.id_field())
+                .map_err(|_| ZippyError::SchemaMismatch {
+                    reason: format!("missing utf8 id field field=[{}]", self.plan.id_field()),
+                })?;
         let id_array = ctx
             .column(id_index)?
             .as_any()
