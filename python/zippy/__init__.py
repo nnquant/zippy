@@ -2693,10 +2693,13 @@ def _remote_collect_stream_request(
             _send_remote_frame(sock, header)
             while True:
                 response, payload = _recv_remote_frame(sock)
+                kind = response.get("kind")
+                if kind == "collect_error":
+                    reason = response.get("reason", "remote collect stream failed")
+                    raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
                 if response.get("status") != "ok":
                     reason = response.get("reason", "unknown remote gateway error")
                     raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
-                kind = response.get("kind")
                 if kind == "collect_start":
                     if payload:
                         schema = _pyarrow_schema_from_ipc(payload)

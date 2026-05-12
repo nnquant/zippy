@@ -11193,6 +11193,32 @@ def test_remote_collect_stream_true_opts_into_streaming_protocol(monkeypatch) ->
     assert stream_flags == [False, True]
 
 
+def test_remote_collect_stream_raises_on_collect_error(monkeypatch) -> None:
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    frames = iter(
+        [
+            ({"status": "ok", "kind": "collect_start"}, b""),
+            ({"status": "error", "kind": "collect_error", "reason": "scan failed"}, b""),
+        ]
+    )
+
+    monkeypatch.setattr(zippy.socket, "create_connection", lambda *args, **kwargs: FakeSocket())
+    monkeypatch.setattr(zippy, "_send_remote_frame", lambda *args, **kwargs: None)
+    monkeypatch.setattr(zippy, "_recv_remote_frame", lambda *args, **kwargs: next(frames))
+
+    with pytest.raises(RuntimeError, match="scan failed"):
+        zippy._remote_collect_stream_request(
+            "tcp://127.0.0.1:17691",
+            {"kind": "collect", "source": "ticks", "plan": []},
+        )
+
+
 def test_remote_collect_sends_temporal_string_filter_as_typed_boundaries(monkeypatch) -> None:
     schema = pa.schema([("dt", pa.timestamp("ns", tz="Asia/Shanghai"))])
     sent_plans: list[list[dict[str, object]]] = []
