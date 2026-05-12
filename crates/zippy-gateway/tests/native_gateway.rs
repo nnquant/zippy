@@ -1100,6 +1100,7 @@ fn native_gateway_collect_stream_returns_start_chunks_and_end_frames() {
     assert_eq!(frames[1].0["kind"], "collect_chunk");
     assert_eq!(frames[2].0["kind"], "collect_chunk");
     assert_eq!(frames[3].0["kind"], "collect_end");
+    assert_eq!(frames[3].0["metrics"]["returned_rows"], json!(2));
     assert_eq!(frames[3].0["metrics"]["streaming"], json!(true));
 
     let first_chunk = decode_ipc_batch(&frames[1].1);

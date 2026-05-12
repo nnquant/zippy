@@ -145,15 +145,17 @@ enum GatewayCollectStreamProducer {
         batch: RecordBatch,
         chunk_rows: usize,
         offset: usize,
+        metrics: Value,
     },
 }
 
 impl GatewayCollectStreamProducer {
-    fn materialized(batch: RecordBatch, chunk_rows: usize) -> Self {
+    fn materialized_with_metrics(batch: RecordBatch, chunk_rows: usize, metrics: Value) -> Self {
         Self::Materialized {
             batch,
             chunk_rows: chunk_rows.max(1),
             offset: 0,
+            metrics,
         }
     }
 
@@ -163,12 +165,19 @@ impl GatewayCollectStreamProducer {
         }
     }
 
+    fn metrics(&self) -> &Value {
+        match self {
+            Self::Materialized { metrics, .. } => metrics,
+        }
+    }
+
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self {
             Self::Materialized {
                 batch,
                 chunk_rows,
                 offset,
+                ..
             } => {
                 if *offset >= batch.num_rows() {
                     return Ok(None);
@@ -819,7 +828,19 @@ impl GatewayState {
         if let Some(snapshot_id) = stream_plan.snapshot_id {
             collect_header["snapshot_id"] = json!(snapshot_id);
         }
-        let (_response, payload) = self.handle_collect(collect_header)?;
+        let (response, payload) = self.handle_collect(collect_header)?;
+        let mut metrics = response
+            .get("metrics")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if let Some(object) = metrics.as_object_mut() {
+            object.insert("streaming".to_string(), json!(true));
+        } else {
+            metrics = json!({
+                "collect_metrics": metrics,
+                "streaming": true,
+            });
+        }
         let batches = decode_ipc_batches(&payload)?;
         let batch = concat_record_batches(
             batches
@@ -828,9 +849,10 @@ impl GatewayState {
                 .unwrap_or_else(|| Arc::new(Schema::empty())),
             batches,
         )?;
-        Ok(GatewayCollectStreamProducer::materialized(
+        Ok(GatewayCollectStreamProducer::materialized_with_metrics(
             batch,
             stream_plan.chunk_rows,
+            metrics,
         ))
     }
 
@@ -1892,13 +1914,14 @@ async fn handle_collect_stream_async(
         chunk_index += 1;
     }
 
+    let metrics = producer.metrics().clone();
     write_frame_async(
         stream,
         &json!({
             "status": "ok",
             "kind": "collect_end",
             "chunks": chunk_index,
-            "metrics": {"streaming": true},
+            "metrics": metrics,
         }),
         &[],
     )
@@ -4054,7 +4077,11 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
         )
         .unwrap();
-        let mut producer = GatewayCollectStreamProducer::materialized(batch, 2);
+        let mut producer = GatewayCollectStreamProducer::materialized_with_metrics(
+            batch,
+            2,
+            json!({"streaming": true}),
+        );
 
         let first = producer.next_batch().unwrap().unwrap();
         let second = producer.next_batch().unwrap().unwrap();
