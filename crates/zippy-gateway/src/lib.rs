@@ -56,6 +56,8 @@ const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_SUBSCRIBE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM: usize = 4;
+const DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS: usize = 8;
 const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
 
 /// Native Rust GatewayServer configuration.
@@ -159,6 +161,59 @@ struct GatewayCollectStreamMetrics {
     materialized_live_batches: usize,
 }
 
+struct OrderedGatewayFileResults {
+    next_file_index: usize,
+    max_pending: usize,
+    pending: BTreeMap<usize, Vec<RecordBatch>>,
+    max_observed_pending: usize,
+}
+
+impl OrderedGatewayFileResults {
+    fn new(max_pending: usize) -> Self {
+        Self {
+            next_file_index: 0,
+            max_pending: max_pending.max(1),
+            pending: BTreeMap::new(),
+            max_observed_pending: 0,
+        }
+    }
+
+    fn insert(&mut self, file_index: usize, batches: Vec<RecordBatch>) -> Result<()> {
+        if self.pending.len() >= self.max_pending {
+            return Err(ZippyError::Io {
+                reason: "streaming collect pending file result limit exceeded".to_string(),
+            });
+        }
+        self.pending.insert(file_index, batches);
+        self.max_observed_pending = self.max_observed_pending.max(self.pending.len());
+        Ok(())
+    }
+
+    fn pop_ready(&mut self) -> Option<Vec<RecordBatch>> {
+        let batches = self.pending.remove(&self.next_file_index)?;
+        self.next_file_index += 1;
+        Some(batches)
+    }
+
+    fn max_observed_pending(&self) -> usize {
+        self.max_observed_pending
+    }
+}
+
+#[derive(Clone)]
+struct GatewayPersistedScanTask {
+    file_index: usize,
+    file_path: String,
+    projection_columns: Option<Vec<String>>,
+    scan_pushdown: GatewayScanPushdown,
+}
+
+struct GatewayPersistedScanResult {
+    file_index: usize,
+    batches: Vec<RecordBatch>,
+    scanned_rows: usize,
+}
+
 impl GatewayCollectStreamMetrics {
     fn value(&self) -> Value {
         json!({
@@ -231,6 +286,7 @@ impl GatewayCollectStreamProducer {
         let scan_schema = schema_for_scan_pushdown(&schema, scan_pushdown)?;
         let mut scanned_rows = 0usize;
         let mut scanned_files = Vec::new();
+        let mut max_pending_file_results = 0usize;
         let (skip_rows, remaining_rows, batches) = match row_range_pushdown {
             Some(GatewayRowRangePushdown::Tail(n)) => (
                 0,
@@ -246,35 +302,37 @@ impl GatewayCollectStreamProducer {
             Some(GatewayRowRangePushdown::Head(n)) => (
                 0,
                 Some(n),
-                persisted_file_record_batches(
+                parallel_persisted_file_record_batches(
                     stream,
                     scan_pushdown,
                     &mut scanned_rows,
                     &mut scanned_files,
+                    &mut max_pending_file_results,
                 )?,
             ),
             Some(GatewayRowRangePushdown::Slice { offset, length }) => (
                 offset,
                 length,
-                persisted_file_record_batches(
+                parallel_persisted_file_record_batches(
                     stream,
                     scan_pushdown,
                     &mut scanned_rows,
                     &mut scanned_files,
+                    &mut max_pending_file_results,
                 )?,
             ),
             None => (
                 0,
                 None,
-                persisted_file_record_batches(
+                parallel_persisted_file_record_batches(
                     stream,
                     scan_pushdown,
                     &mut scanned_rows,
                     &mut scanned_files,
+                    &mut max_pending_file_results,
                 )?,
             ),
         };
-        // Task 5 replaces this eager serial scan with bounded pending file results.
         let batches = batches
             .into_iter()
             .map(|batch| project_record_batch(&batch, output_projection_columns))
@@ -286,6 +344,7 @@ impl GatewayCollectStreamProducer {
             scanned_rows,
             row_range_pushdown: row_range_pushdown.map(GatewayRowRangePushdown::op_name),
             scan_elapsed_ms: scan_started.elapsed().as_secs_f64() * 1000.0,
+            max_pending_file_results,
             ..GatewayCollectStreamMetrics::default()
         };
         Ok(Self::Persisted {
@@ -2556,6 +2615,85 @@ fn persisted_file_record_batches(
     Ok(batches)
 }
 
+fn parallel_persisted_file_record_batches(
+    stream: &StreamInfo,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+    scanned_files: &mut Vec<String>,
+    max_pending_file_results: &mut usize,
+) -> Result<Vec<RecordBatch>> {
+    let files = non_overlapping_persisted_files(stream)
+        .into_iter()
+        .map(persisted_file_path)
+        .collect::<Result<Vec<_>>>()?;
+    let tasks = files
+        .iter()
+        .enumerate()
+        .map(|(file_index, file_path)| GatewayPersistedScanTask {
+            file_index,
+            file_path: file_path.clone(),
+            projection_columns: scan_pushdown.projection_columns.clone(),
+            scan_pushdown: scan_pushdown.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut batches = Vec::new();
+    let mut ordered =
+        OrderedGatewayFileResults::new(DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS);
+    let mut next_task_index = 0usize;
+    while next_task_index < tasks.len() {
+        let end_index =
+            (next_task_index + DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM).min(tasks.len());
+        let chunk = &tasks[next_task_index..end_index];
+        let results = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .cloned()
+                .map(|task| scope.spawn(move || scan_persisted_file_task(task)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| ZippyError::Io {
+                        reason: "streaming collect persisted scan worker panicked".to_string(),
+                    })?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for result in results {
+            *scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
+            ordered.insert(result.file_index, result.batches)?;
+            while let Some(ready) = ordered.pop_ready() {
+                batches.extend(ready);
+            }
+        }
+        next_task_index = end_index;
+    }
+    *max_pending_file_results = ordered.max_observed_pending();
+    scanned_files.extend(files);
+    Ok(batches)
+}
+
+fn scan_persisted_file_task(task: GatewayPersistedScanTask) -> Result<GatewayPersistedScanResult> {
+    let mut scanned_rows = 0usize;
+    let file_batches = read_parquet_record_batches(
+        Path::new(&task.file_path),
+        task.projection_columns.as_deref(),
+    )?;
+    let mut batches = Vec::new();
+    for batch in file_batches {
+        let batch =
+            apply_scan_pushdown_to_record_batch(batch, &task.scan_pushdown, &mut scanned_rows)?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+    Ok(GatewayPersistedScanResult {
+        file_index: task.file_index,
+        batches,
+        scanned_rows,
+    })
+}
+
 fn tail_persisted_file_record_batches(
     stream: &StreamInfo,
     n: usize,
@@ -4409,6 +4547,48 @@ mod tests {
             Some(PERSISTED_PARQUET_SCAN_BATCH_SIZE as i64 + 1)
         );
         assert!(seq.windows(2).all(|window| window[0] < window[1]));
+    }
+
+    #[test]
+    fn ordered_file_results_emit_in_file_index_order() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch_one = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+        )
+        .unwrap();
+        let batch_two = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef],
+        )
+        .unwrap();
+        let mut results = OrderedGatewayFileResults::new(2);
+
+        results.insert(1, vec![batch_two]).unwrap();
+        assert!(results.pop_ready().is_none());
+        results.insert(0, vec![batch_one]).unwrap();
+
+        let first = results.pop_ready().unwrap();
+        let second = results.pop_ready().unwrap();
+
+        assert_eq!(
+            first[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            second[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
     }
 
     #[test]
