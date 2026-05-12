@@ -291,7 +291,7 @@ impl GatewayCollectStreamMetrics {
                 .and_then(Value::as_f64)
                 .unwrap_or_default();
             metrics.materialized_live_batches = object
-                .get("returned_rows")
+                .get("scanned_live_rows")
                 .and_then(Value::as_u64)
                 .filter(|value| *value > 0)
                 .map(|_| 1usize)
