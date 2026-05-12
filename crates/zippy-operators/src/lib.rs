@@ -7,7 +7,10 @@ pub use aggregation::{
     AggCountSpec, AggFirstSpec, AggLastSpec, AggMaxSpec, AggMinSpec, AggSumSpec, AggVwapSpec,
     AggregationKind, AggregationSpec,
 };
-pub use cross_sectional::{CSDemeanSpec, CSRankSpec, CSZscoreSpec, CrossSectionalFactor};
+pub use cross_sectional::{
+    CSDemeanSpec, CSRankSpec, CSZscoreSpec, CrossSectionalFactor, CrossSectionalFactorContext,
+    Float64Stats,
+};
 pub use expression::ExpressionSpec;
 pub use reactive::{
     AbsSpec, CastSpec, ClipSpec, LogSpec, ReactiveFactor, ReactiveFactorContext, TsDelaySpec,
