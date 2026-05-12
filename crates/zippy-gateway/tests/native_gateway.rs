@@ -1492,6 +1492,62 @@ fn native_gateway_collect_stream_returns_start_chunks_and_end_frames() {
 }
 
 #[test]
+fn native_gateway_collect_stream_reports_streaming_metrics() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)])),
+        vec![std::sync::Arc::new(Int64Array::from(vec![1_i64, 2]))],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "stream_metrics_ticks",
+            "token": "dev-token",
+            "rows": 2
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_metrics_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": []
+        }),
+        vec![],
+    );
+    let metrics = &frames.last().unwrap().0["metrics"];
+
+    assert_eq!(metrics["streaming"], json!(true));
+    assert_eq!(metrics["returned_rows"], json!(2));
+    assert!(metrics["encode_elapsed_ms"].as_f64().unwrap() >= 0.0);
+    assert!(metrics["write_elapsed_ms"].as_f64().unwrap() >= 0.0);
+    assert!(metrics["materialized_live_batches"].as_u64().unwrap() >= 1);
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_collect_stream_rejects_residual_plan_before_start() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());

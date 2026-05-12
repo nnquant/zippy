@@ -250,6 +250,56 @@ struct GatewayPersistedScanThreadResult {
 }
 
 impl GatewayCollectStreamMetrics {
+    fn from_collect_metrics(value: &Value) -> Self {
+        let mut metrics = Self {
+            streaming: true,
+            ..Self::default()
+        };
+        if let Some(object) = value.as_object() {
+            metrics.scanned_files = object
+                .get("scanned_files")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.scanned_file_paths = object
+                .get("scanned_file_paths")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            metrics.scanned_rows = object
+                .get("scanned_rows")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.returned_rows = object
+                .get("returned_rows")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.row_range_pushdown = object
+                .get("row_range_pushdown")
+                .and_then(Value::as_str)
+                .and_then(gateway_row_range_metric_name);
+            metrics.scan_elapsed_ms = object
+                .get("elapsed_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            metrics.materialized_live_batches = object
+                .get("returned_rows")
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+                .map(|_| 1usize)
+                .unwrap_or_default();
+        }
+        metrics
+    }
+
     fn value(&self) -> Value {
         json!({
             "streaming": self.streaming,
@@ -273,7 +323,7 @@ enum GatewayCollectStreamProducer {
         batch: RecordBatch,
         chunk_rows: usize,
         offset: usize,
-        metrics: Value,
+        metrics: GatewayCollectStreamMetrics,
     },
     Persisted {
         schema: SchemaRef,
@@ -293,11 +343,15 @@ impl GatewayCollectStreamProducer {
             batch,
             chunk_rows: chunk_rows.max(1),
             offset: 0,
-            metrics: json!({}),
+            metrics: GatewayCollectStreamMetrics::default(),
         }
     }
 
-    fn materialized_with_metrics(batch: RecordBatch, chunk_rows: usize, metrics: Value) -> Self {
+    fn materialized_with_metrics(
+        batch: RecordBatch,
+        chunk_rows: usize,
+        metrics: GatewayCollectStreamMetrics,
+    ) -> Self {
         let mut producer = Self::materialized(batch, chunk_rows);
         if let Self::Materialized {
             metrics: stored_metrics,
@@ -403,8 +457,15 @@ impl GatewayCollectStreamProducer {
 
     fn metrics(&self) -> Value {
         match self {
-            Self::Materialized { metrics, .. } => metrics.clone(),
+            Self::Materialized { metrics, .. } => metrics.value(),
             Self::Persisted { metrics, .. } => metrics.value(),
+        }
+    }
+
+    fn metrics_mut(&mut self) -> &mut GatewayCollectStreamMetrics {
+        match self {
+            Self::Materialized { metrics, .. } => metrics,
+            Self::Persisted { metrics, .. } => metrics,
         }
     }
 
@@ -1148,6 +1209,7 @@ impl GatewayState {
                 "streaming": true,
             });
         }
+        let metrics = GatewayCollectStreamMetrics::from_collect_metrics(&metrics);
         let batches = decode_ipc_batches(&payload)?;
         let batch = concat_record_batches(
             batches
@@ -2200,13 +2262,31 @@ async fn handle_collect_stream_async(
 
     let mut chunk_index = 0usize;
     loop {
-        let next = producer.next_batch()?;
+        let next = match producer.next_batch() {
+            Ok(next) => next,
+            Err(error) => {
+                write_frame_async(
+                    stream,
+                    &json!({
+                        "status": "error",
+                        "kind": "collect_error",
+                        "reason": error.to_string(),
+                    }),
+                    &[],
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let Some(next_batch) = next else {
             break;
         };
         let rows = next_batch.num_rows();
+        let encode_started = Instant::now();
         let payload =
             run_blocking_request(Arc::clone(&state), move || encode_ipc_table(&next_batch)).await?;
+        producer.metrics_mut().encode_elapsed_ms += encode_started.elapsed().as_secs_f64() * 1000.0;
+        let write_started = Instant::now();
         write_frame_async(
             stream,
             &json!({
@@ -2218,6 +2298,7 @@ async fn handle_collect_stream_async(
             &payload,
         )
         .await?;
+        producer.metrics_mut().write_elapsed_ms += write_started.elapsed().as_secs_f64() * 1000.0;
         chunk_index += 1;
     }
 
@@ -2505,6 +2586,15 @@ fn normalize_collect_stream_metrics(object: &mut serde_json::Map<String, Value>)
     };
     object.insert("scanned_file_paths".to_string(), json!(scanned_files));
     object.insert("scanned_files".to_string(), json!(scanned_files.len()));
+}
+
+fn gateway_row_range_metric_name(name: &str) -> Option<&'static str> {
+    match name {
+        "head" => Some("head"),
+        "tail" => Some("tail"),
+        "slice" => Some("slice"),
+        _ => None,
+    }
 }
 
 fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStreamPlan> {
