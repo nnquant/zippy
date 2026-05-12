@@ -121,22 +121,26 @@
   `bucket_batch` 仍是剩余热点。
 - 真正的 columnar bucket buffer、append/update fast path 和多因子共享统计 pass 需要后续专项处理。
 
-### P006 ReactiveLatest local update collection
+### P006 ReactiveLatest / KeyValue columnar latest state
 
 变更：
 
-- `ReactiveLatestEngine` 新增本批 `LatestBatchUpdates` 收集路径。
-- `on_data()` 不再 clone 全量 `latest_rows`；先把本批 key -> row 更新收集到局部 map。
-- 输出 batch 直接从本批局部更新构造，成功后再合入 `self.latest_rows`，保留失败时不污染状态的
-  rollback 语义。
-- 同一批内同 key 多次更新仍只输出最终最新行，输出 key 顺序继续由 `BTreeSet` 保持稳定。
+- 新增内部 `LatestColumnarState`，用 key -> slot 索引和 typed column stores 保存 latest rows。
+- `ReactiveLatestEngine` 改为复用共享 latest state；`on_data()` 仍只输出本批更新 key 的最终
+  delta rows，`on_flush()` 输出全量 snapshot。
+- `KeyValueTableMaterializer` 改为复用共享 latest state；每批更新后仍沿用现有
+  `replace_with_table()` 发布完整 snapshot，但 snapshot 不再由 per-key `OwnedRow` 单行 batch
+  concat 构造。
+- latest state 支持 `Int64`、`Float64`、`Utf8` 和 `Timestamp(Nanosecond, _)`，并在 prepare
+  阶段校验 null key / 非 nullable null value，输入非法时不污染现有状态。
+- 同一批内同 key 多次更新仍只保留最终最新行，输出 key 顺序继续稳定。
 
 边界：
 
-- 本轮没有改动每行 `OwnedRow` / 单行 `RecordBatch` 抽取。
-- `KeyValueTableMaterializer` 仍会在每批后构造全量 snapshot 并 `replace_with_table()`，这是 P006
-  剩余的主要热点。
-- slot-level latest state、增量 snapshot 和 active segment 原地更新仍需后续专项设计。
+- `KeyValueTableMaterializer` 仍会在每批后发布完整 snapshot，并调用现有 `replace_with_table()`；
+  active segment slot-level update 或增量 snapshot descriptor 仍需后续专项。
+- latest key 仍使用 `BTreeMap<Vec<String>, usize>` 保持 deterministic order；跨 engine 的 id
+  interning 留给 P004/P005 的 shared id registry 设计。
 
 ### P007 Reactive rolling window state
 
