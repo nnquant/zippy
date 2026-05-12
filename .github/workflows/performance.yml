@@ -1,0 +1,60 @@
+name: performance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 20 * * *"
+
+jobs:
+  zippy-perf-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: run in-process timeseries profile
+        run: |
+          cargo run -p zippy-perf --release -- inproc-timeseries \
+            --rows-per-batch 4096 \
+            --target-rows-per-sec 1000000 \
+            --duration-sec 10 \
+            --warmup-sec 2 \
+            --symbols 1024 \
+            --max-p95-micros 1000 \
+            --max-p99-micros 5000 \
+            --max-queue-depth 0 \
+            --report-json target/zippy-perf-inproc-timeseries.json
+
+      - name: run stream table copy profile
+        run: |
+          cargo run -p zippy-perf --release -- stream-table-segment-copy \
+            --rows-per-batch 4096 \
+            --target-rows-per-sec 1000000 \
+            --duration-sec 10 \
+            --warmup-sec 2 \
+            --symbols 1024 \
+            --max-p95-micros 5000 \
+            --max-p99-micros 20000 \
+            --report-json target/zippy-perf-stream-table-copy.json
+
+      - name: run stream table forward profile
+        run: |
+          cargo run -p zippy-perf --release -- stream-table-segment-forward \
+            --rows-per-batch 4096 \
+            --target-rows-per-sec 1000000 \
+            --duration-sec 10 \
+            --warmup-sec 2 \
+            --symbols 1024 \
+            --max-p95-micros 1000 \
+            --max-p99-micros 5000 \
+            --report-json target/zippy-perf-stream-table-forward.json
+
+      - name: upload performance reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: zippy-perf-reports
+          path: target/zippy-perf-*.json

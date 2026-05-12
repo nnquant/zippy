@@ -43,6 +43,12 @@ struct Cli {
     buffer_capacity: usize,
     #[arg(long, value_enum, default_value_t = CliOverflowPolicy::Block)]
     overflow_policy: CliOverflowPolicy,
+    #[arg(long)]
+    max_p95_micros: Option<f64>,
+    #[arg(long)]
+    max_p99_micros: Option<f64>,
+    #[arg(long)]
+    max_queue_depth: Option<usize>,
     #[arg(long, default_value = "tcp://127.0.0.1:5560")]
     endpoint: String,
     #[arg(long)]
@@ -78,6 +84,9 @@ fn main() {
             CliOverflowPolicy::Reject => OverflowPolicyConfig::Reject,
             CliOverflowPolicy::DropOldest => OverflowPolicyConfig::DropOldest,
         },
+        max_p95_micros: cli.max_p95_micros,
+        max_p99_micros: cli.max_p99_micros,
+        max_queue_depth: cli.max_queue_depth,
     };
 
     info!(

@@ -55,6 +55,8 @@ const DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS: usize = 64;
 const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_GATEWAY_SUBSCRIBE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
 
 /// Native Rust GatewayServer configuration.
 #[derive(Debug, Clone)]
@@ -76,7 +78,8 @@ struct GatewayState {
     master: Arc<GatewayAsyncMasterClient>,
     token: Option<String>,
     max_write_rows: Option<usize>,
-    writers: Mutex<BTreeMap<String, GatewayTableWriter>>,
+    writers: Mutex<BTreeMap<String, GatewayTableWriterHandle>>,
+    subscribe_notifier: GatewaySubscribeNotifier,
     snapshots: Mutex<HashMap<String, GatewaySnapshot>>,
     snapshot_counter: AtomicU64,
     metrics: Arc<Mutex<GatewayMetrics>>,
@@ -94,6 +97,34 @@ struct GatewayRuntime {
 struct GatewayTableWriter {
     source_name: String,
     materializer: StreamTableMaterializer,
+}
+
+type GatewayTableWriterHandle = Arc<Mutex<GatewayTableWriter>>;
+
+#[derive(Default)]
+struct GatewaySubscribeNotifier {
+    sequence: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl GatewaySubscribeNotifier {
+    fn mark_activity(&self) {
+        self.sequence.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence.load(Ordering::SeqCst)
+    }
+
+    async fn wait_after(&self, observed_sequence: u64, timeout: Duration) -> bool {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        if self.sequence() != observed_sequence {
+            return true;
+        }
+        tokio::time::timeout(timeout, &mut notified).await.is_ok()
+    }
 }
 
 #[derive(Default)]
@@ -242,6 +273,7 @@ impl GatewayServer {
                 token: config.token,
                 max_write_rows: config.max_write_rows,
                 writers: Mutex::new(BTreeMap::new()),
+                subscribe_notifier: GatewaySubscribeNotifier::default(),
                 snapshots: Mutex::new(HashMap::new()),
                 snapshot_counter: AtomicU64::new(0),
                 metrics,
@@ -843,12 +875,15 @@ impl GatewayState {
             if snapshot_id.is_some() {
                 None
             } else {
-                writers
-                    .get(source)
-                    .map(|writer| writer.materializer.active_record_batch())
-                    .transpose()?
+                writers.get(source).cloned()
             }
         };
+        let batch = batch
+            .map(|writer| {
+                let writer = writer.lock().unwrap();
+                writer.materializer.active_record_batch()
+            })
+            .transpose()?;
         let mut row_range_pushed = false;
         let mut scan_pushdown_applied = false;
         let scanned = if let Some(snapshot_id) = snapshot_id {
@@ -1020,23 +1055,23 @@ impl GatewayState {
     }
 
     fn write_batch(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
-        let mut writers = self.writers.lock().unwrap();
-        if !writers.contains_key(stream_name) {
-            let writer = self.create_writer(stream_name, batch.schema())?;
-            writers.insert(stream_name.to_string(), writer);
+        let writer = self.writer_handle(stream_name, batch.schema())?;
+        {
+            let mut writer = writer.lock().unwrap();
+            writer
+                .materializer
+                .on_data(SegmentTableView::from_record_batch(batch))?;
+            writer.materializer.on_flush()?;
         }
-        let writer = writers.get_mut(stream_name).expect("writer just inserted");
-        writer
-            .materializer
-            .on_data(SegmentTableView::from_record_batch(batch))?;
-        writer.materializer.on_flush()?;
+        self.subscribe_notifier.mark_activity();
         Ok(())
     }
 
     fn close_writer(&self, stream_name: &str) -> Result<()> {
         let writer = self.writers.lock().unwrap().remove(stream_name);
         if let Some(writer) = writer {
-            self.close_table_writer(writer)?;
+            let mut writer = writer.lock().unwrap();
+            self.close_table_writer(&mut writer)?;
         }
         Ok(())
     }
@@ -1047,14 +1082,30 @@ impl GatewayState {
             std::mem::take(&mut *guard)
         };
         for writer in writers.into_values() {
-            let _ = self.close_table_writer(writer);
+            let mut writer = writer.lock().unwrap();
+            let _ = self.close_table_writer(&mut writer);
         }
     }
 
-    fn close_table_writer(&self, mut writer: GatewayTableWriter) -> Result<()> {
+    fn close_table_writer(&self, writer: &mut GatewayTableWriter) -> Result<()> {
         let stop_result = writer.materializer.on_stop();
         let unregister_result = self.master.unregister_source_blocking(&writer.source_name);
         stop_result.and(unregister_result)
+    }
+
+    fn writer_handle(
+        &self,
+        stream_name: &str,
+        schema: SchemaRef,
+    ) -> Result<GatewayTableWriterHandle> {
+        let mut writers = self.writers.lock().unwrap();
+        if let Some(writer) = writers.get(stream_name) {
+            return Ok(Arc::clone(writer));
+        }
+
+        let writer = Arc::new(Mutex::new(self.create_writer(stream_name, schema)?));
+        writers.insert(stream_name.to_string(), Arc::clone(&writer));
+        Ok(writer)
     }
 
     fn create_writer(&self, stream_name: &str, schema: SchemaRef) -> Result<GatewayTableWriter> {
@@ -1095,13 +1146,13 @@ impl GatewayState {
         let stream = self.master.get_stream_blocking(source)?;
         let schema_payload = {
             let writers = self.writers.lock().unwrap();
-            writers
-                .get(source)
-                .map(|writer| encode_ipc_schema(&writer.materializer.output_schema()))
-                .transpose()?
+            writers.get(source).cloned()
         };
         let schema_payload = match schema_payload {
-            Some(payload) => payload,
+            Some(writer) => {
+                let writer = writer.lock().unwrap();
+                encode_ipc_schema(&writer.materializer.output_schema())?
+            }
             None => encode_ipc_schema(&Arc::new(arrow_schema_from_stream_metadata(
                 &stream.schema,
             )?))?,
@@ -1195,11 +1246,14 @@ impl GatewayState {
     ) -> Result<GatewaySubscribeFetch> {
         let batch = {
             let writers = self.writers.lock().unwrap();
-            writers
-                .get(&request.source)
-                .map(|writer| writer.materializer.active_record_batch())
-                .transpose()?
+            writers.get(&request.source).cloned()
         };
+        let batch = batch
+            .map(|writer| {
+                let writer = writer.lock().unwrap();
+                writer.materializer.active_record_batch()
+            })
+            .transpose()?;
         let batch = match batch {
             Some(batch) => Some(batch),
             None => {
@@ -1666,6 +1720,27 @@ async fn handle_client_async(mut stream: tokio::net::TcpStream, state: Arc<Gatew
                         }
                     }
                 }
+                Ok(())
+                    if frame.header.get("kind").and_then(Value::as_str)
+                        == Some("collect_stream") =>
+                {
+                    if frame.payload_len != 0 {
+                        Err(ZippyError::InvalidConfig {
+                            reason: "collect_stream request must not include payload".to_string(),
+                        })
+                    } else {
+                        match handle_collect_stream_async(
+                            &mut stream,
+                            Arc::clone(&state),
+                            frame.header,
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
                 Ok(()) => match read_frame_payload_async(&mut stream, frame.payload_len).await {
                     Ok(payload) => {
                         let state_for_request = Arc::clone(&state);
@@ -1693,6 +1768,81 @@ async fn handle_client_async(mut stream: tokio::net::TcpStream, state: Arc<Gatew
     let _ = write_frame_async(&mut stream, &header, &payload).await;
 }
 
+async fn handle_collect_stream_async(
+    stream: &mut tokio::net::TcpStream,
+    state: Arc<GatewayState>,
+    header: Value,
+) -> Result<()> {
+    let chunk_rows = header
+        .get("chunk_rows")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(65_536);
+    let state_for_request = Arc::clone(&state);
+    let (response, payload) = run_blocking_request(Arc::clone(&state), move || {
+        state_for_request.handle_collect(header)
+    })
+    .await?;
+    let batches = decode_ipc_batches(&payload)?;
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| ZippyError::Io {
+            reason: "collect_stream produced no schema".to_string(),
+        })?;
+    let schema_payload = encode_ipc_schema(&schema)?;
+    let metrics = response
+        .get("metrics")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    write_frame_async(
+        stream,
+        &json!({
+            "status": "ok",
+            "kind": "collect_start",
+            "chunk_rows": chunk_rows,
+        }),
+        &schema_payload,
+    )
+    .await?;
+
+    let mut chunk_index = 0usize;
+    for batch in batches {
+        let mut offset = 0usize;
+        while offset < batch.num_rows() {
+            let rows = chunk_rows.min(batch.num_rows() - offset);
+            let chunk = batch.slice(offset, rows);
+            let payload = encode_ipc_table(&chunk)?;
+            write_frame_async(
+                stream,
+                &json!({
+                    "status": "ok",
+                    "kind": "collect_chunk",
+                    "chunk_index": chunk_index,
+                    "rows": rows,
+                }),
+                &payload,
+            )
+            .await?;
+            offset += rows;
+            chunk_index += 1;
+        }
+    }
+
+    write_frame_async(
+        stream,
+        &json!({
+            "status": "ok",
+            "kind": "collect_end",
+            "chunks": chunk_index,
+            "metrics": metrics,
+        }),
+        &[],
+    )
+    .await
+}
+
 async fn handle_subscribe_table_stream_async(
     stream: &mut tokio::net::TcpStream,
     state: Arc<GatewayState>,
@@ -1715,6 +1865,7 @@ async fn handle_subscribe_table_stream_async(
         write_frame_async(stream, &json!({"status": "ok", "kind": "subscribed"}), &[]).await?;
         let mut sent_row_count = 0usize;
         while !state.stopped.load(Ordering::SeqCst) {
+            let observed_activity = state.subscribe_notifier.sequence();
             let request_for_fetch = request.clone();
             let state_for_fetch = Arc::clone(&state);
             let fetch = run_blocking_request(Arc::clone(&state), move || {
@@ -1723,7 +1874,10 @@ async fn handle_subscribe_table_stream_async(
             .await?;
             sent_row_count = fetch.next_sent_row_count;
             let Some(next_batch) = fetch.batch else {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                state
+                    .subscribe_notifier
+                    .wait_after(observed_activity, DEFAULT_GATEWAY_SUBSCRIBE_IDLE_TIMEOUT)
+                    .await;
                 continue;
             };
             if next_batch.num_rows() > 0 {
@@ -2016,14 +2170,16 @@ fn persisted_file_record_batches(
     let mut batches = Vec::new();
     for persisted_file in non_overlapping_persisted_files(stream) {
         let file_path = persisted_file_path(persisted_file)?;
-        let batch = read_parquet_record_batch(
+        let file_batches = read_parquet_record_batches(
             Path::new(&file_path),
             scan_pushdown.projection_columns.as_deref(),
         )?;
         scanned_files.push(file_path);
-        let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
-        if batch.num_rows() > 0 {
-            batches.push(batch);
+        for batch in file_batches {
+            let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
         }
     }
     Ok(batches)
@@ -2043,17 +2199,22 @@ fn tail_persisted_file_record_batches(
             break;
         }
         let file_path = persisted_file_path(persisted_file)?;
-        let batch = read_parquet_record_batch_tail(
+        let file_batches = read_parquet_record_batches_tail(
             Path::new(&file_path),
             scan_pushdown.projection_columns.as_deref(),
             remaining,
         )?;
-        let raw_rows = batch.num_rows();
+        let raw_rows = file_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
         scanned_files.push(file_path);
-        let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
         remaining = remaining.saturating_sub(raw_rows);
-        if batch.num_rows() > 0 {
-            batches_reversed.push(batch);
+        for batch in file_batches {
+            let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
+            if batch.num_rows() > 0 {
+                batches_reversed.push(batch);
+            }
         }
     }
     scanned_files.reverse();
@@ -2061,26 +2222,26 @@ fn tail_persisted_file_record_batches(
     Ok(batches_reversed)
 }
 
-fn read_parquet_record_batch(
+fn read_parquet_record_batches(
     path: &Path,
     projection_columns: Option<&[String]>,
-) -> Result<RecordBatch> {
-    read_parquet_record_batch_with_tail(path, projection_columns, None)
+) -> Result<Vec<RecordBatch>> {
+    Ok(read_parquet_record_batch_chunks_with_tail(path, projection_columns, None)?.1)
 }
 
-fn read_parquet_record_batch_tail(
+fn read_parquet_record_batches_tail(
     path: &Path,
     projection_columns: Option<&[String]>,
     n: usize,
-) -> Result<RecordBatch> {
-    read_parquet_record_batch_with_tail(path, projection_columns, Some(n))
+) -> Result<Vec<RecordBatch>> {
+    Ok(read_parquet_record_batch_chunks_with_tail(path, projection_columns, Some(n))?.1)
 }
 
-fn read_parquet_record_batch_with_tail(
+fn read_parquet_record_batch_chunks_with_tail(
     path: &Path,
     projection_columns: Option<&[String]>,
     tail_rows: Option<usize>,
-) -> Result<RecordBatch> {
+) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let file = File::open(path).map_err(|error| ZippyError::Io {
         reason: format!(
             "failed to open persisted parquet file path=[{}] error=[{}]",
@@ -2135,18 +2296,19 @@ fn read_parquet_record_batch_with_tail(
         if selected_rows > 0 {
             selectors.push(RowSelector::select(selected_rows));
         }
-        builder = builder
-            .with_batch_size(selected_rows.max(1))
-            .with_row_selection(RowSelection::from(selectors));
+        builder = builder.with_row_selection(RowSelection::from(selectors));
     }
     let schema = builder.schema().clone();
-    let reader = builder.build().map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to build persisted parquet reader path=[{}] error=[{}]",
-            path.display(),
-            error
-        ),
-    })?;
+    let reader = builder
+        .with_batch_size(PERSISTED_PARQUET_SCAN_BATCH_SIZE)
+        .build()
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to build persisted parquet reader path=[{}] error=[{}]",
+                path.display(),
+                error
+            ),
+        })?;
     let batches = reader
         .map(|batch| {
             batch.map_err(|error| ZippyError::Io {
@@ -2158,7 +2320,7 @@ fn read_parquet_record_batch_with_tail(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    concat_record_batches(schema, batches)
+    Ok((schema, batches))
 }
 
 fn apply_scan_pushdown_to_record_batch(
@@ -3748,7 +3910,8 @@ pub fn crate_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, TimestampNanosecondArray};
+    use arrow::array::{Float64Array, Int64Array, TimestampNanosecondArray};
+    use parquet::arrow::ArrowWriter;
 
     #[test]
     fn gateway_filter_accepts_typed_timestamp_literal() {
@@ -3801,5 +3964,73 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 1);
         assert_eq!(seq.value(0), 2);
+    }
+
+    #[test]
+    fn persisted_parquet_reader_exposes_batches_before_concat() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let row_count = PERSISTED_PARQUET_SCAN_BATCH_SIZE + 1;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from((0..row_count as i64).collect::<Vec<_>>())) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.0; row_count])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ticks.parquet");
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let batches = read_parquet_record_batches(&path, None).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            row_count
+        );
+    }
+
+    #[test]
+    fn gateway_writer_handle_is_cloneable_for_per_stream_locking() {
+        fn assert_clone<T: Clone>() {}
+
+        assert_clone::<GatewayTableWriterHandle>();
+    }
+
+    #[tokio::test]
+    async fn subscribe_notifier_wakes_waiters_without_poll_sleep() {
+        let notifier = GatewaySubscribeNotifier::default();
+        let observed_sequence = notifier.sequence();
+
+        let wait = tokio::time::timeout(
+            Duration::from_millis(100),
+            notifier.wait_after(observed_sequence, Duration::from_secs(60)),
+        );
+        notifier.mark_activity();
+
+        assert!(wait.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscribe_notifier_returns_immediately_after_sequence_change() {
+        let notifier = GatewaySubscribeNotifier::default();
+        let observed_sequence = notifier.sequence();
+        notifier.mark_activity();
+
+        let wait = tokio::time::timeout(
+            Duration::from_millis(100),
+            notifier.wait_after(observed_sequence, Duration::from_secs(60)),
+        );
+
+        assert!(wait.await.is_ok());
     }
 }

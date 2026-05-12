@@ -9073,6 +9073,50 @@ def test_remote_gateway_writer_batches_rows_to_gateway() -> None:
         server.join()
 
 
+def test_remote_gateway_writer_write_batch_sends_arrow_table_immediately() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
+    try:
+        writer = zippy.RemoteGatewayWriter(
+            "qmt_ticks",
+            endpoint=gateway_endpoint,
+            schema=schema,
+            batch_size=1024,
+        )
+
+        writer.write_batch(
+            pa.table(
+                {
+                    "instrument_id": ["IF2606", "IF2607"],
+                    "last_price": [4102.5, 4103.5],
+                },
+                schema=schema,
+            )
+        )
+
+        assert gateway.metrics()["written_rows_total"] == 2
+    finally:
+        gateway.stop()
+        server.stop()
+        server.join()
+
+
+def test_remote_gateway_writer_write_batch_rejects_scalar_row_dict() -> None:
+    writer = zippy.RemoteGatewayWriter(
+        "qmt_ticks",
+        endpoint="tcp://127.0.0.1:1",
+        batch_size=1024,
+    )
+
+    with pytest.raises(TypeError, match="write_batch requires a batched value"):
+        writer.write_batch({"instrument_id": "IF2606", "last_price": 4102.5})
+
+
 def test_remote_gateway_writer_close_detaches_master_writer() -> None:
     schema = pa.schema(
         [
@@ -11104,6 +11148,51 @@ def test_remote_collect_sends_optimized_plan(monkeypatch) -> None:
     assert [item["op"] for item in sent_plans[0]] == ["filter", "select"]
 
 
+def test_remote_collect_stream_true_opts_into_streaming_protocol(monkeypatch) -> None:
+    schema = pa.schema([("instrument_id", pa.string())])
+    stream_flags: list[bool] = []
+
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, endpoint: str, token: str | None) -> None:
+            self.source = source
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def collect_plan(
+            self,
+            plan: list[dict[str, object]],
+            *,
+            snapshot: bool,
+            stream: bool = False,
+        ) -> pa.Table:
+            del plan, snapshot
+            stream_flags.append(stream)
+            return pa.table({"instrument_id": ["IF2606"]}, schema=schema)
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self._process_id = None
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def get_config(self) -> dict[str, object]:
+            return {"gateway": {"enabled": True, "endpoint": "127.0.0.1:17691", "token": None}}
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+
+    query = zippy.read_table("ctp_ticks", master=FakeMaster(), snapshot=False)
+    assert query.collect().to_pydict() == {"instrument_id": ["IF2606"]}
+    assert query.collect(stream=True).to_pydict() == {"instrument_id": ["IF2606"]}
+
+    assert stream_flags == [False, True]
+
+
 def test_remote_collect_sends_temporal_string_filter_as_typed_boundaries(monkeypatch) -> None:
     schema = pa.schema([("dt", pa.timestamp("ns", tz="Asia/Shanghai"))])
     sent_plans: list[list[dict[str, object]]] = []
@@ -11278,6 +11367,48 @@ def test_remote_query_sends_snapshot_id_and_releases_snapshot(monkeypatch) -> No
     ]
     assert requests[1]["snapshot_id"] == "snapshot-1"
     assert "snapshot" not in requests[1]
+
+
+def test_remote_query_collect_plan_stream_true_uses_stream_request(monkeypatch) -> None:
+    schema = pa.schema([("instrument_id", pa.string())])
+    table = pa.table({"instrument_id": ["IF2606"]}, schema=schema)
+    stream_requests: list[dict[str, object]] = []
+
+    def fake_remote_collect_stream_request(
+        endpoint: str,
+        header: dict[str, object],
+        *,
+        token: str | None = None,
+        timeout_sec: float | None = None,
+    ) -> tuple[pa.Table, dict[str, object]]:
+        del endpoint, token, timeout_sec
+        stream_requests.append(header)
+        return table, {"returned_rows": 1, "chunks": 1}
+
+    def fake_remote_request(*args: object, **kwargs: object) -> tuple[dict[str, object], bytes]:
+        raise AssertionError("collect_plan(stream=True) should not use single-response collect")
+
+    monkeypatch.setattr(zippy, "_remote_collect_stream_request", fake_remote_collect_stream_request)
+    monkeypatch.setattr(zippy, "_remote_request", fake_remote_request)
+
+    remote_query = zippy._RemoteQuery(
+        "ctp_ticks",
+        master=object(),
+        endpoint="127.0.0.1:17691",
+        token="dev-token",
+    )
+    result = remote_query.collect_plan([], snapshot=False, stream=True)
+
+    assert result.to_pydict() == {"instrument_id": ["IF2606"]}
+    assert stream_requests == [
+        {
+            "kind": "collect",
+            "source": "ctp_ticks",
+            "plan": [],
+            "snapshot": False,
+        }
+    ]
+    assert remote_query.last_collect_metrics() == {"returned_rows": 1, "chunks": 1}
 
 
 def test_remote_collect_applies_filter_after_head_locally(monkeypatch) -> None:

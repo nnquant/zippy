@@ -62,6 +62,46 @@ fn row_span_converts_to_record_batch_for_debug_export() {
 }
 
 #[test]
+fn row_span_record_batch_projection_materializes_only_requested_columns() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 4).unwrap();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+    let span = RowSpanView::new(writer.sealed_handle_for_test().unwrap(), 0, 2).unwrap();
+    let batch = span
+        .as_record_batch_with_projection(&["instrument_id", "last_price"])
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch.num_columns(), 2);
+    assert_eq!(batch.schema().field(0).name(), "instrument_id");
+    assert_eq!(batch.schema().field(1).name(), "last_price");
+
+    let instrument = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(instrument.value(0), "rb2501");
+    assert_eq!(instrument.value(1), "rb2505");
+
+    let last_price = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(last_price.value(0), 4123.5);
+    assert_eq!(last_price.value(1), 4125.0);
+}
+
+#[test]
 fn row_span_exports_nullable_columns_as_true_nulls() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),

@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -69,6 +70,9 @@ pub struct PerfConfig {
     pub endpoint: String,
     pub buffer_capacity: usize,
     pub overflow_policy: OverflowPolicyConfig,
+    pub max_p95_micros: Option<f64>,
+    pub max_p99_micros: Option<f64>,
+    pub max_queue_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -100,9 +104,30 @@ pub struct SourceMetricsReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfReportMetadata {
+    pub git_sha: String,
+    pub target: String,
+    pub started_at_unix_ms: u128,
+}
+
+impl PerfReportMetadata {
+    fn capture() -> Self {
+        Self {
+            git_sha: current_git_sha(),
+            target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            started_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfReport {
     pub profile: PerfProfile,
     pub config: PerfConfig,
+    pub metadata: PerfReportMetadata,
     pub input_rows_total: u64,
     pub output_rows_total: u64,
     pub actual_average_rows_per_sec: f64,
@@ -138,9 +163,23 @@ pub fn write_report_json(path: &Path, report: &PerfReport) -> PerfResult<()> {
     fs::write(path, json).map_err(|error| error.to_string())
 }
 
+fn current_git_sha() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub fn format_report(report: &PerfReport) -> String {
     let mut lines = vec![
         format!("profile={:?}", report.profile),
+        format!("git_sha={}", report.metadata.git_sha),
+        format!("target={}", report.metadata.target),
         format!("pass={}", report.pass),
         format!("engine_status={}", report.engine_status),
         format!("input_rows_total={}", report.input_rows_total),
@@ -202,23 +241,26 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
     let output_batches_total = publisher_counters
         .output_batches_total
         .load(Ordering::Relaxed);
+    let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let pass = evaluate_pass(
         config,
         drive_stats.actual_average_rows_per_sec,
         handle.status(),
         &engine_metrics,
         None,
+        &latency,
     );
 
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
+        metadata: PerfReportMetadata::capture(),
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total,
         actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
         actual_peak_rows_per_sec: drive_stats.actual_peak_rows_per_sec,
         batches_per_sec: compute_batches_per_sec(output_batches_total, config.duration_sec as f64),
-        latency: build_latency_summary(&drive_stats.batch_latencies_micros),
+        latency,
         engine_status: handle.status().as_str().to_string(),
         engine_metrics,
         source_metrics: None,
@@ -258,23 +300,26 @@ fn run_remote_pipeline_upstream(config: &PerfConfig) -> PerfResult<PerfReport> {
     let output_batches_total = publisher_counters
         .output_batches_total
         .load(Ordering::Relaxed);
+    let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let pass = evaluate_pass(
         config,
         drive_stats.actual_average_rows_per_sec,
         handle.status(),
         &engine_metrics,
         None,
+        &latency,
     );
 
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
+        metadata: PerfReportMetadata::capture(),
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total,
         actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
         actual_peak_rows_per_sec: drive_stats.actual_peak_rows_per_sec,
         batches_per_sec: compute_batches_per_sec(output_batches_total, config.duration_sec as f64),
-        latency: build_latency_summary(&drive_stats.batch_latencies_micros),
+        latency,
         engine_status: handle.status().as_str().to_string(),
         engine_metrics,
         source_metrics: None,
@@ -319,23 +364,26 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
         .unwrap_or(config.duration_sec as f64)
         .max(1e-9);
     let average_rows_per_sec = engine_metrics.processed_rows_total as f64 / observed_secs;
+    let latency = LatencySummary::default();
     let pass = evaluate_pass(
         config,
         average_rows_per_sec,
         handle.status(),
         &engine_metrics,
         Some(&source_metrics),
+        &latency,
     );
 
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
+        metadata: PerfReportMetadata::capture(),
         input_rows_total: engine_metrics.processed_rows_total,
         output_rows_total,
         actual_average_rows_per_sec: average_rows_per_sec,
         actual_peak_rows_per_sec: average_rows_per_sec,
         batches_per_sec: compute_batches_per_sec(output_batches_total, observed_secs),
-        latency: LatencySummary::default(),
+        latency,
         engine_status: handle.status().as_str().to_string(),
         engine_metrics,
         source_metrics: Some(source_metrics),
@@ -386,17 +434,20 @@ fn run_stream_table_segment(config: &PerfConfig, forwarding: bool) -> PerfResult
         publish_errors_total: 0,
         queue_depth: 0,
     };
+    let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let pass = evaluate_pass(
         config,
         drive_stats.actual_average_rows_per_sec,
         EngineStatus::Stopped,
         &engine_metrics,
         None,
+        &latency,
     );
 
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
+        metadata: PerfReportMetadata::capture(),
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total: drive_stats.input_rows_total,
         actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
@@ -405,7 +456,7 @@ fn run_stream_table_segment(config: &PerfConfig, forwarding: bool) -> PerfResult
             processed_batches_total,
             config.duration_sec as f64,
         ),
-        latency: build_latency_summary(&drive_stats.batch_latencies_micros),
+        latency,
         engine_status: EngineStatus::Stopped.as_str().to_string(),
         engine_metrics,
         source_metrics: None,
@@ -1065,6 +1116,7 @@ fn evaluate_pass(
     status: EngineStatus,
     engine_metrics: &EngineMetricsReport,
     source_metrics: Option<&SourceMetricsReport>,
+    latency: &LatencySummary,
 ) -> bool {
     if status == EngineStatus::Failed {
         return false;
@@ -1073,6 +1125,24 @@ fn evaluate_pass(
         return false;
     }
     if engine_metrics.dropped_batches_total != 0 || engine_metrics.publish_errors_total != 0 {
+        return false;
+    }
+    if config
+        .max_queue_depth
+        .is_some_and(|max_queue_depth| engine_metrics.queue_depth > max_queue_depth)
+    {
+        return false;
+    }
+    if config
+        .max_p95_micros
+        .is_some_and(|max_p95_micros| latency.p95_micros > max_p95_micros)
+    {
+        return false;
+    }
+    if config
+        .max_p99_micros
+        .is_some_and(|max_p99_micros| latency.p99_micros > max_p99_micros)
+    {
         return false;
     }
     if let Some(source_metrics) = source_metrics {
@@ -1089,8 +1159,10 @@ mod tests {
 
     use super::{
         compute_remote_downstream_deadline, remote_downstream_should_stop_for_idle, run_profile,
-        write_report_json, OverflowPolicyConfig, PerfConfig, PerfProfile, REMOTE_IDLE_GRACE_SEC,
+        write_report_json, EngineMetricsReport, LatencySummary, OverflowPolicyConfig, PerfConfig,
+        PerfProfile, REMOTE_IDLE_GRACE_SEC,
     };
+    use zippy_core::EngineStatus;
 
     fn test_endpoint() -> String {
         let nanos = SystemTime::now()
@@ -1111,6 +1183,9 @@ mod tests {
             endpoint,
             buffer_capacity: 1024,
             overflow_policy: OverflowPolicyConfig::Block,
+            max_p95_micros: None,
+            max_p99_micros: None,
+            max_queue_depth: None,
         }
     }
 
@@ -1183,7 +1258,76 @@ mod tests {
 
         assert!(content.contains("profile"));
         assert!(content.contains("pass"));
+        assert!(content.contains("metadata"));
+        assert!(content.contains("git_sha"));
+        assert!(content.contains("target"));
+        assert!(content.contains("started_at_unix_ms"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn evaluate_pass_rejects_latency_above_configured_p99_threshold() {
+        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        config.max_p99_micros = Some(100.0);
+        let latency = LatencySummary {
+            p50_micros: 10.0,
+            p95_micros: 50.0,
+            p99_micros: 101.0,
+        };
+
+        let pass = super::evaluate_pass(
+            &config,
+            10_000.0,
+            EngineStatus::Stopped,
+            &EngineMetricsReport::default(),
+            None,
+            &latency,
+        );
+
+        assert!(!pass);
+    }
+
+    #[test]
+    fn evaluate_pass_rejects_latency_above_configured_p95_threshold() {
+        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        config.max_p95_micros = Some(50.0);
+        let latency = LatencySummary {
+            p50_micros: 10.0,
+            p95_micros: 50.1,
+            p99_micros: 80.0,
+        };
+
+        let pass = super::evaluate_pass(
+            &config,
+            10_000.0,
+            EngineStatus::Stopped,
+            &EngineMetricsReport::default(),
+            None,
+            &latency,
+        );
+
+        assert!(!pass);
+    }
+
+    #[test]
+    fn evaluate_pass_rejects_queue_depth_above_configured_threshold() {
+        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        config.max_queue_depth = Some(2);
+        let engine_metrics = EngineMetricsReport {
+            queue_depth: 3,
+            ..EngineMetricsReport::default()
+        };
+
+        let pass = super::evaluate_pass(
+            &config,
+            10_000.0,
+            EngineStatus::Stopped,
+            &engine_metrics,
+            None,
+            &LatencySummary::default(),
+        );
+
+        assert!(!pass);
     }
 
     #[test]

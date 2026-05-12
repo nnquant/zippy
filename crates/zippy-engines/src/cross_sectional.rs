@@ -176,16 +176,9 @@ impl Engine for CrossSectionalEngine {
         let mut next_current_rows = self.current_rows.clone();
         let mut next_last_closed_bucket_start = self.last_closed_bucket_start;
         let mut next_pending_late_rows = self.pending_late_rows;
-        let mut row_indices = (0..table.num_rows()).collect::<Vec<_>>();
+        let row_order = build_row_order(dts, table.num_rows(), self.trigger_interval);
 
-        row_indices.sort_by_key(|row_index| {
-            (
-                align_bucket_start(dts.value(*row_index), self.trigger_interval),
-                *row_index,
-            )
-        });
-
-        for row_index in row_indices {
+        for row_index in row_order.iter() {
             let id = ids.value(row_index).to_string();
             let dt = dts.value(row_index);
             let bucket_start = align_bucket_start(dt, self.trigger_interval);
@@ -339,6 +332,63 @@ fn extract_owned_row(
     Ok(OwnedRow { batch })
 }
 
+enum RowOrder {
+    Natural { row_count: usize },
+    Sorted(Vec<usize>),
+}
+
+impl RowOrder {
+    fn iter(&self) -> RowOrderIter<'_> {
+        match self {
+            Self::Natural { row_count } => RowOrderIter::Natural(0..*row_count),
+            Self::Sorted(row_indices) => RowOrderIter::Sorted(row_indices.iter()),
+        }
+    }
+}
+
+enum RowOrderIter<'a> {
+    Natural(std::ops::Range<usize>),
+    Sorted(std::slice::Iter<'a, usize>),
+}
+
+impl Iterator for RowOrderIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Natural(row_indices) => row_indices.next(),
+            Self::Sorted(row_indices) => row_indices.next().copied(),
+        }
+    }
+}
+
+fn build_row_order(
+    dts: &TimestampNanosecondArray,
+    row_count: usize,
+    trigger_interval: i64,
+) -> RowOrder {
+    let mut previous_bucket_start = None;
+
+    for row_index in 0..row_count {
+        let bucket_start = align_bucket_start(dts.value(row_index), trigger_interval);
+
+        if matches!(previous_bucket_start, Some(previous) if bucket_start < previous) {
+            let mut row_indices = (0..row_count).collect::<Vec<_>>();
+            row_indices.sort_by_key(|row_index| {
+                (
+                    align_bucket_start(dts.value(*row_index), trigger_interval),
+                    *row_index,
+                )
+            });
+            return RowOrder::Sorted(row_indices);
+        }
+
+        previous_bucket_start = Some(bucket_start);
+    }
+
+    RowOrder::Natural { row_count }
+}
+
 fn validate_id_column(schema: &Schema, id_column: &str) -> Result<()> {
     let field = schema
         .field_with_name(id_column)
@@ -409,4 +459,45 @@ fn checked_dt_array<'a>(
 
 fn align_bucket_start(dt: i64, trigger_interval: i64) -> i64 {
     dt.div_euclid(trigger_interval) * trigger_interval
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::TimestampNanosecondArray;
+
+    use super::{build_row_order, RowOrder};
+
+    #[test]
+    fn row_order_natural_iterates_without_materialized_indices() {
+        let rows = RowOrder::Natural { row_count: 3 };
+
+        assert!(matches!(rows, RowOrder::Natural { row_count: 3 }));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn row_order_sorted_iterates_materialized_indices() {
+        let rows = RowOrder::Sorted(vec![2, 0, 1]);
+
+        assert!(matches!(rows, RowOrder::Sorted(_)));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn build_row_order_keeps_natural_order_for_non_decreasing_buckets() {
+        let dts = TimestampNanosecondArray::from(vec![0, 5, 10, 15]).with_timezone("UTC");
+        let rows = build_row_order(&dts, 4, 10);
+
+        assert!(matches!(rows, RowOrder::Natural { row_count: 4 }));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn build_row_order_sorts_only_when_bucket_order_regresses() {
+        let dts = TimestampNanosecondArray::from(vec![10, 0, 20]).with_timezone("UTC");
+        let rows = build_row_order(&dts, 3, 10);
+
+        assert!(matches!(rows, RowOrder::Sorted(_)));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![1, 0, 2]);
+    }
 }

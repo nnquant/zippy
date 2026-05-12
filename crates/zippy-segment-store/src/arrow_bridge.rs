@@ -24,6 +24,19 @@ impl RowSpanView {
         RecordBatch::try_new(schema, arrays)
     }
 
+    /// 将指定列投影为 `RecordBatch`，避免物化未请求列。
+    pub fn as_record_batch_with_projection(
+        &self,
+        field_names: &[&str],
+    ) -> Result<RecordBatch, ArrowError> {
+        let schema = self.projected_arrow_schema(field_names)?;
+        let arrays = field_names
+            .iter()
+            .map(|field_name| self.project_array(field_name))
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        RecordBatch::try_new(schema, arrays)
+    }
+
     /// 返回当前行范围的 Arrow schema。
     pub fn schema_ref(&self) -> SchemaRef {
         self.arrow_schema()
@@ -268,6 +281,20 @@ impl RowSpanView {
 
     fn arrow_schema(&self) -> SchemaRef {
         build_arrow_schema(self.schema())
+    }
+
+    fn projected_arrow_schema(&self, field_names: &[&str]) -> Result<SchemaRef, ArrowError> {
+        let full_schema = self.arrow_schema();
+        let fields = field_names
+            .iter()
+            .map(|field_name| {
+                full_schema
+                    .field_with_name(field_name)
+                    .cloned()
+                    .map_err(|_| ArrowError::SchemaError(format!("missing column [{field_name}]")))
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+        Ok(Arc::new(Schema::new(fields)))
     }
 }
 

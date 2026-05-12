@@ -1046,6 +1046,85 @@ fn native_gateway_pushes_slice_collect_into_segment_reader() {
 }
 
 #[test]
+fn native_gateway_collect_stream_returns_start_chunks_and_end_frames() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606", "IF2607"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5, 4103.5])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "stream_collect_ticks",
+            "token": "dev-token",
+            "rows": 2
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_collect_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": [{"op": "select", "exprs": [{"kind": "col", "value": "instrument_id"}]}]
+        }),
+        vec![],
+    );
+
+    assert_eq!(frames[0].0["status"], "ok");
+    assert_eq!(frames[0].0["kind"], "collect_start");
+    assert_eq!(frames[1].0["kind"], "collect_chunk");
+    assert_eq!(frames[2].0["kind"], "collect_chunk");
+    assert_eq!(frames[3].0["kind"], "collect_end");
+    assert_eq!(frames[3].0["metrics"]["returned_rows"], json!(2));
+
+    let first_chunk = decode_ipc_batch(&frames[1].1);
+    let second_chunk = decode_ipc_batch(&frames[2].1);
+    assert_eq!(first_chunk.num_rows(), 1);
+    assert_eq!(second_chunk.num_rows(), 1);
+    let first_ids = first_chunk
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let second_ids = second_chunk
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(first_ids.value(0), "IF2606");
+    assert_eq!(second_ids.value(0), "IF2607");
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_applies_lazy_shape_collect_plan() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -1371,6 +1450,45 @@ fn send_gateway_frame_with_payload(
         serde_json::from_slice(&response_header).unwrap(),
         response_payload,
     )
+}
+
+fn send_gateway_stream_frames(
+    endpoint: &str,
+    header: serde_json::Value,
+    payload: Vec<u8>,
+) -> Vec<(serde_json::Value, Vec<u8>)> {
+    let mut stream = TcpStream::connect(endpoint).unwrap();
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    stream
+        .write_all(&(header_bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    stream
+        .write_all(&(payload.len() as u64).to_be_bytes())
+        .unwrap();
+    stream.write_all(&header_bytes).unwrap();
+    stream.write_all(&payload).unwrap();
+
+    let mut frames = Vec::new();
+    loop {
+        let mut prefix = [0u8; 12];
+        stream.read_exact(&mut prefix).unwrap();
+        let header_len = u32::from_be_bytes(prefix[0..4].try_into().unwrap()) as usize;
+        let payload_len = u64::from_be_bytes(prefix[4..12].try_into().unwrap()) as usize;
+        let mut response_header = vec![0u8; header_len];
+        stream.read_exact(&mut response_header).unwrap();
+        let mut response_payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            stream.read_exact(&mut response_payload).unwrap();
+        }
+        let response = serde_json::from_slice::<serde_json::Value>(&response_header).unwrap();
+        let kind = response.get("kind").and_then(serde_json::Value::as_str);
+        let is_terminal = matches!(kind, Some("collect_end")) || response["status"] == "error";
+        frames.push((response, response_payload));
+        if is_terminal {
+            break;
+        }
+    }
+    frames
 }
 
 fn send_gateway_header_without_payload(

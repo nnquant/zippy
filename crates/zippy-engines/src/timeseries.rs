@@ -285,7 +285,7 @@ impl Engine for TimeSeriesEngine {
             ProcessedInput::Table {
                 ids,
                 dts,
-                row_indices: accepted_rows,
+                row_selection: accepted_rows,
                 spec_inputs: self
                     .specs
                     .iter()
@@ -303,10 +303,11 @@ impl Engine for TimeSeriesEngine {
                     .collect::<Result<Vec<_>>>()?,
             }
         } else {
+            let accepted_row_indices = accepted_rows.to_vec();
             let accepted_batch = record_batch_from_table_rows(
                 &table,
                 &self.input_schema,
-                &accepted_rows,
+                &accepted_row_indices,
                 "timeseries accepted",
             )?;
             let processed_batch = apply_reactive_factors(
@@ -315,7 +316,9 @@ impl Engine for TimeSeriesEngine {
                 &self.pre_schema,
                 "timeseries pre",
             )?;
-            let row_indices = (0..processed_batch.num_rows()).collect::<Vec<_>>();
+            let row_selection = RowSelection::All {
+                row_count: processed_batch.num_rows(),
+            };
             let spec_inputs = self
                 .specs
                 .iter()
@@ -334,7 +337,7 @@ impl Engine for TimeSeriesEngine {
                 dts: extract_dt_array(&processed_batch, &self.dt_column)?,
                 id_column: self.id_column.clone(),
                 dt_column: self.dt_column.clone(),
-                row_indices,
+                row_selection,
                 spec_inputs,
             }
         };
@@ -343,7 +346,7 @@ impl Engine for TimeSeriesEngine {
         let mut next_open_windows = self.open_windows.clone();
         let mut next_last_dt_by_id = self.last_dt_by_id.clone();
 
-        for row_index in processed_input.row_indices() {
+        for row_index in processed_input.row_selection() {
             let id = processed_input.id_value(row_index)?.to_string();
             let dt = processed_input.dt_value(row_index)?;
             let window_start = align_window_start(dt, self.window_ns);
@@ -413,9 +416,9 @@ impl Engine for TimeSeriesEngine {
 }
 
 impl TimeSeriesEngine {
-    fn collect_id_filter_rows(&mut self, ids: &StringArray, row_count: usize) -> Vec<u32> {
+    fn collect_id_filter_rows(&mut self, ids: &StringArray, row_count: usize) -> RowSelection {
         let Some(id_filter) = &self.id_filter else {
-            return (0..row_count).map(|row_index| row_index as u32).collect();
+            return RowSelection::All { row_count };
         };
 
         let mut kept_rows = Vec::with_capacity(row_count);
@@ -432,7 +435,55 @@ impl TimeSeriesEngine {
         }
 
         self.pending_filtered_rows += filtered_rows;
-        kept_rows
+        RowSelection::Selected(kept_rows)
+    }
+}
+
+enum RowSelection {
+    All { row_count: usize },
+    Selected(Vec<u32>),
+}
+
+impl RowSelection {
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::All { row_count } => *row_count,
+            Self::Selected(row_indices) => row_indices.len(),
+        }
+    }
+
+    fn iter(&self) -> RowSelectionIter<'_> {
+        match self {
+            Self::All { row_count } => RowSelectionIter::All(0..*row_count),
+            Self::Selected(row_indices) => RowSelectionIter::Selected(row_indices.iter()),
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u32> {
+        match self {
+            Self::All { row_count } => (0..*row_count).map(|row_index| row_index as u32).collect(),
+            Self::Selected(row_indices) => row_indices.clone(),
+        }
+    }
+}
+
+enum RowSelectionIter<'a> {
+    All(std::ops::Range<usize>),
+    Selected(std::slice::Iter<'a, u32>),
+}
+
+impl Iterator for RowSelectionIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::All(row_indices) => row_indices.next(),
+            Self::Selected(row_indices) => row_indices.next().map(|row_index| *row_index as usize),
+        }
     }
 }
 
@@ -567,7 +618,7 @@ enum ProcessedInput<'a> {
     Table {
         ids: &'a StringArray,
         dts: &'a TimestampNanosecondArray,
-        row_indices: Vec<u32>,
+        row_selection: RowSelection,
         spec_inputs: Vec<SpecInputArrays>,
     },
     Batch {
@@ -575,19 +626,17 @@ enum ProcessedInput<'a> {
         dts: ArrayRef,
         id_column: String,
         dt_column: String,
-        row_indices: Vec<usize>,
+        row_selection: RowSelection,
         spec_inputs: Vec<SpecInputArrays>,
     },
 }
 
 impl<'a> ProcessedInput<'a> {
-    fn row_indices(&self) -> Vec<usize> {
+    fn row_selection(&self) -> RowSelectionIter<'_> {
         match self {
-            Self::Table { row_indices, .. } => row_indices
-                .iter()
-                .map(|row_index| *row_index as usize)
-                .collect(),
-            Self::Batch { row_indices, .. } => row_indices.clone(),
+            Self::Table { row_selection, .. } | Self::Batch { row_selection, .. } => {
+                row_selection.iter()
+            }
         }
     }
 
@@ -767,14 +816,14 @@ fn apply_reactive_factors(
 fn collect_accepted_rows_for_rows(
     ids: &StringArray,
     dts: &TimestampNanosecondArray,
-    row_indices: &[u32],
+    row_selection: &RowSelection,
     last_dt_by_id: &BTreeMap<String, i64>,
     pending_late_rows: &mut u64,
-) -> Vec<u32> {
-    let mut accepted_rows = Vec::with_capacity(row_indices.len());
+) -> RowSelection {
+    let mut accepted_rows = Vec::with_capacity(row_selection.len());
     let mut batch_last_dt_by_id = BTreeMap::new();
 
-    for row_index in row_indices.iter().map(|row_index| *row_index as usize) {
+    for row_index in row_selection.iter() {
         let id = ids.value(row_index);
         let dt = dts.value(row_index);
 
@@ -787,7 +836,7 @@ fn collect_accepted_rows_for_rows(
         accepted_rows.push(row_index as u32);
     }
 
-    accepted_rows
+    RowSelection::Selected(accepted_rows)
 }
 
 fn is_late_row(
@@ -948,12 +997,12 @@ fn checked_value_array<'a>(array: &'a ArrayRef, column: &str) -> Result<&'a Floa
 fn validate_non_decreasing_dts_for_rows(
     ids: &StringArray,
     dts: &TimestampNanosecondArray,
-    row_indices: &[u32],
+    row_selection: &RowSelection,
     last_dt_by_id: &BTreeMap<String, i64>,
 ) -> Result<()> {
     let mut batch_last_dt_by_id = BTreeMap::new();
 
-    for row_index in row_indices.iter().map(|row_index| *row_index as usize) {
+    for row_index in row_selection.iter() {
         let id = ids.value(row_index);
         let dt = dts.value(row_index);
         let last_dt = batch_last_dt_by_id
@@ -975,4 +1024,29 @@ fn validate_non_decreasing_dts_for_rows(
 
 fn align_window_start(dt: i64, window_ns: i64) -> i64 {
     dt.div_euclid(window_ns) * window_ns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RowSelection;
+
+    #[test]
+    fn row_selection_all_iterates_without_materialized_indices() {
+        let rows = RowSelection::All { row_count: 3 };
+
+        assert!(!rows.is_empty());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(rows.to_vec(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn row_selection_selected_iterates_existing_indices() {
+        let rows = RowSelection::Selected(vec![1, 3]);
+
+        assert!(!rows.is_empty());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(rows.to_vec(), vec![1, 3]);
+    }
 }

@@ -7,6 +7,8 @@
 - `inproc-timeseries`
 - `remote-pipeline-upstream`
 - `remote-pipeline-downstream`
+- `stream-table-segment-copy`
+- `stream-table-segment-forward`
 
 ## 最小用法
 
@@ -24,7 +26,10 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
   --target-rows-per-sec 1000000 \
   --duration-sec 60 \
   --warmup-sec 10 \
-  --symbols 1024
+  --symbols 1024 \
+  --max-p95-micros 1000 \
+  --max-p99-micros 5000 \
+  --max-queue-depth 0
 ```
 
 跨进程压测需要先启动 downstream，再启动 upstream：
@@ -64,10 +69,40 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
   --report-json /tmp/zippy-perf-report.json
 ```
 
+## 性能门禁
+
+`zippy-perf` 的 `pass` 不是单纯的平均吞吐判断。默认会检查：
+
+- engine 没有进入 failed 状态
+- 平均吞吐不低于目标吞吐的 90%
+- 没有 dropped batches
+- 没有 publish errors
+- remote source 没有 decode errors
+
+可以用以下可选阈值把尾延迟和队列堆积纳入门禁：
+
+- `--max-p95-micros`
+- `--max-p99-micros`
+- `--max-queue-depth`
+
+示例：
+
+```bash
+cargo run -p zippy-perf --release -- stream-table-segment-copy \
+  --rows-per-batch 4096 \
+  --target-rows-per-sec 1000000 \
+  --duration-sec 60 \
+  --warmup-sec 10 \
+  --symbols 1024 \
+  --max-p95-micros 2000 \
+  --max-p99-micros 15000
+```
+
 ## 当前输出
 
 首版报告包含：
 
+- metadata：git sha、target、started_at_unix_ms
 - input rows total
 - output rows total
 - actual average rows/s
@@ -81,6 +116,6 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
 
 ## 当前边界
 
-- 首版只实现 `inproc-timeseries` 与 `remote-pipeline`
 - 远程压测通过两个独立进程运行，不自动拉起对端
-- `pass` 以目标吞吐的 `90%` 作为默认判定线，便于本地小规模 smoke 与高目标压测共用一套逻辑
+- `pass` 以目标吞吐的 `90%` 作为默认吞吐判定线，便于本地小规模 smoke 与高目标压测共用一套逻辑
+- 延迟和队列阈值默认关闭；生产门禁应显式设置这些阈值

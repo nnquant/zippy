@@ -34,7 +34,7 @@ enum StatefulFloatState {
     Window {
         size: usize,
         kind: WindowHistoryKind,
-        history_by_id: HashMap<String, VecDeque<f64>>,
+        history_by_id: HashMap<String, WindowHistory>,
     },
 }
 
@@ -45,7 +45,7 @@ struct StatefulFloatUndoLog {
 
 enum StatefulFloatUndoEntry {
     Ema(Option<f64>),
-    Window(Option<VecDeque<f64>>),
+    Window(Option<WindowHistory>),
 }
 
 /// Evaluate a stateful factor against rows in input order.
@@ -204,67 +204,55 @@ impl StatefulFloatById {
 
                 let output = match kind {
                     WindowHistoryKind::Mean => {
-                        history.push_back(value);
-                        trim_history(history, *size);
+                        history.push_and_trim(value, *size);
                         if history.len() < *size {
                             None
                         } else {
-                            Some(history.iter().copied().sum::<f64>() / *size as f64)
+                            Some(history.sum() / *size as f64)
                         }
                     }
                     WindowHistoryKind::Std => {
-                        history.push_back(value);
-                        trim_history(history, *size);
+                        history.push_and_trim(value, *size);
                         if history.len() < *size {
                             None
                         } else {
-                            let mean = history.iter().copied().sum::<f64>() / *size as f64;
-                            let variance = history
-                                .iter()
-                                .map(|item| {
-                                    let centered = *item - mean;
-                                    centered * centered
-                                })
-                                .sum::<f64>()
-                                / *size as f64;
-                            Some(variance.sqrt())
+                            let mean = history.sum() / *size as f64;
+                            let variance = history.sum_squares() / *size as f64 - mean * mean;
+                            Some(variance.max(0.0).sqrt())
                         }
                     }
                     WindowHistoryKind::Delay => {
                         let output = if history.len() < *size {
                             None
                         } else {
-                            Some(*history.front().expect("history length checked above"))
+                            history.front()
                         };
-                        history.push_back(value);
-                        trim_history(history, *size);
+                        history.push_and_trim(value, *size);
                         output
                     }
                     WindowHistoryKind::Diff => {
                         let output = if history.len() < *size {
                             None
                         } else {
-                            let base = *history.front().expect("history length checked above");
-                            Some(value - base)
+                            history.front().map(|base| value - base)
                         };
-                        history.push_back(value);
-                        trim_history(history, *size);
+                        history.push_and_trim(value, *size);
                         output
                     }
                     WindowHistoryKind::Return => {
                         let output = if history.len() < *size {
                             None
                         } else {
-                            let base = *history.front().expect("history length checked above");
-                            if base == 0.0 {
-                                None
-                            } else {
-                                let ret = (value / base) - 1.0;
-                                ret.is_finite().then_some(ret)
-                            }
+                            history.front().and_then(|base| {
+                                if base == 0.0 {
+                                    None
+                                } else {
+                                    let ret = (value / base) - 1.0;
+                                    ret.is_finite().then_some(ret)
+                                }
+                            })
                         };
-                        history.push_back(value);
-                        trim_history(history, *size);
+                        history.push_and_trim(value, *size);
                         output
                     }
                 };
@@ -657,6 +645,46 @@ enum WindowHistoryKind {
     Return,
 }
 
+#[derive(Clone, Default)]
+struct WindowHistory {
+    values: VecDeque<f64>,
+    sum: f64,
+    sum_squares: f64,
+}
+
+impl WindowHistory {
+    fn push_and_trim(&mut self, value: f64, size: usize) {
+        self.values.push_back(value);
+        self.sum += value;
+        self.sum_squares += value * value;
+
+        while self.values.len() > size {
+            let removed = self
+                .values
+                .pop_front()
+                .expect("window history length checked above");
+            self.sum -= removed;
+            self.sum_squares -= removed * removed;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn front(&self) -> Option<f64> {
+        self.values.front().copied()
+    }
+
+    fn sum(&self) -> f64 {
+        self.sum
+    }
+
+    fn sum_squares(&self) -> f64 {
+        self.sum_squares
+    }
+}
+
 struct WindowHistoryFactor {
     id_field: String,
     value_field: String,
@@ -849,12 +877,6 @@ fn build_window_history_factor(
     }))
 }
 
-fn trim_history(history: &mut VecDeque<f64>, size: usize) {
-    while history.len() > size {
-        history.pop_front();
-    }
-}
-
 fn extract_columns<'a>(
     batch: &'a RecordBatch,
     id_field: &str,
@@ -914,4 +936,24 @@ fn extract_columns<'a>(
     }
 
     Ok((id_array, value_array))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowHistory;
+
+    #[test]
+    fn window_history_maintains_running_sum_and_squares_when_trimmed() {
+        let mut history = WindowHistory::default();
+
+        history.push_and_trim(2.0, 3);
+        history.push_and_trim(4.0, 3);
+        history.push_and_trim(6.0, 3);
+        history.push_and_trim(8.0, 3);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.front(), Some(4.0));
+        assert_eq!(history.sum(), 18.0);
+        assert_eq!(history.sum_squares(), 116.0);
+    }
 }

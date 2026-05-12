@@ -2661,6 +2661,82 @@ def _remote_request(
     return response, response_payload
 
 
+def _remote_collect_stream_request(
+    endpoint: str,
+    header: dict[str, object],
+    *,
+    token: str | None = None,
+    timeout_sec: float | None = None,
+):
+    import pyarrow as pa
+
+    host, port = _parse_remote_endpoint(endpoint)
+    timeout_sec = _remote_gateway_timeout_sec() if timeout_sec is None else float(timeout_sec)
+    header = dict(header)
+    header["kind"] = "collect_stream"
+    if token is not None:
+        header["token"] = token
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout_sec)
+    except OSError as error:
+        raise RuntimeError(
+            "failed to connect remote gateway "
+            f"endpoint=[{endpoint}] host=[{host}] port=[{port}] timeout_sec=[{timeout_sec}] "
+            f"error=[{error}]"
+        ) from error
+
+    chunks = []
+    schema = None
+    metrics: dict[str, object] = {}
+    try:
+        with sock:
+            _send_remote_frame(sock, header)
+            while True:
+                response, payload = _recv_remote_frame(sock)
+                if response.get("status") != "ok":
+                    reason = response.get("reason", "unknown remote gateway error")
+                    raise RuntimeError(f"remote gateway request failed reason=[{reason}]")
+                kind = response.get("kind")
+                if kind == "collect_start":
+                    if payload:
+                        schema = _pyarrow_schema_from_ipc(payload)
+                    continue
+                if kind == "collect_chunk":
+                    table = _pyarrow_table_from_ipc(payload)
+                    schema = schema or table.schema
+                    chunks.append(table)
+                    continue
+                if kind == "collect_end":
+                    response_metrics = response.get("metrics", {})
+                    metrics = dict(response_metrics) if isinstance(response_metrics, dict) else {}
+                    break
+                raise RuntimeError(
+                    f"remote gateway request failed reason=[unexpected frame {kind}]"
+                )
+    except TimeoutError as error:
+        raise RuntimeError(
+            "remote gateway request timed out "
+            f"endpoint=[{endpoint}] host=[{host}] port=[{port}] timeout_sec=[{timeout_sec}] "
+            f"kind=[{header.get('kind')}]"
+        ) from error
+    except RuntimeError as error:
+        if token is None and "connection closed while reading frame" in str(error):
+            raise RuntimeError(
+                "remote gateway request failed reason=[unauthorized remote gateway request]"
+            ) from error
+        raise
+    except OSError as error:
+        raise RuntimeError(
+            "remote gateway request failed "
+            f"endpoint=[{endpoint}] host=[{host}] port=[{port}] error=[{error}]"
+        ) from error
+
+    table = _concat_query_tables(chunks, schema)
+    if table is None:
+        table = pa.Table.from_batches([])
+    return table, metrics
+
+
 def _remote_master_get_config(endpoint: str, timeout_sec: float = 5.0) -> dict[str, object]:
     host, port = _parse_remote_endpoint(endpoint)
     with socket.create_connection((host, port), timeout=timeout_sec) as sock:
@@ -2936,7 +3012,9 @@ class _RemoteQuery:
             return table.slice(0, 0)
         return table.slice(max(0, table.num_rows - n), n)
 
-    def collect_plan(self, plan: list[dict[str, object]], *, snapshot: object):
+    def collect_plan(
+        self, plan: list[dict[str, object]], *, snapshot: object, stream: bool = False
+    ):
         header = {
             "kind": "collect",
             "source": str(self.source),
@@ -2949,6 +3027,14 @@ class _RemoteQuery:
             header["snapshot_id"] = str(snapshot_id)
         else:
             header["snapshot"] = bool(snapshot)
+        if stream:
+            table, metrics = _remote_collect_stream_request(
+                self.endpoint,
+                header,
+                token=self.token,
+            )
+            self._last_collect_metrics = metrics
+            return table
         response, payload = _remote_request(
             self.endpoint,
             header,
@@ -2986,6 +3072,10 @@ class _RemoteQuery:
 class RemoteGatewayWriter:
     """
     Remote writer that accepts row writes and sends Arrow IPC batches to a gateway.
+
+    This is a convenience writer for low-frequency or already batched remote writes. Hot tick
+    paths should pass Arrow tables or record batches instead of scalar row dictionaries so Python
+    does not become the per-row conversion bottleneck.
     """
 
     def __init__(
@@ -3018,6 +3108,23 @@ class RemoteGatewayWriter:
             if len(self._rows) >= self.batch_size or self._flush_interval_elapsed():
                 self.flush()
             return
+        self.write_batch(value)
+
+    def write_batch(self, value: object) -> None:
+        """
+        Send an already batched value to the remote gateway immediately.
+
+        :param value: PyArrow table, record batch, list of row dicts, or DataFrame-like object.
+        :type value: object
+        :raises RuntimeError: If the writer is closed.
+        :raises TypeError: If ``value`` is a scalar row dictionary.
+        """
+        if self._closed:
+            raise RuntimeError("remote writer is closed")
+        if _is_scalar_row_dict(value):
+            raise TypeError(
+                "write_batch requires a batched value; use write() for scalar row dictionaries"
+            )
         self.flush()
         self._send_table(_value_to_pyarrow_table(value, self.schema))
 
@@ -3283,6 +3390,9 @@ def get_writer(
 ):
     """
     Return a writer for a named stream, choosing local segment or remote gateway automatically.
+
+    Remote scalar row writes are buffered for convenience. For high-frequency streams, prefer
+    passing Arrow table or record-batch inputs to the returned writer.
     """
     selected_master = master or _default_master()
     remote_endpoint = (
@@ -3648,17 +3758,20 @@ class Table:
         column_expr = col(column) if isinstance(column, str) else _literal(column)
         return self.filter((column_expr >= start) & (column_expr <= end))
 
-    def collect(self):
+    def collect(self, *, stream: bool = False):
         """
         Collect all currently queryable rows as a ``pyarrow.Table``.
 
         This user-level query path merges persisted parquet rows with the live
         segment view and hides the active/sealed/persisted storage split.
 
+        :param stream: Use the remote Gateway streaming collect protocol when true. Local
+            queries and default remote collects keep the existing single-response path.
+        :type stream: bool
         :returns: Current query result.
         :rtype: pyarrow.Table
         """
-        return self._collect_query(metrics=None)
+        return self._collect_query(metrics=None, stream=stream)
 
     def profile(self) -> dict[str, object]:
         """
@@ -3679,17 +3792,24 @@ class Table:
         metrics["elapsed_ms"] = (time.perf_counter_ns() - started_ns) / 1_000_000.0
         return {"result": result, "metrics": metrics}
 
-    def _collect_query(self, metrics: dict[str, object] | None):
+    def _collect_query(self, metrics: dict[str, object] | None, stream: bool = False):
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         remote_collect = getattr(self._inner, "collect_plan", None)
         if callable(remote_collect):
             remote_plan, residual_plan = _remote_gateway_plan_split(optimized_plan)
             snapshot = self.snapshot() if self._snapshot_enabled else False
-            result = remote_collect(
-                _query_plan_to_json(remote_plan),
-                snapshot=snapshot,
-            )
+            if stream:
+                result = remote_collect(
+                    _query_plan_to_json(remote_plan),
+                    snapshot=snapshot,
+                    stream=True,
+                )
+            else:
+                result = remote_collect(
+                    _query_plan_to_json(remote_plan),
+                    snapshot=snapshot,
+                )
             if residual_plan:
                 result = _apply_query_plan_ops_to_arrow(result, residual_plan)
             if metrics is not None:
