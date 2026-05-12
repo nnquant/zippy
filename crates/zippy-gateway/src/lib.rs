@@ -150,13 +150,24 @@ enum GatewayCollectStreamProducer {
 }
 
 impl GatewayCollectStreamProducer {
-    fn materialized_with_metrics(batch: RecordBatch, chunk_rows: usize, metrics: Value) -> Self {
+    fn materialized(batch: RecordBatch, chunk_rows: usize) -> Self {
         Self::Materialized {
             batch,
             chunk_rows: chunk_rows.max(1),
             offset: 0,
-            metrics,
+            metrics: json!({}),
         }
+    }
+
+    fn materialized_with_metrics(batch: RecordBatch, chunk_rows: usize, metrics: Value) -> Self {
+        let mut producer = Self::materialized(batch, chunk_rows);
+        match &mut producer {
+            Self::Materialized {
+                metrics: stored_metrics,
+                ..
+            } => *stored_metrics = metrics,
+        }
+        producer
     }
 
     fn schema(&self) -> SchemaRef {
@@ -4077,11 +4088,7 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
         )
         .unwrap();
-        let mut producer = GatewayCollectStreamProducer::materialized_with_metrics(
-            batch,
-            2,
-            json!({"streaming": true}),
-        );
+        let mut producer = GatewayCollectStreamProducer::materialized(batch, 2);
 
         let first = producer.next_batch().unwrap().unwrap();
         let second = producer.next_batch().unwrap().unwrap();
