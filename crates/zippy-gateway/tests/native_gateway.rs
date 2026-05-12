@@ -1027,6 +1027,16 @@ fn native_gateway_collect_stream_keeps_mixed_persisted_and_live_on_materialized_
 }
 
 #[test]
+fn native_gateway_collect_stream_head_matches_default_collect() {
+    assert_streaming_row_range_matches_default("head", json!({"op": "head", "n": 1}));
+}
+
+#[test]
+fn native_gateway_collect_stream_tail_matches_default_collect() {
+    assert_streaming_row_range_matches_default("tail", json!({"op": "tail", "n": 1}));
+}
+
+#[test]
 fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
     let temp = tempfile::tempdir().unwrap();
     let old_path = temp.path().join("segment-1.parquet");
@@ -1838,6 +1848,128 @@ fn send_raw_control_line(endpoint: &ControlEndpoint, line: &str) -> serde_json::
     let mut reader = BufReader::new(stream);
     reader.read_line(&mut response).unwrap();
     serde_json::from_str(&response).unwrap()
+}
+
+fn assert_streaming_row_range_matches_default(label: &str, row_range_op: serde_json::Value) {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join(format!("{}_first.parquet", label));
+    let second_path = temp.path().join(format!("{}_second.parquet", label));
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) =
+        spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+    let first_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![std::sync::Arc::new(Int64Array::from(vec![1_i64]))],
+    )
+    .unwrap();
+    let second_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![std::sync::Arc::new(Int64Array::from(vec![2_i64]))],
+    )
+    .unwrap();
+    write_parquet_batch(&first_path, &first_batch);
+    write_parquet_batch(&second_path, &second_batch);
+
+    let stream_name = format!("stream_range_{}_ticks", label);
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client
+        .register_process(&format!("stream_range_{}_writer", label))
+        .unwrap();
+    client
+        .register_stream(&stream_name, schema, 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            &format!("stream_range_{}_source", label),
+            "test",
+            &stream_name,
+            json!({}),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            &stream_name,
+            json!({
+                "file_path": first_path.to_string_lossy(),
+                "row_count": 1,
+                "source_segment_id": 1,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            &stream_name,
+            json!({
+                "file_path": second_path.to_string_lossy(),
+                "row_count": 1,
+                "source_segment_id": 2,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+
+    let plan = json!([
+        row_range_op,
+        {"op": "select", "exprs": [{"kind": "col", "value": "seq"}]}
+    ]);
+    let (default_response, default_payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": stream_name,
+            "token": "dev-token",
+            "plan": plan
+        }),
+        vec![],
+    );
+    assert_eq!(default_response["status"], "ok");
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": stream_name,
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": plan
+        }),
+        vec![],
+    );
+    let default_batch = decode_ipc_batch(&default_payload);
+    let default_values = default_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(streamed_i64_values(&frames), default_values);
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["row_range_pushdown"],
+        json!(label)
+    );
+    let expected_scanned_files = if label == "tail" { 1 } else { 2 };
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["scanned_files"],
+        json!(expected_scanned_files)
+    );
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
 }
 
 fn reserve_tcp_port() -> u16 {

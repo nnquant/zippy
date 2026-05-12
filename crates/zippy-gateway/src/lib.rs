@@ -150,6 +150,7 @@ struct GatewayCollectStreamMetrics {
     scanned_file_paths: Vec<String>,
     scanned_rows: usize,
     returned_rows: usize,
+    row_range_pushdown: Option<&'static str>,
     scan_elapsed_ms: f64,
     filter_elapsed_ms: f64,
     encode_elapsed_ms: f64,
@@ -166,6 +167,7 @@ impl GatewayCollectStreamMetrics {
             "scanned_file_paths": self.scanned_file_paths,
             "scanned_rows": self.scanned_rows,
             "returned_rows": self.returned_rows,
+            "row_range_pushdown": self.row_range_pushdown,
             "scan_elapsed_ms": self.scan_elapsed_ms,
             "filter_elapsed_ms": self.filter_elapsed_ms,
             "encode_elapsed_ms": self.encode_elapsed_ms,
@@ -189,6 +191,8 @@ enum GatewayCollectStreamProducer {
         chunk_rows: usize,
         current_batch: Option<RecordBatch>,
         current_offset: usize,
+        skip_rows: usize,
+        remaining_rows: Option<usize>,
         metrics: GatewayCollectStreamMetrics,
     },
 }
@@ -219,6 +223,7 @@ impl GatewayCollectStreamProducer {
         stream: &StreamInfo,
         scan_pushdown: &GatewayScanPushdown,
         output_projection_columns: Option<&[String]>,
+        row_range_pushdown: Option<GatewayRowRangePushdown>,
         chunk_rows: usize,
     ) -> Result<Self> {
         let scan_started = Instant::now();
@@ -226,21 +231,60 @@ impl GatewayCollectStreamProducer {
         let scan_schema = schema_for_scan_pushdown(&schema, scan_pushdown)?;
         let mut scanned_rows = 0usize;
         let mut scanned_files = Vec::new();
+        let (skip_rows, remaining_rows, batches) = match row_range_pushdown {
+            Some(GatewayRowRangePushdown::Tail(n)) => (
+                0,
+                Some(n),
+                tail_persisted_file_record_batches(
+                    stream,
+                    n,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                    &mut scanned_files,
+                )?,
+            ),
+            Some(GatewayRowRangePushdown::Head(n)) => (
+                0,
+                Some(n),
+                persisted_file_record_batches(
+                    stream,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                    &mut scanned_files,
+                )?,
+            ),
+            Some(GatewayRowRangePushdown::Slice { offset, length }) => (
+                offset,
+                length,
+                persisted_file_record_batches(
+                    stream,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                    &mut scanned_files,
+                )?,
+            ),
+            None => (
+                0,
+                None,
+                persisted_file_record_batches(
+                    stream,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                    &mut scanned_files,
+                )?,
+            ),
+        };
         // Task 5 replaces this eager serial scan with bounded pending file results.
-        let batches = persisted_file_record_batches(
-            stream,
-            scan_pushdown,
-            &mut scanned_rows,
-            &mut scanned_files,
-        )?
-        .into_iter()
-        .map(|batch| project_record_batch(&batch, output_projection_columns))
-        .collect::<Result<Vec<_>>>()?;
+        let batches = batches
+            .into_iter()
+            .map(|batch| project_record_batch(&batch, output_projection_columns))
+            .collect::<Result<Vec<_>>>()?;
         let metrics = GatewayCollectStreamMetrics {
             streaming: true,
             scanned_files: scanned_files.len(),
             scanned_file_paths: scanned_files,
             scanned_rows,
+            row_range_pushdown: row_range_pushdown.map(GatewayRowRangePushdown::op_name),
             scan_elapsed_ms: scan_started.elapsed().as_secs_f64() * 1000.0,
             ..GatewayCollectStreamMetrics::default()
         };
@@ -250,6 +294,8 @@ impl GatewayCollectStreamProducer {
             chunk_rows: chunk_rows.max(1),
             current_batch: None,
             current_offset: 0,
+            skip_rows,
+            remaining_rows,
             metrics,
         })
     }
@@ -289,9 +335,14 @@ impl GatewayCollectStreamProducer {
                 chunk_rows,
                 current_batch,
                 current_offset,
+                skip_rows,
+                remaining_rows,
                 metrics,
                 ..
             } => loop {
+                if remaining_rows.is_some_and(|remaining| remaining == 0) {
+                    return Ok(None);
+                }
                 if current_batch
                     .as_ref()
                     .is_none_or(|batch| *current_offset >= batch.num_rows())
@@ -306,9 +357,25 @@ impl GatewayCollectStreamProducer {
                     *current_batch = None;
                     continue;
                 }
-                let rows = (*chunk_rows).min(batch.num_rows() - *current_offset);
-                let chunk = batch.slice(*current_offset, rows);
-                *current_offset += rows;
+                let available_rows = batch.num_rows() - *current_offset;
+                if *skip_rows >= available_rows {
+                    *skip_rows -= available_rows;
+                    *current_offset = batch.num_rows();
+                    continue;
+                }
+                let start = *current_offset + *skip_rows;
+                let available_rows = batch.num_rows() - start;
+                *skip_rows = 0;
+                let mut rows = (*chunk_rows).min(available_rows);
+                if let Some(remaining) = remaining_rows.as_mut() {
+                    rows = rows.min(*remaining);
+                    *remaining = remaining.saturating_sub(rows);
+                }
+                if rows == 0 {
+                    return Ok(None);
+                }
+                let chunk = batch.slice(start, rows);
+                *current_offset = start + rows;
                 metrics.returned_rows = metrics.returned_rows.saturating_add(rows);
                 return Ok(Some(chunk));
             },
@@ -945,8 +1012,7 @@ impl GatewayState {
         &self,
         stream_plan: GatewayCollectStreamPlan,
     ) -> Result<GatewayCollectStreamProducer> {
-        let has_row_range_pushdown = stream_plan.row_range_pushdown.is_some();
-        if stream_plan.snapshot_id.is_none() && !has_row_range_pushdown {
+        if stream_plan.snapshot_id.is_none() {
             let has_active_writer = self
                 .writers
                 .lock()
@@ -960,6 +1026,7 @@ impl GatewayState {
                         &stream,
                         &stream_plan.scan_pushdown,
                         stream_plan.output_projection_columns.as_deref(),
+                        stream_plan.row_range_pushdown.map(|(pushdown, _)| pushdown),
                         stream_plan.chunk_rows,
                     );
                 }
