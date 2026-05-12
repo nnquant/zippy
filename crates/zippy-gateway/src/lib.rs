@@ -179,6 +179,22 @@ impl OrderedGatewayFileResults {
     }
 
     fn insert(&mut self, file_index: usize, batches: Vec<RecordBatch>) -> Result<()> {
+        if file_index < self.next_file_index {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "streaming collect received stale file result file_index=[{}] next_file_index=[{}]",
+                    file_index, self.next_file_index
+                ),
+            });
+        }
+        if self.pending.contains_key(&file_index) {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "streaming collect received duplicate file result file_index=[{}]",
+                    file_index
+                ),
+            });
+        }
         if self.pending.len() >= self.max_pending {
             return Err(ZippyError::Io {
                 reason: "streaming collect pending file result limit exceeded".to_string(),
@@ -198,6 +214,20 @@ impl OrderedGatewayFileResults {
     fn max_observed_pending(&self) -> usize {
         self.max_observed_pending
     }
+
+    fn finish(self, total_files: usize) -> Result<()> {
+        if self.next_file_index != total_files || !self.pending.is_empty() {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "streaming collect missing ordered file results next_file_index=[{}] total_files=[{}] pending=[{}]",
+                    self.next_file_index,
+                    total_files,
+                    self.pending.len()
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -212,6 +242,11 @@ struct GatewayPersistedScanResult {
     file_index: usize,
     batches: Vec<RecordBatch>,
     scanned_rows: usize,
+}
+
+struct GatewayPersistedScanThreadResult {
+    file_index: usize,
+    result: Result<GatewayPersistedScanResult>,
 }
 
 impl GatewayCollectStreamMetrics {
@@ -2644,24 +2679,48 @@ fn parallel_persisted_file_record_batches(
         let end_index =
             (next_task_index + DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM).min(tasks.len());
         let chunk = &tasks[next_task_index..end_index];
-        let results = thread::scope(|scope| {
+        let results = std::sync::mpsc::channel::<GatewayPersistedScanThreadResult>();
+        let receiver = thread::scope(|scope| {
+            let (sender, receiver) = results;
             let handles = chunk
                 .iter()
                 .cloned()
-                .map(|task| scope.spawn(move || scan_persisted_file_task(task)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| ZippyError::Io {
-                        reason: "streaming collect persisted scan worker panicked".to_string(),
-                    })?
+                .map(|task| {
+                    let sender = sender.clone();
+                    scope.spawn(move || {
+                        let file_index = task.file_index;
+                        let result = scan_persisted_file_task(task);
+                        let _ =
+                            sender.send(GatewayPersistedScanThreadResult { file_index, result });
+                    })
                 })
-                .collect::<Result<Vec<_>>>()
+                .collect::<Vec<_>>();
+            drop(sender);
+            let mut join_error = None;
+            for handle in handles {
+                if handle.join().is_err() && join_error.is_none() {
+                    join_error = Some(ZippyError::Io {
+                        reason: "streaming collect persisted scan worker panicked".to_string(),
+                    });
+                }
+            }
+            if let Some(error) = join_error {
+                return Err(error);
+            }
+            Ok(receiver)
         })?;
-        for result in results {
+        for thread_result in receiver {
+            let result = thread_result.result?;
+            if result.file_index != thread_result.file_index {
+                return Err(ZippyError::Io {
+                    reason: format!(
+                        "streaming collect file result index mismatch expected=[{}] actual=[{}]",
+                        thread_result.file_index, result.file_index
+                    ),
+                });
+            }
             *scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
-            ordered.insert(result.file_index, result.batches)?;
+            ordered.insert(thread_result.file_index, result.batches)?;
             while let Some(ready) = ordered.pop_ready() {
                 batches.extend(ready);
             }
@@ -2669,6 +2728,7 @@ fn parallel_persisted_file_record_batches(
         next_task_index = end_index;
     }
     *max_pending_file_results = ordered.max_observed_pending();
+    ordered.finish(tasks.len())?;
     scanned_files.extend(files);
     Ok(batches)
 }
@@ -4589,6 +4649,38 @@ mod tests {
                 .value(0),
             2
         );
+        results.finish(2).unwrap();
+    }
+
+    #[test]
+    fn ordered_file_results_reject_duplicate_and_stale_indices() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef],
+        )
+        .unwrap();
+        let mut results = OrderedGatewayFileResults::new(2);
+
+        results.insert(0, vec![batch.clone()]).unwrap();
+        assert!(results.insert(0, vec![batch.clone()]).is_err());
+        assert!(results.pop_ready().is_some());
+        assert!(results.insert(0, vec![batch]).is_err());
+    }
+
+    #[test]
+    fn ordered_file_results_reject_unfinished_gap() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef],
+        )
+        .unwrap();
+        let mut results = OrderedGatewayFileResults::new(2);
+
+        results.insert(1, vec![batch]).unwrap();
+
+        assert!(results.finish(2).is_err());
     }
 
     #[test]
