@@ -671,6 +671,153 @@ fn native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment()
 }
 
 #[test]
+fn native_gateway_collect_streams_persisted_files_in_default_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join("first.parquet");
+    let second_path = temp.path().join("second.parquet");
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) =
+        spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("seq", DataType::Int64, false),
+    ]));
+    let first_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let second_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2607"])),
+            std::sync::Arc::new(Int64Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    write_parquet_batch(&first_path, &first_batch);
+    write_parquet_batch(&second_path, &second_batch);
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("stream_persisted_writer").unwrap();
+    client
+        .register_stream("stream_persisted_ticks", schema, 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "stream_persisted_source",
+            "test",
+            "stream_persisted_ticks",
+            json!({}),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "stream_persisted_ticks",
+            json!({
+                "file_path": first_path.to_string_lossy(),
+                "row_count": 1,
+                "source_segment_id": 1,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "stream_persisted_ticks",
+            json!({
+                "file_path": second_path.to_string_lossy(),
+                "row_count": 1,
+                "source_segment_id": 2,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+
+    let collect_plan = json!([
+        {"op": "select", "exprs": [{"kind": "col", "value": "seq"}]}
+    ]);
+    let (default_response, default_payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": "stream_persisted_ticks",
+            "token": "dev-token",
+            "plan": collect_plan
+        }),
+        vec![],
+    );
+    assert_eq!(default_response["status"], "ok");
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_persisted_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": collect_plan
+        }),
+        vec![],
+    );
+
+    assert_eq!(frames.first().unwrap().0["kind"], "collect_start");
+    assert_eq!(frames.last().unwrap().0["kind"], "collect_end");
+    let streamed_batches = frames
+        .iter()
+        .filter(|(header, _)| header["kind"] == "collect_chunk")
+        .map(|(_, payload)| decode_ipc_batch(payload))
+        .collect::<Vec<_>>();
+    let default_batch = decode_ipc_batch(&default_payload);
+    let streamed_values = streamed_batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    let default_values = default_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(streamed_values, default_values);
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["streaming"],
+        json!(true)
+    );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["scanned_files"],
+        json!(2)
+    );
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
     let temp = tempfile::tempdir().unwrap();
     let old_path = temp.path().join("segment-1.parquet");

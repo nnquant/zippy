@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Cursor;
 use std::net::{TcpListener as StdTcpListener, TcpStream};
@@ -127,7 +127,7 @@ impl GatewaySubscribeNotifier {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct GatewayScanPushdown {
     filters: Vec<Value>,
     projection_columns: Option<Vec<String>>,
@@ -137,7 +137,40 @@ struct GatewayCollectStreamPlan {
     source: String,
     snapshot_id: Option<String>,
     plan: Vec<Value>,
+    row_range_pushdown: Option<(GatewayRowRangePushdown, usize)>,
+    scan_pushdown: GatewayScanPushdown,
     chunk_rows: usize,
+}
+
+#[derive(Default)]
+struct GatewayCollectStreamMetrics {
+    streaming: bool,
+    scanned_files: usize,
+    scanned_rows: usize,
+    returned_rows: usize,
+    scan_elapsed_ms: f64,
+    filter_elapsed_ms: f64,
+    encode_elapsed_ms: f64,
+    write_elapsed_ms: f64,
+    max_pending_file_results: usize,
+    materialized_live_batches: usize,
+}
+
+impl GatewayCollectStreamMetrics {
+    fn value(&self) -> Value {
+        json!({
+            "streaming": self.streaming,
+            "scanned_files": self.scanned_files,
+            "scanned_rows": self.scanned_rows,
+            "returned_rows": self.returned_rows,
+            "scan_elapsed_ms": self.scan_elapsed_ms,
+            "filter_elapsed_ms": self.filter_elapsed_ms,
+            "encode_elapsed_ms": self.encode_elapsed_ms,
+            "write_elapsed_ms": self.write_elapsed_ms,
+            "max_pending_file_results": self.max_pending_file_results,
+            "materialized_live_batches": self.materialized_live_batches,
+        })
+    }
 }
 
 enum GatewayCollectStreamProducer {
@@ -146,6 +179,14 @@ enum GatewayCollectStreamProducer {
         chunk_rows: usize,
         offset: usize,
         metrics: Value,
+    },
+    Persisted {
+        schema: SchemaRef,
+        batches: VecDeque<RecordBatch>,
+        chunk_rows: usize,
+        current_batch: Option<RecordBatch>,
+        current_offset: usize,
+        metrics: GatewayCollectStreamMetrics,
     },
 }
 
@@ -161,24 +202,59 @@ impl GatewayCollectStreamProducer {
 
     fn materialized_with_metrics(batch: RecordBatch, chunk_rows: usize, metrics: Value) -> Self {
         let mut producer = Self::materialized(batch, chunk_rows);
-        match &mut producer {
-            Self::Materialized {
-                metrics: stored_metrics,
-                ..
-            } => *stored_metrics = metrics,
+        if let Self::Materialized {
+            metrics: stored_metrics,
+            ..
+        } = &mut producer
+        {
+            *stored_metrics = metrics;
         }
         producer
+    }
+
+    fn persisted_serial(
+        stream: &StreamInfo,
+        scan_pushdown: &GatewayScanPushdown,
+        chunk_rows: usize,
+    ) -> Result<Self> {
+        let scan_started = Instant::now();
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let batches = persisted_file_record_batches(
+            stream,
+            scan_pushdown,
+            &mut scanned_rows,
+            &mut scanned_files,
+        )?;
+        let metrics = GatewayCollectStreamMetrics {
+            streaming: true,
+            scanned_files: scanned_files.len(),
+            scanned_rows,
+            scan_elapsed_ms: scan_started.elapsed().as_secs_f64() * 1000.0,
+            ..GatewayCollectStreamMetrics::default()
+        };
+        Ok(Self::Persisted {
+            schema: schema_for_scan_pushdown(&schema, scan_pushdown)?,
+            batches: batches.into(),
+            chunk_rows: chunk_rows.max(1),
+            current_batch: None,
+            current_offset: 0,
+            metrics,
+        })
     }
 
     fn schema(&self) -> SchemaRef {
         match self {
             Self::Materialized { batch, .. } => batch.schema(),
+            Self::Persisted { schema, .. } => Arc::clone(schema),
         }
     }
 
-    fn metrics(&self) -> &Value {
+    fn metrics(&self) -> Value {
         match self {
-            Self::Materialized { metrics, .. } => metrics,
+            Self::Materialized { metrics, .. } => metrics.clone(),
+            Self::Persisted { metrics, .. } => metrics.value(),
         }
     }
 
@@ -198,6 +274,34 @@ impl GatewayCollectStreamProducer {
                 *offset += rows;
                 Ok(Some(chunk))
             }
+            Self::Persisted {
+                batches,
+                chunk_rows,
+                current_batch,
+                current_offset,
+                metrics,
+                ..
+            } => loop {
+                if current_batch
+                    .as_ref()
+                    .is_none_or(|batch| *current_offset >= batch.num_rows())
+                {
+                    *current_batch = batches.pop_front();
+                    *current_offset = 0;
+                }
+                let Some(batch) = current_batch.as_ref() else {
+                    return Ok(None);
+                };
+                if batch.num_rows() == 0 {
+                    *current_batch = None;
+                    continue;
+                }
+                let rows = (*chunk_rows).min(batch.num_rows() - *current_offset);
+                let chunk = batch.slice(*current_offset, rows);
+                *current_offset += rows;
+                metrics.returned_rows = metrics.returned_rows.saturating_add(rows);
+                return Ok(Some(chunk));
+            },
         }
     }
 }
@@ -831,6 +935,24 @@ impl GatewayState {
         &self,
         stream_plan: GatewayCollectStreamPlan,
     ) -> Result<GatewayCollectStreamProducer> {
+        let has_row_range_pushdown = stream_plan.row_range_pushdown.is_some();
+        if stream_plan.snapshot_id.is_none() && !has_row_range_pushdown {
+            let has_active_writer = self
+                .writers
+                .lock()
+                .unwrap()
+                .contains_key(&stream_plan.source);
+            if !has_active_writer {
+                let stream = self.master.get_stream_blocking(&stream_plan.source)?;
+                if stream_has_persisted_files(&stream) {
+                    return GatewayCollectStreamProducer::persisted_serial(
+                        &stream,
+                        &stream_plan.scan_pushdown,
+                        stream_plan.chunk_rows,
+                    );
+                }
+            }
+        }
         let mut collect_header = json!({
             "kind": "collect",
             "source": stream_plan.source,
@@ -1925,7 +2047,7 @@ async fn handle_collect_stream_async(
         chunk_index += 1;
     }
 
-    let metrics = producer.metrics().clone();
+    let metrics = producer.metrics();
     write_frame_async(
         stream,
         &json!({
@@ -2216,10 +2338,15 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
     let row_range_residual_start = row_range_pushdown.map_or(0, |(_, start)| start);
     let pushed_filter_count = collect_plan_leading_filter_count(&plan[row_range_residual_start..]);
     let scan_residual_start = row_range_residual_start + pushed_filter_count;
+    let scan_pushdown = GatewayScanPushdown {
+        filters: plan[row_range_residual_start..scan_residual_start].to_vec(),
+        projection_columns: collect_plan_scan_projection_columns(
+            &plan[row_range_residual_start..],
+        )?,
+    };
     let streamable_projection_count =
         collect_plan_streamable_projection_count(&plan[scan_residual_start..])?;
     let residual_start = scan_residual_start + streamable_projection_count;
-    collect_plan_scan_projection_columns(&plan[row_range_residual_start..])?;
     if residual_start < plan.len() {
         return Err(ZippyError::InvalidConfig {
             reason: concat!(
@@ -2242,6 +2369,8 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
             .and_then(Value::as_str)
             .map(ToString::to_string),
         plan,
+        row_range_pushdown,
+        scan_pushdown,
         chunk_rows,
     })
 }
