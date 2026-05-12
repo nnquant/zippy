@@ -15,7 +15,7 @@
 | P002 Gateway collect 一次性整批执行 | 已修复 streaming 路径，live zero-copy 留待 P008 | `collect(stream=True)` 走 Gateway 多帧 streaming collect；默认 `collect()` 保持旧路径。 |
 | P003 StreamTable Arrow batch 按行写入 | 已修复典型路径 | 非空 Arrow batch 走 columnar append；含 null batch 保留原逐行语义。 |
 | P004 TimeSeriesEngine 全量 clone 和按行 key 分配 | 部分修复，剩余继续处理 | 无 id filter 的常见路径不再物化全量 row index Vec；状态 clone、String key 分配和 id interning 留待专项。 |
-| P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 行序 fast path 和 columnar bucket state 已落地；多因子重复扫描留待专项。 |
+| P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 行序 fast path、columnar bucket state 和 factor context 已落地；group_by/id interning 等留待专项。 |
 | P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 全量 snapshot replace 留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch，只物化请求列；zero-copy/chunked reader 留待专项。 |
@@ -105,7 +105,7 @@
   slot state 设计一起处理。
 - `DropWithMetric` 路径仍会构造 accepted row vector，因为它本身需要剔除迟到行。
 
-### P005 CrossSectional row order fast path and columnar bucket state
+### P005 CrossSectional row order fast path, columnar bucket state and factor context
 
 变更：
 
@@ -122,12 +122,19 @@
 - 输出 id 顺序继续由 `BTreeMap` key 顺序决定，保持 replay deterministic。
 - 同 bucket 同 id 仍是最后一行覆盖；`flush()`、late data、skipped bucket 和 public API 语义不变。
 - bucket state 支持 `Utf8`、`Float64`、`Int64` 和 `Timestamp(Nanosecond, _)`，并拒绝 null id。
+- 新增 `CrossSectionalFactorContext`，同一个 finalized bucket 内共享 float64 value extraction、
+  stats 和 rank cache。
+- `CrossSectionalEngine` finalize 阶段为每个 bucket 创建一个 context，并通过
+  `evaluate_with_context()` 调用 factor。
+- 内置 `CS_RANK`、`CS_ZSCORE`、`CS_DEMEAN` 已迁移到 context-native path；旧 `evaluate(batch)`
+  仍保留兼容。
 
 边界：
 
-- `CrossSectionalFactor` trait 未改变，factors 仍接收 materialized bucket `RecordBatch`。
-- 多个截面因子仍会各自扫描 `bucket_batch`，共享 value extraction / mean / std / rank 统计留给后续
-  `CrossSectionalFactorContext` 专项。
+- `CrossSectionalFactor` trait 只新增默认 context 方法；已有只实现 `evaluate(batch)` 的自定义
+  factor 仍会走 fallback 兼容路径。
+- context cache 只在单 bucket 内有效；跨 bucket cache、group_by/industry neutralization 和 id
+  interning 仍属后续专项。
 - `on_data()` 仍保留批级 `current_rows.clone()` rollback 边界；移除 clone 需要单独设计
   touched-slot undo log。
 

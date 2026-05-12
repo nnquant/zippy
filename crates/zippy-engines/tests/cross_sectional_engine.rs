@@ -350,6 +350,50 @@ fn cross_sectional_engine_flush_emits_current_bucket_with_expected_schema() {
 }
 
 #[test]
+fn cross_sectional_engine_evaluates_multiple_same_field_factors_through_context() {
+    let mut engine = CrossSectionalEngine::new(
+        "cs",
+        input_schema(),
+        "symbol",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![
+            CSRankSpec::new("ret_1m", "rank_a").build().unwrap(),
+            CSRankSpec::new("ret_1m", "rank_b").build().unwrap(),
+            CSZscoreSpec::new("ret_1m", "ret_z").build().unwrap(),
+            CSDemeanSpec::new("ret_1m", "ret_dm").build().unwrap(),
+        ],
+    )
+    .unwrap();
+
+    engine
+        .on_data(batch(
+            vec!["C", "A", "B"],
+            vec![3_000_000_000, 1_000_000_000, 2_000_000_000],
+            vec![30.0, 10.0, 20.0],
+        ))
+        .unwrap();
+
+    let flushed = engine.on_flush().unwrap();
+
+    assert_eq!(
+        column_names(&flushed[0]),
+        vec!["symbol", "dt", "rank_a", "rank_b", "ret_z", "ret_dm"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert_float_slices_eq(&float_values(flushed[0].column_at(2)), &[1.0, 2.0, 3.0]);
+    assert_float_slices_eq(&float_values(flushed[0].column_at(3)), &[1.0, 2.0, 3.0]);
+    assert_float_slices_eq(
+        &float_values(flushed[0].column_at(4)),
+        &[-1.224744871391589, 0.0, 1.224744871391589],
+    );
+    assert_float_slices_eq(&float_values(flushed[0].column_at(5)), &[-10.0, 0.0, 10.0]);
+}
+
+#[test]
 fn cross_sectional_engine_flush_without_open_bucket_returns_empty() {
     let mut engine = CrossSectionalEngine::new(
         "cs",

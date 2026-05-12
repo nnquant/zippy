@@ -7,7 +7,7 @@ use arrow::record_batch::RecordBatch;
 use zippy_core::{
     Engine, EngineMetricsDelta, LateDataPolicy, Result, SchemaRef, SegmentTableView, ZippyError,
 };
-use zippy_operators::CrossSectionalFactor;
+use zippy_operators::{CrossSectionalFactor, CrossSectionalFactorContext};
 
 use crate::cross_sectional_bucket::CrossSectionalBucketState;
 use crate::table_view::{string_array, timestamp_ns_array};
@@ -116,8 +116,9 @@ impl CrossSectionalEngine {
             bucket_start_array(bucket_start, rows.len(), dt_field.data_type())?,
         ];
 
+        let mut context = CrossSectionalFactorContext::new(&bucket_batch);
         for factor in &mut self.factors {
-            columns.push(factor.evaluate(&bucket_batch)?);
+            columns.push(factor.evaluate_with_context(&mut context)?);
         }
 
         RecordBatch::try_new(Arc::clone(&self.output_schema), columns).map_err(|error| {
