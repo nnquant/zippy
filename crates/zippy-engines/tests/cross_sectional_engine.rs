@@ -26,11 +26,24 @@ fn input_schema_with_timezone(timezone: &str) -> Arc<Schema> {
 }
 
 fn record_batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> RecordBatch {
+    record_batch_with_schema(input_schema(), symbols, dts, values)
+}
+
+fn record_batch_with_schema(
+    schema: Arc<Schema>,
+    symbols: Vec<&str>,
+    dts: Vec<i64>,
+    values: Vec<f64>,
+) -> RecordBatch {
+    let timezone = match schema.field_with_name("dt").unwrap().data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) => timezone.clone(),
+        data_type => panic!("unexpected dt data type [{data_type:?}]"),
+    };
     RecordBatch::try_new(
-        input_schema(),
+        schema,
         vec![
             Arc::new(StringArray::from(symbols)) as ArrayRef,
-            Arc::new(TimestampNanosecondArray::from(dts).with_timezone("UTC")) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(dts).with_timezone(timezone)) as ArrayRef,
             Arc::new(Float64Array::from(values)) as ArrayRef,
         ],
     )
@@ -39,6 +52,15 @@ fn record_batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> RecordBa
 
 fn batch(symbols: Vec<&str>, dts: Vec<i64>, values: Vec<f64>) -> SegmentTableView {
     SegmentTableView::from_record_batch(record_batch(symbols, dts, values))
+}
+
+fn batch_with_schema(
+    schema: Arc<Schema>,
+    symbols: Vec<&str>,
+    dts: Vec<i64>,
+    values: Vec<f64>,
+) -> SegmentTableView {
+    SegmentTableView::from_record_batch(record_batch_with_schema(schema, symbols, dts, values))
 }
 
 fn string_values(array: zippy_core::Result<ArrayRef>) -> Vec<String> {
@@ -127,6 +149,44 @@ fn cross_sectional_engine_accepts_shanghai_timestamp_input_schema() {
     );
 
     assert!(engine.is_ok());
+}
+
+#[test]
+fn cross_sectional_engine_flush_preserves_output_dt_timezone() {
+    let schema = input_schema_with_timezone("Asia/Shanghai");
+    let mut engine = CrossSectionalEngine::new(
+        "cs",
+        Arc::clone(&schema),
+        "symbol",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![CSRankSpec::new("ret_1m", "ret_rank").build().unwrap()],
+    )
+    .unwrap();
+
+    engine
+        .on_data(batch_with_schema(
+            schema,
+            vec!["A", "B"],
+            vec![1_000_000_000, 2_000_000_000],
+            vec![1.0, 2.0],
+        ))
+        .unwrap();
+
+    let flushed = engine.on_flush().unwrap();
+    let dt_column = flushed[0].column_at(1).unwrap();
+    let dt_array = dt_column
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+
+    assert!(matches!(
+        dt_array.data_type(),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone))
+            if timezone.as_ref() == "Asia/Shanghai"
+    ));
+    assert_eq!(timestamp_values(flushed[0].column_at(1)), vec![0, 0]);
 }
 
 #[test]

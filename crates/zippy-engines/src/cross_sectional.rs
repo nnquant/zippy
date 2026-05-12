@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, StringArray, TimestampNanosecondArray};
-use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{
@@ -10,9 +9,8 @@ use zippy_core::{
 };
 use zippy_operators::CrossSectionalFactor;
 
-use crate::table_view::{record_batch_from_table_rows, string_array, timestamp_ns_array};
-
-const UTC_TIMEZONE: &str = "UTC";
+use crate::cross_sectional_bucket::CrossSectionalBucketState;
+use crate::table_view::{string_array, timestamp_ns_array};
 
 /// Evaluate cross-sectional factors on event-time aligned buckets.
 pub struct CrossSectionalEngine {
@@ -25,7 +23,7 @@ pub struct CrossSectionalEngine {
     late_data_policy: LateDataPolicy,
     factors: Vec<Box<dyn CrossSectionalFactor>>,
     current_bucket_start: Option<i64>,
-    current_rows: BTreeMap<String, OwnedRow>,
+    current_rows: CrossSectionalBucketState,
     last_closed_bucket_start: Option<i64>,
     pending_late_rows: u64,
 }
@@ -68,6 +66,7 @@ impl CrossSectionalEngine {
         }
 
         let output_schema = build_output_schema(&input_schema, id_column, dt_column, &factors)?;
+        let current_rows = CrossSectionalBucketState::new(Arc::clone(&input_schema), id_column)?;
         let empty_batch = RecordBatch::new_empty(Arc::clone(&input_schema));
         for factor in &mut factors {
             factor.evaluate(&empty_batch)?;
@@ -83,7 +82,7 @@ impl CrossSectionalEngine {
             late_data_policy,
             factors,
             current_bucket_start: None,
-            current_rows: BTreeMap::new(),
+            current_rows,
             last_closed_bucket_start: None,
             pending_late_rows: 0,
         })
@@ -92,17 +91,29 @@ impl CrossSectionalEngine {
     fn finalize_bucket(
         &mut self,
         bucket_start: i64,
-        rows: &BTreeMap<String, OwnedRow>,
+        rows: &CrossSectionalBucketState,
     ) -> Result<RecordBatch> {
-        let bucket_batch = build_bucket_batch(&self.input_schema, rows.values())?;
+        let bucket_batch = rows.materialize()?;
+        let id_index = self.input_schema.index_of(&self.id_column).map_err(|_| {
+            ZippyError::SchemaMismatch {
+                reason: format!(
+                    "missing cross-sectional id field field=[{}]",
+                    self.id_column
+                ),
+            }
+        })?;
+        let dt_field = self
+            .output_schema
+            .field_with_name(&self.dt_column)
+            .map_err(|_| ZippyError::SchemaMismatch {
+                reason: format!(
+                    "missing cross-sectional output dt field field=[{}]",
+                    self.dt_column
+                ),
+            })?;
         let mut columns = vec![
-            Arc::new(StringArray::from(
-                rows.keys().map(|id| id.as_str()).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(
-                TimestampNanosecondArray::from(vec![bucket_start; rows.len()])
-                    .with_timezone(UTC_TIMEZONE),
-            ) as ArrayRef,
+            Arc::clone(bucket_batch.column(id_index)),
+            bucket_start_array(bucket_start, rows.len(), dt_field.data_type())?,
         ];
 
         for factor in &mut self.factors {
@@ -168,7 +179,7 @@ impl Engine for CrossSectionalEngine {
         }
 
         let id_array = table.column(&self.id_column)?;
-        let ids = checked_id_array(&id_array, &self.id_column)?;
+        let _ids = checked_id_array(&id_array, &self.id_column)?;
         let dt_array = table.column(&self.dt_column)?;
         let dts = checked_dt_array(&dt_array, &self.dt_column)?;
         let mut outputs = Vec::new();
@@ -179,10 +190,8 @@ impl Engine for CrossSectionalEngine {
         let row_order = build_row_order(dts, table.num_rows(), self.trigger_interval);
 
         for row_index in row_order.iter() {
-            let id = ids.value(row_index).to_string();
             let dt = dts.value(row_index);
             let bucket_start = align_bucket_start(dt, self.trigger_interval);
-            let owned_row = extract_owned_row(&table, &self.input_schema, row_index)?;
 
             match next_current_bucket_start {
                 Some(current_bucket_start) if bucket_start < current_bucket_start => {
@@ -194,14 +203,14 @@ impl Engine for CrossSectionalEngine {
                     )?;
                 }
                 Some(current_bucket_start) if bucket_start == current_bucket_start => {
-                    next_current_rows.insert(id, owned_row);
+                    next_current_rows.apply_row(&table, row_index)?;
                 }
                 Some(current_bucket_start) => {
                     outputs.push(self.finalize_bucket(current_bucket_start, &next_current_rows)?);
                     next_last_closed_bucket_start = Some(current_bucket_start);
                     next_current_bucket_start = Some(bucket_start);
                     next_current_rows.clear();
-                    next_current_rows.insert(id, owned_row);
+                    next_current_rows.apply_row(&table, row_index)?;
                 }
                 None => {
                     if matches!(
@@ -216,7 +225,7 @@ impl Engine for CrossSectionalEngine {
                         )?;
                     } else {
                         next_current_bucket_start = Some(bucket_start);
-                        next_current_rows.insert(id, owned_row);
+                        next_current_rows.apply_row(&table, row_index)?;
                     }
                 }
             }
@@ -262,11 +271,6 @@ impl Engine for CrossSectionalEngine {
     }
 }
 
-#[derive(Clone)]
-struct OwnedRow {
-    batch: RecordBatch,
-}
-
 fn build_output_schema(
     input_schema: &SchemaRef,
     id_column: &str,
@@ -307,29 +311,6 @@ fn build_output_schema(
     }
 
     Ok(Arc::new(Schema::new(output_fields)))
-}
-
-fn build_bucket_batch<'a>(
-    schema: &SchemaRef,
-    rows: impl Iterator<Item = &'a OwnedRow>,
-) -> Result<RecordBatch> {
-    concat_batches(schema, rows.map(|row| &row.batch)).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to build cross-sectional bucket batch error=[{}]",
-            error
-        ),
-    })
-}
-
-fn extract_owned_row(
-    table: &SegmentTableView,
-    schema: &SchemaRef,
-    row_index: usize,
-) -> Result<OwnedRow> {
-    let batch =
-        record_batch_from_table_rows(table, schema, &[row_index as u32], "cross-sectional row")?;
-
-    Ok(OwnedRow { batch })
 }
 
 enum RowOrder {
@@ -461,11 +442,165 @@ fn align_bucket_start(dt: i64, trigger_interval: i64) -> i64 {
     dt.div_euclid(trigger_interval) * trigger_interval
 }
 
+fn bucket_start_array(bucket_start: i64, len: usize, data_type: &DataType) -> Result<ArrayRef> {
+    let DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) = data_type else {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!(
+                "cross-sectional output dt field must be timezone-aware nanosecond timestamp type=[{:?}]",
+                data_type
+            ),
+        });
+    };
+
+    Ok(Arc::new(
+        TimestampNanosecondArray::from(vec![bucket_start; len]).with_timezone(timezone.clone()),
+    ) as ArrayRef)
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow::array::TimestampNanosecondArray;
+    use std::sync::Arc;
+
+    use arrow::array::{
+        Array, ArrayRef, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use zippy_core::{SegmentTableView, ZippyError};
 
     use super::{build_row_order, RowOrder};
+    use crate::cross_sectional_bucket::CrossSectionalBucketState;
+
+    fn bucket_schema(id_nullable: bool) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, id_nullable),
+            Field::new(
+                "dt",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("Asia/Shanghai".into())),
+                false,
+            ),
+            Field::new("ret_1m", DataType::Float64, false),
+            Field::new("volume", DataType::Int64, false),
+        ]))
+    }
+
+    fn bucket_table(
+        schema: Arc<Schema>,
+        symbols: Vec<Option<&str>>,
+        dts: Vec<i64>,
+        values: Vec<f64>,
+        volumes: Vec<i64>,
+    ) -> SegmentTableView {
+        SegmentTableView::from_record_batch(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(symbols)) as ArrayRef,
+                    Arc::new(TimestampNanosecondArray::from(dts).with_timezone("Asia/Shanghai"))
+                        as ArrayRef,
+                    Arc::new(Float64Array::from(values)) as ArrayRef,
+                    Arc::new(Int64Array::from(volumes)) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn bucket_state_keeps_last_row_per_id_in_sorted_id_order() {
+        let schema = bucket_schema(false);
+        let table = bucket_table(
+            Arc::clone(&schema),
+            vec![Some("B"), Some("A"), Some("A")],
+            vec![101, 102, 103],
+            vec![2.0, 1.0, 3.0],
+            vec![20, 10, 30],
+        );
+        let mut state = CrossSectionalBucketState::new(schema, "symbol").unwrap();
+
+        state.apply_row(&table, 0).unwrap();
+        state.apply_row(&table, 1).unwrap();
+        state.apply_row(&table, 2).unwrap();
+
+        let materialized = state.materialize().unwrap();
+        let ids = materialized
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dts = materialized
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        let values = materialized
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let volumes = materialized
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some("A"), Some("B")]);
+        assert!(matches!(
+            dts.data_type(),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone))
+                if timezone.as_ref() == "Asia/Shanghai"
+        ));
+        assert_eq!(
+            (0..dts.len())
+                .map(|index| dts.value(index))
+                .collect::<Vec<_>>(),
+            vec![103, 101]
+        );
+        assert_eq!(
+            (0..values.len())
+                .map(|index| values.value(index))
+                .collect::<Vec<_>>(),
+            vec![3.0, 2.0]
+        );
+        assert_eq!(
+            (0..volumes.len())
+                .map(|index| volumes.value(index))
+                .collect::<Vec<_>>(),
+            vec![30, 20]
+        );
+    }
+
+    #[test]
+    fn bucket_state_rejects_null_id_without_polluting_existing_rows() {
+        let schema = bucket_schema(true);
+        let valid_table = bucket_table(
+            Arc::clone(&schema),
+            vec![Some("A")],
+            vec![101],
+            vec![1.0],
+            vec![10],
+        );
+        let invalid_table = bucket_table(
+            Arc::clone(&schema),
+            vec![None],
+            vec![102],
+            vec![2.0],
+            vec![20],
+        );
+        let mut state = CrossSectionalBucketState::new(schema, "symbol").unwrap();
+
+        state.apply_row(&valid_table, 0).unwrap();
+        let error = state.apply_row(&invalid_table, 0).unwrap_err();
+
+        assert!(matches!(error, ZippyError::SchemaMismatch { .. }));
+        let materialized = state.materialize().unwrap();
+        let ids = materialized
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some("A")]);
+    }
 
     #[test]
     fn row_order_natural_iterates_without_materialized_indices() {

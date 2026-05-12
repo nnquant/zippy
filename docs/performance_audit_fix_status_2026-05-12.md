@@ -15,7 +15,7 @@
 | P002 Gateway collect 一次性整批执行 | 已修复 streaming 路径，live zero-copy 留待 P008 | `collect(stream=True)` 走 Gateway 多帧 streaming collect；默认 `collect()` 保持旧路径。 |
 | P003 StreamTable Arrow batch 按行写入 | 已修复典型路径 | 非空 Arrow batch 走 columnar append；含 null batch 保留原逐行语义。 |
 | P004 TimeSeriesEngine 全量 clone 和按行 key 分配 | 部分修复，剩余继续处理 | 无 id filter 的常见路径不再物化全量 row index Vec；状态 clone、String key 分配和 id interning 留待专项。 |
-| P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 非递减输入不再分配并排序全量 row index Vec；OwnedRow/concat 和多因子重复扫描留待专项。 |
+| P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 行序 fast path 和 columnar bucket state 已落地；多因子重复扫描留待专项。 |
 | P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 全量 snapshot replace 留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch，只物化请求列；zero-copy/chunked reader 留待专项。 |
@@ -105,7 +105,7 @@
   slot state 设计一起处理。
 - `DropWithMetric` 路径仍会构造 accepted row vector，因为它本身需要剔除迟到行。
 
-### P005 CrossSectional row order fast path
+### P005 CrossSectional row order fast path and columnar bucket state
 
 变更：
 
@@ -113,13 +113,23 @@
 - `on_data()` 先扫描 bucket 顺序；只有发现 bucket 回退时才分配 `Vec<usize>` 并按
   `(bucket_start, row_index)` 排序。
 - 乱序批次保留旧排序语义，同一 bucket 内仍按原始 row index 稳定处理。
+- 新增内部 `CrossSectionalBucketState`，用 id -> slot 索引和 typed column stores 保存当前
+  bucket 每个 id 的最后一行。
+- `CrossSectionalEngine` 的 current bucket 不再保存 `BTreeMap<String, OwnedRow>`，每行输入不再
+  抽取单行 `RecordBatch`。
+- finalize 时从 columnar slots 一次 materialize bucket `RecordBatch`，不再对 per-id 单行 batch
+  调用 `concat_batches()`。
+- 输出 id 顺序继续由 `BTreeMap` key 顺序决定，保持 replay deterministic。
+- 同 bucket 同 id 仍是最后一行覆盖；`flush()`、late data、skipped bucket 和 public API 语义不变。
+- bucket state 支持 `Utf8`、`Float64`、`Int64` 和 `Timestamp(Nanosecond, _)`，并拒绝 null id。
 
 边界：
 
-- 本轮没有改动 `BTreeMap<String, OwnedRow>` 状态模型。
-- 每行 `extract_owned_row()`、finalize 时 `concat_batches()`、以及多个截面因子重复扫描
-  `bucket_batch` 仍是剩余热点。
-- 真正的 columnar bucket buffer、append/update fast path 和多因子共享统计 pass 需要后续专项处理。
+- `CrossSectionalFactor` trait 未改变，factors 仍接收 materialized bucket `RecordBatch`。
+- 多个截面因子仍会各自扫描 `bucket_batch`，共享 value extraction / mean / std / rank 统计留给后续
+  `CrossSectionalFactorContext` 专项。
+- `on_data()` 仍保留批级 `current_rows.clone()` rollback 边界；移除 clone 需要单独设计
+  touched-slot undo log。
 
 ### P006 ReactiveLatest / KeyValue columnar latest state
 
