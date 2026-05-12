@@ -1,5 +1,6 @@
 pub mod bar_generator;
 pub mod cross_sectional;
+mod latest_state;
 pub mod reactive;
 pub mod reactive_latest;
 pub mod stream_table;
