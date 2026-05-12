@@ -811,6 +811,7 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
         frames.last().unwrap().0["metrics"]["scanned_files"],
         json!(2)
     );
+    assert_eq!(gateway.metrics()["collect_requests_total"], json!(2));
 
     gateway.stop();
     master.shutdown();
@@ -1528,6 +1529,54 @@ fn native_gateway_collect_stream_rejects_residual_plan_before_start() {
                 {"op": "with_columns", "exprs": [
                     {"kind": "literal", "value": 1, "alias": "one"}
                 ]}
+            ]
+        }),
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("collect(stream=True) requires a fully streamable plan"));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_collect_stream_rejects_row_range_then_filter_before_start() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_range_filter_ticks",
+            "token": "dev-token",
+            "plan": [
+                {"op": "head", "n": 1},
+                {"op": "filter", "expr": {
+                    "kind": "binary",
+                    "op": "eq",
+                    "args": [
+                        {"kind": "col", "value": "seq"},
+                        {"kind": "literal", "value": 2}
+                    ]
+                }}
             ]
         }),
         0,

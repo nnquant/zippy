@@ -955,6 +955,7 @@ impl GatewayState {
             if !has_active_writer {
                 let stream = self.master.get_stream_blocking(&stream_plan.source)?;
                 if stream_is_persisted_only(&stream) {
+                    self.increment_metric(|metrics| metrics.collect_requests_total += 1);
                     return GatewayCollectStreamProducer::persisted_serial(
                         &stream,
                         &stream_plan.scan_pushdown,
@@ -2360,7 +2361,11 @@ fn collect_stream_plan_from_header(header: Value) -> Result<GatewayCollectStream
         .unwrap_or_default();
     let row_range_pushdown = collect_plan_row_range_prefix(&plan)?;
     let row_range_residual_start = row_range_pushdown.map_or(0, |(_, start)| start);
-    let pushed_filter_count = collect_plan_leading_filter_count(&plan[row_range_residual_start..]);
+    let pushed_filter_count = if row_range_pushdown.is_some() {
+        0
+    } else {
+        collect_plan_leading_filter_count(&plan[row_range_residual_start..])
+    };
     let scan_residual_start = row_range_residual_start + pushed_filter_count;
     let scan_pushdown = GatewayScanPushdown {
         filters: plan[row_range_residual_start..scan_residual_start].to_vec(),
