@@ -8,7 +8,7 @@ use arrow::{
 };
 
 use crate::{
-    view::{ActiveSegmentAttachment, RowSpanBacking},
+    view::{read_active_payload_consistent, ActiveSegmentAttachment, RowSpanBacking},
     ColumnType, CompiledSchema, RowSpanView, SealedSegmentHandle,
 };
 
@@ -57,9 +57,11 @@ impl RowSpanView {
 
         match &self.backing {
             RowSpanBacking::Sealed(handle) => self.project_sealed_array(handle, field_name, spec),
-            RowSpanBacking::Active(attachment) => {
-                self.project_active_array(attachment, field_name, spec)
-            }
+            RowSpanBacking::Active(attachment) => read_active_payload_consistent(
+                attachment,
+                || self.project_active_array_unchecked(attachment, field_name, spec),
+                |error| ArrowError::ParseError(error.to_string()),
+            ),
         }
     }
 
@@ -169,7 +171,7 @@ impl RowSpanView {
         }
     }
 
-    fn project_active_array(
+    fn project_active_array_unchecked(
         &self,
         attachment: &ActiveSegmentAttachment,
         field_name: &str,

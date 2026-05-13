@@ -145,6 +145,26 @@ fn active_segment_reader_exposes_control_snapshot_from_mmap_header() {
 }
 
 #[test]
+fn control_snapshot_reports_payload_version() {
+    let schema = tick_schema();
+    let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let partition = store
+        .open_partition_with_schema("openctp_ticks", "all", schema.clone())
+        .unwrap();
+    {
+        let writer = partition.writer();
+        writer.append_tick_for_test(1, "IF2606", 4112.5).unwrap();
+    }
+
+    let envelope = partition.active_descriptor_envelope_bytes().unwrap();
+    let reader = ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout).unwrap();
+    let snapshot = reader.control_snapshot().unwrap();
+
+    assert_eq!(snapshot.payload_version, Some(0));
+}
+
+#[test]
 fn active_segment_reader_rejects_writer_epoch_mismatch() {
     let schema = tick_schema();
     let layout = LayoutPlan::for_schema(&schema, 32).unwrap();

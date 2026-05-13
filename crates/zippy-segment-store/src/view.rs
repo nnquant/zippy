@@ -33,6 +33,45 @@ pub(crate) struct ActiveSegmentAttachment {
     pub(crate) shm_region: Arc<ShmRegion>,
 }
 
+const ACTIVE_PAYLOAD_READ_MAX_RETRIES: usize = 8;
+
+pub(crate) fn read_active_payload_consistent<T, E, F, M>(
+    attachment: &ActiveSegmentAttachment,
+    mut read_fn: F,
+    map_error: M,
+) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+    M: Fn(ZippySegmentStoreError) -> E,
+{
+    let Some(offset) = attachment.descriptor.payload_version_offset() else {
+        return read_fn();
+    };
+
+    for _ in 0..ACTIVE_PAYLOAD_READ_MAX_RETRIES {
+        let before = attachment
+            .shm_region
+            .load_u64_acquire(offset)
+            .map_err(|error| map_error(ZippySegmentStoreError::Shmem(error.to_string())))?;
+        if before % 2 != 0 {
+            continue;
+        }
+
+        let result = read_fn()?;
+        let after = attachment
+            .shm_region
+            .load_u64_acquire(offset)
+            .map_err(|error| map_error(ZippySegmentStoreError::Shmem(error.to_string())))?;
+        if before == after && after % 2 == 0 {
+            return Ok(result);
+        }
+    }
+
+    Err(map_error(ZippySegmentStoreError::Lifecycle(
+        "active payload changed during read",
+    )))
+}
+
 /// 已 seal segment 上的连续行视图。
 #[derive(Debug, Clone)]
 pub struct RowSpanView {
@@ -184,9 +223,11 @@ impl RowSpanView {
 
         match &self.backing {
             RowSpanBacking::Sealed(handle) => self.sealed_cell_value(handle, spec, absolute_row),
-            RowSpanBacking::Active(attachment) => {
-                self.active_cell_value(attachment, spec, absolute_row)
-            }
+            RowSpanBacking::Active(attachment) => read_active_payload_consistent(
+                attachment,
+                || self.active_cell_value(attachment, spec, absolute_row),
+                |error| error,
+            ),
         }
     }
 

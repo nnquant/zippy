@@ -276,6 +276,21 @@ fn active_descriptor_envelope_accepts_legacy_payload_version_absence() {
 }
 
 #[test]
+fn active_record_batch_read_rejects_odd_payload_version() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.begin_payload_mutation_for_test().unwrap();
+
+    let span = RowSpanView::from_active_descriptor(writer.active_descriptor(), 0, 1).unwrap();
+    let err = span.as_record_batch().unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("active payload changed during read"));
+}
+
+#[test]
 fn active_descriptor_envelope_rejects_schema_id_mismatch() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
