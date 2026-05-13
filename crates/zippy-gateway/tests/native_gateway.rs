@@ -1550,6 +1550,109 @@ fn native_gateway_collect_stream_reports_streaming_metrics() {
 }
 
 #[test]
+fn native_gateway_collect_stream_live_segment_applies_projection_and_filter_by_chunk() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("seq", DataType::Int64, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606", "IF2607", "IF2608"])),
+            std::sync::Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5, 4103.5, 4104.5])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "stream_live_chunk_filter_ticks",
+            "token": "dev-token",
+            "rows": 3
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_live_chunk_filter_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1,
+            "plan": [
+                {
+                    "op": "filter",
+                    "expr": {
+                        "kind": "binary",
+                        "op": "gt",
+                        "args": [
+                            {"kind": "col", "value": "seq"},
+                            {"kind": "literal", "value": 1}
+                        ]
+                    }
+                },
+                {
+                    "op": "select",
+                    "exprs": [
+                        {"kind": "col", "value": "instrument_id"},
+                        {"kind": "col", "value": "last_price"}
+                    ]
+                }
+            ]
+        }),
+        vec![],
+    );
+
+    let chunks = frames
+        .iter()
+        .filter(|(header, _)| header["kind"] == json!("collect_chunk"))
+        .map(|(_, payload)| decode_ipc_batch(payload))
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].schema().field(0).name(), "instrument_id");
+    assert_eq!(chunks[0].schema().field(1).name(), "last_price");
+
+    let first_ids = chunks[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let second_ids = chunks[1]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(first_ids.value(0), "IF2607");
+    assert_eq!(second_ids.value(0), "IF2608");
+
+    let metrics = &frames.last().unwrap().0["metrics"];
+    assert_eq!(metrics["segment_streamed_batches"], json!(3));
+    assert_eq!(metrics["segment_streamed_rows"], json!(3));
+    assert_eq!(metrics["returned_rows"], json!(2));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_collect_stream_rejects_residual_plan_before_start() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());

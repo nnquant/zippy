@@ -18,7 +18,7 @@
 | P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 行序 fast path、columnar bucket state 和 factor context 已落地；group_by/id interning 等留待专项。 |
 | P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 在容量允许时原地 rewrite active snapshot；slot-level 增量更新留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
-| P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch，只物化请求列；zero-copy/chunked reader 留待专项。 |
+| P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch 和 chunked reader；Gateway live `collect(stream=True)` 接入 segment chunked producer；zero-copy 留待专项。 |
 | P009 persisted parquet scan 串行与 filter 读后执行 | 已修复 streaming persisted scan 基础路径，row-group pruning 留待后续 | persisted streaming collect 支持按文件有界并行扫描、确定性输出顺序和逐 batch filter/project。 |
 | P010 Gateway write 全局 writers mutex 包住 flush | 部分修复，剩余继续处理 | writer map 改为 per-stream writer handle；已有 writer 的 `on_data/on_flush` 不再持有全局 map 锁。 |
 | P011 subscribe 固定 sleep 轮询 | 部分修复，剩余继续处理 | 本 gateway 写入成功后通知 subscribe idle wait；跨进程 active-segment notification 留待专项。 |
@@ -191,19 +191,24 @@
   第三方 factor 仍会通过 fallback materialize `RecordBatch`。
 - id interning / borrowed key state 仍需后续专项。
 
-### P008 RowSpan projection batch export
+### P008 RowSpan projection and chunked batch export
 
 变更：
 
 - `RowSpanView` 新增 `as_record_batch_with_projection(&[&str])`。
 - projection batch 只构造请求列的 Arrow schema，并只调用对应列的 `project_array()`。
+- `RowSpanView` 新增 chunked batch reader，按 `chunk_rows` 逐块导出 segment 行范围。
+- Gateway `collect(stream=True)` 的 live segment 路径接入 segment chunked producer，不再先把
+  active batch 完整 materialize 后切片。
+- segment streaming metrics 增加 `segment_streamed_batches` 和 `segment_streamed_rows`，用于区分
+  真实 chunked segment streaming 与 materialized fallback。
 - 默认 `as_record_batch()` 保持全列导出行为不变。
 
 边界：
 
 - 本轮没有实现 active/sealed segment 的 Arrow buffer zero-copy。
-- Utf8 和 nullable 列仍会在列投影时分配新 Arrow array。
-- query/subscribe 侧还需要逐块 reader，而不是先把大 span 一次性导出成单个 batch。
+- Utf8 和 nullable 列仍会在每个 chunk 投影时分配新 Arrow array。
+- mixed persisted + live 的统一 streaming planner 仍需后续专项。
 
 ### P009 Persisted parquet streaming scan
 
