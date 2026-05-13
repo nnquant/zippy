@@ -15,6 +15,7 @@ mod shm;
 mod view;
 
 pub use active_reader::ActiveSegmentReader;
+pub use arrow_bridge::RowSpanBatchReader;
 pub use builder::{ActiveSegmentShmLayout, ActiveSegmentWriter};
 pub use catalog::{
     PartitionHandle, PartitionRowWriter, PartitionWriterHandle, SegmentStore, SegmentStoreConfig,

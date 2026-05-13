@@ -12,6 +12,39 @@ use crate::{
     ColumnType, CompiledSchema, RowSpanView, SealedSegmentHandle,
 };
 
+/// Incrementally exports a row span as Arrow `RecordBatch` chunks.
+#[derive(Debug, Clone)]
+pub struct RowSpanBatchReader {
+    span: RowSpanView,
+    chunk_rows: usize,
+    projection_columns: Option<Vec<String>>,
+    offset: usize,
+}
+
+impl RowSpanBatchReader {
+    /// Returns the next chunk, or `None` once the span is exhausted.
+    pub fn next_batch(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
+        if self.offset >= self.span.row_count() {
+            return Ok(None);
+        }
+
+        let rows = self.chunk_rows.min(self.span.row_count() - self.offset);
+        let start = self.span.start_row + self.offset;
+        let end = start + rows;
+        let chunk = self.span.subspan(start, end)?;
+        self.offset += rows;
+
+        let batch = match self.projection_columns.as_ref() {
+            Some(columns) => {
+                let field_names = columns.iter().map(String::as_str).collect::<Vec<_>>();
+                chunk.as_record_batch_with_projection(&field_names)?
+            }
+            None => chunk.as_record_batch()?,
+        };
+        Ok(Some(batch))
+    }
+}
+
 impl RowSpanView {
     /// 将行范围导出为调试用 `RecordBatch`。
     pub fn as_record_batch(&self) -> Result<RecordBatch, ArrowError> {
@@ -35,6 +68,25 @@ impl RowSpanView {
             .map(|field_name| self.project_array(field_name))
             .collect::<Result<Vec<_>, ArrowError>>()?;
         RecordBatch::try_new(schema, arrays)
+    }
+
+    /// 创建按固定行数导出当前 span 的 batch reader。
+    pub fn batch_reader(
+        &self,
+        chunk_rows: usize,
+        projection_columns: Option<Vec<String>>,
+    ) -> Result<RowSpanBatchReader, ArrowError> {
+        if let Some(columns) = projection_columns.as_ref() {
+            let field_names = columns.iter().map(String::as_str).collect::<Vec<_>>();
+            self.projected_arrow_schema(&field_names)?;
+        }
+
+        Ok(RowSpanBatchReader {
+            span: self.clone(),
+            chunk_rows: chunk_rows.max(1),
+            projection_columns,
+            offset: 0,
+        })
     }
 
     /// 返回当前行范围的 Arrow schema。
@@ -297,6 +349,20 @@ impl RowSpanView {
             })
             .collect::<Result<Vec<_>, ArrowError>>()?;
         Ok(Arc::new(Schema::new(fields)))
+    }
+
+    fn subspan(&self, start_row: usize, end_row: usize) -> Result<Self, ArrowError> {
+        if start_row < self.start_row || end_row > self.end_row || start_row > end_row {
+            return Err(ArrowError::SchemaError(
+                "row span chunk is out of bounds".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            backing: self.backing.clone(),
+            start_row,
+            end_row,
+        })
     }
 }
 

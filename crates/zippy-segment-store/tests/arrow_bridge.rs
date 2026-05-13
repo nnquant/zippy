@@ -114,6 +114,87 @@ fn row_span_record_batch_projection_materializes_only_requested_columns() {
 }
 
 #[test]
+fn row_span_batch_reader_splits_sealed_span_by_chunk_rows() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 4).unwrap();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+    writer.append_tick_for_test(3, "rb2510", 4128.5).unwrap();
+
+    let span = RowSpanView::new(writer.sealed_handle_for_test().unwrap(), 0, 3).unwrap();
+    let mut reader = span.batch_reader(2, None).unwrap();
+
+    let first = reader.next_batch().unwrap().unwrap();
+    let second = reader.next_batch().unwrap().unwrap();
+    let end = reader.next_batch().unwrap();
+
+    assert_eq!(first.num_rows(), 2);
+    assert_eq!(second.num_rows(), 1);
+    assert!(end.is_none());
+
+    let first_ids = first
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let second_ids = second
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(first_ids.value(0), "rb2501");
+    assert_eq!(first_ids.value(1), "rb2505");
+    assert_eq!(second_ids.value(0), "rb2510");
+}
+
+#[test]
+fn row_span_batch_reader_projects_sealed_columns_in_requested_order() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 4).unwrap();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+
+    let span = RowSpanView::new(writer.sealed_handle_for_test().unwrap(), 0, 2).unwrap();
+    let projection = vec!["last_price".to_string(), "instrument_id".to_string()];
+    let mut reader = span.batch_reader(1, Some(projection)).unwrap();
+
+    let first = reader.next_batch().unwrap().unwrap();
+    let second = reader.next_batch().unwrap().unwrap();
+
+    assert_eq!(first.num_columns(), 2);
+    assert_eq!(first.schema().field(0).name(), "last_price");
+    assert_eq!(first.schema().field(1).name(), "instrument_id");
+
+    let first_prices = first
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let second_ids = second
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(first_prices.value(0), 4123.5);
+    assert_eq!(second_ids.value(0), "rb2505");
+    assert!(reader.next_batch().unwrap().is_none());
+}
+
+#[test]
 fn row_span_exports_nullable_columns_as_true_nulls() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
