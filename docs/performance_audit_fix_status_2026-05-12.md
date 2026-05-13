@@ -16,7 +16,7 @@
 | P003 StreamTable Arrow batch 按行写入 | 已修复典型路径 | 非空 Arrow batch 走 columnar append；含 null batch 保留原逐行语义。 |
 | P004 TimeSeriesEngine 全量 clone 和按行 key 分配 | 部分修复，剩余继续处理 | row selection fast path 和 touched-id transaction rollback 已落地；String key 分配和 id interning 留待专项。 |
 | P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 行序 fast path、columnar bucket state 和 factor context 已落地；group_by/id interning 等留待专项。 |
-| P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 全量 snapshot replace 留待专项。 |
+| P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 在容量允许时原地 rewrite active snapshot；slot-level 增量更新留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch，只物化请求列；zero-copy/chunked reader 留待专项。 |
 | P009 persisted parquet scan 串行与 filter 读后执行 | 已修复 streaming persisted scan 基础路径，row-group pruning 留待后续 | persisted streaming collect 支持按文件有界并行扫描、确定性输出顺序和逐 batch filter/project。 |
@@ -147,17 +147,22 @@
 - 新增内部 `LatestColumnarState`，用 key -> slot 索引和 typed column stores 保存 latest rows。
 - `ReactiveLatestEngine` 改为复用共享 latest state；`on_data()` 仍只输出本批更新 key 的最终
   delta rows，`on_flush()` 输出全量 snapshot。
-- `KeyValueTableMaterializer` 改为复用共享 latest state；每批更新后仍沿用现有
-  `replace_with_table()` 发布完整 snapshot，但 snapshot 不再由 per-key `OwnedRow` 单行 batch
-  concat 构造。
+- `KeyValueTableMaterializer` 改为复用共享 latest state；每批更新后仍 materialize 完整 snapshot，
+  但 snapshot 不再由 per-key `OwnedRow` 单行 batch concat 构造。
+- `KeyValueTableMaterializer` 在 snapshot 行数不超过 active segment capacity，且没有 persist /
+  sealed snapshot 交叉时，优先通过 active payload version boundary 原地 rewrite active rows。
+- KeyValue active rewrite 不再更换 `segment_id/shm_os_id`，避免小批更新造成 descriptor 和 retained
+  snapshot churn。
+- snapshot 超过 active capacity 时继续 fallback 到现有 `replace_with_table()`，保留旧的安全边界。
 - latest state 支持 `Int64`、`Float64`、`Utf8` 和 `Timestamp(Nanosecond, _)`，并在 prepare
   阶段校验 null key / 非 nullable null value，输入非法时不污染现有状态。
 - 同一批内同 key 多次更新仍只保留最终最新行，输出 key 顺序继续稳定。
 
 边界：
 
-- `KeyValueTableMaterializer` 仍会在每批后发布完整 snapshot，并调用现有 `replace_with_table()`；
-  active segment slot-level update 或增量 snapshot descriptor 仍需后续专项。
+- `KeyValueTableMaterializer` 仍会在每批后 materialize 完整 snapshot；本轮消除了可容纳场景的
+  segment replacement churn，但没有做到 `O(updated_keys)`。
+- active segment slot-level update 或增量 snapshot descriptor 仍需后续专项。
 - latest key 仍使用 `BTreeMap<Vec<String>, usize>` 保持 deterministic order；跨 engine 的 id
   interning 留给 P004/P005 的 shared id registry 设计。
 
