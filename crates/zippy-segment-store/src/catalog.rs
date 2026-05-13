@@ -719,6 +719,107 @@ impl PartitionWriterHandle {
         Ok(written)
     }
 
+    /// 在同一个 active segment 内重写完整 committed snapshot。
+    pub fn rewrite_rows<F>(
+        &self,
+        row_count: usize,
+        mut write: F,
+    ) -> Result<usize, ZippySegmentStoreError>
+    where
+        F: FnMut(&mut PartitionRowWriter<'_>, usize) -> Result<(), ZippySegmentStoreError>,
+    {
+        let written = {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            if state.writer.has_open_row() {
+                return Err(ZippySegmentStoreError::Writer("row already open"));
+            }
+            if row_count > state.row_capacity {
+                return Err(ZippySegmentStoreError::Writer("segment is full"));
+            }
+
+            let snapshot = state
+                .writer
+                .capture_rows_snapshot()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            state
+                .writer
+                .begin_payload_mutation()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            if let Err(error) = state.writer.reset_rows_without_publish() {
+                state
+                    .writer
+                    .restore_rows_snapshot(snapshot)
+                    .map_err(ZippySegmentStoreError::Writer)?;
+                state
+                    .writer
+                    .abort_payload_mutation()
+                    .map_err(ZippySegmentStoreError::Writer)?;
+                return Err(ZippySegmentStoreError::Writer(error));
+            }
+
+            let mut written = 0;
+            let mut failure = None;
+            for index in 0..row_count {
+                if let Err(error) = state.writer.begin_row() {
+                    failure = Some(ZippySegmentStoreError::Writer(error));
+                    break;
+                }
+                let write_result = {
+                    let mut row_writer = PartitionRowWriter {
+                        writer: &mut state.writer,
+                    };
+                    write(&mut row_writer, index)
+                };
+                match write_result {
+                    Ok(()) => match state.writer.finish_open_row() {
+                        Ok(()) => {
+                            written += 1;
+                        }
+                        Err(error) => {
+                            if state.writer.has_open_row() {
+                                let _ = state.writer.abort_row();
+                            }
+                            failure = Some(ZippySegmentStoreError::Writer(error));
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        if state.writer.has_open_row() {
+                            let _ = state.writer.abort_row();
+                        }
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(error) = failure {
+                state
+                    .writer
+                    .restore_rows_snapshot(snapshot)
+                    .map_err(ZippySegmentStoreError::Writer)?;
+                state
+                    .writer
+                    .abort_payload_mutation()
+                    .map_err(ZippySegmentStoreError::Writer)?;
+                return Err(error);
+            }
+
+            state
+                .writer
+                .finish_payload_mutation()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            written
+        };
+
+        self.handle
+            .inner
+            .broadcaster
+            .notify_all()
+            .map_err(ZippySegmentStoreError::Io)?;
+        Ok(written)
+    }
+
     /// 在同一个分区锁内按列批量写入多行，并只发布一次 committed prefix。
     pub fn write_columnar_rows<F>(
         &self,

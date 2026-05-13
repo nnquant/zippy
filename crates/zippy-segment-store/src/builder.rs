@@ -35,6 +35,18 @@ struct Utf8ColumnBuffer {
     values_capacity: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveRowsSnapshot {
+    row_cursor: usize,
+    row_count: usize,
+    committed_row_count: usize,
+    validity: HashMap<&'static str, Vec<bool>>,
+    i64_columns: HashMap<&'static str, Vec<i64>>,
+    f64_columns: HashMap<&'static str, Vec<f64>>,
+    utf8_columns: HashMap<&'static str, Utf8ColumnBuffer>,
+    payload: Vec<u8>,
+}
+
 /// Active segment 的最小写入器。
 #[derive(Debug)]
 pub struct ActiveSegmentWriter {
@@ -273,7 +285,7 @@ impl ActiveSegmentWriter {
             .map_err(|_| "failed to publish shared memory payload version")
     }
 
-    fn begin_payload_mutation(&mut self) -> Result<u64, &'static str> {
+    pub(crate) fn begin_payload_mutation(&mut self) -> Result<u64, &'static str> {
         if self.header.sealed {
             return Err("segment is sealed");
         }
@@ -290,7 +302,7 @@ impl ActiveSegmentWriter {
         Ok(odd)
     }
 
-    fn finish_payload_mutation(&mut self) -> Result<u64, &'static str> {
+    pub(crate) fn finish_payload_mutation(&mut self) -> Result<u64, &'static str> {
         let current = self.payload_version()?;
         if current % 2 == 0 {
             return Err("payload mutation is not in progress");
@@ -302,7 +314,7 @@ impl ActiveSegmentWriter {
         Ok(even)
     }
 
-    fn abort_payload_mutation(&mut self) -> Result<u64, &'static str> {
+    pub(crate) fn abort_payload_mutation(&mut self) -> Result<u64, &'static str> {
         let current = self.payload_version()?;
         if current % 2 == 0 {
             return Err("payload mutation is not in progress");
@@ -331,6 +343,97 @@ impl ActiveSegmentWriter {
     /// 放弃测试用 payload mutation。
     pub fn abort_payload_mutation_for_test(&mut self) -> Result<u64, &'static str> {
         self.abort_payload_mutation()
+    }
+
+    pub(crate) fn capture_rows_snapshot(&self) -> Result<ActiveRowsSnapshot, &'static str> {
+        let mut payload = vec![0_u8; self.layout.total_bytes()];
+        self.shm_region
+            .read_at(SHM_PAYLOAD_OFFSET, &mut payload)
+            .map_err(|_| "failed to read active payload snapshot")?;
+        Ok(ActiveRowsSnapshot {
+            row_cursor: self.row_cursor,
+            row_count: self.header.row_count,
+            committed_row_count: self.committed_row_count(),
+            validity: self.validity.clone(),
+            i64_columns: self.i64_columns.clone(),
+            f64_columns: self.f64_columns.clone(),
+            utf8_columns: self.utf8_columns.clone(),
+            payload,
+        })
+    }
+
+    pub(crate) fn restore_rows_snapshot(
+        &mut self,
+        snapshot: ActiveRowsSnapshot,
+    ) -> Result<(), &'static str> {
+        self.row_cursor = snapshot.row_cursor;
+        self.header.row_count = snapshot.row_count;
+        self.current_row_open = false;
+        self.validity = snapshot.validity;
+        self.i64_columns = snapshot.i64_columns;
+        self.f64_columns = snapshot.f64_columns;
+        self.utf8_columns = snapshot.utf8_columns;
+        self.shm_region
+            .write_at(SHM_PAYLOAD_OFFSET, &snapshot.payload)
+            .map_err(|_| "failed to restore active payload snapshot")?;
+        write_u64_header(
+            &mut self.shm_region,
+            SHM_ROW_COUNT_OFFSET,
+            self.header.row_count as u64,
+        )?;
+        self.header
+            .committed_row_count
+            .store(snapshot.committed_row_count, Ordering::Release);
+        self.shm_region
+            .store_u64_release(
+                SHM_COMMITTED_ROW_COUNT_OFFSET,
+                snapshot.committed_row_count as u64,
+            )
+            .map_err(|_| "failed to restore shared memory committed row count")?;
+        Ok(())
+    }
+
+    pub(crate) fn reset_rows_without_publish(&mut self) -> Result<(), &'static str> {
+        if self.header.sealed {
+            return Err("segment is sealed");
+        }
+        if self.current_row_open {
+            return Err("open row exists during rewrite");
+        }
+
+        self.header.row_count = 0;
+        self.row_cursor = 0;
+        write_u64_header(&mut self.shm_region, SHM_ROW_COUNT_OFFSET, 0)?;
+
+        for (column_name, validity) in self.validity.iter_mut() {
+            validity.fill(false);
+            let Some(column_layout) = self.layout.column(column_name) else {
+                continue;
+            };
+            if column_layout.validity_len == 0 {
+                continue;
+            }
+            let offset = SHM_PAYLOAD_OFFSET + column_layout.validity_offset;
+            let zeros = vec![0_u8; column_layout.validity_len];
+            self.shm_region
+                .write_at(offset, &zeros)
+                .map_err(|_| "failed to clear shared memory validity bytes")?;
+        }
+
+        for (column_name, utf8) in self.utf8_columns.iter_mut() {
+            utf8.offsets.fill(0);
+            utf8.values.clear();
+            let column_layout = self
+                .layout
+                .column(column_name)
+                .ok_or("missing column layout")?;
+            let offset = SHM_PAYLOAD_OFFSET + column_layout.offsets_offset;
+            let zeros = vec![0_u8; column_layout.offsets_len];
+            self.shm_region
+                .write_at(offset, &zeros)
+                .map_err(|_| "failed to clear shared memory utf8 offsets")?;
+        }
+        Ok(())
     }
 
     /// 放弃当前未提交行，允许调用方重试同一行槽位。

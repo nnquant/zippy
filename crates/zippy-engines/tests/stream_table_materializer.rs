@@ -342,7 +342,7 @@ fn key_value_table_materializer_keeps_last_row_for_duplicate_key_in_same_batch()
 }
 
 #[test]
-fn key_value_table_materializer_publishes_new_segment_for_snapshot_replace() {
+fn key_value_table_materializer_rewrites_active_snapshot_when_capacity_fits() {
     let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
         "ticks_latest",
         input_schema(),
@@ -370,22 +370,61 @@ fn key_value_table_materializer_publishes_new_segment_for_snapshot_replace() {
     let second_descriptor = materializer.active_descriptor_envelope_bytes().unwrap();
     let second_descriptor_value: serde_json::Value =
         serde_json::from_slice(&second_descriptor).unwrap();
-    let old_snapshot = descriptor_batch(&first_descriptor, 8, 2);
-    let old_prices = old_snapshot
+
+    assert_eq!(
+        first_descriptor_value["segment_id"],
+        second_descriptor_value["segment_id"]
+    );
+    assert_eq!(
+        first_descriptor_value["shm_os_id"],
+        second_descriptor_value["shm_os_id"]
+    );
+
+    let active = materializer.active_record_batch().unwrap();
+    let prices = active
         .column(2)
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
+    assert_eq!(prices.value(0), 4103.5);
+}
+
+#[test]
+fn key_value_table_materializer_falls_back_to_replace_when_snapshot_exceeds_capacity() {
+    let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
+        "ticks_latest",
+        input_schema(),
+        vec!["instrument_id"],
+        1,
+    )
+    .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606", "IH2606"],
+            vec![4102.5, 2711.0],
+        )))
+        .unwrap();
+    let first_descriptor: serde_json::Value =
+        serde_json::from_slice(&materializer.active_descriptor_envelope_bytes().unwrap()).unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606"],
+            vec![4103.5],
+        )))
+        .unwrap();
+    let second_descriptor: serde_json::Value =
+        serde_json::from_slice(&materializer.active_descriptor_envelope_bytes().unwrap()).unwrap();
 
     assert_ne!(
-        first_descriptor_value["segment_id"],
-        second_descriptor_value["segment_id"]
+        first_descriptor["segment_id"],
+        second_descriptor["segment_id"]
     );
     assert_ne!(
-        first_descriptor_value["shm_os_id"],
-        second_descriptor_value["shm_os_id"]
+        first_descriptor["shm_os_id"],
+        second_descriptor["shm_os_id"]
     );
-    assert_eq!(old_prices.value(0), 4102.5);
 }
 
 #[test]
