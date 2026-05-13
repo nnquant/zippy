@@ -241,6 +241,12 @@ impl ActiveSegmentWriter {
     }
 
     pub(crate) fn publish_committed_prefix(&mut self) -> Result<(), &'static str> {
+        self.publish_committed_prefix_without_notify()?;
+        self.notify_readers()?;
+        Ok(())
+    }
+
+    fn publish_committed_prefix_without_notify(&mut self) -> Result<(), &'static str> {
         self.header
             .committed_row_count
             .store(self.row_cursor, Ordering::Release);
@@ -252,8 +258,79 @@ impl ActiveSegmentWriter {
         self.shm_region
             .store_u64_release(SHM_COMMITTED_ROW_COUNT_OFFSET, self.row_cursor as u64)
             .map_err(|_| "failed to publish shared memory committed row count")?;
-        self.notify_readers()?;
         Ok(())
+    }
+
+    fn payload_version(&self) -> Result<u64, &'static str> {
+        self.shm_region
+            .load_u64_acquire(SHM_PAYLOAD_VERSION_OFFSET)
+            .map_err(|_| "failed to read shared memory payload version")
+    }
+
+    fn publish_payload_version(&mut self, version: u64) -> Result<(), &'static str> {
+        self.shm_region
+            .store_u64_release(SHM_PAYLOAD_VERSION_OFFSET, version)
+            .map_err(|_| "failed to publish shared memory payload version")
+    }
+
+    fn begin_payload_mutation(&mut self) -> Result<u64, &'static str> {
+        if self.header.sealed {
+            return Err("segment is sealed");
+        }
+        if self.current_row_open {
+            return Err("open row exists during payload mutation");
+        }
+
+        let current = self.payload_version()?;
+        if current % 2 != 0 {
+            return Err("payload mutation already in progress");
+        }
+        let odd = current.checked_add(1).ok_or("payload version overflow")?;
+        self.publish_payload_version(odd)?;
+        Ok(odd)
+    }
+
+    fn finish_payload_mutation(&mut self) -> Result<u64, &'static str> {
+        let current = self.payload_version()?;
+        if current % 2 == 0 {
+            return Err("payload mutation is not in progress");
+        }
+        self.publish_committed_prefix_without_notify()?;
+        let even = current.checked_add(1).ok_or("payload version overflow")?;
+        self.publish_payload_version(even)?;
+        self.notify_readers()?;
+        Ok(even)
+    }
+
+    fn abort_payload_mutation(&mut self) -> Result<u64, &'static str> {
+        let current = self.payload_version()?;
+        if current % 2 == 0 {
+            return Err("payload mutation is not in progress");
+        }
+        let even = current - 1;
+        self.publish_payload_version(even)?;
+        self.notify_readers()?;
+        Ok(even)
+    }
+
+    /// 返回当前 payload version，仅用于测试。
+    pub fn payload_version_for_test(&self) -> Result<u64, &'static str> {
+        self.payload_version()
+    }
+
+    /// 开始测试用 payload mutation。
+    pub fn begin_payload_mutation_for_test(&mut self) -> Result<u64, &'static str> {
+        self.begin_payload_mutation()
+    }
+
+    /// 结束测试用 payload mutation。
+    pub fn finish_payload_mutation_for_test(&mut self) -> Result<u64, &'static str> {
+        self.finish_payload_mutation()
+    }
+
+    /// 放弃测试用 payload mutation。
+    pub fn abort_payload_mutation_for_test(&mut self) -> Result<u64, &'static str> {
+        self.abort_payload_mutation()
     }
 
     /// 放弃当前未提交行，允许调用方重试同一行槽位。

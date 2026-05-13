@@ -1,6 +1,52 @@
 use zippy_segment_store::{
-    compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan, ShmRegion,
+    compile_schema, ActiveSegmentWriter, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan,
+    ShmRegion,
 };
+
+fn tick_schema_and_layout() -> (CompiledSchema, LayoutPlan) {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 8).unwrap();
+    (schema, layout)
+}
+
+#[test]
+fn payload_mutation_marks_odd_then_even_version() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    assert_eq!(writer.payload_version_for_test().unwrap(), 0);
+    assert_eq!(writer.begin_payload_mutation_for_test().unwrap(), 1);
+    assert_eq!(writer.payload_version_for_test().unwrap(), 1);
+    assert_eq!(writer.finish_payload_mutation_for_test().unwrap(), 2);
+    assert_eq!(writer.payload_version_for_test().unwrap(), 2);
+}
+
+#[test]
+fn payload_mutation_rejects_open_row() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.begin_row().unwrap();
+    let err = writer.begin_payload_mutation_for_test().unwrap_err();
+
+    assert_eq!(err, "open row exists during payload mutation");
+}
+
+#[test]
+fn payload_mutation_rejects_nested_mutation() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.begin_payload_mutation_for_test().unwrap();
+    let err = writer.begin_payload_mutation_for_test().unwrap_err();
+
+    assert_eq!(err, "payload mutation already in progress");
+}
 
 #[test]
 fn reader_only_observes_committed_prefix() {
