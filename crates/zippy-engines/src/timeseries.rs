@@ -342,53 +342,26 @@ impl Engine for TimeSeriesEngine {
             }
         };
 
-        let mut completed = Vec::new();
-        let mut next_open_windows = self.open_windows.clone();
-        let mut next_last_dt_by_id = self.last_dt_by_id.clone();
+        let txn_result = apply_timeseries_rows(
+            &mut self.open_windows,
+            &mut self.last_dt_by_id,
+            &self.specs,
+            self.window_ns,
+            &processed_input,
+        )?;
 
-        for row_index in processed_input.row_selection() {
-            let id = processed_input.id_value(row_index)?.to_string();
-            let dt = processed_input.dt_value(row_index)?;
-            let window_start = align_window_start(dt, self.window_ns);
-            let window_end =
-                window_start
-                    .checked_add(self.window_ns)
-                    .ok_or(ZippyError::InvalidState {
-                        status: "window end overflow",
-                    })?;
-
-            match next_open_windows.remove(&id) {
-                Some(mut open_window) if open_window.window_start == window_start => {
-                    open_window.update(&self.specs, processed_input.spec_inputs(), row_index)?;
-                    next_open_windows.insert(id.clone(), open_window);
-                }
-                Some(open_window) => {
-                    completed.push(open_window);
-                    let mut next_window =
-                        OpenWindow::new(id.clone(), window_start, window_end, self.specs.len());
-                    next_window.update(&self.specs, processed_input.spec_inputs(), row_index)?;
-                    next_open_windows.insert(id.clone(), next_window);
-                }
-                None => {
-                    let mut open_window =
-                        OpenWindow::new(id.clone(), window_start, window_end, self.specs.len());
-                    open_window.update(&self.specs, processed_input.spec_inputs(), row_index)?;
-                    next_open_windows.insert(id.clone(), open_window);
-                }
-            }
-
-            next_last_dt_by_id.insert(id, dt);
+        if txn_result.completed.is_empty() {
+            return Ok(vec![]);
         }
 
-        if completed.is_empty() {
-            self.open_windows = next_open_windows;
-            self.last_dt_by_id = next_last_dt_by_id;
-            Ok(vec![])
-        } else {
-            let output = self.finalize_windows(completed)?;
-            self.open_windows = next_open_windows;
-            self.last_dt_by_id = next_last_dt_by_id;
-            Ok(vec![SegmentTableView::from_record_batch(output)])
+        match self.finalize_windows(txn_result.completed) {
+            Ok(output) => Ok(vec![SegmentTableView::from_record_batch(output)]),
+            Err(error) => {
+                txn_result
+                    .rollback
+                    .restore(&mut self.open_windows, &mut self.last_dt_by_id);
+                Err(error)
+            }
         }
     }
 
@@ -594,6 +567,109 @@ impl OpenWindow {
             _ => Ok(self.values[spec_index]),
         }
     }
+}
+
+struct TimeSeriesStateUndo {
+    open_window: Option<OpenWindow>,
+    last_dt: Option<i64>,
+}
+
+struct TimeSeriesRollback {
+    undo: BTreeMap<String, TimeSeriesStateUndo>,
+}
+
+impl TimeSeriesRollback {
+    fn restore(
+        self,
+        open_windows: &mut BTreeMap<String, OpenWindow>,
+        last_dt_by_id: &mut BTreeMap<String, i64>,
+    ) {
+        for (id, undo) in self.undo {
+            match undo.open_window {
+                Some(open_window) => {
+                    open_windows.insert(id.clone(), open_window);
+                }
+                None => {
+                    open_windows.remove(&id);
+                }
+            }
+
+            match undo.last_dt {
+                Some(last_dt) => {
+                    last_dt_by_id.insert(id, last_dt);
+                }
+                None => {
+                    last_dt_by_id.remove(&id);
+                }
+            }
+        }
+    }
+}
+
+struct TimeSeriesStateTxn<'a> {
+    open_windows: &'a mut BTreeMap<String, OpenWindow>,
+    last_dt_by_id: &'a mut BTreeMap<String, i64>,
+    undo: BTreeMap<String, TimeSeriesStateUndo>,
+}
+
+impl<'a> TimeSeriesStateTxn<'a> {
+    fn new(
+        open_windows: &'a mut BTreeMap<String, OpenWindow>,
+        last_dt_by_id: &'a mut BTreeMap<String, i64>,
+    ) -> Self {
+        Self {
+            open_windows,
+            last_dt_by_id,
+            undo: BTreeMap::new(),
+        }
+    }
+
+    fn take_open_window(&mut self, id: &str) -> Option<OpenWindow> {
+        self.touch(id);
+        self.open_windows.remove(id)
+    }
+
+    fn insert_open_window(&mut self, id: &str, open_window: OpenWindow) {
+        self.touch(id);
+        self.open_windows.insert(id.to_string(), open_window);
+    }
+
+    fn set_last_dt(&mut self, id: &str, dt: i64) {
+        self.touch(id);
+        self.last_dt_by_id.insert(id.to_string(), dt);
+    }
+
+    fn into_rollback(self) -> TimeSeriesRollback {
+        TimeSeriesRollback { undo: self.undo }
+    }
+
+    fn rollback(self) {
+        let Self {
+            open_windows,
+            last_dt_by_id,
+            undo,
+        } = self;
+        TimeSeriesRollback { undo }.restore(open_windows, last_dt_by_id);
+    }
+
+    fn touch(&mut self, id: &str) {
+        if self.undo.contains_key(id) {
+            return;
+        }
+
+        self.undo.insert(
+            id.to_string(),
+            TimeSeriesStateUndo {
+                open_window: self.open_windows.get(id).cloned(),
+                last_dt: self.last_dt_by_id.get(id).copied(),
+            },
+        );
+    }
+}
+
+struct TimeSeriesTxnResult {
+    completed: Vec<OpenWindow>,
+    rollback: TimeSeriesRollback,
 }
 
 struct SpecInputArrays {
@@ -853,6 +929,78 @@ fn is_late_row(
     matches!(last_dt, Some(last_dt) if dt < last_dt)
 }
 
+fn apply_timeseries_rows(
+    open_windows: &mut BTreeMap<String, OpenWindow>,
+    last_dt_by_id: &mut BTreeMap<String, i64>,
+    specs: &[Box<dyn AggregationSpec>],
+    window_ns: i64,
+    processed_input: &ProcessedInput<'_>,
+) -> Result<TimeSeriesTxnResult> {
+    let mut completed = Vec::new();
+    let mut txn = TimeSeriesStateTxn::new(open_windows, last_dt_by_id);
+
+    for row_index in processed_input.row_selection() {
+        let row_result =
+            apply_timeseries_row(&mut txn, specs, window_ns, processed_input, row_index);
+
+        match row_result {
+            Ok(Some(completed_window)) => completed.push(completed_window),
+            Ok(None) => {}
+            Err(error) => {
+                txn.rollback();
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(TimeSeriesTxnResult {
+        completed,
+        rollback: txn.into_rollback(),
+    })
+}
+
+fn apply_timeseries_row(
+    txn: &mut TimeSeriesStateTxn<'_>,
+    specs: &[Box<dyn AggregationSpec>],
+    window_ns: i64,
+    processed_input: &ProcessedInput<'_>,
+    row_index: usize,
+) -> Result<Option<OpenWindow>> {
+    let id = processed_input.id_value(row_index)?.to_string();
+    let dt = processed_input.dt_value(row_index)?;
+    let window_start = align_window_start(dt, window_ns);
+    let window_end = window_start
+        .checked_add(window_ns)
+        .ok_or(ZippyError::InvalidState {
+            status: "window end overflow",
+        })?;
+
+    let completed = match txn.take_open_window(&id) {
+        Some(mut open_window) if open_window.window_start == window_start => {
+            open_window.update(specs, processed_input.spec_inputs(), row_index)?;
+            txn.insert_open_window(&id, open_window);
+            None
+        }
+        Some(open_window) => {
+            let mut next_window =
+                OpenWindow::new(id.clone(), window_start, window_end, specs.len());
+            next_window.update(specs, processed_input.spec_inputs(), row_index)?;
+            txn.insert_open_window(&id, next_window);
+            Some(open_window)
+        }
+        None => {
+            let mut open_window =
+                OpenWindow::new(id.clone(), window_start, window_end, specs.len());
+            open_window.update(specs, processed_input.spec_inputs(), row_index)?;
+            txn.insert_open_window(&id, open_window);
+            None
+        }
+    };
+
+    txn.set_last_dt(&id, dt);
+    Ok(completed)
+}
+
 fn validate_id_column(schema: &Schema, id_column: &str) -> Result<()> {
     let field = schema
         .field_with_name(id_column)
@@ -1028,7 +1176,50 @@ fn align_window_start(dt: i64, window_ns: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::RowSelection;
+    use std::collections::BTreeMap;
+
+    use super::{OpenWindow, RowSelection, TimeSeriesStateTxn};
+
+    #[test]
+    fn time_series_state_txn_rollback_removes_new_id() {
+        let mut open_windows = BTreeMap::new();
+        let mut last_dt_by_id = BTreeMap::new();
+        let mut txn = TimeSeriesStateTxn::new(&mut open_windows, &mut last_dt_by_id);
+
+        txn.insert_open_window("A", OpenWindow::new("A".to_string(), 0, 10, 1));
+        txn.set_last_dt("A", 5);
+        let rollback = txn.into_rollback();
+
+        rollback.restore(&mut open_windows, &mut last_dt_by_id);
+
+        assert!(open_windows.is_empty());
+        assert!(last_dt_by_id.is_empty());
+    }
+
+    #[test]
+    fn time_series_state_txn_rollback_restores_existing_id_once() {
+        let original = OpenWindow::new("A".to_string(), 0, 10, 1);
+        let mut open_windows = BTreeMap::from([("A".to_string(), original.clone())]);
+        let mut last_dt_by_id = BTreeMap::from([("A".to_string(), 5)]);
+        let mut txn = TimeSeriesStateTxn::new(&mut open_windows, &mut last_dt_by_id);
+
+        txn.take_open_window("A");
+        txn.insert_open_window("A", OpenWindow::new("A".to_string(), 10, 20, 1));
+        txn.set_last_dt("A", 15);
+        let rollback = txn.into_rollback();
+
+        rollback.restore(&mut open_windows, &mut last_dt_by_id);
+
+        assert_eq!(
+            open_windows.get("A").unwrap().window_start,
+            original.window_start
+        );
+        assert_eq!(
+            open_windows.get("A").unwrap().window_end,
+            original.window_end
+        );
+        assert_eq!(last_dt_by_id.get("A"), Some(&5));
+    }
 
     #[test]
     fn row_selection_all_iterates_without_materialized_indices() {

@@ -561,6 +561,53 @@ fn timeseries_engine_errors_on_zero_weight_vwap_window() {
 }
 
 #[test]
+fn timeseries_engine_rolls_back_state_when_finalize_fails() {
+    let mut engine = TimeSeriesEngine::new(
+        "bars",
+        input_schema(),
+        "id",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![AggVwapSpec::new("value", "weight", "vwap_value")
+            .build()
+            .unwrap()],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    engine
+        .on_data(batch(vec!["a"], vec![1_000_000_000], vec![10.0], vec![0.0]))
+        .unwrap();
+
+    let transition_error = engine
+        .on_data(batch(
+            vec!["a"],
+            vec![MINUTE_NS + 1_000_000_000],
+            vec![12.0],
+            vec![1.0],
+        ))
+        .unwrap_err();
+
+    assert!(matches!(
+        transition_error,
+        ZippyError::InvalidState {
+            status: "vwap denominator is zero",
+        }
+    ));
+
+    let flush_error = engine.on_flush().unwrap_err();
+
+    assert!(matches!(
+        flush_error,
+        ZippyError::InvalidState {
+            status: "vwap denominator is zero",
+        }
+    ));
+}
+
+#[test]
 fn timeseries_engine_drop_with_metric_skips_late_rows_and_keeps_valid_rows() {
     let mut engine = TimeSeriesEngine::new(
         "bars",

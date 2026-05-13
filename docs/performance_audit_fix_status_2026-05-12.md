@@ -14,7 +14,7 @@
 | P001 性能门禁没有运行真实压测和尾延迟阈值 | 已修复基础门禁 | `zippy-perf` 增加 p95/p99/queue depth 阈值，新增 nightly/manual performance workflow。 |
 | P002 Gateway collect 一次性整批执行 | 已修复 streaming 路径，live zero-copy 留待 P008 | `collect(stream=True)` 走 Gateway 多帧 streaming collect；默认 `collect()` 保持旧路径。 |
 | P003 StreamTable Arrow batch 按行写入 | 已修复典型路径 | 非空 Arrow batch 走 columnar append；含 null batch 保留原逐行语义。 |
-| P004 TimeSeriesEngine 全量 clone 和按行 key 分配 | 部分修复，剩余继续处理 | 无 id filter 的常见路径不再物化全量 row index Vec；状态 clone、String key 分配和 id interning 留待专项。 |
+| P004 TimeSeriesEngine 全量 clone 和按行 key 分配 | 部分修复，剩余继续处理 | row selection fast path 和 touched-id transaction rollback 已落地；String key 分配和 id interning 留待专项。 |
 | P005 CrossSectionalEngine 按行 OwnedRow 和全量排序 | 部分修复，剩余继续处理 | bucket 行序 fast path、columnar bucket state 和 factor context 已落地；group_by/id interning 等留待专项。 |
 | P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 全量 snapshot replace 留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
@@ -97,12 +97,14 @@
 - `ProcessedInput`、迟到数据校验和 drop-with-metric 过滤统一消费 `RowSelection` iterator。
 - 有 pre factor 时仍在构造 accepted batch 前显式转换为 row index `Vec<u32>`，保持现有
   `record_batch_from_table_rows()` 接口不变。
+- `on_data()` 改为 touched-id transaction rollback，不再每批 clone 全量 `open_windows` 和
+  `last_dt_by_id`。
+- finalize 或 row update 失败时只恢复本批 touched ids，保持错误不污染状态语义。
 
 边界：
 
-- 本轮没有改动 `open_windows` / `last_dt_by_id` 的 clone-on-write rollback 语义。
-- 每行 `id.to_string()` 和 `BTreeMap<String, ...>` 状态模型仍是剩余热点，需要和 id interning、
-  slot state 设计一起处理。
+- 每行 `id.to_string()` 和 `BTreeMap<String, ...>` 状态容器仍是剩余热点；id interning / slot
+  arena 留待后续专项。
 - `DropWithMetric` 路径仍会构造 accepted row vector，因为它本身需要剔除迟到行。
 
 ### P005 CrossSectional row order fast path, columnar bucket state and factor context
