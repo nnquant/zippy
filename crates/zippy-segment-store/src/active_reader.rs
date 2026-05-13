@@ -4,9 +4,9 @@ use crate::{
     segment::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
         SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
-        SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET,
-        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WAITER_COUNT_OFFSET,
-        SHM_WRITER_EPOCH_OFFSET,
+        SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_PAYLOAD_VERSION_OFFSET,
+        SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET,
+        SHM_WAITER_COUNT_OFFSET, SHM_WRITER_EPOCH_OFFSET,
     },
     ActiveSegmentDescriptor, CompiledSchema, LayoutPlan, RowSpanView, SegmentControlSnapshot,
     ShmRegion, ZippySegmentStoreError,
@@ -175,6 +175,7 @@ fn read_control_snapshot(
             "active segment committed row count offset mismatch",
         ));
     }
+    let payload_version = read_payload_version_capability(descriptor, shm_region)?;
 
     let schema_id = read_u64_header(shm_region, SHM_SCHEMA_ID_OFFSET)?;
     if schema_id != descriptor.schema().schema_id() {
@@ -251,12 +252,31 @@ fn read_control_snapshot(
         capacity_rows,
         row_count,
         committed_row_count,
+        payload_version,
         notify_seq,
         waiter_count,
         sealed,
         payload_offset: descriptor.payload_offset(),
         committed_row_count_offset: descriptor.committed_row_count_offset(),
     })
+}
+
+fn read_payload_version_capability(
+    descriptor: &ActiveSegmentDescriptor,
+    shm_region: &ShmRegion,
+) -> Result<Option<u64>, ZippySegmentStoreError> {
+    let Some(offset) = descriptor.payload_version_offset() else {
+        return Err(ZippySegmentStoreError::Layout(
+            "active segment payload version capability missing",
+        ));
+    };
+    if offset != SHM_PAYLOAD_VERSION_OFFSET {
+        return Err(ZippySegmentStoreError::Layout(
+            "active segment payload version offset mismatch",
+        ));
+    }
+    let version = shm_region.load_u64_acquire(offset)?;
+    Ok(Some(version))
 }
 
 fn read_sealed_flag(shm_region: &ShmRegion) -> Result<bool, ZippySegmentStoreError> {

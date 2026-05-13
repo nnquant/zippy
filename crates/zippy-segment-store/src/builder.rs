@@ -12,9 +12,9 @@ use crate::{
     segment::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
         SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
-        SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET,
-        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WAITER_COUNT_OFFSET,
-        SHM_WRITER_EPOCH_OFFSET,
+        SHM_MAGIC_OFFSET, SHM_NOTIFY_SEQ_OFFSET, SHM_PAYLOAD_OFFSET, SHM_PAYLOAD_VERSION_OFFSET,
+        SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET,
+        SHM_WAITER_COUNT_OFFSET, SHM_WRITER_EPOCH_OFFSET,
     },
     view::{ActiveSegmentAttachment, RowSpanBacking},
     ColumnLayout, ColumnType, CompiledSchema, LayoutPlan, RowSpanView, SealedSegmentHandle,
@@ -151,6 +151,9 @@ impl ActiveSegmentWriter {
         shm_region
             .store_u32_release(SHM_WAITER_COUNT_OFFSET, 0)
             .map_err(|_| "failed to initialize shared memory waiter count")?;
+        shm_region
+            .store_u64_release(SHM_PAYLOAD_VERSION_OFFSET, 0)
+            .map_err(|_| "failed to initialize shared memory payload version")?;
         write_u32_header(&mut shm_region, SHM_MAGIC_OFFSET, SHM_MAGIC)?;
         write_u32_header(
             &mut shm_region,
@@ -539,6 +542,7 @@ impl ActiveSegmentWriter {
             shm_os_id: self.shm_region.os_id().to_string(),
             payload_offset: SHM_PAYLOAD_OFFSET,
             committed_row_count_offset: SHM_COMMITTED_ROW_COUNT_OFFSET,
+            payload_version_offset: Some(SHM_PAYLOAD_VERSION_OFFSET),
             segment_id: self.header.segment_id,
             generation: self.header.generation,
             writer_epoch: self.header.writer_epoch,

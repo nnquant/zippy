@@ -120,7 +120,7 @@ fn active_segment_reader_exposes_control_snapshot_from_mmap_header() {
     let snapshot = reader.control_snapshot().unwrap();
 
     assert_eq!(snapshot.magic, 0x5448_535A);
-    assert_eq!(snapshot.layout_version, 3);
+    assert_eq!(snapshot.layout_version, 4);
     assert_eq!(snapshot.schema_id, schema.schema_id());
     assert_eq!(snapshot.segment_id, 1);
     assert_eq!(snapshot.generation, 0);
@@ -135,6 +135,7 @@ fn active_segment_reader_exposes_control_snapshot_from_mmap_header() {
     assert_eq!(snapshot.capacity_rows, 32);
     assert_eq!(snapshot.row_count, 2);
     assert_eq!(snapshot.committed_row_count, 2);
+    assert_eq!(snapshot.payload_version, Some(0));
     assert_eq!(snapshot.notify_seq, 2);
     assert_eq!(snapshot.waiter_count, 0);
     assert!(!snapshot.sealed);
@@ -185,6 +186,33 @@ fn active_segment_reader_rejects_descriptor_generation_mismatch() {
         .unwrap_err()
         .to_string()
         .contains("descriptor generation mismatch"));
+}
+
+#[test]
+fn active_segment_reader_rejects_v4_header_without_payload_version_capability() {
+    let schema = tick_schema();
+    let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let partition = store
+        .open_partition_with_schema("openctp_ticks", "all", schema.clone())
+        .unwrap();
+    {
+        let writer = partition.writer();
+        writer.append_tick_for_test(1, "IF2606", 4112.5).unwrap();
+    }
+
+    let bytes = partition.active_descriptor_envelope_bytes().unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    envelope
+        .as_object_mut()
+        .unwrap()
+        .remove("payload_version_offset");
+    let legacy = serde_json::to_vec(&envelope).unwrap();
+
+    let err = ActiveSegmentReader::from_descriptor_envelope(&legacy, schema, layout).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("active segment payload version capability missing"));
 }
 
 #[test]

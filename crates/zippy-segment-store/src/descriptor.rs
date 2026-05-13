@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    segment::{ActiveSegmentDescriptor, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_PAYLOAD_OFFSET},
+    segment::{
+        ActiveSegmentDescriptor, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_PAYLOAD_OFFSET,
+        SHM_PAYLOAD_VERSION_OFFSET,
+    },
     CompiledSchema, LayoutPlan,
 };
 
@@ -17,6 +20,8 @@ struct ActiveSegmentDescriptorEnvelope {
     shm_os_id: String,
     payload_offset: usize,
     committed_row_count_offset: usize,
+    #[serde(default)]
+    payload_version_offset: Option<usize>,
     segment_id: u64,
     generation: u64,
     writer_epoch: u64,
@@ -34,6 +39,7 @@ impl ActiveSegmentDescriptor {
             shm_os_id: self.shm_os_id().to_string(),
             payload_offset: self.payload_offset(),
             committed_row_count_offset: self.committed_row_count_offset(),
+            payload_version_offset: self.payload_version_offset(),
             segment_id: self.segment_id(),
             generation: self.generation(),
             writer_epoch: self.writer_epoch(),
@@ -70,6 +76,11 @@ impl ActiveSegmentDescriptor {
         if envelope.committed_row_count_offset != SHM_COMMITTED_ROW_COUNT_OFFSET {
             return Err("active segment descriptor committed row count offset mismatch");
         }
+        if let Some(offset) = envelope.payload_version_offset {
+            if offset != SHM_PAYLOAD_VERSION_OFFSET {
+                return Err("active segment descriptor payload version offset mismatch");
+            }
+        }
 
         Ok(Self {
             schema,
@@ -77,6 +88,7 @@ impl ActiveSegmentDescriptor {
             shm_os_id: envelope.shm_os_id,
             payload_offset: envelope.payload_offset,
             committed_row_count_offset: envelope.committed_row_count_offset,
+            payload_version_offset: envelope.payload_version_offset,
             segment_id: envelope.segment_id,
             generation: envelope.generation,
             writer_epoch: envelope.writer_epoch,

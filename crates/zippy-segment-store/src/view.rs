@@ -5,8 +5,8 @@ use crate::{
     segment::{
         SHM_CAPACITY_ROWS_OFFSET, SHM_COMMITTED_ROW_COUNT_OFFSET, SHM_DESCRIPTOR_GENERATION_OFFSET,
         SHM_GENERATION_OFFSET, SHM_LAYOUT_VERSION, SHM_LAYOUT_VERSION_OFFSET, SHM_MAGIC,
-        SHM_MAGIC_OFFSET, SHM_PAYLOAD_OFFSET, SHM_ROW_COUNT_OFFSET, SHM_SCHEMA_ID_OFFSET,
-        SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WRITER_EPOCH_OFFSET,
+        SHM_MAGIC_OFFSET, SHM_PAYLOAD_OFFSET, SHM_PAYLOAD_VERSION_OFFSET, SHM_ROW_COUNT_OFFSET,
+        SHM_SCHEMA_ID_OFFSET, SHM_SEALED_OFFSET, SHM_SEGMENT_ID_OFFSET, SHM_WRITER_EPOCH_OFFSET,
     },
     ActiveSegmentDescriptor, ColumnSpec, ColumnType, CompiledSchema, SealedSegmentHandle,
     ShmRegion, ZippySegmentStoreError,
@@ -493,6 +493,15 @@ fn validate_active_descriptor_header(
     if descriptor.committed_row_count_offset() != SHM_COMMITTED_ROW_COUNT_OFFSET {
         return Err("active segment committed row count offset mismatch");
     }
+    let Some(payload_version_offset) = descriptor.payload_version_offset() else {
+        return Err("active segment payload version capability missing");
+    };
+    if payload_version_offset != SHM_PAYLOAD_VERSION_OFFSET {
+        return Err("active segment payload version offset mismatch");
+    }
+    shm_region
+        .load_u64_acquire(payload_version_offset)
+        .map_err(|_| "failed to read active segment payload version")?;
 
     let schema_id = read_u64_header(shm_region, SHM_SCHEMA_ID_OFFSET)?;
     if schema_id != descriptor.schema().schema_id() {

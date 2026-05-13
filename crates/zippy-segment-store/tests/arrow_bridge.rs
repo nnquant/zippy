@@ -4,7 +4,8 @@ use arrow::{
 };
 use zippy_segment_store::{
     compile_schema, debug_snapshot_record_batch_for_test, ActiveSegmentDescriptor,
-    ActiveSegmentWriter, ColumnSpec, ColumnType, LayoutPlan, RowSpanView, ShmRegion,
+    ActiveSegmentWriter, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanView,
+    ShmRegion,
 };
 
 const SHM_SCHEMA_ID_OFFSET: usize = 0;
@@ -13,6 +14,17 @@ const SHM_COMMITTED_ROW_COUNT_OFFSET: usize = 40;
 const SHM_MAGIC_OFFSET: usize = 56;
 const SHM_LAYOUT_VERSION_OFFSET: usize = 60;
 const SHM_PAYLOAD_OFFSET: usize = 128;
+
+fn tick_schema_and_layout() -> (CompiledSchema, LayoutPlan) {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let layout = LayoutPlan::for_schema(&schema, 4).unwrap();
+    (schema, layout)
+}
 
 #[test]
 fn row_span_converts_to_record_batch_for_debug_export() {
@@ -228,6 +240,39 @@ fn active_descriptor_envelope_roundtrips_for_cross_process_attach() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(instrument.value(0), "rb2501");
+}
+
+#[test]
+fn active_descriptor_envelope_includes_payload_version_offset() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema.clone(), layout.clone()).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+
+    let bytes = writer.active_descriptor().to_envelope_bytes().unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(envelope["payload_version_offset"], serde_json::json!(88));
+
+    let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(&bytes, schema, layout).unwrap();
+    assert_eq!(descriptor.payload_version_offset(), Some(88));
+}
+
+#[test]
+fn active_descriptor_envelope_accepts_legacy_payload_version_absence() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema.clone(), layout.clone()).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+
+    let bytes = writer.active_descriptor().to_envelope_bytes().unwrap();
+    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    envelope
+        .as_object_mut()
+        .unwrap()
+        .remove("payload_version_offset");
+    let legacy = serde_json::to_vec(&envelope).unwrap();
+
+    let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(&legacy, schema, layout).unwrap();
+    assert_eq!(descriptor.payload_version_offset(), None);
 }
 
 #[test]
