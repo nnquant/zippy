@@ -18,8 +18,8 @@ use parquet::arrow::ArrowWriter;
 use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
     compile_schema, ColumnSpec, ColumnType, PartitionHandle, PartitionRowWriter,
-    PartitionWriterHandle, ReaderSession, SealedSegmentHandle, SegmentLease, SegmentStore,
-    SegmentStoreConfig, ZippySegmentStoreError,
+    PartitionWriterHandle, ReaderSession, RowSpanView, SealedSegmentHandle, SegmentLease,
+    SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
 
 use crate::latest_state::LatestColumnarState;
@@ -684,6 +684,14 @@ impl StreamTableMaterializer {
     /// Return the active segment committed row count.
     pub fn active_committed_row_count(&self) -> usize {
         self.partition.active_committed_row_count()
+    }
+
+    /// Return a row span covering the currently committed active segment rows.
+    pub fn active_row_span(&self) -> Result<RowSpanView> {
+        let committed = self.partition.active_committed_row_count();
+        self.partition
+            .active_row_span(0, committed)
+            .map_err(segment_error)
     }
 
     /// Export the active segment descriptor envelope for cross-process readers.

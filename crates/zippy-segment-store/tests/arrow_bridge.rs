@@ -312,10 +312,7 @@ fn row_span_batch_reader_reads_active_span_chunks() {
     let mut reader = span
         .batch_reader(
             2,
-            Some(vec![
-                "instrument_id".to_string(),
-                "last_price".to_string(),
-            ]),
+            Some(vec!["instrument_id".to_string(), "last_price".to_string()]),
         )
         .unwrap();
 

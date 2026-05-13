@@ -1540,7 +1540,9 @@ fn native_gateway_collect_stream_reports_streaming_metrics() {
     assert_eq!(metrics["returned_rows"], json!(2));
     assert!(metrics["encode_elapsed_ms"].as_f64().unwrap() >= 0.0);
     assert!(metrics["write_elapsed_ms"].as_f64().unwrap() >= 0.0);
-    assert!(metrics["materialized_live_batches"].as_u64().unwrap() >= 1);
+    assert_eq!(metrics["materialized_live_batches"], json!(0));
+    assert_eq!(metrics["segment_streamed_batches"], json!(2));
+    assert_eq!(metrics["segment_streamed_rows"], json!(2));
 
     gateway.stop();
     master.shutdown();

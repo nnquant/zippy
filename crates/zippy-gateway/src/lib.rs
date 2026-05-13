@@ -44,7 +44,7 @@ use zippy_engines::{
 };
 use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
-    ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanView,
+    ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanBatchReader, RowSpanView,
 };
 
 const MAX_GATEWAY_HEADER_BYTES: usize = 64 * 1024;
@@ -159,6 +159,8 @@ struct GatewayCollectStreamMetrics {
     write_elapsed_ms: f64,
     max_pending_file_results: usize,
     materialized_live_batches: usize,
+    segment_streamed_batches: usize,
+    segment_streamed_rows: usize,
 }
 
 struct OrderedGatewayFileResults {
@@ -296,6 +298,16 @@ impl GatewayCollectStreamMetrics {
                 .filter(|value| *value > 0)
                 .map(|_| 1usize)
                 .unwrap_or_default();
+            metrics.segment_streamed_batches = object
+                .get("segment_streamed_batches")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.segment_streamed_rows = object
+                .get("segment_streamed_rows")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
         }
         metrics
     }
@@ -314,6 +326,8 @@ impl GatewayCollectStreamMetrics {
             "write_elapsed_ms": self.write_elapsed_ms,
             "max_pending_file_results": self.max_pending_file_results,
             "materialized_live_batches": self.materialized_live_batches,
+            "segment_streamed_batches": self.segment_streamed_batches,
+            "segment_streamed_rows": self.segment_streamed_rows,
         })
     }
 }
@@ -333,6 +347,13 @@ enum GatewayCollectStreamProducer {
         current_offset: usize,
         skip_rows: usize,
         remaining_rows: Option<usize>,
+        metrics: GatewayCollectStreamMetrics,
+    },
+    Segment {
+        schema: SchemaRef,
+        readers: VecDeque<RowSpanBatchReader>,
+        scan_pushdown: GatewayScanPushdown,
+        output_projection_columns: Option<Vec<String>>,
         metrics: GatewayCollectStreamMetrics,
     },
 }
@@ -448,10 +469,43 @@ impl GatewayCollectStreamProducer {
         })
     }
 
+    fn segment(
+        schema: SchemaRef,
+        spans: Vec<RowSpanView>,
+        scan_pushdown: GatewayScanPushdown,
+        output_projection_columns: Option<Vec<String>>,
+        chunk_rows: usize,
+    ) -> Result<Self> {
+        let scan_schema = schema_for_scan_pushdown(&schema, &scan_pushdown)?;
+        let mut readers = VecDeque::with_capacity(spans.len());
+        for span in spans {
+            let reader = span
+                .batch_reader(chunk_rows, scan_pushdown.projection_columns.clone())
+                .map_err(|error| ZippyError::Io {
+                    reason: error.to_string(),
+                })?;
+            readers.push_back(reader);
+        }
+        Ok(Self::Segment {
+            schema: schema_for_projection_columns(
+                &scan_schema,
+                output_projection_columns.as_deref(),
+            )?,
+            readers,
+            scan_pushdown,
+            output_projection_columns,
+            metrics: GatewayCollectStreamMetrics {
+                streaming: true,
+                ..GatewayCollectStreamMetrics::default()
+            },
+        })
+    }
+
     fn schema(&self) -> SchemaRef {
         match self {
             Self::Materialized { batch, .. } => batch.schema(),
             Self::Persisted { schema, .. } => Arc::clone(schema),
+            Self::Segment { schema, .. } => Arc::clone(schema),
         }
     }
 
@@ -459,6 +513,7 @@ impl GatewayCollectStreamProducer {
         match self {
             Self::Materialized { metrics, .. } => metrics.value(),
             Self::Persisted { metrics, .. } => metrics.value(),
+            Self::Segment { metrics, .. } => metrics.value(),
         }
     }
 
@@ -466,6 +521,7 @@ impl GatewayCollectStreamProducer {
         match self {
             Self::Materialized { metrics, .. } => metrics,
             Self::Persisted { metrics, .. } => metrics,
+            Self::Segment { metrics, .. } => metrics,
         }
     }
 
@@ -533,6 +589,39 @@ impl GatewayCollectStreamProducer {
                 *current_offset = start + rows;
                 metrics.returned_rows = metrics.returned_rows.saturating_add(rows);
                 return Ok(Some(chunk));
+            },
+            Self::Segment {
+                readers,
+                scan_pushdown,
+                output_projection_columns,
+                metrics,
+                ..
+            } => loop {
+                let Some(reader) = readers.front_mut() else {
+                    return Ok(None);
+                };
+                let Some(mut batch) = reader.next_batch().map_err(|error| ZippyError::Io {
+                    reason: error.to_string(),
+                })?
+                else {
+                    readers.pop_front();
+                    continue;
+                };
+                metrics.segment_streamed_batches =
+                    metrics.segment_streamed_batches.saturating_add(1);
+                metrics.segment_streamed_rows = metrics
+                    .segment_streamed_rows
+                    .saturating_add(batch.num_rows());
+                metrics.scanned_rows = metrics.scanned_rows.saturating_add(batch.num_rows());
+                for filter in &scan_pushdown.filters {
+                    batch = apply_filter(batch, filter)?;
+                }
+                batch = project_record_batch(&batch, output_projection_columns.as_deref())?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                metrics.returned_rows = metrics.returned_rows.saturating_add(batch.num_rows());
+                return Ok(Some(batch));
             },
         }
     }
@@ -1168,12 +1257,26 @@ impl GatewayState {
         stream_plan: GatewayCollectStreamPlan,
     ) -> Result<GatewayCollectStreamProducer> {
         if stream_plan.snapshot_id.is_none() {
-            let has_active_writer = self
+            let active_writer = self
                 .writers
                 .lock()
                 .unwrap()
-                .contains_key(&stream_plan.source);
-            if !has_active_writer {
+                .get(&stream_plan.source)
+                .cloned();
+            if let Some(writer) = active_writer {
+                let span = {
+                    let writer = writer.lock().unwrap();
+                    writer.materializer.active_row_span()?
+                };
+                return GatewayCollectStreamProducer::segment(
+                    span.schema_ref(),
+                    vec![span],
+                    stream_plan.scan_pushdown,
+                    stream_plan.output_projection_columns,
+                    stream_plan.chunk_rows,
+                );
+            }
+            {
                 let stream = self.master.get_stream_blocking(&stream_plan.source)?;
                 if stream_is_persisted_only(&stream) {
                     self.increment_metric(|metrics| metrics.collect_requests_total += 1);
@@ -2577,6 +2680,8 @@ fn record_gateway_error_metric(state: &GatewayState, error: &ZippyError) {
 }
 
 fn normalize_collect_stream_metrics(object: &mut serde_json::Map<String, Value>) {
+    object.entry("segment_streamed_batches").or_insert(json!(0));
+    object.entry("segment_streamed_rows").or_insert(json!(0));
     let Some(scanned_files) = object
         .get("scanned_files")
         .and_then(Value::as_array)
