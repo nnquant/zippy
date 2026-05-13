@@ -2,8 +2,8 @@ use arrow::array::{Float64Array, StringArray};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use zippy_segment_store::{
-    compile_schema, ActiveSegmentReader, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan,
-    SegmentCellValue, SegmentStore, SegmentStoreConfig,
+    compile_schema, ActiveSegmentReader, ActiveSegmentWriter, ColumnSpec, ColumnType,
+    CompiledSchema, LayoutPlan, SegmentCellValue, SegmentStore, SegmentStoreConfig,
 };
 
 fn tick_schema() -> CompiledSchema {
@@ -368,6 +368,26 @@ fn active_row_span_reads_cells_without_record_batch_materialization() {
         span.cell_value(0, "last_price").unwrap(),
         SegmentCellValue::Float64(4112.5)
     );
+}
+
+#[test]
+fn reader_read_available_keeps_cursor_when_payload_read_later_fails() {
+    let schema = tick_schema();
+    let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema.clone(), layout.clone()).unwrap();
+    writer.append_tick_for_test(1, "IF2606", 4112.5).unwrap();
+
+    let envelope = writer.active_descriptor().to_envelope_bytes().unwrap();
+    writer.begin_payload_mutation_for_test().unwrap();
+    let mut reader =
+        ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout).unwrap();
+    let span = reader.read_available().unwrap().expect("expected row");
+    assert!(span
+        .as_record_batch()
+        .unwrap_err()
+        .to_string()
+        .contains("active payload changed during read"));
+    assert!(reader.read_available().unwrap().is_none());
 }
 
 #[test]

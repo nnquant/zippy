@@ -310,6 +310,37 @@ fn active_row_span_exposes_borrowed_utf8_cell_values_for_hot_filters() {
 }
 
 #[test]
+fn active_descriptor_control_snapshot_keeps_append_only_reads_unchanged() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let handle = store
+        .open_partition_with_schema("ticks", "source", schema)
+        .unwrap();
+    {
+        let writer = handle.writer();
+        writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+        writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+    }
+
+    let span = handle.active_row_span(0, 2).unwrap();
+    let batch = span.as_record_batch().unwrap();
+
+    assert_eq!(batch.num_rows(), 2);
+    let instrument = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(instrument.value(1), "rb2505");
+}
+
+#[test]
 fn partition_writer_appends_active_row_span_with_nullable_columns_and_offset() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
