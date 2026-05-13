@@ -1486,7 +1486,7 @@ def _build_table_alerts(info: dict[str, object]) -> list[dict[str, object]]:
             }
         )
 
-    if info.get("active_segment_descriptor") is None:
+    if info.get("active_segment_descriptor") is None and not _info_has_persisted_files(info):
         alerts.append(
             {
                 "severity": "warning",
@@ -1530,6 +1530,13 @@ def _build_table_alerts(info: dict[str, object]) -> list[dict[str, object]]:
         alerts.append(alert)
 
     return alerts
+
+
+def _info_has_persisted_files(info: dict[str, object]) -> bool:
+    return any(
+        isinstance(item, dict) and bool(item.get("file_path"))
+        for item in info.get("persisted_files", []) or []
+    )
 
 
 def _active_segment_preflight_ok(preflight: dict[str, object]) -> bool:
@@ -3845,10 +3852,12 @@ class Table:
             filters=pushdown_filters,
             metrics=metrics,
         )
-        live = self._scan_live_snapshot(snapshot).read_all()
-        _record_live_scan(metrics, live)
-        live = _filter_query_table(live, pushdown_filters)
-        live = _select_query_columns(live, read_columns)
+        live = None
+        if _snapshot_has_active_descriptor(snapshot):
+            live = self._scan_live_snapshot(snapshot).read_all()
+            _record_live_scan(metrics, live)
+            live = _filter_query_table(live, pushdown_filters)
+            live = _select_query_columns(live, read_columns)
         table = _concat_query_tables(
             [persisted, live],
             _schema_for_query_columns(schema, read_columns),
@@ -4136,17 +4145,22 @@ class Table:
     def _collect_tail_pushdown(self, n: int, metrics: dict[str, object] | None = None):
         for attempt in range(2):
             snapshot = self.snapshot()
-            try:
-                live = self._tail_live_snapshot(snapshot, n)
-            except RuntimeError as error:
-                if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
-                    continue
-                raise
+            live = None
+            if _snapshot_has_active_descriptor(snapshot):
+                try:
+                    live = self._tail_live_snapshot(snapshot, n)
+                except RuntimeError as error:
+                    if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                        continue
+                    raise
             _record_live_scan(metrics, live)
-            if n <= 0 or live.num_rows >= n:
+            live_rows = 0 if live is None else live.num_rows
+            if n <= 0:
+                return _concat_query_tables([], self.schema())
+            if live_rows >= n:
                 return live
 
-            persisted = _tail_persisted_rows(snapshot, n - live.num_rows, metrics=metrics)
+            persisted = _tail_persisted_rows(snapshot, n - live_rows, metrics=metrics)
             table = _concat_query_tables([persisted, live], self.schema())
             if table.num_rows > n:
                 return table.slice(table.num_rows - n)
@@ -4165,12 +4179,14 @@ class Table:
                 return persisted.slice(0, n)
 
             remaining = n - (0 if persisted is None else persisted.num_rows)
-            try:
-                live = self._slice_live_snapshot(snapshot, 0, remaining, metrics=metrics)
-            except RuntimeError as error:
-                if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
-                    continue
-                raise
+            live = None
+            if _snapshot_has_active_descriptor(snapshot):
+                try:
+                    live = self._slice_live_snapshot(snapshot, 0, remaining, metrics=metrics)
+                except RuntimeError as error:
+                    if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                        continue
+                    raise
             table = _concat_query_tables([persisted, live], schema)
             if table.num_rows > n:
                 return table.slice(0, n)
@@ -4202,17 +4218,19 @@ class Table:
 
             live_offset = max(0, offset - persisted_row_count)
             live_length = None if length is None else length - collected_rows
-            try:
-                live = self._slice_live_snapshot(
-                    snapshot,
-                    live_offset,
-                    live_length,
-                    metrics=metrics,
-                )
-            except RuntimeError as error:
-                if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
-                    continue
-                raise
+            live = None
+            if _snapshot_has_active_descriptor(snapshot):
+                try:
+                    live = self._slice_live_snapshot(
+                        snapshot,
+                        live_offset,
+                        live_length,
+                        metrics=metrics,
+                    )
+                except RuntimeError as error:
+                    if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                        continue
+                    raise
             table = _concat_query_tables([persisted, live], schema)
             if length is not None and table.num_rows > length:
                 return table.slice(0, length)
@@ -4660,6 +4678,8 @@ def _record_persisted_file_scan(
 def _record_live_scan(metrics: dict[str, object] | None, table: object) -> None:
     if metrics is None:
         return
+    if table is None:
+        return
     metrics["scanned_live_rows"] = int(metrics.get("scanned_live_rows", 0)) + table.num_rows
     metrics["scanned_rows"] = int(metrics.get("scanned_rows", 0)) + table.num_rows
 
@@ -4855,6 +4875,10 @@ def _non_overlapping_persisted_files(
     ]
 
 
+def _snapshot_has_active_descriptor(snapshot: dict[str, object]) -> bool:
+    return isinstance(snapshot.get("active_segment_descriptor"), dict)
+
+
 def _persisted_segment_identities(value: dict[str, object]) -> set[tuple[int, int, int | None]]:
     source_segments = value.get("source_segments")
     if isinstance(source_segments, list):
@@ -4988,8 +5012,9 @@ def _schema_for_query_columns(schema: object | None, columns: list[str] | None):
 def _live_segment_identities(snapshot: dict[str, object]) -> set[tuple[int, int, int | None]]:
     identities: set[tuple[int, int, int | None]] = set()
     active_identity = _descriptor_segment_identity(snapshot.get("active_segment_descriptor"))
-    if active_identity is not None:
-        identities.add(active_identity)
+    if active_identity is None:
+        return identities
+    identities.add(active_identity)
 
     for descriptor in snapshot.get("sealed_segments", []):
         identity = _descriptor_segment_identity(descriptor)

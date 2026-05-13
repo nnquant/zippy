@@ -2383,6 +2383,7 @@ impl Query {
             .map_err(|error| py_value_error(error.to_string()))?;
         let descriptor = snapshot
             .get("active_segment_descriptor")
+            .filter(|value| value.is_object())
             .cloned()
             .ok_or_else(|| py_runtime_error("snapshot missing active_segment_descriptor"))?;
         let sealed_descriptors = snapshot
@@ -2436,6 +2437,22 @@ impl Query {
                 .map_err(|error| py_runtime_error(error.to_string()))?;
             ensure_stream_live_readable(&stream)?;
             let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+                if stream_has_queryable_persisted_files(&stream) {
+                    let mut snapshot = query_snapshot_value(&stream, None, None)
+                        .map_err(|error| py_runtime_error(error.to_string()))?;
+                    let snapshot_id = format!(
+                        "{}-{}",
+                        self.source,
+                        NEXT_QUERY_SNAPSHOT_ID.fetch_add(1, Ordering::SeqCst)
+                    );
+                    if let Some(object) = snapshot.as_object_mut() {
+                        object.insert(
+                            "snapshot_id".to_string(),
+                            serde_json::Value::String(snapshot_id),
+                        );
+                    }
+                    return serde_json_value_to_py(py, &snapshot);
+                }
                 return Err(py_runtime_error(format!(
                     "segment descriptor is not published source=[{}]",
                     self.source
@@ -2457,9 +2474,12 @@ impl Query {
             });
             match snapshot_state {
                 Ok((leases, active_segment_control)) => {
-                    let mut snapshot =
-                        query_snapshot_value(&stream, descriptor, active_segment_control)
-                            .map_err(|error| py_runtime_error(error.to_string()))?;
+                    let mut snapshot = query_snapshot_value(
+                        &stream,
+                        Some(descriptor),
+                        Some(active_segment_control),
+                    )
+                    .map_err(|error| py_runtime_error(error.to_string()))?;
                     let snapshot_id = format!(
                         "{}-{}",
                         self.source,
@@ -2525,10 +2545,18 @@ impl Query {
         let snapshot_text = python_json_dumps(py, snapshot)?;
         let snapshot = serde_json::from_str::<serde_json::Value>(&snapshot_text)
             .map_err(|error| py_value_error(error.to_string()))?;
-        let descriptor = snapshot
+        let Some(descriptor) = snapshot
             .get("active_segment_descriptor")
+            .filter(|value| value.is_object())
             .cloned()
-            .ok_or_else(|| py_runtime_error("snapshot missing active_segment_descriptor"))?;
+        else {
+            let batch = RecordBatch::new_empty(Arc::clone(&self.schema));
+            return record_batches_to_pyarrow_record_batch_reader(
+                py,
+                self.schema.as_ref(),
+                vec![batch],
+            );
+        };
         let sealed_descriptors = snapshot
             .get("sealed_segments")
             .and_then(serde_json::Value::as_array)
@@ -2573,21 +2601,40 @@ fn ensure_stream_live_readable(stream: &StreamInfo) -> PyResult<()> {
     Ok(())
 }
 
+fn stream_has_queryable_persisted_files(stream: &StreamInfo) -> bool {
+    stream.persisted_files.iter().any(|item| {
+        item.get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    })
+}
+
 fn query_snapshot_value(
     stream: &StreamInfo,
-    descriptor: serde_json::Value,
-    active_segment_control: serde_json::Value,
+    descriptor: Option<serde_json::Value>,
+    active_segment_control: Option<serde_json::Value>,
 ) -> zippy_core::Result<serde_json::Value> {
-    let mut active_segment_descriptor = descriptor;
+    let has_active_descriptor = descriptor.is_some();
+    let mut active_segment_descriptor = descriptor.unwrap_or(serde_json::Value::Null);
     if let Some(object) = active_segment_descriptor.as_object_mut() {
         object.remove("sealed_segments");
     }
-    let active_committed_row_high_watermark = active_segment_control
-        .get("committed_row_count")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(ZippyError::InvalidState {
-            status: "active segment control missing committed_row_count",
-        })?;
+    let active_segment_control = active_segment_control.unwrap_or(serde_json::Value::Null);
+    let active_committed_row_high_watermark = if has_active_descriptor {
+        active_segment_control
+            .get("committed_row_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(ZippyError::InvalidState {
+                status: "active segment control missing committed_row_count",
+            })?
+    } else {
+        0
+    };
+    let sealed_segments = if has_active_descriptor {
+        stream.sealed_segments.clone()
+    } else {
+        Vec::new()
+    };
 
     Ok(serde_json::json!({
         "stream_name": stream.stream_name,
@@ -2598,7 +2645,7 @@ fn query_snapshot_value(
         "active_segment_descriptor": active_segment_descriptor,
         "active_segment_control": active_segment_control,
         "active_committed_row_high_watermark": active_committed_row_high_watermark,
-        "sealed_segments": stream.sealed_segments.clone(),
+        "sealed_segments": sealed_segments,
         "persisted_files": stream.persisted_files.clone(),
         "persist_events": stream.persist_events.clone(),
         "segment_reader_leases": stream.segment_reader_leases.clone(),
@@ -8135,7 +8182,8 @@ mod tests {
             "segment_id": 3,
             "generation": 2,
         });
-        let snapshot = query_snapshot_value(&stream, descriptor, active_segment_control).unwrap();
+        let snapshot =
+            query_snapshot_value(&stream, Some(descriptor), Some(active_segment_control)).unwrap();
 
         assert_eq!(snapshot["stream_name"], "ticks");
         assert_eq!(snapshot["schema_hash"], "schema_hash");

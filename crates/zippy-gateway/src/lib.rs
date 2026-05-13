@@ -3239,6 +3239,8 @@ fn live_segment_identities(stream: &StreamInfo) -> std::collections::BTreeSet<(u
         {
             identities.insert(identity);
         }
+    } else {
+        return identities;
     }
     for descriptor in &stream.sealed_segments {
         if let Some(identity) = segment_identity_from_value(descriptor, "segment_id", "generation")
@@ -4969,6 +4971,46 @@ mod tests {
         fn assert_clone<T: Clone>() {}
 
         assert_clone::<GatewayTableWriterHandle>();
+    }
+
+    #[test]
+    fn persisted_only_stream_keeps_files_overlapping_stale_sealed_segments() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let stream = StreamInfo {
+            stream_name: "persisted_only_ticks".to_string(),
+            schema: schema_metadata(&schema),
+            schema_hash: canonical_schema_hash(&schema),
+            data_path: "segment".to_string(),
+            descriptor_generation: 0,
+            active_segment_descriptor: None,
+            active_segment_preflight: None,
+            segment_row_capacity: Some(4096),
+            sealed_segments: vec![json!({
+                "segment_id": 1,
+                "generation": 0,
+                "writer_epoch": 7
+            })],
+            persisted_files: vec![json!({
+                "file_path": "/tmp/part-000001.parquet",
+                "row_count": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "writer_epoch": 7
+            })],
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: None,
+            writer_epoch: 7,
+            reader_count: 0,
+            status: "registered".to_string(),
+        };
+
+        let files = non_overlapping_persisted_files(&stream);
+
+        assert_eq!(files.len(), 1);
     }
 
     #[tokio::test]

@@ -5664,6 +5664,30 @@ def test_table_health_reports_warning_for_stream_without_active_descriptor() -> 
     assert "active segment descriptor is not published" in health["alerts"][0]["message"]
 
 
+def test_table_health_reports_ok_for_persisted_only_stream() -> None:
+    class FakeMaster:
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            return {
+                "stream_name": table_name,
+                "status": "registered",
+                "descriptor_generation": 3,
+                "active_segment_descriptor": None,
+                "persisted_files": [
+                    {
+                        "file_path": "/tmp/part-000001.parquet",
+                        "row_count": 1,
+                    }
+                ],
+                "persist_events": [],
+            }
+
+    health = zippy.ops.table_health("persisted_only_ticks", master=FakeMaster())
+    alerts = zippy.ops.table_alerts("persisted_only_ticks", master=FakeMaster())
+
+    assert alerts == []
+    assert health["status"] == "ok"
+
+
 def test_table_health_reports_error_for_failed_active_segment_preflight() -> None:
     class FakeMaster:
         def get_stream(self, table_name: str) -> dict[str, object]:
@@ -6169,6 +6193,90 @@ def test_master_client_drop_table_removes_stream_and_persisted_files(tmp_path: P
         client.get_stream("openctp_ticks")
 
     server.stop()
+
+
+def test_read_table_collects_persisted_only_stream_without_active_descriptor(
+    tmp_path: Path,
+) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+    try:
+        server, control_endpoint = start_master_server(
+            tmp_path,
+            config={"table": {"persist": {"data_dir": str(tmp_path)}}},
+        )
+    except RuntimeError as error:
+        if "Operation not permitted" in str(error):
+            pytest.skip("unix socket bind is not permitted in this test environment")
+        raise
+
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    parquet_file = tmp_path / "tables" / "persisted_only_ticks" / "part-000001.parquet"
+    parquet_file.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "instrument_id": ["IF2606", "IH2606"],
+                "last_price": [4102.5, 2801.0],
+            },
+            schema=tick_schema,
+        ),
+        parquet_file,
+    )
+
+    try:
+        client = zippy.connect(uri=control_endpoint, app="persisted_only_reader")
+        client.register_stream("persisted_only_ticks", tick_schema, 64, 4096)
+        client.register_source("persisted_only_source", "test", "persisted_only_ticks", {})
+        client.publish_persisted_file(
+            "persisted_only_ticks",
+            {
+                "file_path": str(parquet_file),
+                "row_count": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+            },
+        )
+
+        table = zippy.read_table("persisted_only_ticks").head(1).collect()
+
+        assert table.num_rows == 1
+        assert table["instrument_id"].to_pylist() == ["IF2606"]
+    finally:
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_non_overlapping_persisted_files_ignores_stale_sealed_without_active_descriptor() -> None:
+    snapshot = {
+        "active_segment_descriptor": None,
+        "sealed_segments": [
+            {
+                "segment_id": 1,
+                "generation": 0,
+                "writer_epoch": 7,
+            }
+        ],
+        "persisted_files": [
+            {
+                "file_path": "/tmp/part-000001.parquet",
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "writer_epoch": 7,
+            }
+        ],
+    }
+
+    files = zippy._non_overlapping_persisted_files(snapshot)
+
+    assert len(files) == 1
 
 
 def test_master_client_publishes_and_gets_segment_descriptor(tmp_path: Path) -> None:
