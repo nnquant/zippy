@@ -299,6 +299,54 @@ fn active_descriptor_reopens_shared_segment_for_record_batch_export() {
 }
 
 #[test]
+fn row_span_batch_reader_reads_active_span_chunks() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+    writer.append_tick_for_test(3, "rb2510", 4128.5).unwrap();
+
+    let span = RowSpanView::from_active_descriptor(writer.active_descriptor(), 0, 3).unwrap();
+    let full = span.as_record_batch().unwrap();
+    let mut reader = span
+        .batch_reader(
+            2,
+            Some(vec![
+                "instrument_id".to_string(),
+                "last_price".to_string(),
+            ]),
+        )
+        .unwrap();
+
+    let first = reader.next_batch().unwrap().unwrap();
+    let second = reader.next_batch().unwrap().unwrap();
+    assert!(reader.next_batch().unwrap().is_none());
+
+    assert_eq!(first.num_rows(), 2);
+    assert_eq!(second.num_rows(), 1);
+
+    let full_ids = full
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let first_ids = first
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let second_prices = second
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(first_ids.value(0), full_ids.value(0));
+    assert_eq!(first_ids.value(1), full_ids.value(1));
+    assert_eq!(second_prices.value(0), 4128.5);
+}
+
+#[test]
 fn active_descriptor_envelope_roundtrips_for_cross_process_attach() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
