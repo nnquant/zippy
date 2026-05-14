@@ -313,7 +313,7 @@
 1. Gateway streaming collect 配置化 + parquet row-group pruning。
 2. Engine columnar state model。
 3. Segment Arrow zero-copy/chunked reader。
-4. Gateway per-stream writer actor + notification-driven subscribe。
+4. Gateway per-stream writer actor + writer 分段耗时 metrics。
 5. Capacity matrix + soak + RSS/p999 performance reporting。
 6. Python remote writer async pipeline + zippy-perf profile。
 
