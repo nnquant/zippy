@@ -16,7 +16,10 @@ import click
 import zippy
 
 from .cli_common import DEFAULT_CONTROL_ENDPOINT, cli_error, echo_json
-from .remote_gateway_perf import run_remote_subscribe_perf_probe
+from .remote_gateway_perf import (
+    run_remote_subscribe_perf_probe,
+    run_remote_subscribe_rows_perf_probe,
+)
 
 
 @click.group("gateway")
@@ -260,6 +263,25 @@ def run_gateway_subscribe_perf(
     )
 
 
+def run_gateway_subscribe_rows_perf(
+    *,
+    uri: str,
+    stream_name: str,
+    rows: int,
+    timeout_sec: float,
+    instrument_id: str | None,
+) -> dict[str, object]:
+    """Run a client-only remote ``subscribe`` row delivery probe."""
+    return run_remote_subscribe_rows_perf_probe(
+        uri=uri,
+        stream=stream_name,
+        rows=rows,
+        timeout_sec=timeout_sec,
+        instrument_id=instrument_id,
+        app="gateway_subscribe_rows_perf",
+    )
+
+
 @gateway_group.command("run")
 @click.option(
     "--uri",
@@ -456,5 +478,48 @@ def subscribe_perf_gateway(
             f"stream_name=[{result['stream']}] "
             f"received_rows=[{result['received_rows']}] "
             f"received_tables=[{result['received_tables']}] "
+            f"metrics_match=[{result['gateway_delivery_matches_received']}]"
+        )
+
+
+@gateway_group.command("subscribe-rows-perf")
+@click.option(
+    "--uri",
+    required=True,
+    help="existing remote master URI, for example zippy://wsl-host:17690/default",
+)
+@click.option("--stream", "stream_name", default="qmt_ticks", show_default=True)
+@click.option("--rows", type=int, default=100, show_default=True)
+@click.option("--timeout-sec", type=float, default=10.0, show_default=True)
+@click.option("--instrument-id", default=None, help="optional instrument_id filter")
+@click.option("--json", "as_json", is_flag=True, default=False, help="emit JSON output")
+def subscribe_rows_perf_gateway(
+    uri: str,
+    stream_name: str,
+    rows: int,
+    timeout_sec: float,
+    instrument_id: str | None,
+    as_json: bool,
+) -> None:
+    """
+    Run a client-only remote subscribe row delivery probe.
+    """
+    try:
+        result = run_gateway_subscribe_rows_perf(
+            uri=uri,
+            stream_name=stream_name,
+            rows=rows,
+            timeout_sec=timeout_sec,
+            instrument_id=instrument_id,
+        )
+    except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+        cli_error(str(error))
+    if as_json:
+        echo_json(result)
+    else:
+        click.echo(
+            "gateway subscribe-rows-perf ok "
+            f"stream_name=[{result['stream']}] "
+            f"received_rows=[{result['received_rows']}] "
             f"metrics_match=[{result['gateway_delivery_matches_received']}]"
         )

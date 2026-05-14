@@ -130,6 +130,62 @@ def build_subscribe_perf_report(
     }
 
 
+def build_subscribe_rows_perf_report(
+    *,
+    uri: str,
+    stream: str,
+    expected_rows: int,
+    timeout_sec: float,
+    received_rows: list[dict[str, Any]],
+    first_row_wait_ms: float | None,
+    elapsed_ms: float,
+    gateway_metrics_before: dict[str, object],
+    gateway_metrics_after: dict[str, object],
+) -> dict[str, object]:
+    """
+    Build the JSON-serializable remote row subscribe performance report.
+
+    :param uri: Master URI used by the probe.
+    :type uri: str
+    :param stream: Subscribed stream name.
+    :type stream: str
+    :param expected_rows: Rows requested before the probe stops.
+    :type expected_rows: int
+    :param timeout_sec: Probe timeout in seconds.
+    :type timeout_sec: float
+    :param received_rows: Row dictionaries received by the callback.
+    :type received_rows: list[dict[str, typing.Any]]
+    :param first_row_wait_ms: Milliseconds until the first row callback, or ``None``.
+    :type first_row_wait_ms: float | None
+    :param elapsed_ms: Total elapsed milliseconds.
+    :type elapsed_ms: float
+    :param gateway_metrics_before: Gateway metrics before subscribing.
+    :type gateway_metrics_before: dict[str, object]
+    :param gateway_metrics_after: Gateway metrics after subscribing.
+    :type gateway_metrics_after: dict[str, object]
+    :returns: Probe report.
+    :rtype: dict[str, object]
+    """
+    delivery_delta = gateway_delivery_delta(gateway_metrics_before, gateway_metrics_after)
+    return {
+        "mode": "rows",
+        "uri": uri,
+        "stream": stream,
+        "expected_rows": expected_rows,
+        "timeout_sec": timeout_sec,
+        "received_rows": len(received_rows),
+        "sample_rows": [dict(row) for row in received_rows[:5]],
+        "first_row_wait_ms": first_row_wait_ms,
+        "elapsed_ms": elapsed_ms,
+        "gateway_delivery_delta": delivery_delta,
+        "gateway_delivery_matches_received": (
+            delivery_delta["subscribe_rows_delivered_total"] == len(received_rows)
+        ),
+        "gateway_metrics_before": dict(gateway_metrics_before),
+        "gateway_metrics_after": dict(gateway_metrics_after),
+    }
+
+
 def remote_gateway_client_from_master(master: object) -> zp.RemoteMasterClient:
     """
     Build a remote gateway facade from a master connection.
@@ -259,6 +315,107 @@ def run_remote_subscribe_perf_probe(
             timeout_sec=timeout_sec,
             received_tables=tables,
             first_batch_wait_ms=first_wait,
+            elapsed_ms=elapsed_ms,
+            gateway_metrics_before=metrics_before,
+            gateway_metrics_after=metrics_after,
+        )
+    finally:
+        subscriber.stop()
+
+
+def run_remote_subscribe_rows_perf_probe(
+    *,
+    uri: str,
+    stream: str,
+    rows: int,
+    timeout_sec: float,
+    instrument_id: str | None,
+    app: str,
+) -> dict[str, object]:
+    """
+    Run a client-only remote ``subscribe`` row delivery probe.
+
+    :param uri: Existing remote master URI, usually ``zippy://host:port/default``.
+    :type uri: str
+    :param stream: Stream to subscribe.
+    :type stream: str
+    :param rows: Stop after receiving at least this many rows.
+    :type rows: int
+    :param timeout_sec: Timeout in seconds.
+    :type timeout_sec: float
+    :param instrument_id: Optional instrument filter.
+    :type instrument_id: str | None
+    :param app: Process app name used for ``zp.connect``.
+    :type app: str
+    :returns: Probe report.
+    :rtype: dict[str, object]
+    :raises ValueError: If numeric arguments are invalid.
+    :raises TimeoutError: If expected rows are not received before timeout.
+    """
+    if rows <= 0:
+        raise ValueError("rows must be greater than zero")
+    if timeout_sec <= 0.0:
+        raise ValueError("timeout_sec must be greater than zero")
+
+    master = zp.connect(uri=uri, app=app, local=False)
+    gateway_client = remote_gateway_client_from_master(master)
+    metrics_before = gateway_client.gateway_metrics()
+
+    done = threading.Event()
+    lock = threading.Lock()
+    received_rows: list[dict[str, Any]] = []
+    first_row_wait_ms: float | None = None
+    started_ns = time.perf_counter_ns()
+
+    def on_row(row: object) -> None:
+        """
+        Record one remote GatewayServer row callback.
+
+        :param row: Incremental row callback payload.
+        :type row: object
+        :returns: None
+        :rtype: None
+        """
+        nonlocal first_row_wait_ms
+        now_ns = time.perf_counter_ns()
+        to_dict = getattr(row, "to_dict", None)
+        values = to_dict() if callable(to_dict) else dict(row)  # type: ignore[arg-type]
+        with lock:
+            if first_row_wait_ms is None:
+                first_row_wait_ms = (now_ns - started_ns) / 1_000_000.0
+            received_rows.append(dict(values))
+            if len(received_rows) >= rows:
+                done.set()
+
+    subscriber = zp.subscribe(
+        stream,
+        callback=on_row,
+        instrument_ids=instrument_id,
+        wait=True,
+        timeout=timeout_sec,
+    )
+    try:
+        if not done.wait(timeout_sec):
+            with lock:
+                received_count = len(received_rows)
+            raise TimeoutError(
+                "remote subscribe rows perf probe timed out "
+                f"stream=[{stream}] received_rows=[{received_count}] "
+                f"expected_rows=[{rows}] timeout_sec=[{timeout_sec}]"
+            )
+
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        metrics_after = gateway_client.gateway_metrics()
+        with lock:
+            rows_snapshot = [dict(row) for row in received_rows]
+            first_wait = first_row_wait_ms
+        return build_subscribe_rows_perf_report(
+            uri=uri,
+            stream=stream,
+            expected_rows=rows,
+            timeout_sec=timeout_sec,
+            received_rows=rows_snapshot,
+            first_row_wait_ms=first_wait,
             elapsed_ms=elapsed_ms,
             gateway_metrics_before=metrics_before,
             gateway_metrics_after=metrics_after,

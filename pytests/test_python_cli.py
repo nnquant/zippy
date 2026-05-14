@@ -417,6 +417,67 @@ def test_gateway_subscribe_perf_uses_existing_remote_uri(
     assert "metrics_match=[True]" in result.output
 
 
+def test_gateway_subscribe_rows_perf_uses_existing_remote_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    def fake_subscribe_rows_perf(
+        *,
+        uri: str,
+        stream_name: str,
+        rows: int,
+        timeout_sec: float,
+        instrument_id: str | None,
+    ) -> dict[str, object]:
+        events.append(
+            (
+                "subscribe_rows_perf",
+                (uri, stream_name, rows, timeout_sec, instrument_id),
+            )
+        )
+        return {
+            "stream": stream_name,
+            "received_rows": rows,
+            "gateway_delivery_matches_received": True,
+        }
+
+    monkeypatch.setattr(
+        "zippy.cli_gateway.run_gateway_subscribe_rows_perf",
+        fake_subscribe_rows_perf,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "subscribe-rows-perf",
+            "--uri",
+            "zippy://wsl-host:17690/default",
+            "--stream",
+            "qmt_ticks",
+            "--rows",
+            "50",
+            "--timeout-sec",
+            "2.5",
+            "--instrument-id",
+            "IF2606",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        (
+            "subscribe_rows_perf",
+            ("zippy://wsl-host:17690/default", "qmt_ticks", 50, 2.5, "IF2606"),
+        )
+    ]
+    assert "gateway subscribe-rows-perf ok stream_name=[qmt_ticks]" in result.output
+    assert "received_rows=[50]" in result.output
+    assert "metrics_match=[True]" in result.output
+
+
 def test_master_run_returns_click_error_when_server_start_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

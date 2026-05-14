@@ -468,6 +468,9 @@ Windows 原生 master + Windows 原生 segment backend
   `05_remote_subscribe_perf_probe.py` 可在远端客户端侧对账订阅交付 metrics；
 - subscribe perf CLI：已提供 `zippy gateway subscribe-perf --uri zippy://host:port/default`，
   用于从远端客户端侧直接运行 `subscribe_table` 交付探针；
+- subscribe rows perf CLI：已提供 `zippy gateway subscribe-rows-perf --uri ...` 和
+  `examples/08_remote_gateway/06_remote_subscribe_rows_perf_probe.py`，用于低频 row callback
+  场景的远端交付探针；
 - Windows QMT mock writer + WSL subscriber/query 验收：执行步骤见
   [remote_gateway_windows_smoke_runbook.md](remote_gateway_windows_smoke_runbook.md)。
 

@@ -6183,6 +6183,40 @@ def test_remote_gateway_perf_package_helper_summarizes_delivery_metrics() -> Non
     assert report["gateway_delivery_matches_received"] is True
 
 
+def test_remote_gateway_perf_package_helper_summarizes_row_delivery_metrics() -> None:
+    import zippy.remote_gateway_perf as remote_gateway_perf
+
+    rows = [
+        {"instrument_id": "IF2606", "seq": 1},
+        {"instrument_id": "IF2607", "seq": 2},
+    ]
+    report = remote_gateway_perf.build_subscribe_rows_perf_report(
+        uri="zippy://127.0.0.1:17690/default",
+        stream="qmt_ticks",
+        expected_rows=2,
+        timeout_sec=5.0,
+        received_rows=rows,
+        first_row_wait_ms=0.4,
+        elapsed_ms=1.2,
+        gateway_metrics_before={
+            "subscribe_rows_delivered_total": 30,
+            "subscribe_tables_delivered_total": 4,
+            "subscribe_table_rows_delivered_total": 100,
+        },
+        gateway_metrics_after={
+            "subscribe_rows_delivered_total": 32,
+            "subscribe_tables_delivered_total": 4,
+            "subscribe_table_rows_delivered_total": 100,
+        },
+    )
+
+    assert report["mode"] == "rows"
+    assert report["received_rows"] == 2
+    assert report["sample_rows"] == rows
+    assert report["gateway_delivery_delta"]["subscribe_rows_delivered_total"] == 2
+    assert report["gateway_delivery_matches_received"] is True
+
+
 def test_remote_gateway_examples_use_unique_number_prefixes() -> None:
     example_dir = WORKSPACE_ROOT / "examples" / "08_remote_gateway"
     prefixes: dict[str, str] = {}
