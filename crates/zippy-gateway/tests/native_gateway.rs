@@ -33,6 +33,7 @@ fn native_gateway_accepts_arrow_write_batch_and_publishes_descriptor() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -114,6 +115,7 @@ fn native_gateway_binds_writer_epoch_to_master_source_epoch() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -171,6 +173,7 @@ fn native_gateway_rejects_bad_token_before_reading_payload() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -211,6 +214,7 @@ fn native_gateway_rejects_oversized_payload_length_before_allocation() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -259,6 +263,7 @@ fn native_gateway_runtime_starts_and_stops_cleanly() {
             max_connections: None,
             max_subscribers: None,
             max_blocking_requests: None,
+            write_timeout_ms: None,
         })
         .unwrap()
         .start()
@@ -291,6 +296,7 @@ fn native_gateway_idle_connection_does_not_block_metrics_request() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -340,6 +346,7 @@ fn native_gateway_rejects_invalid_resource_limits() {
         max_connections: Some(0),
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     });
     assert!(invalid_connection_limit
         .err()
@@ -355,6 +362,7 @@ fn native_gateway_rejects_invalid_resource_limits() {
         max_connections: None,
         max_subscribers: Some(0),
         max_blocking_requests: None,
+        write_timeout_ms: None,
     });
     assert!(invalid_subscriber_limit
         .err()
@@ -364,18 +372,35 @@ fn native_gateway_rejects_invalid_resource_limits() {
 
     let invalid_blocking_limit = GatewayServer::new(GatewayServerConfig {
         endpoint: gateway_endpoint,
-        master_endpoint,
+        master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: Some(0),
+        write_timeout_ms: None,
     });
     assert!(invalid_blocking_limit
         .err()
         .unwrap()
         .to_string()
         .contains("max_blocking_requests must be positive"));
+
+    let invalid_write_timeout = GatewayServer::new(GatewayServerConfig {
+        endpoint: format!("127.0.0.1:{}", reserve_tcp_port()),
+        master_endpoint,
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+        write_timeout_ms: Some(0),
+    });
+    assert!(invalid_write_timeout
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("write_timeout_ms must be positive"));
 }
 
 #[test]
@@ -391,6 +416,7 @@ fn native_gateway_reports_configured_resource_limits() {
         max_connections: Some(3),
         max_subscribers: Some(2),
         max_blocking_requests: Some(1),
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -419,6 +445,7 @@ fn native_gateway_rejects_blocking_requests_over_configured_limit() {
         max_connections: Some(4),
         max_subscribers: Some(1),
         max_blocking_requests: Some(1),
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -524,6 +551,7 @@ fn native_gateway_rejects_connections_over_configured_limit() {
         max_connections: Some(1),
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -573,6 +601,7 @@ fn native_gateway_rejects_subscribers_over_configured_limit() {
         max_connections: Some(4),
         max_subscribers: Some(1),
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -635,6 +664,7 @@ fn native_gateway_reports_async_master_control_requests() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -695,6 +725,7 @@ fn native_gateway_collects_existing_segment_stream() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -799,6 +830,7 @@ fn native_gateway_collect_uses_pinned_snapshot_high_watermark() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -913,6 +945,7 @@ fn native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment()
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1012,6 +1045,7 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1162,6 +1196,7 @@ fn native_gateway_collect_stream_applies_filter_then_final_select_for_persisted_
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1273,6 +1308,7 @@ fn native_gateway_collect_stream_keeps_mixed_persisted_and_live_on_materialized_
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1387,6 +1423,7 @@ fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1497,6 +1534,7 @@ fn native_gateway_pushes_tail_collect_into_segment_reader() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1584,6 +1622,7 @@ fn native_gateway_pushes_head_collect_into_segment_reader() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1684,6 +1723,7 @@ fn native_gateway_pushes_slice_collect_into_segment_reader() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1770,6 +1810,7 @@ fn native_gateway_collect_stream_returns_start_chunks_and_end_frames() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1853,6 +1894,7 @@ fn native_gateway_collect_stream_reports_streaming_metrics() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -1914,6 +1956,7 @@ fn native_gateway_collect_stream_live_segment_applies_projection_and_filter_by_c
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2020,6 +2063,7 @@ fn native_gateway_collect_stream_rejects_residual_plan_before_start() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2088,6 +2132,7 @@ fn native_gateway_collect_stream_rejects_row_range_then_filter_before_start() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2139,6 +2184,7 @@ fn native_gateway_subscribe_rows_returns_row_frames_without_table_payload() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2208,6 +2254,7 @@ fn native_gateway_subscribe_rows_rejects_table_controls() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2249,6 +2296,7 @@ fn native_gateway_subscribe_table_rejects_non_positive_controls() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2290,6 +2338,7 @@ fn native_gateway_subscribe_table_rejects_instrument_ids() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2331,6 +2380,7 @@ fn native_gateway_subscribe_table_uses_active_segment_notifications() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2436,6 +2486,7 @@ fn native_gateway_subscribe_table_batches_rows_across_flushes() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2549,6 +2600,7 @@ fn native_gateway_subscribe_table_throttle_flushes_pending_rows() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2641,6 +2693,7 @@ fn native_gateway_subscribe_table_filters_before_batching_and_applies_count_on_f
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2776,6 +2829,7 @@ fn native_gateway_subscribe_rows_follows_active_segment_rollover() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -2885,6 +2939,7 @@ fn native_gateway_subscribe_table_follows_active_segment_rollover() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3004,6 +3059,7 @@ fn native_gateway_subscribe_rows_follows_writer_restart_descriptor() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3110,6 +3166,7 @@ fn native_gateway_subscribe_disconnect_releases_metrics_and_reader_lease() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3200,6 +3257,7 @@ fn native_gateway_stop_releases_active_subscribe_reader_lease() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3291,6 +3349,7 @@ fn native_gateway_slow_subscribe_client_does_not_block_writes_or_metrics() {
         max_connections: Some(8),
         max_subscribers: Some(4),
         max_blocking_requests: Some(4),
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3388,6 +3447,132 @@ fn native_gateway_slow_subscribe_client_does_not_block_writes_or_metrics() {
 }
 
 #[test]
+fn native_gateway_slow_subscribe_client_times_out_and_reports_reason() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(2048),
+        max_connections: Some(8),
+        max_subscribers: Some(4),
+        max_blocking_requests: Some(4),
+        write_timeout_ms: Some(10),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let initial_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(StringArray::from(vec!["seed"])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "slow_timeout_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&initial_batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let mut slow_subscriber = TcpStream::connect(gateway.endpoint()).unwrap();
+    slow_subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut slow_subscriber,
+        json!({
+            "kind": "subscribe_table",
+            "source": "slow_timeout_ticks",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    let subscribed = read_gateway_stream_frame(&mut slow_subscriber);
+    assert_eq!(subscribed.0["status"], "ok");
+    assert_eq!(subscribed.0["kind"], "subscribed");
+
+    let payload = "x".repeat(512);
+    for batch_index in 0..128 {
+        let rows = 256;
+        let instruments = (0..rows)
+            .map(|row| format!("IF{:04}", 2600 + row))
+            .collect::<Vec<_>>();
+        let payloads = vec![payload.clone(); rows];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(StringArray::from(instruments)),
+                std::sync::Arc::new(StringArray::from(payloads)),
+            ],
+        )
+        .unwrap();
+        let response = send_gateway_frame_with_read_timeout(
+            gateway.endpoint(),
+            json!({
+                "kind": "write_batch",
+                "stream_name": "slow_timeout_ticks",
+                "token": "dev-token",
+                "rows": rows,
+                "batch_index": batch_index
+            }),
+            encode_ipc_batch(&batch),
+            Duration::from_secs(2),
+        );
+        assert_eq!(response["status"], "ok", "response={}", response);
+
+        let metrics = gateway.metrics();
+        if metrics["subscribe_write_timeouts_total"] == json!(1) {
+            break;
+        }
+    }
+
+    for _ in 0..100 {
+        let metrics = gateway.metrics();
+        if metrics["subscribe_clients_active"] == json!(0)
+            && metrics["subscribe_write_timeouts_total"] == json!(1)
+            && metrics["subscribe_slow_clients_total"] == json!(1)
+        {
+            assert_eq!(
+                metrics["subscribe_last_close_reason"],
+                json!("gateway frame write timed out timeout_ms=[10]")
+            );
+            assert!(
+                metrics["subscribe_last_write_elapsed_ms"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    >= 0.0
+            );
+            drop(slow_subscriber);
+            gateway.stop();
+            master.shutdown();
+            master_thread.join().unwrap().unwrap();
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "slow subscriber timeout metrics did not converge metrics=[{}]",
+        gateway.metrics()
+    );
+}
+
+#[test]
 fn native_gateway_subscribe_perf_smoke_reports_delivery_metrics() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -3400,6 +3585,7 @@ fn native_gateway_subscribe_perf_smoke_reports_delivery_metrics() {
         max_connections: Some(8),
         max_subscribers: Some(4),
         max_blocking_requests: Some(4),
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3562,6 +3748,7 @@ fn native_gateway_applies_lazy_shape_collect_plan() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3685,6 +3872,7 @@ fn native_gateway_reregisters_master_process_after_lease_expiry() {
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()
@@ -3817,6 +4005,7 @@ fn assert_streaming_row_range_matches_default(label: &str, row_range_op: serde_j
         max_connections: None,
         max_subscribers: None,
         max_blocking_requests: None,
+        write_timeout_ms: None,
     })
     .unwrap()
     .start()

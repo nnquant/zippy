@@ -10440,16 +10440,19 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
         max_connections=11,
         max_subscribers=12,
         max_blocking_requests=13,
+        write_timeout_ms=14,
     )
 
     assert gateway.max_write_rows == 10
     assert gateway.max_connections == 11
     assert gateway.max_subscribers == 12
     assert gateway.max_blocking_requests == 13
+    assert gateway.write_timeout_ms == 14
     assert captured["max_write_rows"] == 10
     assert captured["max_connections"] == 11
     assert captured["max_subscribers"] == 12
     assert captured["max_blocking_requests"] == 13
+    assert captured["write_timeout_ms"] == 14
 
 
 @pytest.mark.parametrize(
@@ -10458,6 +10461,7 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
         ("max_connections", 0),
         ("max_subscribers", 0),
         ("max_blocking_requests", 0),
+        ("write_timeout_ms", 0),
     ],
 )
 def test_gateway_server_rejects_non_positive_resource_limits(name: str, value: int) -> None:

@@ -70,6 +70,7 @@ pub struct GatewayServerConfig {
     pub max_connections: Option<usize>,
     pub max_subscribers: Option<usize>,
     pub max_blocking_requests: Option<usize>,
+    pub write_timeout_ms: Option<u64>,
 }
 
 /// Native TCP gateway for cross-platform remote writes and queries.
@@ -95,6 +96,7 @@ struct GatewayState {
     max_connections: usize,
     max_subscribers: usize,
     max_blocking_requests: usize,
+    write_timeout: Duration,
 }
 
 struct GatewayRuntime {
@@ -764,6 +766,11 @@ struct GatewayMetrics {
     subscribe_rows_delivered_total: u64,
     subscribe_tables_delivered_total: u64,
     subscribe_table_rows_delivered_total: u64,
+    subscribe_write_timeouts_total: u64,
+    subscribe_slow_clients_total: u64,
+    subscribe_last_close_reason: Option<String>,
+    subscribe_last_write_elapsed_ms: f64,
+    subscribe_write_elapsed_ms_total: f64,
     master_async_requests_total: u64,
     master_process_reregistrations_total: u64,
     connections_active: u64,
@@ -806,6 +813,11 @@ impl GatewayServer {
             config.max_blocking_requests,
             DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS,
         )?;
+        let write_timeout = positive_gateway_duration_ms(
+            "write_timeout_ms",
+            config.write_timeout_ms,
+            DEFAULT_GATEWAY_WRITE_TIMEOUT,
+        )?;
         let metrics = Arc::new(Mutex::new(GatewayMetrics::default()));
         let master = Arc::new(GatewayAsyncMasterClient::new(
             config.master_endpoint.clone(),
@@ -829,6 +841,7 @@ impl GatewayServer {
                 max_connections,
                 max_subscribers,
                 max_blocking_requests,
+                write_timeout,
             }),
             runtime: None,
         })
@@ -910,6 +923,11 @@ impl GatewayServer {
             "subscribe_rows_delivered_total": metrics.subscribe_rows_delivered_total,
             "subscribe_tables_delivered_total": metrics.subscribe_tables_delivered_total,
             "subscribe_table_rows_delivered_total": metrics.subscribe_table_rows_delivered_total,
+            "subscribe_write_timeouts_total": metrics.subscribe_write_timeouts_total,
+            "subscribe_slow_clients_total": metrics.subscribe_slow_clients_total,
+            "subscribe_last_close_reason": metrics.subscribe_last_close_reason.clone(),
+            "subscribe_last_write_elapsed_ms": metrics.subscribe_last_write_elapsed_ms,
+            "subscribe_write_elapsed_ms_total": metrics.subscribe_write_elapsed_ms_total,
             "master_async_requests_total": metrics.master_async_requests_total,
             "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
             "connections_active": metrics.connections_active,
@@ -921,6 +939,7 @@ impl GatewayServer {
             "subscribe_clients_active": metrics.subscribe_clients_active,
             "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
             "max_subscribers": self.state.max_subscribers,
+            "write_timeout_ms": self.state.write_timeout.as_millis() as u64,
             "request_timeouts_total": metrics.request_timeouts_total,
             "payload_timeouts_total": metrics.payload_timeouts_total,
         })
@@ -958,6 +977,22 @@ fn positive_gateway_limit(name: &str, configured: Option<usize>, default: usize)
         });
     }
     Ok(value)
+}
+
+fn positive_gateway_duration_ms(
+    name: &str,
+    configured: Option<u64>,
+    default: Duration,
+) -> Result<Duration> {
+    let Some(value) = configured else {
+        return Ok(default);
+    };
+    if value == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!("{} must be positive", name),
+        });
+    }
+    Ok(Duration::from_millis(value))
 }
 
 impl StreamTableDescriptorPublisher for MasterDescriptorPublisher {
@@ -1861,6 +1896,11 @@ impl GatewayState {
             "subscribe_rows_delivered_total": metrics.subscribe_rows_delivered_total,
             "subscribe_tables_delivered_total": metrics.subscribe_tables_delivered_total,
             "subscribe_table_rows_delivered_total": metrics.subscribe_table_rows_delivered_total,
+            "subscribe_write_timeouts_total": metrics.subscribe_write_timeouts_total,
+            "subscribe_slow_clients_total": metrics.subscribe_slow_clients_total,
+            "subscribe_last_close_reason": metrics.subscribe_last_close_reason.clone(),
+            "subscribe_last_write_elapsed_ms": metrics.subscribe_last_write_elapsed_ms,
+            "subscribe_write_elapsed_ms_total": metrics.subscribe_write_elapsed_ms_total,
             "master_async_requests_total": metrics.master_async_requests_total,
             "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
             "connections_active": metrics.connections_active,
@@ -1869,6 +1909,7 @@ impl GatewayState {
             "blocking_requests_rejected_total": metrics.blocking_requests_rejected_total,
             "subscribe_clients_active": metrics.subscribe_clients_active,
             "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
+            "write_timeout_ms": self.write_timeout.as_millis() as u64,
             "request_timeouts_total": metrics.request_timeouts_total,
             "payload_timeouts_total": metrics.payload_timeouts_total,
         })
@@ -2791,12 +2832,19 @@ async fn handle_subscribe_stream_async(
                     continue;
                 }
                 GatewaySubscribeEvent::Row(row) => {
-                    write_frame_async(
+                    let write_started = Instant::now();
+                    let write_result = write_frame_async_with_timeout(
                         stream,
                         &json!({"status": "ok", "kind": "row", "row": row}),
                         &[],
+                        state.write_timeout,
                     )
-                    .await?;
+                    .await;
+                    record_subscribe_write_elapsed(&state, write_started.elapsed());
+                    if let Err(error) = write_result {
+                        record_subscribe_write_error(&state, &error);
+                        return Err(error);
+                    }
                     state.increment_metric(|metrics| metrics.subscribe_rows_delivered_total += 1);
                 }
                 GatewaySubscribeEvent::Table(next_batch) => {
@@ -2805,8 +2853,19 @@ async fn handle_subscribe_stream_async(
                         encode_ipc_table(&next_batch)
                     })
                     .await?;
-                    write_frame_async(stream, &json!({"status": "ok", "kind": "table"}), &payload)
-                        .await?;
+                    let write_started = Instant::now();
+                    let write_result = write_frame_async_with_timeout(
+                        stream,
+                        &json!({"status": "ok", "kind": "table"}),
+                        &payload,
+                        state.write_timeout,
+                    )
+                    .await;
+                    record_subscribe_write_elapsed(&state, write_started.elapsed());
+                    if let Err(error) = write_result {
+                        record_subscribe_write_error(&state, &error);
+                        return Err(error);
+                    }
                     state.increment_metric(|metrics| {
                         metrics.subscribe_tables_delivered_total += 1;
                         metrics.subscribe_table_rows_delivered_total += delivered_rows;
@@ -2822,6 +2881,28 @@ async fn handle_subscribe_stream_async(
         metrics.subscribe_clients_active = metrics.subscribe_clients_active.saturating_sub(1);
     });
     result
+}
+
+fn record_subscribe_write_elapsed(state: &GatewayState, elapsed: Duration) {
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+    state.increment_metric(|metrics| {
+        metrics.subscribe_last_write_elapsed_ms = elapsed_ms;
+        metrics.subscribe_write_elapsed_ms_total += elapsed_ms;
+    });
+}
+
+fn record_subscribe_write_error(state: &GatewayState, error: &ZippyError) {
+    let reason = match error {
+        ZippyError::Io { reason } => reason.clone(),
+        _ => error.to_string(),
+    };
+    state.increment_metric(|metrics| {
+        metrics.subscribe_last_close_reason = Some(reason.clone());
+        if reason.contains("gateway frame write timed out") {
+            metrics.subscribe_write_timeouts_total += 1;
+            metrics.subscribe_slow_clients_total += 1;
+        }
+    });
 }
 
 fn subscribe_peer_closed(stream: &tokio::net::TcpStream) -> Result<bool> {
@@ -2930,46 +3011,49 @@ async fn write_frame_async(
     header: &Value,
     payload: &[u8],
 ) -> Result<()> {
+    write_frame_async_with_timeout(stream, header, payload, DEFAULT_GATEWAY_WRITE_TIMEOUT).await
+}
+
+async fn write_frame_async_with_timeout(
+    stream: &mut tokio::net::TcpStream,
+    header: &Value,
+    payload: &[u8],
+    timeout: Duration,
+) -> Result<()> {
     let header = serde_json::to_vec(header).map_err(|error| ZippyError::Io {
         reason: format!("failed to encode gateway header error=[{}]", error),
     })?;
+    let timeout_reason = format!(
+        "gateway frame write timed out timeout_ms=[{}]",
+        timeout.as_millis()
+    );
     timeout_io(
-        DEFAULT_GATEWAY_WRITE_TIMEOUT,
-        "gateway frame write timed out timeout_ms=[30000]",
+        timeout,
+        timeout_reason.clone(),
         stream.write_all(&(header.len() as u32).to_be_bytes()),
     )
     .await?;
     timeout_io(
-        DEFAULT_GATEWAY_WRITE_TIMEOUT,
-        "gateway frame write timed out timeout_ms=[30000]",
+        timeout,
+        timeout_reason.clone(),
         stream.write_all(&(payload.len() as u64).to_be_bytes()),
     )
     .await?;
-    timeout_io(
-        DEFAULT_GATEWAY_WRITE_TIMEOUT,
-        "gateway frame write timed out timeout_ms=[30000]",
-        stream.write_all(&header),
-    )
-    .await?;
-    timeout_io(
-        DEFAULT_GATEWAY_WRITE_TIMEOUT,
-        "gateway frame write timed out timeout_ms=[30000]",
-        stream.write_all(payload),
-    )
-    .await?;
+    timeout_io(timeout, timeout_reason.clone(), stream.write_all(&header)).await?;
+    timeout_io(timeout, timeout_reason, stream.write_all(payload)).await?;
     Ok(())
 }
 
 async fn timeout_io<T>(
     timeout: Duration,
-    timeout_reason: &'static str,
+    timeout_reason: impl Into<String>,
     future: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> Result<T> {
     match tokio::time::timeout(timeout, future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(io_error(error)),
         Err(_) => Err(ZippyError::Io {
-            reason: timeout_reason.to_string(),
+            reason: timeout_reason.into(),
         }),
     }
 }
