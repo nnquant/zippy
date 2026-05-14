@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::Cursor;
+use std::io::{Cursor, ErrorKind};
 use std::net::{TcpListener as StdTcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -67,6 +67,9 @@ pub struct GatewayServerConfig {
     pub master_endpoint: ControlEndpoint,
     pub token: Option<String>,
     pub max_write_rows: Option<usize>,
+    pub max_connections: Option<usize>,
+    pub max_subscribers: Option<usize>,
+    pub max_blocking_requests: Option<usize>,
 }
 
 /// Native TCP gateway for cross-platform remote writes and queries.
@@ -89,6 +92,9 @@ struct GatewayState {
     connection_limit: Arc<tokio::sync::Semaphore>,
     blocking_limit: Arc<tokio::sync::Semaphore>,
     subscriber_limit: Arc<tokio::sync::Semaphore>,
+    max_connections: usize,
+    max_subscribers: usize,
+    max_blocking_requests: usize,
 }
 
 struct GatewayRuntime {
@@ -782,6 +788,21 @@ impl GatewayServer {
                 });
             }
         }
+        let max_connections = positive_gateway_limit(
+            "max_connections",
+            config.max_connections,
+            DEFAULT_MAX_GATEWAY_CONNECTIONS,
+        )?;
+        let max_subscribers = positive_gateway_limit(
+            "max_subscribers",
+            config.max_subscribers,
+            DEFAULT_MAX_GATEWAY_SUBSCRIBERS,
+        )?;
+        let max_blocking_requests = positive_gateway_limit(
+            "max_blocking_requests",
+            config.max_blocking_requests,
+            DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS,
+        )?;
         let metrics = Arc::new(Mutex::new(GatewayMetrics::default()));
         let master = Arc::new(GatewayAsyncMasterClient::new(
             config.master_endpoint.clone(),
@@ -799,15 +820,12 @@ impl GatewayServer {
                 snapshot_counter: AtomicU64::new(0),
                 metrics,
                 stopped: AtomicBool::new(false),
-                connection_limit: Arc::new(tokio::sync::Semaphore::new(
-                    DEFAULT_MAX_GATEWAY_CONNECTIONS,
-                )),
-                blocking_limit: Arc::new(tokio::sync::Semaphore::new(
-                    DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS,
-                )),
-                subscriber_limit: Arc::new(tokio::sync::Semaphore::new(
-                    DEFAULT_MAX_GATEWAY_SUBSCRIBERS,
-                )),
+                connection_limit: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+                blocking_limit: Arc::new(tokio::sync::Semaphore::new(max_blocking_requests)),
+                subscriber_limit: Arc::new(tokio::sync::Semaphore::new(max_subscribers)),
+                max_connections,
+                max_subscribers,
+                max_blocking_requests,
             }),
             runtime: None,
         })
@@ -890,10 +908,13 @@ impl GatewayServer {
             "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
             "connections_active": metrics.connections_active,
             "connections_rejected_total": metrics.connections_rejected_total,
+            "max_connections": self.state.max_connections,
             "blocking_requests_active": metrics.blocking_requests_active,
             "blocking_requests_rejected_total": metrics.blocking_requests_rejected_total,
+            "max_blocking_requests": self.state.max_blocking_requests,
             "subscribe_clients_active": metrics.subscribe_clients_active,
             "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
+            "max_subscribers": self.state.max_subscribers,
             "request_timeouts_total": metrics.request_timeouts_total,
             "payload_timeouts_total": metrics.payload_timeouts_total,
         })
@@ -921,6 +942,16 @@ impl Drop for GatewayServer {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn positive_gateway_limit(name: &str, configured: Option<usize>, default: usize) -> Result<usize> {
+    let value = configured.unwrap_or(default);
+    if value == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!("{} must be positive", name),
+        });
+    }
+    Ok(value)
 }
 
 impl StreamTableDescriptorPublisher for MasterDescriptorPublisher {
@@ -2744,7 +2775,12 @@ async fn handle_subscribe_stream_async(
                 run_blocking_request(Arc::clone(&state), move || next_driver.next_event()).await?;
             driver = Some(event.driver);
             match event.event {
-                GatewaySubscribeEvent::Idle => continue,
+                GatewaySubscribeEvent::Idle => {
+                    if subscribe_peer_closed(stream)? {
+                        break;
+                    }
+                    continue;
+                }
                 GatewaySubscribeEvent::Row(row) => {
                     write_frame_async(
                         stream,
@@ -2771,6 +2807,21 @@ async fn handle_subscribe_stream_async(
         metrics.subscribe_clients_active = metrics.subscribe_clients_active.saturating_sub(1);
     });
     result
+}
+
+fn subscribe_peer_closed(stream: &tokio::net::TcpStream) -> Result<bool> {
+    let mut buffer = [0_u8; 1];
+    match stream.try_read(&mut buffer) {
+        Ok(0) => Ok(true),
+        Ok(_) => Err(ZippyError::InvalidConfig {
+            reason: "gateway subscribe connections do not accept client payload after start"
+                .to_string(),
+        }),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(ZippyError::Io {
+            reason: format!("gateway subscribe peer read failed error=[{}]", error),
+        }),
+    }
 }
 
 fn subscribe_driver_start_retryable(error: &ZippyError) -> bool {

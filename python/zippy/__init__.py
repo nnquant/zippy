@@ -3385,6 +3385,9 @@ class GatewayServer:
         subscribe_table_provider=None,
         token: str | None = None,
         max_write_rows: int | None = None,
+        max_connections: int | None = None,
+        max_subscribers: int | None = None,
+        max_blocking_requests: int | None = None,
     ) -> None:
         if writer_factory is not None or stream_info_provider is not None:
             raise ValueError("GatewayServer no longer accepts Python writer/stream providers")
@@ -3395,12 +3398,26 @@ class GatewayServer:
         self.token = token
         if max_write_rows is not None and int(max_write_rows) <= 0:
             raise ValueError("max_write_rows must be positive")
+        if max_connections is not None and int(max_connections) <= 0:
+            raise ValueError("max_connections must be positive")
+        if max_subscribers is not None and int(max_subscribers) <= 0:
+            raise ValueError("max_subscribers must be positive")
+        if max_blocking_requests is not None and int(max_blocking_requests) <= 0:
+            raise ValueError("max_blocking_requests must be positive")
         self.max_write_rows = int(max_write_rows) if max_write_rows is not None else None
+        self.max_connections = int(max_connections) if max_connections is not None else None
+        self.max_subscribers = int(max_subscribers) if max_subscribers is not None else None
+        self.max_blocking_requests = (
+            int(max_blocking_requests) if max_blocking_requests is not None else None
+        )
         self._native = _NativeGatewayServer(
             endpoint=self.endpoint,
             master=master,
             token=token,
-            max_write_rows=max_write_rows,
+            max_write_rows=self.max_write_rows,
+            max_connections=self.max_connections,
+            max_subscribers=self.max_subscribers,
+            max_blocking_requests=self.max_blocking_requests,
         )
 
     def start(self) -> "GatewayServer":

@@ -446,9 +446,16 @@ Windows 原生 master + Windows 原生 segment backend
 
 ### M10.5 Reliability and ops
 
-- gateway metrics：已提供 `GatewayServer.metrics()` 和远端 `metrics` request；
+- gateway metrics：已提供 `GatewayServer.metrics()` 和远端 `metrics` request，并暴露
+  `max_connections`、`max_subscribers`、`max_blocking_requests` 等资源上限；
 - client reconnect：`RemoteStreamSubscriber` 已支持 Gateway 暂不可用时按间隔重连；
 - backpressure：当前 request/response 同步阻塞，且 `max_write_rows` 可限制单批写入；
+- resource limits：`GatewayServer` 支持配置 `max_connections`、`max_subscribers`、
+  `max_blocking_requests`，超限请求返回明确错误并累计 rejected metrics；
+- lifecycle：remote subscribe 客户端断开或 Gateway stop 时会释放 active segment reader lease，
+  避免 stale subscriber 长时间占用 master metadata；
+- slow client isolation：已验证慢 table subscriber 不读取数据时，Gateway 仍能处理其他
+  `write_batch` 和 `metrics` 请求；
 - token：当前 `gateway.token` 可由 master config 下发，GatewayServer 校验请求 token；
 - CLI：`zippy gateway run` 保留为高级调试入口；日常推荐由 master 管理 native
   GatewayServer；

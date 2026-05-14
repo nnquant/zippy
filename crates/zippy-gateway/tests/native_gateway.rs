@@ -30,6 +30,9 @@ fn native_gateway_accepts_arrow_write_batch_and_publishes_descriptor() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -108,6 +111,9 @@ fn native_gateway_binds_writer_epoch_to_master_source_epoch() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -162,6 +168,9 @@ fn native_gateway_rejects_bad_token_before_reading_payload() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -199,6 +208,9 @@ fn native_gateway_rejects_oversized_payload_length_before_allocation() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -244,6 +256,9 @@ fn native_gateway_runtime_starts_and_stops_cleanly() {
             master_endpoint: master_endpoint.clone(),
             token: Some("dev-token".to_string()),
             max_write_rows: Some(1024),
+            max_connections: None,
+            max_subscribers: None,
+            max_blocking_requests: None,
         })
         .unwrap()
         .start()
@@ -255,7 +270,7 @@ fn native_gateway_runtime_starts_and_stops_cleanly() {
             vec![],
         );
 
-        assert_eq!(response["status"], "ok");
+        assert_eq!(response["status"], "ok", "response={}", response);
 
         gateway.stop();
         master.shutdown();
@@ -273,6 +288,9 @@ fn native_gateway_idle_connection_does_not_block_metrics_request() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -310,6 +328,301 @@ fn native_gateway_idle_connection_does_not_block_metrics_request() {
 }
 
 #[test]
+fn native_gateway_rejects_invalid_resource_limits() {
+    let master_endpoint = loopback_control_endpoint();
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+
+    let invalid_connection_limit = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: Some(0),
+        max_subscribers: None,
+        max_blocking_requests: None,
+    });
+    assert!(invalid_connection_limit
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("max_connections must be positive"));
+
+    let invalid_subscriber_limit = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: Some(0),
+        max_blocking_requests: None,
+    });
+    assert!(invalid_subscriber_limit
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("max_subscribers must be positive"));
+
+    let invalid_blocking_limit = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint,
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: Some(0),
+    });
+    assert!(invalid_blocking_limit
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("max_blocking_requests must be positive"));
+}
+
+#[test]
+fn native_gateway_reports_configured_resource_limits() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: Some(3),
+        max_subscribers: Some(2),
+        max_blocking_requests: Some(1),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let metrics = gateway.metrics();
+    assert_eq!(metrics["max_connections"], json!(3));
+    assert_eq!(metrics["max_subscribers"], json!(2));
+    assert_eq!(metrics["max_blocking_requests"], json!(1));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_rejects_blocking_requests_over_configured_limit() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: Some(4),
+        max_subscribers: Some(1),
+        max_blocking_requests: Some(1),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "blocking_limit_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let mut subscriber = TcpStream::connect(gateway.endpoint()).unwrap();
+    subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut subscriber,
+        json!({
+            "kind": "subscribe_rows",
+            "source": "blocking_limit_ticks",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    assert_eq!(
+        read_gateway_stream_frame(&mut subscriber).0["kind"],
+        "subscribed"
+    );
+    assert_eq!(read_gateway_stream_frame(&mut subscriber).0["kind"], "row");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if gateway.metrics()["blocking_requests_active"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        let response = send_gateway_frame_with_read_timeout(
+            gateway.endpoint(),
+            json!({
+                "kind": "get_stream",
+                "source": "blocking_limit_ticks",
+                "token": "dev-token"
+            }),
+            vec![],
+            Duration::from_secs(2),
+        );
+        if response["status"] == json!("error")
+            && response["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("gateway blocking request limit exceeded")
+        {
+            assert_eq!(
+                gateway.metrics()["blocking_requests_rejected_total"],
+                json!(1)
+            );
+            drop(subscriber);
+            gateway.stop();
+            master.shutdown();
+            master_thread.join().unwrap().unwrap();
+            return;
+        }
+    }
+
+    panic!(
+        "blocking request limit was not exercised metrics=[{}]",
+        gateway.metrics()
+    );
+}
+
+#[test]
+fn native_gateway_rejects_connections_over_configured_limit() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: Some(1),
+        max_subscribers: None,
+        max_blocking_requests: None,
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let idle_stream = TcpStream::connect(gateway.endpoint()).unwrap();
+    for _ in 0..50 {
+        if gateway.metrics()["connections_active"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut rejected_stream = TcpStream::connect(gateway.endpoint()).unwrap();
+    rejected_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let response = read_gateway_stream_frame(&mut rejected_stream).0;
+
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("gateway connection limit exceeded"));
+    assert_eq!(gateway.metrics()["connections_rejected_total"], json!(1));
+
+    drop(idle_stream);
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_rejects_subscribers_over_configured_limit() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: Some(4),
+        max_subscribers: Some(1),
+        max_blocking_requests: None,
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let mut first_subscriber = TcpStream::connect(gateway.endpoint()).unwrap();
+    first_subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut first_subscriber,
+        json!({
+            "kind": "subscribe_rows",
+            "source": "subscriber_limit_waiting_stream",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    let first_frame = read_gateway_stream_frame(&mut first_subscriber);
+    assert_eq!(first_frame.0["status"], "ok");
+    assert_eq!(first_frame.0["kind"], "subscribed");
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "subscribe_rows",
+            "source": "subscriber_limit_rejected_stream",
+            "token": "dev-token"
+        }),
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("gateway subscriber limit exceeded"));
+    assert_eq!(
+        gateway.metrics()["subscribe_clients_rejected_total"],
+        json!(1)
+    );
+
+    drop(first_subscriber);
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_reports_async_master_control_requests() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -319,6 +632,9 @@ fn native_gateway_reports_async_master_control_requests() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -376,6 +692,9 @@ fn native_gateway_collects_existing_segment_stream() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -477,6 +796,9 @@ fn native_gateway_collect_uses_pinned_snapshot_high_watermark() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -588,6 +910,9 @@ fn native_gateway_collects_persisted_parquet_catalog_rows_without_live_segment()
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -684,6 +1009,9 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -831,6 +1159,9 @@ fn native_gateway_collect_stream_applies_filter_then_final_select_for_persisted_
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -939,6 +1270,9 @@ fn native_gateway_collect_stream_keeps_mixed_persisted_and_live_on_materialized_
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1050,6 +1384,9 @@ fn native_gateway_pushes_tail_collect_into_persisted_catalog_files() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1157,6 +1494,9 @@ fn native_gateway_pushes_tail_collect_into_segment_reader() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1241,6 +1581,9 @@ fn native_gateway_pushes_head_collect_into_segment_reader() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1338,6 +1681,9 @@ fn native_gateway_pushes_slice_collect_into_segment_reader() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1421,6 +1767,9 @@ fn native_gateway_collect_stream_returns_start_chunks_and_end_frames() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1501,6 +1850,9 @@ fn native_gateway_collect_stream_reports_streaming_metrics() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1559,6 +1911,9 @@ fn native_gateway_collect_stream_live_segment_applies_projection_and_filter_by_c
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1662,6 +2017,9 @@ fn native_gateway_collect_stream_rejects_residual_plan_before_start() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1727,6 +2085,9 @@ fn native_gateway_collect_stream_rejects_row_range_then_filter_before_start() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1775,6 +2136,9 @@ fn native_gateway_subscribe_rows_returns_row_frames_without_table_payload() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1841,6 +2205,9 @@ fn native_gateway_subscribe_rows_rejects_table_controls() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1879,6 +2246,9 @@ fn native_gateway_subscribe_table_rejects_non_positive_controls() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1917,6 +2287,9 @@ fn native_gateway_subscribe_table_rejects_instrument_ids() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -1955,6 +2328,9 @@ fn native_gateway_subscribe_table_uses_active_segment_notifications() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2057,6 +2433,9 @@ fn native_gateway_subscribe_table_batches_rows_across_flushes() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2167,6 +2546,9 @@ fn native_gateway_subscribe_table_throttle_flushes_pending_rows() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2256,6 +2638,9 @@ fn native_gateway_subscribe_table_filters_before_batching_and_applies_count_on_f
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2388,6 +2773,9 @@ fn native_gateway_subscribe_rows_follows_active_segment_rollover() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2494,6 +2882,9 @@ fn native_gateway_subscribe_table_follows_active_segment_rollover() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2610,6 +3001,9 @@ fn native_gateway_subscribe_rows_follows_writer_restart_descriptor() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2704,6 +3098,296 @@ fn native_gateway_subscribe_rows_follows_writer_restart_descriptor() {
 }
 
 #[test]
+fn native_gateway_subscribe_disconnect_releases_metrics_and_reader_lease() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "lease_cleanup_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let mut subscriber = TcpStream::connect(gateway.endpoint()).unwrap();
+    subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut subscriber,
+        json!({
+            "kind": "subscribe_rows",
+            "source": "lease_cleanup_ticks",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    let subscribed = read_gateway_stream_frame(&mut subscriber);
+    assert_eq!(subscribed.0["status"], "ok");
+    assert_eq!(subscribed.0["kind"], "subscribed");
+
+    let row_frame = read_gateway_stream_frame(&mut subscriber);
+    assert_eq!(row_frame.0["kind"], "row");
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint.clone()).unwrap();
+    client.register_process("lease_cleanup_probe").unwrap();
+    let stream = client.get_stream("lease_cleanup_ticks").unwrap();
+    assert_eq!(stream.segment_reader_leases.len(), 1);
+    assert_eq!(gateway.metrics()["subscribe_clients_active"], json!(1));
+
+    drop(subscriber);
+
+    for _ in 0..50 {
+        let stream = client.get_stream("lease_cleanup_ticks").unwrap();
+        if stream.segment_reader_leases.is_empty()
+            && gateway.metrics()["subscribe_clients_active"] == json!(0)
+        {
+            gateway.stop();
+            master.shutdown();
+            master_thread.join().unwrap().unwrap();
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let stream = client.get_stream("lease_cleanup_ticks").unwrap();
+    panic!(
+        "subscriber cleanup did not complete leases=[{:?}] metrics=[{}]",
+        stream.segment_reader_leases,
+        gateway.metrics()
+    );
+}
+
+#[test]
+fn native_gateway_stop_releases_active_subscribe_reader_lease() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "stop_lease_cleanup_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let mut subscriber = TcpStream::connect(gateway.endpoint()).unwrap();
+    subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut subscriber,
+        json!({
+            "kind": "subscribe_rows",
+            "source": "stop_lease_cleanup_ticks",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    assert_eq!(
+        read_gateway_stream_frame(&mut subscriber).0["kind"],
+        "subscribed"
+    );
+    assert_eq!(read_gateway_stream_frame(&mut subscriber).0["kind"], "row");
+
+    let mut client = MasterClient::connect_endpoint(master_endpoint.clone()).unwrap();
+    client.register_process("stop_lease_cleanup_probe").unwrap();
+    assert_eq!(
+        client
+            .get_stream("stop_lease_cleanup_ticks")
+            .unwrap()
+            .segment_reader_leases
+            .len(),
+        1
+    );
+
+    gateway.stop();
+    drop(subscriber);
+
+    for _ in 0..50 {
+        let stream = client.get_stream("stop_lease_cleanup_ticks").unwrap();
+        if stream.segment_reader_leases.is_empty() {
+            master.shutdown();
+            master_thread.join().unwrap().unwrap();
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let stream = client.get_stream("stop_lease_cleanup_ticks").unwrap();
+    panic!(
+        "gateway stop did not release subscribe lease leases=[{:?}]",
+        stream.segment_reader_leases
+    );
+}
+
+#[test]
+fn native_gateway_slow_subscribe_client_does_not_block_writes_or_metrics() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(2048),
+        max_connections: Some(8),
+        max_subscribers: Some(4),
+        max_blocking_requests: Some(4),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let initial_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(StringArray::from(vec!["seed"])),
+        ],
+    )
+    .unwrap();
+    let write_response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "slow_subscriber_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&initial_batch),
+    );
+    assert_eq!(write_response["status"], "ok");
+
+    let mut slow_subscriber = TcpStream::connect(gateway.endpoint()).unwrap();
+    slow_subscriber
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut slow_subscriber,
+        json!({
+            "kind": "subscribe_table",
+            "source": "slow_subscriber_ticks",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    let subscribed = read_gateway_stream_frame(&mut slow_subscriber);
+    assert_eq!(subscribed.0["status"], "ok");
+    assert_eq!(subscribed.0["kind"], "subscribed");
+
+    let payload = "x".repeat(512);
+    for batch_index in 0..8 {
+        let rows = 256;
+        let instruments = (0..rows)
+            .map(|row| format!("IF{:04}", 2600 + row))
+            .collect::<Vec<_>>();
+        let payloads = vec![payload.clone(); rows];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                std::sync::Arc::new(StringArray::from(instruments)),
+                std::sync::Arc::new(StringArray::from(payloads)),
+            ],
+        )
+        .unwrap();
+        let response = send_gateway_frame_with_read_timeout(
+            gateway.endpoint(),
+            json!({
+                "kind": "write_batch",
+                "stream_name": "slow_subscriber_ticks",
+                "token": "dev-token",
+                "rows": rows,
+                "batch_index": batch_index
+            }),
+            encode_ipc_batch(&batch),
+            Duration::from_secs(2),
+        );
+        assert_eq!(response["status"], "ok", "response={}", response);
+    }
+
+    let metrics_response = send_gateway_frame_with_read_timeout(
+        gateway.endpoint(),
+        json!({"kind": "metrics", "token": "dev-token"}),
+        vec![],
+        Duration::from_secs(2),
+    );
+    assert_eq!(metrics_response["status"], "ok");
+    assert_eq!(
+        metrics_response["metrics"]["write_batches_total"]
+            .as_u64()
+            .unwrap(),
+        9
+    );
+
+    drop(slow_subscriber);
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_applies_lazy_shape_collect_plan() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -2713,6 +3397,9 @@ fn native_gateway_applies_lazy_shape_collect_plan() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2833,6 +3520,9 @@ fn native_gateway_reregisters_master_process_after_lease_expiry() {
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -2962,6 +3652,9 @@ fn assert_streaming_row_range_matches_default(label: &str, row_range_op: serde_j
         master_endpoint: master_endpoint.clone(),
         token: Some("dev-token".to_string()),
         max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })
     .unwrap()
     .start()
@@ -3121,12 +3814,33 @@ fn send_gateway_frame(
     send_gateway_frame_with_payload(endpoint, header, payload).0
 }
 
+fn send_gateway_frame_with_read_timeout(
+    endpoint: &str,
+    header: serde_json::Value,
+    payload: Vec<u8>,
+    timeout: Duration,
+) -> serde_json::Value {
+    send_gateway_frame_with_payload_and_read_timeout(endpoint, header, payload, Some(timeout)).0
+}
+
 fn send_gateway_frame_with_payload(
     endpoint: &str,
     header: serde_json::Value,
     payload: Vec<u8>,
 ) -> (serde_json::Value, Vec<u8>) {
+    send_gateway_frame_with_payload_and_read_timeout(endpoint, header, payload, None)
+}
+
+fn send_gateway_frame_with_payload_and_read_timeout(
+    endpoint: &str,
+    header: serde_json::Value,
+    payload: Vec<u8>,
+    timeout: Option<Duration>,
+) -> (serde_json::Value, Vec<u8>) {
     let mut stream = TcpStream::connect(endpoint).unwrap();
+    if let Some(timeout) = timeout {
+        stream.set_read_timeout(Some(timeout)).unwrap();
+    }
     let header_bytes = serde_json::to_vec(&header).unwrap();
     stream
         .write_all(&(header_bytes.len() as u32).to_be_bytes())

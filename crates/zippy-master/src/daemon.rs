@@ -208,6 +208,9 @@ fn start_gateway_if_enabled(
         master_endpoint: control_endpoint.clone(),
         token: runtime_config.gateway.token.clone(),
         max_write_rows: None,
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
     })?
     .start()?;
     let (host, port) = gateway_endpoint_host_port(gateway.endpoint());

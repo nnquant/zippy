@@ -2072,12 +2072,15 @@ struct GatewayServer {
 #[pymethods]
 impl GatewayServer {
     #[new]
-    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None))]
+    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None, max_connections=None, max_subscribers=None, max_blocking_requests=None))]
     fn new(
         endpoint: String,
         master: Option<PyRef<'_, MasterClient>>,
         token: Option<String>,
         max_write_rows: Option<usize>,
+        max_connections: Option<usize>,
+        max_subscribers: Option<usize>,
+        max_blocking_requests: Option<usize>,
     ) -> PyResult<Self> {
         let master_endpoint = match master {
             Some(master) => resolve_control_endpoint_value(&master.control_endpoint)?,
@@ -2090,6 +2093,9 @@ impl GatewayServer {
                 master_endpoint,
                 token,
                 max_write_rows,
+                max_connections,
+                max_subscribers,
+                max_blocking_requests,
             })),
             server: Mutex::new(None),
             endpoint: Mutex::new(endpoint),

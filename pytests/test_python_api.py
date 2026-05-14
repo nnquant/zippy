@@ -10285,6 +10285,59 @@ def test_remote_stream_subscriber_reconnects_until_gateway_starts() -> None:
         server.join()
 
 
+def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.endpoint = kwargs["endpoint"]
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+
+    gateway = zippy.GatewayServer(
+        endpoint="127.0.0.1:17691",
+        max_write_rows=10,
+        max_connections=11,
+        max_subscribers=12,
+        max_blocking_requests=13,
+    )
+
+    assert gateway.max_write_rows == 10
+    assert gateway.max_connections == 11
+    assert gateway.max_subscribers == 12
+    assert gateway.max_blocking_requests == 13
+    assert captured["max_write_rows"] == 10
+    assert captured["max_connections"] == 11
+    assert captured["max_subscribers"] == 12
+    assert captured["max_blocking_requests"] == 13
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("max_connections", 0),
+        ("max_subscribers", 0),
+        ("max_blocking_requests", 0),
+    ],
+)
+def test_gateway_server_rejects_non_positive_resource_limits(name: str, value: int) -> None:
+    with pytest.raises(ValueError, match=f"{name} must be positive"):
+        zippy.GatewayServer(
+            endpoint="127.0.0.1:17691",
+            **{name: value},
+        )
+
+
 def test_remote_gateway_e2e_through_tcp_master_config() -> None:
     master_port = reserve_tcp_port()
     gateway_port = reserve_tcp_port()
