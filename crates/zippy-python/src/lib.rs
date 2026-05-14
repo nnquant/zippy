@@ -3170,6 +3170,7 @@ struct SegmentReaderDriver {
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
     pending_descriptor_retry: Option<DescriptorUpdate>,
     next_descriptor_retry_at: Instant,
+    next_descriptor_refresh_at: Instant,
     xfast: bool,
     idle_wait: Duration,
     idle_spin_checks: u32,
@@ -3199,6 +3200,7 @@ impl SegmentReaderDriver {
             descriptor_refresh_error,
             pending_descriptor_retry: None,
             next_descriptor_retry_at: Instant::now(),
+            next_descriptor_refresh_at: Instant::now(),
             xfast,
             idle_wait,
             idle_spin_checks,
@@ -3237,6 +3239,11 @@ impl SegmentReaderDriver {
 
                 let sealed = self.reader.is_sealed().map_err(|error| error.to_string())?;
                 if sealed {
+                    if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
+                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                            descriptor_generation,
+                        ));
+                    }
                     let update = if self.xfast {
                         spin_loop();
                         None
@@ -3257,7 +3264,9 @@ impl SegmentReaderDriver {
                                 descriptor_generation,
                             ));
                         }
-                        if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
+                        if let Some(descriptor_generation) =
+                            self.apply_ready_descriptor_updates()?
+                        {
                             return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
                                 descriptor_generation,
                             ));
@@ -3280,6 +3289,35 @@ impl SegmentReaderDriver {
                 Ok(SegmentReaderDriverEvent::Idle)
             }
         }
+    }
+
+    fn refresh_latest_descriptor_update(&mut self) -> std::result::Result<Option<u64>, String> {
+        if Instant::now() < self.next_descriptor_refresh_at {
+            return Ok(None);
+        }
+        self.next_descriptor_refresh_at = Instant::now() + self.descriptor_refresh_interval();
+
+        let Some(reader_lease) = self.reader_lease.as_ref() else {
+            return Ok(None);
+        };
+        let stream = reader_lease
+            .master
+            .lock()
+            .unwrap()
+            .get_stream(&reader_lease.source)
+            .map_err(|error| error.to_string())?;
+        let Some(descriptor) = stream.active_segment_descriptor else {
+            return Ok(None);
+        };
+        let update = descriptor_update_from_value(stream.descriptor_generation, descriptor)?;
+        if update.text == self.descriptor_text {
+            return Ok(None);
+        }
+        self.apply_descriptor_update_or_retry(update)
+    }
+
+    fn descriptor_refresh_interval(&self) -> Duration {
+        self.idle_wait.max(Duration::from_millis(1))
     }
 
     fn apply_ready_descriptor_updates(&mut self) -> std::result::Result<Option<u64>, String> {
@@ -3315,9 +3353,7 @@ impl SegmentReaderDriver {
         let should_replace = self
             .pending_descriptor_retry
             .as_ref()
-            .is_none_or(|pending| {
-                update.descriptor_generation >= pending.descriptor_generation
-            });
+            .is_none_or(|pending| update.descriptor_generation >= pending.descriptor_generation);
         if should_replace {
             self.pending_descriptor_retry = Some(update);
         }
@@ -7978,6 +8014,44 @@ mod tests {
         (0..values.len()).map(|index| values.value(index)).collect()
     }
 
+    fn unused_loopback_endpoint() -> ControlEndpoint {
+        let listener = std::net::TcpListener::bind(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .unwrap();
+        ControlEndpoint::Tcp(listener.local_addr().unwrap())
+    }
+
+    fn spawn_test_master() -> (
+        ControlEndpoint,
+        RustMasterServer,
+        JoinHandle<zippy_core::Result<()>>,
+    ) {
+        let endpoint = unused_loopback_endpoint();
+        let server = RustMasterServer::default();
+        let handle_server = server.clone();
+        let endpoint_for_thread = endpoint.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let join_handle = thread::spawn(move || {
+            handle_server.serve_endpoint_with_ready(&endpoint_for_thread, Some(ready_tx))
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        (endpoint, server, join_handle)
+    }
+
+    fn publishable_descriptor_from_partition(partition: &PartitionHandle) -> serde_json::Value {
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+        if let Some(object) = descriptor.as_object_mut() {
+            object.remove("writer_epoch");
+        }
+        descriptor
+    }
+
     #[test]
     fn descriptor_update_slot_is_consumed_only_after_empty_segment_poll() {
         let descriptor_updates = DescriptorUpdateSlot::default();
@@ -8294,6 +8368,109 @@ mod tests {
         }
         drop(driver);
         let _ = std::fs::remove_file(target_shm_path);
+    }
+
+    #[test]
+    fn segment_reader_driver_refetches_latest_descriptor_after_sealed_reader() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "sealed-refetch",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("sealed_refetch_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "sealed_refetch_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor("ticks", publishable_descriptor_from_partition(&partition))
+            .unwrap();
+        let current_descriptor = writer_master
+            .get_segment_descriptor("ticks")
+            .unwrap()
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint).unwrap();
+        reader_master
+            .register_process("sealed_refetch_reader")
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let reader_lease = SegmentReaderLeaseGuard::acquire(
+            Arc::clone(&reader_master),
+            "ticks",
+            &current_descriptor,
+        )
+        .unwrap();
+
+        partition.writer().rollover_without_persistence().unwrap();
+        partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2609")?;
+                row.write_f64("last_price", 4110.5)?;
+                Ok(())
+            })
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor("ticks", publishable_descriptor_from_partition(&partition))
+            .unwrap();
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            reader,
+            serde_json::to_string(&current_descriptor).unwrap(),
+            Some(reader_lease),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            None,
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 2),
+            other => panic!("expected sealed reader to refetch latest descriptor got [{other:?}]"),
+        }
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected rows from refetched descriptor got [{other:?}]"),
+        }
+
+        drop(driver);
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
     }
 
     #[test]
