@@ -9996,6 +9996,177 @@ def test_remote_subscribe_table_rejects_complex_filter_before_gateway_request(
         )
 
 
+def test_remote_subscribe_table_rejects_non_positive_controls_before_gateway_request(
+    monkeypatch,
+) -> None:
+    class FakeMasterClient:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "token": None,
+                    "protocol_version": 1,
+                }
+            }
+
+    def fail_remote_subscriber(*args, **kwargs):
+        raise AssertionError("remote subscriber must not be created for invalid table controls")
+
+    monkeypatch.setattr(zippy, "RemoteStreamSubscriber", fail_remote_subscriber)
+
+    invalid_controls = [
+        ("batch_size", 0),
+        ("throttle_ms", 0),
+        ("count", 0),
+    ]
+    for name, value in invalid_controls:
+        with pytest.raises(ValueError, match=f"{name} must be positive"):
+            zippy.subscribe_table(
+                "qmt_ticks",
+                callback=lambda table: None,
+                master=FakeMasterClient(),
+                **{name: value},
+            )
+
+
+def test_remote_stream_subscriber_rejects_table_instrument_ids() -> None:
+    with pytest.raises(
+        ValueError,
+        match="instrument_ids is only supported by remote subscribe row callbacks",
+    ):
+        zippy.RemoteStreamSubscriber(
+            "qmt_ticks",
+            endpoint="127.0.0.1:17691",
+            callback=lambda table: None,
+            table_callback=True,
+            instrument_ids=["IF2606"],
+        )
+
+
+@pytest.mark.parametrize("table_callback", [False, True])
+def test_remote_subscribe_wait_timeout_runs_before_gateway_request(
+    monkeypatch,
+    table_callback: bool,
+) -> None:
+    class FakeMasterClient:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "token": None,
+                    "protocol_version": 1,
+                }
+            }
+
+        def get_stream(self, source: str) -> dict[str, object]:
+            raise RuntimeError(f"stream not found source=[{source}]")
+
+    def fail_remote_subscriber(*args, **kwargs):
+        raise AssertionError("remote subscriber must not be created before wait succeeds")
+
+    monkeypatch.setattr(zippy, "RemoteStreamSubscriber", fail_remote_subscriber)
+
+    with pytest.raises(TimeoutError, match="timed out waiting for table source=\\[missing\\]"):
+        if table_callback:
+            zippy.subscribe_table(
+                "missing",
+                callback=lambda table: None,
+                master=FakeMasterClient(),
+                wait=True,
+                timeout="1ms",
+            )
+        else:
+            zippy.subscribe(
+                "missing",
+                callback=lambda row: None,
+                master=FakeMasterClient(),
+                wait=True,
+                timeout="1ms",
+            )
+
+
+@pytest.mark.parametrize("table_callback", [False, True])
+def test_remote_subscribe_waits_for_late_gateway_stream(
+    table_callback: bool,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    stream_name = "qmt_wait_table_ticks" if table_callback else "qmt_wait_row_ticks"
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
+    ready = threading.Event()
+    subscribed = threading.Event()
+    received = threading.Event()
+    result: dict[str, object] = {}
+    rows: list[dict[str, object]] = []
+    tables: list[pa.Table] = []
+
+    def subscribe_late_stream() -> None:
+        ready.set()
+        try:
+            if table_callback:
+                result["subscriber"] = zippy.subscribe_table(
+                    stream_name,
+                    callback=lambda table: (tables.append(table), received.set()),
+                    master=zippy.RemoteMasterClient(gateway_endpoint),
+                    wait=True,
+                    timeout=2.0,
+                )
+            else:
+                result["subscriber"] = zippy.subscribe(
+                    stream_name,
+                    callback=lambda row: (rows.append(row.to_dict()), received.set()),
+                    master=zippy.RemoteMasterClient(gateway_endpoint),
+                    wait=True,
+                    timeout=2.0,
+                )
+            subscribed.set()
+        except BaseException as error:
+            result["error"] = error
+
+    subscriber_thread = threading.Thread(
+        target=subscribe_late_stream,
+        name=f"remote-subscribe-wait-{stream_name}",
+    )
+    try:
+        subscriber_thread.start()
+        assert ready.wait(timeout=1.0)
+        time.sleep(0.05)
+
+        writer = zippy.RemoteGatewayWriter(
+            stream_name,
+            endpoint=gateway_endpoint,
+            schema=schema,
+            batch_size=1,
+        )
+        writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
+
+        subscriber_thread.join(timeout=2.0)
+        assert not subscriber_thread.is_alive()
+        assert "error" not in result
+        assert subscribed.wait(timeout=1.0)
+        assert received.wait(timeout=2.0)
+        if table_callback:
+            assert tables[-1].to_pydict() == {
+                "instrument_id": ["IF2606"],
+                "last_price": [4102.5],
+            }
+        else:
+            assert rows == [{"instrument_id": "IF2606", "last_price": 4102.5}]
+    finally:
+        subscriber = result.get("subscriber")
+        if subscriber is not None:
+            subscriber.stop()
+        gateway.stop()
+        server.stop()
+        server.join()
+
+
 def test_subscribe_table_uses_gateway_token_discovered_from_master_config() -> None:
     schema = pa.schema(
         [

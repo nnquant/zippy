@@ -1832,6 +1832,120 @@ fn native_gateway_subscribe_rows_returns_row_frames_without_table_payload() {
 }
 
 #[test]
+fn native_gateway_subscribe_rows_rejects_table_controls() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "subscribe_rows",
+            "source": "row_subscribe_invalid_controls",
+            "token": "dev-token",
+            "batch_size": 1
+        }),
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("subscribe_rows does not support batch_size"));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_subscribe_table_rejects_non_positive_controls() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "subscribe_table",
+            "source": "table_subscribe_invalid_controls",
+            "token": "dev-token",
+            "batch_size": 0
+        }),
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("subscribe_table batch_size must be positive"));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn native_gateway_subscribe_table_rejects_instrument_ids() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let response = send_gateway_header_without_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "subscribe_table",
+            "source": "table_subscribe_invalid_instrument_ids",
+            "token": "dev-token",
+            "instrument_ids": ["IF2606"]
+        }),
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "error");
+    assert!(response["reason"]
+        .as_str()
+        .unwrap()
+        .contains("subscribe_table does not support instrument_ids"));
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_subscribe_table_uses_active_segment_notifications() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());

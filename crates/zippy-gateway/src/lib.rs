@@ -1852,21 +1852,31 @@ impl GatewayState {
             })?
             .to_string();
         let filter = subscribe_filter_plan(header.get("filter").unwrap_or(&Value::Null));
+        if mode == GatewaySubscribeMode::Table
+            && header
+                .get("instrument_ids")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: "subscribe_table does not support instrument_ids".to_string(),
+            });
+        }
         let instrument_ids = parse_subscribe_instrument_ids(header.get("instrument_ids"))?;
-        let batch_size = header
-            .get("batch_size")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .filter(|value| *value > 0);
-        let count = header
-            .get("count")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .filter(|value| *value > 0);
-        let throttle = header
-            .get("throttle_ms")
-            .and_then(Value::as_u64)
-            .map(Duration::from_millis);
+        if mode == GatewaySubscribeMode::Rows {
+            for field_name in ["batch_size", "throttle_ms", "count"] {
+                if header.get(field_name).is_some_and(|value| !value.is_null()) {
+                    return Err(ZippyError::InvalidConfig {
+                        reason: format!("subscribe_rows does not support {}", field_name),
+                    });
+                }
+            }
+        }
+        let batch_size =
+            parse_positive_subscribe_usize(&header, "batch_size", subscribe_kind_name(mode))?;
+        let count = parse_positive_subscribe_usize(&header, "count", subscribe_kind_name(mode))?;
+        let throttle_ms =
+            parse_positive_subscribe_u64(&header, "throttle_ms", subscribe_kind_name(mode))?;
+        let throttle = throttle_ms.map(Duration::from_millis);
         Ok(GatewaySubscribeRequest {
             mode,
             source,
@@ -4221,6 +4231,39 @@ fn subscribe_kind_name(mode: GatewaySubscribeMode) -> &'static str {
         GatewaySubscribeMode::Rows => "subscribe_rows",
         GatewaySubscribeMode::Table => "subscribe_table",
     }
+}
+
+fn parse_positive_subscribe_usize(
+    header: &Value,
+    field_name: &str,
+    request_kind: &str,
+) -> Result<Option<usize>> {
+    parse_positive_subscribe_u64(header, field_name, request_kind)
+        .map(|value| value.map(|item| item as usize))
+}
+
+fn parse_positive_subscribe_u64(
+    header: &Value,
+    field_name: &str,
+    request_kind: &str,
+) -> Result<Option<u64>> {
+    let Some(value) = header.get(field_name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(unsigned) = value.as_u64() else {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!("{} {} must be positive", request_kind, field_name),
+        });
+    };
+    if unsigned == 0 {
+        return Err(ZippyError::InvalidConfig {
+            reason: format!("{} {} must be positive", request_kind, field_name),
+        });
+    }
+    Ok(Some(unsigned))
 }
 
 fn parse_subscribe_instrument_ids(value: Option<&Value>) -> Result<Option<HashSet<String>>> {

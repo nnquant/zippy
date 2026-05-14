@@ -243,7 +243,7 @@ remote 模式下：
 ```text
 Windows client subscribe request
   -> Gateway
-  -> GatewayServer 在 WSL 本地 subscribe / subscribe_table
+  -> GatewayServer 在 WSL 本地 subscribe_rows / subscribe_table
   -> Gateway 按 filter/batch/count 处理或下推
   -> Arrow IPC / row frames
   -> Windows callback
@@ -251,10 +251,21 @@ Windows client subscribe request
 
 推荐默认：
 
-- `subscribe()` 返回 `zippy.Row`；
-- `subscribe_table()` 返回 `pyarrow.Table`；
+- `subscribe()` 走 `subscribe_rows` wire request，返回 `zippy.Row`；
+- `subscribe_table()` 走 `subscribe_table` wire request，返回 `pyarrow.Table`；
 - 高吞吐场景推荐 table callback；
 - row callback 只适合低频或已经过滤后的行情。
+
+契约边界：
+
+- `subscribe()` 支持 `instrument_ids`，也支持可转换为合约集合的
+  `zp.col("instrument_id") == ...` / `is_in(...)` 过滤；
+- `subscribe()` 不支持 `batch_size`、`throttle_ms`、`count`；
+- `subscribe_table()` 支持 `filter`、`batch_size`、`throttle_ms`、`count`；
+- `subscribe_table()` 不支持 `instrument_ids`，合约过滤应使用
+  `filter=zp.col("instrument_id").is_in([...])`；
+- remote `wait=True, timeout=...` 在 Python 层先等待 stream 和 active descriptor ready，
+  超时前不会创建 remote subscriber。
 
 ## 8. Remote Query / read_table 语义
 
@@ -419,9 +430,12 @@ Windows 原生 master + Windows 原生 segment backend
 
 ### M10.3 Remote subscribe
 
-- remote `subscribe()` 支持 row callback；
-- remote `subscribe_table()` 支持 Arrow table callback；
-- 支持 `filter`、`batch_size`、`throttle_ms`、`count`。
+- remote `subscribe()` 支持 row callback，wire request 为 `subscribe_rows`；
+- remote `subscribe_table()` 支持 Arrow table callback，wire request 为 `subscribe_table`；
+- `subscribe_rows` 支持 `instrument_ids` 和可转换为合约集合的 row filter；
+- `subscribe_table` 支持 `filter`、`batch_size`、`throttle_ms`、`count`；
+- `subscribe_table` 不接受 `instrument_ids`，避免静默忽略 table 模式无法应用的过滤；
+- remote `wait=True, timeout=...` 复用 Python ready 等待逻辑。
 
 ### M10.4 Remote lazy query
 

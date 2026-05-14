@@ -3205,6 +3205,19 @@ class RemoteStreamSubscriber:
         self.callback = callback
         self.table_callback = bool(table_callback)
         self.filter = filter
+        if self.table_callback and instrument_ids is not None:
+            raise ValueError("instrument_ids is only supported by remote subscribe row callbacks")
+        if not self.table_callback:
+            for name, value in (
+                ("batch_size", batch_size),
+                ("throttle_ms", throttle_ms),
+                ("count", count),
+            ):
+                if value is not None:
+                    raise ValueError(f"{name} is only supported by remote subscribe_table")
+        batch_size = _require_positive_optional_int("batch_size", batch_size)
+        throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
+        count = _require_positive_optional_int("count", count)
         if instrument_ids is None:
             self.instrument_ids = None
         elif isinstance(instrument_ids, str):
@@ -5482,6 +5495,8 @@ def subscribe(
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
+        if wait:
+            _wait_for_table_ready(source, selected_master, timeout)
         if filter is not None and instrument_ids is not None:
             raise ValueError("filter and instrument_ids cannot be used together")
         remote_filter = filter
@@ -5575,8 +5590,13 @@ def subscribe_table(
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
+        if wait:
+            _wait_for_table_ready(source, selected_master, timeout)
         if filter is not None:
             _pyarrow_filters_from_query_filter(filter)
+        batch_size = _require_positive_optional_int("batch_size", batch_size)
+        throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
+        count = _require_positive_optional_int("count", count)
         return RemoteStreamSubscriber(
             source,
             endpoint=remote_endpoint,
