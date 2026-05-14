@@ -6100,6 +6100,57 @@ def test_subscribe_latency_probe_summarizes_latency_samples() -> None:
     ]
 
 
+def test_remote_subscribe_perf_probe_summarizes_delivery_metrics() -> None:
+    module_path = (
+        WORKSPACE_ROOT / "examples" / "08_remote_gateway" / "04_remote_subscribe_perf_probe.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "remote_subscribe_perf_probe_example", module_path
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    tables = [
+        pa.table({"seq": [1, 2]}),
+        pa.table({"seq": [3, 4, 5]}),
+    ]
+    before = {
+        "subscribe_tables_delivered_total": 10,
+        "subscribe_table_rows_delivered_total": 100,
+        "subscribe_rows_delivered_total": 7,
+    }
+    after = {
+        "subscribe_tables_delivered_total": 12,
+        "subscribe_table_rows_delivered_total": 105,
+        "subscribe_rows_delivered_total": 9,
+    }
+
+    report = module.build_probe_report(
+        uri="zippy://127.0.0.1:17690/default",
+        stream="qmt_ticks",
+        expected_rows=5,
+        batch_size=2,
+        timeout_sec=3.0,
+        received_tables=tables,
+        first_batch_wait_ms=1.25,
+        elapsed_ms=2.5,
+        gateway_metrics_before=before,
+        gateway_metrics_after=after,
+    )
+
+    assert report["received_tables"] == 2
+    assert report["received_rows"] == 5
+    assert report["batch_rows"] == [2, 3]
+    assert report["gateway_delivery_delta"] == {
+        "subscribe_rows_delivered_total": 2,
+        "subscribe_tables_delivered_total": 2,
+        "subscribe_table_rows_delivered_total": 5,
+    }
+    assert report["gateway_delivery_matches_received"] is True
+
+
 def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
