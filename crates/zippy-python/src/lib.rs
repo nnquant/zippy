@@ -2073,6 +2073,7 @@ struct GatewayServer {
 impl GatewayServer {
     #[new]
     #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None, max_connections=None, max_subscribers=None, max_blocking_requests=None, write_timeout_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: String,
         master: Option<PyRef<'_, MasterClient>>,
@@ -3096,32 +3097,55 @@ fn apply_segment_descriptor_update(
     update: DescriptorUpdate,
     segment_schema: &CompiledSchema,
     reader_lease: Option<&mut SegmentReaderLeaseGuard>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<DescriptorApplyOutcome, String> {
     let next_lease = match reader_lease.as_ref() {
-        Some(lease) => Some(
-            SegmentReaderLeaseGuard::acquire(
+        Some(lease) => {
+            match SegmentReaderLeaseGuard::acquire(
                 Arc::clone(&lease.master),
                 lease.source.clone(),
                 &update.descriptor,
-            )
-            .map_err(|error| error.to_string())?,
-        ),
+            ) {
+                Ok(next_lease) => Some(next_lease),
+                Err(error) if is_segment_reader_lease_target_not_found(&error) => {
+                    return Ok(DescriptorApplyOutcome::TransientMissing);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
         None => None,
     };
-    let (next_reader, _) = build_active_segment_reader(&update.descriptor, segment_schema)
-        .map_err(|error| error.to_string())?;
+    let (next_reader, _) = match build_active_segment_reader(&update.descriptor, segment_schema) {
+        Ok(next_reader) => next_reader,
+        Err(error) if is_transient_missing_segment_reader_error(&error) => {
+            return Ok(DescriptorApplyOutcome::TransientMissing);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let descriptor_generation = update.descriptor_generation;
     *reader = next_reader;
     *descriptor_text = update.text;
     if let (Some(reader_lease), Some(next_lease)) = (reader_lease, next_lease) {
         *reader_lease = next_lease;
     }
-    Ok(())
+    Ok(DescriptorApplyOutcome::Applied(descriptor_generation))
+}
+
+fn is_transient_missing_segment_reader_error(error: &ZippyError) -> bool {
+    let message = error.to_string();
+    message.contains("shared memory error: No such file or directory")
+        || message.contains("os error 2")
+        || message.contains("The system cannot find the file specified")
 }
 
 enum SegmentReaderDriverEvent {
     Rows(RowSpanView),
     DescriptorUpdated(u64),
     Idle,
+}
+
+enum DescriptorApplyOutcome {
+    Applied(u64),
+    TransientMissing,
 }
 
 impl fmt::Debug for SegmentReaderDriverEvent {
@@ -3144,6 +3168,8 @@ struct SegmentReaderDriver {
     segment_schema: CompiledSchema,
     descriptor_updates: Arc<DescriptorUpdateSlot>,
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
+    pending_descriptor_retry: Option<DescriptorUpdate>,
+    next_descriptor_retry_at: Instant,
     xfast: bool,
     idle_wait: Duration,
     idle_spin_checks: u32,
@@ -3171,6 +3197,8 @@ impl SegmentReaderDriver {
             segment_schema,
             descriptor_updates,
             descriptor_refresh_error,
+            pending_descriptor_retry: None,
+            next_descriptor_retry_at: Instant::now(),
             xfast,
             idle_wait,
             idle_spin_checks,
@@ -3201,19 +3229,7 @@ impl SegmentReaderDriver {
                 Ok(SegmentReaderDriverEvent::Rows(span))
             }
             None => {
-                if let Some(update) = take_descriptor_update_after_poll(
-                    SubscriberReadOutcome::Empty,
-                    self.descriptor_updates.as_ref(),
-                    &self.descriptor_text,
-                ) {
-                    let descriptor_generation = update.descriptor_generation;
-                    apply_segment_descriptor_update(
-                        &mut self.reader,
-                        &mut self.descriptor_text,
-                        update,
-                        &self.segment_schema,
-                        self.reader_lease.as_mut(),
-                    )?;
+                if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
                     return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
                         descriptor_generation,
                     ));
@@ -3234,14 +3250,21 @@ impl SegmentReaderDriver {
                         return Err(error);
                     }
                     if let Some(update) = update {
-                        let descriptor_generation = update.descriptor_generation;
-                        apply_segment_descriptor_update(
-                            &mut self.reader,
-                            &mut self.descriptor_text,
-                            update,
-                            &self.segment_schema,
-                            self.reader_lease.as_mut(),
-                        )?;
+                        if let Some(descriptor_generation) =
+                            self.apply_descriptor_update_or_retry(update)?
+                        {
+                            return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                                descriptor_generation,
+                            ));
+                        }
+                        if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
+                            return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                                descriptor_generation,
+                            ));
+                        }
+                        return Ok(SegmentReaderDriverEvent::Idle);
+                    }
+                    if let Some(descriptor_generation) = self.retry_pending_descriptor_update()? {
                         return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
                             descriptor_generation,
                         ));
@@ -3257,6 +3280,80 @@ impl SegmentReaderDriver {
                 Ok(SegmentReaderDriverEvent::Idle)
             }
         }
+    }
+
+    fn apply_ready_descriptor_updates(&mut self) -> std::result::Result<Option<u64>, String> {
+        while let Some(update) = take_descriptor_update_after_poll(
+            SubscriberReadOutcome::Empty,
+            self.descriptor_updates.as_ref(),
+            &self.descriptor_text,
+        ) {
+            if let Some(descriptor_generation) = self.apply_descriptor_update_or_retry(update)? {
+                return Ok(Some(descriptor_generation));
+            }
+        }
+        self.retry_pending_descriptor_update()
+    }
+
+    fn apply_descriptor_update_or_retry(
+        &mut self,
+        update: DescriptorUpdate,
+    ) -> std::result::Result<Option<u64>, String> {
+        match self.apply_descriptor_update(update.clone())? {
+            DescriptorApplyOutcome::Applied(descriptor_generation) => {
+                self.pending_descriptor_retry = None;
+                Ok(Some(descriptor_generation))
+            }
+            DescriptorApplyOutcome::TransientMissing => {
+                self.defer_descriptor_retry(update);
+                Ok(None)
+            }
+        }
+    }
+
+    fn defer_descriptor_retry(&mut self, update: DescriptorUpdate) {
+        let should_replace = self
+            .pending_descriptor_retry
+            .as_ref()
+            .is_none_or(|pending| {
+                update.descriptor_generation >= pending.descriptor_generation
+            });
+        if should_replace {
+            self.pending_descriptor_retry = Some(update);
+        }
+        self.next_descriptor_retry_at = Instant::now() + self.idle_wait;
+    }
+
+    fn retry_pending_descriptor_update(&mut self) -> std::result::Result<Option<u64>, String> {
+        if self.pending_descriptor_retry.is_none() || Instant::now() < self.next_descriptor_retry_at
+        {
+            return Ok(None);
+        }
+
+        let update = self.pending_descriptor_retry.clone().unwrap();
+        match self.apply_descriptor_update(update.clone())? {
+            DescriptorApplyOutcome::Applied(descriptor_generation) => {
+                self.pending_descriptor_retry = None;
+                Ok(Some(descriptor_generation))
+            }
+            DescriptorApplyOutcome::TransientMissing => {
+                self.defer_descriptor_retry(update);
+                Ok(None)
+            }
+        }
+    }
+
+    fn apply_descriptor_update(
+        &mut self,
+        update: DescriptorUpdate,
+    ) -> std::result::Result<DescriptorApplyOutcome, String> {
+        apply_segment_descriptor_update(
+            &mut self.reader,
+            &mut self.descriptor_text,
+            update,
+            &self.segment_schema,
+            self.reader_lease.as_mut(),
+        )
     }
 
     fn wait_for_mmap_notification_after(&self, observed: u32) -> std::result::Result<bool, String> {
@@ -8022,6 +8119,181 @@ mod tests {
             SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
             other => panic!("expected rows from next descriptor got [{other:?}]"),
         }
+    }
+
+    #[test]
+    fn segment_reader_driver_skips_missing_shm_descriptor_update() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema("ticks", "current", schema.clone())
+            .unwrap();
+        let current_descriptor: serde_json::Value = serde_json::from_slice(
+            &current_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let missing_partition = store
+            .open_partition_with_schema("ticks", "missing", schema.clone())
+            .unwrap();
+        let mut missing_descriptor: serde_json::Value = serde_json::from_slice(
+            &missing_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        missing_descriptor["shm_os_id"] = serde_json::json!(
+            "file:/tmp/zippy-segment-store/missing-subscribe-rollover-segment.shm"
+        );
+
+        let next_partition = store
+            .open_partition_with_schema("ticks", "next", schema.clone())
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let next_descriptor: serde_json::Value =
+            serde_json::from_slice(&next_partition.active_descriptor_envelope_bytes().unwrap())
+                .unwrap();
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        descriptor_updates.set(descriptor_update_from_value(2, missing_descriptor).unwrap());
+        descriptor_updates.set(descriptor_update_from_value(3, next_descriptor).unwrap());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            reader,
+            serde_json::to_string(&current_descriptor).unwrap(),
+            None,
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            None,
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 3),
+            other => panic!(
+                "expected driver to skip missing descriptor and apply valid update got [{other:?}]"
+            ),
+        }
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected rows from recovered descriptor got [{other:?}]"),
+        }
+    }
+
+    #[test]
+    fn segment_reader_driver_retries_missing_shm_descriptor_update() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema("ticks", "retry-current", schema.clone())
+            .unwrap();
+        let current_descriptor: serde_json::Value = serde_json::from_slice(
+            &current_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let retry_partition = store
+            .open_partition_with_schema("ticks", "retry-target", schema.clone())
+            .unwrap();
+        retry_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2608")?;
+                row.write_f64("last_price", 4108.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let mut retry_descriptor: serde_json::Value =
+            serde_json::from_slice(&retry_partition.active_descriptor_envelope_bytes().unwrap())
+                .unwrap();
+        let source_shm_path = retry_descriptor["shm_os_id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("file:")
+            .unwrap()
+            .to_string();
+        let target_shm_path = std::env::temp_dir().join(format!(
+            "zippy-segment-store/retry-missing-subscribe-rollover-{}-{}.shm",
+            std::process::id(),
+            retry_descriptor["segment_id"].as_u64().unwrap()
+        ));
+        let _ = std::fs::remove_file(&target_shm_path);
+        std::fs::create_dir_all(target_shm_path.parent().unwrap()).unwrap();
+        retry_descriptor["shm_os_id"] =
+            serde_json::json!(format!("file:{}", target_shm_path.display()));
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        descriptor_updates.set(descriptor_update_from_value(2, retry_descriptor).unwrap());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            reader,
+            serde_json::to_string(&current_descriptor).unwrap(),
+            None,
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            None,
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Idle => {}
+            other => panic!("expected transient missing descriptor to stay idle got [{other:?}]"),
+        }
+        assert_eq!(
+            driver
+                .pending_descriptor_retry
+                .as_ref()
+                .map(|update| update.descriptor_generation),
+            Some(2)
+        );
+
+        std::fs::copy(source_shm_path, &target_shm_path).unwrap();
+        driver.next_descriptor_retry_at = Instant::now();
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 2),
+            other => panic!("expected retried descriptor update got [{other:?}]"),
+        }
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected rows from retried descriptor got [{other:?}]"),
+        }
+        drop(driver);
+        let _ = std::fs::remove_file(target_shm_path);
     }
 
     #[test]
