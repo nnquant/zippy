@@ -3388,6 +3388,168 @@ fn native_gateway_slow_subscribe_client_does_not_block_writes_or_metrics() {
 }
 
 #[test]
+fn native_gateway_subscribe_perf_smoke_reports_delivery_metrics() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint,
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(2048),
+        max_connections: Some(8),
+        max_subscribers: Some(4),
+        max_blocking_requests: Some(4),
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("seq", DataType::Int64, false),
+    ]));
+    let mut client = MasterClient::connect_endpoint(master_endpoint).unwrap();
+    client.register_process("subscribe_perf_writer").unwrap();
+    client
+        .register_stream("subscribe_perf_rows_ticks", schema.clone(), 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "subscribe_perf_rows_source",
+            "test",
+            "subscribe_perf_rows_ticks",
+            json!({}),
+        )
+        .unwrap();
+    let mut row_materializer = master_bound_materializer(
+        &mut client,
+        "subscribe_perf_rows_ticks",
+        schema.clone(),
+        256,
+    );
+    client
+        .publish_segment_descriptor_bytes(
+            "subscribe_perf_rows_ticks",
+            &row_materializer.active_descriptor_envelope_bytes().unwrap(),
+        )
+        .unwrap();
+
+    let mut row_stream = TcpStream::connect(gateway.endpoint()).unwrap();
+    row_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut row_stream,
+        json!({
+            "kind": "subscribe_rows",
+            "source": "subscribe_perf_rows_ticks",
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    assert_eq!(
+        read_gateway_stream_frame(&mut row_stream).0["kind"],
+        "subscribed"
+    );
+
+    let row_count = 128_usize;
+    row_materializer
+        .on_data(SegmentTableView::from_record_batch(
+            sequential_gateway_batch(schema.clone(), row_count, 0),
+        ))
+        .unwrap();
+    row_materializer.on_flush().unwrap();
+
+    let first_row_started = Instant::now();
+    let mut received_rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let (frame, payload) = read_gateway_stream_frame(&mut row_stream);
+        assert_eq!(frame["status"], "ok");
+        assert_eq!(frame["kind"], "row");
+        assert!(payload.is_empty());
+        received_rows.push(frame["row"]["seq"].as_i64().unwrap());
+    }
+    assert!(first_row_started.elapsed() < Duration::from_secs(2));
+    assert_eq!(received_rows, (0..row_count as i64).collect::<Vec<_>>());
+
+    client
+        .register_stream("subscribe_perf_table_ticks", schema.clone(), 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "subscribe_perf_table_source",
+            "test",
+            "subscribe_perf_table_ticks",
+            json!({}),
+        )
+        .unwrap();
+    let mut table_materializer = master_bound_materializer(
+        &mut client,
+        "subscribe_perf_table_ticks",
+        schema.clone(),
+        256,
+    );
+    client
+        .publish_segment_descriptor_bytes(
+            "subscribe_perf_table_ticks",
+            &table_materializer
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+    let mut table_stream = TcpStream::connect(gateway.endpoint()).unwrap();
+    table_stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write_gateway_stream_request(
+        &mut table_stream,
+        json!({
+            "kind": "subscribe_table",
+            "source": "subscribe_perf_table_ticks",
+            "token": "dev-token",
+            "batch_size": 128
+        }),
+        vec![],
+    );
+    assert_eq!(
+        read_gateway_stream_frame(&mut table_stream).0["kind"],
+        "subscribed"
+    );
+
+    let table_row_count = 128_usize;
+    table_materializer
+        .on_data(SegmentTableView::from_record_batch(
+            sequential_gateway_batch(schema, table_row_count, 10_000),
+        ))
+        .unwrap();
+    table_materializer.on_flush().unwrap();
+
+    let table_started = Instant::now();
+    let (frame, payload) = read_gateway_stream_frame(&mut table_stream);
+    assert!(table_started.elapsed() < Duration::from_secs(2));
+    assert_eq!(frame["status"], "ok");
+    assert_eq!(frame["kind"], "table");
+    let table = decode_ipc_batch(&payload);
+    assert_eq!(table.num_rows(), table_row_count);
+
+    let metrics = gateway.metrics();
+    assert_eq!(metrics["subscribe_rows_delivered_total"], json!(row_count));
+    assert_eq!(metrics["subscribe_tables_delivered_total"], json!(1));
+    assert_eq!(
+        metrics["subscribe_table_rows_delivered_total"],
+        json!(table_row_count)
+    );
+
+    drop(row_stream);
+    drop(table_stream);
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_applies_lazy_shape_collect_plan() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());
@@ -3804,6 +3966,27 @@ fn write_parquet_batch(path: &Path, batch: &RecordBatch) {
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
     writer.write(batch).unwrap();
     writer.close().unwrap();
+}
+
+fn sequential_gateway_batch(
+    schema: std::sync::Arc<Schema>,
+    rows: usize,
+    seq_offset: i64,
+) -> RecordBatch {
+    let instruments = (0..rows)
+        .map(|row| format!("IF{:04}", 2600 + row))
+        .collect::<Vec<_>>();
+    let seq = (0..rows)
+        .map(|row| seq_offset + row as i64)
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(StringArray::from(instruments)),
+            std::sync::Arc::new(Int64Array::from(seq)),
+        ],
+    )
+    .unwrap()
 }
 
 fn send_gateway_frame(

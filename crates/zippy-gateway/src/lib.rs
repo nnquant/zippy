@@ -761,6 +761,9 @@ struct GatewayMetrics {
     write_rejections_total: u64,
     collect_requests_total: u64,
     subscribe_clients_total: u64,
+    subscribe_rows_delivered_total: u64,
+    subscribe_tables_delivered_total: u64,
+    subscribe_table_rows_delivered_total: u64,
     master_async_requests_total: u64,
     master_process_reregistrations_total: u64,
     connections_active: u64,
@@ -904,6 +907,9 @@ impl GatewayServer {
             "write_rejections_total": metrics.write_rejections_total,
             "collect_requests_total": metrics.collect_requests_total,
             "subscribe_clients_total": metrics.subscribe_clients_total,
+            "subscribe_rows_delivered_total": metrics.subscribe_rows_delivered_total,
+            "subscribe_tables_delivered_total": metrics.subscribe_tables_delivered_total,
+            "subscribe_table_rows_delivered_total": metrics.subscribe_table_rows_delivered_total,
             "master_async_requests_total": metrics.master_async_requests_total,
             "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
             "connections_active": metrics.connections_active,
@@ -1852,6 +1858,9 @@ impl GatewayState {
             "write_rejections_total": metrics.write_rejections_total,
             "collect_requests_total": metrics.collect_requests_total,
             "subscribe_clients_total": metrics.subscribe_clients_total,
+            "subscribe_rows_delivered_total": metrics.subscribe_rows_delivered_total,
+            "subscribe_tables_delivered_total": metrics.subscribe_tables_delivered_total,
+            "subscribe_table_rows_delivered_total": metrics.subscribe_table_rows_delivered_total,
             "master_async_requests_total": metrics.master_async_requests_total,
             "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
             "connections_active": metrics.connections_active,
@@ -2788,14 +2797,20 @@ async fn handle_subscribe_stream_async(
                         &[],
                     )
                     .await?;
+                    state.increment_metric(|metrics| metrics.subscribe_rows_delivered_total += 1);
                 }
                 GatewaySubscribeEvent::Table(next_batch) => {
+                    let delivered_rows = next_batch.num_rows() as u64;
                     let payload = run_blocking_request(Arc::clone(&state), move || {
                         encode_ipc_table(&next_batch)
                     })
                     .await?;
                     write_frame_async(stream, &json!({"status": "ok", "kind": "table"}), &payload)
                         .await?;
+                    state.increment_metric(|metrics| {
+                        metrics.subscribe_tables_delivered_total += 1;
+                        metrics.subscribe_table_rows_delivered_total += delivered_rows;
+                    });
                 }
             }
         }
