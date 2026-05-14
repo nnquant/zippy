@@ -103,6 +103,87 @@ fn native_gateway_accepts_arrow_write_batch_and_publishes_descriptor() {
 }
 
 #[test]
+fn native_gateway_reports_writer_segment_timing_metrics() {
+    let master_endpoint = loopback_control_endpoint();
+    let (master, master_thread) = spawn_master(master_endpoint.clone());
+    let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
+    let gateway = GatewayServer::new(GatewayServerConfig {
+        endpoint: gateway_endpoint.clone(),
+        master_endpoint: master_endpoint.clone(),
+        token: Some("dev-token".to_string()),
+        max_write_rows: Some(1024),
+        max_connections: None,
+        max_subscribers: None,
+        max_blocking_requests: None,
+        write_timeout_ms: None,
+    })
+    .unwrap()
+    .start()
+    .unwrap();
+
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ])),
+        vec![
+            std::sync::Arc::new(StringArray::from(vec!["IF2606"])),
+            std::sync::Arc::new(Float64Array::from(vec![4102.5])),
+        ],
+    )
+    .unwrap();
+    let response = send_gateway_frame(
+        gateway.endpoint(),
+        json!({
+            "kind": "write_batch",
+            "stream_name": "writer_metrics_ticks",
+            "token": "dev-token",
+            "rows": 1
+        }),
+        encode_ipc_batch(&batch),
+    );
+    assert_eq!(response["status"], "ok");
+
+    let metrics = gateway.metrics();
+    assert_eq!(metrics["writer_map_lock_wait_count"], json!(1));
+    assert_eq!(metrics["writer_lock_wait_count"], json!(1));
+    assert_eq!(metrics["writer_create_count"], json!(1));
+    assert_eq!(metrics["writer_on_data_count"], json!(1));
+    assert_eq!(metrics["writer_flush_count"], json!(1));
+    assert!(
+        metrics["writer_descriptor_publish_count"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+    for name in [
+        "writer_map_lock_wait_last_ms",
+        "writer_map_lock_wait_total_ms",
+        "writer_lock_wait_last_ms",
+        "writer_lock_wait_total_ms",
+        "writer_create_last_ms",
+        "writer_create_total_ms",
+        "writer_on_data_last_ms",
+        "writer_on_data_total_ms",
+        "writer_flush_last_ms",
+        "writer_flush_total_ms",
+        "writer_descriptor_publish_last_ms",
+        "writer_descriptor_publish_total_ms",
+    ] {
+        assert!(
+            metrics[name].as_f64().is_some(),
+            "metric must be numeric name=[{}] metrics=[{}]",
+            name,
+            metrics
+        );
+    }
+
+    gateway.stop();
+    master.shutdown();
+    master_thread.join().unwrap().unwrap();
+}
+
+#[test]
 fn native_gateway_binds_writer_epoch_to_master_source_epoch() {
     let master_endpoint = loopback_control_endpoint();
     let (master, master_thread) = spawn_master(master_endpoint.clone());

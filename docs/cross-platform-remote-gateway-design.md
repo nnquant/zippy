@@ -449,7 +449,9 @@ Windows 原生 master + Windows 原生 segment backend
 - gateway metrics：已提供 `GatewayServer.metrics()` 和远端 `metrics` request，并暴露
   `max_connections`、`max_subscribers`、`max_blocking_requests` 等资源上限，以及
   `subscribe_rows_delivered_total`、`subscribe_tables_delivered_total`、
-  `subscribe_table_rows_delivered_total` 等订阅交付计数；
+  `subscribe_table_rows_delivered_total` 等订阅交付计数；writer 热路径已暴露
+  `writer_map_lock_wait_*`、`writer_lock_wait_*`、`writer_on_data_*`、`writer_flush_*` 和
+  `writer_descriptor_publish_*` 分段耗时 metrics；
 - client reconnect：`RemoteStreamSubscriber` 已支持 Gateway 暂不可用时按间隔重连；
 - backpressure：当前 request/response 同步阻塞，且 `max_write_rows` 可限制单批写入；
 - resource limits：`GatewayServer` 支持配置 `max_connections`、`max_subscribers`、

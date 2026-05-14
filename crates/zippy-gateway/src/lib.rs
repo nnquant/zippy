@@ -27,7 +27,8 @@ use parquet::arrow::{
     arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
     ProjectionMask,
 };
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use zippy_core::bus_protocol::{
     AcquireSegmentReaderLeaseRequest, ReleaseSegmentReaderLeaseRequest, WatchRequest, WatchResource,
@@ -761,6 +762,24 @@ struct GatewayMetrics {
     write_batches_total: u64,
     written_rows_total: u64,
     write_rejections_total: u64,
+    writer_map_lock_wait_count: u64,
+    writer_map_lock_wait_last_ms: f64,
+    writer_map_lock_wait_total_ms: f64,
+    writer_lock_wait_count: u64,
+    writer_lock_wait_last_ms: f64,
+    writer_lock_wait_total_ms: f64,
+    writer_create_count: u64,
+    writer_create_last_ms: f64,
+    writer_create_total_ms: f64,
+    writer_on_data_count: u64,
+    writer_on_data_last_ms: f64,
+    writer_on_data_total_ms: f64,
+    writer_flush_count: u64,
+    writer_flush_last_ms: f64,
+    writer_flush_total_ms: f64,
+    writer_descriptor_publish_count: u64,
+    writer_descriptor_publish_last_ms: f64,
+    writer_descriptor_publish_total_ms: f64,
     collect_requests_total: u64,
     subscribe_clients_total: u64,
     subscribe_rows_delivered_total: u64,
@@ -785,6 +804,7 @@ struct GatewayMetrics {
 
 struct MasterDescriptorPublisher {
     master: Arc<GatewayAsyncMasterClient>,
+    metrics: Arc<Mutex<GatewayMetrics>>,
     stream_name: String,
 }
 
@@ -909,40 +929,27 @@ impl GatewayServer {
     /// Return GatewayServer metrics as JSON.
     pub fn metrics(&self) -> Value {
         let metrics = self.state.metrics.lock().unwrap().clone();
-        json!({
-            "endpoint": self.endpoint,
-            "running": !self.state.stopped.load(Ordering::SeqCst),
-            "requests_total": metrics.requests_total,
-            "auth_failures_total": metrics.auth_failures_total,
-            "errors_total": metrics.errors_total,
-            "write_batches_total": metrics.write_batches_total,
-            "written_rows_total": metrics.written_rows_total,
-            "write_rejections_total": metrics.write_rejections_total,
-            "collect_requests_total": metrics.collect_requests_total,
-            "subscribe_clients_total": metrics.subscribe_clients_total,
-            "subscribe_rows_delivered_total": metrics.subscribe_rows_delivered_total,
-            "subscribe_tables_delivered_total": metrics.subscribe_tables_delivered_total,
-            "subscribe_table_rows_delivered_total": metrics.subscribe_table_rows_delivered_total,
-            "subscribe_write_timeouts_total": metrics.subscribe_write_timeouts_total,
-            "subscribe_slow_clients_total": metrics.subscribe_slow_clients_total,
-            "subscribe_last_close_reason": metrics.subscribe_last_close_reason.clone(),
-            "subscribe_last_write_elapsed_ms": metrics.subscribe_last_write_elapsed_ms,
-            "subscribe_write_elapsed_ms_total": metrics.subscribe_write_elapsed_ms_total,
-            "master_async_requests_total": metrics.master_async_requests_total,
-            "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
-            "connections_active": metrics.connections_active,
-            "connections_rejected_total": metrics.connections_rejected_total,
-            "max_connections": self.state.max_connections,
-            "blocking_requests_active": metrics.blocking_requests_active,
-            "blocking_requests_rejected_total": metrics.blocking_requests_rejected_total,
-            "max_blocking_requests": self.state.max_blocking_requests,
-            "subscribe_clients_active": metrics.subscribe_clients_active,
-            "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
-            "max_subscribers": self.state.max_subscribers,
-            "write_timeout_ms": self.state.write_timeout.as_millis() as u64,
-            "request_timeouts_total": metrics.request_timeouts_total,
-            "payload_timeouts_total": metrics.payload_timeouts_total,
-        })
+        let mut value = gateway_metrics_json(&metrics);
+        let fields = value.as_object_mut().unwrap();
+        insert_json_metric(fields, "endpoint", self.endpoint.clone());
+        insert_json_metric(
+            fields,
+            "running",
+            !self.state.stopped.load(Ordering::SeqCst),
+        );
+        insert_json_metric(fields, "max_connections", self.state.max_connections);
+        insert_json_metric(
+            fields,
+            "max_blocking_requests",
+            self.state.max_blocking_requests,
+        );
+        insert_json_metric(fields, "max_subscribers", self.state.max_subscribers);
+        insert_json_metric(
+            fields,
+            "write_timeout_ms",
+            self.state.write_timeout.as_millis() as u64,
+        );
+        value
     }
 
     /// Stop the background gateway listener and flush table writers.
@@ -979,6 +986,72 @@ fn positive_gateway_limit(name: &str, configured: Option<usize>, default: usize)
     Ok(value)
 }
 
+fn elapsed_ms(elapsed: Duration) -> f64 {
+    elapsed.as_secs_f64() * 1000.0
+}
+
+fn insert_json_metric<T: Serialize>(metrics: &mut Map<String, Value>, name: &str, value: T) {
+    metrics.insert(name.to_string(), json!(value));
+}
+
+fn gateway_metrics_json(metrics: &GatewayMetrics) -> Value {
+    let mut value = Map::new();
+    macro_rules! metric_fields {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                insert_json_metric(&mut value, stringify!($field), &metrics.$field);
+            )+
+        };
+    }
+    metric_fields!(
+        requests_total,
+        auth_failures_total,
+        errors_total,
+        write_batches_total,
+        written_rows_total,
+        write_rejections_total,
+        writer_map_lock_wait_count,
+        writer_map_lock_wait_last_ms,
+        writer_map_lock_wait_total_ms,
+        writer_lock_wait_count,
+        writer_lock_wait_last_ms,
+        writer_lock_wait_total_ms,
+        writer_create_count,
+        writer_create_last_ms,
+        writer_create_total_ms,
+        writer_on_data_count,
+        writer_on_data_last_ms,
+        writer_on_data_total_ms,
+        writer_flush_count,
+        writer_flush_last_ms,
+        writer_flush_total_ms,
+        writer_descriptor_publish_count,
+        writer_descriptor_publish_last_ms,
+        writer_descriptor_publish_total_ms,
+        collect_requests_total,
+        subscribe_clients_total,
+        subscribe_rows_delivered_total,
+        subscribe_tables_delivered_total,
+        subscribe_table_rows_delivered_total,
+        subscribe_write_timeouts_total,
+        subscribe_slow_clients_total,
+        subscribe_last_close_reason,
+        subscribe_last_write_elapsed_ms,
+        subscribe_write_elapsed_ms_total,
+        master_async_requests_total,
+        master_process_reregistrations_total,
+        connections_active,
+        connections_rejected_total,
+        blocking_requests_active,
+        blocking_requests_rejected_total,
+        subscribe_clients_active,
+        subscribe_clients_rejected_total,
+        request_timeouts_total,
+        payload_timeouts_total,
+    );
+    Value::Object(value)
+}
+
 fn positive_gateway_duration_ms(
     name: &str,
     configured: Option<u64>,
@@ -997,9 +1070,25 @@ fn positive_gateway_duration_ms(
 
 impl StreamTableDescriptorPublisher for MasterDescriptorPublisher {
     fn publish(&self, descriptor_envelope: Vec<u8>) -> Result<()> {
-        self.master
+        let started = Instant::now();
+        let result = self
+            .master
             .publish_segment_descriptor_bytes_blocking(&self.stream_name, &descriptor_envelope)
+            .map(|_| ());
+        record_writer_descriptor_publish_elapsed(&self.metrics, started.elapsed());
+        result
     }
+}
+
+fn record_writer_descriptor_publish_elapsed(
+    metrics: &Arc<Mutex<GatewayMetrics>>,
+    elapsed: Duration,
+) {
+    let elapsed_ms = elapsed_ms(elapsed);
+    let mut metrics = metrics.lock().unwrap();
+    metrics.writer_descriptor_publish_count += 1;
+    metrics.writer_descriptor_publish_last_ms = elapsed_ms;
+    metrics.writer_descriptor_publish_total_ms += elapsed_ms;
 }
 
 impl GatewayAsyncMasterClient {
@@ -1761,11 +1850,21 @@ impl GatewayState {
     fn write_batch(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
         let writer = self.writer_handle(stream_name, batch.schema())?;
         {
+            let writer_lock_started = Instant::now();
             let mut writer = writer.lock().unwrap();
+            let writer_lock_wait = writer_lock_started.elapsed();
+            let on_data_started = Instant::now();
             writer
                 .materializer
                 .on_data(SegmentTableView::from_record_batch(batch))?;
+            let on_data_elapsed = on_data_started.elapsed();
+            let flush_started = Instant::now();
             writer.materializer.on_flush()?;
+            let flush_elapsed = flush_started.elapsed();
+            drop(writer);
+            self.record_writer_lock_wait(writer_lock_wait);
+            self.record_writer_on_data_elapsed(on_data_elapsed);
+            self.record_writer_flush_elapsed(flush_elapsed);
         }
         self.subscribe_catalog_notifier.mark_activity();
         Ok(())
@@ -1802,13 +1901,23 @@ impl GatewayState {
         stream_name: &str,
         schema: SchemaRef,
     ) -> Result<GatewayTableWriterHandle> {
+        let map_lock_started = Instant::now();
         let mut writers = self.writers.lock().unwrap();
+        let map_lock_wait = map_lock_started.elapsed();
         if let Some(writer) = writers.get(stream_name) {
-            return Ok(Arc::clone(writer));
+            let writer = Arc::clone(writer);
+            drop(writers);
+            self.record_writer_map_lock_wait(map_lock_wait);
+            return Ok(writer);
         }
 
+        let create_started = Instant::now();
         let writer = Arc::new(Mutex::new(self.create_writer(stream_name, schema)?));
+        let create_elapsed = create_started.elapsed();
         writers.insert(stream_name.to_string(), Arc::clone(&writer));
+        drop(writers);
+        self.record_writer_map_lock_wait(map_lock_wait);
+        self.record_writer_create_elapsed(create_elapsed);
         Ok(writer)
     }
 
@@ -1822,6 +1931,7 @@ impl GatewayState {
 
         let publisher = Arc::new(MasterDescriptorPublisher {
             master: Arc::clone(&self.master),
+            metrics: Arc::clone(&self.metrics),
             stream_name: stream_name.to_string(),
         });
         let materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
@@ -1832,12 +1942,63 @@ impl GatewayState {
         )?
         .with_descriptor_publisher(publisher);
         let descriptor = materializer.active_descriptor_envelope_bytes()?;
+        let descriptor_publish_started = Instant::now();
         self.master
             .publish_segment_descriptor_bytes_blocking(stream_name, &descriptor)?;
+        self.record_writer_descriptor_publish_elapsed(descriptor_publish_started.elapsed());
         Ok(GatewayTableWriter {
             source_name,
             materializer,
         })
+    }
+
+    fn record_writer_map_lock_wait(&self, elapsed: Duration) {
+        self.increment_metric(|metrics| {
+            let elapsed_ms = elapsed_ms(elapsed);
+            metrics.writer_map_lock_wait_count += 1;
+            metrics.writer_map_lock_wait_last_ms = elapsed_ms;
+            metrics.writer_map_lock_wait_total_ms += elapsed_ms;
+        });
+    }
+
+    fn record_writer_lock_wait(&self, elapsed: Duration) {
+        self.increment_metric(|metrics| {
+            let elapsed_ms = elapsed_ms(elapsed);
+            metrics.writer_lock_wait_count += 1;
+            metrics.writer_lock_wait_last_ms = elapsed_ms;
+            metrics.writer_lock_wait_total_ms += elapsed_ms;
+        });
+    }
+
+    fn record_writer_create_elapsed(&self, elapsed: Duration) {
+        self.increment_metric(|metrics| {
+            let elapsed_ms = elapsed_ms(elapsed);
+            metrics.writer_create_count += 1;
+            metrics.writer_create_last_ms = elapsed_ms;
+            metrics.writer_create_total_ms += elapsed_ms;
+        });
+    }
+
+    fn record_writer_on_data_elapsed(&self, elapsed: Duration) {
+        self.increment_metric(|metrics| {
+            let elapsed_ms = elapsed_ms(elapsed);
+            metrics.writer_on_data_count += 1;
+            metrics.writer_on_data_last_ms = elapsed_ms;
+            metrics.writer_on_data_total_ms += elapsed_ms;
+        });
+    }
+
+    fn record_writer_flush_elapsed(&self, elapsed: Duration) {
+        self.increment_metric(|metrics| {
+            let elapsed_ms = elapsed_ms(elapsed);
+            metrics.writer_flush_count += 1;
+            metrics.writer_flush_last_ms = elapsed_ms;
+            metrics.writer_flush_total_ms += elapsed_ms;
+        });
+    }
+
+    fn record_writer_descriptor_publish_elapsed(&self, elapsed: Duration) {
+        record_writer_descriptor_publish_elapsed(&self.metrics, elapsed);
     }
 
     fn handle_get_stream(&self, header: Value) -> Result<(Value, Vec<u8>)> {
@@ -1884,35 +2045,13 @@ impl GatewayState {
 
     fn metrics_value(&self) -> Value {
         let metrics = self.metrics.lock().unwrap().clone();
-        json!({
-            "requests_total": metrics.requests_total,
-            "auth_failures_total": metrics.auth_failures_total,
-            "errors_total": metrics.errors_total,
-            "write_batches_total": metrics.write_batches_total,
-            "written_rows_total": metrics.written_rows_total,
-            "write_rejections_total": metrics.write_rejections_total,
-            "collect_requests_total": metrics.collect_requests_total,
-            "subscribe_clients_total": metrics.subscribe_clients_total,
-            "subscribe_rows_delivered_total": metrics.subscribe_rows_delivered_total,
-            "subscribe_tables_delivered_total": metrics.subscribe_tables_delivered_total,
-            "subscribe_table_rows_delivered_total": metrics.subscribe_table_rows_delivered_total,
-            "subscribe_write_timeouts_total": metrics.subscribe_write_timeouts_total,
-            "subscribe_slow_clients_total": metrics.subscribe_slow_clients_total,
-            "subscribe_last_close_reason": metrics.subscribe_last_close_reason.clone(),
-            "subscribe_last_write_elapsed_ms": metrics.subscribe_last_write_elapsed_ms,
-            "subscribe_write_elapsed_ms_total": metrics.subscribe_write_elapsed_ms_total,
-            "master_async_requests_total": metrics.master_async_requests_total,
-            "master_process_reregistrations_total": metrics.master_process_reregistrations_total,
-            "connections_active": metrics.connections_active,
-            "connections_rejected_total": metrics.connections_rejected_total,
-            "blocking_requests_active": metrics.blocking_requests_active,
-            "blocking_requests_rejected_total": metrics.blocking_requests_rejected_total,
-            "subscribe_clients_active": metrics.subscribe_clients_active,
-            "subscribe_clients_rejected_total": metrics.subscribe_clients_rejected_total,
-            "write_timeout_ms": self.write_timeout.as_millis() as u64,
-            "request_timeouts_total": metrics.request_timeouts_total,
-            "payload_timeouts_total": metrics.payload_timeouts_total,
-        })
+        let mut value = gateway_metrics_json(&metrics);
+        insert_json_metric(
+            value.as_object_mut().unwrap(),
+            "write_timeout_ms",
+            self.write_timeout.as_millis() as u64,
+        );
+        value
     }
 
     fn increment_metric(&self, update: impl FnOnce(&mut GatewayMetrics)) {

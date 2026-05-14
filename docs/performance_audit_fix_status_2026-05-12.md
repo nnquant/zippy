@@ -20,7 +20,7 @@
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch 和 chunked reader；Gateway live `collect(stream=True)` 接入 segment chunked producer；zero-copy 留待专项。 |
 | P009 persisted parquet scan 串行与 filter 读后执行 | 已修复 streaming persisted scan 基础路径，row-group pruning 留待后续 | persisted streaming collect 支持按文件有界并行扫描、确定性输出顺序和逐 batch filter/project。 |
-| P010 Gateway write 全局 writers mutex 包住 flush | 部分修复，剩余继续处理 | writer map 改为 per-stream writer handle；已有 writer 的 `on_data/on_flush` 不再持有全局 map 锁。 |
+| P010 Gateway write 全局 writers mutex 包住 flush | 已修复核心锁耦合，writer actor 留待真实指标决策 | writer map 改为 per-stream writer handle；已有 writer 的 `on_data/on_flush` 不再持有全局 map 锁；metrics 已覆盖 writer lock/on_data/flush/descriptor publish 分段耗时。 |
 | P011 subscribe 固定 sleep 轮询 | 已修复核心轮询路径 | subscribe 空闲等待接入 active segment mmap notification；gateway 内部写入 notifier 仅作为 descriptor 未就绪等启动路径兜底。 |
 | P012 benchmark 场景不能代表目标容量 | 部分修复，剩余跳过 | performance workflow 覆盖 3 个核心 profile；JSON 报告补充 git sha、target 和启动时间；完整容量矩阵仍需专项。 |
 | P013 Python remote writer 逐行 dict 路径不可见 | 部分修复，剩余跳过 | Python docstring 明确高频路径应传 Arrow table/RecordBatch；新增 `RemoteGatewayWriter.write_batch()` 显式批量入口；profile 仍需专项。 |
@@ -242,11 +242,16 @@
 - `collect()`、`get_stream()` 和 subscribe 获取 active batch/schema 时也先克隆 writer handle，再释放
   全局 map 锁后访问 materializer。
 - `close_writer()` / `close_all_writers()` 先从全局 map 移除 handle，再锁具体 writer 执行 stop/unregister。
+- `GatewayServer.metrics()` 和远端 `metrics` request 增加 writer 分段耗时指标，覆盖
+  `writer_map_lock_wait_*`、`writer_lock_wait_*`、`writer_create_*`、`writer_on_data_*`、
+  `writer_flush_*`、`writer_descriptor_publish_*`。
+- `native_gateway_reports_writer_segment_timing_metrics` 覆盖 writer metrics 的计数和数值字段。
 
 边界：
 
 - 首次创建 writer 仍在全局 map 锁内完成，避免并发重复 register stream/source 的竞态。
-- 本轮没有实现 per-stream writer actor，也没有增加 lock wait / materialize / flush 分段耗时指标。
+- 本轮没有实现 per-stream writer actor；是否需要 actor 应基于新增 metrics 的真实 lock wait、
+  flush 和 descriptor publish 分布决策。
 - 同一 stream 内写入仍串行，这是必要的单 writer 顺序语义。
 
 ### P011 Gateway subscribe idle notification
@@ -304,7 +309,7 @@
 - Gateway 查询协议：P002/P009 的限流配置化、背压式逐文件拉取和 row-group pruning。
 - engine 状态存储模型：P004/P005/P006/P007 剩余项。
 - segment/Arrow 读侧内存模型：P008 剩余项。
-- Gateway 写入调度：P010 的 writer actor 和分段耗时 metrics。
+- Gateway 写入调度：P010 的 writer actor 是否值得引入需要基于分段 metrics 评估。
 - 性能容量矩阵、长跑和报告扩展：P012 剩余项。
 - Python remote writer pipeline/profile：P013 剩余项。
 
@@ -313,7 +318,7 @@
 1. Gateway streaming collect 配置化 + parquet row-group pruning。
 2. Engine columnar state model。
 3. Segment Arrow zero-copy/chunked reader。
-4. Gateway per-stream writer actor + writer 分段耗时 metrics。
+4. Gateway writer metrics 采样 + per-stream writer actor 决策。
 5. Capacity matrix + soak + RSS/p999 performance reporting。
 6. Python remote writer async pipeline + zippy-perf profile。
 
