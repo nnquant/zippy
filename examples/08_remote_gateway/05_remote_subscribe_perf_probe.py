@@ -7,7 +7,7 @@ delivery metrics 对账。
 
 :example:
 
-    uv run python examples/08_remote_gateway/04_remote_subscribe_perf_probe.py \\
+    uv run python examples/08_remote_gateway/05_remote_subscribe_perf_probe.py \\
         --uri zippy://127.0.0.1:17690/default \\
         --stream qmt_ticks \\
         --rows 100 \\

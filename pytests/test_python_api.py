@@ -6102,7 +6102,7 @@ def test_subscribe_latency_probe_summarizes_latency_samples() -> None:
 
 def test_remote_subscribe_perf_probe_summarizes_delivery_metrics() -> None:
     module_path = (
-        WORKSPACE_ROOT / "examples" / "08_remote_gateway" / "04_remote_subscribe_perf_probe.py"
+        WORKSPACE_ROOT / "examples" / "08_remote_gateway" / "05_remote_subscribe_perf_probe.py"
     )
     spec = importlib.util.spec_from_file_location(
         "remote_subscribe_perf_probe_example", module_path
@@ -6149,6 +6149,19 @@ def test_remote_subscribe_perf_probe_summarizes_delivery_metrics() -> None:
         "subscribe_table_rows_delivered_total": 5,
     }
     assert report["gateway_delivery_matches_received"] is True
+
+
+def test_remote_gateway_examples_use_unique_number_prefixes() -> None:
+    example_dir = WORKSPACE_ROOT / "examples" / "08_remote_gateway"
+    prefixes: dict[str, str] = {}
+    duplicates: dict[str, list[str]] = {}
+    for path in sorted(example_dir.glob("[0-9][0-9]_*.py")):
+        prefix = path.name.split("_", 1)[0]
+        previous = prefixes.setdefault(prefix, path.name)
+        if previous != path.name:
+            duplicates.setdefault(prefix, [previous]).append(path.name)
+
+    assert duplicates == {}
 
 
 def test_subscribe_latency_probe_runs_against_temp_master(tmp_path: Path) -> None:

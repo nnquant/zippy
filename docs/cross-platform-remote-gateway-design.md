@@ -465,7 +465,9 @@ Windows 原生 master + Windows 原生 segment backend
 - Windows client smoke：已提供 `zippy gateway smoke-client --uri zippy://host:port/default`，
   用于在 Windows 侧连接已有 WSL/Linux master/Gateway 验收；
 - e2e examples：已补 `examples/08_remote_gateway/`，其中
-  `04_remote_subscribe_perf_probe.py` 可在远端客户端侧对账订阅交付 metrics；
+  `05_remote_subscribe_perf_probe.py` 可在远端客户端侧对账订阅交付 metrics；
+- subscribe perf CLI：已提供 `zippy gateway subscribe-perf --uri zippy://host:port/default`，
+  用于从远端客户端侧直接运行 `subscribe_table` 交付探针；
 - Windows QMT mock writer + WSL subscriber/query 验收：执行步骤见
   [remote_gateway_windows_smoke_runbook.md](remote_gateway_windows_smoke_runbook.md)。
 

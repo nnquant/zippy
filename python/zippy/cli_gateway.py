@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 
 import click
@@ -238,6 +239,146 @@ def run_gateway_smoke_client(
     }
 
 
+def _gateway_metric_int(metrics: dict[str, object], key: str) -> int:
+    value = metrics.get(key, 0)
+    if value is None:
+        return 0
+    return int(value)
+
+
+def _gateway_delivery_delta(
+    before: dict[str, object],
+    after: dict[str, object],
+) -> dict[str, int]:
+    keys = (
+        "subscribe_rows_delivered_total",
+        "subscribe_tables_delivered_total",
+        "subscribe_table_rows_delivered_total",
+    )
+    return {key: _gateway_metric_int(after, key) - _gateway_metric_int(before, key) for key in keys}
+
+
+def _remote_gateway_client_from_master(master: object) -> zippy.RemoteMasterClient:
+    if isinstance(master, zippy.RemoteMasterClient):
+        return master
+
+    config = master.get_config()
+    gateway = config.get("gateway", {})
+    if not isinstance(gateway, dict) or not gateway.get("endpoint"):
+        raise RuntimeError("master does not advertise gateway.endpoint")
+    token = str(gateway["token"]) if gateway.get("token") else None
+    return zippy.RemoteMasterClient(str(gateway["endpoint"]), token=token)
+
+
+def run_gateway_subscribe_perf(
+    *,
+    uri: str,
+    stream_name: str,
+    rows: int,
+    batch_size: int,
+    timeout_sec: float,
+    instrument_id: str | None,
+) -> dict[str, object]:
+    """
+    Run a client-only remote ``subscribe_table`` delivery probe.
+
+    :param uri: Existing remote master URI, usually ``zippy://host:port/default``.
+    :type uri: str
+    :param stream_name: Stream to subscribe.
+    :type stream_name: str
+    :param rows: Stop after receiving at least this many rows.
+    :type rows: int
+    :param batch_size: ``subscribe_table`` batch size.
+    :type batch_size: int
+    :param timeout_sec: Timeout in seconds.
+    :type timeout_sec: float
+    :param instrument_id: Optional instrument filter.
+    :type instrument_id: str | None
+    :returns: Probe report.
+    :rtype: dict[str, object]
+    """
+    if rows <= 0:
+        raise ValueError("rows must be greater than zero")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than zero")
+    if timeout_sec <= 0.0:
+        raise ValueError("timeout_sec must be greater than zero")
+
+    master = zippy.connect(uri=uri, app="gateway_subscribe_perf", local=False)
+    gateway_client = _remote_gateway_client_from_master(master)
+    metrics_before = gateway_client.gateway_metrics()
+    done = threading.Event()
+    lock = threading.Lock()
+    received_tables: list[object] = []
+    first_batch_wait_ms: float | None = None
+    started_ns = time.perf_counter_ns()
+
+    def received_row_count() -> int:
+        return sum(int(table.num_rows) for table in received_tables)
+
+    def on_table(table) -> None:
+        nonlocal first_batch_wait_ms
+        now_ns = time.perf_counter_ns()
+        with lock:
+            if first_batch_wait_ms is None:
+                first_batch_wait_ms = (now_ns - started_ns) / 1_000_000.0
+            received_tables.append(table)
+            if received_row_count() >= rows:
+                done.set()
+
+    filter_expr = None
+    if instrument_id:
+        filter_expr = zippy.col("instrument_id") == instrument_id
+
+    subscriber = zippy.subscribe_table(
+        stream_name,
+        callback=on_table,
+        filter=filter_expr,
+        batch_size=batch_size,
+        wait=True,
+        timeout=timeout_sec,
+    )
+    try:
+        if not done.wait(timeout_sec):
+            with lock:
+                received_rows = received_row_count()
+            raise TimeoutError(
+                "gateway subscribe-perf timed out "
+                f"stream_name=[{stream_name}] received_rows=[{received_rows}] "
+                f"expected_rows=[{rows}] timeout_sec=[{timeout_sec}]"
+            )
+
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        metrics_after = gateway_client.gateway_metrics()
+        with lock:
+            batch_rows = [int(table.num_rows) for table in received_tables]
+            received_rows = sum(batch_rows)
+            received_table_count = len(received_tables)
+            first_wait = first_batch_wait_ms
+        delivery_delta = _gateway_delivery_delta(metrics_before, metrics_after)
+        return {
+            "uri": uri,
+            "stream": stream_name,
+            "expected_rows": rows,
+            "batch_size": batch_size,
+            "timeout_sec": timeout_sec,
+            "received_tables": received_table_count,
+            "received_rows": received_rows,
+            "batch_rows": batch_rows,
+            "first_batch_wait_ms": first_wait,
+            "elapsed_ms": elapsed_ms,
+            "gateway_delivery_delta": delivery_delta,
+            "gateway_delivery_matches_received": (
+                delivery_delta["subscribe_tables_delivered_total"] == received_table_count
+                and delivery_delta["subscribe_table_rows_delivered_total"] == received_rows
+            ),
+            "gateway_metrics_before": metrics_before,
+            "gateway_metrics_after": metrics_after,
+        }
+    finally:
+        subscriber.stop()
+
+
 @gateway_group.command("run")
 @click.option(
     "--uri",
@@ -388,4 +529,51 @@ def smoke_gateway_client(uri: str, stream_name: str, as_json: bool) -> None:
         click.echo(
             "gateway smoke-client ok "
             f"stream_name=[{result['stream_name']}] rows=[{result['rows']}]"
+        )
+
+
+@gateway_group.command("subscribe-perf")
+@click.option(
+    "--uri",
+    required=True,
+    help="existing remote master URI, for example zippy://wsl-host:17690/default",
+)
+@click.option("--stream", "stream_name", default="qmt_ticks", show_default=True)
+@click.option("--rows", type=int, default=100, show_default=True)
+@click.option("--batch-size", type=int, default=1, show_default=True)
+@click.option("--timeout-sec", type=float, default=10.0, show_default=True)
+@click.option("--instrument-id", default=None, help="optional instrument_id filter")
+@click.option("--json", "as_json", is_flag=True, default=False, help="emit JSON output")
+def subscribe_perf_gateway(
+    uri: str,
+    stream_name: str,
+    rows: int,
+    batch_size: int,
+    timeout_sec: float,
+    instrument_id: str | None,
+    as_json: bool,
+) -> None:
+    """
+    Run a client-only remote subscribe_table delivery probe.
+    """
+    try:
+        result = run_gateway_subscribe_perf(
+            uri=uri,
+            stream_name=stream_name,
+            rows=rows,
+            batch_size=batch_size,
+            timeout_sec=timeout_sec,
+            instrument_id=instrument_id,
+        )
+    except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+        cli_error(str(error))
+    if as_json:
+        echo_json(result)
+    else:
+        click.echo(
+            "gateway subscribe-perf ok "
+            f"stream_name=[{result['stream']}] "
+            f"received_rows=[{result['received_rows']}] "
+            f"received_tables=[{result['received_tables']}] "
+            f"metrics_match=[{result['gateway_delivery_matches_received']}]"
         )

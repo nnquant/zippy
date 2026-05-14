@@ -354,6 +354,69 @@ def test_gateway_smoke_client_uses_existing_remote_uri(monkeypatch: pytest.Monke
     assert "windows_smoke_ticks" in result.output
 
 
+def test_gateway_subscribe_perf_uses_existing_remote_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, object]] = []
+
+    def fake_subscribe_perf(
+        *,
+        uri: str,
+        stream_name: str,
+        rows: int,
+        batch_size: int,
+        timeout_sec: float,
+        instrument_id: str | None,
+    ) -> dict[str, object]:
+        events.append(
+            (
+                "subscribe_perf",
+                (uri, stream_name, rows, batch_size, timeout_sec, instrument_id),
+            )
+        )
+        return {
+            "stream": stream_name,
+            "received_rows": rows,
+            "received_tables": 3,
+            "gateway_delivery_matches_received": True,
+        }
+
+    monkeypatch.setattr("zippy.cli_gateway.run_gateway_subscribe_perf", fake_subscribe_perf)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "gateway",
+            "subscribe-perf",
+            "--uri",
+            "zippy://wsl-host:17690/default",
+            "--stream",
+            "qmt_ticks",
+            "--rows",
+            "100",
+            "--batch-size",
+            "8",
+            "--timeout-sec",
+            "3.5",
+            "--instrument-id",
+            "IF2606",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == [
+        (
+            "subscribe_perf",
+            ("zippy://wsl-host:17690/default", "qmt_ticks", 100, 8, 3.5, "IF2606"),
+        )
+    ]
+    assert "gateway subscribe-perf ok stream_name=[qmt_ticks]" in result.output
+    assert "received_rows=[100]" in result.output
+    assert "received_tables=[3]" in result.output
+    assert "metrics_match=[True]" in result.output
+
+
 def test_master_run_returns_click_error_when_server_start_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
