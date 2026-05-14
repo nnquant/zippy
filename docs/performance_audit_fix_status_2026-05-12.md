@@ -21,7 +21,7 @@
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch 和 chunked reader；Gateway live `collect(stream=True)` 接入 segment chunked producer；zero-copy 留待专项。 |
 | P009 persisted parquet scan 串行与 filter 读后执行 | 已修复 streaming persisted scan 基础路径，row-group pruning 留待后续 | persisted streaming collect 支持按文件有界并行扫描、确定性输出顺序和逐 batch filter/project。 |
 | P010 Gateway write 全局 writers mutex 包住 flush | 部分修复，剩余继续处理 | writer map 改为 per-stream writer handle；已有 writer 的 `on_data/on_flush` 不再持有全局 map 锁。 |
-| P011 subscribe 固定 sleep 轮询 | 部分修复，剩余继续处理 | 本 gateway 写入成功后通知 subscribe idle wait；跨进程 active-segment notification 留待专项。 |
+| P011 subscribe 固定 sleep 轮询 | 已修复核心轮询路径 | subscribe 空闲等待接入 active segment mmap notification；gateway 内部写入 notifier 仅作为 descriptor 未就绪等启动路径兜底。 |
 | P012 benchmark 场景不能代表目标容量 | 部分修复，剩余跳过 | performance workflow 覆盖 3 个核心 profile；JSON 报告补充 git sha、target 和启动时间；完整容量矩阵仍需专项。 |
 | P013 Python remote writer 逐行 dict 路径不可见 | 部分修复，剩余跳过 | Python docstring 明确高频路径应传 Arrow table/RecordBatch；新增 `RemoteGatewayWriter.write_batch()` 显式批量入口；profile 仍需专项。 |
 
@@ -256,15 +256,19 @@
 - `GatewayState` 增加 `GatewaySubscribeNotifier`，用单调递增 activity sequence 区分真实写入活动。
 - `write_batch()` 在 `on_data()` 和 `on_flush()` 成功后发布 subscribe activity notification。
 - subscribe 空闲时不再固定 `sleep(5ms)`；现在先记录 fetch 前的 sequence，若 fetch 后没有新 batch，
-  则等待 activity notification，最多 1 秒兜底。
+  则等待 active segment mmap notification，兜底超时为 100ms。
 - sequence 检查覆盖“写入发生在 fetch 和 wait 之间”的竞态，避免订阅方错过通知后无意义等待。
+- `native_gateway_subscribe_table_uses_active_segment_notifications` 覆盖外部 writer 直接写 active
+  segment 后唤醒 remote `subscribe_table`，不依赖 gateway 自己的写入 notifier。
+- slow subscriber 采用 fail-fast：订阅 socket 写出超过 `write_timeout_ms` 后关闭该 subscriber、
+  释放 lease，并累计 `subscribe_write_timeouts_total`、`subscribe_slow_clients_total` 和
+  `subscribe_last_close_reason`。
 
 边界：
 
-- 本轮通知只覆盖通过当前 gateway 写入的 stream。
-- 其他进程写入、segment rollover、descriptor 更新和 shutdown 还没有接入
-  `ActiveSegmentReader::wait_for_notification_after()`。
-- subscribe 仍是 best-effort 语义；本轮没有引入 per-stream subscriber registry 或 backpressure policy。
+- descriptor 尚未发布、stream 尚未注册、Gateway stop 等控制面路径仍使用 bounded timeout 兜底；
+  数据行提交路径已经走 active segment notification。
+- subscribe 仍是 best-effort 语义；本轮没有引入 per-stream subscriber registry。
 
 ### P012 性能覆盖
 
@@ -300,7 +304,7 @@
 - Gateway 查询协议：P002/P009 的限流配置化、背压式逐文件拉取和 row-group pruning。
 - engine 状态存储模型：P004/P005/P006/P007 剩余项。
 - segment/Arrow 读侧内存模型：P008 剩余项。
-- Gateway 写入调度和订阅调度：P010、P011 剩余项。
+- Gateway 写入调度：P010 的 writer actor 和分段耗时 metrics。
 - 性能容量矩阵、长跑和报告扩展：P012 剩余项。
 - Python remote writer pipeline/profile：P013 剩余项。
 
