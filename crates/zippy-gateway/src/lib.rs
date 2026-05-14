@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Cursor;
 use std::net::{TcpListener as StdTcpListener, TcpStream};
@@ -30,7 +30,7 @@ use parquet::arrow::{
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use zippy_core::bus_protocol::{
-    AcquireSegmentReaderLeaseRequest, ReleaseSegmentReaderLeaseRequest,
+    AcquireSegmentReaderLeaseRequest, ReleaseSegmentReaderLeaseRequest, WatchRequest, WatchResource,
 };
 use zippy_core::{
     canonical_schema_hash, schema_metadata, send_control_line_request, ControlEndpoint,
@@ -55,7 +55,7 @@ const DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS: usize = 64;
 const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_GATEWAY_SUBSCRIBE_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM: usize = 4;
 const DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS: usize = 8;
 const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
@@ -81,7 +81,7 @@ struct GatewayState {
     token: Option<String>,
     max_write_rows: Option<usize>,
     writers: Mutex<BTreeMap<String, GatewayTableWriterHandle>>,
-    subscribe_notifier: GatewaySubscribeNotifier,
+    subscribe_catalog_notifier: GatewaySubscribeCatalogNotifier,
     snapshots: Mutex<HashMap<String, GatewaySnapshot>>,
     snapshot_counter: AtomicU64,
     metrics: Arc<Mutex<GatewayMetrics>>,
@@ -104,12 +104,12 @@ struct GatewayTableWriter {
 type GatewayTableWriterHandle = Arc<Mutex<GatewayTableWriter>>;
 
 #[derive(Default)]
-struct GatewaySubscribeNotifier {
+struct GatewaySubscribeCatalogNotifier {
     sequence: AtomicU64,
     notify: tokio::sync::Notify,
 }
 
-impl GatewaySubscribeNotifier {
+impl GatewaySubscribeCatalogNotifier {
     fn mark_activity(&self) {
         self.sequence.fetch_add(1, Ordering::SeqCst);
         self.notify.notify_waiters();
@@ -670,16 +670,43 @@ struct GatewayFrameHeader {
 
 #[derive(Clone)]
 struct GatewaySubscribeRequest {
+    mode: GatewaySubscribeMode,
     source: String,
     filter: Option<Value>,
+    instrument_ids: Option<HashSet<String>>,
     batch_size: Option<usize>,
     count: Option<usize>,
     throttle: Option<Duration>,
 }
 
-struct GatewaySubscribeFetch {
-    next_sent_row_count: usize,
-    batch: Option<RecordBatch>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewaySubscribeMode {
+    Rows,
+    Table,
+}
+
+struct GatewayActiveSubscribeDriver {
+    request: GatewaySubscribeRequest,
+    master: Arc<GatewayAsyncMasterClient>,
+    reader: ActiveSegmentReader,
+    segment_schema: CompiledSchema,
+    descriptor_generation: u64,
+    pending: VecDeque<GatewaySubscribeEvent>,
+    table_pending: Vec<RecordBatch>,
+    table_pending_rows: usize,
+    table_last_emit_at: Instant,
+    _lease: SegmentReaderLeaseGuard,
+}
+
+enum GatewaySubscribeEvent {
+    Idle,
+    Row(Value),
+    Table(RecordBatch),
+}
+
+struct GatewaySubscribeStep {
+    driver: GatewayActiveSubscribeDriver,
+    event: GatewaySubscribeEvent,
 }
 
 #[derive(Clone, Copy)]
@@ -767,7 +794,7 @@ impl GatewayServer {
                 token: config.token,
                 max_write_rows: config.max_write_rows,
                 writers: Mutex::new(BTreeMap::new()),
-                subscribe_notifier: GatewaySubscribeNotifier::default(),
+                subscribe_catalog_notifier: GatewaySubscribeCatalogNotifier::default(),
                 snapshots: Mutex::new(HashMap::new()),
                 snapshot_counter: AtomicU64::new(0),
                 metrics,
@@ -1069,6 +1096,41 @@ impl GatewayAsyncMasterClient {
         .and_then(|response| match response {
             ControlResponse::SegmentReaderLeaseReleased { .. } => Ok(()),
             other => Err(unexpected_response("SegmentReaderLeaseReleased", other)),
+        })
+    }
+
+    fn wait_segment_descriptor_blocking(
+        &self,
+        stream_name: &str,
+        after_descriptor_generation: u64,
+        timeout: Duration,
+    ) -> Result<Option<(u64, Value)>> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.with_process_blocking(|process| {
+            ControlRequest::Watch(WatchRequest {
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+                resource: WatchResource::SegmentDescriptor {
+                    stream_name: stream_name.to_string(),
+                },
+                after_revision: after_descriptor_generation,
+                timeout_ms,
+            })
+        })
+        .and_then(|response| match response {
+            ControlResponse::ResourceChanged { event: None } => Ok(None),
+            ControlResponse::ResourceChanged { event: Some(event) } => match event.resource {
+                WatchResource::SegmentDescriptor { .. } => {
+                    let descriptor = event
+                        .payload
+                        .get("descriptor")
+                        .cloned()
+                        .filter(|value| !value.is_null());
+                    Ok(descriptor.map(|descriptor| (event.revision, descriptor)))
+                }
+                other => Err(unexpected_watch_resource("SegmentDescriptor", other)),
+            },
+            other => Err(unexpected_response("ResourceChanged", other)),
         })
     }
 
@@ -1633,7 +1695,7 @@ impl GatewayState {
                 .on_data(SegmentTableView::from_record_batch(batch))?;
             writer.materializer.on_flush()?;
         }
-        self.subscribe_notifier.mark_activity();
+        self.subscribe_catalog_notifier.mark_activity();
         Ok(())
     }
 
@@ -1777,15 +1839,20 @@ impl GatewayState {
         update(&mut metrics);
     }
 
-    fn parse_subscribe_table_request(&self, header: Value) -> Result<GatewaySubscribeRequest> {
+    fn parse_subscribe_request(
+        &self,
+        header: Value,
+        mode: GatewaySubscribeMode,
+    ) -> Result<GatewaySubscribeRequest> {
         let source = header
             .get("source")
             .and_then(Value::as_str)
             .ok_or_else(|| ZippyError::InvalidConfig {
-                reason: "subscribe_table requires source".to_string(),
+                reason: format!("{} requires source", subscribe_kind_name(mode)),
             })?
             .to_string();
         let filter = subscribe_filter_plan(header.get("filter").unwrap_or(&Value::Null));
+        let instrument_ids = parse_subscribe_instrument_ids(header.get("instrument_ids"))?;
         let batch_size = header
             .get("batch_size")
             .and_then(Value::as_u64)
@@ -1801,83 +1868,59 @@ impl GatewayState {
             .and_then(Value::as_u64)
             .map(Duration::from_millis);
         Ok(GatewaySubscribeRequest {
+            mode,
             source,
             filter,
+            instrument_ids,
             batch_size,
             count,
             throttle,
         })
     }
 
-    fn fetch_subscribe_table_batch(
+    fn active_subscribe_driver(
         &self,
-        request: &GatewaySubscribeRequest,
-        sent_row_count: usize,
-    ) -> Result<GatewaySubscribeFetch> {
-        let batch = {
-            let writers = self.writers.lock().unwrap();
-            writers.get(&request.source).cloned()
-        };
-        let batch = batch
-            .map(|writer| {
-                let writer = writer.lock().unwrap();
-                writer.materializer.active_record_batch()
-            })
-            .transpose()?;
-        let batch = match batch {
-            Some(batch) => Some(batch),
-            None => {
-                match self.collect_stream_source(&request.source, &GatewayScanPushdown::default()) {
-                    Ok(scanned) => Some(scanned.batch),
-                    Err(_) => None,
-                }
-            }
-        };
-        let Some(batch) = batch else {
-            return Ok(GatewaySubscribeFetch {
-                next_sent_row_count: sent_row_count,
-                batch: None,
+        request: GatewaySubscribeRequest,
+    ) -> Result<GatewayActiveSubscribeDriver> {
+        let stream = self.master.get_stream_blocking(&request.source)?;
+        if stream.data_path != "segment" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "gateway subscribe source is not a live segment stream data_path=[{}]",
+                    stream.data_path
+                ),
+            });
+        }
+        if stream.status == "stale" {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "stream is stale source=[{}] status=[{}]",
+                    request.source, stream.status
+                ),
+            });
+        }
+        let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "segment descriptor is not published source=[{}]",
+                    request.source
+                ),
             });
         };
-        let total_rows = batch.num_rows();
-        let sent_row_count = if total_rows < sent_row_count {
-            0
-        } else {
-            sent_row_count
-        };
-        let mut next_sent_row_count = sent_row_count;
-        let next_batch = if let Some(count) = request.count {
-            if total_rows == sent_row_count {
-                None
-            } else {
-                next_sent_row_count = total_rows;
-                let batch = apply_optional_subscribe_filter(batch, request.filter.as_ref())?;
-                let row_count = count.min(batch.num_rows());
-                if row_count == 0 {
-                    None
-                } else {
-                    Some(batch.slice(batch.num_rows() - row_count, row_count))
-                }
-            }
-        } else if total_rows > sent_row_count {
-            let row_count = request
-                .batch_size
-                .map(|value| value.min(total_rows - sent_row_count))
-                .unwrap_or(total_rows - sent_row_count);
-            next_sent_row_count = sent_row_count + row_count;
-            let batch = batch.slice(sent_row_count, row_count);
-            let batch = apply_optional_subscribe_filter(batch, request.filter.as_ref())?;
-            if batch.num_rows() == 0 {
-                None
-            } else {
-                Some(batch)
-            }
-        } else {
-            None
-        };
-        Ok(GatewaySubscribeFetch {
-            next_sent_row_count,
-            batch: next_batch,
+        let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+        let reader = active_segment_reader_from_descriptor(&descriptor, segment_schema.clone())?;
+        let lease = self.acquire_segment_reader_lease(&request.source, &descriptor)?;
+        Ok(GatewayActiveSubscribeDriver {
+            request,
+            master: Arc::clone(&self.master),
+            reader,
+            segment_schema,
+            descriptor_generation: stream.descriptor_generation,
+            pending: VecDeque::new(),
+            table_pending: Vec::new(),
+            table_pending_rows: 0,
+            table_last_emit_at: Instant::now(),
+            _lease: lease,
         })
     }
 
@@ -2191,6 +2234,202 @@ impl Drop for SegmentReaderLeaseGuard {
     }
 }
 
+impl GatewayActiveSubscribeDriver {
+    fn next_event(mut self) -> Result<GatewaySubscribeStep> {
+        if let Some(event) = self.pop_event_or_flush_table()? {
+            return Ok(GatewaySubscribeStep {
+                driver: self,
+                event,
+            });
+        }
+
+        let observed = self
+            .reader
+            .notification_sequence()
+            .map_err(segment_zippy_error)?;
+        if let Some(span) = self.reader.read_available().map_err(segment_zippy_error)? {
+            self.enqueue_span(span)?;
+            let event = self
+                .pop_event_or_flush_table()?
+                .unwrap_or(GatewaySubscribeEvent::Idle);
+            return Ok(GatewaySubscribeStep {
+                driver: self,
+                event,
+            });
+        }
+
+        if self.apply_descriptor_update_if_available(Duration::from_millis(0))? {
+            if let Some(span) = self.reader.read_available().map_err(segment_zippy_error)? {
+                self.enqueue_span(span)?;
+            }
+            let event = self
+                .pop_event_or_flush_table()?
+                .unwrap_or(GatewaySubscribeEvent::Idle);
+            return Ok(GatewaySubscribeStep {
+                driver: self,
+                event,
+            });
+        }
+
+        if self.reader.is_sealed().map_err(segment_zippy_error)? {
+            if self.apply_descriptor_update_if_available(
+                DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT,
+            )? {
+                if let Some(span) = self.reader.read_available().map_err(segment_zippy_error)? {
+                    self.enqueue_span(span)?;
+                }
+            }
+        } else {
+            self.reader
+                .wait_for_notification_after(
+                    observed,
+                    DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT,
+                )
+                .map_err(segment_zippy_error)?;
+        }
+        if let Some(span) = self.reader.read_available().map_err(segment_zippy_error)? {
+            self.enqueue_span(span)?;
+        } else if self.apply_descriptor_update_if_available(Duration::from_millis(0))? {
+            if let Some(span) = self.reader.read_available().map_err(segment_zippy_error)? {
+                self.enqueue_span(span)?;
+            }
+        }
+        let event = self
+            .pop_event_or_flush_table()?
+            .unwrap_or(GatewaySubscribeEvent::Idle);
+        Ok(GatewaySubscribeStep {
+            driver: self,
+            event,
+        })
+    }
+
+    fn pop_event_or_flush_table(&mut self) -> Result<Option<GatewaySubscribeEvent>> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
+        if self.should_emit_pending_table() {
+            return Ok(self
+                .flush_pending_table()?
+                .map(GatewaySubscribeEvent::Table));
+        }
+        Ok(None)
+    }
+
+    fn enqueue_span(&mut self, span: RowSpanView) -> Result<()> {
+        match self.request.mode {
+            GatewaySubscribeMode::Rows => self.enqueue_row_events(span),
+            GatewaySubscribeMode::Table => self.enqueue_table_events(span),
+        }
+    }
+
+    fn apply_descriptor_update_if_available(&mut self, timeout: Duration) -> Result<bool> {
+        let Some((descriptor_generation, descriptor)) =
+            self.master.wait_segment_descriptor_blocking(
+                &self.request.source,
+                self.descriptor_generation,
+                timeout,
+            )?
+        else {
+            return Ok(false);
+        };
+        let reader =
+            active_segment_reader_from_descriptor(&descriptor, self.segment_schema.clone())?;
+        let lease = acquire_segment_reader_lease_from_master(
+            Arc::clone(&self.master),
+            &self.request.source,
+            &descriptor,
+        )?;
+        self.reader = reader;
+        self._lease = lease;
+        self.descriptor_generation = descriptor_generation;
+        Ok(true)
+    }
+
+    fn enqueue_row_events(&mut self, span: RowSpanView) -> Result<()> {
+        let batch = span.as_record_batch().map_err(|error| ZippyError::Io {
+            reason: error.to_string(),
+        })?;
+        let batch = apply_optional_subscribe_filter(batch, self.request.filter.as_ref())?;
+        for row_index in 0..batch.num_rows() {
+            if !record_batch_row_matches_instrument_ids(
+                &batch,
+                row_index,
+                self.request.instrument_ids.as_ref(),
+            )? {
+                continue;
+            }
+            self.pending
+                .push_back(GatewaySubscribeEvent::Row(record_batch_row_to_json(
+                    &batch, row_index,
+                )?));
+        }
+        Ok(())
+    }
+
+    fn enqueue_table_events(&mut self, span: RowSpanView) -> Result<()> {
+        let chunk_rows = span.row_count().max(1);
+        let mut reader = span
+            .batch_reader(chunk_rows, None)
+            .map_err(|error| ZippyError::Io {
+                reason: error.to_string(),
+            })?;
+        while let Some(batch) = reader.next_batch().map_err(|error| ZippyError::Io {
+            reason: error.to_string(),
+        })? {
+            let mut batch = apply_optional_subscribe_filter(batch, self.request.filter.as_ref())?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if self.request.batch_size.is_none() && self.request.throttle.is_none() {
+                batch = apply_subscribe_count_tail(batch, self.request.count);
+                self.pending.push_back(GatewaySubscribeEvent::Table(batch));
+                continue;
+            }
+
+            self.table_pending_rows = self.table_pending_rows.saturating_add(batch.num_rows());
+            self.table_pending.push(batch);
+            if self.should_emit_pending_table() {
+                if let Some(batch) = self.flush_pending_table()? {
+                    self.pending.push_back(GatewaySubscribeEvent::Table(batch));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn should_emit_pending_table(&self) -> bool {
+        if self.table_pending_rows == 0 {
+            return false;
+        }
+        if self
+            .request
+            .batch_size
+            .is_some_and(|batch_size| self.table_pending_rows >= batch_size)
+        {
+            return true;
+        }
+        self.request
+            .throttle
+            .is_some_and(|throttle| self.table_last_emit_at.elapsed() >= throttle)
+    }
+
+    fn flush_pending_table(&mut self) -> Result<Option<RecordBatch>> {
+        if self.table_pending.is_empty() {
+            return Ok(None);
+        }
+        let batches = std::mem::take(&mut self.table_pending);
+        self.table_pending_rows = 0;
+        self.table_last_emit_at = Instant::now();
+        let schema = batches[0].schema();
+        let batch = concat_record_batches(schema, batches)?;
+        let batch = apply_subscribe_count_tail(batch, self.request.count);
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(batch))
+    }
+}
+
 async fn async_serve_loop(
     listener: tokio::net::TcpListener,
     state: Arc<GatewayState>,
@@ -2271,6 +2510,28 @@ async fn handle_client_async(mut stream: tokio::net::TcpStream, state: Arc<Gatew
                 Err(error) => Err(error),
                 Ok(())
                     if frame.header.get("kind").and_then(Value::as_str)
+                        == Some("subscribe_rows") =>
+                {
+                    if frame.payload_len != 0 {
+                        Err(ZippyError::InvalidConfig {
+                            reason: "subscribe_rows request must not include payload".to_string(),
+                        })
+                    } else {
+                        match handle_subscribe_stream_async(
+                            &mut stream,
+                            Arc::clone(&state),
+                            frame.header,
+                            GatewaySubscribeMode::Rows,
+                        )
+                        .await
+                        {
+                            Ok(()) => return,
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                Ok(())
+                    if frame.header.get("kind").and_then(Value::as_str)
                         == Some("subscribe_table") =>
                 {
                     if frame.payload_len != 0 {
@@ -2278,10 +2539,11 @@ async fn handle_client_async(mut stream: tokio::net::TcpStream, state: Arc<Gatew
                             reason: "subscribe_table request must not include payload".to_string(),
                         })
                     } else {
-                        match handle_subscribe_table_stream_async(
+                        match handle_subscribe_stream_async(
                             &mut stream,
                             Arc::clone(&state),
                             frame.header,
+                            GatewaySubscribeMode::Table,
                         )
                         .await
                         {
@@ -2419,12 +2681,13 @@ async fn handle_collect_stream_async(
     .await
 }
 
-async fn handle_subscribe_table_stream_async(
+async fn handle_subscribe_stream_async(
     stream: &mut tokio::net::TcpStream,
     state: Arc<GatewayState>,
     header: Value,
+    mode: GatewaySubscribeMode,
 ) -> Result<()> {
-    let request = state.parse_subscribe_table_request(header)?;
+    let request = state.parse_subscribe_request(header, mode)?;
     let Ok(subscriber_permit) = state.subscriber_limit.clone().try_acquire_owned() else {
         state.increment_metric(|metrics| metrics.subscribe_clients_rejected_total += 1);
         return Err(ZippyError::Io {
@@ -2439,32 +2702,55 @@ async fn handle_subscribe_table_stream_async(
 
     let result = async {
         write_frame_async(stream, &json!({"status": "ok", "kind": "subscribed"}), &[]).await?;
-        let mut sent_row_count = 0usize;
+        let mut driver: Option<GatewayActiveSubscribeDriver> = None;
         while !state.stopped.load(Ordering::SeqCst) {
-            let observed_activity = state.subscribe_notifier.sequence();
-            let request_for_fetch = request.clone();
-            let state_for_fetch = Arc::clone(&state);
-            let fetch = run_blocking_request(Arc::clone(&state), move || {
-                state_for_fetch.fetch_subscribe_table_batch(&request_for_fetch, sent_row_count)
-            })
-            .await?;
-            sent_row_count = fetch.next_sent_row_count;
-            let Some(next_batch) = fetch.batch else {
-                state
-                    .subscribe_notifier
-                    .wait_after(observed_activity, DEFAULT_GATEWAY_SUBSCRIBE_IDLE_TIMEOUT)
-                    .await;
-                continue;
-            };
-            if next_batch.num_rows() > 0 {
-                let payload =
-                    run_blocking_request(Arc::clone(&state), move || encode_ipc_table(&next_batch))
-                        .await?;
-                write_frame_async(stream, &json!({"status": "ok", "kind": "table"}), &payload)
-                    .await?;
+            if driver.is_none() {
+                let observed_activity = state.subscribe_catalog_notifier.sequence();
+                let request_for_driver = request.clone();
+                let state_for_driver = Arc::clone(&state);
+                match run_blocking_request(Arc::clone(&state), move || {
+                    state_for_driver.active_subscribe_driver(request_for_driver)
+                })
+                .await
+                {
+                    Ok(next_driver) => {
+                        driver = Some(next_driver);
+                    }
+                    Err(error) if subscribe_driver_start_retryable(&error) => {
+                        state
+                            .subscribe_catalog_notifier
+                            .wait_after(
+                                observed_activity,
+                                DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT,
+                            )
+                            .await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            if let Some(throttle) = request.throttle {
-                tokio::time::sleep(throttle).await;
+            let next_driver = driver.take().unwrap();
+            let event =
+                run_blocking_request(Arc::clone(&state), move || next_driver.next_event()).await?;
+            driver = Some(event.driver);
+            match event.event {
+                GatewaySubscribeEvent::Idle => continue,
+                GatewaySubscribeEvent::Row(row) => {
+                    write_frame_async(
+                        stream,
+                        &json!({"status": "ok", "kind": "row", "row": row}),
+                        &[],
+                    )
+                    .await?;
+                }
+                GatewaySubscribeEvent::Table(next_batch) => {
+                    let payload = run_blocking_request(Arc::clone(&state), move || {
+                        encode_ipc_table(&next_batch)
+                    })
+                    .await?;
+                    write_frame_async(stream, &json!({"status": "ok", "kind": "table"}), &payload)
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -2475,6 +2761,13 @@ async fn handle_subscribe_table_stream_async(
         metrics.subscribe_clients_active = metrics.subscribe_clients_active.saturating_sub(1);
     });
     result
+}
+
+fn subscribe_driver_start_retryable(error: &ZippyError) -> bool {
+    let message = error.to_string();
+    message.contains("stream not found")
+        || message.contains("segment descriptor is not published")
+        || message.contains("stream not registered")
 }
 
 async fn run_blocking_request<T: Send + 'static>(
@@ -3645,6 +3938,15 @@ fn active_committed_row_high_watermark(
     descriptor: &Value,
     segment_schema: CompiledSchema,
 ) -> Result<usize> {
+    active_segment_reader_from_descriptor(descriptor, segment_schema)?
+        .committed_row_count()
+        .map_err(segment_zippy_error)
+}
+
+fn active_segment_reader_from_descriptor(
+    descriptor: &Value,
+    segment_schema: CompiledSchema,
+) -> Result<ActiveSegmentReader> {
     let row_capacity = descriptor_row_capacity(descriptor)?;
     let layout = LayoutPlan::for_schema(&segment_schema, row_capacity).map_err(|error| {
         ZippyError::InvalidConfig {
@@ -3653,9 +3955,21 @@ fn active_committed_row_high_watermark(
     })?;
     let descriptor_envelope = serde_json::to_vec(descriptor).map_err(json_zippy_error)?;
     ActiveSegmentReader::from_descriptor_envelope(&descriptor_envelope, segment_schema, layout)
-        .map_err(segment_zippy_error)?
-        .committed_row_count()
         .map_err(segment_zippy_error)
+}
+
+fn acquire_segment_reader_lease_from_master(
+    master: Arc<GatewayAsyncMasterClient>,
+    source: &str,
+    descriptor: &Value,
+) -> Result<SegmentReaderLeaseGuard> {
+    let (segment_id, generation) = descriptor_segment_identity(descriptor)?;
+    let lease_id = master.acquire_segment_reader_lease_blocking(source, segment_id, generation)?;
+    Ok(SegmentReaderLeaseGuard {
+        master,
+        source: source.to_string(),
+        lease_id: Some(lease_id),
+    })
 }
 
 fn descriptor_row_capacity(descriptor: &Value) -> Result<usize> {
@@ -3853,6 +4167,15 @@ fn unexpected_response(expected: &str, response: ControlResponse) -> ZippyError 
     }
 }
 
+fn unexpected_watch_resource(expected: &str, resource: WatchResource) -> ZippyError {
+    ZippyError::Io {
+        reason: format!(
+            "unexpected control watch resource expected=[{}] actual=[{:?}]",
+            expected, resource
+        ),
+    }
+}
+
 fn segment_zippy_error(error: zippy_segment_store::ZippySegmentStoreError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
@@ -3893,6 +4216,44 @@ fn subscribe_filter_plan(filter: &Value) -> Option<Value> {
     Some(json!({"op": "filter", "expr": filter.clone()}))
 }
 
+fn subscribe_kind_name(mode: GatewaySubscribeMode) -> &'static str {
+    match mode {
+        GatewaySubscribeMode::Rows => "subscribe_rows",
+        GatewaySubscribeMode::Table => "subscribe_table",
+    }
+}
+
+fn parse_subscribe_instrument_ids(value: Option<&Value>) -> Result<Option<HashSet<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = match value {
+        Value::String(instrument_id) => vec![instrument_id.clone()],
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: "subscribe instrument_ids must contain strings".to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => {
+            return Err(ZippyError::InvalidConfig {
+                reason: "subscribe instrument_ids must be a string or string array".to_string(),
+            });
+        }
+    };
+    if values.is_empty() {
+        return Ok(Some(HashSet::new()));
+    }
+    Ok(Some(values.into_iter().collect()))
+}
+
 fn apply_optional_subscribe_filter(
     batch: RecordBatch,
     filter: Option<&Value>,
@@ -3901,6 +4262,159 @@ fn apply_optional_subscribe_filter(
         return Ok(batch);
     };
     apply_filter(batch, filter)
+}
+
+fn apply_subscribe_count_tail(batch: RecordBatch, count: Option<usize>) -> RecordBatch {
+    let Some(count) = count else {
+        return batch;
+    };
+    let row_count = count.min(batch.num_rows());
+    if row_count >= batch.num_rows() {
+        return batch;
+    }
+    batch.slice(batch.num_rows() - row_count, row_count)
+}
+
+fn record_batch_row_matches_instrument_ids(
+    batch: &RecordBatch,
+    row_index: usize,
+    instrument_ids: Option<&HashSet<String>>,
+) -> Result<bool> {
+    let Some(instrument_ids) = instrument_ids else {
+        return Ok(true);
+    };
+    let Ok(column_index) = batch.schema().index_of("instrument_id") else {
+        return Ok(false);
+    };
+    let column = batch.column(column_index);
+    if column.is_null(row_index) {
+        return Ok(false);
+    }
+    let instruments = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ZippyError::SchemaMismatch {
+            reason: "subscribe instrument_id column must be utf8".to_string(),
+        })?;
+    Ok(instrument_ids.contains(instruments.value(row_index)))
+}
+
+fn record_batch_row_to_json(batch: &RecordBatch, row_index: usize) -> Result<Value> {
+    let mut object = serde_json::Map::new();
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        object.insert(
+            field.name().clone(),
+            arrow_value_to_json(column.as_ref(), field.data_type(), row_index)?,
+        );
+    }
+    Ok(Value::Object(object))
+}
+
+fn arrow_value_to_json(array: &dyn Array, data_type: &DataType, row_index: usize) -> Result<Value> {
+    if array.is_null(row_index) {
+        return Ok(Value::Null);
+    }
+    match data_type {
+        DataType::Utf8 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast utf8 subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Int64 => {
+            let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                ZippyError::SchemaMismatch {
+                    reason: "failed to downcast int64 subscribe column".to_string(),
+                }
+            })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Float64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast float64 subscribe column".to_string(),
+                })?;
+            serde_json::Number::from_f64(array.value(row_index))
+                .map(Value::Number)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: "subscribe row contains non-finite float64 value".to_string(),
+                })
+        }
+        DataType::Boolean => {
+            let array = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast boolean subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Date32 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast date32 subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Date64 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast date64 subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast second timestamp subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast millisecond timestamp subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast microsecond timestamp subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| ZippyError::SchemaMismatch {
+                    reason: "failed to downcast nanosecond timestamp subscribe column".to_string(),
+                })?;
+            Ok(json!(array.value(row_index)))
+        }
+        other => Err(ZippyError::SchemaMismatch {
+            reason: format!(
+                "unsupported subscribe row column type data_type=[{}]",
+                other
+            ),
+        }),
+    }
 }
 
 fn collect_plan_row_range_prefix(
@@ -5011,33 +5525,5 @@ mod tests {
         let files = non_overlapping_persisted_files(&stream);
 
         assert_eq!(files.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn subscribe_notifier_wakes_waiters_without_poll_sleep() {
-        let notifier = GatewaySubscribeNotifier::default();
-        let observed_sequence = notifier.sequence();
-
-        let wait = tokio::time::timeout(
-            Duration::from_millis(100),
-            notifier.wait_after(observed_sequence, Duration::from_secs(60)),
-        );
-        notifier.mark_activity();
-
-        assert!(wait.await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn subscribe_notifier_returns_immediately_after_sequence_change() {
-        let notifier = GatewaySubscribeNotifier::default();
-        let observed_sequence = notifier.sequence();
-        notifier.mark_activity();
-
-        let wait = tokio::time::timeout(
-            Duration::from_millis(100),
-            notifier.wait_after(observed_sequence, Duration::from_secs(60)),
-        );
-
-        assert!(wait.await.is_ok());
     }
 }

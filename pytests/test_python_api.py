@@ -9773,6 +9773,51 @@ def test_remote_subscribe_table_receives_gateway_table_callback() -> None:
         server.join()
 
 
+def test_remote_subscribe_table_batches_gateway_rows_across_writes() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    server, gateway, _master_uri, gateway_endpoint = _start_native_gateway_stack()
+    received: list[pa.Table] = []
+    try:
+        subscriber = zippy.subscribe_table(
+            "qmt_batched_ticks",
+            callback=received.append,
+            master=zippy.RemoteMasterClient(gateway_endpoint),
+            batch_size=2,
+        )
+        try:
+            writer = zippy.RemoteGatewayWriter(
+                "qmt_batched_ticks",
+                endpoint=gateway_endpoint,
+                schema=schema,
+                batch_size=1,
+            )
+            writer.write({"instrument_id": "IF2606", "last_price": 4102.5})
+            time.sleep(0.2)
+            assert received == []
+
+            writer.write({"instrument_id": "IF2607", "last_price": 4103.5})
+            for _ in range(50):
+                if received:
+                    break
+                time.sleep(0.02)
+            assert len(received) == 1
+            assert received[0].to_pydict() == {
+                "instrument_id": ["IF2606", "IF2607"],
+                "last_price": [4102.5, 4103.5],
+            }
+        finally:
+            subscriber.stop()
+    finally:
+        gateway.stop()
+        server.stop()
+        server.join()
+
+
 def test_remote_subscribe_receives_gateway_row_callback() -> None:
     schema = pa.schema(
         [

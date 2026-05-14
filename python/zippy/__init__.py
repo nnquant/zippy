@@ -3192,6 +3192,7 @@ class RemoteStreamSubscriber:
         callback,
         table_callback: bool = False,
         filter: object | None = None,
+        instrument_ids: list[str] | tuple[str, ...] | str | None = None,
         batch_size: int | None = None,
         throttle_ms: int | None = None,
         count: int | None = None,
@@ -3204,6 +3205,12 @@ class RemoteStreamSubscriber:
         self.callback = callback
         self.table_callback = bool(table_callback)
         self.filter = filter
+        if instrument_ids is None:
+            self.instrument_ids = None
+        elif isinstance(instrument_ids, str):
+            self.instrument_ids = [instrument_ids]
+        else:
+            self.instrument_ids = list(instrument_ids)
         self.batch_size = batch_size
         self.throttle_ms = throttle_ms
         self.count = count
@@ -3293,9 +3300,10 @@ class RemoteStreamSubscriber:
         with socket.create_connection((host, port), timeout=5.0) as sock:
             self._socket = sock
             request = {
-                "kind": "subscribe_table",
+                "kind": "subscribe_table" if self.table_callback else "subscribe_rows",
                 "source": self.source,
                 "filter": (_query_expr_to_json(self.filter) if self.filter is not None else None),
+                "instrument_ids": self.instrument_ids,
                 "batch_size": self.batch_size,
                 "throttle_ms": self.throttle_ms,
                 "count": self.count,
@@ -3308,6 +3316,12 @@ class RemoteStreamSubscriber:
                 if header.get("status") != "ok":
                     raise RuntimeError(header.get("reason", "remote subscribe failed"))
                 if header.get("kind") == "subscribed":
+                    continue
+                if header.get("kind") == "row" and not self.table_callback:
+                    row = header.get("row")
+                    if not isinstance(row, dict):
+                        raise RuntimeError("remote subscribe row frame missing row object")
+                    self.callback(Row(row))
                     continue
                 if header.get("kind") != "table":
                     continue
@@ -5471,18 +5485,23 @@ def subscribe(
         if filter is not None and instrument_ids is not None:
             raise ValueError("filter and instrument_ids cannot be used together")
         remote_filter = filter
+        remote_instrument_ids = None
         if filter is not None:
             instrument_values = _instrument_ids_from_query_filter(filter)
-            remote_filter = col("instrument_id").is_in(instrument_values or [])
+            if instrument_values is not None:
+                remote_filter = None
+                remote_instrument_ids = instrument_values
         elif instrument_ids is not None:
-            values = [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
-            remote_filter = col("instrument_id").is_in(values)
+            remote_instrument_ids = (
+                [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
+            )
         return RemoteStreamSubscriber(
             source,
             endpoint=remote_endpoint,
             callback=callback,
             table_callback=False,
             filter=remote_filter,
+            instrument_ids=remote_instrument_ids,
             token=remote_token,
         ).start()
 
