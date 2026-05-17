@@ -127,6 +127,22 @@ impl ActiveSegmentReader {
         Ok(committed)
     }
 
+    /// 将 cursor 移到指定 active segment 行偏移。
+    ///
+    /// 该偏移是当前 active segment 内的 row offset，不跨 sealed segment。
+    pub fn seek_to_row_offset(
+        &mut self,
+        row_offset: usize,
+    ) -> Result<usize, ZippySegmentStoreError> {
+        if row_offset > self.descriptor.layout().row_capacity() {
+            return Err(ZippySegmentStoreError::Layout(
+                "active segment reader start offset exceeds row capacity",
+            ));
+        }
+        self.cursor = row_offset;
+        Ok(row_offset)
+    }
+
     /// 读取当前 active segment 上新增的连续行区间。
     pub fn read_available(&mut self) -> Result<Option<RowSpanView>, ZippySegmentStoreError> {
         let committed = self.committed_row_count()?;

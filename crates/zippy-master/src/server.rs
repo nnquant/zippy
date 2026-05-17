@@ -189,7 +189,7 @@ impl MasterServer {
                         stream.persisted_files,
                         stream.persist_events,
                         stream.persist_revision,
-                        stream.segment_reader_leases,
+                        Vec::new(),
                         stream.writer_epoch,
                     )
                     .map_err(registry_error)?;
@@ -2444,9 +2444,7 @@ impl MasterServer {
                 ) {
                     return write_control_response(&mut stream, &response);
                 }
-                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                let previous_registry = registry.clone();
                 let acquire_result = registry.acquire_segment_reader_lease(
                     &request.stream_name,
                     &request.process_id,
@@ -2455,16 +2453,6 @@ impl MasterServer {
                 );
                 match acquire_result {
                     Ok(lease_id) => {
-                        let snapshot = Self::snapshot_from_registry(&registry);
-                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            *registry = previous_registry;
-                            return write_control_response(
-                                &mut stream,
-                                &ControlResponse::Error {
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
                         tracing::info!(
                             component = "master_server",
                             event = "acquire_segment_reader_lease",
@@ -2502,9 +2490,7 @@ impl MasterServer {
                 ) {
                     return write_control_response(&mut stream, &response);
                 }
-                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                let previous_registry = registry.clone();
                 let release_result = registry.release_segment_reader_lease(
                     &request.stream_name,
                     &request.process_id,
@@ -2512,16 +2498,6 @@ impl MasterServer {
                 );
                 match release_result {
                     Ok(()) => {
-                        let snapshot = Self::snapshot_from_registry(&registry);
-                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            *registry = previous_registry;
-                            return write_control_response(
-                                &mut stream,
-                                &ControlResponse::Error {
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
                         tracing::info!(
                             component = "master_server",
                             event = "release_segment_reader_lease",
@@ -3081,7 +3057,7 @@ impl MasterServer {
                     persisted_files: stream.persisted_files,
                     persist_events: stream.persist_events,
                     persist_revision: stream.persist_revision,
-                    segment_reader_leases: stream.segment_reader_leases,
+                    segment_reader_leases: Vec::new(),
                     writer_epoch: stream.writer_epoch,
                     buffer_size: stream.buffer_size,
                     frame_size: stream.frame_size,

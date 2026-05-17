@@ -343,6 +343,7 @@ class StreamSubscriber:
         idle_spin_checks: int = 64,
         row_factory: object | None = None,
         instrument_ids: list[str] | tuple[str, ...] | str | None = None,
+        start_from: int = -1,
     ) -> None: ...
     def start(self) -> None: ...
     def stop(self) -> None: ...
@@ -357,6 +358,7 @@ class SegmentStreamSource:
         master: MasterClient,
         mode: _SourceModeValue | None = None,
         xfast: bool = False,
+        start_from: int = -1,
     ) -> None: ...
 
 WriteValue = pl.DataFrame | pa.RecordBatch | pa.Table | dict[str, object] | list[dict[str, object]]

@@ -210,7 +210,7 @@ struct SegmentSourceConfig {
     segment_schema: CompiledSchema,
     master: SharedMasterClient,
     mode: RustSourceMode,
-    start_at_tail: bool,
+    start_from: i64,
     xfast: bool,
 }
 
@@ -2251,6 +2251,17 @@ struct SegmentReaderLeaseGuard {
     lease_id: Option<String>,
 }
 
+#[derive(Clone)]
+struct SegmentReaderLeaseContext {
+    master: SharedMasterClient,
+    source: String,
+}
+
+struct ActiveSegmentReaderHandle {
+    reader: ActiveSegmentReader,
+    reader_lease: Option<SegmentReaderLeaseGuard>,
+}
+
 struct SegmentReaderLeaseSet {
     _leases: Vec<SegmentReaderLeaseGuard>,
 }
@@ -2272,6 +2283,13 @@ impl SegmentReaderLeaseGuard {
             source,
             lease_id: Some(lease_id),
         })
+    }
+
+    fn context(&self) -> SegmentReaderLeaseContext {
+        SegmentReaderLeaseContext {
+            master: Arc::clone(&self.master),
+            source: self.source.clone(),
+        }
     }
 }
 
@@ -2319,6 +2337,26 @@ impl SegmentReaderLeaseSet {
         )?);
         Ok(Self { _leases: leases })
     }
+}
+
+fn open_active_segment_reader_handle(
+    descriptor: &serde_json::Value,
+    segment_schema: &CompiledSchema,
+    lease_context: Option<SegmentReaderLeaseContext>,
+) -> zippy_core::Result<ActiveSegmentReaderHandle> {
+    let reader = active_segment_reader_from_descriptor(descriptor, segment_schema)?;
+    let reader_lease = match lease_context {
+        Some(context) => Some(SegmentReaderLeaseGuard::acquire(
+            context.master,
+            context.source,
+            descriptor,
+        )?),
+        None => None,
+    };
+    Ok(ActiveSegmentReaderHandle {
+        reader,
+        reader_lease,
+    })
 }
 
 #[pymethods]
@@ -2930,6 +2968,7 @@ fn record_batches_to_pyarrow_record_batch_reader(
 }
 
 const SEGMENT_DESCRIPTOR_WATCH_TIMEOUT: Duration = Duration::from_millis(500);
+const SEGMENT_DESCRIPTOR_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const SEGMENT_READER_IDLE_SPIN_CHECKS: u32 = 64;
 
 #[derive(Clone, Debug)]
@@ -3022,9 +3061,18 @@ struct SubscriberMetrics {
     mmap_futex_waits_total: AtomicU64,
     mmap_futex_notifications_total: AtomicU64,
     mmap_futex_timeouts_total: AtomicU64,
+    last_error: Mutex<Option<String>>,
 }
 
 impl SubscriberMetrics {
+    fn clear_last_error(&self) {
+        *self.last_error.lock().unwrap() = None;
+    }
+
+    fn record_last_error(&self, error: String) {
+        *self.last_error.lock().unwrap() = Some(error);
+    }
+
     fn record_descriptor_update(&self, descriptor_generation: u64) {
         self.descriptor_updates_total.fetch_add(1, Ordering::SeqCst);
         self.current_descriptor_generation
@@ -3092,41 +3140,32 @@ fn take_descriptor_refresh_error(error_slot: &Mutex<Option<String>>) -> Option<S
 }
 
 fn apply_segment_descriptor_update(
-    reader: &mut ActiveSegmentReader,
+    reader_handle: &mut ActiveSegmentReaderHandle,
     descriptor_text: &mut String,
     update: DescriptorUpdate,
     segment_schema: &CompiledSchema,
-    reader_lease: Option<&mut SegmentReaderLeaseGuard>,
 ) -> std::result::Result<DescriptorApplyOutcome, String> {
-    let next_lease = match reader_lease.as_ref() {
-        Some(lease) => {
-            match SegmentReaderLeaseGuard::acquire(
-                Arc::clone(&lease.master),
-                lease.source.clone(),
-                &update.descriptor,
-            ) {
-                Ok(next_lease) => Some(next_lease),
-                Err(error) if is_segment_reader_lease_target_not_found(&error) => {
-                    return Ok(DescriptorApplyOutcome::TransientMissing);
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        None => None,
-    };
-    let (next_reader, _) = match build_active_segment_reader(&update.descriptor, segment_schema) {
-        Ok(next_reader) => next_reader,
+    let lease_context = reader_handle
+        .reader_lease
+        .as_ref()
+        .map(SegmentReaderLeaseGuard::context);
+    let next_handle = match open_active_segment_reader_handle(
+        &update.descriptor,
+        segment_schema,
+        lease_context,
+    ) {
+        Ok(next_handle) => next_handle,
         Err(error) if is_transient_missing_segment_reader_error(&error) => {
+            return Ok(DescriptorApplyOutcome::TransientMissing);
+        }
+        Err(error) if is_segment_reader_lease_target_not_found(&error) => {
             return Ok(DescriptorApplyOutcome::TransientMissing);
         }
         Err(error) => return Err(error.to_string()),
     };
     let descriptor_generation = update.descriptor_generation;
-    *reader = next_reader;
+    *reader_handle = next_handle;
     *descriptor_text = update.text;
-    if let (Some(reader_lease), Some(next_lease)) = (reader_lease, next_lease) {
-        *reader_lease = next_lease;
-    }
     Ok(DescriptorApplyOutcome::Applied(descriptor_generation))
 }
 
@@ -3162,9 +3201,8 @@ impl fmt::Debug for SegmentReaderDriverEvent {
 }
 
 struct SegmentReaderDriver {
-    reader: ActiveSegmentReader,
+    reader_handle: ActiveSegmentReaderHandle,
     descriptor_text: String,
-    reader_lease: Option<SegmentReaderLeaseGuard>,
     segment_schema: CompiledSchema,
     descriptor_updates: Arc<DescriptorUpdateSlot>,
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
@@ -3180,9 +3218,8 @@ struct SegmentReaderDriver {
 impl SegmentReaderDriver {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        reader: ActiveSegmentReader,
+        reader_handle: ActiveSegmentReaderHandle,
         descriptor_text: String,
-        reader_lease: Option<SegmentReaderLeaseGuard>,
         segment_schema: CompiledSchema,
         descriptor_updates: Arc<DescriptorUpdateSlot>,
         descriptor_refresh_error: Arc<Mutex<Option<String>>>,
@@ -3192,9 +3229,8 @@ impl SegmentReaderDriver {
         metrics: Option<Arc<SubscriberMetrics>>,
     ) -> Self {
         Self {
-            reader,
+            reader_handle,
             descriptor_text,
-            reader_lease,
             segment_schema,
             descriptor_updates,
             descriptor_refresh_error,
@@ -3214,10 +3250,12 @@ impl SegmentReaderDriver {
         }
 
         let observed_notification_seq = self
+            .reader_handle
             .reader
             .notification_sequence()
             .map_err(|error| error.to_string())?;
         match self
+            .reader_handle
             .reader
             .read_available()
             .map_err(|error| error.to_string())?
@@ -3237,7 +3275,11 @@ impl SegmentReaderDriver {
                     ));
                 }
 
-                let sealed = self.reader.is_sealed().map_err(|error| error.to_string())?;
+                let sealed = self
+                    .reader_handle
+                    .reader
+                    .is_sealed()
+                    .map_err(|error| error.to_string())?;
                 if sealed {
                     if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
                         return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
@@ -3297,7 +3339,17 @@ impl SegmentReaderDriver {
         }
         self.next_descriptor_refresh_at = Instant::now() + self.descriptor_refresh_interval();
 
-        let Some(reader_lease) = self.reader_lease.as_ref() else {
+        let Some(update) = self.latest_descriptor_update()? else {
+            return Ok(None);
+        };
+        if update.text == self.descriptor_text {
+            return Ok(None);
+        }
+        self.apply_descriptor_update_or_retry(update)
+    }
+
+    fn latest_descriptor_update(&self) -> std::result::Result<Option<DescriptorUpdate>, String> {
+        let Some(reader_lease) = self.reader_handle.reader_lease.as_ref() else {
             return Ok(None);
         };
         let stream = reader_lease
@@ -3309,15 +3361,11 @@ impl SegmentReaderDriver {
         let Some(descriptor) = stream.active_segment_descriptor else {
             return Ok(None);
         };
-        let update = descriptor_update_from_value(stream.descriptor_generation, descriptor)?;
-        if update.text == self.descriptor_text {
-            return Ok(None);
-        }
-        self.apply_descriptor_update_or_retry(update)
+        descriptor_update_from_value(stream.descriptor_generation, descriptor).map(Some)
     }
 
     fn descriptor_refresh_interval(&self) -> Duration {
-        self.idle_wait.max(Duration::from_millis(1))
+        self.idle_wait.max(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN)
     }
 
     fn apply_ready_descriptor_updates(&mut self) -> std::result::Result<Option<u64>, String> {
@@ -3357,7 +3405,7 @@ impl SegmentReaderDriver {
         if should_replace {
             self.pending_descriptor_retry = Some(update);
         }
-        self.next_descriptor_retry_at = Instant::now() + self.idle_wait;
+        self.next_descriptor_retry_at = Instant::now() + SEGMENT_DESCRIPTOR_RETRY_COOLDOWN;
     }
 
     fn retry_pending_descriptor_update(&mut self) -> std::result::Result<Option<u64>, String> {
@@ -3366,7 +3414,15 @@ impl SegmentReaderDriver {
             return Ok(None);
         }
 
-        let update = self.pending_descriptor_retry.clone().unwrap();
+        let pending = self.pending_descriptor_retry.clone().unwrap();
+        let update = match self.latest_descriptor_update()? {
+            Some(latest) if latest.text == self.descriptor_text => {
+                self.pending_descriptor_retry = None;
+                return Ok(None);
+            }
+            Some(latest) if latest.text != pending.text => latest,
+            _ => pending,
+        };
         match self.apply_descriptor_update(update.clone())? {
             DescriptorApplyOutcome::Applied(descriptor_generation) => {
                 self.pending_descriptor_retry = None;
@@ -3384,11 +3440,10 @@ impl SegmentReaderDriver {
         update: DescriptorUpdate,
     ) -> std::result::Result<DescriptorApplyOutcome, String> {
         apply_segment_descriptor_update(
-            &mut self.reader,
+            &mut self.reader_handle,
             &mut self.descriptor_text,
             update,
             &self.segment_schema,
-            self.reader_lease.as_mut(),
         )
     }
 
@@ -3399,6 +3454,7 @@ impl SegmentReaderDriver {
             }
             spin_loop();
             if self
+                .reader_handle
                 .reader
                 .notification_sequence()
                 .map_err(|error| error.to_string())?
@@ -3409,6 +3465,7 @@ impl SegmentReaderDriver {
         }
 
         let notified = self
+            .reader_handle
             .reader
             .wait_for_notification_after(observed, self.idle_wait)
             .map_err(|error| error.to_string())?;
@@ -3476,6 +3533,7 @@ struct StreamSubscriber {
     callback: Py<PyAny>,
     row_factory: Option<Py<PyAny>>,
     instrument_filter: Option<BTreeSet<String>>,
+    start_from: i64,
     poll_interval: Duration,
     xfast: bool,
     idle_spin_checks: u32,
@@ -3487,7 +3545,7 @@ struct StreamSubscriber {
 #[pymethods]
 impl StreamSubscriber {
     #[new]
-    #[pyo3(signature = (source, master, callback, poll_interval_ms=1, xfast=false, idle_spin_checks=SEGMENT_READER_IDLE_SPIN_CHECKS, row_factory=None, instrument_ids=None))]
+    #[pyo3(signature = (source, master, callback, poll_interval_ms=1, xfast=false, idle_spin_checks=SEGMENT_READER_IDLE_SPIN_CHECKS, row_factory=None, instrument_ids=None, start_from=-1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -3499,12 +3557,14 @@ impl StreamSubscriber {
         idle_spin_checks: u32,
         row_factory: Option<Py<PyAny>>,
         instrument_ids: Option<&Bound<'_, PyAny>>,
+        start_from: i64,
     ) -> PyResult<Self> {
         if poll_interval_ms == 0 && !xfast {
             return Err(py_value_error(
                 "poll_interval_ms must be greater than zero unless xfast is true",
             ));
         }
+        validate_stream_subscriber_start_from(start_from)?;
         let instrument_filter =
             parse_instrument_ids(instrument_ids)?.map(|values| values.into_iter().collect());
         if instrument_filter.is_some() && row_factory.is_none() {
@@ -3534,6 +3594,7 @@ impl StreamSubscriber {
             callback,
             row_factory,
             instrument_filter,
+            start_from,
             poll_interval: Duration::from_millis(poll_interval_ms),
             xfast,
             idle_spin_checks,
@@ -3568,21 +3629,25 @@ impl StreamSubscriber {
             })?;
         let descriptor_text = serde_json::to_string(&descriptor)
             .map_err(|error| py_value_error(error.to_string()))?;
-        let reader_lease = py
+        let mut reader_handle = py
             .allow_threads(|| {
-                SegmentReaderLeaseGuard::acquire(
-                    Arc::clone(&self.master),
-                    self.source.clone(),
+                open_active_segment_reader_handle(
                     &descriptor,
+                    &self.segment_schema,
+                    Some(SegmentReaderLeaseContext {
+                        master: Arc::clone(&self.master),
+                        source: self.source.clone(),
+                    }),
                 )
             })
             .map_err(|error| py_runtime_error(error.to_string()))?;
-        let reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)
+        seek_active_segment_reader_start_from(&mut reader_handle.reader, self.start_from)
             .map_err(|error| py_runtime_error(error.to_string()))?;
 
         self.metrics
             .current_descriptor_generation
             .store(stream.descriptor_generation, Ordering::SeqCst);
+        self.metrics.clear_last_error();
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
         let metrics = Arc::clone(&self.metrics);
@@ -3612,9 +3677,8 @@ impl StreamSubscriber {
             );
 
             let mut driver = SegmentReaderDriver::new(
-                reader,
+                reader_handle,
                 descriptor_text,
-                Some(reader_lease),
                 segment_schema,
                 Arc::clone(&descriptor_updates),
                 Arc::clone(&descriptor_refresh_error),
@@ -3654,6 +3718,15 @@ impl StreamSubscriber {
                 driver.finish()
             })();
 
+            if let Err(error) = result.as_ref() {
+                metrics.record_last_error(error.clone());
+                error!(
+                    event = "stream_subscriber_thread_error",
+                    source = %source,
+                    error = %error,
+                    "stream subscriber thread exited with error"
+                );
+            }
             running.store(false, Ordering::SeqCst);
             let _ = descriptor_refresh_handle.join();
             result
@@ -3727,8 +3800,34 @@ impl StreamSubscriber {
                 .mmap_futex_timeouts_total
                 .load(Ordering::SeqCst),
         )?;
+        dict.set_item(
+            "last_error",
+            self.metrics.last_error.lock().unwrap().clone(),
+        )?;
         Ok(dict.into_py(py))
     }
+}
+
+fn validate_stream_subscriber_start_from(start_from: i64) -> PyResult<()> {
+    if start_from < -1 {
+        return Err(py_value_error(
+            "start_from must be -1 or a non-negative row offset",
+        ));
+    }
+    Ok(())
+}
+
+fn seek_active_segment_reader_start_from(
+    reader: &mut ActiveSegmentReader,
+    start_from: i64,
+) -> zippy_core::Result<usize> {
+    if start_from == -1 {
+        return reader.seek_to_committed().map_err(segment_zippy_error);
+    }
+    let row_offset = start_from as usize;
+    reader
+        .seek_to_row_offset(row_offset)
+        .map_err(segment_zippy_error)
 }
 
 fn invoke_stream_callback(
@@ -3984,20 +4083,23 @@ struct SegmentStreamSource {
     segment_schema: CompiledSchema,
     mode: RustSourceMode,
     master: SharedMasterClient,
+    start_from: i64,
     xfast: bool,
 }
 
 #[pymethods]
 impl SegmentStreamSource {
     #[new]
-    #[pyo3(signature = (stream_name, expected_schema, master, mode=None, xfast=false))]
+    #[pyo3(signature = (stream_name, expected_schema, master, mode=None, xfast=false, start_from=-1))]
     fn new(
         stream_name: String,
         expected_schema: &Bound<'_, PyAny>,
         master: &Bound<'_, PyAny>,
         mode: Option<&Bound<'_, PyAny>>,
         xfast: bool,
+        start_from: i64,
     ) -> PyResult<Self> {
+        validate_stream_subscriber_start_from(start_from)?;
         let expected_schema = Arc::new(
             Schema::from_pyarrow_bound(expected_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
@@ -4015,6 +4117,7 @@ impl SegmentStreamSource {
                 None => RustSourceMode::Pipeline,
             },
             master: Arc::clone(&master.client),
+            start_from,
             xfast,
         })
     }
@@ -4100,7 +4203,7 @@ struct SegmentSourceBridge {
     segment_schema: CompiledSchema,
     mode: RustSourceMode,
     master: SharedMasterClient,
-    start_at_tail: bool,
+    start_from: i64,
     xfast: bool,
 }
 
@@ -4128,15 +4231,15 @@ impl Source for SegmentSourceBridge {
                 status: "segment descriptor is not published",
             })?;
         let descriptor_text = serde_json::to_string(&descriptor).map_err(json_zippy_error)?;
-        let reader_lease = SegmentReaderLeaseGuard::acquire(
-            Arc::clone(&self.master),
-            self.stream_name.clone(),
+        let mut reader_handle = open_active_segment_reader_handle(
             &descriptor,
+            &self.segment_schema,
+            Some(SegmentReaderLeaseContext {
+                master: Arc::clone(&self.master),
+                source: self.stream_name.clone(),
+            }),
         )?;
-        let mut reader = active_segment_reader_from_descriptor(&descriptor, &self.segment_schema)?;
-        if self.start_at_tail {
-            reader.seek_to_committed().map_err(segment_zippy_error)?;
-        }
+        seek_active_segment_reader_start_from(&mut reader_handle.reader, self.start_from)?;
         let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
         sink.emit(SourceEvent::Hello(hello))?;
 
@@ -4159,9 +4262,8 @@ impl Source for SegmentSourceBridge {
             );
 
             let mut driver = SegmentReaderDriver::new(
-                reader,
+                reader_handle,
                 descriptor_text,
-                Some(reader_lease),
                 segment_schema,
                 Arc::clone(&descriptor_updates),
                 Arc::clone(&descriptor_refresh_error),
@@ -6484,7 +6586,7 @@ fn segment_source_config_from_named_stream(
             segment_schema,
             master: shared_master,
             mode: RustSourceMode::Pipeline,
-            start_at_tail: true,
+            start_from: -1,
             xfast,
         },
     ))
@@ -6653,7 +6755,7 @@ fn register_source(
                 segment_schema: segment_source.segment_schema.clone(),
                 master: Arc::clone(&segment_source.master),
                 mode: segment_source.mode,
-                start_at_tail: false,
+                start_from: segment_source.start_from,
                 xfast: segment_source.xfast,
             }),
             None,
@@ -6979,7 +7081,7 @@ fn start_runtime_engine<E: Engine>(
                 segment_schema: segment_source.segment_schema.clone(),
                 mode: segment_source.mode,
                 master: Arc::clone(&segment_source.master),
-                start_at_tail: segment_source.start_at_tail,
+                start_from: segment_source.start_from,
                 xfast: segment_source.xfast,
             });
             start_prepared_source_runtime(source, config, publisher, engine)
@@ -8166,9 +8268,11 @@ mod tests {
         descriptor_updates.set(descriptor_update_from_value(2, next_descriptor).unwrap());
         let descriptor_refresh_error = Arc::new(Mutex::new(None));
         let mut driver = SegmentReaderDriver::new(
-            reader,
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: None,
+            },
             serde_json::to_string(&current_descriptor).unwrap(),
-            None,
             schema,
             Arc::clone(&descriptor_updates),
             Arc::clone(&descriptor_refresh_error),
@@ -8250,9 +8354,11 @@ mod tests {
         descriptor_updates.set(descriptor_update_from_value(3, next_descriptor).unwrap());
         let descriptor_refresh_error = Arc::new(Mutex::new(None));
         let mut driver = SegmentReaderDriver::new(
-            reader,
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: None,
+            },
             serde_json::to_string(&current_descriptor).unwrap(),
-            None,
             schema,
             Arc::clone(&descriptor_updates),
             Arc::clone(&descriptor_refresh_error),
@@ -8331,9 +8437,11 @@ mod tests {
         descriptor_updates.set(descriptor_update_from_value(2, retry_descriptor).unwrap());
         let descriptor_refresh_error = Arc::new(Mutex::new(None));
         let mut driver = SegmentReaderDriver::new(
-            reader,
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: None,
+            },
             serde_json::to_string(&current_descriptor).unwrap(),
-            None,
             schema,
             Arc::clone(&descriptor_updates),
             Arc::clone(&descriptor_refresh_error),
@@ -8368,6 +8476,157 @@ mod tests {
         }
         drop(driver);
         let _ = std::fs::remove_file(target_shm_path);
+    }
+
+    #[test]
+    fn segment_reader_driver_does_not_acquire_lease_for_missing_shm_descriptor() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "lease-current",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        let missing_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "lease-missing",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        let mut missing_descriptor = publishable_descriptor_from_partition(&missing_partition);
+        missing_descriptor["shm_os_id"] =
+            serde_json::json!("file:/tmp/zippy-segment-store/missing-lease-rollover-segment.shm");
+        let next_partition = store
+            .open_partition_with_schema_and_writer_epoch("ticks", "lease-next", schema.clone(), 1)
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2610")?;
+                row.write_f64("last_price", 4111.5)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master.register_process("lease_writer").unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "lease_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&current_partition),
+            )
+            .unwrap();
+        let current_descriptor = writer_master
+            .get_segment_descriptor("ticks")
+            .unwrap()
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        reader_master.register_process("lease_reader").unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let reader_lease = SegmentReaderLeaseGuard::acquire(
+            Arc::clone(&reader_master),
+            "ticks",
+            &current_descriptor,
+        )
+        .unwrap();
+
+        writer_master
+            .publish_segment_descriptor("ticks", missing_descriptor.clone())
+            .unwrap();
+        let missing_stream = writer_master.get_stream("ticks").unwrap();
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        descriptor_updates.set(
+            descriptor_update_from_value(
+                missing_stream.descriptor_generation,
+                missing_stream.active_segment_descriptor.unwrap(),
+            )
+            .unwrap(),
+        );
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: Some(reader_lease),
+            },
+            serde_json::to_string(&current_descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            None,
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Idle => {}
+            other => panic!("expected missing descriptor to stay idle got [{other:?}]"),
+        }
+
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&next_partition),
+            )
+            .unwrap();
+        let next_stream = writer_master.get_stream("ticks").unwrap();
+        descriptor_updates.set(
+            descriptor_update_from_value(
+                next_stream.descriptor_generation,
+                next_stream.active_segment_descriptor.unwrap(),
+            )
+            .unwrap(),
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => {
+                assert_eq!(generation, next_stream.descriptor_generation);
+            }
+            other => panic!("expected valid descriptor update got [{other:?}]"),
+        }
+
+        let stream = writer_master.get_stream("ticks").unwrap();
+        let lease_ids = stream
+            .segment_reader_leases
+            .iter()
+            .filter_map(|lease| lease.get("lease_id").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(lease_ids, vec!["segment-lease-2"]);
+
+        drop(driver);
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -8447,9 +8706,11 @@ mod tests {
         let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
         let descriptor_refresh_error = Arc::new(Mutex::new(None));
         let mut driver = SegmentReaderDriver::new(
-            reader,
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: Some(reader_lease),
+            },
             serde_json::to_string(&current_descriptor).unwrap(),
-            Some(reader_lease),
             schema,
             Arc::clone(&descriptor_updates),
             Arc::clone(&descriptor_refresh_error),

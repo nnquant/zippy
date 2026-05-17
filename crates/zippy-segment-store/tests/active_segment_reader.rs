@@ -101,6 +101,43 @@ fn active_segment_reader_can_seek_to_current_committed_tail() {
 }
 
 #[test]
+fn active_segment_reader_can_seek_to_explicit_row_offset() {
+    let schema = tick_schema();
+    let layout = LayoutPlan::for_schema(&schema, 32).unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let partition = store
+        .open_partition_with_schema("openctp_ticks", "all", schema.clone())
+        .unwrap();
+    let writer = partition.writer();
+    writer.append_tick_for_test(1, "IF2606", 4112.5).unwrap();
+    writer.append_tick_for_test(2, "IF2607", 4113.0).unwrap();
+    writer.append_tick_for_test(3, "IF2608", 4114.5).unwrap();
+
+    let envelope = partition.active_descriptor_envelope_bytes().unwrap();
+    let mut reader =
+        ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout).unwrap();
+
+    assert_eq!(reader.seek_to_row_offset(1).unwrap(), 1);
+
+    let span = reader
+        .read_available()
+        .unwrap()
+        .expect("expected rows from explicit offset");
+    let batch = span.as_record_batch().unwrap();
+    let instruments = batch
+        .column_by_name("instrument_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(span.start_row(), 1);
+    assert_eq!(span.end_row(), 3);
+    assert_eq!(instruments.value(0), "IF2607");
+    assert_eq!(instruments.value(1), "IF2608");
+}
+
+#[test]
 fn active_segment_reader_exposes_control_snapshot_from_mmap_header() {
     let schema = tick_schema();
     let layout = LayoutPlan::for_schema(&schema, 32).unwrap();

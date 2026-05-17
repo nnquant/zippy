@@ -758,7 +758,7 @@ fn lease_reaper_reclaims_expired_segment_reader_leases() {
 }
 
 #[test]
-fn lease_reaper_persists_expired_segment_reader_lease_cleanup_to_snapshot() {
+fn segment_reader_leases_are_not_persisted_to_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("master.sock");
     let snapshot_path = temp.path().join("master-registry.json");
@@ -780,11 +780,16 @@ fn lease_reaper_persists_expired_segment_reader_lease_cleanup_to_snapshot() {
     reader.register_process("query_reader").unwrap();
     reader.acquire_segment_reader_lease("ticks", 1, 0).unwrap();
     assert_eq!(
-        SnapshotStore::load(&snapshot_path).unwrap().streams[0]
+        writer
+            .get_stream("ticks")
+            .unwrap()
             .segment_reader_leases
             .len(),
         1
     );
+    assert!(SnapshotStore::load(&snapshot_path).unwrap().streams[0]
+        .segment_reader_leases
+        .is_empty());
 
     thread::sleep(Duration::from_millis(120));
 

@@ -1682,7 +1682,7 @@ fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
 }
 
 #[test]
-fn master_server_rolls_back_segment_reader_lease_acquire_when_snapshot_write_fails() {
+fn master_server_acquires_segment_reader_lease_without_snapshot_write() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("master.sock");
     let snapshot_parent = temp.path().join("snapshot");
@@ -1716,7 +1716,10 @@ fn master_server_rolls_back_segment_reader_lease_acquire_when_snapshot_write_fai
             source_generation: 0,
         }),
     );
-    assert!(matches!(response, ControlResponse::Error { .. }));
+    let lease_id = match response {
+        ControlResponse::SegmentReaderLeaseAcquired { lease_id, .. } => lease_id,
+        other => panic!("unexpected acquire lease response: {other:?}"),
+    };
 
     let leases = server
         .registry()
@@ -1726,7 +1729,11 @@ fn master_server_rolls_back_segment_reader_lease_acquire_when_snapshot_write_fai
         .unwrap()
         .segment_reader_leases
         .clone();
-    assert!(leases.is_empty());
+    assert_eq!(leases.len(), 1);
+    assert_eq!(
+        leases[0].get("lease_id").and_then(Value::as_str),
+        Some(lease_id.as_str())
+    );
 
     server.shutdown();
     let _ = join_handle.join();
@@ -1776,7 +1783,7 @@ fn master_server_rejects_segment_reader_lease_for_unknown_segment() {
 }
 
 #[test]
-fn master_server_rolls_back_segment_reader_lease_release_when_snapshot_write_fails() {
+fn master_server_releases_segment_reader_lease_without_snapshot_write() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("master.sock");
     let snapshot_parent = temp.path().join("snapshot");
@@ -1822,7 +1829,10 @@ fn master_server_rolls_back_segment_reader_lease_release_when_snapshot_write_fai
             lease_id: lease_id.clone(),
         }),
     );
-    assert!(matches!(response, ControlResponse::Error { .. }));
+    assert!(matches!(
+        response,
+        ControlResponse::SegmentReaderLeaseReleased { .. }
+    ));
 
     let leases = server
         .registry()
@@ -1832,11 +1842,7 @@ fn master_server_rolls_back_segment_reader_lease_release_when_snapshot_write_fai
         .unwrap()
         .segment_reader_leases
         .clone();
-    assert_eq!(leases.len(), 1);
-    assert_eq!(
-        leases[0].get("lease_id").and_then(Value::as_str),
-        Some(lease_id.as_str())
-    );
+    assert!(leases.is_empty());
 
     server.shutdown();
     let _ = join_handle.join();

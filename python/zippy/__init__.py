@@ -5215,6 +5215,15 @@ def _require_positive_optional_int(name: str, value: int | None) -> int | None:
     return normalized
 
 
+def _require_subscribe_start_from(value: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError("start_from must be -1 or a non-negative row offset")
+    normalized = int(value)
+    if normalized < -1:
+        raise ValueError("start_from must be -1 or a non-negative row offset")
+    return normalized
+
+
 def _instrument_ids_from_query_filter(filter_expr: object | None) -> list[str] | None:
     if filter_expr is None:
         return None
@@ -5370,6 +5379,8 @@ class StreamSubscriber:
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
     :type timeout: float | str | None
+    :param start_from: Active segment row offset. ``-1`` starts from the latest committed row.
+    :type start_from: int
     :raises RuntimeError: If no explicit master is supplied and ``zippy.connect()`` was not called.
     """
 
@@ -5389,9 +5400,11 @@ class StreamSubscriber:
         count: int | None = None,
         wait: bool = False,
         timeout: float | str | None = None,
+        start_from: int = -1,
         _table_callback: bool = False,
     ) -> None:
         selected_master = master or _default_master()
+        start_from = _require_subscribe_start_from(start_from)
         _ensure_master_process(selected_master, f"subscribe.{source}")
         if wait:
             _wait_for_table_ready(source, selected_master, timeout)
@@ -5428,6 +5441,7 @@ class StreamSubscriber:
             idle_spin_checks=idle_spin_checks,
             row_factory=None if _table_callback else Row,
             instrument_ids=instrument_ids,
+            start_from=start_from,
         )
 
     def start(self) -> "StreamSubscriber":
@@ -5482,6 +5496,7 @@ def subscribe(
     filter: object | None = None,
     wait: bool = False,
     timeout: float | str | None = None,
+    start_from: int = -1,
 ) -> StreamSubscriber:
     """
     Subscribe to a stream using the default master connection.
@@ -5510,11 +5525,16 @@ def subscribe(
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
     :type timeout: float | str | None
+    :param start_from: Active segment row offset. ``-1`` starts from the latest committed row.
+    :type start_from: int
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
     selected_master = master or _default_master()
+    start_from = _require_subscribe_start_from(start_from)
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
+    if remote_endpoint is not None and start_from != -1:
+        raise ValueError("remote subscribe only supports start_from=-1")
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
         if wait:
@@ -5552,6 +5572,7 @@ def subscribe(
         "instrument_ids": instrument_ids,
         "wait": wait,
         "timeout": timeout,
+        "start_from": start_from,
     }
     if filter is not None:
         subscriber_kwargs["filter"] = filter
@@ -5573,6 +5594,7 @@ def subscribe_table(
     count: int | None = None,
     wait: bool = False,
     timeout: float | str | None = None,
+    start_from: int = -1,
 ) -> StreamSubscriber:
     """
     Subscribe to a stream using incremental ``pyarrow.Table`` callbacks.
@@ -5605,11 +5627,16 @@ def subscribe_table(
     :type wait: bool
     :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
     :type timeout: float | str | None
+    :param start_from: Active segment row offset. ``-1`` starts from the latest committed row.
+    :type start_from: int
     :returns: Started subscriber handle.
     :rtype: StreamSubscriber
     """
     selected_master = master or _default_master()
+    start_from = _require_subscribe_start_from(start_from)
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
+    if remote_endpoint is not None and start_from != -1:
+        raise ValueError("remote subscribe only supports start_from=-1")
     if remote_endpoint is not None:
         remote_token = _remote_gateway_token(selected_master)
         if wait:
@@ -5640,6 +5667,7 @@ def subscribe_table(
         "idle_spin_checks": idle_spin_checks,
         "wait": wait,
         "timeout": timeout,
+        "start_from": start_from,
         "_table_callback": True,
     }
     if filter is not None:

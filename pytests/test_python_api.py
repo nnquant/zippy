@@ -7660,6 +7660,7 @@ def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> Non
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             created["source"] = source
             created["master"] = master
@@ -7669,6 +7670,7 @@ def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> Non
             created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
+            created["start_from"] = start_from
 
         def start(self) -> None:
             return None
@@ -7696,6 +7698,7 @@ def test_subscribe_row_mode_delegates_row_creation_to_native(monkeypatch) -> Non
         "idle_spin_checks": 64,
         "row_factory": zippy.Row,
         "instrument_ids": None,
+        "start_from": -1,
     }
 
 
@@ -7716,6 +7719,45 @@ def test_row_reuses_exact_dict_values_without_copy() -> None:
     }
 
 
+def test_stream_subscriber_forwards_start_from_tail_to_native(monkeypatch) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            idle_spin_checks: int = 64,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+            start_from: int = -1,
+        ) -> None:
+            created["source"] = source
+            created["master"] = master
+            created["callback"] = callback
+            created["row_factory"] = row_factory
+            created["start_from"] = start_from
+
+        def start(self) -> None:
+            return None
+
+    explicit_master = object()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    zippy.StreamSubscriber(
+        "ctp_ticks",
+        callback=lambda row: None,
+        master=explicit_master,
+        start_from=-1,
+    )
+
+    assert created["start_from"] == -1
+    assert created["row_factory"] is zippy.Row
+
+
 def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> None:
     created: dict[str, object] = {}
 
@@ -7730,6 +7772,7 @@ def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> N
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             created["source"] = source
             created["master"] = master
@@ -7739,6 +7782,7 @@ def test_subscribe_row_mode_passes_instrument_filter_to_native(monkeypatch) -> N
             created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
+            created["start_from"] = start_from
 
         def start(self) -> None:
             return None
@@ -7772,6 +7816,7 @@ def test_subscribe_row_mode_accepts_col_instrument_filter(monkeypatch) -> None:
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             created["source"] = source
             created["master"] = master
@@ -7781,6 +7826,7 @@ def test_subscribe_row_mode_accepts_col_instrument_filter(monkeypatch) -> None:
             created["idle_spin_checks"] = idle_spin_checks
             created["row_factory"] = row_factory
             created["instrument_ids"] = instrument_ids
+            created["start_from"] = start_from
 
         def start(self) -> None:
             return None
@@ -7813,6 +7859,7 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
             xfast: bool = False,
             idle_spin_checks: int = 64,
             instrument_ids: object | None = None,
+            start_from: int = -1,
             wait: bool = False,
             timeout: float | str | None = None,
         ) -> None:
@@ -7823,6 +7870,7 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
             created["xfast"] = xfast
             created["idle_spin_checks"] = idle_spin_checks
             created["instrument_ids"] = instrument_ids
+            created["start_from"] = start_from
             created["wait"] = wait
             created["timeout"] = timeout
 
@@ -7852,6 +7900,7 @@ def test_subscribe_passes_instrument_filter_to_stream_subscriber(monkeypatch) ->
         "xfast": False,
         "idle_spin_checks": 64,
         "instrument_ids": ("IF2606", "IF2607"),
+        "start_from": -1,
         "wait": False,
         "timeout": None,
         "started": True,
@@ -7872,6 +7921,7 @@ def test_subscribe_passes_idle_spin_checks_to_native(monkeypatch) -> None:
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             created["source"] = source
             created["master"] = master
@@ -7915,6 +7965,7 @@ def test_subscribe_row_mode_defaults_to_low_latency_poll_interval(monkeypatch) -
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             created["source"] = source
             created["master"] = master
@@ -7953,6 +8004,7 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             created["source"] = source
             created["master"] = master
@@ -7996,6 +8048,7 @@ def test_subscribe_table_filters_batches_and_limits_latest_count(monkeypatch) ->
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             captured["callback"] = callback
             captured["row_factory"] = row_factory
@@ -8062,6 +8115,7 @@ def test_subscribe_table_throttle_ms_flushes_pending_rows(monkeypatch) -> None:
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             captured["callback"] = callback
 
@@ -8126,6 +8180,7 @@ def test_subscribe_registers_default_master_process_before_native_subscriber(
             idle_spin_checks: int = 64,
             row_factory: object | None = None,
             instrument_ids: object | None = None,
+            start_from: int = -1,
         ) -> None:
             assert master.process_id() == "proc_1"
             created["source"] = source
@@ -10172,6 +10227,44 @@ def test_remote_stream_subscriber_rejects_table_instrument_ids() -> None:
             table_callback=True,
             instrument_ids=["IF2606"],
         )
+
+
+@pytest.mark.parametrize("table_callback", [False, True])
+def test_remote_subscribe_rejects_non_tail_start_from_before_gateway_request(
+    monkeypatch,
+    table_callback: bool,
+) -> None:
+    class FakeMasterClient:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "token": None,
+                    "protocol_version": 1,
+                }
+            }
+
+    def fail_remote_subscriber(*args, **kwargs):
+        raise AssertionError("remote subscriber must not be created for non-tail start_from")
+
+    monkeypatch.setattr(zippy, "RemoteStreamSubscriber", fail_remote_subscriber)
+
+    with pytest.raises(ValueError, match="remote subscribe only supports start_from=-1"):
+        if table_callback:
+            zippy.subscribe_table(
+                "qmt_ticks",
+                callback=lambda table: None,
+                master=FakeMasterClient(),
+                start_from=0,
+            )
+        else:
+            zippy.subscribe(
+                "qmt_ticks",
+                callback=lambda row: None,
+                master=FakeMasterClient(),
+                start_from=0,
+            )
 
 
 @pytest.mark.parametrize("table_callback", [False, True])
@@ -12449,6 +12542,104 @@ def test_subscribe_uses_default_master_and_invokes_callback_with_live_row(
         server.stop()
 
 
+def test_subscribe_start_from_tail_skips_existing_active_segment_rows(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("subscriber_tail_test")
+    client.register_stream("tail_ticks", tick_schema, 64, 4096)
+    client.register_source("tail_source", "segment_test", "tail_ticks", {})
+
+    writer = _segment_test_writer(client, "tail_ticks", tick_schema, row_capacity=16)
+    client.publish_segment_descriptor("tail_ticks", writer.descriptor())
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+
+    received: list[zippy.Row] = []
+    ready = threading.Event()
+
+    def on_tick(row: zippy.Row) -> None:
+        received.append(row)
+        ready.set()
+
+    subscriber = zippy.subscribe(
+        source="tail_ticks",
+        callback=on_tick,
+        poll_interval_ms=1,
+        start_from=-1,
+    )
+    writer.append_tick(1777017601000000000, "IF2607", 4103.5)
+
+    try:
+        assert ready.wait(timeout=2.0)
+        assert [row["instrument_id"] for row in received] == ["IF2607"]
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_subscribe_start_from_explicit_offset_reads_from_that_row(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("subscriber_offset_test")
+    client.register_stream("offset_ticks", tick_schema, 64, 4096)
+    client.register_source("offset_source", "segment_test", "offset_ticks", {})
+
+    writer = _segment_test_writer(client, "offset_ticks", tick_schema, row_capacity=16)
+    client.publish_segment_descriptor("offset_ticks", writer.descriptor())
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+    writer.append_tick(1777017601000000000, "IF2607", 4103.5)
+    writer.append_tick(1777017602000000000, "IF2608", 4104.5)
+
+    received: list[zippy.Row] = []
+    ready = threading.Event()
+
+    def on_tick(row: zippy.Row) -> None:
+        received.append(row)
+        if len(received) >= 2:
+            ready.set()
+
+    subscriber = zippy.subscribe(
+        source="offset_ticks",
+        callback=on_tick,
+        poll_interval_ms=1,
+        start_from=1,
+    )
+
+    try:
+        assert ready.wait(timeout=2.0)
+        assert [row["instrument_id"] for row in received] == ["IF2607", "IF2608"]
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_subscribe_resumes_after_writer_process_restart(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
@@ -12594,8 +12785,10 @@ def test_subscriber_metrics_expose_hybrid_mmap_wait_counters(tmp_path: Path) -> 
         server.stop()
 
 
+@pytest.mark.parametrize("xfast", [False, True])
 def test_subscribe_switches_from_sealed_segment_when_descriptor_arrives(
     tmp_path: Path,
+    xfast: bool,
 ) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
@@ -12639,6 +12832,7 @@ def test_subscribe_switches_from_sealed_segment_when_descriptor_arrives(
         source="rollover_ticks",
         callback=on_tick,
         poll_interval_ms=500,
+        xfast=xfast,
     )
 
     try:
@@ -12654,8 +12848,69 @@ def test_subscribe_switches_from_sealed_segment_when_descriptor_arrives(
         assert second_ready.wait(timeout=0.2)
         second_received_at = next(ts for ts, instrument in received if instrument == "IF2607")
         assert second_received_at - descriptor_published_at < 0.15
+
+        metrics = subscriber.metrics()
+        assert metrics["running"] is True
+        assert metrics["descriptor_updates_total"] >= 1
+
+        stream = client.get_stream("rollover_ticks")
+        leases = stream["segment_reader_leases"]
+        active_descriptor = stream["active_segment_descriptor"]
+        assert len(leases) == 1
+        assert leases[0]["source_segment_id"] == active_descriptor["segment_id"]
+        assert leases[0]["source_generation"] == active_descriptor["generation"]
     finally:
         subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_subscribe_metrics_exposes_background_descriptor_error(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("bad_descriptor_writer")
+    client.register_stream("bad_descriptor_ticks", tick_schema, 64, 4096)
+    client.register_source("bad_descriptor_source", "segment_test", "bad_descriptor_ticks", {})
+    writer = _segment_test_writer(client, "bad_descriptor_ticks", tick_schema, row_capacity=4)
+    client.publish_segment_descriptor("bad_descriptor_ticks", writer.descriptor())
+
+    subscriber = zippy.subscribe(
+        source="bad_descriptor_ticks",
+        callback=lambda row: None,
+        poll_interval_ms=1,
+    )
+
+    try:
+        bad_descriptor = dict(writer.descriptor())
+        bad_descriptor["descriptor_generation"] = bad_descriptor["descriptor_generation"] + 1
+        client.publish_segment_descriptor("bad_descriptor_ticks", bad_descriptor)
+
+        deadline = time.time() + 2.0
+        metrics = subscriber.metrics()
+        while metrics["running"] is True and time.time() < deadline:
+            time.sleep(0.01)
+            metrics = subscriber.metrics()
+
+        assert metrics["running"] is False
+        assert "descriptor generation mismatch" in metrics["last_error"]
+    finally:
+        try:
+            subscriber.stop()
+        except RuntimeError:
+            pass
         if reset_default_master is not None:
             reset_default_master()
         server.stop()
@@ -14188,7 +14443,7 @@ def test_reactive_engine_can_consume_segment_stream_source_and_publish_to_zmq(
 
     port = reserve_tcp_port()
     endpoint = f"tcp://127.0.0.1:{port}"
-    subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+    subscriber = None
 
     engine = zippy.ReactiveStateEngine(
         name="reactive_segment",
@@ -14215,6 +14470,75 @@ def test_reactive_engine_can_consume_segment_stream_source_and_publish_to_zmq(
         assert received.schema == factor_schema
         assert received.column("instrument_id").to_pylist() == ["IF2606"]
         assert received.column("price_x2").to_pylist() == [8205.0]
+    finally:
+        if subscriber is not None:
+            subscriber.close()
+        engine.stop()
+        server.stop()
+
+
+def test_reactive_engine_segment_stream_source_start_from_tail_skips_existing_rows(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    factor_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("price_x2", pa.float64()),
+        ]
+    )
+
+    input_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    input_client.register_process("segment_writer")
+    input_client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+    input_client.register_source("openctp_md", "segment_test", "openctp_ticks", {})
+    writer = _segment_test_writer(input_client, "openctp_ticks", tick_schema, row_capacity=16)
+    input_client.publish_segment_descriptor("openctp_ticks", writer.descriptor())
+    writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+
+    factor_client = zippy.MasterClient(control_endpoint=control_endpoint)
+    factor_client.register_process("reactive_engine")
+
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = None
+
+    engine = zippy.ReactiveStateEngine(
+        name="reactive_segment_tail",
+        input_schema=tick_schema,
+        id_column="instrument_id",
+        factors=[zippy.Expr(expression="last_price * 2.0", output="price_x2")],
+        source=zippy.SegmentStreamSource(
+            stream_name="openctp_ticks",
+            expected_schema=tick_schema,
+            master=factor_client,
+            mode=zippy.SourceMode.PIPELINE,
+            xfast=True,
+            start_from=-1,
+        ),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
+    )
+
+    try:
+        engine.start()
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=1_000)
+        time.sleep(0.1)
+        writer.append_tick(1777017601000000000, "IF2606", 4103.0)
+        received = recv_zmq_with_retry(subscriber)
+
+        assert received.schema == factor_schema
+        assert received.column("instrument_id").to_pylist() == ["IF2606"]
+        assert received.column("last_price").to_pylist() == [4103.0]
+        assert received.column("price_x2").to_pylist() == [8206.0]
     finally:
         if subscriber is not None:
             subscriber.close()
