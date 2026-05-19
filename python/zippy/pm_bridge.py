@@ -515,21 +515,32 @@ class PmCommandRunner:
     def start(self, name: str | None = None) -> list[PmTaskInfo]:
         """Start one task or all tasks."""
         client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
-        return [client.start(name)] if name is not None else client.start_all()
+        if name is None or name == "all":
+            return client.start_all()
+        return [client.start(name)]
 
     def stop(self, name: str | None = None) -> list[PmTaskInfo]:
         """Stop one task or all tasks."""
         client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
-        return [client.stop(name)] if name is not None else client.stop_all()
+        if name is None or name == "all":
+            return client.stop_all()
+        return [client.stop(name)]
 
     def restart(self, name: str | None = None) -> list[PmTaskInfo]:
         """Restart one task or all tasks."""
         client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
-        return [client.restart(name)] if name is not None else client.restart_all()
+        if name is None or name == "all":
+            return client.restart_all()
+        return [client.restart(name)]
 
-    def logs(self, name: str, *, lines: int | None = None) -> str:
+    def logs(self, name: str | None = None, *, lines: int | None = None) -> str:
         """Read task logs through the default daemon."""
-        text = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE)).logs(name)
+        client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
+        if name is None:
+            tasks = client.list_tasks()
+            text = "\n".join(f"==> {task.name} <==\n{client.logs(task.name)}" for task in tasks)
+        else:
+            text = client.logs(name)
         if lines is None:
             return text
         return "\n".join(text.splitlines()[-lines:])
@@ -564,7 +575,8 @@ def _task_info_list(payload: Any) -> list[PmTaskInfo]:
 
 
 def _config_summary(path: str | Path) -> tuple[str, int]:
-    config = load_pm_config(path)
+    config = read_pm_config(path)
+    _validate_pm_config(config)
     project = _table(config.get("project", {}), "project")
     tasks = _table(config.get("tasks", {}), "tasks")
     return str(project.get("name", "zippy-local")), len(tasks)
@@ -580,6 +592,11 @@ def default_project_config() -> dict[str, object]:
     runtime = PmRuntimeConfig.default()
     return {
         "project": {"name": "zippy-local"},
+        "defaults": {
+            "restart": "on-failure",
+            "restart_delay": "2s",
+            "max_restarts": 5,
+        },
         "runtime": {
             "daemon_name": runtime.daemon_name,
             "root": str(runtime.root),
@@ -605,12 +622,29 @@ def load_pm_config(path: str | Path) -> dict[str, object]:
     config_path = Path(path)
     if not config_path.exists():
         return default_project_config()
-    with config_path.open("rb") as handle:
-        config = tomllib.load(handle)
+    config = read_pm_config(config_path)
     config.setdefault("project", {"name": "zippy-local"})
+    config.setdefault("defaults", default_project_config()["defaults"])
     config.setdefault("runtime", default_project_config()["runtime"])
     config.setdefault("tasks", {})
     return config
+
+
+def read_pm_config(path: str | Path) -> dict[str, object]:
+    """
+    Read an existing process-manager TOML config.
+
+    :param path: Config file path.
+    :type path: str | pathlib.Path
+    :returns: Parsed config dictionary.
+    :rtype: dict[str, object]
+    :raises FileNotFoundError: If the config file does not exist.
+    """
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"missing config [{config_path}]")
+    with config_path.open("rb") as handle:
+        return tomllib.load(handle)
 
 
 def write_pm_config(path: str | Path, config: dict[str, object]) -> None:
@@ -638,29 +672,24 @@ def format_pm_toml(config: dict[str, object]) -> str:
     :raises TypeError: If an unsupported TOML value is encountered.
     """
     lines: list[str] = []
-    project = _table(config.get("project", {}), "project")
-    runtime = _table(config.get("runtime", {}), "runtime")
     tasks = _table(config.get("tasks", {}), "tasks")
 
-    _append_table(lines, ["project"], project)
-    _append_table(lines, ["runtime"], runtime)
+    root_values, top_level_tables = _partition_table(config)
+    if root_values:
+        _append_root_values(lines, root_values)
+
+    ordered_tables = ["project", "defaults", "runtime"]
+    ordered_tables.extend(
+        sorted(key for key in top_level_tables if key not in {*ordered_tables, "tasks"})
+    )
+    for table_name in ordered_tables:
+        if table_name in top_level_tables:
+            table = _table(top_level_tables[table_name], table_name)
+            _append_table_recursive(lines, [table_name], table)
 
     for task_name in sorted(tasks):
         task = _table(tasks[task_name], f"tasks.{task_name}")
-        scalar_values, nested_tables = _partition_table(task)
-        _append_table(lines, ["tasks", task_name], scalar_values)
-        for nested_name in sorted(nested_tables):
-            nested_table = _table(
-                nested_tables[nested_name],
-                f"tasks.{task_name}.{nested_name}",
-            )
-            if nested_name == "env":
-                nested_table = dict(_validated_env(nested_table))
-            _append_table(
-                lines,
-                ["tasks", task_name, nested_name],
-                nested_table,
-            )
+        _append_task_table_recursive(lines, ["tasks", task_name], task)
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -800,6 +829,26 @@ def add_task(path: str | Path, name: str, task: dict[str, object]) -> dict[str, 
     return config
 
 
+def _validate_pm_config(config: Mapping[str, object]) -> None:
+    tasks = _table(config.get("tasks", {}), "tasks")
+    if not tasks:
+        raise ValueError("at least one [tasks.<name>] section is required")
+    for task_name, task_value in tasks.items():
+        task = _table(task_value, f"tasks.{task_name}")
+        cmd = task.get("cmd")
+        if not isinstance(cmd, str) or not cmd:
+            raise ValueError(f"task [{task_name}] must define non-empty cmd")
+        args = task.get("args", [])
+        if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
+            raise ValueError(f"task [{task_name}] args must be a list of strings")
+        depends_on = task.get("depends_on", [])
+        if not isinstance(depends_on, list) or any(not isinstance(dep, str) for dep in depends_on):
+            raise ValueError(f"task [{task_name}] depends_on must be a list of strings")
+        env = task.get("env")
+        if env is not None:
+            _validated_env(_table(env, f"tasks.{task_name}.env"))
+
+
 def _tcp_health_address(uri: str) -> str:
     parsed = urlparse(uri)
     try:
@@ -819,6 +868,37 @@ def _append_table(lines: list[str], segments: list[str], values: dict[str, objec
     lines.append(_format_toml_header(segments))
     for key in sorted(values):
         lines.append(f"{_format_toml_key(key)} = {_format_toml_value(values[key])}")
+
+
+def _append_root_values(lines: list[str], values: dict[str, object]) -> None:
+    for key in sorted(values):
+        lines.append(f"{_format_toml_key(key)} = {_format_toml_value(values[key])}")
+
+
+def _append_table_recursive(
+    lines: list[str],
+    segments: list[str],
+    values: dict[str, object],
+) -> None:
+    scalar_values, nested_tables = _partition_table(values)
+    _append_table(lines, segments, scalar_values)
+    for nested_name in sorted(nested_tables):
+        nested_table = _table(nested_tables[nested_name], ".".join([*segments, nested_name]))
+        _append_table_recursive(lines, [*segments, nested_name], nested_table)
+
+
+def _append_task_table_recursive(
+    lines: list[str],
+    segments: list[str],
+    values: dict[str, object],
+) -> None:
+    scalar_values, nested_tables = _partition_table(values)
+    _append_table(lines, segments, scalar_values)
+    for nested_name in sorted(nested_tables):
+        nested_table = _table(nested_tables[nested_name], ".".join([*segments, nested_name]))
+        if nested_name == "env":
+            nested_table = dict(_validated_env(nested_table))
+        _append_task_table_recursive(lines, [*segments, nested_name], nested_table)
 
 
 def _partition_table(
@@ -848,6 +928,8 @@ def _format_toml_value(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(_format_toml_value(item) for item in value) + "]"

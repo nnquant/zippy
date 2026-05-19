@@ -222,10 +222,10 @@ def list_tasks() -> None:
 
 
 @pm_group.command("logs")
-@click.argument("name")
+@click.argument("name", required=False)
 @click.option("--lines", type=int, default=None, help="Number of trailing log lines to print.")
 @click.option("--follow", is_flag=True, default=False, help="Follow logs.")
-def logs(name: str, lines: int | None, follow: bool) -> None:
+def logs(name: str | None, lines: int | None, follow: bool) -> None:
     """
     Print task logs.
     """

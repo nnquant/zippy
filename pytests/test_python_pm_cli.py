@@ -17,6 +17,7 @@ from zippy.pm_bridge import (
     PmSupervisor,
     custom_task,
     format_pm_toml,
+    add_task,
     master_task,
 )
 
@@ -65,6 +66,37 @@ def test_pm_format_preserves_literal_task_names_with_dots() -> None:
     parsed = tomllib.loads(text)
 
     assert parsed["tasks"]["foo.bar"]["cmd"] == "zippy"
+
+
+def test_pm_add_preserves_defaults_table(tmp_path: Path) -> None:
+    config_path = tmp_path / "zippy.pm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "zippy-local"
+
+[defaults]
+restart = "on-failure"
+restart_delay = "2s"
+max_restarts = 7
+
+[tasks.worker]
+cmd = "python"
+args = ["-m", "worker"]
+""",
+        encoding="utf-8",
+    )
+
+    add_task(config_path, "master", master_task())
+
+    config = read_toml(config_path)
+    assert config["defaults"] == {
+        "restart": "on-failure",
+        "restart_delay": "2s",
+        "max_restarts": 7,
+    }
+    assert config["tasks"]["worker"]["cmd"] == "python"
+    assert config["tasks"]["master"]["cmd"] == "zippy"
 
 
 def test_pm_custom_task_rejects_invalid_env_key() -> None:
@@ -226,6 +258,71 @@ def test_pm_apply_delegates_to_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0
     assert calls == [("apply", Path("zippy.pm.toml"), True)]
     assert result.output == "apply dry-run [zippy-local] tasks=1\n"
+
+
+def test_pm_validate_rejects_missing_config() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(main, ["pm", "validate"])
+
+        assert result.exit_code != 0
+        assert "missing config [zippy.pm.toml]" in result.output
+
+
+def test_pm_validate_rejects_task_without_cmd() -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        Path(DEFAULT_PM_CONFIG_FILE).write_text(
+            """
+[project]
+name = "bad"
+
+[tasks.worker]
+args = ["-m", "worker"]
+""",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(main, ["pm", "validate"])
+
+        assert result.exit_code != 0
+        assert "task [worker] must define non-empty cmd" in result.output
+
+
+def test_pm_start_all_delegates_to_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeRunner:
+        def start(self, name: str | None = None) -> list[object]:
+            calls.append(("start", name))
+            return [type("Task", (), {"name": "master", "status": "online", "pid": 123})()]
+
+    monkeypatch.setattr(PmCommandRunner, "default", classmethod(lambda cls: FakeRunner()))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["pm", "start", "all"])
+
+    assert result.exit_code == 0
+    assert calls == [("start", "all")]
+    assert "start [master] status=[online] pid=[123]" in result.output
+
+
+def test_pm_logs_accepts_optional_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str | None, int | None]] = []
+
+    class FakeRunner:
+        def logs(self, name: str | None = None, *, lines: int | None = None) -> str:
+            calls.append(("logs", name, lines))
+            return "combined logs"
+
+    monkeypatch.setattr(PmCommandRunner, "default", classmethod(lambda cls: FakeRunner()))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["pm", "logs", "--lines", "20"])
+
+    assert result.exit_code == 0
+    assert calls == [("logs", None, 20)]
+    assert result.output == "combined logs\n"
 
 
 def test_pm_supervisor_does_not_spawn_when_ready_probe_returns_rpc_error(
