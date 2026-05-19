@@ -60,6 +60,7 @@ def test_cli_root_help() -> None:
     assert "gateway" in result.output
     assert "stream" in result.output
     assert "table" in result.output
+    assert "pm" in result.output
 
 
 def test_python_module_entrypoint_shows_root_help() -> None:
@@ -76,6 +77,7 @@ def test_python_module_entrypoint_shows_root_help() -> None:
     assert "gateway" in result.stdout
     assert "stream" in result.stdout
     assert "table" in result.stdout
+    assert "pm" in result.stdout
 
 
 def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch) -> None:
