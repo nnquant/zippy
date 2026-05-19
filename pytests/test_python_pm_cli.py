@@ -11,7 +11,10 @@ from zippy.pm_bridge import (
     DEFAULT_PM_CONFIG_FILE,
     DEFAULT_PM_DAEMON_NAME,
     DEFAULT_PM_ROOT,
+    PmCommandRunner,
+    PmRpcClient,
     PmRuntimeConfig,
+    PmSupervisor,
     custom_task,
     format_pm_toml,
     master_task,
@@ -164,3 +167,134 @@ def test_pm_add_custom_writes_explicit_command() -> None:
         assert task["args"] == ["-m", "worker", "--flag"]
         assert task["cwd"] == "/srv/zippy"
         assert task["env"] == {"MODE": "dev", "EMPTY": ""}
+
+
+def test_pm_supervisor_builds_zippy_rspm_daemon_command() -> None:
+    config = PmRuntimeConfig.default()
+    supervisor = PmSupervisor(config)
+
+    assert supervisor.daemon_command(Path("zippy.pm.toml")) == [
+        "zippy-rspm",
+        "daemon",
+        "run",
+        "zippy.pm.toml",
+        "127.0.0.1:27691",
+        str(config.log_dir),
+        str(config.state_dir),
+        str(config.socket_path),
+    ]
+
+    supervisor_with_token = PmSupervisor(config, token="dev-token")
+
+    assert supervisor_with_token.daemon_command(Path("zippy.pm.toml"))[-2:] == [
+        "--token",
+        "dev-token",
+    ]
+
+
+def test_pm_validate_delegates_to_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, Path]] = []
+
+    class FakeRunner:
+        def validate(self, path: str | Path) -> str:
+            calls.append(("validate", Path(path)))
+            return "valid [zippy-local] tasks=[1]"
+
+    monkeypatch.setattr(PmCommandRunner, "default", classmethod(lambda cls: FakeRunner()))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["pm", "validate", "-f", "zippy.pm.toml"])
+
+    assert result.exit_code == 0
+    assert calls == [("validate", Path("zippy.pm.toml"))]
+    assert result.output == "valid [zippy-local] tasks=[1]\n"
+
+
+def test_pm_apply_delegates_to_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, Path, bool]] = []
+
+    class FakeRunner:
+        def apply(self, path: str | Path, *, dry_run: bool = False) -> str:
+            calls.append(("apply", Path(path), dry_run))
+            return "apply dry-run [zippy-local] tasks=1"
+
+    monkeypatch.setattr(PmCommandRunner, "default", classmethod(lambda cls: FakeRunner()))
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["pm", "apply", "-f", "zippy.pm.toml", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert calls == [("apply", Path("zippy.pm.toml"), True)]
+    assert result.output == "apply dry-run [zippy-local] tasks=1\n"
+
+
+def test_pm_supervisor_does_not_spawn_when_ready_probe_returns_rpc_error(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "zippy.pm.toml"
+    config_path.write_text('[project]\nname = "zippy-local"\n', encoding="utf-8")
+    spawned: list[Path] = []
+
+    class FakeClient:
+        def list_tasks(self) -> None:
+            raise RuntimeError("auth failed")
+
+    class FakeSupervisor(PmSupervisor):
+        def client(self) -> FakeClient:
+            return FakeClient()
+
+        def _spawn_daemon(self, config_path: str | Path) -> None:
+            spawned.append(Path(config_path))
+
+    supervisor = FakeSupervisor(PmRuntimeConfig.default())
+
+    with pytest.raises(RuntimeError, match="auth failed"):
+        supervisor.ensure_daemon(config_path)
+
+    assert spawned == []
+
+
+def test_pm_rpc_client_rejects_success_response_without_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSocket:
+        def __enter__(self) -> "FakeSocket":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def sendall(self, payload: bytes) -> None:
+            return None
+
+    monkeypatch.setattr("socket.create_connection", lambda *args, **kwargs: FakeSocket())
+    monkeypatch.setattr(
+        "zippy.pm_bridge._read_json_line",
+        lambda sock: {"jsonrpc": "2.0", "id": 1},
+    )
+
+    with pytest.raises(RuntimeError, match="task.list"):
+        PmRpcClient().request("task.list")
+
+
+def test_pm_rpc_client_rejects_mismatched_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSocket:
+        def __enter__(self) -> "FakeSocket":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def sendall(self, payload: bytes) -> None:
+            return None
+
+    monkeypatch.setattr("socket.create_connection", lambda *args, **kwargs: FakeSocket())
+    monkeypatch.setattr(
+        "zippy.pm_bridge._read_json_line",
+        lambda sock: {"jsonrpc": "2.0", "id": 99, "result": []},
+    )
+
+    with pytest.raises(RuntimeError, match="response id"):
+        PmRpcClient().request("task.list")

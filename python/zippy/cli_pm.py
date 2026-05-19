@@ -4,8 +4,7 @@ Process-manager bridge commands for the zippy CLI.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Callable
+import json
 
 import click
 
@@ -13,10 +12,11 @@ from .cli_common import cli_error
 from .pm_bridge import (
     DEFAULT_MASTER_URI,
     DEFAULT_PM_CONFIG_FILE,
+    PmCommandRunner,
+    PmTaskInfo,
     add_task,
     custom_task,
     gateway_task,
-    load_pm_config,
     master_task,
 )
 
@@ -43,13 +43,10 @@ def validate_config(config_file: str) -> None:
     Validate a local zippy process-manager config.
     """
     try:
-        config = load_pm_config(config_file)
-        tasks = config.get("tasks", {})
-        if not isinstance(tasks, dict):
-            raise TypeError("config tasks must be a table")
+        message = PmCommandRunner.default().validate(config_file)
     except (OSError, TypeError, ValueError) as error:
         cli_error(str(error))
-    click.echo(f"valid [{config_file}] tasks=[{len(tasks)}]")
+    click.echo(message)
 
 
 @pm_group.command("apply")
@@ -68,19 +65,10 @@ def apply_config(config_file: str, dry_run: bool) -> None:
     Apply a local zippy process-manager config.
     """
     try:
-        config = load_pm_config(config_file)
-        tasks = config.get("tasks", {})
-        if not isinstance(tasks, dict):
-            raise TypeError("config tasks must be a table")
-        if dry_run:
-            click.echo(f"dry-run [{config_file}] tasks=[{len(tasks)}]")
-            return
-        runner_cls = _pm_command_runner()
-        if runner_cls is None:
-            raise NotImplementedError("pm apply runner is not implemented yet")
-        runner_cls(config_file).apply()
-    except (AttributeError, NotImplementedError, OSError, TypeError, ValueError) as error:
+        message = PmCommandRunner.default().apply(config_file, dry_run=dry_run)
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
         cli_error(str(error))
+    click.echo(message)
 
 
 @pm_group.group("add")
@@ -185,27 +173,80 @@ def add_custom(
 
 
 @pm_group.command("start")
-def start() -> None:
+@click.argument("name", required=False)
+def start(name: str | None) -> None:
     """
     Start managed zippy process-manager tasks.
     """
-    _runtime_command("start")
+    _task_action("start", name)
 
 
 @pm_group.command("stop")
-def stop() -> None:
+@click.argument("name", required=False)
+def stop(name: str | None) -> None:
     """
     Stop managed zippy process-manager tasks.
     """
-    _runtime_command("stop")
+    _task_action("stop", name)
 
 
 @pm_group.command("restart")
-def restart() -> None:
+@click.argument("name", required=False)
+def restart(name: str | None) -> None:
     """
     Restart managed zippy process-manager tasks.
     """
-    _runtime_command("restart")
+    _task_action("restart", name)
+
+
+@pm_group.command("status")
+def status() -> None:
+    """
+    Show managed task status.
+    """
+    try:
+        _print_task_table(PmCommandRunner.default().status())
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        cli_error(str(error))
+
+
+@pm_group.command("ls")
+def list_tasks() -> None:
+    """
+    List managed tasks.
+    """
+    try:
+        _print_task_table(PmCommandRunner.default().list_tasks())
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        cli_error(str(error))
+
+
+@pm_group.command("logs")
+@click.argument("name")
+@click.option("--lines", type=int, default=None, help="Number of trailing log lines to print.")
+@click.option("--follow", is_flag=True, default=False, help="Follow logs.")
+def logs(name: str, lines: int | None, follow: bool) -> None:
+    """
+    Print task logs.
+    """
+    if follow:
+        cli_error("log follow is not implemented in the first bridge version")
+    try:
+        click.echo(PmCommandRunner.default().logs(name, lines=lines))
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        cli_error(str(error))
+
+
+@pm_group.command("events")
+def events() -> None:
+    """
+    Print daemon events.
+    """
+    try:
+        for event in PmCommandRunner.default().events():
+            click.echo(json.dumps(event, ensure_ascii=False, sort_keys=True))
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        cli_error(str(error))
 
 
 @pm_group.command("doctor")
@@ -213,22 +254,25 @@ def doctor() -> None:
     """
     Inspect local zippy process-manager health.
     """
-    _runtime_command("doctor")
-
-
-def _runtime_command(command: str) -> None:
-    runner_cls = _pm_command_runner()
-    if runner_cls is None:
-        cli_error(f"pm {command} runner is not implemented yet")
     try:
-        getattr(runner_cls(DEFAULT_PM_CONFIG_FILE), command)()
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        info = PmCommandRunner.default().doctor()
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
         cli_error(str(error))
+    for key in ("daemon", "endpoint", "log_dir", "state_dir", "run_dir", "socket_path"):
+        click.echo(f"{key}: {info[key]}")
 
 
-def _pm_command_runner() -> Callable[[str | Path], object] | None:
+def _task_action(action: str, name: str | None) -> None:
     try:
-        from .pm_bridge import PmCommandRunner
-    except ImportError:
-        return None
-    return PmCommandRunner
+        tasks = getattr(PmCommandRunner.default(), action)(name)
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as error:
+        cli_error(str(error))
+    for task in tasks:
+        click.echo(f"{action} [{task.name}] status=[{task.status}] pid=[{task.pid}]")
+
+
+def _print_task_table(tasks: list[PmTaskInfo]) -> None:
+    click.echo(f"{'name':<24} {'status':<14} {'pid':<10} command")
+    for task in tasks:
+        pid = "" if task.pid is None else str(task.pid)
+        click.echo(f"{task.name:<24} {task.status:<14} {pid:<10} {task.cmd}")

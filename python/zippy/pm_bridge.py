@@ -6,11 +6,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import shlex
+import socket
+import subprocess
+import time
 import tomllib
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
 DEFAULT_PM_CONFIG_FILE = "zippy.pm.toml"
@@ -78,6 +82,492 @@ class PmRuntimeConfig:
             socket_path=run_dir / f"{DEFAULT_PM_DAEMON_NAME}.sock",
             endpoint=f"{DEFAULT_PM_HOST}:{DEFAULT_PM_PORT}",
         )
+
+
+@dataclass(frozen=True)
+class PmTaskInfo:
+    """
+    Structured task state returned by the zippy process-manager daemon.
+
+    :param name: Task name from the process-manager config.
+    :type name: str
+    :param status: Runtime lifecycle status.
+    :type status: str
+    :param pid: Current process id if the task is running.
+    :type pid: int | None
+    """
+
+    name: str
+    task_id: int = 0
+    run_mode: str = ""
+    pid: int | None = None
+    status: str = "defined"
+    health: str | None = None
+    started_at: str | None = None
+    stopped_at: str | None = None
+    uptime_ms: int | None = None
+    cpu_percent: float | None = None
+    memory_bytes: int | None = None
+    restart_count: int = 0
+    last_exit_code: int | None = None
+    cwd: str | None = None
+    cmd: str = ""
+    dependencies: list[str] | None = None
+    dependents: list[str] | None = None
+    schedule_state: str | None = None
+    display_timezone: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "PmTaskInfo":
+        """
+        Build task info from a JSON-RPC result object.
+
+        :param payload: JSON object returned by zippy-rspm.
+        :type payload: collections.abc.Mapping[str, typing.Any]
+        :returns: Structured task info.
+        :rtype: PmTaskInfo
+        """
+        return cls(
+            task_id=int(payload.get("task_id", 0)),
+            name=str(payload["name"]),
+            run_mode=str(payload.get("run_mode", "")),
+            pid=payload.get("pid"),
+            status=str(payload.get("status", "defined")),
+            health=payload.get("health"),
+            started_at=payload.get("started_at"),
+            stopped_at=payload.get("stopped_at"),
+            uptime_ms=payload.get("uptime_ms"),
+            cpu_percent=payload.get("cpu_percent"),
+            memory_bytes=payload.get("memory_bytes"),
+            restart_count=int(payload.get("restart_count", 0)),
+            last_exit_code=payload.get("last_exit_code"),
+            cwd=payload.get("cwd"),
+            cmd=str(payload.get("cmd", "")),
+            dependencies=list(payload.get("dependencies", [])),
+            dependents=list(payload.get("dependents", [])),
+            schedule_state=payload.get("schedule_state"),
+            display_timezone=payload.get("display_timezone"),
+        )
+
+
+@dataclass
+class PmRpcClient:
+    """
+    Synchronous JSON-RPC client for the local zippy-rspm daemon.
+
+    :param host: Daemon TCP host.
+    :type host: str
+    :param port: Daemon TCP port.
+    :type port: int
+    :param token: Optional daemon auth token.
+    :type token: str | None
+    """
+
+    host: str = DEFAULT_PM_HOST
+    port: int = DEFAULT_PM_PORT
+    token: str | None = None
+    timeout: float = 5.0
+    _next_id: int = 1
+
+    def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
+        """
+        Send one JSON-RPC request and return the decoded result.
+
+        :param method: RPC method name.
+        :type method: str
+        :param params: RPC params object.
+        :type params: collections.abc.Mapping[str, typing.Any] | None
+        :returns: Decoded ``result`` field.
+        :rtype: typing.Any
+        :raises RuntimeError: If the daemon returns a JSON-RPC error.
+        """
+        request_params = dict(params or {})
+        if self.token is not None:
+            request_params["token"] = self.token
+        request_id = self._next_id
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": request_params,
+        }
+        self._next_id += 1
+
+        with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+            sock.sendall(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
+            response = _read_json_line(sock)
+
+        error = response.get("error")
+        if error is not None:
+            if isinstance(error, Mapping):
+                raise RuntimeError(
+                    f"zippy-rspm RPC method=[{method}] endpoint=[{self.host}:{self.port}] "
+                    f"error=[{error.get('code')}]: {error.get('message')}"
+                )
+            raise RuntimeError(
+                f"zippy-rspm RPC method=[{method}] endpoint=[{self.host}:{self.port}] "
+                f"error=[{error}]"
+            )
+        if response.get("id") != request_id:
+            raise RuntimeError(
+                f"zippy-rspm RPC response id mismatch method=[{method}] "
+                f"endpoint=[{self.host}:{self.port}] expected=[{request_id}] "
+                f"actual=[{response.get('id')}]"
+            )
+        if "result" not in response:
+            raise RuntimeError(
+                f"zippy-rspm RPC response missing result method=[{method}] "
+                f"endpoint=[{self.host}:{self.port}]"
+            )
+        return response.get("result")
+
+    def list_tasks(self) -> list[PmTaskInfo]:
+        """
+        List configured tasks.
+
+        :returns: Task info list.
+        :rtype: list[PmTaskInfo]
+        """
+        return _task_info_list(self.request("task.list"))
+
+    def apply_file(self, path: str | Path) -> list[PmTaskInfo]:
+        """
+        Apply a process-manager TOML file through the daemon.
+
+        :param path: Config file path.
+        :type path: str | pathlib.Path
+        :returns: Task info list after applying the config.
+        :rtype: list[PmTaskInfo]
+        """
+        text = Path(path).read_text(encoding="utf-8")
+        return _task_info_list(self.request("config.apply", {"toml": _rewrite_rspm_text(text)}))
+
+    def start(self, name: str) -> PmTaskInfo:
+        """Start one task."""
+        return _task_info(self.request("task.start", {"task": name}))
+
+    def stop(self, name: str) -> PmTaskInfo:
+        """Stop one task."""
+        return _task_info(self.request("task.stop", {"task": name}))
+
+    def restart(self, name: str) -> PmTaskInfo:
+        """Restart one task."""
+        return _task_info(self.request("task.restart", {"task": name}))
+
+    def start_all(self) -> list[PmTaskInfo]:
+        """Start all tasks."""
+        return _task_info_list(self.request("task.start_all"))
+
+    def stop_all(self) -> list[PmTaskInfo]:
+        """Stop all tasks."""
+        return _task_info_list(self.request("task.stop_all"))
+
+    def restart_all(self) -> list[PmTaskInfo]:
+        """Restart all tasks."""
+        self.stop_all()
+        return self.start_all()
+
+    def logs(self, name: str) -> str:
+        """Read one task log."""
+        result = self.request("task.logs", {"task": name})
+        return str(result)
+
+    def events(self) -> list[dict[str, Any]]:
+        """List daemon events."""
+        result = self.request("event.list")
+        if not isinstance(result, list):
+            raise TypeError("event.list result must be a list")
+        return [dict(item) for item in result]
+
+
+def _read_json_line(sock: socket.socket) -> dict[str, Any]:
+    """
+    Read a single line-delimited JSON response from a socket.
+
+    :param sock: Connected socket.
+    :type sock: socket.socket
+    :returns: Decoded JSON object.
+    :rtype: dict[str, typing.Any]
+    :raises ConnectionError: If no response is returned.
+    """
+    chunks: list[bytes] = []
+    while True:
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        if chunk == b"\n":
+            break
+        chunks.append(chunk)
+    if not chunks:
+        raise ConnectionError("zippy-rspm returned empty response")
+    response = json.loads(b"".join(chunks).decode("utf-8"))
+    if not isinstance(response, dict):
+        raise TypeError("zippy-rspm response must be a JSON object")
+    return response
+
+
+def _rewrite_rspm_text(text: str) -> str:
+    """
+    Rewrite zippy-local TOML into the subset consumed by rspm.
+
+    The zippy bridge stores local runtime metadata under ``[runtime]``. rspm
+    treats the task config as the source of truth, so that zippy-only table is
+    stripped before ``config.apply`` while all task/default sections are kept.
+
+    :param text: zippy process-manager TOML text.
+    :type text: str
+    :returns: TOML text suitable for rspm ``config.apply``.
+    :rtype: str
+    """
+    tomllib.loads(text)
+    lines = text.splitlines()
+    rewritten: list[str] = []
+    skipping_runtime = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[runtime]":
+            skipping_runtime = True
+            continue
+        if skipping_runtime and stripped.startswith("[") and stripped.endswith("]"):
+            skipping_runtime = False
+        if not skipping_runtime:
+            rewritten.append(line)
+    return "\n".join(rewritten).rstrip() + "\n"
+
+
+@dataclass(frozen=True)
+class PmSupervisor:
+    """
+    Ensure a detached zippy-rspm sidecar is ready for CLI commands.
+
+    :param config: Runtime paths and endpoint.
+    :type config: PmRuntimeConfig
+    :param token: Optional local auth token.
+    :type token: str | None
+    :param startup_timeout: Seconds to wait for daemon readiness.
+    :type startup_timeout: float
+    """
+
+    config: PmRuntimeConfig
+    token: str | None = None
+    startup_timeout: float = 10.0
+
+    def client(self) -> PmRpcClient:
+        """
+        Build a JSON-RPC client for the configured daemon endpoint.
+
+        :returns: Configured RPC client.
+        :rtype: PmRpcClient
+        """
+        return PmRpcClient(self.config.host, self.config.port, self.token)
+
+    def daemon_command(self, config_path: str | Path) -> list[str]:
+        """
+        Build the detached zippy-rspm daemon command.
+
+        :param config_path: Process-manager config path.
+        :type config_path: str | pathlib.Path
+        :returns: Command argv.
+        :rtype: list[str]
+        """
+        command = [
+            self.config.daemon_name,
+            "daemon",
+            "run",
+            str(config_path),
+            self.config.endpoint,
+            str(self.config.log_dir),
+            str(self.config.state_dir),
+            str(self.config.socket_path),
+        ]
+        if self.token is not None:
+            command.extend(["--token", self.token])
+        return command
+
+    def ensure_daemon(self, config_path: str | Path) -> PmRpcClient:
+        """
+        Return a ready client, spawning the detached daemon if needed.
+
+        :param config_path: Process-manager config path.
+        :type config_path: str | pathlib.Path
+        :returns: Ready RPC client.
+        :rtype: PmRpcClient
+        """
+        if self._is_ready():
+            return self.client()
+        self._ensure_config_source(config_path)
+        self._spawn_daemon(config_path)
+        return self._wait_ready()
+
+    def _is_ready(self) -> bool:
+        try:
+            self.client().list_tasks()
+        except (ConnectionError, OSError, TimeoutError):
+            return False
+        return True
+
+    def _ensure_config_source(self, config_path: str | Path) -> None:
+        config = Path(config_path)
+        applied_config = self.config.state_dir / "applied.toml"
+        if config.exists() or applied_config.exists():
+            return
+        raise FileNotFoundError(
+            f"missing config [{config}] and no applied config [{applied_config}]"
+        )
+
+    def _spawn_daemon(self, config_path: str | Path) -> None:
+        self.config.log_dir.mkdir(parents=True, exist_ok=True)
+        self.config.state_dir.mkdir(parents=True, exist_ok=True)
+        self.config.socket_path.parent.mkdir(parents=True, exist_ok=True)
+
+        kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+                subprocess, "DETACHED_PROCESS", 0
+            )
+        else:
+            kwargs["start_new_session"] = True
+
+        with (
+            (self.config.log_dir / "zippy-rspm.stdout.log").open("ab") as stdout,
+            (self.config.log_dir / "zippy-rspm.stderr.log").open("ab") as stderr,
+        ):
+            process = subprocess.Popen(
+                self.daemon_command(config_path),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                **kwargs,
+            )
+        (self.config.state_dir / "zippy-rspm.pid").write_text(
+            str(process.pid),
+            encoding="utf-8",
+        )
+
+    def _wait_ready(self) -> PmRpcClient:
+        deadline = time.monotonic() + self.startup_timeout
+        while True:
+            if self._is_ready():
+                return self.client()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"zippy-rspm did not become ready at [{self.config.endpoint}]")
+            time.sleep(0.1)
+
+
+@dataclass(frozen=True)
+class PmCommandRunner:
+    """
+    High-level command runner used by ``zippy pm`` CLI commands.
+
+    :param supervisor: Daemon supervisor.
+    :type supervisor: PmSupervisor
+    """
+
+    supervisor: PmSupervisor
+
+    @classmethod
+    def default(cls) -> "PmCommandRunner":
+        """
+        Build the default zippy-local command runner.
+
+        :returns: Default runner.
+        :rtype: PmCommandRunner
+        """
+        return cls(PmSupervisor(PmRuntimeConfig.default()))
+
+    def validate(self, path: str | Path) -> str:
+        """
+        Validate local TOML without starting the daemon.
+
+        :param path: Config file path.
+        :type path: str | pathlib.Path
+        :returns: Human-readable validation summary.
+        :rtype: str
+        """
+        project_name, task_count = _config_summary(path)
+        return f"valid [{project_name}] tasks=[{task_count}]"
+
+    def apply(self, path: str | Path, *, dry_run: bool = False) -> str:
+        """
+        Apply a TOML config, or validate locally for dry-run.
+
+        :param path: Config file path.
+        :type path: str | pathlib.Path
+        :param dry_run: Whether to skip daemon application.
+        :type dry_run: bool
+        :returns: Human-readable apply summary.
+        :rtype: str
+        """
+        project_name, task_count = _config_summary(path)
+        if dry_run:
+            return f"apply dry-run [{project_name}] tasks={task_count}"
+        tasks = self.supervisor.ensure_daemon(path).apply_file(path)
+        return f"apply [{project_name}] tasks={len(tasks)}"
+
+    def list_tasks(self) -> list[PmTaskInfo]:
+        """List tasks through the default daemon."""
+        return self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE)).list_tasks()
+
+    def status(self) -> list[PmTaskInfo]:
+        """Return task status through the default daemon."""
+        return self.list_tasks()
+
+    def start(self, name: str | None = None) -> list[PmTaskInfo]:
+        """Start one task or all tasks."""
+        client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
+        return [client.start(name)] if name is not None else client.start_all()
+
+    def stop(self, name: str | None = None) -> list[PmTaskInfo]:
+        """Stop one task or all tasks."""
+        client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
+        return [client.stop(name)] if name is not None else client.stop_all()
+
+    def restart(self, name: str | None = None) -> list[PmTaskInfo]:
+        """Restart one task or all tasks."""
+        client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
+        return [client.restart(name)] if name is not None else client.restart_all()
+
+    def logs(self, name: str, *, lines: int | None = None) -> str:
+        """Read task logs through the default daemon."""
+        text = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE)).logs(name)
+        if lines is None:
+            return text
+        return "\n".join(text.splitlines()[-lines:])
+
+    def events(self) -> list[dict[str, Any]]:
+        """List daemon events through the default daemon."""
+        return self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE)).events()
+
+    def doctor(self) -> dict[str, str]:
+        """Return local daemon diagnostic fields."""
+        config = self.supervisor.config
+        return {
+            "daemon": config.daemon_name,
+            "endpoint": config.endpoint,
+            "log_dir": str(config.log_dir),
+            "state_dir": str(config.state_dir),
+            "run_dir": str(config.run_dir),
+            "socket_path": str(config.socket_path),
+        }
+
+
+def _task_info(payload: Any) -> PmTaskInfo:
+    if not isinstance(payload, Mapping):
+        raise TypeError("task result must be a JSON object")
+    return PmTaskInfo.from_dict(payload)
+
+
+def _task_info_list(payload: Any) -> list[PmTaskInfo]:
+    if not isinstance(payload, list):
+        raise TypeError("task list result must be a list")
+    return [_task_info(item) for item in payload]
+
+
+def _config_summary(path: str | Path) -> tuple[str, int]:
+    config = load_pm_config(path)
+    project = _table(config.get("project", {}), "project")
+    tasks = _table(config.get("tasks", {}), "tasks")
+    return str(project.get("name", "zippy-local")), len(tasks)
 
 
 def default_project_config() -> dict[str, object]:
@@ -165,7 +655,7 @@ def format_pm_toml(config: dict[str, object]) -> str:
                 f"tasks.{task_name}.{nested_name}",
             )
             if nested_name == "env":
-                nested_table = _validated_env(nested_table)
+                nested_table = dict(_validated_env(nested_table))
             _append_table(
                 lines,
                 ["tasks", task_name, nested_name],
