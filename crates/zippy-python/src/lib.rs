@@ -181,6 +181,10 @@ type RegisteredSource = (
     Option<PythonSourceConfig>,
 );
 
+fn is_internal_stream_name(stream_name: &str) -> bool {
+    stream_name.ends_with(".__kv_changelog")
+}
+
 #[derive(Clone)]
 struct DownstreamLink {
     handle: SharedHandle,
@@ -1924,7 +1928,8 @@ impl MasterClient {
         Ok(python_json_loads(py, &descriptor_text)?.into_py(py))
     }
 
-    fn list_streams(&self, py: Python<'_>) -> PyResult<PyObject> {
+    #[pyo3(signature = (include_internal=false))]
+    fn list_streams(&self, py: Python<'_>, include_internal: bool) -> PyResult<PyObject> {
         let streams = self
             .client
             .lock()
@@ -1933,6 +1938,9 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         let records = PyList::empty_bound(py);
         for stream in streams {
+            if !include_internal && is_internal_stream_name(&stream.stream_name) {
+                continue;
+            }
             let dict = PyDict::new_bound(py);
             dict.set_item("stream_name", stream.stream_name)?;
             dict.set_item("schema", serde_json_value_to_py(py, &stream.schema)?)?;
@@ -5137,7 +5145,7 @@ impl StreamTableMaterializer {
 impl KeyValueTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_guard=None, replacement_retention_snapshots=None))]
+    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_guard=None, replacement_retention_snapshots=None, changelog_name=None, changelog_descriptor_publisher=None, changelog_writer_epoch=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5156,6 +5164,9 @@ impl KeyValueTableMaterializer {
         writer_epoch: Option<u64>,
         retention_guard: Option<Py<PyAny>>,
         replacement_retention_snapshots: Option<usize>,
+        changelog_name: Option<String>,
+        changelog_descriptor_publisher: Option<Py<PyAny>>,
+        changelog_writer_epoch: Option<u64>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -5171,6 +5182,32 @@ impl KeyValueTableMaterializer {
             writer_epoch,
         )
         .map_err(|error| py_value_error(error.to_string()))?;
+        if let Some(changelog_name) = changelog_name {
+            engine = engine
+                .with_changelog(changelog_name, row_capacity, changelog_writer_epoch)
+                .map_err(|error| py_value_error(error.to_string()))?;
+            if let Some(callback) = changelog_descriptor_publisher {
+                if !callback.bind(py).is_callable() {
+                    return Err(PyTypeError::new_err(
+                        "changelog_descriptor_publisher must be callable",
+                    ));
+                }
+                engine = engine.with_changelog_descriptor_publisher(Arc::new(
+                    PyStreamTableDescriptorPublisher { callback },
+                ));
+            }
+        } else {
+            if changelog_descriptor_publisher.is_some() {
+                return Err(PyValueError::new_err(
+                    "changelog_name is required when changelog_descriptor_publisher is provided",
+                ));
+            }
+            if changelog_writer_epoch.is_some() {
+                return Err(PyValueError::new_err(
+                    "changelog_name is required when changelog_writer_epoch is provided",
+                ));
+            }
+        }
         if let Some(callback) = descriptor_publisher {
             if !callback.bind(py).is_callable() {
                 return Err(PyTypeError::new_err(
@@ -5327,6 +5364,20 @@ impl KeyValueTableMaterializer {
         })?;
         let envelope = engine
             .active_descriptor_envelope_bytes()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let envelope_text =
+            std::str::from_utf8(&envelope).map_err(|error| py_value_error(error.to_string()))?;
+        Ok(python_json_loads(py, envelope_text)?.into_py(py))
+    }
+
+    fn changelog_active_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            py_runtime_error(
+                "key-value table changelog descriptor is unavailable after the engine has started",
+            )
+        })?;
+        let envelope = engine
+            .changelog_active_descriptor_envelope_bytes()
             .map_err(|error| py_runtime_error(error.to_string()))?;
         let envelope_text =
             std::str::from_utf8(&envelope).map_err(|error| py_value_error(error.to_string()))?;

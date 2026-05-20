@@ -441,7 +441,7 @@ def test_session_named_source_materializes_default_output_table() -> None:
             "latest_session.ctp_ticks_latest.materializer.proc_test",
             "session_engine_output",
             "ctp_ticks_latest",
-            {"session": "latest_session"},
+            {"session": "latest_session", "zippy_table_kind": "append_table"},
         )
     ]
     assert master.published_descriptors[0][0] == "ctp_ticks_latest"
@@ -667,7 +667,7 @@ def test_session_engine_output_overrides_default_output_table_name() -> None:
             "latest_session.ctp_ticks_latest.materializer.proc_test",
             "session_engine_output",
             "ctp_ticks_latest",
-            {"session": "latest_session"},
+            {"session": "latest_session", "zippy_table_kind": "append_table"},
         )
     ]
     assert master.published_descriptors[0][0] == "ctp_ticks_latest"
@@ -780,10 +780,336 @@ def test_session_stream_table_materializes_last_engine_output() -> None:
             "latest_session.ctp_ticks_latest.materializer.proc_test",
             "session_engine_output",
             "ctp_ticks_latest",
-            {"session": "latest_session"},
+            {"session": "latest_session", "zippy_table_kind": "append_table"},
         )
     ]
     assert master.published_descriptors[0][0] == "ctp_ticks_latest"
+
+
+def test_session_publish_append_table_sets_append_table_kind(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def __init__(self):
+            self.registered_sources: list[tuple[str, str, str, dict[str, object]]] = []
+            self.published_descriptors: list[tuple[str, dict[str, object]]] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "retention_segments": None,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(self, stream_name, stream_schema, buffer_size, frame_size) -> None:
+            assert stream_name == "factor_events"
+            assert stream_schema == schema
+
+        def register_source(self, source_name, source_type, output_stream, config) -> None:
+            self.registered_sources.append((source_name, source_type, output_stream, config))
+
+        def publish_segment_descriptor(self, stream_name, descriptor) -> None:
+            self.published_descriptors.append((stream_name, descriptor))
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self._status = "created"
+
+        def output_schema(self) -> pa.Schema:
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    class CapturingStreamTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", CapturingStreamTableMaterializer)
+
+    master = FakeMaster()
+    session = zippy.Session(name="factor_session", master=master)
+    returned = session.engine(FakeEngine()).publish_append_table("factor_events")
+
+    assert returned is session
+    assert master.registered_sources[0][3]["zippy_table_kind"] == "append_table"
+    assert master.published_descriptors[0] == (
+        "factor_events",
+        {"zippy_table_kind": "append_table"},
+    )
+
+
+def test_session_publish_key_value_table_sets_key_value_table_kind(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    captured_materializer: dict[str, object] = {}
+
+    class FakeMaster:
+        def __init__(self):
+            self.registered_streams: list[tuple[str, pa.Schema, int, int]] = []
+            self.registered_sources: list[tuple[str, str, str, dict[str, object]]] = []
+            self.published_descriptors: list[tuple[str, dict[str, object]]] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "replacement_retention_snapshots": 3,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(self, stream_name, stream_schema, buffer_size, frame_size) -> None:
+            self.registered_streams.append((stream_name, stream_schema, buffer_size, frame_size))
+
+        def register_source(self, source_name, source_type, output_stream, config) -> None:
+            self.registered_sources.append((source_name, source_type, output_stream, config))
+
+        def publish_segment_descriptor(self, stream_name, descriptor) -> None:
+            self.published_descriptors.append((stream_name, descriptor))
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    class CapturingKeyValueTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            captured_materializer.update(kwargs)
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def changelog_active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self._status = "created"
+
+        def output_schema(self) -> pa.Schema:
+            return schema
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    monkeypatch.setattr(zippy, "_KeyValueTableMaterializer", CapturingKeyValueTableMaterializer)
+
+    master = FakeMaster()
+    session = zippy.Session(name="factor_session", master=master)
+    returned = session.engine(FakeEngine()).publish_key_value_table(
+        "latest_factors",
+        by=["instrument_id"],
+    )
+
+    assert returned is session
+    assert captured_materializer["by"] == ["instrument_id"]
+    assert master.registered_streams[0][0] == "latest_factors"
+    assert master.registered_streams[1][0] == "latest_factors.__kv_changelog"
+    descriptor = master.published_descriptors[-1][1]
+    assert descriptor["zippy_table_kind"] == "key_value_table"
+    assert descriptor["zippy_key_value_keys"] == ["instrument_id"]
+    assert descriptor["zippy_key_value_changelog_stream"] == "latest_factors.__kv_changelog"
+    assert descriptor["zippy_kv_changelog_stream"] == "latest_factors.__kv_changelog"
+    assert master.registered_sources[0][3]["zippy_table_kind"] == "key_value_table"
+
+
+def test_session_publish_append_table_rejects_reactive_latest_output() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeLatestEngine:
+        def __init__(self) -> None:
+            self._status = "created"
+
+        def output_schema(self) -> pa.Schema:
+            return schema
+
+        def config(self) -> dict[str, object]:
+            return {
+                "engine_type": "reactive_latest",
+                "by": ["instrument_id"],
+            }
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    session = zippy.Session(name="latest_session", master=zippy.MasterClient())
+
+    with pytest.raises(ValueError, match="ReactiveLatestEngine output cannot publish append_table"):
+        session.engine(FakeLatestEngine()).publish_append_table("latest_history")
+
+
+def test_key_value_subscription_detection_prefers_table_kind_metadata() -> None:
+    class FakeMaster:
+        def get_stream(self, source: str) -> dict[str, object]:
+            assert source == "latest_factors"
+            return {
+                "active_segment_descriptor": {
+                    "zippy_table_kind": "key_value_table",
+                    "zippy_key_value_changelog_stream": "latest_factors.__kv_changelog",
+                }
+            }
+
+    assert (
+        zippy._key_value_changelog_subscription_source(
+            "latest_factors",
+            FakeMaster(),
+            wait=False,
+            timeout=None,
+        )
+        == "latest_factors.__kv_changelog"
+    )
+
+
+def test_session_source_key_value_table_requires_explicit_tail_until_replay_exists() -> None:
+    session = zippy.Session(name="source_session", master=zippy.MasterClient())
+
+    with pytest.raises(NotImplementedError, match="start_from='replay' is not implemented"):
+        session.source("factor_events").publish_key_value_table(
+            "latest_factors",
+            by=["instrument_id"],
+        )
+
+
+def test_session_source_publish_key_value_table_tail_registers_materializer(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    captured_materializer: dict[str, object] = {}
+
+    class FakeMaster:
+        def __init__(self):
+            self.registered_streams: list[tuple[str, pa.Schema, int, int]] = []
+            self.registered_sources: list[tuple[str, str, str, dict[str, object]]] = []
+            self.published_descriptors: list[tuple[str, dict[str, object]]] = []
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "replacement_retention_snapshots": 3,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def get_stream_schema(self, stream_name: str) -> pa.Schema:
+            assert stream_name == "factor_events"
+            return schema
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            if stream_name == "factor_events":
+                return {
+                    "active_segment_descriptor": {
+                        "zippy_table_kind": "append_table",
+                    },
+                    "segment_reader_leases": [],
+                }
+            return {"segment_reader_leases": []}
+
+        def register_stream(self, stream_name, stream_schema, buffer_size, frame_size) -> None:
+            self.registered_streams.append((stream_name, stream_schema, buffer_size, frame_size))
+
+        def register_source(self, source_name, source_type, output_stream, config) -> None:
+            self.registered_sources.append((source_name, source_type, output_stream, config))
+
+        def publish_segment_descriptor(self, stream_name, descriptor) -> None:
+            self.published_descriptors.append((stream_name, descriptor))
+
+    class CapturingKeyValueTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            captured_materializer.update(kwargs)
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def changelog_active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> str:
+            return "created"
+
+    monkeypatch.setattr(zippy, "_KeyValueTableMaterializer", CapturingKeyValueTableMaterializer)
+
+    master = FakeMaster()
+    session = zippy.Session(name="source_session", master=master)
+    returned = session.source("factor_events").publish_key_value_table(
+        "latest_factors",
+        by=["instrument_id"],
+        start_from="tail",
+    )
+
+    assert returned is session
+    assert captured_materializer["source"] == "factor_events"
+    assert captured_materializer["master"] is master
+    assert captured_materializer["by"] == ["instrument_id"]
+    assert master.registered_streams[0][0] == "latest_factors"
+    assert master.registered_streams[1][0] == "latest_factors.__kv_changelog"
+    assert master.published_descriptors[-1][1]["zippy_table_kind"] == "key_value_table"
 
 
 def test_session_engine_rejects_output_stream_with_explicit_target() -> None:
@@ -965,6 +1291,9 @@ def test_session_engine_persist_true_materializes_parquet_output(monkeypatch) ->
             self._status = "created"
 
         def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def changelog_active_descriptor(self) -> dict[str, object]:
             return {}
 
         def start(self) -> None:
@@ -13119,6 +13448,257 @@ def test_reactive_latest_stream_table_tail_returns_key_value_snapshot(tmp_path: 
         server.stop()
 
 
+def test_subscribe_table_auto_watches_reactive_latest_active_rewrites(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    zippy.connect(uri=control_endpoint)
+    engine = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument",
+        input_schema=tick_schema,
+        by="instrument_id",
+        target=zippy.NullPublisher(),
+    )
+    session = (
+        zippy.Session(name="latest_session", master=zippy._DEFAULT_MASTER)
+        .engine(engine)
+        .stream_table("ctp_ticks_latest", persist=False)
+    )
+
+    received: list[pa.Table] = []
+    updated = threading.Event()
+
+    def on_snapshot(table: pa.Table) -> None:
+        received.append(table)
+        if table.num_rows == 2 and table.column("last_price").to_pylist() == [4103.5, 2711.0]:
+            updated.set()
+
+    subscriber = None
+    try:
+        session.run()
+        subscriber = zippy.subscribe_table(
+            "ctp_ticks_latest",
+            callback=on_snapshot,
+            poll_interval_ms=5,
+            wait=True,
+            timeout=2.0,
+        )
+        engine.write(
+            {
+                "instrument_id": ["IF2606", "IH2606"],
+                "last_price": [4102.5, 2711.0],
+            }
+        )
+        engine.write(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4103.5],
+            }
+        )
+
+        assert updated.wait(timeout=2.0)
+        assert received[-1].column("instrument_id").to_pylist() == ["IF2606", "IH2606"]
+        assert received[-1].column("last_price").to_pylist() == [4103.5, 2711.0]
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        session.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    zippy.connect(uri=control_endpoint)
+    engine = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument",
+        input_schema=tick_schema,
+        by="instrument_id",
+        target=zippy.NullPublisher(),
+    )
+    session = (
+        zippy.Session(name="latest_session", master=zippy._DEFAULT_MASTER)
+        .engine(engine)
+        .stream_table("ctp_ticks_latest", persist=False)
+    )
+
+    received: list[dict[str, object]] = []
+    updated = threading.Event()
+
+    def on_row(row: zippy.Row) -> None:
+        item = row.to_dict()
+        received.append(item)
+        if item == {"instrument_id": "IF2606", "last_price": 4103.5}:
+            updated.set()
+
+    subscriber = None
+    try:
+        session.run()
+        subscriber = zippy.subscribe(
+            "ctp_ticks_latest",
+            callback=on_row,
+            poll_interval_ms=5,
+            filter=zippy.col("instrument_id") == "IF2606",
+            wait=True,
+            timeout=2.0,
+        )
+        engine.write(
+            {
+                "instrument_id": ["IF2606", "IH2606"],
+                "last_price": [4102.5, 2711.0],
+            }
+        )
+        engine.write(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4103.5],
+            }
+        )
+
+        assert updated.wait(timeout=2.0)
+        assert {"instrument_id": "IF2606", "last_price": 4103.5} in received
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        session.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
+def test_subscribe_reactive_latest_routes_to_changelog_rows(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    zippy.connect(uri=control_endpoint)
+    engine = zippy.ReactiveLatestEngine(
+        name="latest_by_instrument",
+        input_schema=tick_schema,
+        by="instrument_id",
+        target=zippy.NullPublisher(),
+    )
+    session = (
+        zippy.Session(name="latest_session", master=zippy._DEFAULT_MASTER)
+        .engine(engine)
+        .stream_table("ctp_ticks_latest", persist=False)
+    )
+
+    received: list[dict[str, object]] = []
+    delivered = threading.Event()
+
+    def on_row(row: zippy.Row) -> None:
+        received.append(row.to_dict())
+        if len(received) >= 3:
+            delivered.set()
+
+    subscriber = None
+    try:
+        session.run()
+        stream = zippy._DEFAULT_MASTER.get_stream("ctp_ticks_latest")
+        descriptor = stream["active_segment_descriptor"]
+        assert descriptor["zippy_kv_changelog_stream"] == "ctp_ticks_latest.__kv_changelog"
+        assert "ctp_ticks_latest.__kv_changelog" not in {
+            item["stream_name"] for item in zippy._DEFAULT_MASTER.list_streams()
+        }
+        assert "ctp_ticks_latest.__kv_changelog" in {
+            item["stream_name"]
+            for item in zippy._DEFAULT_MASTER.list_streams(include_internal=True)
+        }
+
+        subscriber = zippy.subscribe(
+            "ctp_ticks_latest",
+            callback=on_row,
+            poll_interval_ms=5,
+            wait=True,
+            timeout=2.0,
+        )
+        engine.write(
+            {
+                "instrument_id": ["IF2606", "IH2606"],
+                "last_price": [4102.5, 2711.0],
+            }
+        )
+        engine.write(
+            {
+                "instrument_id": ["IF2606"],
+                "last_price": [4103.5],
+            }
+        )
+
+        assert delivered.wait(timeout=2.0)
+        assert received == [
+            {"instrument_id": "IF2606", "last_price": 4102.5},
+            {"instrument_id": "IH2606", "last_price": 2711.0},
+            {"instrument_id": "IF2606", "last_price": 4103.5},
+        ]
+
+        deadline = time.time() + 2.0
+        descriptor = zippy._DEFAULT_MASTER.get_stream("ctp_ticks_latest")[
+            "active_segment_descriptor"
+        ]
+        while descriptor.get("zippy_kv_last_changelog_seq") != 3 and time.time() < deadline:
+            time.sleep(0.02)
+            descriptor = zippy._DEFAULT_MASTER.get_stream("ctp_ticks_latest")[
+                "active_segment_descriptor"
+            ]
+        assert descriptor["zippy_kv_snapshot_version"] == 2
+        assert descriptor["zippy_kv_last_changelog_seq"] == 3
+        assert descriptor["zippy_kv_schema_version"] == 1
+        assert descriptor["zippy_table_kind"] == "key_value_table"
+        assert descriptor["zippy_key_value_keys"] == ["instrument_id"]
+        assert descriptor["zippy_key_value_changelog_stream"] == "ctp_ticks_latest.__kv_changelog"
+        assert descriptor["zippy_key_value_snapshot_version"] == 2
+        assert descriptor["zippy_key_value_last_changelog_seq"] == 3
+        assert descriptor["zippy_key_value_schema_version"] == 1
+
+        changelog = zippy.read_table("ctp_ticks_latest.__kv_changelog").collect()
+        assert changelog.column_names[:3] == [
+            "_zippy_kv_seq",
+            "_zippy_kv_op",
+            "_zippy_kv_snapshot_version",
+        ]
+        assert changelog.column("_zippy_kv_seq").to_pylist() == [1, 2, 3]
+        assert changelog.column("_zippy_kv_op").to_pylist() == ["upsert", "upsert", "upsert"]
+        assert changelog.column("_zippy_kv_snapshot_version").to_pylist() == [1, 1, 2]
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        session.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_key_value_table_materializer_uses_materializer_name() -> None:
     assert hasattr(zippy._internal, "KeyValueTableMaterializer")
     assert not hasattr(zippy._internal, "KeyValueTableEngine")
@@ -13184,6 +13764,16 @@ def test_session_reactive_latest_passes_replacement_retention_snapshots(monkeypa
         def active_descriptor(self) -> dict[str, object]:
             return {}
 
+        def changelog_active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    class CapturingStreamTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
     class FakeLatestEngine:
         def __init__(self) -> None:
             self._status = "created"
@@ -13210,6 +13800,11 @@ def test_session_reactive_latest_passes_replacement_retention_snapshots(monkeypa
         zippy,
         "_KeyValueTableMaterializer",
         CapturingKeyValueTableMaterializer,
+    )
+    monkeypatch.setattr(
+        zippy,
+        "_StreamTableMaterializer",
+        CapturingStreamTableMaterializer,
     )
 
     engine = FakeLatestEngine()
@@ -13239,6 +13834,25 @@ def test_session_materializer_source_registration_is_idempotent(
     )
 
     class CapturingKeyValueTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            self._status = "created"
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def changelog_active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+    class CapturingStreamTableMaterializer:
         def __init__(self, **kwargs) -> None:
             self._status = "created"
 
@@ -13280,6 +13894,11 @@ def test_session_materializer_source_registration_is_idempotent(
         zippy,
         "_KeyValueTableMaterializer",
         CapturingKeyValueTableMaterializer,
+    )
+    monkeypatch.setattr(
+        zippy,
+        "_StreamTableMaterializer",
+        CapturingStreamTableMaterializer,
     )
 
     zippy.connect(uri=control_endpoint)
@@ -13931,7 +14550,7 @@ def test_pipeline_source_uses_python_source_control_plane_metadata() -> None:
     )
 
     assert master.source_records == [
-        ("openctp_md", "openctp", "openctp_ticks", {}),
+        ("openctp_md", "openctp", "openctp_ticks", {"zippy_table_kind": "append_table"}),
     ]
 
 
@@ -14010,12 +14629,15 @@ def test_pipeline_stream_table_persist_publishes_master_metadata(
     assert callable(kwargs["retention_guard"])
     assert master.source_records == [
         (
-            "test_ingest.openctp_ticks",
-            "pipeline",
-            "openctp_ticks",
-            {"persist_data_root": str(tmp_path / "ctp_ticks")},
-        )
-    ]
+                "test_ingest.openctp_ticks",
+                "pipeline",
+                "openctp_ticks",
+                {
+                    "persist_data_root": str(tmp_path / "ctp_ticks"),
+                    "zippy_table_kind": "append_table",
+                },
+            )
+        ]
 
     kwargs["persist_publisher"](
         json.dumps(

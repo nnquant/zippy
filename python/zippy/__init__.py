@@ -22,6 +22,26 @@ from zoneinfo import ZoneInfo
 _NATIVE_IMPORT_ERROR: BaseException | None = None
 _NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
 _DEFAULT_REMOTE_GATEWAY_TIMEOUT_SEC = 60.0
+_TABLE_KIND_FIELD = "zippy_table_kind"
+_APPEND_TABLE_KIND = "append_table"
+_KEY_VALUE_TABLE_KIND = "key_value_table"
+_TABLE_SEMANTICS_FIELD = "zippy_table_semantics"
+_KEY_VALUE_SNAPSHOT_SEMANTICS = "key_value_snapshot"
+_LATEST_BY_FIELD = "zippy_latest_by"
+_KEY_VALUE_CHANGELOG_SUFFIX = ".__kv_changelog"
+_KV_SEQ_FIELD = "_zippy_kv_seq"
+_KV_OP_FIELD = "_zippy_kv_op"
+_KV_SNAPSHOT_VERSION_FIELD = "_zippy_kv_snapshot_version"
+_KV_CHANGELOG_STREAM_FIELD = "zippy_kv_changelog_stream"
+_KV_PARENT_STREAM_FIELD = "zippy_kv_parent_stream"
+_KEY_VALUE_KEYS_FIELD = "zippy_key_value_keys"
+_KEY_VALUE_CHANGELOG_STREAM_FIELD = "zippy_key_value_changelog_stream"
+_KEY_VALUE_PARENT_STREAM_FIELD = "zippy_key_value_parent_stream"
+_KEY_VALUE_SNAPSHOT_VERSION_DESCRIPTOR_FIELD = "zippy_key_value_snapshot_version"
+_KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD = "zippy_key_value_last_changelog_seq"
+_KEY_VALUE_SCHEMA_VERSION_FIELD = "zippy_key_value_schema_version"
+_LIVE_SNAPSHOT_RETRY_ATTEMPTS = 20
+_LIVE_SNAPSHOT_RETRY_SLEEP_SEC = 0.002
 _TEMPORAL_LITERAL_RE = re.compile(
     r"^(?P<year>\d{4})"
     r"(?:(?P<dash_month>-?)(?P<month>\d{2})"
@@ -4192,14 +4212,15 @@ class Table:
         return {"offset": offset, "length": None if length is None else int(length)}
 
     def _collect_tail_pushdown(self, n: int, metrics: dict[str, object] | None = None):
-        for attempt in range(2):
+        for attempt in range(_LIVE_SNAPSHOT_RETRY_ATTEMPTS):
             snapshot = self.snapshot()
             live = None
             if _snapshot_has_active_descriptor(snapshot):
                 try:
                     live = self._tail_live_snapshot(snapshot, n)
                 except RuntimeError as error:
-                    if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                    if self._reset_snapshot_after_retryable_live_read_error(error):
+                        time.sleep(_LIVE_SNAPSHOT_RETRY_SLEEP_SEC)
                         continue
                     raise
             _record_live_scan(metrics, live)
@@ -4217,7 +4238,7 @@ class Table:
         raise RuntimeError("snapshot retry exhausted")
 
     def _collect_head_pushdown(self, n: int, metrics: dict[str, object] | None = None):
-        for attempt in range(2):
+        for attempt in range(_LIVE_SNAPSHOT_RETRY_ATTEMPTS):
             snapshot = self.snapshot()
             schema = self.schema()
             if n <= 0:
@@ -4233,7 +4254,8 @@ class Table:
                 try:
                     live = self._slice_live_snapshot(snapshot, 0, remaining, metrics=metrics)
                 except RuntimeError as error:
-                    if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                    if self._reset_snapshot_after_retryable_live_read_error(error):
+                        time.sleep(_LIVE_SNAPSHOT_RETRY_SLEEP_SEC)
                         continue
                     raise
             table = _concat_query_tables([persisted, live], schema)
@@ -4248,7 +4270,7 @@ class Table:
         length: int | None,
         metrics: dict[str, object] | None = None,
     ):
-        for attempt in range(2):
+        for attempt in range(_LIVE_SNAPSHOT_RETRY_ATTEMPTS):
             snapshot = self.snapshot()
             schema = self.schema()
             if length == 0:
@@ -4277,7 +4299,8 @@ class Table:
                         metrics=metrics,
                     )
                 except RuntimeError as error:
-                    if attempt == 0 and self._reset_snapshot_after_lease_target_error(error):
+                    if self._reset_snapshot_after_retryable_live_read_error(error):
+                        time.sleep(_LIVE_SNAPSHOT_RETRY_SLEEP_SEC)
                         continue
                     raise
             table = _concat_query_tables([persisted, live], schema)
@@ -4296,8 +4319,12 @@ class Table:
             return scan_snapshot(snapshot)
         return self._inner.scan_live()
 
-    def _reset_snapshot_after_lease_target_error(self, error: RuntimeError) -> bool:
-        if "segment reader lease target not found" not in str(error):
+    def _reset_snapshot_after_retryable_live_read_error(self, error: RuntimeError) -> bool:
+        message = str(error)
+        if (
+            "segment reader lease target not found" not in message
+            and "active payload changed during read" not in message
+        ):
             return False
         self._fixed_snapshot = None
         return True
@@ -5224,6 +5251,175 @@ def _require_subscribe_start_from(value: int) -> int:
     return normalized
 
 
+def _descriptor_table_semantics(stream: dict[str, object]) -> str | None:
+    semantics = _descriptor_metadata_value(stream, _TABLE_SEMANTICS_FIELD)
+    return None if semantics is None else str(semantics)
+
+
+def _descriptor_table_kind(stream: dict[str, object]) -> str | None:
+    table_kind = _descriptor_metadata_value(stream, _TABLE_KIND_FIELD)
+    if table_kind is not None:
+        return str(table_kind)
+    if _descriptor_table_semantics(stream) == _KEY_VALUE_SNAPSHOT_SEMANTICS:
+        return _KEY_VALUE_TABLE_KIND
+    return None
+
+
+def _is_key_value_table_descriptor(stream: dict[str, object]) -> bool:
+    return _descriptor_table_kind(stream) == _KEY_VALUE_TABLE_KIND
+
+
+def _descriptor_metadata_value(stream: dict[str, object], field: str) -> object | None:
+    descriptor = stream.get("active_segment_descriptor")
+    if isinstance(descriptor, dict):
+        value = descriptor.get(field)
+        if value is not None:
+            return value
+    return stream.get(field)
+
+
+def _key_value_changelog_stream_name(table_name: str) -> str:
+    return f"{table_name}{_KEY_VALUE_CHANGELOG_SUFFIX}"
+
+
+def _key_value_changelog_schema(schema: object) -> object:
+    import pyarrow as pa
+
+    return pa.schema(
+        [
+            pa.field(_KV_SEQ_FIELD, pa.int64(), nullable=False),
+            pa.field(_KV_OP_FIELD, pa.string(), nullable=False),
+            pa.field(_KV_SNAPSHOT_VERSION_FIELD, pa.int64(), nullable=False),
+            *list(schema),
+        ]
+    )
+
+
+def _descriptor_key_value_changelog_stream(stream: dict[str, object]) -> str | None:
+    value = _descriptor_metadata_value(stream, _KEY_VALUE_CHANGELOG_STREAM_FIELD)
+    if value is None:
+        value = _descriptor_metadata_value(stream, _KV_CHANGELOG_STREAM_FIELD)
+    return None if value is None else str(value)
+
+
+def _normalize_key_value_by(by: object, *, parameter: str = "by") -> list[str]:
+    if isinstance(by, str):
+        fields = [by]
+    elif by is None:
+        fields = []
+    else:
+        try:
+            fields = [str(item) for item in by]
+        except TypeError as exc:
+            raise TypeError(f"{parameter} must be a string or a non-empty sequence") from exc
+    if not fields:
+        raise ValueError(f"{parameter} must contain at least one key column")
+    if any(not field for field in fields):
+        raise ValueError(f"{parameter} must not contain empty key columns")
+    if len(set(fields)) != len(fields):
+        raise ValueError(f"{parameter} must not contain duplicate key columns")
+    return fields
+
+
+def _append_table_descriptor_metadata() -> dict[str, object]:
+    return {_TABLE_KIND_FIELD: _APPEND_TABLE_KIND}
+
+
+def _key_value_table_descriptor_metadata(
+    *,
+    by: list[str],
+    changelog_stream_name: str,
+) -> dict[str, object]:
+    return {
+        _TABLE_KIND_FIELD: _KEY_VALUE_TABLE_KIND,
+        _TABLE_SEMANTICS_FIELD: _KEY_VALUE_SNAPSHOT_SEMANTICS,
+        _LATEST_BY_FIELD: list(by),
+        _KEY_VALUE_KEYS_FIELD: list(by),
+        _KEY_VALUE_CHANGELOG_STREAM_FIELD: changelog_stream_name,
+        _KV_CHANGELOG_STREAM_FIELD: changelog_stream_name,
+    }
+
+
+def _key_value_changelog_descriptor_metadata(
+    *,
+    table_name: str,
+    by: list[str],
+) -> dict[str, object]:
+    return {
+        _TABLE_KIND_FIELD: _APPEND_TABLE_KIND,
+        _KEY_VALUE_PARENT_STREAM_FIELD: table_name,
+        _KV_PARENT_STREAM_FIELD: table_name,
+        _LATEST_BY_FIELD: list(by),
+        _KEY_VALUE_KEYS_FIELD: list(by),
+    }
+
+
+def _uses_key_value_snapshot_subscription(
+    source: str,
+    master: MasterClient,
+    *,
+    wait: bool,
+    timeout: float | str | None,
+) -> bool:
+    get_stream = getattr(master, "get_stream", None)
+    if not callable(get_stream):
+        return False
+    if wait:
+        _wait_for_table_ready(source, master, timeout)
+    try:
+        stream = get_stream(source)
+    except RuntimeError as error:
+        if "stream not found" not in str(error):
+            raise
+        return False
+    return _is_key_value_table_descriptor(stream)
+
+
+def _key_value_changelog_subscription_source(
+    source: str,
+    master: MasterClient,
+    *,
+    wait: bool,
+    timeout: float | str | None,
+) -> str | None:
+    get_stream = getattr(master, "get_stream", None)
+    if not callable(get_stream):
+        return None
+    if wait:
+        _wait_for_table_ready(source, master, timeout)
+    try:
+        stream = get_stream(source)
+    except RuntimeError as error:
+        if "stream not found" not in str(error):
+            raise
+        return None
+    if not _is_key_value_table_descriptor(stream):
+        return None
+    changelog_stream = _descriptor_key_value_changelog_stream(stream)
+    if changelog_stream is not None and wait:
+        _wait_for_table_ready(changelog_stream, master, timeout)
+    return changelog_stream
+
+
+def _row_callback_from_snapshot_callback(callback):
+    def on_snapshot(table) -> None:
+        for row in table.to_pylist():
+            callback(Row(row))
+
+    return on_snapshot
+
+
+def _row_callback_without_key_value_internal_columns(callback):
+    def on_row(row) -> None:
+        values = row.to_dict()
+        values.pop(_KV_SEQ_FIELD, None)
+        values.pop(_KV_OP_FIELD, None)
+        values.pop(_KV_SNAPSHOT_VERSION_FIELD, None)
+        callback(Row(values))
+
+    return on_row
+
+
 def _instrument_ids_from_query_filter(filter_expr: object | None) -> list[str] | None:
     if filter_expr is None:
         return None
@@ -5484,6 +5680,168 @@ class StreamSubscriber:
         return self._inner.metrics()
 
 
+class _TableSnapshotWatcher:
+    """
+    Watch a named table by polling master metadata and emitting full snapshots.
+
+    This watcher is intended for key-value/latest tables whose active segment may be
+    rewritten in place. It does not expose row-offset semantics; every callback receives
+    the latest table snapshot for the observed descriptor generation.
+
+    :param source: Named table to watch.
+    :type source: str
+    :param callback: Function called with each latest ``pyarrow.Table`` snapshot.
+    :type callback: callable
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :param poll_interval_ms: Metadata poll interval in milliseconds.
+    :type poll_interval_ms: int
+    :param filter: Optional ``zp.col`` predicate applied before callbacks.
+    :type filter: object | None
+    :param count: Limit each snapshot callback to the latest ``count`` rows.
+    :type count: int | None
+    :param emit_initial: When true, emit the current snapshot before waiting for changes.
+    :type emit_initial: bool
+    :param wait: When true, wait until the table is ready before starting.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
+    """
+
+    def __init__(
+        self,
+        source: str,
+        callback,
+        master: MasterClient | None = None,
+        *,
+        poll_interval_ms: int = 10,
+        filter: object | None = None,
+        count: int | None = None,
+        emit_initial: bool = True,
+        wait: bool = False,
+        timeout: float | str | None = None,
+        collect_retries: int = 3,
+    ) -> None:
+        if not isinstance(source, str) or not source:
+            raise ValueError("source must be a non-empty string")
+        poll_interval_ms = int(poll_interval_ms)
+        if poll_interval_ms <= 0:
+            raise ValueError("poll_interval_ms must be positive")
+        collect_retries = int(collect_retries)
+        if collect_retries <= 0:
+            raise ValueError("collect_retries must be positive")
+
+        self.source = source
+        self._callback = callback
+        self._master = master or _default_master()
+        self._poll_interval_sec = poll_interval_ms / 1000.0
+        self._filter = filter
+        self._count = _require_positive_optional_int("count", count)
+        self._emit_initial = bool(emit_initial)
+        self._collect_retries = collect_retries
+        self._stop_event = threading.Event()
+        self._stopped_event = threading.Event()
+        self._error: BaseException | None = None
+        self._last_descriptor_generation: int | None = None
+        self._snapshots_delivered_total = 0
+        self._rows_delivered_total = 0
+
+        if wait:
+            _wait_for_table_ready(source, self._master, timeout)
+        if not self._emit_initial:
+            try:
+                self._last_descriptor_generation = self._descriptor_generation()
+            except RuntimeError as error:
+                if "stream not found" not in str(error):
+                    raise
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"zippy-watch-table-latest-{source}",
+            daemon=True,
+        )
+
+    def start(self) -> "_TableSnapshotWatcher":
+        """
+        Start the background watch thread.
+
+        :returns: This watcher handle.
+        :rtype: _TableSnapshotWatcher
+        """
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """
+        Stop the watch thread and re-raise background errors.
+
+        :raises BaseException: If snapshot collection or callback execution failed.
+        """
+        self._stop_event.set()
+        self.join()
+
+    def join(self) -> None:
+        """
+        Wait for the watch thread to finish and re-raise background errors.
+
+        :raises BaseException: If snapshot collection or callback execution failed.
+        """
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+
+    def metrics(self) -> dict[str, object]:
+        """
+        Return runtime counters for this snapshot watcher.
+
+        :returns: Snapshot delivery counters and the latest observed descriptor generation.
+        :rtype: dict[str, object]
+        """
+        return {
+            "snapshots_delivered_total": self._snapshots_delivered_total,
+            "rows_delivered_total": self._rows_delivered_total,
+            "current_descriptor_generation": self._last_descriptor_generation or 0,
+            "last_error": None if self._error is None else str(self._error),
+        }
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                descriptor_generation = self._descriptor_generation()
+                if descriptor_generation != self._last_descriptor_generation:
+                    snapshot = self._collect_snapshot()
+                    self._callback(snapshot)
+                    self._snapshots_delivered_total += 1
+                    self._rows_delivered_total += int(getattr(snapshot, "num_rows", 0))
+                    self._last_descriptor_generation = descriptor_generation
+                self._stop_event.wait(self._poll_interval_sec)
+        except BaseException as error:
+            self._error = error
+            self._stop_event.set()
+        finally:
+            self._stopped_event.set()
+
+    def _descriptor_generation(self) -> int:
+        stream = self._master.get_stream(self.source)
+        return int(stream.get("descriptor_generation", 0))
+
+    def _collect_snapshot(self):
+        for attempt in range(self._collect_retries):
+            try:
+                table = read_table(self.source, master=self._master, snapshot=False)
+                if self._filter is not None:
+                    table = table.filter(self._filter)
+                if self._count is not None:
+                    table = table.tail(self._count)
+                return table.collect()
+            except RuntimeError as error:
+                is_retryable = "active payload changed during read" in str(error)
+                if not is_retryable or attempt + 1 >= self._collect_retries:
+                    raise
+                time.sleep(self._poll_interval_sec)
+        raise RuntimeError("unreachable table snapshot collect retry state")
+
+
 def subscribe(
     source: str,
     callback,
@@ -5532,6 +5890,46 @@ def subscribe(
     """
     selected_master = master or _default_master()
     start_from = _require_subscribe_start_from(start_from)
+    changelog_source = _key_value_changelog_subscription_source(
+        source,
+        selected_master,
+        wait=wait,
+        timeout=timeout,
+    )
+    if changelog_source is not None:
+        if start_from != -1:
+            raise ValueError("key-value snapshot subscribe only supports start_from=-1")
+        source = changelog_source
+        callback = _row_callback_without_key_value_internal_columns(callback)
+        wait = False
+    snapshot_subscription = _uses_key_value_snapshot_subscription(
+        source,
+        selected_master,
+        wait=wait and changelog_source is None,
+        timeout=timeout,
+    )
+    if snapshot_subscription:
+        if start_from != -1:
+            raise ValueError("key-value snapshot subscribe only supports start_from=-1")
+        if filter is not None and instrument_ids is not None:
+            raise ValueError("filter and instrument_ids cannot be used together")
+        table_filter = filter
+        if instrument_ids is not None:
+            instrument_values = (
+                [instrument_ids] if isinstance(instrument_ids, str) else list(instrument_ids)
+            )
+            table_filter = col("instrument_id").is_in(instrument_values)
+        return _watch_table_latest(
+            source,
+            callback=_row_callback_from_snapshot_callback(callback),
+            master=selected_master,
+            poll_interval_ms=poll_interval_ms,
+            filter=table_filter,
+            emit_initial=True,
+            wait=False,
+            timeout=timeout,
+        )
+
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None and start_from != -1:
         raise ValueError("remote subscribe only supports start_from=-1")
@@ -5580,6 +5978,61 @@ def subscribe(
     return subscriber.start()
 
 
+def _watch_table_latest(
+    source: str,
+    callback,
+    master: MasterClient | None = None,
+    *,
+    poll_interval_ms: int = 10,
+    filter: object | None = None,
+    count: int | None = None,
+    emit_initial: bool = True,
+    wait: bool = False,
+    timeout: float | str | None = None,
+) -> _TableSnapshotWatcher:
+    """
+    Watch a named table and invoke callbacks with full latest snapshots.
+
+    Use this for ``ReactiveLatestEngine.stream_table(...)`` outputs and other
+    key-value snapshot tables. Unlike :func:`subscribe_table`, this API does not
+    follow active-segment row offsets; it treats descriptor generation changes as
+    snapshot boundaries and recollects the table.
+
+    :param source: Named table to watch.
+    :type source: str
+    :param callback: Function called with each latest ``pyarrow.Table`` snapshot.
+    :type callback: callable
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :param poll_interval_ms: Metadata poll interval in milliseconds.
+    :type poll_interval_ms: int
+    :param filter: Optional ``zp.col`` predicate applied before callbacks.
+    :type filter: object | None
+    :param count: Limit each callback table to the latest ``count`` rows.
+    :type count: int | None
+    :param emit_initial: When true, emit the current snapshot before waiting for changes.
+    :type emit_initial: bool
+    :param wait: When true, wait until the table exists and has an active segment descriptor.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds, or strings such as ``"30s"``.
+    :type timeout: float | str | None
+    :returns: Started table snapshot watcher handle.
+    :rtype: _TableSnapshotWatcher
+    """
+    watcher = _TableSnapshotWatcher(
+        source,
+        callback,
+        master=master,
+        poll_interval_ms=poll_interval_ms,
+        filter=filter,
+        count=count,
+        emit_initial=emit_initial,
+        wait=wait,
+        timeout=timeout,
+    )
+    return watcher.start()
+
+
 def subscribe_table(
     source: str,
     callback,
@@ -5597,11 +6050,11 @@ def subscribe_table(
     start_from: int = -1,
 ) -> StreamSubscriber:
     """
-    Subscribe to a stream using incremental ``pyarrow.Table`` callbacks.
+    Subscribe to a stream using ``pyarrow.Table`` callbacks.
 
-    This is a best-effort live subscription. It can resume on new writer
-    descriptors, but does not automatically backfill rows missed during writer
-    downtime.
+    Append streams use incremental active-segment row batches. Key-value/latest
+    snapshot tables are detected from table metadata and use full latest snapshot
+    callbacks on each descriptor generation change.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -5634,6 +6087,30 @@ def subscribe_table(
     """
     selected_master = master or _default_master()
     start_from = _require_subscribe_start_from(start_from)
+    batch_size = _require_positive_optional_int("batch_size", batch_size)
+    throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
+    count = _require_positive_optional_int("count", count)
+    snapshot_subscription = _uses_key_value_snapshot_subscription(
+        source,
+        selected_master,
+        wait=wait,
+        timeout=timeout,
+    )
+    if snapshot_subscription:
+        if start_from != -1:
+            raise ValueError("key-value snapshot subscribe only supports start_from=-1")
+        return _watch_table_latest(
+            source,
+            callback=callback,
+            master=selected_master,
+            poll_interval_ms=poll_interval_ms,
+            filter=filter,
+            count=count,
+            emit_initial=True,
+            wait=False,
+            timeout=timeout,
+        )
+
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None and start_from != -1:
         raise ValueError("remote subscribe only supports start_from=-1")
@@ -5643,9 +6120,6 @@ def subscribe_table(
             _wait_for_table_ready(source, selected_master, timeout)
         if filter is not None:
             _pyarrow_filters_from_query_filter(filter)
-        batch_size = _require_positive_optional_int("batch_size", batch_size)
-        throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
-        count = _require_positive_optional_int("count", count)
         return RemoteStreamSubscriber(
             source,
             endpoint=remote_endpoint,
@@ -6536,6 +7010,47 @@ def _engine_latest_by(engine: object) -> list[str] | None:
     return [str(item) for item in by]
 
 
+class _SessionSourceBinding:
+    """
+    Fluent binding for materializing an existing named table source.
+
+    :param session: Owning session.
+    :type session: Session
+    :param source: Existing source table name.
+    :type source: str
+    """
+
+    def __init__(self, session: "Session", source: str) -> None:
+        self._session = session
+        self._source = source
+
+    def publish_key_value_table(
+        self,
+        name: str,
+        *,
+        by: str | list[str] | tuple[str, ...],
+        start_from: str = "replay",
+    ) -> "Session":
+        """
+        Publish this source append table as a key-value table.
+
+        :param name: Output key-value table name.
+        :type name: str
+        :param by: Key columns used to identify the latest value for each key.
+        :type by: str | list[str] | tuple[str, ...]
+        :param start_from: ``"replay"`` for replay-backed state or ``"tail"`` for live-only state.
+        :type start_from: str
+        :returns: Owning session for fluent ``.run()`` usage.
+        :rtype: Session
+        """
+        return self._session._publish_source_key_value_table(
+            self._source,
+            name,
+            by=by,
+            start_from=start_from,
+        )
+
+
 class Session:
     """
     Own and run a small group of Python-configured Zippy engines.
@@ -6585,6 +7100,22 @@ class Session:
         self._needs_master_process = False
         self._shutdown_hook_unregister = None
 
+    def source(self, source: str) -> _SessionSourceBinding:
+        """
+        Select an existing named table as a publish source.
+
+        :param source: Existing append table source name.
+        :type source: str
+        :returns: Source binding with source-derived publish methods.
+        :rtype: _SessionSourceBinding
+        :raises ValueError: If the source name is empty.
+        """
+        if not isinstance(source, str):
+            raise TypeError("source name must be a string")
+        if not source:
+            raise ValueError("source name must not be empty")
+        return _SessionSourceBinding(self, source)
+
     def engine(self, engine=None, /, **kwargs) -> "Session":
         """
         Add an engine instance or build an engine from an engine class.
@@ -6628,7 +7159,11 @@ class Session:
 
     def stream_table(self, name: str, *, persist: bool = False) -> "Session":
         """
-        Materialize the latest engine output into a named stream table.
+        Materialize the latest engine output into a named table.
+
+        This is a compatibility wrapper. Normal engine outputs become
+        ``append_table`` outputs. ``ReactiveLatestEngine`` outputs become
+        ``key_value_table`` outputs.
 
         :param name: Output stream table name.
         :type name: str
@@ -6639,23 +7174,103 @@ class Session:
         :raises RuntimeError: If no engine has been added.
         :raises ValueError: If the latest engine already has an output table.
         """
-        if not isinstance(name, str):
-            raise TypeError("stream table name must be a string")
-        if not name:
-            raise ValueError("stream table name must not be empty")
-        if not isinstance(persist, bool):
-            raise TypeError("persist must be True or False")
         if not self._engines:
             raise RuntimeError("stream_table() requires an engine() before it")
 
         engine = self._engines[-1]
+        latest_by = _engine_latest_by(engine)
+        if latest_by is not None:
+            return self.publish_key_value_table(name, by=latest_by, persist=persist)
+        return self.publish_append_table(name, persist=persist)
+
+    def publish_append_table(self, name: str, *, persist: bool = False) -> "Session":
+        """
+        Publish the latest engine output as an append-only table.
+
+        :param name: Output append table name.
+        :type name: str
+        :param persist: Whether to persist the append table as parquet.
+        :type persist: bool
+        :returns: This session for fluent ``.publish_append_table(...).run()`` usage.
+        :rtype: Session
+        :raises RuntimeError: If no engine has been added.
+        :raises ValueError: If the latest engine already has an output table.
+        """
+        self._validate_publish_table_name(name, method="publish_append_table")
+        if not isinstance(persist, bool):
+            raise TypeError("persist must be True or False")
+        if not self._engines:
+            raise RuntimeError("publish_append_table() requires an engine() before it")
+
+        engine = self._engines[-1]
+        if _engine_latest_by(engine) is not None:
+            raise ValueError("ReactiveLatestEngine output cannot publish append_table")
         engine_id = id(engine)
         if engine_id in self._materialized_engine_ids:
             raise ValueError("latest engine output is already materialized")
 
         self._pending_output_tables.pop(engine_id, None)
-        self._attach_engine_output_table(engine, name, persist=persist)
+        self._attach_engine_output_table(
+            engine,
+            name,
+            persist=persist,
+            table_kind=_APPEND_TABLE_KIND,
+        )
         return self
+
+    def publish_key_value_table(
+        self,
+        name: str,
+        *,
+        by: str | list[str] | tuple[str, ...] | None = None,
+        persist: bool = False,
+    ) -> "Session":
+        """
+        Publish the latest engine output as a key-value latest table.
+
+        :param name: Output key-value table name.
+        :type name: str
+        :param by: Key columns used to identify the latest value for each key.
+        :type by: str | list[str] | tuple[str, ...] | None
+        :param persist: Reserved for compatibility with ``stream_table``. Key-value tables do not
+            currently support parquet persistence.
+        :type persist: bool
+        :returns: This session for fluent ``.publish_key_value_table(...).run()`` usage.
+        :rtype: Session
+        :raises RuntimeError: If no engine has been added.
+        :raises ValueError: If key columns are missing or the latest output is already materialized.
+        """
+        self._validate_publish_table_name(name, method="publish_key_value_table")
+        if not isinstance(persist, bool):
+            raise TypeError("persist must be True or False")
+        if persist:
+            raise ValueError("key_value_table does not support persist=True")
+        if not self._engines:
+            raise RuntimeError("publish_key_value_table() requires an engine() before it")
+
+        engine = self._engines[-1]
+        latest_by = _engine_latest_by(engine)
+        key_fields = _normalize_key_value_by(by if by is not None else latest_by)
+        engine_id = id(engine)
+        if engine_id in self._materialized_engine_ids:
+            raise ValueError("latest engine output is already materialized")
+
+        self._pending_output_tables.pop(engine_id, None)
+        self._attach_engine_output_table(
+            engine,
+            name,
+            persist=False,
+            table_kind=_KEY_VALUE_TABLE_KIND,
+            key_fields=key_fields,
+        )
+        return self
+
+    @staticmethod
+    def _validate_publish_table_name(name: str, *, method: str) -> None:
+        if not isinstance(name, str):
+            raise TypeError(f"{method} table name must be a string")
+        if not name:
+            raise ValueError(f"{method} table name must not be empty")
 
     def engines(self) -> tuple[object, ...]:
         """
@@ -6763,7 +7378,7 @@ class Session:
         materializers: list[object] = []
         pending_output = None
         if output_stream is not None and callable(getattr(engine, "output_schema", None)):
-            materializers.append(
+            materializers.extend(
                 self._materialize_engine_output(
                     engine,
                     output_stream,
@@ -6791,10 +7406,19 @@ class Session:
         table_name: str,
         *,
         persist: bool,
+        table_kind: str | None = None,
+        key_fields: list[str] | None = None,
     ) -> None:
-        materializer = self._materialize_engine_output(engine, table_name, persist=persist)
+        materializers = self._materialize_engine_output(
+            engine,
+            table_name,
+            persist=persist,
+            table_kind=table_kind,
+            key_fields=key_fields,
+        )
         engine_index = self._runtime_engines.index(engine)
-        self._runtime_engines.insert(engine_index, materializer)
+        for offset, materializer in enumerate(materializers):
+            self._runtime_engines.insert(engine_index + offset, materializer)
         self._materialized_engine_ids.add(id(engine))
 
     def _materialize_engine_output(
@@ -6803,7 +7427,9 @@ class Session:
         table_name: str,
         *,
         persist: bool,
-    ) -> object:
+        table_kind: str | None = None,
+        key_fields: list[str] | None = None,
+    ) -> list[object]:
         output_schema = engine.output_schema()
         table_options = _resolve_stream_table_options(
             name=table_name,
@@ -6818,27 +7444,94 @@ class Session:
             persist_path=None,
         )
         latest_by = _engine_latest_by(engine)
-        if latest_by is not None and table_options["persist_path"] is not None:
-            raise ValueError("ReactiveLatestEngine stream_table does not support persist=True")
+        if table_kind is None:
+            table_kind = _KEY_VALUE_TABLE_KIND if latest_by is not None else _APPEND_TABLE_KIND
+        if table_kind not in {_APPEND_TABLE_KIND, _KEY_VALUE_TABLE_KIND}:
+            raise ValueError(f"unsupported table kind table_kind=[{table_kind}]")
+        if table_kind == _APPEND_TABLE_KIND and latest_by is not None:
+            raise ValueError("ReactiveLatestEngine output cannot publish append_table")
+        if table_kind == _KEY_VALUE_TABLE_KIND:
+            key_fields = _normalize_key_value_by(
+                key_fields if key_fields is not None else latest_by
+            )
+        if table_kind == _KEY_VALUE_TABLE_KIND and table_options["persist_path"] is not None:
+            raise ValueError("key_value_table does not support persist=True")
+
+        descriptor_metadata: dict[str, object] = _append_table_descriptor_metadata()
+        changelog_stream_name = None
+        if table_kind == _KEY_VALUE_TABLE_KIND:
+            assert key_fields is not None
+            changelog_stream_name = _key_value_changelog_stream_name(table_name)
+            descriptor_metadata = _key_value_table_descriptor_metadata(
+                by=key_fields,
+                changelog_stream_name=changelog_stream_name,
+            )
         _ensure_master_process(self.master, self.app or self.name)
         self.master.register_stream(table_name, output_schema, 64, 4096)
-        source_name = self._register_materializer_source(table_name, table_options)
+        changelog_schema = None
+        if changelog_stream_name is not None:
+            changelog_schema = _key_value_changelog_schema(output_schema)
+            self.master.register_stream(changelog_stream_name, changelog_schema, 64, 4096)
+        changelog_descriptor_metadata = None
+        if changelog_stream_name is not None:
+            assert key_fields is not None
+            changelog_descriptor_metadata = _key_value_changelog_descriptor_metadata(
+                table_name=table_name,
+                by=key_fields,
+            )
+        source_names: list[str | None] = []
+        source_names.append(
+            self._register_materializer_source(
+                table_name,
+                table_options,
+                descriptor_metadata=descriptor_metadata,
+            )
+        )
+        if changelog_stream_name is not None:
+            source_names.append(
+                self._register_materializer_source(
+                    changelog_stream_name,
+                    table_options,
+                    descriptor_metadata=changelog_descriptor_metadata,
+                )
+            )
         try:
             writer_epoch = _stream_writer_epoch(self.master, table_name)
-            if latest_by is not None:
+            materializers: list[object] = []
+            if table_kind == _KEY_VALUE_TABLE_KIND:
+                assert changelog_stream_name is not None
+                assert key_fields is not None
+                assert changelog_descriptor_metadata is not None
+                changelog_writer_epoch = _stream_writer_epoch(self.master, changelog_stream_name)
                 materializer = _KeyValueTableMaterializer(
                     name=table_name,
                     input_schema=output_schema,
-                    by=latest_by,
+                    by=key_fields,
                     source=engine,
                     target=NullPublisher(),
-                    descriptor_publisher=self._descriptor_publisher(table_name),
+                    descriptor_publisher=self._descriptor_publisher(
+                        table_name,
+                        descriptor_metadata=descriptor_metadata,
+                    ),
                     row_capacity=table_options["row_capacity"],
                     writer_epoch=writer_epoch,
                     retention_guard=self._retention_guard(table_name),
                     replacement_retention_snapshots=table_options[
                         "replacement_retention_snapshots"
                     ],
+                    changelog_name=changelog_stream_name,
+                    changelog_descriptor_publisher=self._descriptor_publisher(
+                        changelog_stream_name,
+                        descriptor_metadata=changelog_descriptor_metadata,
+                    ),
+                    changelog_writer_epoch=changelog_writer_epoch,
+                )
+                self.master.publish_segment_descriptor(
+                    changelog_stream_name,
+                    _annotate_table_descriptor(
+                        materializer.changelog_active_descriptor(),
+                        changelog_descriptor_metadata,
+                    ),
                 )
             else:
                 materializer = _StreamTableMaterializer(
@@ -6846,7 +7539,10 @@ class Session:
                     input_schema=output_schema,
                     source=engine,
                     target=NullPublisher(),
-                    descriptor_publisher=self._descriptor_publisher(table_name),
+                    descriptor_publisher=self._descriptor_publisher(
+                        table_name,
+                        descriptor_metadata=descriptor_metadata,
+                    ),
                     row_capacity=table_options["row_capacity"],
                     writer_epoch=writer_epoch,
                     retention_segments=table_options["retention_segments"],
@@ -6861,17 +7557,154 @@ class Session:
                         else None
                     ),
                 )
-            self.master.publish_segment_descriptor(table_name, materializer.active_descriptor())
+            self.master.publish_segment_descriptor(
+                table_name,
+                _annotate_table_descriptor(
+                    materializer.active_descriptor(),
+                    descriptor_metadata,
+                ),
+            )
+            materializers.append(materializer)
         except BaseException:
-            self._unregister_materializer_source_name(source_name)
+            for source_name in reversed(source_names):
+                self._unregister_materializer_source_name(source_name)
             raise
         self._needs_master_process = True
-        return materializer
+        return materializers
+
+    def _publish_source_key_value_table(
+        self,
+        source: str,
+        table_name: str,
+        *,
+        by: str | list[str] | tuple[str, ...],
+        start_from: str,
+    ) -> "Session":
+        self._validate_publish_table_name(table_name, method="publish_key_value_table")
+        key_fields = _normalize_key_value_by(by)
+        if start_from not in {"replay", "tail"}:
+            raise ValueError("start_from must be 'replay' or 'tail'")
+        if start_from == "replay":
+            raise NotImplementedError(
+                "source(...).publish_key_value_table start_from='replay' is not implemented; "
+                "use start_from='tail' for an explicit live-only view"
+            )
+
+        get_stream = getattr(self.master, "get_stream", None)
+        if callable(get_stream):
+            source_stream = get_stream(source)
+            source_kind = _descriptor_table_kind(source_stream)
+            if source_kind == _KEY_VALUE_TABLE_KIND:
+                raise ValueError("key_value_table source cannot publish another key_value_table")
+        get_stream_schema = getattr(self.master, "get_stream_schema", None)
+        if not callable(get_stream_schema):
+            raise RuntimeError("master does not support get_stream_schema")
+        output_schema = get_stream_schema(source)
+        table_options = _resolve_stream_table_options(
+            name=table_name,
+            master=self.master,
+            row_capacity=None,
+            retention_segments=None,
+            dt_column=None,
+            id_column=None,
+            dt_part=None,
+            persist=False,
+            data_dir=None,
+            persist_path=None,
+        )
+        changelog_stream_name = _key_value_changelog_stream_name(table_name)
+        descriptor_metadata = _key_value_table_descriptor_metadata(
+            by=key_fields,
+            changelog_stream_name=changelog_stream_name,
+        )
+        changelog_descriptor_metadata = _key_value_changelog_descriptor_metadata(
+            table_name=table_name,
+            by=key_fields,
+        )
+
+        _ensure_master_process(self.master, self.app or self.name)
+        self.master.register_stream(table_name, output_schema, 64, 4096)
+        self.master.register_stream(
+            changelog_stream_name,
+            _key_value_changelog_schema(output_schema),
+            64,
+            4096,
+        )
+        source_names: list[str | None] = []
+        source_names.append(
+            self._register_materializer_source(
+                table_name,
+                table_options,
+                descriptor_metadata={
+                    **descriptor_metadata,
+                    "source_table": source,
+                    "start_from": start_from,
+                },
+            )
+        )
+        source_names.append(
+            self._register_materializer_source(
+                changelog_stream_name,
+                table_options,
+                descriptor_metadata=changelog_descriptor_metadata,
+            )
+        )
+        try:
+            writer_epoch = _stream_writer_epoch(self.master, table_name)
+            changelog_writer_epoch = _stream_writer_epoch(self.master, changelog_stream_name)
+            materializer = _KeyValueTableMaterializer(
+                name=table_name,
+                input_schema=output_schema,
+                by=key_fields,
+                source=source,
+                master=self.master,
+                target=NullPublisher(),
+                descriptor_publisher=self._descriptor_publisher(
+                    table_name,
+                    descriptor_metadata=descriptor_metadata,
+                ),
+                row_capacity=table_options["row_capacity"],
+                writer_epoch=writer_epoch,
+                retention_guard=self._retention_guard(table_name),
+                replacement_retention_snapshots=table_options[
+                    "replacement_retention_snapshots"
+                ],
+                changelog_name=changelog_stream_name,
+                changelog_descriptor_publisher=self._descriptor_publisher(
+                    changelog_stream_name,
+                    descriptor_metadata=changelog_descriptor_metadata,
+                ),
+                changelog_writer_epoch=changelog_writer_epoch,
+            )
+            self.master.publish_segment_descriptor(
+                changelog_stream_name,
+                _annotate_table_descriptor(
+                    materializer.changelog_active_descriptor(),
+                    changelog_descriptor_metadata,
+                ),
+            )
+            self.master.publish_segment_descriptor(
+                table_name,
+                _annotate_table_descriptor(
+                    materializer.active_descriptor(),
+                    descriptor_metadata,
+                ),
+            )
+            self._validate_engine(materializer)
+            self._runtime_engines.append(materializer)
+        except BaseException:
+            for source_name in reversed(source_names):
+                self._unregister_materializer_source_name(source_name)
+            raise
+        self._needs_master_process = True
+        return self
 
     def _register_materializer_source(
         self,
         table_name: str,
         table_options: dict[str, object],
+        *,
+        descriptor_metadata: dict[str, object] | None = None,
     ) -> str | None:
         register_source = getattr(self.master, "register_source", None)
         if register_source is None:
@@ -6887,7 +7720,11 @@ class Session:
             source_name,
             "session_engine_output",
             table_name,
-            _stream_table_source_config(table_options, session=self.name),
+            _stream_table_source_config(
+                table_options,
+                session=self.name,
+                **(descriptor_metadata or {}),
+            ),
         )
         if source_name not in self._materializer_source_names:
             self._materializer_source_names.append(source_name)
@@ -6929,7 +7766,12 @@ class Session:
             return
         raise first_error
 
-    def _descriptor_publisher(self, stream_name: str):
+    def _descriptor_publisher(
+        self,
+        stream_name: str,
+        *,
+        descriptor_metadata: dict[str, object] | None = None,
+    ):
         def publish(payload) -> None:
             if isinstance(payload, (bytes, bytearray, memoryview)):
                 descriptor = json.loads(bytes(payload).decode("utf-8"))
@@ -6937,6 +7779,7 @@ class Session:
                 descriptor = json.loads(payload)
             else:
                 descriptor = payload
+            descriptor = _annotate_table_descriptor(descriptor, descriptor_metadata)
             self.master.publish_segment_descriptor(stream_name, descriptor)
 
         return publish
@@ -7115,6 +7958,7 @@ class Pipeline:
             data_dir=data_dir,
             persist_path=persist_path,
         )
+        descriptor_metadata = _append_table_descriptor_metadata()
         self._stream_name = name
         self._schema = schema
         self.master.register_stream(name, schema, buffer_size, frame_size)
@@ -7123,7 +7967,7 @@ class Pipeline:
             source_name,
             self._source_type,
             name,
-            _stream_table_source_config(table_options),
+            _stream_table_source_config(table_options, **descriptor_metadata),
         )
         self._registered_source_name = source_name
         try:
@@ -7133,7 +7977,10 @@ class Pipeline:
                 input_schema=schema,
                 source=self._source,
                 target=NullPublisher(),
-                descriptor_publisher=self._descriptor_publisher(name),
+                descriptor_publisher=self._descriptor_publisher(
+                    name,
+                    descriptor_metadata=descriptor_metadata,
+                ),
                 row_capacity=table_options["row_capacity"],
                 writer_epoch=writer_epoch,
                 retention_segments=table_options["retention_segments"],
@@ -7156,7 +8003,10 @@ class Pipeline:
                     and os.name != "nt"
                 ),
             )
-            self.master.publish_segment_descriptor(name, self._engine.active_descriptor())
+            self.master.publish_segment_descriptor(
+                name,
+                _annotate_table_descriptor(self._engine.active_descriptor(), descriptor_metadata),
+            )
         except BaseException:
             self._engine = None
             self._unregister_registered_source()
@@ -7266,7 +8116,12 @@ class Pipeline:
             return None
         return str(value)
 
-    def _descriptor_publisher(self, stream_name: str):
+    def _descriptor_publisher(
+        self,
+        stream_name: str,
+        *,
+        descriptor_metadata: dict[str, object] | None = None,
+    ):
         def publish(payload) -> None:
             if isinstance(payload, (bytes, bytearray, memoryview)):
                 descriptor = json.loads(bytes(payload).decode("utf-8"))
@@ -7274,6 +8129,7 @@ class Pipeline:
                 descriptor = json.loads(payload)
             else:
                 descriptor = payload
+            descriptor = _annotate_table_descriptor(descriptor, descriptor_metadata)
             self.master.publish_segment_descriptor(stream_name, descriptor)
 
         return publish
@@ -7363,6 +8219,17 @@ def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:
     if writer_epoch_int <= 0:
         return None
     return writer_epoch_int
+
+
+def _annotate_table_descriptor(
+    descriptor: object,
+    metadata: dict[str, object] | None,
+) -> object:
+    if not metadata or not isinstance(descriptor, dict):
+        return descriptor
+    annotated = dict(descriptor)
+    annotated.update(metadata)
+    return annotated
 
 
 def _stream_table_source_config(
