@@ -11,7 +11,7 @@ use arrow::{
         UInt32Array,
     },
     compute::take,
-    datatypes::{DataType, Fields, Schema, TimeUnit},
+    datatypes::{DataType, Field, Fields, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
 use parquet::arrow::ArrowWriter;
@@ -27,13 +27,24 @@ use crate::latest_state::LatestColumnarState;
 const STREAM_TABLE_PARTITION: &str = "all";
 pub const DEFAULT_STREAM_TABLE_ROW_CAPACITY: usize = 65_536;
 const DEFAULT_REPLACEMENT_RETAINED_SNAPSHOTS: usize = 8;
+const KEY_VALUE_CHANGELOG_SEQ_FIELD: &str = "_zippy_kv_seq";
+const KEY_VALUE_CHANGELOG_OP_FIELD: &str = "_zippy_kv_op";
+const KEY_VALUE_CHANGELOG_SNAPSHOT_VERSION_FIELD: &str = "_zippy_kv_snapshot_version";
+const KEY_VALUE_SNAPSHOT_VERSION_FIELD: &str = "zippy_kv_snapshot_version";
+const KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD: &str = "zippy_kv_last_changelog_seq";
+const KEY_VALUE_CHANGELOG_STREAM_FIELD: &str = "zippy_kv_changelog_stream";
+const KEY_VALUE_SCHEMA_VERSION_FIELD: &str = "zippy_kv_schema_version";
+const KEY_VALUE_SNAPSHOT_VERSION_PUBLIC_FIELD: &str = "zippy_key_value_snapshot_version";
+const KEY_VALUE_LAST_CHANGELOG_SEQ_PUBLIC_FIELD: &str = "zippy_key_value_last_changelog_seq";
+const KEY_VALUE_CHANGELOG_STREAM_PUBLIC_FIELD: &str = "zippy_key_value_changelog_stream";
+const KEY_VALUE_SCHEMA_VERSION_PUBLIC_FIELD: &str = "zippy_key_value_schema_version";
+const KEY_VALUE_SCHEMA_VERSION: u64 = 1;
 type SegmentIdentity = (u64, u64);
 
 /// Materializes an input stream into an active segment-backed stream table.
 pub struct StreamTableMaterializer {
     name: String,
     input_schema: SchemaRef,
-    default_row_capacity: usize,
     store: SegmentStore,
     partition: PartitionHandle,
     sealed_segment_descriptors: Vec<serde_json::Value>,
@@ -57,6 +68,18 @@ pub struct KeyValueTableMaterializer {
     by: Vec<String>,
     latest_state: LatestColumnarState,
     table: StreamTableMaterializer,
+    changelog_table: Option<StreamTableMaterializer>,
+    changelog_schema: Option<SchemaRef>,
+    snapshot_version: u64,
+    last_changelog_seq: u64,
+    descriptor_metadata: Arc<Mutex<KeyValueDescriptorMetadata>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct KeyValueDescriptorMetadata {
+    snapshot_version: u64,
+    last_changelog_seq: u64,
+    changelog_stream: Option<String>,
 }
 
 /// Keeps a stream table segment pinned for reader-safe retention tests.
@@ -68,6 +91,54 @@ pub struct StreamTableSegmentLease {
 /// Publishes active segment descriptor updates after stream table rollover.
 pub trait StreamTableDescriptorPublisher: Send + Sync {
     fn publish(&self, descriptor_envelope: Vec<u8>) -> Result<()>;
+}
+
+struct KeyValueSnapshotDescriptorPublisher {
+    inner: Arc<dyn StreamTableDescriptorPublisher>,
+    metadata: Arc<Mutex<KeyValueDescriptorMetadata>>,
+}
+
+impl StreamTableDescriptorPublisher for KeyValueSnapshotDescriptorPublisher {
+    fn publish(&self, descriptor_envelope: Vec<u8>) -> Result<()> {
+        let mut descriptor: serde_json::Value = serde_json::from_slice(&descriptor_envelope)
+            .map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to decode key-value snapshot descriptor error=[{}]",
+                    error
+                ),
+            })?;
+        self.metadata.lock().unwrap().annotate(&mut descriptor);
+        let payload = serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to encode key-value snapshot descriptor error=[{}]",
+                error
+            ),
+        })?;
+        self.inner.publish(payload)
+    }
+}
+
+impl KeyValueDescriptorMetadata {
+    fn annotate(&self, descriptor: &mut serde_json::Value) {
+        descriptor[KEY_VALUE_SNAPSHOT_VERSION_FIELD] =
+            serde_json::Value::from(self.snapshot_version);
+        descriptor[KEY_VALUE_SNAPSHOT_VERSION_PUBLIC_FIELD] =
+            serde_json::Value::from(self.snapshot_version);
+        descriptor[KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD] =
+            serde_json::Value::from(self.last_changelog_seq);
+        descriptor[KEY_VALUE_LAST_CHANGELOG_SEQ_PUBLIC_FIELD] =
+            serde_json::Value::from(self.last_changelog_seq);
+        descriptor[KEY_VALUE_SCHEMA_VERSION_FIELD] =
+            serde_json::Value::from(KEY_VALUE_SCHEMA_VERSION);
+        descriptor[KEY_VALUE_SCHEMA_VERSION_PUBLIC_FIELD] =
+            serde_json::Value::from(KEY_VALUE_SCHEMA_VERSION);
+        if let Some(changelog_stream) = &self.changelog_stream {
+            descriptor[KEY_VALUE_CHANGELOG_STREAM_FIELD] =
+                serde_json::Value::from(changelog_stream.clone());
+            descriptor[KEY_VALUE_CHANGELOG_STREAM_PUBLIC_FIELD] =
+                serde_json::Value::from(changelog_stream.clone());
+        }
+    }
 }
 
 /// Checks whether a sealed segment is safe to release from live retention.
@@ -610,7 +681,6 @@ impl StreamTableMaterializer {
         Ok(Self {
             name,
             input_schema,
-            default_row_capacity: row_capacity,
             store,
             partition,
             sealed_segment_descriptors: Vec::new(),
@@ -1009,44 +1079,6 @@ impl StreamTableMaterializer {
         Ok(())
     }
 
-    fn rewrite_active_with_table(&mut self, table: &SegmentTableView) -> Result<bool> {
-        self.ensure_persist_healthy()?;
-        if table.schema().as_ref() != self.input_schema.as_ref() {
-            return Err(ZippyError::SchemaMismatch {
-                reason: format!(
-                    "input batch schema does not match stream table input schema engine=[{}]",
-                    self.name
-                ),
-            });
-        }
-        if self.persist_config.is_some()
-            || !self.sealed_segment_descriptors.is_empty()
-            || table.num_rows() > self.default_row_capacity
-        {
-            return Ok(false);
-        }
-
-        let fields = self.input_schema.fields().clone();
-        let columns = (0..fields.len())
-            .map(|index| table.column_at(index))
-            .collect::<Result<Vec<_>>>()?;
-        let writer = self.partition.writer();
-        match writer.rewrite_rows(table.num_rows(), |row_writer, row_index| {
-            Self::write_materialized_row_fields(row_writer, &fields, &columns, row_index)
-        }) {
-            Ok(rows) if rows == table.num_rows() => {
-                self.forwarded_active_descriptor = None;
-                self.publish_active_descriptor()?;
-                Ok(true)
-            }
-            Ok(_) => Err(ZippyError::Io {
-                reason: "stream table active rewrite wrote fewer rows than requested".to_string(),
-            }),
-            Err(ZippySegmentStoreError::Writer("segment is full")) => Ok(false),
-            Err(error) => Err(segment_error(error)),
-        }
-    }
-
     fn write_materialized_row(
         &self,
         writer: &PartitionWriterHandle,
@@ -1430,7 +1462,44 @@ impl KeyValueTableMaterializer {
             by,
             latest_state,
             table,
+            changelog_table: None,
+            changelog_schema: None,
+            snapshot_version: 0,
+            last_changelog_seq: 0,
+            descriptor_metadata: Arc::new(Mutex::new(KeyValueDescriptorMetadata::default())),
         })
+    }
+
+    /// Attach an internal append-only changelog table.
+    pub fn with_changelog(
+        mut self,
+        changelog_name: impl Into<String>,
+        row_capacity: usize,
+        writer_epoch: Option<u64>,
+    ) -> Result<Self> {
+        let changelog_name = changelog_name.into();
+        let changelog_schema = key_value_changelog_schema(Arc::clone(&self.input_schema));
+        let changelog_table = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+            changelog_name.clone(),
+            Arc::clone(&changelog_schema),
+            row_capacity,
+            writer_epoch,
+        )?;
+        self.descriptor_metadata.lock().unwrap().changelog_stream = Some(changelog_name);
+        self.changelog_schema = Some(changelog_schema);
+        self.changelog_table = Some(changelog_table);
+        Ok(self)
+    }
+
+    /// Attach a publisher used when the internal changelog descriptor changes.
+    pub fn with_changelog_descriptor_publisher(
+        mut self,
+        publisher: Arc<dyn StreamTableDescriptorPublisher>,
+    ) -> Self {
+        if let Some(changelog_table) = self.changelog_table.take() {
+            self.changelog_table = Some(changelog_table.with_descriptor_publisher(publisher));
+        }
+        self
     }
 
     /// Attach a publisher used when the active snapshot descriptor changes.
@@ -1438,7 +1507,12 @@ impl KeyValueTableMaterializer {
         mut self,
         publisher: Arc<dyn StreamTableDescriptorPublisher>,
     ) -> Self {
-        self.table = self.table.with_descriptor_publisher(publisher);
+        self.table =
+            self.table
+                .with_descriptor_publisher(Arc::new(KeyValueSnapshotDescriptorPublisher {
+                    inner: publisher,
+                    metadata: Arc::clone(&self.descriptor_metadata),
+                }));
         self
     }
 
@@ -1466,7 +1540,27 @@ impl KeyValueTableMaterializer {
 
     /// Export the active segment descriptor envelope for cross-process readers.
     pub fn active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
-        self.table.active_descriptor_envelope_bytes()
+        let mut descriptor = self.table.active_descriptor_value()?;
+        self.descriptor_metadata
+            .lock()
+            .unwrap()
+            .annotate(&mut descriptor);
+        serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to encode key-value snapshot descriptor error=[{}]",
+                error
+            ),
+        })
+    }
+
+    /// Export the active changelog segment descriptor envelope for cross-process readers.
+    pub fn changelog_active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
+        let Some(changelog_table) = self.changelog_table.as_ref() else {
+            return Err(ZippyError::InvalidState {
+                status: "key-value changelog table is not configured",
+            });
+        };
+        changelog_table.active_descriptor_envelope_bytes()
     }
 
     /// Return a debug Arrow snapshot of the active key-value table segment.
@@ -1474,11 +1568,68 @@ impl KeyValueTableMaterializer {
         self.table.active_record_batch()
     }
 
+    /// Return a debug Arrow snapshot of the active changelog segment.
+    pub fn changelog_record_batch(&self) -> Result<RecordBatch> {
+        let Some(changelog_table) = self.changelog_table.as_ref() else {
+            return Err(ZippyError::InvalidState {
+                status: "key-value changelog table is not configured",
+            });
+        };
+        changelog_table.active_record_batch()
+    }
+
     fn build_snapshot_batch(&self) -> Result<RecordBatch> {
         if self.latest_state.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&self.input_schema)));
         }
         self.latest_state.materialize_snapshot()
+    }
+
+    fn build_changelog_batch(
+        &self,
+        update: &RecordBatch,
+        snapshot_version: u64,
+        first_seq: u64,
+    ) -> Result<RecordBatch> {
+        let Some(changelog_schema) = self.changelog_schema.as_ref() else {
+            return Err(ZippyError::InvalidState {
+                status: "key-value changelog schema is not configured",
+            });
+        };
+        let rows = update.num_rows();
+        let mut seq_values = Vec::with_capacity(rows);
+        let mut version_values = Vec::with_capacity(rows);
+        for row_index in 0..rows {
+            seq_values.push(i64::try_from(first_seq + row_index as u64).map_err(|_| {
+                ZippyError::InvalidState {
+                    status: "key-value changelog sequence exceeds i64 range",
+                }
+            })?);
+            version_values.push(i64::try_from(snapshot_version).map_err(|_| {
+                ZippyError::InvalidState {
+                    status: "key-value snapshot version exceeds i64 range",
+                }
+            })?);
+        }
+        let mut columns = Vec::with_capacity(update.num_columns() + 3);
+        columns.push(Arc::new(Int64Array::from(seq_values)) as ArrayRef);
+        columns.push(Arc::new(StringArray::from(vec!["upsert"; rows])) as ArrayRef);
+        columns.push(Arc::new(Int64Array::from(version_values)) as ArrayRef);
+        columns.extend(update.columns().iter().cloned());
+        RecordBatch::try_new(Arc::clone(changelog_schema), columns).map_err(|error| {
+            ZippyError::Io {
+                reason: format!(
+                    "failed to build key-value changelog batch error=[{}]",
+                    error
+                ),
+            }
+        })
+    }
+
+    fn update_descriptor_metadata(&mut self) {
+        let mut metadata = self.descriptor_metadata.lock().unwrap();
+        metadata.snapshot_version = self.snapshot_version;
+        metadata.last_changelog_seq = self.last_changelog_seq;
     }
 }
 
@@ -1512,15 +1663,32 @@ impl Engine for KeyValueTableMaterializer {
         if update.is_empty() {
             return Ok(vec![]);
         }
+        let update_batch = self.latest_state.materialize_update(&update)?;
+        if self.changelog_table.is_some() {
+            let next_snapshot_version = self.snapshot_version.saturating_add(1);
+            let first_seq = self.last_changelog_seq.saturating_add(1);
+            let changelog_batch =
+                self.build_changelog_batch(&update_batch, next_snapshot_version, first_seq)?;
+            let changelog_rows = changelog_batch.num_rows() as u64;
+            if let Some(changelog_table) = self.changelog_table.as_mut() {
+                changelog_table.on_data(SegmentTableView::from_record_batch(changelog_batch))?;
+            }
+            self.last_changelog_seq = self.last_changelog_seq.saturating_add(changelog_rows);
+            self.snapshot_version = next_snapshot_version;
+        } else {
+            self.snapshot_version = self.snapshot_version.saturating_add(1);
+        }
+        self.update_descriptor_metadata();
         let snapshot = self.build_snapshot_batch()?;
         let view = SegmentTableView::from_record_batch(snapshot);
-        if !self.table.rewrite_active_with_table(&view)? {
-            self.table.replace_with_table(&view)?;
-        }
+        self.table.replace_with_table(&view)?;
         Ok(vec![view])
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
+        if let Some(changelog_table) = self.changelog_table.as_mut() {
+            changelog_table.on_flush()?;
+        }
         self.table.on_flush()?;
         if self.latest_state.is_empty() {
             return Ok(vec![]);
@@ -1531,9 +1699,39 @@ impl Engine for KeyValueTableMaterializer {
     }
 
     fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
+        if let Some(changelog_table) = self.changelog_table.as_mut() {
+            changelog_table.on_stop()?;
+        }
         self.table.on_stop()?;
-        self.on_flush()
+        if self.latest_state.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![SegmentTableView::from_record_batch(
+            self.build_snapshot_batch()?,
+        )])
     }
+}
+
+fn key_value_changelog_schema(input_schema: SchemaRef) -> SchemaRef {
+    let mut fields = vec![
+        Arc::new(Field::new(
+            KEY_VALUE_CHANGELOG_SEQ_FIELD,
+            DataType::Int64,
+            false,
+        )),
+        Arc::new(Field::new(
+            KEY_VALUE_CHANGELOG_OP_FIELD,
+            DataType::Utf8,
+            false,
+        )),
+        Arc::new(Field::new(
+            KEY_VALUE_CHANGELOG_SNAPSHOT_VERSION_FIELD,
+            DataType::Int64,
+            false,
+        )),
+    ];
+    fields.extend(input_schema.fields().iter().cloned());
+    Arc::new(Schema::new(fields))
 }
 
 fn validate_latest_by_columns(schema: &Schema, by: &[String]) -> Result<()> {

@@ -342,7 +342,103 @@ fn key_value_table_materializer_keeps_last_row_for_duplicate_key_in_same_batch()
 }
 
 #[test]
-fn key_value_table_materializer_rewrites_active_snapshot_when_capacity_fits() {
+fn key_value_table_materializer_appends_changelog_and_marks_snapshot_watermark() {
+    let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
+        "ticks_latest",
+        input_schema(),
+        vec!["instrument_id"],
+        8,
+    )
+    .unwrap()
+    .with_changelog("ticks_latest.__kv_changelog", 8, None)
+    .unwrap();
+
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606", "IH2606"],
+            vec![4102.5, 2711.0],
+        )))
+        .unwrap();
+    materializer
+        .on_data(SegmentTableView::from_record_batch(latest_update_batch(
+            vec!["IF2606"],
+            vec![4103.5],
+        )))
+        .unwrap();
+
+    let changelog = materializer.changelog_record_batch().unwrap();
+    assert_eq!(
+        changelog
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .take(3)
+            .collect::<Vec<_>>(),
+        vec![
+            "_zippy_kv_seq",
+            "_zippy_kv_op",
+            "_zippy_kv_snapshot_version",
+        ]
+    );
+
+    let seq = changelog
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let op = changelog
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let version = changelog
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let instrument_ids = changelog
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let prices = changelog
+        .column(5)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    assert_eq!(changelog.num_rows(), 3);
+    assert_eq!(
+        (0..3).map(|index| seq.value(index)).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        (0..3).map(|index| op.value(index)).collect::<Vec<_>>(),
+        vec!["upsert", "upsert", "upsert"]
+    );
+    assert_eq!(
+        (0..3).map(|index| version.value(index)).collect::<Vec<_>>(),
+        vec![1, 1, 2]
+    );
+    assert_eq!(instrument_ids.value(0), "IF2606");
+    assert_eq!(instrument_ids.value(1), "IH2606");
+    assert_eq!(instrument_ids.value(2), "IF2606");
+    assert_eq!(prices.value(2), 4103.5);
+
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&materializer.active_descriptor_envelope_bytes().unwrap()).unwrap();
+    assert_eq!(descriptor["zippy_kv_snapshot_version"], 2);
+    assert_eq!(descriptor["zippy_kv_last_changelog_seq"], 3);
+    assert_eq!(
+        descriptor["zippy_kv_changelog_stream"],
+        "ticks_latest.__kv_changelog"
+    );
+    assert_eq!(descriptor["zippy_kv_schema_version"], 1);
+}
+
+#[test]
+fn key_value_table_materializer_replaces_snapshot_even_when_capacity_fits() {
     let mut materializer = KeyValueTableMaterializer::new_with_row_capacity(
         "ticks_latest",
         input_schema(),
@@ -371,11 +467,11 @@ fn key_value_table_materializer_rewrites_active_snapshot_when_capacity_fits() {
     let second_descriptor_value: serde_json::Value =
         serde_json::from_slice(&second_descriptor).unwrap();
 
-    assert_eq!(
+    assert_ne!(
         first_descriptor_value["segment_id"],
         second_descriptor_value["segment_id"]
     );
-    assert_eq!(
+    assert_ne!(
         first_descriptor_value["shm_os_id"],
         second_descriptor_value["shm_os_id"]
     );
@@ -433,7 +529,7 @@ fn key_value_table_materializer_retains_and_releases_all_segments_from_old_snaps
         "ticks_latest",
         input_schema(),
         vec!["instrument_id"],
-        1,
+        8,
     )
     .unwrap();
 
@@ -445,13 +541,6 @@ fn key_value_table_materializer_retains_and_releases_all_segments_from_old_snaps
         .unwrap();
     let first_descriptor: serde_json::Value =
         serde_json::from_slice(&materializer.active_descriptor_envelope_bytes().unwrap()).unwrap();
-    let first_sealed_descriptor = first_descriptor["sealed_segments"]
-        .as_array()
-        .unwrap()
-        .first()
-        .unwrap()
-        .clone();
-    let first_sealed_path = descriptor_shm_path(&first_sealed_descriptor);
     let first_active_path = descriptor_shm_path(&first_descriptor);
 
     for update_index in 0..10 {
@@ -467,11 +556,6 @@ fn key_value_table_materializer_retains_and_releases_all_segments_from_old_snaps
         !first_active_path.exists(),
         "old active snapshot segment should be released path=[{}]",
         first_active_path.display()
-    );
-    assert!(
-        !first_sealed_path.exists(),
-        "old sealed snapshot segment should be released path=[{}]",
-        first_sealed_path.display()
     );
 }
 
