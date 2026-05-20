@@ -37,7 +37,7 @@ def run_master(uri: str, config_path: str | None) -> None:
     """
     Run the local zippy-master daemon.
 
-    Default URI: zippy://default
+    Default URI: tcp://127.0.0.1:17690
     """
     try:
         config = _load_config(config_path)

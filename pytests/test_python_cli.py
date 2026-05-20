@@ -522,7 +522,11 @@ def test_master_run_wraps_control_parent_creation_failures(
     assert "Traceback" not in result.output
 
 
-def test_master_run_uses_expanded_default_control_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_default_control_endpoint_uses_local_tcp_master() -> None:
+    assert DEFAULT_CONTROL_ENDPOINT == "tcp://127.0.0.1:17690"
+
+
+def test_master_run_uses_default_tcp_control_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, str]] = []
 
     def recording_run_master_daemon(control_endpoint: str) -> None:
@@ -534,18 +538,15 @@ def test_master_run_uses_expanded_default_control_endpoint(monkeypatch: pytest.M
                 f"master run must not construct MasterServer control_endpoint=[{control_endpoint}]"
             )
 
-    fake_home = Path("/tmp/zippy-cli-home")
     monkeypatch.setattr(zippy, "run_master_daemon", recording_run_master_daemon, raising=False)
     monkeypatch.setattr(zippy, "MasterServer", UnexpectedMasterServer)
-    monkeypatch.setenv("HOME", str(fake_home))
 
     runner = CliRunner()
     result = runner.invoke(main, ["master", "run"])
 
-    expected = expected_logical_endpoint(fake_home)
     assert result.exit_code == 0
-    assert events == [("run_master_daemon", expected)]
-    assert result.output == ""
+    assert events == [("run_master_daemon", "tcp://127.0.0.1:17690")]
+    assert "master starting host=[127.0.0.1] port=[17690]" in result.output
     assert "keyboard interrupt" not in result.output.lower()
 
 

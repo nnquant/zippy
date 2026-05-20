@@ -10,7 +10,7 @@ from typing import NoReturn
 
 import click
 
-DEFAULT_CONTROL_ENDPOINT = "zippy://default"
+DEFAULT_CONTROL_ENDPOINT = "tcp://127.0.0.1:17690"
 
 
 def echo_json(payload: object) -> None:
