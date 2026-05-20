@@ -47,7 +47,9 @@ files = [
     "python/zippy/cli_common.py",
     "python/zippy/cli_gateway.py",
     "python/zippy/cli_master.py",
+    "python/zippy/cli_pm.py",
     "python/zippy/cli_stream.py",
+    "python/zippy/pm_bridge.py",
 ]
 ignore_missing_imports = true
 follow_imports = "silent"
