@@ -3368,7 +3368,13 @@ class RemoteStreamSubscriber:
     @staticmethod
     def _is_retryable_runtime_error(error: RuntimeError) -> bool:
         message = str(error)
-        return "remote gateway connection closed" in message
+        return (
+            "remote gateway connection closed" in message
+            or "stream is stale" in message
+            or "segment descriptor is not published" in message
+            or "stream not found" in message
+            or "stream not registered" in message
+        )
 
 
 class _LocalGatewayWriter:
@@ -7666,9 +7672,7 @@ class Session:
                 row_capacity=table_options["row_capacity"],
                 writer_epoch=writer_epoch,
                 retention_guard=self._retention_guard(table_name),
-                replacement_retention_snapshots=table_options[
-                    "replacement_retention_snapshots"
-                ],
+                replacement_retention_snapshots=table_options["replacement_retention_snapshots"],
                 changelog_name=changelog_stream_name,
                 changelog_descriptor_publisher=self._descriptor_publisher(
                     changelog_stream_name,

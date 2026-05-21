@@ -6323,6 +6323,82 @@ def test_subscribe_table_waits_for_late_producer_stream(tmp_path: Path) -> None:
         server.stop()
 
 
+@pytest.mark.parametrize("table_callback", [False, True])
+def test_subscribe_resumes_when_started_without_active_descriptor(
+    tmp_path: Path,
+    table_callback: bool,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    master = zippy.MasterClient(control_endpoint=control_endpoint)
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    stream_name = "inactive_subscribe_table_ticks" if table_callback else "inactive_subscribe_ticks"
+    batches: list[pa.Table] = []
+    rows: list[dict[str, object]] = []
+    received = threading.Event()
+    subscriber = None
+    pipeline = None
+
+    def on_table(table: pa.Table) -> None:
+        batches.append(table)
+        received.set()
+
+    def on_row(row: zippy.Row) -> None:
+        rows.append(row.to_dict())
+        received.set()
+
+    try:
+        pipeline = (
+            zippy.Pipeline("inactive_subscribe_table_ingest", master=master)
+            .stream_table(stream_name, schema=schema, row_capacity=8)
+            .start()
+        )
+        pipeline.stop()
+        pipeline = None
+        assert master.get_stream(stream_name)["active_segment_descriptor"] is None
+
+        if table_callback:
+            subscriber = zippy.subscribe_table(
+                stream_name,
+                callback=on_table,
+                master=master,
+                poll_interval_ms=1,
+            )
+        else:
+            subscriber = zippy.subscribe(
+                stream_name,
+                callback=on_row,
+                master=master,
+                poll_interval_ms=1,
+            )
+
+        pipeline = (
+            zippy.Pipeline("inactive_subscribe_table_ingest", master=master)
+            .stream_table(stream_name, schema=schema, row_capacity=8)
+            .start()
+        )
+        pipeline.write({"instrument_id": ["IF2606"], "last_price": [3912.5]})
+
+        assert received.wait(timeout=2.0)
+        if table_callback:
+            assert batches[-1].to_pydict() == {
+                "instrument_id": ["IF2606"],
+                "last_price": [3912.5],
+            }
+        else:
+            assert rows == [{"instrument_id": "IF2606", "last_price": 3912.5}]
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        if pipeline is not None:
+            pipeline.stop()
+        server.stop()
+
+
 def test_subscribe_wait_times_out_when_stream_never_appears(tmp_path: Path) -> None:
     server, control_endpoint = start_master_server(tmp_path)
     reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
@@ -10719,6 +10795,92 @@ def test_remote_subscribe_waits_for_late_gateway_stream(
         server.join()
 
 
+@pytest.mark.parametrize("table_callback", [False, True])
+def test_remote_subscribe_resumes_when_started_during_stale_stream(
+    table_callback: bool,
+) -> None:
+    schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    stream_name = "qmt_stale_table_ticks" if table_callback else "qmt_stale_row_ticks"
+    server, gateway, master_uri, gateway_endpoint = _start_native_gateway_stack()
+    rows: list[dict[str, object]] = []
+    tables: list[pa.Table] = []
+    received = threading.Event()
+    subscriber = None
+
+    try:
+        writer_master = zippy.MasterClient(uri=master_uri)
+        writer_process_id = writer_master.register_process(f"{stream_name}_writer_1")
+        writer_master.register_stream(stream_name, schema, 64, 4096)
+        writer_master.register_source(
+            f"{stream_name}_source",
+            "segment_test",
+            stream_name,
+            {},
+        )
+        writer = _segment_test_writer(writer_master, stream_name, schema, row_capacity=16)
+        writer_master.publish_segment_descriptor(stream_name, writer.descriptor())
+
+        response = expire_process_for_test(master_uri, writer_process_id)
+        assert response == {"HeartbeatAccepted": {"process_id": writer_process_id}}
+        assert writer_master.get_stream(stream_name)["status"] == "stale"
+
+        remote_master = zippy.RemoteMasterClient(gateway_endpoint)
+        if table_callback:
+            subscriber = zippy.subscribe_table(
+                stream_name,
+                callback=lambda table: (tables.append(table), received.set()),
+                master=remote_master,
+            )
+        else:
+            subscriber = zippy.subscribe(
+                stream_name,
+                callback=lambda row: (rows.append(row.to_dict()), received.set()),
+                master=remote_master,
+            )
+
+        restarted_master = zippy.MasterClient(uri=master_uri)
+        restarted_master.register_process(f"{stream_name}_writer_2")
+        restarted_master.register_source(
+            f"{stream_name}_source",
+            "segment_test",
+            stream_name,
+            {},
+        )
+        restarted_writer = _segment_test_writer(
+            restarted_master,
+            stream_name,
+            schema,
+            row_capacity=16,
+        )
+        restarted_master.publish_segment_descriptor(stream_name, restarted_writer.descriptor())
+        restarted_writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+
+        assert received.wait(timeout=2.0)
+        if table_callback:
+            assert tables[-1].column("instrument_id").to_pylist() == ["IF2606"]
+            assert tables[-1].column("last_price").to_pylist() == [4102.5]
+        else:
+            assert rows == [
+                {
+                    "dt": 1777017600000000000,
+                    "instrument_id": "IF2606",
+                    "last_price": 4102.5,
+                }
+            ]
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        gateway.stop()
+        server.stop()
+        server.join()
+
+
 def test_subscribe_table_uses_gateway_token_discovered_from_master_config() -> None:
     schema = pa.schema(
         [
@@ -14629,15 +14791,15 @@ def test_pipeline_stream_table_persist_publishes_master_metadata(
     assert callable(kwargs["retention_guard"])
     assert master.source_records == [
         (
-                "test_ingest.openctp_ticks",
-                "pipeline",
-                "openctp_ticks",
-                {
-                    "persist_data_root": str(tmp_path / "ctp_ticks"),
-                    "zippy_table_kind": "append_table",
-                },
-            )
-        ]
+            "test_ingest.openctp_ticks",
+            "pipeline",
+            "openctp_ticks",
+            {
+                "persist_data_root": str(tmp_path / "ctp_ticks"),
+                "zippy_table_kind": "append_table",
+            },
+        )
+    ]
 
     kwargs["persist_publisher"](
         json.dumps(

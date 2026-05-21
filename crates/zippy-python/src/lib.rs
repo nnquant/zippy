@@ -3618,43 +3618,28 @@ impl StreamSubscriber {
             return Err(py_runtime_error("stream subscriber is already started"));
         }
 
-        let stream = py
-            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        let descriptor = py
+        let initial_reader_handle = py
             .allow_threads(|| {
-                self.master
+                let stream = self
+                    .master
                     .lock()
                     .unwrap()
-                    .get_segment_descriptor(&self.source)
-            })
-            .map_err(|error| py_runtime_error(error.to_string()))?
-            .ok_or_else(|| {
-                py_runtime_error(format!(
-                    "segment descriptor is not published source=[{}]",
-                    self.source
-                ))
-            })?;
-        let descriptor_text = serde_json::to_string(&descriptor)
-            .map_err(|error| py_value_error(error.to_string()))?;
-        let mut reader_handle = py
-            .allow_threads(|| {
-                open_active_segment_reader_handle(
-                    &descriptor,
+                    .get_stream(&self.source)
+                    .map_err(|error| error.to_string())?;
+                let Some(descriptor) = stream.active_segment_descriptor.clone() else {
+                    return Ok(None);
+                };
+                open_initial_segment_reader_handle(
+                    Arc::clone(&self.master),
+                    &self.source,
                     &self.segment_schema,
-                    Some(SegmentReaderLeaseContext {
-                        master: Arc::clone(&self.master),
-                        source: self.source.clone(),
-                    }),
+                    self.start_from,
+                    stream.descriptor_generation,
+                    descriptor,
                 )
             })
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        seek_active_segment_reader_start_from(&mut reader_handle.reader, self.start_from)
-            .map_err(|error| py_runtime_error(error.to_string()))?;
+            .map_err(py_runtime_error)?;
 
-        self.metrics
-            .current_descriptor_generation
-            .store(stream.descriptor_generation, Ordering::SeqCst);
         self.metrics.clear_last_error();
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
@@ -3671,59 +3656,85 @@ impl StreamSubscriber {
         let poll_interval = self.poll_interval;
         let xfast = self.xfast;
         let idle_spin_checks = self.idle_spin_checks;
+        let start_from = self.start_from;
 
         *guard = Some(thread::spawn(move || {
-            let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
-            let descriptor_refresh_error = Arc::new(Mutex::new(None));
-            let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
-                Arc::clone(&running),
-                Arc::clone(&master),
-                source.clone(),
-                stream.descriptor_generation,
-                Arc::clone(&descriptor_updates),
-                Arc::clone(&descriptor_refresh_error),
-            );
-
-            let mut driver = SegmentReaderDriver::new(
-                reader_handle,
-                descriptor_text,
-                segment_schema,
-                Arc::clone(&descriptor_updates),
-                Arc::clone(&descriptor_refresh_error),
-                xfast,
-                poll_interval,
-                idle_spin_checks,
-                Some(Arc::clone(&metrics)),
-            );
-
             let result = (|| -> std::result::Result<(), String> {
-                while running.load(Ordering::SeqCst) {
-                    match driver.poll_next()? {
-                        SegmentReaderDriverEvent::Rows(span) => {
-                            if let Some(row_factory) = row_factory.as_ref() {
-                                let delivered_rows = invoke_stream_row_callbacks(
-                                    &callback,
-                                    row_factory,
-                                    span,
-                                    instrument_filter.as_ref(),
-                                )?;
-                                metrics.record_rows_delivered(delivered_rows);
-                            } else {
-                                let batch =
-                                    span.as_record_batch().map_err(|error| error.to_string())?;
-                                let row_count = batch.num_rows();
-                                invoke_stream_callback(&callback, batch)?;
-                                metrics.record_batch_delivered(row_count);
-                            }
-                        }
-                        SegmentReaderDriverEvent::DescriptorUpdated(descriptor_generation) => {
-                            metrics.record_descriptor_update(descriptor_generation);
-                        }
-                        SegmentReaderDriverEvent::Idle => {}
-                    }
-                }
+                let initial_reader_handle = match initial_reader_handle {
+                    Some(reader_handle) => Some(reader_handle),
+                    None => wait_for_initial_segment_reader_handle(
+                        Arc::clone(&master),
+                        &source,
+                        &segment_schema,
+                        start_from,
+                        Arc::clone(&running),
+                        poll_interval.max(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN),
+                    )?,
+                };
+                let Some((reader_handle, descriptor_text, descriptor_generation)) =
+                    initial_reader_handle
+                else {
+                    return Ok(());
+                };
+                metrics
+                    .current_descriptor_generation
+                    .store(descriptor_generation, Ordering::SeqCst);
 
-                driver.finish()
+                let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+                let descriptor_refresh_error = Arc::new(Mutex::new(None));
+                let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
+                    Arc::clone(&running),
+                    Arc::clone(&master),
+                    source.clone(),
+                    descriptor_generation,
+                    Arc::clone(&descriptor_updates),
+                    Arc::clone(&descriptor_refresh_error),
+                );
+
+                let mut driver = SegmentReaderDriver::new(
+                    reader_handle,
+                    descriptor_text,
+                    segment_schema,
+                    Arc::clone(&descriptor_updates),
+                    Arc::clone(&descriptor_refresh_error),
+                    xfast,
+                    poll_interval,
+                    idle_spin_checks,
+                    Some(Arc::clone(&metrics)),
+                );
+
+                let run_result = (|| -> std::result::Result<(), String> {
+                    while running.load(Ordering::SeqCst) {
+                        match driver.poll_next()? {
+                            SegmentReaderDriverEvent::Rows(span) => {
+                                if let Some(row_factory) = row_factory.as_ref() {
+                                    let delivered_rows = invoke_stream_row_callbacks(
+                                        &callback,
+                                        row_factory,
+                                        span,
+                                        instrument_filter.as_ref(),
+                                    )?;
+                                    metrics.record_rows_delivered(delivered_rows);
+                                } else {
+                                    let batch = span
+                                        .as_record_batch()
+                                        .map_err(|error| error.to_string())?;
+                                    let row_count = batch.num_rows();
+                                    invoke_stream_callback(&callback, batch)?;
+                                    metrics.record_batch_delivered(row_count);
+                                }
+                            }
+                            SegmentReaderDriverEvent::DescriptorUpdated(descriptor_generation) => {
+                                metrics.record_descriptor_update(descriptor_generation);
+                            }
+                            SegmentReaderDriverEvent::Idle => {}
+                        }
+                    }
+
+                    driver.finish()
+                })();
+                let _ = descriptor_refresh_handle.join();
+                run_result
             })();
 
             if let Err(error) = result.as_ref() {
@@ -3736,7 +3747,6 @@ impl StreamSubscriber {
                 );
             }
             running.store(false, Ordering::SeqCst);
-            let _ = descriptor_refresh_handle.join();
             result
         }));
         Ok(())
@@ -3836,6 +3846,93 @@ fn seek_active_segment_reader_start_from(
     reader
         .seek_to_row_offset(row_offset)
         .map_err(segment_zippy_error)
+}
+
+fn wait_for_initial_segment_reader_handle(
+    master: SharedMasterClient,
+    source: &str,
+    segment_schema: &CompiledSchema,
+    start_from: i64,
+    running: Arc<AtomicBool>,
+    wait_interval: Duration,
+) -> std::result::Result<Option<(ActiveSegmentReaderHandle, String, u64)>, String> {
+    let start_from_after_recovery = if start_from == -1 { 0 } else { start_from };
+    while running.load(Ordering::SeqCst) {
+        let client = master.lock().unwrap().clone();
+        let stream = client
+            .get_stream(source)
+            .map_err(|error| error.to_string())?;
+        if let Some(descriptor) = stream.active_segment_descriptor.clone() {
+            match open_initial_segment_reader_handle(
+                Arc::clone(&master),
+                source,
+                segment_schema,
+                start_from_after_recovery,
+                stream.descriptor_generation,
+                descriptor,
+            )? {
+                Some(handle) => return Ok(Some(handle)),
+                None => {
+                    thread::sleep(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN);
+                    continue;
+                }
+            }
+        }
+
+        match client.wait_segment_descriptor(source, stream.descriptor_generation, wait_interval) {
+            Ok(Some(update)) => {
+                if let Some(handle) = open_initial_segment_reader_handle(
+                    Arc::clone(&master),
+                    source,
+                    segment_schema,
+                    start_from_after_recovery,
+                    update.descriptor_generation,
+                    update.descriptor,
+                )? {
+                    return Ok(Some(handle));
+                }
+                thread::sleep(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN);
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
+}
+
+fn open_initial_segment_reader_handle(
+    master: SharedMasterClient,
+    source: &str,
+    segment_schema: &CompiledSchema,
+    start_from: i64,
+    descriptor_generation: u64,
+    descriptor: serde_json::Value,
+) -> std::result::Result<Option<(ActiveSegmentReaderHandle, String, u64)>, String> {
+    let descriptor_text = serde_json::to_string(&descriptor).map_err(|error| error.to_string())?;
+    let mut reader_handle = match open_active_segment_reader_handle(
+        &descriptor,
+        segment_schema,
+        Some(SegmentReaderLeaseContext {
+            master,
+            source: source.to_string(),
+        }),
+    ) {
+        Ok(reader_handle) => reader_handle,
+        Err(error) if is_transient_missing_segment_reader_error(&error) => {
+            return Ok(None);
+        }
+        Err(error) if is_segment_reader_lease_target_not_found(&error) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    seek_active_segment_reader_start_from(&mut reader_handle.reader, start_from)
+        .map_err(|error| error.to_string())?;
+    Ok(Some((
+        reader_handle,
+        descriptor_text,
+        descriptor_generation,
+    )))
 }
 
 fn invoke_stream_callback(

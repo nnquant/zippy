@@ -3063,6 +3063,7 @@ fn subscribe_driver_start_retryable(error: &ZippyError) -> bool {
     let message = error.to_string();
     message.contains("stream not found")
         || message.contains("segment descriptor is not published")
+        || message.contains("stream is stale")
         || message.contains("stream not registered")
 }
 
