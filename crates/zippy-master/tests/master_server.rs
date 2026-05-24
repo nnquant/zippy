@@ -2181,10 +2181,9 @@ fn master_server_graceful_shutdown_times_out_with_alive_processes() {
 
     assert_eq!(outcome.timed_out_processes, vec![process_id.clone()]);
     assert!(
-        server.is_running(),
-        "master must remain alive after strict shutdown timeout"
+        !server.is_running(),
+        "master must stop after strict shutdown timeout"
     );
-    server.shutdown();
     join_handle.join().unwrap();
     let _ = fs::remove_file(socket_path);
 }
@@ -2250,8 +2249,7 @@ fn master_server_graceful_shutdown_timeout_keeps_writer_source_alive_in_snapshot
 
     let outcome = server.request_graceful_shutdown(Duration::from_millis(20));
     assert_eq!(outcome.timed_out_processes, vec![process_id.clone()]);
-    assert!(server.is_running());
-    server.shutdown();
+    assert!(!server.is_running());
     join_handle.join().unwrap();
 
     let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
@@ -3189,6 +3187,11 @@ fn master_server_emits_structured_control_plane_logs() {
 }
 
 #[test]
+fn master_server_ignores_empty_control_probe_logs() {
+    run_master_server_logging_case("empty_control_probe");
+}
+
+#[test]
 fn master_server_logs_cleanup_failure_without_stopped_log() {
     let temp = tempfile::tempdir().unwrap();
     let socket_dir = temp.path().join("srv");
@@ -3248,6 +3251,7 @@ fn master_server_logging_case_dispatch() {
 
     match case.as_str() {
         "control_plane_logs" => master_server_control_plane_logging_case(&temp_dir),
+        "empty_control_probe" => master_server_empty_control_probe_logging_case(&temp_dir),
         other => panic!("unknown master server logging test case: {other}"),
     }
 }
@@ -3379,6 +3383,37 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
         ],
         &[],
         &[],
+    );
+}
+
+fn master_server_empty_control_probe_logging_case(temp_dir: &Path) {
+    let socket_path = temp_dir.join("master.sock");
+    let log_dir = temp_dir.join("logs");
+
+    let snapshot = setup_log(LogConfig::new(
+        "master_server_test",
+        "info",
+        &log_dir,
+        false,
+        true,
+    ))
+    .unwrap();
+    let log_file = snapshot.file_path.expect("missing log file path");
+
+    let (server, join_handle) = spawn_test_server(&socket_path);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    drop(stream);
+    thread::sleep(Duration::from_millis(100));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+
+    let records = read_jsonl_records(&log_file);
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["event"] == "control_connection_error"),
+        "empty control probes should not emit control connection warnings"
     );
 }
 

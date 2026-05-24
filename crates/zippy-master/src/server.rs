@@ -530,6 +530,7 @@ impl MasterServer {
                     timed_out_processes = ?alive,
                     "timed out waiting for child processes to unregister"
                 );
+                self.running.store(false, Ordering::SeqCst);
                 return GracefulShutdownOutcome {
                     timed_out_processes: alive,
                 };
@@ -1495,6 +1496,9 @@ impl MasterServer {
         {
             let mut reader = BufReader::new(&mut stream);
             reader.read_line(&mut request_line).map_err(io_error)?;
+        }
+        if request_line.is_empty() {
+            return Ok(());
         }
 
         if let Some(response) = self.try_handle_test_control_request(&request_line)? {
