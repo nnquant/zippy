@@ -13357,6 +13357,88 @@ def test_subscribe_switches_from_sealed_segment_when_descriptor_arrives(
         server.stop()
 
 
+def test_subscribe_with_instrument_filter_rebinds_after_rollover(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    server, control_endpoint = start_master_server(tmp_path)
+    tick_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    client = zippy.connect(uri=control_endpoint)
+    client.register_process("rollover_filter_writer")
+    client.register_stream("rollover_filter_ticks", tick_schema, 64, 4096)
+    client.register_source("rollover_filter_source", "segment_test", "rollover_filter_ticks", {})
+    writer = zippy._internal._SegmentTestWriter(
+        "rollover_filter_ticks",
+        tick_schema,
+        row_capacity=2,
+        writer_epoch=client.get_stream("rollover_filter_ticks")["writer_epoch"],
+    )
+    client.publish_segment_descriptor("rollover_filter_ticks", writer.descriptor())
+
+    received: list[str] = []
+    first_ready = threading.Event()
+    second_ready = threading.Event()
+
+    def on_tick(row: zippy.Row) -> None:
+        instrument_id = str(row["instrument_id"])
+        received.append(instrument_id)
+        if instrument_id == "TL2606" and len(received) == 1:
+            first_ready.set()
+        if instrument_id == "TL2606" and len(received) >= 2:
+            second_ready.set()
+
+    subscriber = zippy.subscribe(
+        source="rollover_filter_ticks",
+        callback=on_tick,
+        poll_interval_ms=1,
+        xfast=True,
+        instrument_ids=["TL2606"],
+        start_from=-1,
+    )
+
+    try:
+        writer.append_tick(1777017600000000000, "TL2606", 113.05)
+        writer.append_tick(1777017600500000000, "TL2609", 112.90)
+        assert first_ready.wait(timeout=2.0)
+
+        writer.rollover()
+        client.publish_segment_descriptor("rollover_filter_ticks", writer.descriptor())
+        writer.append_tick(1777017601000000000, "TL2606", 113.10)
+
+        assert second_ready.wait(timeout=2.0)
+        assert received == ["TL2606", "TL2606"]
+
+        stream = client.get_stream("rollover_filter_ticks")
+        active_descriptor = stream["active_segment_descriptor"]
+        leases = stream["segment_reader_leases"]
+        assert len(leases) == 1
+        assert leases[0]["source_segment_id"] == active_descriptor["segment_id"]
+        assert leases[0]["source_generation"] == active_descriptor["generation"]
+
+        metrics = subscriber.metrics()
+        assert metrics["descriptor_updates_total"] >= 1
+        assert metrics["descriptor_rebinds_total"] >= 1
+        assert metrics["current_segment_id"] == active_descriptor["segment_id"]
+        assert metrics["current_segment_generation"] == active_descriptor["generation"]
+        assert metrics["current_descriptor_generation"] == stream["descriptor_generation"]
+        assert metrics["master_descriptor_generation"] == stream["descriptor_generation"]
+        assert metrics["last_descriptor_refresh_ns"] >= 0
+        assert metrics["descriptor_refresh_errors_total"] == 0
+    finally:
+        subscriber.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+
 def test_subscribe_metrics_exposes_background_descriptor_error(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
@@ -13382,6 +13464,7 @@ def test_subscribe_metrics_exposes_background_descriptor_error(tmp_path: Path) -
         source="bad_descriptor_ticks",
         callback=lambda row: None,
         poll_interval_ms=1,
+        xfast=True,
     )
 
     try:
@@ -13747,6 +13830,340 @@ def test_subscribe_auto_watches_reactive_latest_rows(tmp_path: Path) -> None:
         if reset_default_master is not None:
             reset_default_master()
         server.stop()
+
+
+def test_table_snapshot_watcher_retries_transient_metadata_errors(monkeypatch) -> None:
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_stream(self, source: str) -> dict[str, object]:
+            self.calls += 1
+            if self.calls <= 2:
+                raise RuntimeError("stream not found")
+            return {"descriptor_generation": 1}
+
+    class FakeQuery:
+        def filter(self, _filter):
+            return self
+
+        def tail(self, _count: int):
+            return self
+
+        def collect(self) -> pa.Table:
+            return pa.table({"instrument_id": ["IF2606"], "last_price": [4102.5]})
+
+    monkeypatch.setattr(zippy, "read_table", lambda *args, **kwargs: FakeQuery())
+
+    delivered = threading.Event()
+    snapshots: list[pa.Table] = []
+    watcher = zippy._watch_table_latest(
+        "ctp_ticks_latest",
+        callback=lambda table: (snapshots.append(table), delivered.set()),
+        master=FakeMaster(),
+        poll_interval_ms=5,
+    )
+
+    try:
+        assert delivered.wait(timeout=1.0)
+        metrics = watcher.metrics()
+        health = watcher.health()
+        assert metrics["running"] is True
+        assert metrics["descriptor_refresh_errors_total"] == 2
+        assert metrics["snapshots_delivered_total"] == 1
+        assert health["state"] == "running"
+        assert health["healthy"] is True
+        assert health["last_error"] is None
+    finally:
+        watcher.stop()
+
+
+def test_remote_stream_subscriber_metrics_use_live_health_contract() -> None:
+    subscriber = zippy.RemoteStreamSubscriber(
+        "qmt_ticks",
+        endpoint="127.0.0.1:1",
+        callback=lambda row: None,
+        reconnect_interval_ms=1,
+    )
+
+    metrics = subscriber.metrics()
+    health = subscriber.health()
+
+    assert metrics["running"] is False
+    assert metrics["state"] == "created"
+    assert metrics["last_error"] is None
+    assert metrics["rows_delivered_total"] == 0
+    assert metrics["batches_delivered_total"] == 0
+    assert metrics["last_event_ns"] == 0
+    assert health["kind"] == "remote_stream_subscriber"
+    assert health["restart_required"] is False
+
+
+def test_session_status_metrics_and_health_aggregate_runtime_engines() -> None:
+    class FakeEngine:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self._status = "created"
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def metrics(self) -> dict[str, object]:
+            return {"processed_rows_total": 1 if self._status == "running" else 0}
+
+    first = FakeEngine("first")
+    second = FakeEngine("second")
+    session = zippy.Session(name="aggregate_session", master=zippy.MasterClient())
+    session.engine(first).engine(second)
+
+    assert session.status() == "created"
+    assert session.metrics()["status"] == "created"
+
+    session.run()
+    assert session.status() == "running"
+    assert session.health()["healthy"] is True
+    assert zippy.wait_healthy(session, timeout=0.1)["state"] == "running"
+    assert zippy.needs_rebuild(session) is False
+
+    second._status = "failed"
+    metrics = session.metrics()
+    health = session.health()
+    assert session.status() == "failed"
+    assert metrics["engines"][1]["status"] == "failed"
+    assert health["state"] == "failed"
+    assert health["restart_required"] is True
+    assert zippy.needs_rebuild(session) is True
+    with pytest.raises(RuntimeError, match="live handle failed"):
+        zippy.raise_if_failed(session)
+
+    second._status = "running"
+    session.stop()
+    assert session.status() == "stopped"
+
+
+def test_native_engine_metrics_and_health_use_live_contract() -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+    engine = zippy.ReactiveStateEngine(
+        name="contract_engine",
+        input_schema=schema,
+        id_column="instrument_id",
+        factors=[zippy.Expr(expression="last_price * 2.0", output="price_x2")],
+        target=zippy.NullPublisher(),
+    )
+
+    created_metrics = engine.metrics()
+    created_health = engine.health()
+    assert created_metrics["status"] == "created"
+    assert created_metrics["running"] is False
+    assert created_metrics["last_error"] is None
+    assert created_health["kind"] == "reactive"
+    assert created_health["state"] == "created"
+    assert created_health["restart_required"] is False
+
+    engine.start()
+    try:
+        running_metrics = engine.metrics()
+        running_health = engine.health()
+        assert running_metrics["status"] == "running"
+        assert running_metrics["running"] is True
+        assert running_health["healthy"] is True
+        assert zippy.live_health(engine)["state"] == "running"
+    finally:
+        engine.stop()
+
+
+def test_session_lifespan_emits_connect_and_error_without_auto_restart() -> None:
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.name = "lifespan_engine"
+            self._status = "created"
+            self.start_count = 0
+            self.stop_count = 0
+
+        def start(self) -> None:
+            self.start_count += 1
+            self._status = "running"
+
+        def stop(self) -> None:
+            self.stop_count += 1
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def metrics(self) -> dict[str, object]:
+            return {"last_error": "terminal failure"} if self._status == "failed" else {}
+
+    engine = FakeEngine()
+    events: list[tuple[str, str, bool]] = []
+    connected = threading.Event()
+    errored = threading.Event()
+
+    def on_lifespan(ctx: zippy.SessionContext) -> None:
+        events.append((ctx.event, ctx.health["state"], ctx.error_is_transient))
+        if ctx.event == "connect":
+            connected.set()
+        if ctx.event == "error":
+            errored.set()
+
+    session = (
+        zippy.Session(name="lifespan_session", master=zippy.MasterClient())
+        .engine(engine)
+        .lifespan(on_lifespan, poll_interval_ms=5)
+    )
+
+    try:
+        session.run()
+        assert connected.wait(timeout=1.0)
+        engine._status = "failed"
+        assert errored.wait(timeout=1.0)
+        assert ("connect", "running", False) in events
+        assert ("error", "failed", False) in events
+        assert engine.start_count == 1
+        assert engine.stop_count == 0
+        assert session.status() == "failed"
+    finally:
+        try:
+            session.stop()
+        except RuntimeError:
+            pass
+
+
+def test_session_lifespan_context_can_stop_session_on_error() -> None:
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.name = "lifespan_stop_engine"
+            self._status = "created"
+            self.stop_count = 0
+
+        def start(self) -> None:
+            self._status = "running"
+
+        def stop(self) -> None:
+            self.stop_count += 1
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def metrics(self) -> dict[str, object]:
+            return {"last_error": "terminal failure"} if self._status == "failed" else {}
+
+    engine = FakeEngine()
+    stopped = threading.Event()
+
+    def on_lifespan(ctx: zippy.SessionContext) -> None:
+        if ctx.event == "error":
+            ctx.stop_session()
+        if ctx.event == "stopped":
+            stopped.set()
+
+    session = (
+        zippy.Session(name="lifespan_stop_session", master=zippy.MasterClient())
+        .engine(engine)
+        .lifespan(on_lifespan, poll_interval_ms=5)
+    )
+
+    session.run()
+    engine._status = "failed"
+    deadline = time.time() + 1.0
+    while session.status() != "stopped" and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert session.status() == "stopped"
+    assert engine.stop_count == 1
+    assert stopped.wait(timeout=1.0)
+
+
+def test_session_lifespan_named_hooks_receive_context() -> None:
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.name = "lifespan_hook_engine"
+            self._status = "created"
+            self.start_count = 0
+            self.stop_count = 0
+
+        def start(self) -> None:
+            self.start_count += 1
+            self._status = "running"
+
+        def stop(self) -> None:
+            self.stop_count += 1
+            self._status = "stopped"
+
+        def status(self) -> str:
+            return self._status
+
+        def metrics(self) -> dict[str, object]:
+            if self._status == "reconnecting":
+                return {"last_transient_error": "temporary source disconnect"}
+            if self._status == "failed":
+                return {"last_error": "terminal failure"}
+            return {}
+
+    engine = FakeEngine()
+    connected = threading.Event()
+    disconnected = threading.Event()
+    errored = threading.Event()
+    events: list[tuple[str, str, bool]] = []
+
+    def record(ctx: zippy.SessionContext) -> None:
+        events.append((ctx.event, ctx.health["state"], ctx.error_is_transient))
+
+    def on_connect(ctx: zippy.SessionContext) -> None:
+        record(ctx)
+        connected.set()
+
+    def on_disconnect(ctx: zippy.SessionContext) -> None:
+        record(ctx)
+        disconnected.set()
+
+    def on_error(ctx: zippy.SessionContext) -> None:
+        record(ctx)
+        ctx.request_exit(7)
+        errored.set()
+
+    session = (
+        zippy.Session(name="lifespan_hook_session", master=zippy.MasterClient())
+        .engine(engine)
+        .lifespan(
+            on_connect=on_connect,
+            on_disconnect=on_disconnect,
+            on_error=on_error,
+            poll_interval_ms=5,
+        )
+    )
+
+    try:
+        session.run()
+        assert connected.wait(timeout=1.0)
+        engine._status = "reconnecting"
+        assert disconnected.wait(timeout=1.0)
+        engine._status = "failed"
+        assert errored.wait(timeout=1.0)
+
+        assert ("connect", "running", False) in events
+        assert ("disconnect", "degraded", True) in events
+        assert ("error", "failed", False) in events
+        assert session.requested_exit_code == 7
+        assert engine.start_count == 1
+        assert engine.stop_count == 0
+    finally:
+        try:
+            session.stop()
+        except RuntimeError:
+            pass
 
 
 def test_subscribe_reactive_latest_routes_to_changelog_rows(tmp_path: Path) -> None:
@@ -15502,7 +15919,9 @@ def test_stream_table_engine_rejects_segment_stream_source_schema_mismatch() -> 
         )
 
 
-def test_segment_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> None:
+def test_segment_stream_source_recovers_when_descriptor_is_published_after_engine_start(
+    tmp_path: Path,
+) -> None:
     server, control_endpoint = start_master_server(tmp_path)
     tick_schema = pa.schema(
         [
@@ -15511,11 +15930,22 @@ def test_segment_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> 
             ("last_price", pa.float64()),
         ]
     )
+    factor_schema = pa.schema(
+        [
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+            ("price_x2", pa.float64()),
+        ]
+    )
 
     reader_master = zippy.MasterClient(control_endpoint=control_endpoint)
     reader_master.register_process("reactive_reader")
     writer_master = zippy.MasterClient(control_endpoint=control_endpoint)
     writer_master.register_process("writer")
+    port = reserve_tcp_port()
+    endpoint = f"tcp://127.0.0.1:{port}"
+    subscriber = None
 
     engine = zippy.ReactiveStateEngine(
         name="reactive_segment_retry",
@@ -15529,21 +15959,27 @@ def test_segment_source_start_failure_keeps_engine_retryable(tmp_path: Path) -> 
         input_schema=tick_schema,
         id_column="instrument_id",
         factors=[zippy.Expr(expression="last_price * 2.0", output="price_x2")],
-        target=zippy.NullPublisher(),
+        target=zippy.ZmqPublisher(endpoint=endpoint),
     )
 
     try:
-        with pytest.raises(RuntimeError, match="stream not found"):
-            engine.start()
+        engine.start()
+        assert engine.status() == "running"
+        subscriber = zippy.ZmqSubscriber(endpoint=endpoint, timeout_ms=2_000)
 
         writer_master.register_stream("ticks", tick_schema, 64, 4096)
         writer_master.register_source("segment_md", "segment_test", "ticks", {})
         writer = _segment_test_writer(writer_master, "ticks", tick_schema, row_capacity=16)
         writer_master.publish_segment_descriptor("ticks", writer.descriptor())
+        writer.append_tick(1777017600000000000, "IF2606", 4102.5)
 
-        engine.start()
-        engine.stop()
+        received = recv_zmq_with_retry(subscriber)
+        assert received.schema == factor_schema
+        assert received.column("instrument_id").to_pylist() == ["IF2606"]
+        assert received.column("price_x2").to_pylist() == [8205.0]
     finally:
+        if subscriber is not None:
+            subscriber.close()
         if engine.status() == "running":
             engine.stop()
         server.stop()

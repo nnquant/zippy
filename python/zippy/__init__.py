@@ -52,6 +52,155 @@ _TEMPORAL_LITERAL_RE = re.compile(
 )
 
 
+def _current_time_ns() -> int:
+    return time.time_ns()
+
+
+def _live_status_from_metrics(metrics: dict[str, object]) -> str:
+    state = metrics.get("state")
+    if isinstance(state, str) and state:
+        return state
+    last_error = metrics.get("last_error")
+    if last_error:
+        return "failed"
+    if bool(metrics.get("running", False)):
+        return "running"
+    return "stopped"
+
+
+def _live_health_from_metrics(
+    *,
+    kind: str,
+    source: str | None,
+    metrics: dict[str, object],
+) -> dict[str, object]:
+    state = _live_status_from_metrics(metrics)
+    running = bool(metrics.get("running", state == "running"))
+    last_error = metrics.get("last_error")
+    terminal = state in {"failed", "stopped"}
+    restart_required = state == "failed" or bool(last_error)
+    return {
+        "kind": kind,
+        "source": source,
+        "state": state,
+        "status": state,
+        "running": running,
+        "healthy": running and not last_error and state == "running",
+        "terminal": terminal,
+        "restart_required": restart_required,
+        "last_error": last_error,
+        "last_transient_error": metrics.get("last_transient_error"),
+        "last_event_ns": int(metrics.get("last_event_ns", 0) or 0),
+        "last_success_ns": int(metrics.get("last_success_ns", 0) or 0),
+        "rows_delivered_total": int(metrics.get("rows_delivered_total", 0) or 0),
+        "batches_delivered_total": int(metrics.get("batches_delivered_total", 0) or 0),
+        "snapshots_delivered_total": int(metrics.get("snapshots_delivered_total", 0) or 0),
+        "current_segment_id": metrics.get("current_segment_id"),
+        "current_segment_generation": metrics.get("current_segment_generation"),
+        "current_descriptor_generation": metrics.get("current_descriptor_generation"),
+        "master_descriptor_generation": metrics.get("master_descriptor_generation"),
+        "descriptor_rebinds_total": int(metrics.get("descriptor_rebinds_total", 0) or 0),
+        "reconnects_total": int(metrics.get("reconnects_total", 0) or 0),
+        "pending_descriptor_updates": int(metrics.get("pending_descriptor_updates", 0) or 0),
+    }
+
+
+def live_health(handle: object) -> dict[str, object]:
+    """
+    Return a normalized live-health snapshot for subscribers, watchers, sessions, and engines.
+
+    :param handle: Live handle exposing ``health()``, or ``status()``/``metrics()``.
+    :type handle: object
+    :returns: Normalized live health fields.
+    :rtype: dict[str, object]
+    :raises TypeError: If the object does not expose a compatible lifecycle surface.
+    """
+    health = getattr(handle, "health", None)
+    if callable(health):
+        value = health()
+        if isinstance(value, dict):
+            return value
+    metrics_fn = getattr(handle, "metrics", None)
+    status_fn = getattr(handle, "status", None)
+    if not callable(metrics_fn) and not callable(status_fn):
+        raise TypeError("handle must expose health(), metrics(), or status()")
+    metrics = dict(metrics_fn()) if callable(metrics_fn) else {}
+    if callable(status_fn):
+        metrics.setdefault("state", status_fn())
+    source = metrics.get("source")
+    return _live_health_from_metrics(
+        kind=handle.__class__.__name__,
+        source=str(source) if source is not None else None,
+        metrics=metrics,
+    )
+
+
+def needs_rebuild(handle: object) -> bool:
+    """
+    Return whether a live handle must be recreated to recover.
+
+    :param handle: Live handle exposing the normalized health contract.
+    :type handle: object
+    :returns: True when the handle is terminal or otherwise requires rebuild.
+    :rtype: bool
+    """
+    return bool(live_health(handle).get("restart_required", False))
+
+
+def raise_if_failed(handle: object) -> None:
+    """
+    Raise if a live handle is failed or requires rebuild.
+
+    :param handle: Live handle exposing the normalized health contract.
+    :type handle: object
+    :raises RuntimeError: If the handle is failed or marked restart-required.
+    """
+    health = live_health(handle)
+    if not health.get("restart_required") and health.get("state") != "failed":
+        return
+    reason = health.get("last_error") or health.get("state") or "unknown"
+    raise RuntimeError(f"live handle failed kind=[{health.get('kind')}] reason=[{reason}]")
+
+
+def wait_healthy(
+    handle: object,
+    *,
+    timeout: float | str | None = None,
+    poll_interval_ms: int = 10,
+) -> dict[str, object]:
+    """
+    Wait until a live handle reports healthy, or fail when it becomes terminal.
+
+    :param handle: Live handle exposing the normalized health contract.
+    :type handle: object
+    :param timeout: Optional maximum wait duration in seconds or duration string.
+    :type timeout: float | str | None
+    :param poll_interval_ms: Poll interval while waiting.
+    :type poll_interval_ms: int
+    :returns: Final healthy snapshot.
+    :rtype: dict[str, object]
+    :raises TimeoutError: If timeout elapses before the handle becomes healthy.
+    :raises RuntimeError: If the handle fails while waiting.
+    """
+    poll_interval_ms = int(poll_interval_ms)
+    if poll_interval_ms <= 0:
+        raise ValueError("poll_interval_ms must be positive")
+    timeout_sec = _parse_timeout_seconds(timeout)
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
+    while True:
+        health = live_health(handle)
+        if health.get("healthy"):
+            return health
+        if health.get("restart_required") or health.get("state") == "failed":
+            raise_if_failed(handle)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(
+                "live handle did not become healthy "
+                f"kind=[{health.get('kind')}] state=[{health.get('state')}]"
+            )
+        time.sleep(poll_interval_ms / 1000.0)
+
+
 def _native_unavailable(name: str):
     class _NativeUnavailable:
         def __init__(self, *args, **kwargs) -> None:
@@ -3255,8 +3404,13 @@ class RemoteStreamSubscriber:
         self._stop_event = threading.Event()
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._started = False
         self._error: BaseException | None = None
         self._reconnects_total = 0
+        self._rows_delivered_total = 0
+        self._batches_delivered_total = 0
+        self._last_event_ns = 0
+        self._last_success_ns = 0
 
     def start(self) -> "RemoteStreamSubscriber":
         self._thread = threading.Thread(
@@ -3264,6 +3418,7 @@ class RemoteStreamSubscriber:
             name=f"zippy-remote-subscriber-{self.source}",
             daemon=True,
         )
+        self._started = True
         self._thread.start()
         return self
 
@@ -3290,12 +3445,37 @@ class RemoteStreamSubscriber:
             raise self._error
 
     def metrics(self) -> dict[str, object]:
+        state = self.status()
         return {
             "source": self.source,
             "remote_gateway_endpoint": self.endpoint,
-            "running": self._thread is not None and self._thread.is_alive(),
+            "state": state,
+            "running": state in {"running", "reconnecting"},
+            "last_error": None if self._error is None else str(self._error),
             "reconnects_total": self._reconnects_total,
+            "rows_delivered_total": self._rows_delivered_total,
+            "batches_delivered_total": self._batches_delivered_total,
+            "last_event_ns": self._last_event_ns,
+            "last_success_ns": self._last_success_ns,
         }
+
+    def status(self) -> str:
+        if self._error is not None:
+            return "failed"
+        if self._thread is not None and self._thread.is_alive():
+            return "running"
+        if self._stop_event.is_set():
+            return "stopped"
+        if self._started:
+            return "stopped"
+        return "created"
+
+    def health(self) -> dict[str, object]:
+        return _live_health_from_metrics(
+            kind="remote_stream_subscriber",
+            source=self.source,
+            metrics=self.metrics(),
+        )
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -3355,15 +3535,25 @@ class RemoteStreamSubscriber:
                     if not isinstance(row, dict):
                         raise RuntimeError("remote subscribe row frame missing row object")
                     self.callback(Row(row))
+                    self._rows_delivered_total += 1
+                    self._last_event_ns = _current_time_ns()
+                    self._last_success_ns = self._last_event_ns
                     continue
                 if header.get("kind") != "table":
                     continue
                 table = _pyarrow_table_from_ipc(payload)
                 if self.table_callback:
                     self.callback(table)
+                    self._batches_delivered_total += 1
+                    self._rows_delivered_total += int(getattr(table, "num_rows", 0))
+                    self._last_event_ns = _current_time_ns()
+                    self._last_success_ns = self._last_event_ns
                 else:
                     for row in table.to_pylist():
                         self.callback(Row(row))
+                        self._rows_delivered_total += 1
+                        self._last_event_ns = _current_time_ns()
+                        self._last_success_ns = self._last_event_ns
 
     @staticmethod
     def _is_retryable_runtime_error(error: RuntimeError) -> bool:
@@ -5685,6 +5875,29 @@ class StreamSubscriber:
         """
         return self._inner.metrics()
 
+    def status(self) -> str:
+        """
+        Return normalized subscriber lifecycle status.
+
+        :returns: ``running``, ``failed``, or ``stopped``.
+        :rtype: str
+        """
+        return _live_status_from_metrics(self.metrics())
+
+    def health(self) -> dict[str, object]:
+        """
+        Return normalized subscriber live health.
+
+        :returns: Normalized live health fields.
+        :rtype: dict[str, object]
+        """
+        metrics = self.metrics()
+        return _live_health_from_metrics(
+            kind="stream_subscriber",
+            source=str(metrics.get("source", "")),
+            metrics=metrics,
+        )
+
 
 class _TableSnapshotWatcher:
     """
@@ -5747,10 +5960,16 @@ class _TableSnapshotWatcher:
         self._collect_retries = collect_retries
         self._stop_event = threading.Event()
         self._stopped_event = threading.Event()
+        self._started = False
         self._error: BaseException | None = None
+        self._last_transient_error: BaseException | None = None
         self._last_descriptor_generation: int | None = None
         self._snapshots_delivered_total = 0
         self._rows_delivered_total = 0
+        self._descriptor_refresh_errors_total = 0
+        self._snapshot_refresh_errors_total = 0
+        self._last_event_ns = 0
+        self._last_success_ns = 0
 
         if wait:
             _wait_for_table_ready(source, self._master, timeout)
@@ -5774,6 +5993,7 @@ class _TableSnapshotWatcher:
         :returns: This watcher handle.
         :rtype: _TableSnapshotWatcher
         """
+        self._started = True
         self._thread.start()
         return self
 
@@ -5803,23 +6023,81 @@ class _TableSnapshotWatcher:
         :returns: Snapshot delivery counters and the latest observed descriptor generation.
         :rtype: dict[str, object]
         """
+        state = self.status()
         return {
+            "source": self.source,
+            "state": state,
+            "running": state == "running",
             "snapshots_delivered_total": self._snapshots_delivered_total,
             "rows_delivered_total": self._rows_delivered_total,
             "current_descriptor_generation": self._last_descriptor_generation or 0,
             "last_error": None if self._error is None else str(self._error),
+            "last_transient_error": (
+                None if self._last_transient_error is None else str(self._last_transient_error)
+            ),
+            "descriptor_refresh_errors_total": self._descriptor_refresh_errors_total,
+            "snapshot_refresh_errors_total": self._snapshot_refresh_errors_total,
+            "last_event_ns": self._last_event_ns,
+            "last_success_ns": self._last_success_ns,
         }
+
+    def status(self) -> str:
+        """
+        Return normalized snapshot watcher lifecycle status.
+
+        :returns: ``created``, ``running``, ``failed``, or ``stopped``.
+        :rtype: str
+        """
+        if self._error is not None:
+            return "failed"
+        if self._thread.is_alive():
+            return "running"
+        if self._stopped_event.is_set() or self._stop_event.is_set():
+            return "stopped"
+        if self._started:
+            return "stopped"
+        return "created"
+
+    def health(self) -> dict[str, object]:
+        """
+        Return normalized snapshot watcher live health.
+
+        :returns: Normalized live health fields.
+        :rtype: dict[str, object]
+        """
+        return _live_health_from_metrics(
+            kind="table_snapshot_watcher",
+            source=self.source,
+            metrics=self.metrics(),
+        )
 
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
-                descriptor_generation = self._descriptor_generation()
+                try:
+                    descriptor_generation = self._descriptor_generation()
+                except RuntimeError as error:
+                    if not self._is_transient_error(error):
+                        raise
+                    self._record_descriptor_refresh_error(error)
+                    self._stop_event.wait(self._poll_interval_sec)
+                    continue
                 if descriptor_generation != self._last_descriptor_generation:
-                    snapshot = self._collect_snapshot()
+                    try:
+                        snapshot = self._collect_snapshot()
+                    except RuntimeError as error:
+                        if not self._is_transient_error(error):
+                            raise
+                        self._record_snapshot_refresh_error(error)
+                        self._stop_event.wait(self._poll_interval_sec)
+                        continue
                     self._callback(snapshot)
                     self._snapshots_delivered_total += 1
                     self._rows_delivered_total += int(getattr(snapshot, "num_rows", 0))
                     self._last_descriptor_generation = descriptor_generation
+                    self._last_event_ns = _current_time_ns()
+                    self._last_success_ns = self._last_event_ns
+                    self._last_transient_error = None
                 self._stop_event.wait(self._poll_interval_sec)
         except BaseException as error:
             self._error = error
@@ -5846,6 +6124,30 @@ class _TableSnapshotWatcher:
                     raise
                 time.sleep(self._poll_interval_sec)
         raise RuntimeError("unreachable table snapshot collect retry state")
+
+    @staticmethod
+    def _is_transient_error(error: RuntimeError) -> bool:
+        message = str(error)
+        return (
+            "active payload changed during read" in message
+            or "stream not found" in message
+            or "stream not registered" in message
+            or "stream is stale" in message
+            or "segment descriptor is not published" in message
+            or "shared memory error: No such file or directory" in message
+            or "os error 2" in message
+            or "segment reader lease target not found" in message
+        )
+
+    def _record_descriptor_refresh_error(self, error: BaseException) -> None:
+        self._descriptor_refresh_errors_total += 1
+        self._last_transient_error = error
+        self._last_event_ns = _current_time_ns()
+
+    def _record_snapshot_refresh_error(self, error: BaseException) -> None:
+        self._snapshot_refresh_errors_total += 1
+        self._last_transient_error = error
+        self._last_event_ns = _current_time_ns()
 
 
 def subscribe(
@@ -7057,6 +7359,126 @@ class _SessionSourceBinding:
         )
 
 
+class Lifespan:
+    """
+    Dispatch session lifecycle events to optional callbacks.
+
+    :param callback: Callback invoked for every lifecycle event.
+    :type callback: callable | None
+    :param on_connect: Callback invoked when the session becomes healthy.
+    :type on_connect: callable | None
+    :param on_disconnect: Callback invoked when the session becomes degraded/reconnecting.
+    :type on_disconnect: callable | None
+    :param on_error: Callback invoked when a new error is observed.
+    :type on_error: callable | None
+    :param on_stopped: Callback invoked when the session stops.
+    :type on_stopped: callable | None
+    """
+
+    def __init__(
+        self,
+        callback=None,
+        *,
+        on_connect=None,
+        on_disconnect=None,
+        on_error=None,
+        on_stopped=None,
+    ) -> None:
+        self.callback = callback
+        self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
+        self.on_error = on_error
+        self.on_stopped = on_stopped
+
+    def __call__(self, ctx: "SessionContext") -> None:
+        if self.callback is not None:
+            self.callback(ctx)
+        handler = {
+            "connect": self.on_connect,
+            "disconnect": self.on_disconnect,
+            "error": self.on_error,
+            "stopped": self.on_stopped,
+        }.get(ctx.event)
+        if handler is not None:
+            handler(ctx)
+
+
+class SessionContext:
+    """
+    Context object passed to Session lifespan callbacks.
+
+    Callback methods record explicit user decisions. Session does not restart or stop anything
+    unless the callback calls one of these action methods.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: "Session",
+        event: str,
+        health: dict[str, object],
+        metrics: dict[str, object],
+        engine: object | None,
+        engine_health: dict[str, object] | None,
+        error: str | None,
+        error_is_transient: bool,
+        retry_count: int,
+    ) -> None:
+        self.session = session
+        self.event = event
+        self.health = health
+        self.metrics = metrics
+        self.engine = engine
+        self.engine_health = engine_health
+        self.error = error
+        self.error_is_transient = error_is_transient
+        self.retry_count = retry_count
+        self._action: str | None = None
+        self._action_engine: object | None = None
+        self._retry_after_sec: float | None = None
+        self._exit_code: int | None = None
+
+    def stop_session(self) -> None:
+        """Request stopping the owning session after the callback returns."""
+        self._action = "stop_session"
+
+    def restart_engine(self, engine: object | None = None) -> None:
+        """
+        Request restarting an engine after the callback returns.
+
+        :param engine: Engine to restart. When omitted, the event-related engine is used.
+        :type engine: object | None
+        :raises ValueError: If no engine is available.
+        """
+        target = engine if engine is not None else self.engine
+        if target is None:
+            raise ValueError("restart_engine requires an engine")
+        self._action = "restart_engine"
+        self._action_engine = target
+
+    def retry_after(self, timeout: float | str) -> None:
+        """
+        Request delaying the next lifespan health poll.
+
+        :param timeout: Delay in seconds or duration string.
+        :type timeout: float | str
+        """
+        timeout_sec = _parse_timeout_seconds(timeout)
+        if timeout_sec is None:
+            raise ValueError("retry_after timeout must not be None")
+        self._retry_after_sec = timeout_sec
+
+    def request_exit(self, code: int = 1) -> None:
+        """
+        Record an application exit request on the session.
+
+        This does not terminate the Python process from the monitor thread. Applications can inspect
+        ``session.requested_exit_code`` and decide how to exit in their own control loop.
+        """
+        self._action = "request_exit"
+        self._exit_code = int(code)
+
+
 class Session:
     """
     Own and run a small group of Python-configured Zippy engines.
@@ -7105,6 +7527,15 @@ class Session:
         self._started = False
         self._needs_master_process = False
         self._shutdown_hook_unregister = None
+        self._lifespan_callback = None
+        self._lifespan_poll_interval_sec = 0.1
+        self._lifespan_stop_event = threading.Event()
+        self._lifespan_thread: threading.Thread | None = None
+        self._lifespan_last_state: str | None = None
+        self._lifespan_last_error: str | None = None
+        self._lifespan_retry_count = 0
+        self._lifespan_error: BaseException | None = None
+        self.requested_exit_code: int | None = None
 
     def source(self, source: str) -> _SessionSourceBinding:
         """
@@ -7287,6 +7718,65 @@ class Session:
         """
         return tuple(self._engines)
 
+    def lifespan(
+        self,
+        callback=None,
+        *,
+        on_connect=None,
+        on_disconnect=None,
+        on_error=None,
+        on_stopped=None,
+        poll_interval_ms: int = 100,
+    ) -> "Session":
+        """
+        Attach an explicit lifecycle callback policy to this session.
+
+        Without a lifespan callback, Session only exposes aggregate health and does not restart or
+        stop user-managed engines automatically.
+
+        :param callback: Callback invoked for every lifecycle event, or a ``Lifespan`` instance.
+        :type callback: callable | Lifespan | None
+        :param on_connect: Callback invoked when the session becomes healthy.
+        :type on_connect: callable | None
+        :param on_disconnect: Callback invoked when the session becomes degraded/reconnecting.
+        :type on_disconnect: callable | None
+        :param on_error: Callback invoked when a new error is observed.
+        :type on_error: callable | None
+        :param on_stopped: Callback invoked when the session stops.
+        :type on_stopped: callable | None
+        :param poll_interval_ms: Health polling interval for lifecycle events.
+        :type poll_interval_ms: int
+        :returns: This session for fluent construction.
+        :rtype: Session
+        """
+        poll_interval_ms = int(poll_interval_ms)
+        if poll_interval_ms <= 0:
+            raise ValueError("poll_interval_ms must be positive")
+        if isinstance(callback, Lifespan):
+            lifespan_callback = callback
+        elif (
+            on_connect is not None
+            or on_disconnect is not None
+            or on_error is not None
+            or on_stopped is not None
+        ):
+            lifespan_callback = Lifespan(
+                callback,
+                on_connect=on_connect,
+                on_disconnect=on_disconnect,
+                on_error=on_error,
+                on_stopped=on_stopped,
+            )
+        else:
+            lifespan_callback = callback
+        if lifespan_callback is not None and not callable(lifespan_callback):
+            raise TypeError("lifespan callback must be callable")
+        self._lifespan_callback = lifespan_callback
+        self._lifespan_poll_interval_sec = poll_interval_ms / 1000.0
+        if self._started:
+            self._start_lifespan_monitor()
+        return self
+
     def start(self) -> "Session":
         """
         Start all owned engines.
@@ -7305,6 +7795,7 @@ class Session:
         if self._shutdown_hook_unregister is None:
             self._shutdown_hook_unregister = _register_shutdown_hook(self.stop)
         _ACTIVE_SESSIONS[self.name] = self
+        self._start_lifespan_monitor()
         return self
 
     def run(self) -> "Session":
@@ -7316,8 +7807,259 @@ class Session:
         """
         return self.start()
 
+    def status(self) -> str:
+        """
+        Return aggregate lifecycle status for all runtime engines.
+
+        :returns: ``created``, ``running``, ``degraded``, ``failed``, or ``stopped``.
+        :rtype: str
+        """
+        statuses = [self._engine_status(engine) for engine in self._runtime_engines]
+        statuses = [status for status in statuses if status is not None]
+        if self._lifespan_error is not None:
+            return "failed"
+        if not statuses:
+            return "running" if self._started else "created"
+        if any(status == "failed" for status in statuses):
+            return "failed"
+        if all(status == "created" for status in statuses):
+            return "created"
+        if all(status == "stopped" for status in statuses):
+            return "stopped"
+        if all(status == "running" for status in statuses):
+            return "running"
+        if any(status == "running" for status in statuses):
+            return "degraded"
+        if self._started:
+            return "degraded"
+        return "stopped"
+
+    def metrics(self) -> dict[str, object]:
+        """
+        Return aggregate runtime metrics for this session.
+
+        :returns: Session-level status plus per-engine status and metrics.
+        :rtype: dict[str, object]
+        """
+        engine_metrics: list[dict[str, object]] = []
+        for index, engine in enumerate(self._runtime_engines):
+            status = self._engine_status(engine)
+            metrics_fn = getattr(engine, "metrics", None)
+            metrics: dict[str, object] = {}
+            metrics_error = None
+            if callable(metrics_fn):
+                try:
+                    metrics = dict(metrics_fn())
+                except BaseException as error:
+                    metrics_error = str(error)
+            item: dict[str, object] = {
+                "index": index,
+                "kind": engine.__class__.__name__,
+                "name": str(getattr(engine, "name", "")),
+                "status": status,
+                "running": status == "running",
+                "metrics": metrics,
+            }
+            if metrics_error is not None:
+                item["metrics_error"] = metrics_error
+            engine_metrics.append(item)
+        last_error = self._session_last_error(engine_metrics)
+        if last_error is None and self._lifespan_error is not None:
+            last_error = str(self._lifespan_error)
+        return {
+            "name": self.name,
+            "state": self.status(),
+            "status": self.status(),
+            "running": self.status() == "running",
+            "engine_count": len(self._runtime_engines),
+            "engines": engine_metrics,
+            "last_error": last_error,
+            "last_transient_error": self._session_last_transient_error(engine_metrics),
+            "lifespan_error": None if self._lifespan_error is None else str(self._lifespan_error),
+            "requested_exit_code": self.requested_exit_code,
+        }
+
+    def health(self) -> dict[str, object]:
+        """
+        Return normalized aggregate live health for this session.
+
+        :returns: Normalized live health fields plus per-engine status.
+        :rtype: dict[str, object]
+        """
+        metrics = self.metrics()
+        health = _live_health_from_metrics(
+            kind="session",
+            source=self.name,
+            metrics=metrics,
+        )
+        health["engines"] = metrics["engines"]
+        if metrics["status"] == "degraded":
+            health["healthy"] = False
+            health["restart_required"] = True
+            health["terminal"] = False
+        return health
+
+    def _start_lifespan_monitor(self) -> None:
+        if self._lifespan_callback is None:
+            return
+        if self._lifespan_thread is not None and self._lifespan_thread.is_alive():
+            return
+        self._lifespan_stop_event.clear()
+        self._lifespan_thread = threading.Thread(
+            target=self._run_lifespan_monitor,
+            name=f"zippy-session-lifespan-{self.name}",
+            daemon=True,
+        )
+        self._lifespan_thread.start()
+
+    def _stop_lifespan_monitor(self) -> None:
+        self._lifespan_stop_event.set()
+        if (
+            self._lifespan_thread is not None
+            and self._lifespan_thread.is_alive()
+            and threading.current_thread() is not self._lifespan_thread
+        ):
+            self._lifespan_thread.join(timeout=1.0)
+
+    def _run_lifespan_monitor(self) -> None:
+        while not self._lifespan_stop_event.is_set():
+            try:
+                ctx = self._build_lifespan_context()
+                if ctx is not None:
+                    self._lifespan_callback(ctx)
+                    self._apply_lifespan_action(ctx)
+                    wait_sec = (
+                        ctx._retry_after_sec
+                        if ctx._retry_after_sec is not None
+                        else self._lifespan_poll_interval_sec
+                    )
+                else:
+                    wait_sec = self._lifespan_poll_interval_sec
+            except BaseException as error:
+                self._lifespan_error = error
+                self._lifespan_stop_event.set()
+                break
+            self._lifespan_stop_event.wait(wait_sec)
+
+    def _build_lifespan_context(self) -> SessionContext | None:
+        metrics = self.metrics()
+        health = self.health()
+        state = str(health.get("state", "created"))
+        error = self._health_error(health)
+        event = self._lifespan_event(state=state, error=error)
+        self._lifespan_last_state = state
+        if error is not None:
+            self._lifespan_last_error = error
+        if event is None:
+            return None
+        if event == "connect":
+            self._lifespan_retry_count = 0
+        elif event in {"disconnect", "error"}:
+            self._lifespan_retry_count += 1
+        engine, engine_health = self._lifespan_related_engine(health)
+        return SessionContext(
+            session=self,
+            event=event,
+            health=health,
+            metrics=metrics,
+            engine=engine,
+            engine_health=engine_health,
+            error=error,
+            error_is_transient=self._lifespan_error_is_transient(event, health),
+            retry_count=self._lifespan_retry_count,
+        )
+
+    def _lifespan_event(self, *, state: str, error: str | None) -> str | None:
+        previous_state = self._lifespan_last_state
+        previous_error = self._lifespan_last_error
+        if state == "running" and previous_state != "running":
+            return "connect"
+        if state in {"reconnecting", "degraded"} and previous_state != state:
+            return "disconnect"
+        if state == "failed" and previous_state != "failed":
+            return "error"
+        if error is not None and error != previous_error:
+            return "error"
+        if state == "stopped" and previous_state not in {None, "created", "stopped"}:
+            return "stopped"
+        return None
+
+    @staticmethod
+    def _health_error(health: dict[str, object]) -> str | None:
+        for key in ("last_error", "last_transient_error"):
+            value = health.get(key)
+            if value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _lifespan_error_is_transient(event: str, health: dict[str, object]) -> bool:
+        if event == "disconnect":
+            return True
+        if health.get("last_transient_error") and not health.get("last_error"):
+            return True
+        return False
+
+    def _lifespan_related_engine(
+        self,
+        health: dict[str, object],
+    ) -> tuple[object | None, dict[str, object] | None]:
+        engines = health.get("engines")
+        if not isinstance(engines, list):
+            return None, None
+        for item in engines:
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            if status in {"failed", "degraded", "reconnecting", "stopped"}:
+                index = item.get("index")
+                if isinstance(index, int) and 0 <= index < len(self._runtime_engines):
+                    return self._runtime_engines[index], item
+        return None, None
+
+    def _apply_lifespan_action(self, ctx: SessionContext) -> None:
+        if ctx._action == "stop_session":
+            self.stop()
+            self._emit_lifespan_stopped_event()
+        elif ctx._action == "restart_engine":
+            self._restart_lifespan_engine(ctx._action_engine)
+        elif ctx._action == "request_exit":
+            self.requested_exit_code = ctx._exit_code
+            self._lifespan_stop_event.set()
+
+    def _emit_lifespan_stopped_event(self) -> None:
+        if self._lifespan_callback is None:
+            return
+        metrics = self.metrics()
+        health = self.health()
+        ctx = SessionContext(
+            session=self,
+            event="stopped",
+            health=health,
+            metrics=metrics,
+            engine=None,
+            engine_health=None,
+            error=None,
+            error_is_transient=False,
+            retry_count=self._lifespan_retry_count,
+        )
+        self._lifespan_callback(ctx)
+
+    @staticmethod
+    def _restart_lifespan_engine(engine: object | None) -> None:
+        if engine is None:
+            raise ValueError("restart_engine requires an engine")
+        stop = getattr(engine, "stop", None)
+        if callable(stop):
+            stop()
+        start = getattr(engine, "start", None)
+        if not callable(start):
+            raise TypeError("engine must provide start()")
+        start()
+
     def stop(self) -> None:
         """Stop all running engines in reverse order."""
+        self._stop_lifespan_monitor()
         first_error: BaseException | None = None
         for engine in reversed(self._runtime_engines):
             if self._engine_status(engine) in {"created", "stopped"}:
@@ -7844,6 +8586,27 @@ class Session:
         if not callable(status):
             return None
         return status()
+
+    @staticmethod
+    def _session_last_error(engine_metrics: list[dict[str, object]]) -> str | None:
+        for item in engine_metrics:
+            if item.get("status") == "failed":
+                metrics = item.get("metrics")
+                if isinstance(metrics, dict) and metrics.get("last_error"):
+                    return str(metrics["last_error"])
+                name = item.get("name") or item.get("kind") or item.get("index")
+                return f"engine failed name=[{name}]"
+            if item.get("metrics_error"):
+                return str(item["metrics_error"])
+        return None
+
+    @staticmethod
+    def _session_last_transient_error(engine_metrics: list[dict[str, object]]) -> str | None:
+        for item in engine_metrics:
+            metrics = item.get("metrics")
+            if isinstance(metrics, dict) and metrics.get("last_transient_error"):
+                return str(metrics["last_transient_error"])
+        return None
 
 
 class Pipeline:
@@ -8754,6 +9517,7 @@ __all__ = [
     "ExpressionFactor",
     "GatewayServer",
     "LateDataPolicy",
+    "Lifespan",
     "LogSpec",
     "MasterClient",
     "MasterServer",
@@ -8772,6 +9536,7 @@ __all__ = [
     "RemoteStreamSubscriber",
     "Row",
     "Session",
+    "SessionContext",
     "SourceMode",
     "StreamSubscriber",
     "Table",
@@ -8817,12 +9582,16 @@ __all__ = [
     "connect",
     "get_writer",
     "lit",
+    "live_health",
     "log_info",
     "master",
+    "needs_rebuild",
     "ops",
     "read_table",
     "replay",
+    "raise_if_failed",
     "subscribe",
     "subscribe_table",
+    "wait_healthy",
     "version",
 ]

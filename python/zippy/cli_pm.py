@@ -272,7 +272,11 @@ def _task_action(action: str, name: str | None) -> None:
 
 
 def _print_task_table(tasks: list[PmTaskInfo]) -> None:
-    click.echo(f"{'name':<24} {'status':<14} {'pid':<10} command")
-    for task in tasks:
-        pid = "" if task.pid is None else str(task.pid)
-        click.echo(f"{task.name:<24} {task.status:<14} {pid:<10} {task.cmd}")
+    try:
+        from rspm.render import format_task_table
+    except ImportError as error:
+        raise RuntimeError(
+            "rspm Python package is required for zippy pm table rendering"
+        ) from error
+
+    click.echo(format_task_table(tasks), nl=False)

@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "zippy"
 version = "0.5.0"
 requires-python = ">=3.11"
-dependencies = ["click>=8.1.0", "polars>=1.25.0", "pyarrow>=18.0.0"]
+dependencies = ["click>=8.1.0", "polars>=1.25.0", "pyarrow>=18.0.0", "rspm>=0.1.0"]
 
 [project.scripts]
 zippy = "zippy.cli:main"
@@ -25,6 +25,9 @@ module-name = "zippy._internal"
 python-source = "python"
 manifest-path = "crates/zippy-python/Cargo.toml"
 features = ["extension-module"]
+
+[tool.uv.sources]
+rspm = { path = "../rspm/python", editable = true }
 
 [tool.black]
 line-length = 100

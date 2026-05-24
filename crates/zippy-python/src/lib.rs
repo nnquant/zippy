@@ -3052,7 +3052,6 @@ impl DescriptorUpdateSlot {
         None
     }
 
-    #[cfg(test)]
     fn pending_update_count(&self) -> usize {
         self.updates.lock().unwrap().len()
     }
@@ -3063,8 +3062,15 @@ struct SubscriberMetrics {
     rows_delivered_total: AtomicU64,
     batches_delivered_total: AtomicU64,
     descriptor_updates_total: AtomicU64,
+    descriptor_rebinds_total: AtomicU64,
     current_descriptor_generation: AtomicU64,
+    current_segment_id: AtomicU64,
+    current_segment_generation: AtomicU64,
+    master_descriptor_generation: AtomicU64,
+    pending_descriptor_updates: AtomicU64,
     last_descriptor_update_ns: AtomicU64,
+    last_descriptor_refresh_ns: AtomicU64,
+    descriptor_refresh_errors_total: AtomicU64,
     mmap_spin_checks_total: AtomicU64,
     mmap_futex_waits_total: AtomicU64,
     mmap_futex_notifications_total: AtomicU64,
@@ -3081,12 +3087,54 @@ impl SubscriberMetrics {
         *self.last_error.lock().unwrap() = Some(error);
     }
 
-    fn record_descriptor_update(&self, descriptor_generation: u64) {
+    fn record_initial_descriptor(
+        &self,
+        descriptor_generation: u64,
+        descriptor: &serde_json::Value,
+    ) {
+        self.record_descriptor_state(descriptor_generation, descriptor);
+        self.master_descriptor_generation
+            .store(descriptor_generation, Ordering::SeqCst);
+    }
+
+    fn record_descriptor_rebind(&self, descriptor_generation: u64, descriptor: &serde_json::Value) {
         self.descriptor_updates_total.fetch_add(1, Ordering::SeqCst);
-        self.current_descriptor_generation
+        self.descriptor_rebinds_total.fetch_add(1, Ordering::SeqCst);
+        self.record_descriptor_state(descriptor_generation, descriptor);
+        self.master_descriptor_generation
             .store(descriptor_generation, Ordering::SeqCst);
         self.last_descriptor_update_ns
             .store(current_localtime_ns() as u64, Ordering::SeqCst);
+    }
+
+    fn record_descriptor_state(&self, descriptor_generation: u64, descriptor: &serde_json::Value) {
+        self.current_descriptor_generation
+            .store(descriptor_generation, Ordering::SeqCst);
+        if let Ok((segment_id, segment_generation)) = descriptor_segment_identity(descriptor) {
+            self.current_segment_id.store(segment_id, Ordering::SeqCst);
+            self.current_segment_generation
+                .store(segment_generation, Ordering::SeqCst);
+        }
+    }
+
+    fn record_master_descriptor_generation(&self, descriptor_generation: u64) {
+        self.master_descriptor_generation
+            .store(descriptor_generation, Ordering::SeqCst);
+    }
+
+    fn record_pending_descriptor_updates(&self, pending_count: usize) {
+        self.pending_descriptor_updates
+            .store(pending_count as u64, Ordering::SeqCst);
+    }
+
+    fn record_descriptor_refresh(&self) {
+        self.last_descriptor_refresh_ns
+            .store(current_localtime_ns() as u64, Ordering::SeqCst);
+    }
+
+    fn record_descriptor_refresh_error(&self) {
+        self.descriptor_refresh_errors_total
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn record_rows_delivered(&self, row_count: usize) {
@@ -3254,8 +3302,12 @@ impl SegmentReaderDriver {
 
     fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
         if let Some(error) = take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref()) {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.record_descriptor_refresh_error();
+            }
             return Err(error);
         }
+        self.record_pending_descriptor_updates();
 
         let observed_notification_seq = self
             .reader_handle
@@ -3282,6 +3334,11 @@ impl SegmentReaderDriver {
                         descriptor_generation,
                     ));
                 }
+                if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
+                    return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                        descriptor_generation,
+                    ));
+                }
 
                 let sealed = self
                     .reader_handle
@@ -3289,11 +3346,6 @@ impl SegmentReaderDriver {
                     .is_sealed()
                     .map_err(|error| error.to_string())?;
                 if sealed {
-                    if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
-                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
-                            descriptor_generation,
-                        ));
-                    }
                     let update = if self.xfast {
                         spin_loop();
                         None
@@ -3304,6 +3356,9 @@ impl SegmentReaderDriver {
                     if let Some(error) =
                         take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref())
                     {
+                        if let Some(metrics) = self.metrics.as_ref() {
+                            metrics.record_descriptor_refresh_error();
+                        }
                         return Err(error);
                     }
                     if let Some(update) = update {
@@ -3334,7 +3389,30 @@ impl SegmentReaderDriver {
                 if self.xfast {
                     spin_loop();
                 } else {
-                    self.wait_for_mmap_notification_after(observed_notification_seq)?;
+                    if let Some(update) = self
+                        .descriptor_updates
+                        .wait_for_update_after(&self.descriptor_text, self.idle_wait)
+                    {
+                        if let Some(descriptor_generation) =
+                            self.apply_descriptor_update_or_retry(update)?
+                        {
+                            return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                                descriptor_generation,
+                            ));
+                        }
+                    }
+                    if let Some(error) =
+                        take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref())
+                    {
+                        if let Some(metrics) = self.metrics.as_ref() {
+                            metrics.record_descriptor_refresh_error();
+                        }
+                        return Err(error);
+                    }
+                    self.wait_for_mmap_notification_after(
+                        observed_notification_seq,
+                        Duration::ZERO,
+                    )?;
                 }
                 Ok(SegmentReaderDriverEvent::Idle)
             }
@@ -3346,10 +3424,25 @@ impl SegmentReaderDriver {
             return Ok(None);
         }
         self.next_descriptor_refresh_at = Instant::now() + self.descriptor_refresh_interval();
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_descriptor_refresh();
+        }
 
-        let Some(update) = self.latest_descriptor_update()? else {
+        let update = match self.latest_descriptor_update() {
+            Ok(update) => update,
+            Err(error) => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.record_descriptor_refresh_error();
+                }
+                return Err(error);
+            }
+        };
+        let Some(update) = update else {
             return Ok(None);
         };
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_master_descriptor_generation(update.descriptor_generation);
+        }
         if update.text == self.descriptor_text {
             return Ok(None);
         }
@@ -3447,15 +3540,28 @@ impl SegmentReaderDriver {
         &mut self,
         update: DescriptorUpdate,
     ) -> std::result::Result<DescriptorApplyOutcome, String> {
-        apply_segment_descriptor_update(
+        let descriptor_generation = update.descriptor_generation;
+        let descriptor = update.descriptor.clone();
+        let outcome = apply_segment_descriptor_update(
             &mut self.reader_handle,
             &mut self.descriptor_text,
             update,
             &self.segment_schema,
-        )
+        )?;
+        if matches!(outcome, DescriptorApplyOutcome::Applied(_)) {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.record_descriptor_rebind(descriptor_generation, &descriptor);
+            }
+        }
+        self.record_pending_descriptor_updates();
+        Ok(outcome)
     }
 
-    fn wait_for_mmap_notification_after(&self, observed: u32) -> std::result::Result<bool, String> {
+    fn wait_for_mmap_notification_after(
+        &self,
+        observed: u32,
+        timeout: Duration,
+    ) -> std::result::Result<bool, String> {
         for _ in 0..self.idle_spin_checks {
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics.record_mmap_spin_check();
@@ -3475,7 +3581,7 @@ impl SegmentReaderDriver {
         let notified = self
             .reader_handle
             .reader
-            .wait_for_notification_after(observed, self.idle_wait)
+            .wait_for_notification_after(observed, timeout)
             .map_err(|error| error.to_string())?;
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.record_mmap_futex_wait(notified);
@@ -3485,9 +3591,19 @@ impl SegmentReaderDriver {
 
     fn finish(&self) -> std::result::Result<(), String> {
         if let Some(error) = take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref()) {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.record_descriptor_refresh_error();
+            }
             return Err(error);
         }
         Ok(())
+    }
+
+    fn record_pending_descriptor_updates(&self) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics
+                .record_pending_descriptor_updates(self.descriptor_updates.pending_update_count());
+        }
     }
 }
 
@@ -3496,6 +3612,7 @@ fn spawn_segment_descriptor_watcher(
     master: SharedMasterClient,
     stream_name: String,
     mut descriptor_generation: u64,
+    segment_schema: CompiledSchema,
     descriptor_updates: Arc<DescriptorUpdateSlot>,
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
@@ -3520,7 +3637,20 @@ fn spawn_segment_descriptor_watcher(
             descriptor_generation = update.descriptor_generation;
             match descriptor_update_from_value(update.descriptor_generation, update.descriptor) {
                 Ok(update) => {
-                    descriptor_updates.set(update);
+                    match validate_descriptor_update_for_watcher(&update, &segment_schema) {
+                        Ok(()) => {
+                            descriptor_updates.set(update);
+                        }
+                        Err(error) if is_transient_missing_segment_reader_error(&error) => {
+                            descriptor_updates.set(update);
+                        }
+                        Err(error) => {
+                            *descriptor_refresh_error.lock().unwrap() = Some(error.to_string());
+                            descriptor_updates.notify();
+                            running.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    }
                 }
                 Err(error) => {
                     *descriptor_refresh_error.lock().unwrap() = Some(error);
@@ -3531,6 +3661,13 @@ fn spawn_segment_descriptor_watcher(
             }
         }
     })
+}
+
+fn validate_descriptor_update_for_watcher(
+    update: &DescriptorUpdate,
+    segment_schema: &CompiledSchema,
+) -> zippy_core::Result<()> {
+    active_segment_reader_from_descriptor(&update.descriptor, segment_schema).map(|_| ())
 }
 
 #[pyclass]
@@ -3676,9 +3813,19 @@ impl StreamSubscriber {
                 else {
                     return Ok(());
                 };
-                metrics
-                    .current_descriptor_generation
-                    .store(descriptor_generation, Ordering::SeqCst);
+                match serde_json::from_str::<serde_json::Value>(&descriptor_text) {
+                    Ok(descriptor) => {
+                        metrics.record_initial_descriptor(descriptor_generation, &descriptor);
+                    }
+                    Err(_) => {
+                        metrics
+                            .current_descriptor_generation
+                            .store(descriptor_generation, Ordering::SeqCst);
+                        metrics
+                            .master_descriptor_generation
+                            .store(descriptor_generation, Ordering::SeqCst);
+                    }
+                }
 
                 let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
                 let descriptor_refresh_error = Arc::new(Mutex::new(None));
@@ -3687,6 +3834,7 @@ impl StreamSubscriber {
                     Arc::clone(&master),
                     source.clone(),
                     descriptor_generation,
+                    segment_schema.clone(),
                     Arc::clone(&descriptor_updates),
                     Arc::clone(&descriptor_refresh_error),
                 );
@@ -3725,7 +3873,7 @@ impl StreamSubscriber {
                                 }
                             }
                             SegmentReaderDriverEvent::DescriptorUpdated(descriptor_generation) => {
-                                metrics.record_descriptor_update(descriptor_generation);
+                                metrics.record_master_descriptor_generation(descriptor_generation);
                             }
                             SegmentReaderDriverEvent::Idle => {}
                         }
@@ -3787,15 +3935,53 @@ impl StreamSubscriber {
             self.metrics.descriptor_updates_total.load(Ordering::SeqCst),
         )?;
         dict.set_item(
+            "descriptor_rebinds_total",
+            self.metrics.descriptor_rebinds_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
             "current_descriptor_generation",
             self.metrics
                 .current_descriptor_generation
                 .load(Ordering::SeqCst),
         )?;
         dict.set_item(
+            "current_segment_id",
+            self.metrics.current_segment_id.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "current_segment_generation",
+            self.metrics
+                .current_segment_generation
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "master_descriptor_generation",
+            self.metrics
+                .master_descriptor_generation
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "pending_descriptor_updates",
+            self.metrics
+                .pending_descriptor_updates
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
             "last_descriptor_update_ns",
             self.metrics
                 .last_descriptor_update_ns
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "last_descriptor_refresh_ns",
+            self.metrics
+                .last_descriptor_refresh_ns
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "descriptor_refresh_errors_total",
+            self.metrics
+                .descriptor_refresh_errors_total
                 .load(Ordering::SeqCst),
         )?;
         dict.set_item(
@@ -3859,9 +4045,41 @@ fn wait_for_initial_segment_reader_handle(
     let start_from_after_recovery = if start_from == -1 { 0 } else { start_from };
     while running.load(Ordering::SeqCst) {
         let client = master.lock().unwrap().clone();
-        let stream = client
-            .get_stream(source)
-            .map_err(|error| error.to_string())?;
+        let stream = match client.get_stream(source) {
+            Ok(stream) => stream,
+            Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
+                thread::sleep(wait_interval);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if stream.status == "stale" {
+            match client.wait_segment_descriptor(
+                source,
+                stream.descriptor_generation,
+                wait_interval,
+            ) {
+                Ok(Some(update)) => {
+                    if let Some(handle) = open_initial_segment_reader_handle(
+                        Arc::clone(&master),
+                        source,
+                        segment_schema,
+                        start_from_after_recovery,
+                        update.descriptor_generation,
+                        update.descriptor,
+                    )? {
+                        return Ok(Some(handle));
+                    }
+                    thread::sleep(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN);
+                }
+                Ok(None) => {}
+                Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
+                    thread::sleep(wait_interval);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            continue;
+        }
         if let Some(descriptor) = stream.active_segment_descriptor.clone() {
             match open_initial_segment_reader_handle(
                 Arc::clone(&master),
@@ -3894,10 +4112,23 @@ fn wait_for_initial_segment_reader_handle(
                 thread::sleep(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN);
             }
             Ok(None) => {}
+            Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
+                thread::sleep(wait_interval);
+            }
             Err(error) => return Err(error.to_string()),
         }
     }
     Ok(None)
+}
+
+fn is_transient_segment_source_start_error(message: &str) -> bool {
+    message.contains("stream not found")
+        || message.contains("stream not registered")
+        || message.contains("stream is stale")
+        || message.contains("segment descriptor is not published")
+        || message.contains("shared memory error: No such file or directory")
+        || message.contains("os error 2")
+        || message.contains("segment reader lease target not found")
 }
 
 fn open_initial_segment_reader_handle(
@@ -4326,25 +4557,6 @@ impl Source for SegmentSourceBridge {
     }
 
     fn start(self: Box<Self>, sink: Arc<dyn SourceSink>) -> zippy_core::Result<SourceHandle> {
-        let stream = self.master.lock().unwrap().get_stream(&self.stream_name)?;
-        let descriptor = self
-            .master
-            .lock()
-            .unwrap()
-            .get_segment_descriptor(&self.stream_name)?
-            .ok_or(ZippyError::InvalidState {
-                status: "segment descriptor is not published",
-            })?;
-        let descriptor_text = serde_json::to_string(&descriptor).map_err(json_zippy_error)?;
-        let mut reader_handle = open_active_segment_reader_handle(
-            &descriptor,
-            &self.segment_schema,
-            Some(SegmentReaderLeaseContext {
-                master: Arc::clone(&self.master),
-                source: self.stream_name.clone(),
-            }),
-        )?;
-        seek_active_segment_reader_start_from(&mut reader_handle.reader, self.start_from)?;
         let hello = StreamHello::new(&self.stream_name, Arc::clone(&self.expected_schema), 1)?;
         sink.emit(SourceEvent::Hello(hello))?;
 
@@ -4354,14 +4566,32 @@ impl Source for SegmentSourceBridge {
         let stream_name = self.stream_name.clone();
         let segment_schema = self.segment_schema.clone();
         let xfast = self.xfast;
+        let start_from = self.start_from;
         let join_handle = thread::spawn(move || {
+            let initial_reader_handle = match wait_for_initial_segment_reader_handle(
+                Arc::clone(&master),
+                &stream_name,
+                &segment_schema,
+                start_from,
+                Arc::clone(&running_flag),
+                SEGMENT_DESCRIPTOR_RETRY_COOLDOWN,
+            ) {
+                Ok(initial_reader_handle) => initial_reader_handle,
+                Err(error) => return Err(string_zippy_error(error)),
+            };
+            let Some((reader_handle, descriptor_text, descriptor_generation)) =
+                initial_reader_handle
+            else {
+                return Ok(());
+            };
             let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
             let descriptor_refresh_error = Arc::new(Mutex::new(None));
             let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
                 Arc::clone(&running_flag),
                 Arc::clone(&master),
                 stream_name.clone(),
-                stream.descriptor_generation,
+                descriptor_generation,
+                segment_schema.clone(),
                 Arc::clone(&descriptor_updates),
                 Arc::clone(&descriptor_refresh_error),
             );
@@ -4770,7 +5000,22 @@ impl ReactiveStateEngine {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "reactive",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -4962,7 +5207,22 @@ impl ReactiveLatestEngine {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "reactive_latest",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -5188,7 +5448,22 @@ impl StreamTableMaterializer {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "stream_table",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -5429,7 +5704,22 @@ impl KeyValueTableMaterializer {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "key_value_table",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -5653,7 +5943,22 @@ impl TimeSeriesEngine {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "timeseries",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -5814,7 +6119,22 @@ impl BarGeneratorEngine {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "bar_generator",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -5998,7 +6318,22 @@ impl CrossSectionalEngine {
 
     fn metrics(&self, py: Python<'_>) -> PyResult<PyObject> {
         sync_runtime_state(&self.handle, &self.status, &self.metrics);
-        metrics_snapshot_to_pydict(py, *self.metrics.lock().unwrap())
+        engine_metrics_to_pydict(
+            py,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
+    }
+
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        sync_runtime_state(&self.handle, &self.status, &self.metrics);
+        engine_health_to_pydict(
+            py,
+            "cross_sectional",
+            &self.name,
+            *self.status.lock().unwrap(),
+            *self.metrics.lock().unwrap(),
+        )
     }
 
     fn config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -7534,11 +7869,13 @@ fn overflow_policy_as_str(value: OverflowPolicy) -> &'static str {
     }
 }
 
-fn metrics_snapshot_to_pydict(
+fn engine_metrics_to_pydict(
     py: Python<'_>,
+    status: EngineStatus,
     snapshot: EngineMetricsSnapshot,
 ) -> PyResult<PyObject> {
     let dict = PyDict::new_bound(py);
+    set_engine_health_metric_fields(py, &dict, status)?;
     dict.set_item("processed_batches_total", snapshot.processed_batches_total)?;
     dict.set_item("processed_rows_total", snapshot.processed_rows_total)?;
     dict.set_item("output_batches_total", snapshot.output_batches_total)?;
@@ -7548,6 +7885,53 @@ fn metrics_snapshot_to_pydict(
     dict.set_item("publish_errors_total", snapshot.publish_errors_total)?;
     dict.set_item("queue_depth", snapshot.queue_depth)?;
     Ok(dict.into_any().unbind())
+}
+
+fn engine_health_to_pydict(
+    py: Python<'_>,
+    kind: &str,
+    name: &str,
+    status: EngineStatus,
+    snapshot: EngineMetricsSnapshot,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    set_engine_health_metric_fields(py, &dict, status)?;
+    dict.set_item("kind", kind)?;
+    dict.set_item("source", name)?;
+    dict.set_item("healthy", status == EngineStatus::Running)?;
+    dict.set_item(
+        "terminal",
+        matches!(status, EngineStatus::Failed | EngineStatus::Stopped),
+    )?;
+    dict.set_item("restart_required", status == EngineStatus::Failed)?;
+    dict.set_item("processed_batches_total", snapshot.processed_batches_total)?;
+    dict.set_item("processed_rows_total", snapshot.processed_rows_total)?;
+    dict.set_item("output_batches_total", snapshot.output_batches_total)?;
+    dict.set_item("dropped_batches_total", snapshot.dropped_batches_total)?;
+    dict.set_item("late_rows_total", snapshot.late_rows_total)?;
+    dict.set_item("filtered_rows_total", snapshot.filtered_rows_total)?;
+    dict.set_item("publish_errors_total", snapshot.publish_errors_total)?;
+    dict.set_item("queue_depth", snapshot.queue_depth)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn set_engine_health_metric_fields(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    status: EngineStatus,
+) -> PyResult<()> {
+    let state = status.as_str();
+    dict.set_item("state", state)?;
+    dict.set_item("status", state)?;
+    dict.set_item("running", status == EngineStatus::Running)?;
+    dict.set_item("last_error", py.None())?;
+    dict.set_item("last_transient_error", py.None())?;
+    dict.set_item("last_event_ns", py.None())?;
+    dict.set_item("last_success_ns", py.None())?;
+    dict.set_item("descriptor_generation", py.None())?;
+    dict.set_item("reconnect_count", 0_u64)?;
+    dict.set_item("retry_errors_total", 0_u64)?;
+    Ok(())
 }
 
 fn engine_base_config_dict<'py>(
@@ -8876,6 +9260,171 @@ mod tests {
             SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
             other => panic!("expected rows from refetched descriptor got [{other:?}]"),
         }
+
+        drop(driver);
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn segment_reader_driver_refreshes_master_descriptor_without_sealed_reader_or_watcher_update() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "unsealed-refresh-current",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        let next_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "unsealed-refresh-next",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "TL2606")?;
+                row.write_f64("last_price", 113.05)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("unsealed_refresh_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "unsealed_refresh_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&current_partition),
+            )
+            .unwrap();
+        let current_descriptor = writer_master
+            .get_segment_descriptor("ticks")
+            .unwrap()
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        reader_master
+            .register_process("unsealed_refresh_reader")
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let reader_lease = SegmentReaderLeaseGuard::acquire(
+            Arc::clone(&reader_master),
+            "ticks",
+            &current_descriptor,
+        )
+        .unwrap();
+
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&next_partition),
+            )
+            .unwrap();
+        let next_stream = writer_master.get_stream("ticks").unwrap();
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(SubscriberMetrics::default());
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: Some(reader_lease),
+            },
+            serde_json::to_string(&current_descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            Some(Arc::clone(&metrics)),
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => {
+                assert_eq!(generation, next_stream.descriptor_generation);
+            }
+            other => panic!(
+                "expected master descriptor refresh to rebind unsealed idle reader got [{other:?}]"
+            ),
+        }
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => {
+                assert_eq!(span.row_count(), 1);
+                assert_eq!(
+                    span.utf8_cell_value_at(0, span.column_index("instrument_id").unwrap())
+                        .unwrap(),
+                    Some("TL2606")
+                );
+            }
+            other => panic!("expected rows from refreshed descriptor got [{other:?}]"),
+        }
+
+        let stream = writer_master.get_stream("ticks").unwrap();
+        let active_descriptor = stream.active_segment_descriptor.as_ref().unwrap();
+        let active_identity = descriptor_segment_identity(active_descriptor).unwrap();
+        let lease_identities = stream
+            .segment_reader_leases
+            .iter()
+            .map(|lease| {
+                let segment_id = lease
+                    .get("source_segment_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap();
+                let generation = lease
+                    .get("source_generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap();
+                (segment_id, generation)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lease_identities, vec![active_identity]);
+        assert_eq!(metrics.descriptor_rebinds_total.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            metrics.master_descriptor_generation.load(Ordering::SeqCst),
+            next_stream.descriptor_generation
+        );
+        assert_eq!(
+            metrics.current_segment_id.load(Ordering::SeqCst),
+            active_identity.0
+        );
+        assert_eq!(
+            metrics.current_segment_generation.load(Ordering::SeqCst),
+            active_identity.1
+        );
+        assert!(metrics.last_descriptor_refresh_ns.load(Ordering::SeqCst) > 0);
 
         drop(driver);
         server.shutdown();

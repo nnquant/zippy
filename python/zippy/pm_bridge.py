@@ -23,6 +23,8 @@ DEFAULT_PM_ROOT = Path(".zippy") / "rspm"
 DEFAULT_PM_HOST = "127.0.0.1"
 DEFAULT_PM_PORT = 27691
 DEFAULT_MASTER_URI = "tcp://127.0.0.1:17690"
+DEFAULT_PM_CONNECT_TIMEOUT = 5.0
+DEFAULT_PM_RPC_TIMEOUT = 120.0
 _BARE_TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -166,7 +168,8 @@ class PmRpcClient:
     host: str = DEFAULT_PM_HOST
     port: int = DEFAULT_PM_PORT
     token: str | None = None
-    timeout: float = 5.0
+    timeout: float = DEFAULT_PM_RPC_TIMEOUT
+    connect_timeout: float = DEFAULT_PM_CONNECT_TIMEOUT
     _next_id: int = 1
 
     def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
@@ -193,7 +196,9 @@ class PmRpcClient:
         }
         self._next_id += 1
 
-        with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+        with socket.create_connection((self.host, self.port), timeout=self.connect_timeout) as sock:
+            if hasattr(sock, "settimeout"):
+                sock.settimeout(self.timeout)
             sock.sendall(json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n")
             response = _read_json_line(sock)
 
@@ -402,7 +407,9 @@ class PmSupervisor:
     def _is_ready(self) -> bool:
         try:
             self.client().list_tasks()
-        except (ConnectionError, OSError, TimeoutError):
+        except TimeoutError:
+            raise
+        except (ConnectionError, OSError):
             return False
         return True
 
@@ -517,21 +524,21 @@ class PmCommandRunner:
         client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
         if name is None or name == "all":
             return client.start_all()
-        return [client.start(name)]
+        return [client.start(_resolve_task_target(client, name))]
 
     def stop(self, name: str | None = None) -> list[PmTaskInfo]:
         """Stop one task or all tasks."""
         client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
         if name is None or name == "all":
             return client.stop_all()
-        return [client.stop(name)]
+        return [client.stop(_resolve_task_target(client, name))]
 
     def restart(self, name: str | None = None) -> list[PmTaskInfo]:
         """Restart one task or all tasks."""
         client = self.supervisor.ensure_daemon(Path(DEFAULT_PM_CONFIG_FILE))
         if name is None or name == "all":
             return client.restart_all()
-        return [client.restart(name)]
+        return [client.restart(_resolve_task_target(client, name))]
 
     def logs(self, name: str | None = None, *, lines: int | None = None) -> str:
         """Read task logs through the default daemon."""
@@ -540,7 +547,7 @@ class PmCommandRunner:
             tasks = client.list_tasks()
             text = "\n".join(f"==> {task.name} <==\n{client.logs(task.name)}" for task in tasks)
         else:
-            text = client.logs(name)
+            text = client.logs(_resolve_task_target(client, name))
         if lines is None:
             return text
         return "\n".join(text.splitlines()[-lines:])
@@ -572,6 +579,16 @@ def _task_info_list(payload: Any) -> list[PmTaskInfo]:
     if not isinstance(payload, list):
         raise TypeError("task list result must be a list")
     return [_task_info(item) for item in payload]
+
+
+def _resolve_task_target(client: PmRpcClient, target: str) -> str:
+    if not target.isdecimal():
+        return target
+    task_id = int(target)
+    for task in client.list_tasks():
+        if task.task_id == task_id:
+            return task.name
+    raise ValueError(f"task_id [{task_id}] not found")
 
 
 def _config_summary(path: str | Path) -> tuple[str, int]:
