@@ -254,18 +254,20 @@ fn runtime_log_case_dispatch() {
     let log_path = env::var(RUNTIME_LOG_PATH_ENV).unwrap();
     let log_path = std::path::PathBuf::from(log_path);
     let file_path = log_path.clone();
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .json()
-            .with_ansi(false)
-            .with_writer(move || {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&file_path)
-                    .unwrap()
-            }),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(move || {
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&file_path)
+                        .unwrap()
+                }),
+        );
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     match case.as_str() {
@@ -276,11 +278,11 @@ fn runtime_log_case_dispatch() {
 }
 
 #[test]
-fn runtime_emits_start_flush_and_stop_events() {
+fn runtime_info_logs_lifecycle_without_flush_events() {
     let records = run_runtime_log_case("start_flush_stop");
     assert!(has_event(&records, "start"));
-    assert!(has_event(&records, "flush"));
     assert!(has_event(&records, "stop"));
+    assert!(!has_event(&records, "flush"));
 }
 
 #[test]

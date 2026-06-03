@@ -2545,7 +2545,7 @@ impl MasterServer {
                     .segment_descriptor_for_process(&request.stream_name, &request.process_id)
                 {
                     Ok(descriptor) => {
-                        tracing::info!(
+                        tracing::debug!(
                             component = "master_server",
                             event = "get_segment_descriptor",
                             status = "success",
@@ -2584,7 +2584,7 @@ impl MasterServer {
                     .into_iter()
                     .map(stream_info_with_active_preflight)
                     .collect();
-                tracing::info!(
+                tracing::debug!(
                     component = "master_server",
                     event = "list_streams",
                     status = "success",
@@ -2601,7 +2601,7 @@ impl MasterServer {
                 .cloned()
             {
                 Some(stream) => {
-                    tracing::info!(
+                    tracing::debug!(
                         component = "master_server",
                         event = "get_stream",
                         status = "success",
@@ -2747,7 +2747,7 @@ impl MasterServer {
                 })
             }
             ControlRequest::GetConfig(_) => {
-                tracing::info!(
+                tracing::debug!(
                     component = "master_server",
                     event = "get_config",
                     status = "success",

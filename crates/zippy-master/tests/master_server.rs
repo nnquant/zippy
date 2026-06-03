@@ -3326,6 +3326,24 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
     );
     assert!(get_response.contains("StreamFetched"));
 
+    let descriptor_response = send_control_request(
+        &socket_path,
+        ControlRequest::GetSegmentDescriptor(
+            zippy_core::bus_protocol::GetSegmentDescriptorRequest {
+                stream_name: "openctp_ticks".to_string(),
+                process_id: writer_process_id.clone(),
+                process_token: Some(writer_process_token.clone()),
+            },
+        ),
+    );
+    assert!(matches!(
+        descriptor_response,
+        ControlResponse::SegmentDescriptorFetched { .. }
+    ));
+
+    let config_response = send_request(&socket_path, "{\"GetConfig\":{}}\n");
+    assert!(config_response.contains("ConfigFetched"));
+
     server.shutdown();
     join_handle.join().unwrap();
 
@@ -3363,27 +3381,10 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
         &[("buffer_size", 1024), ("frame_size", 256)],
         &[("existing", true)],
     );
-    assert_record_has_fields(
-        &records,
-        "list_streams",
-        "success",
-        "INFO",
-        &[("component", "master_server")],
-        &[("stream_count", 1)],
-        &[],
-    );
-    assert_record_has_fields(
-        &records,
-        "get_stream",
-        "success",
-        "INFO",
-        &[
-            ("component", "master_server"),
-            ("stream_name", "openctp_ticks"),
-        ],
-        &[],
-        &[],
-    );
+    assert_no_record(&records, "list_streams", "success", "INFO");
+    assert_no_record(&records, "get_stream", "success", "INFO");
+    assert_no_record(&records, "get_segment_descriptor", "success", "INFO");
+    assert_no_record(&records, "get_config", "success", "INFO");
 }
 
 fn master_server_empty_control_probe_logging_case(temp_dir: &Path) {
@@ -3492,5 +3493,17 @@ fn assert_record_has_fields(
         record["message"].as_str().is_some(),
         "missing message field event=[{}]",
         event
+    );
+}
+
+fn assert_no_record(records: &[Value], event: &str, status: &str, level: &str) {
+    assert!(
+        !records.iter().any(|record| {
+            record["event"] == event && record["status"] == status && record["level"] == level
+        }),
+        "unexpected log record event=[{}] status=[{}] level=[{}]",
+        event,
+        status,
+        level
     );
 }

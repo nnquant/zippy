@@ -393,7 +393,7 @@ where
                                 let _ = reply_tx.send(Err(err.clone()));
                                 return Err(err);
                             }
-                            info!(
+                            debug!(
                                 component = "runtime",
                                 engine = worker_engine_name.as_str(),
                                 event = "flush",
@@ -1008,7 +1008,7 @@ where
                         .inspect_err(|_| {
                             *status.lock().unwrap() = EngineStatus::Failed;
                         })?;
-                    info!(
+                    debug!(
                         component = "runtime",
                         engine = worker_engine_name,
                         source = worker_source_name,
