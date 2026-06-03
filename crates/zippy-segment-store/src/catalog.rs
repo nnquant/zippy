@@ -501,6 +501,15 @@ pub struct PartitionColumnWriter<'a> {
     row_count: usize,
 }
 
+/// 已提交行的原地更新器。
+///
+/// 该类型只在 `PartitionWriterHandle::update_rows_at` 的闭包内有效，所有写入在同一个
+/// payload mutation 中发布。
+pub struct PartitionRowUpdater<'a> {
+    writer: &'a mut ActiveSegmentWriter,
+    row: usize,
+}
+
 impl PartitionRowWriter<'_> {
     /// 写入 i64 列值。
     pub fn write_i64(&mut self, column: &str, value: i64) -> Result<(), ZippySegmentStoreError> {
@@ -520,6 +529,29 @@ impl PartitionRowWriter<'_> {
     pub fn write_utf8(&mut self, column: &str, value: &str) -> Result<(), ZippySegmentStoreError> {
         self.writer
             .write_utf8(column, value)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+}
+
+impl PartitionRowUpdater<'_> {
+    /// 更新 i64 / timestamp 列值。
+    pub fn write_i64(&mut self, column: &str, value: i64) -> Result<(), ZippySegmentStoreError> {
+        self.writer
+            .write_i64_at(column, self.row, value)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+
+    /// 更新 f64 列值。
+    pub fn write_f64(&mut self, column: &str, value: f64) -> Result<(), ZippySegmentStoreError> {
+        self.writer
+            .write_f64_at(column, self.row, value)
+            .map_err(ZippySegmentStoreError::Writer)
+    }
+
+    /// 将 nullable 列更新为空值。
+    pub fn write_null(&mut self, column: &str) -> Result<(), ZippySegmentStoreError> {
+        self.writer
+            .write_null_at(column, self.row)
             .map_err(ZippySegmentStoreError::Writer)
     }
 }
@@ -818,6 +850,82 @@ impl PartitionWriterHandle {
             .notify_all()
             .map_err(ZippySegmentStoreError::Io)?;
         Ok(written)
+    }
+
+    /// 在同一个 active segment 内原地更新已提交行。
+    pub fn update_rows_at<F>(
+        &self,
+        rows: &[usize],
+        mut write: F,
+    ) -> Result<usize, ZippySegmentStoreError>
+    where
+        F: FnMut(&mut PartitionRowUpdater<'_>, usize) -> Result<(), ZippySegmentStoreError>,
+    {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let updated = {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            if state.writer.has_open_row() {
+                return Err(ZippySegmentStoreError::Writer("row already open"));
+            }
+            let committed = state.writer.committed_row_count();
+            if rows.iter().any(|row| *row >= committed) {
+                return Err(ZippySegmentStoreError::Writer(
+                    "update row index exceeds committed rows",
+                ));
+            }
+
+            let snapshot = state
+                .writer
+                .capture_rows_snapshot()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            state
+                .writer
+                .begin_payload_mutation()
+                .map_err(ZippySegmentStoreError::Writer)?;
+
+            let mut failure = None;
+            for (update_index, row) in rows.iter().copied().enumerate() {
+                let write_result = {
+                    let mut updater = PartitionRowUpdater {
+                        writer: &mut state.writer,
+                        row,
+                    };
+                    write(&mut updater, update_index)
+                };
+                if let Err(error) = write_result {
+                    failure = Some(error);
+                    break;
+                }
+            }
+
+            if let Some(error) = failure {
+                state
+                    .writer
+                    .restore_rows_snapshot(snapshot)
+                    .map_err(ZippySegmentStoreError::Writer)?;
+                state
+                    .writer
+                    .abort_payload_mutation()
+                    .map_err(ZippySegmentStoreError::Writer)?;
+                return Err(error);
+            }
+
+            state
+                .writer
+                .finish_payload_mutation()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            rows.len()
+        };
+
+        self.handle
+            .inner
+            .broadcaster
+            .notify_all()
+            .map_err(ZippySegmentStoreError::Io)?;
+        Ok(updated)
     }
 
     /// 在同一个分区锁内按列批量写入多行，并只发布一次 committed prefix。

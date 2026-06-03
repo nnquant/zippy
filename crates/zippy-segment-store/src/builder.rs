@@ -40,10 +40,10 @@ pub(crate) struct ActiveRowsSnapshot {
     row_cursor: usize,
     row_count: usize,
     committed_row_count: usize,
-    validity: HashMap<&'static str, Vec<bool>>,
-    i64_columns: HashMap<&'static str, Vec<i64>>,
-    f64_columns: HashMap<&'static str, Vec<f64>>,
-    utf8_columns: HashMap<&'static str, Utf8ColumnBuffer>,
+    validity: HashMap<Arc<str>, Vec<bool>>,
+    i64_columns: HashMap<Arc<str>, Vec<i64>>,
+    f64_columns: HashMap<Arc<str>, Vec<f64>>,
+    utf8_columns: HashMap<Arc<str>, Utf8ColumnBuffer>,
     payload: Vec<u8>,
 }
 
@@ -56,10 +56,10 @@ pub struct ActiveSegmentWriter {
     layout: LayoutPlan,
     row_cursor: usize,
     current_row_open: bool,
-    validity: HashMap<&'static str, Vec<bool>>,
-    i64_columns: HashMap<&'static str, Vec<i64>>,
-    f64_columns: HashMap<&'static str, Vec<f64>>,
-    utf8_columns: HashMap<&'static str, Utf8ColumnBuffer>,
+    validity: HashMap<Arc<str>, Vec<bool>>,
+    i64_columns: HashMap<Arc<str>, Vec<i64>>,
+    f64_columns: HashMap<Arc<str>, Vec<f64>>,
+    utf8_columns: HashMap<Arc<str>, Utf8ColumnBuffer>,
     shm_region: ShmRegion,
 }
 
@@ -107,20 +107,28 @@ impl ActiveSegmentWriter {
         let mut validity = HashMap::new();
 
         for spec in schema.columns() {
-            let column_layout = layout.column(spec.name).ok_or("missing column layout")?;
+            let column_layout = layout.column(spec.name()).ok_or("missing column layout")?;
             if spec.nullable {
-                validity.insert(spec.name, vec![false; layout.row_capacity()]);
+                validity.insert(Arc::clone(&spec.name), vec![false; layout.row_capacity()]);
             }
             match spec.data_type {
-                ColumnType::Int64 | ColumnType::TimestampNsTz(_) => {
-                    i64_columns.insert(spec.name, vec![0; column_layout.values_len / 8]);
+                ColumnType::Int64
+                | ColumnType::TimestampNsTz(_)
+                | ColumnType::TimestampNsTzOwned(_) => {
+                    i64_columns.insert(
+                        Arc::clone(&spec.name),
+                        vec![0; column_layout.values_len / 8],
+                    );
                 }
                 ColumnType::Float64 => {
-                    f64_columns.insert(spec.name, vec![0.0; column_layout.values_len / 8]);
+                    f64_columns.insert(
+                        Arc::clone(&spec.name),
+                        vec![0.0; column_layout.values_len / 8],
+                    );
                 }
                 ColumnType::Utf8 => {
                     utf8_columns.insert(
-                        spec.name,
+                        Arc::clone(&spec.name),
                         Utf8ColumnBuffer {
                             offsets: vec![0; column_layout.offsets_len / 4],
                             values: Vec::with_capacity(column_layout.values_len),
@@ -458,9 +466,9 @@ impl ActiveSegmentWriter {
                 .map_err(|_| "failed to mirror utf8 abort offset into shared memory")?;
         }
 
-        let validity_columns = self.validity.keys().copied().collect::<Vec<_>>();
+        let validity_columns = self.validity.keys().cloned().collect::<Vec<_>>();
         for column in validity_columns {
-            self.mark_invalid(column)?;
+            self.mark_invalid(column.as_ref())?;
         }
         self.current_row_open = false;
         Ok(())
@@ -525,7 +533,9 @@ impl ActiveSegmentWriter {
     pub fn write_i64(&mut self, column: &str, value: i64) -> Result<(), &'static str> {
         self.ensure_row_open()?;
         match self.column_type(column)? {
-            ColumnType::Int64 | ColumnType::TimestampNsTz(_) => {
+            ColumnType::Int64
+            | ColumnType::TimestampNsTz(_)
+            | ColumnType::TimestampNsTzOwned(_) => {
                 let buffer = self
                     .i64_columns
                     .get_mut(column)
@@ -567,6 +577,72 @@ impl ActiveSegmentWriter {
             }
             _ => Err("column type mismatch"),
         }
+    }
+
+    pub(crate) fn write_i64_at(
+        &mut self,
+        column: &str,
+        row: usize,
+        value: i64,
+    ) -> Result<(), &'static str> {
+        self.ensure_committed_row(row)?;
+        match self.column_type(column)? {
+            ColumnType::Int64
+            | ColumnType::TimestampNsTz(_)
+            | ColumnType::TimestampNsTzOwned(_) => {
+                let buffer = self
+                    .i64_columns
+                    .get_mut(column)
+                    .ok_or("missing i64 column")?;
+                buffer[row] = value;
+                let column_layout = self.layout.column(column).ok_or("missing column layout")?;
+                self.shm_region
+                    .write_at(
+                        SHM_PAYLOAD_OFFSET + column_layout.values_offset + (row * 8),
+                        &value.to_ne_bytes(),
+                    )
+                    .map_err(|_| "failed to mirror i64 value into shared memory")?;
+                self.mark_valid_at(column, row)?;
+                Ok(())
+            }
+            _ => Err("column type mismatch"),
+        }
+    }
+
+    pub(crate) fn write_f64_at(
+        &mut self,
+        column: &str,
+        row: usize,
+        value: f64,
+    ) -> Result<(), &'static str> {
+        self.ensure_committed_row(row)?;
+        match self.column_type(column)? {
+            ColumnType::Float64 => {
+                let buffer = self
+                    .f64_columns
+                    .get_mut(column)
+                    .ok_or("missing f64 column")?;
+                buffer[row] = value;
+                let column_layout = self.layout.column(column).ok_or("missing column layout")?;
+                self.shm_region
+                    .write_at(
+                        SHM_PAYLOAD_OFFSET + column_layout.values_offset + (row * 8),
+                        &value.to_ne_bytes(),
+                    )
+                    .map_err(|_| "failed to mirror f64 value into shared memory")?;
+                self.mark_valid_at(column, row)?;
+                Ok(())
+            }
+            _ => Err("column type mismatch"),
+        }
+    }
+
+    pub(crate) fn write_null_at(&mut self, column: &str, row: usize) -> Result<(), &'static str> {
+        self.ensure_committed_row(row)?;
+        if !self.column_spec(column)?.nullable {
+            return Err("non-nullable column received null");
+        }
+        self.mark_invalid_at(column, row)
     }
 
     /// 写入 utf8 值，并推进 offsets。
@@ -767,6 +843,19 @@ impl ActiveSegmentWriter {
         Ok(())
     }
 
+    fn ensure_committed_row(&self, row: usize) -> Result<(), &'static str> {
+        if self.header.sealed {
+            return Err("segment is sealed");
+        }
+        if self.current_row_open {
+            return Err("open row exists during committed row update");
+        }
+        if row >= self.committed_row_count() {
+            return Err("update row index exceeds committed rows");
+        }
+        Ok(())
+    }
+
     fn notify_readers(&self) -> Result<(), &'static str> {
         self.shm_region
             .fetch_add_u32_release(SHM_NOTIFY_SEQ_OFFSET, 1)
@@ -787,8 +876,16 @@ impl ActiveSegmentWriter {
         self.schema
             .columns()
             .iter()
-            .find(|spec| spec.name == column)
+            .find(|spec| spec.name() == column)
             .map(|spec| &spec.data_type)
+            .ok_or("missing column")
+    }
+
+    fn column_spec(&self, column: &str) -> Result<&crate::ColumnSpec, &'static str> {
+        self.schema
+            .columns()
+            .iter()
+            .find(|spec| spec.name() == column)
             .ok_or("missing column")
     }
 
@@ -811,7 +908,9 @@ impl ActiveSegmentWriter {
         values: &[i64],
     ) -> Result<(), &'static str> {
         match self.column_type(column)? {
-            ColumnType::Int64 | ColumnType::TimestampNsTz(_) => {
+            ColumnType::Int64
+            | ColumnType::TimestampNsTz(_)
+            | ColumnType::TimestampNsTzOwned(_) => {
                 let end_row = start_row
                     .checked_add(values.len())
                     .ok_or("columnar row range overflow")?;
@@ -1064,20 +1163,22 @@ impl ActiveSegmentWriter {
             let source_layout = attachment
                 .descriptor
                 .layout()
-                .column(spec.name)
+                .column(spec.name())
                 .ok_or("missing source column layout")?;
             let target_layout = self
                 .layout
-                .column(spec.name)
+                .column(spec.name())
                 .ok_or("missing target column layout")?
                 .clone();
             match spec.data_type {
-                ColumnType::Int64 | ColumnType::TimestampNsTz(_) => {
+                ColumnType::Int64
+                | ColumnType::TimestampNsTz(_)
+                | ColumnType::TimestampNsTzOwned(_) => {
                     self.copy_active_i64_column(
                         attachment,
                         source_layout,
                         &target_layout,
-                        spec.name,
+                        spec.name(),
                         source_start_row,
                         target_start_row,
                         rows_to_copy,
@@ -1088,7 +1189,7 @@ impl ActiveSegmentWriter {
                         attachment,
                         source_layout,
                         &target_layout,
-                        spec.name,
+                        spec.name(),
                         source_start_row,
                         target_start_row,
                         rows_to_copy,
@@ -1099,7 +1200,7 @@ impl ActiveSegmentWriter {
                         attachment,
                         source_layout,
                         &target_layout,
-                        spec.name,
+                        spec.name(),
                         source_start_row,
                         target_start_row,
                         rows_to_copy,
@@ -1111,7 +1212,7 @@ impl ActiveSegmentWriter {
                     attachment,
                     source_layout,
                     &target_layout,
-                    spec.name,
+                    spec.name(),
                     source_start_row,
                     target_start_row,
                     rows_to_copy,
@@ -1138,7 +1239,7 @@ impl ActiveSegmentWriter {
             let source_layout = attachment
                 .descriptor
                 .layout()
-                .column(spec.name)
+                .column(spec.name())
                 .ok_or("missing source column layout")?;
             let source_value_start = read_active_u32(
                 attachment,
@@ -1155,7 +1256,7 @@ impl ActiveSegmentWriter {
             let source_value_len = source_value_end - source_value_start;
             let target_utf8 = self
                 .utf8_columns
-                .get(spec.name)
+                .get(spec.name())
                 .ok_or("missing target utf8 column")?;
             if target_utf8.values.len().saturating_add(source_value_len)
                 > target_utf8.values_capacity
@@ -1172,7 +1273,7 @@ impl ActiveSegmentWriter {
         attachment: &ActiveSegmentAttachment,
         source_layout: &ColumnLayout,
         target_layout: &ColumnLayout,
-        column: &'static str,
+        column: &str,
         source_start_row: usize,
         target_start_row: usize,
         rows_to_copy: usize,
@@ -1215,7 +1316,7 @@ impl ActiveSegmentWriter {
         attachment: &ActiveSegmentAttachment,
         source_layout: &ColumnLayout,
         target_layout: &ColumnLayout,
-        column: &'static str,
+        column: &str,
         source_start_row: usize,
         target_start_row: usize,
         rows_to_copy: usize,
@@ -1258,7 +1359,7 @@ impl ActiveSegmentWriter {
         attachment: &ActiveSegmentAttachment,
         source_layout: &ColumnLayout,
         target_layout: &ColumnLayout,
-        column: &'static str,
+        column: &str,
         source_start_row: usize,
         target_start_row: usize,
         rows_to_copy: usize,
@@ -1340,7 +1441,7 @@ impl ActiveSegmentWriter {
         attachment: &ActiveSegmentAttachment,
         source_layout: &ColumnLayout,
         target_layout: &ColumnLayout,
-        column: &'static str,
+        column: &str,
         source_start_row: usize,
         target_start_row: usize,
         rows_to_copy: usize,
@@ -1380,19 +1481,19 @@ impl ActiveSegmentWriter {
     ) -> Result<(), &'static str> {
         for spec in columns {
             match span
-                .cell_value(row_offset, spec.name)
+                .cell_value(row_offset, spec.name())
                 .map_err(|_| "failed to read row span cell")?
             {
                 SegmentCellValue::Null => {
                     if !spec.nullable {
                         return Err("non-nullable column received null");
                     }
-                    self.mark_invalid(spec.name)?;
+                    self.mark_invalid(spec.name())?;
                 }
-                SegmentCellValue::Int64(value) => self.write_i64(spec.name, value)?,
-                SegmentCellValue::Float64(value) => self.write_f64(spec.name, value)?,
-                SegmentCellValue::Utf8(value) => self.write_utf8(spec.name, &value)?,
-                SegmentCellValue::TimestampNs(value) => self.write_i64(spec.name, value)?,
+                SegmentCellValue::Int64(value) => self.write_i64(spec.name(), value)?,
+                SegmentCellValue::Float64(value) => self.write_f64(spec.name(), value)?,
+                SegmentCellValue::Utf8(value) => self.write_utf8(spec.name(), &value)?,
+                SegmentCellValue::TimestampNs(value) => self.write_i64(spec.name(), value)?,
             }
         }
         Ok(())
@@ -1403,27 +1504,33 @@ impl ActiveSegmentWriter {
         let validity = self
             .validity
             .iter()
-            .map(|(name, bits)| (*name, bits[..row_count].to_vec()))
+            .map(|(name, bits)| (Arc::clone(name), bits[..row_count].to_vec()))
             .collect();
         let i64_columns = self
             .i64_columns
             .iter()
-            .map(|(name, values)| (*name, values[..row_count].to_vec()))
+            .map(|(name, values)| (Arc::clone(name), values[..row_count].to_vec()))
             .collect();
         let f64_columns = self
             .f64_columns
             .iter()
-            .map(|(name, values)| (*name, values[..row_count].to_vec()))
+            .map(|(name, values)| (Arc::clone(name), values[..row_count].to_vec()))
             .collect();
         let utf8_columns = self
             .utf8_columns
             .iter()
             .map(|(name, values)| {
                 let end = values.offsets[row_count] as usize;
+                let offsets = values.offsets[..=row_count]
+                    .iter()
+                    .map(|offset| {
+                        i32::try_from(*offset).expect("sealed utf8 offset exceeds arrow utf8 range")
+                    })
+                    .collect();
                 (
-                    *name,
+                    Arc::clone(name),
                     SealedUtf8Column {
-                        offsets: values.offsets[..=row_count].to_vec(),
+                        offsets,
                         values: values.values[..end].to_vec(),
                     },
                 )
@@ -1444,16 +1551,20 @@ impl ActiveSegmentWriter {
     }
 
     fn mark_valid(&mut self, column: &str) -> Result<(), &'static str> {
+        self.mark_valid_at(column, self.row_cursor)
+    }
+
+    fn mark_valid_at(&mut self, column: &str, row: usize) -> Result<(), &'static str> {
         if let Some(validity) = self.validity.get_mut(column) {
-            validity[self.row_cursor] = true;
+            validity[row] = true;
             let Some(column_layout) = self.layout.column(column) else {
                 return Ok(());
             };
             if column_layout.validity_len == 0 {
                 return Ok(());
             }
-            let byte_index = self.row_cursor / 8;
-            let bit_index = self.row_cursor % 8;
+            let byte_index = row / 8;
+            let bit_index = row % 8;
             let offset = SHM_PAYLOAD_OFFSET + column_layout.validity_offset + byte_index;
             let mut byte = [0_u8; 1];
             self.shm_region
@@ -1552,16 +1663,20 @@ impl ActiveSegmentWriter {
     }
 
     fn mark_invalid(&mut self, column: &str) -> Result<(), &'static str> {
+        self.mark_invalid_at(column, self.row_cursor)
+    }
+
+    fn mark_invalid_at(&mut self, column: &str, row: usize) -> Result<(), &'static str> {
         if let Some(validity) = self.validity.get_mut(column) {
-            validity[self.row_cursor] = false;
+            validity[row] = false;
             let Some(column_layout) = self.layout.column(column) else {
                 return Ok(());
             };
             if column_layout.validity_len == 0 {
                 return Ok(());
             }
-            let byte_index = self.row_cursor / 8;
-            let bit_index = self.row_cursor % 8;
+            let byte_index = row / 8;
+            let bit_index = row % 8;
             let offset = SHM_PAYLOAD_OFFSET + column_layout.validity_offset + byte_index;
             let mut byte = [0_u8; 1];
             self.shm_region

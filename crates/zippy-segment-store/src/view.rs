@@ -218,7 +218,7 @@ impl RowSpanView {
             .schema()
             .columns()
             .iter()
-            .find(|spec| spec.name == field_name)
+            .find(|spec| spec.name() == field_name)
             .ok_or(ZippySegmentStoreError::Schema("missing column"))?;
 
         match &self.backing {
@@ -277,7 +277,7 @@ impl RowSpanView {
         self.schema()
             .columns()
             .iter()
-            .position(|spec| spec.name == field_name)
+            .position(|spec| spec.name() == field_name)
             .ok_or(ZippySegmentStoreError::Schema("missing column"))
     }
 
@@ -291,7 +291,7 @@ impl RowSpanView {
             let validity = handle
                 .inner
                 .validity
-                .get(spec.name)
+                .get(spec.name())
                 .ok_or(ZippySegmentStoreError::Schema("missing validity"))?;
             if !validity[row] {
                 return Ok(SegmentCellValue::Null);
@@ -302,20 +302,20 @@ impl RowSpanView {
             ColumnType::Int64 => handle
                 .inner
                 .i64_columns
-                .get(spec.name)
+                .get(spec.name())
                 .map(|values| SegmentCellValue::Int64(values[row]))
                 .ok_or(ZippySegmentStoreError::Schema("missing int64 column")),
             ColumnType::Float64 => handle
                 .inner
                 .f64_columns
-                .get(spec.name)
+                .get(spec.name())
                 .map(|values| SegmentCellValue::Float64(values[row]))
                 .ok_or(ZippySegmentStoreError::Schema("missing float64 column")),
             ColumnType::Utf8 => {
                 let values = handle
                     .inner
                     .utf8_columns
-                    .get(spec.name)
+                    .get(spec.name())
                     .ok_or(ZippySegmentStoreError::Schema("missing utf8 column"))?;
                 let start = values.offsets[row] as usize;
                 let end = values.offsets[row + 1] as usize;
@@ -323,10 +323,10 @@ impl RowSpanView {
                     .map_err(|error| ZippySegmentStoreError::Shmem(error.to_string()))?;
                 Ok(SegmentCellValue::Utf8(value.to_string()))
             }
-            ColumnType::TimestampNsTz(_) => handle
+            ColumnType::TimestampNsTz(_) | ColumnType::TimestampNsTzOwned(_) => handle
                 .inner
                 .i64_columns
-                .get(spec.name)
+                .get(spec.name())
                 .map(|values| SegmentCellValue::TimestampNs(values[row]))
                 .ok_or(ZippySegmentStoreError::Schema("missing timestamp column")),
         }
@@ -342,7 +342,7 @@ impl RowSpanView {
             let validity = handle
                 .inner
                 .validity
-                .get(spec.name)
+                .get(spec.name())
                 .ok_or(ZippySegmentStoreError::Schema("missing validity"))?;
             if !validity[row] {
                 return Ok(None);
@@ -352,7 +352,7 @@ impl RowSpanView {
         let values = handle
             .inner
             .utf8_columns
-            .get(spec.name)
+            .get(spec.name())
             .ok_or(ZippySegmentStoreError::Schema("missing utf8 column"))?;
         let start = values.offsets[row] as usize;
         let end = values.offsets[row + 1] as usize;
@@ -370,7 +370,7 @@ impl RowSpanView {
         let layout = attachment
             .descriptor
             .layout()
-            .column(spec.name)
+            .column(spec.name())
             .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
 
         if spec.nullable && !read_active_validity(attachment, layout, row)? {
@@ -387,9 +387,9 @@ impl RowSpanView {
             ColumnType::Utf8 => Ok(SegmentCellValue::Utf8(read_active_utf8(
                 attachment, layout, row,
             )?)),
-            ColumnType::TimestampNsTz(_) => Ok(SegmentCellValue::TimestampNs(read_active_i64(
-                attachment, layout, row,
-            )?)),
+            ColumnType::TimestampNsTz(_) | ColumnType::TimestampNsTzOwned(_) => Ok(
+                SegmentCellValue::TimestampNs(read_active_i64(attachment, layout, row)?),
+            ),
         }
     }
 
@@ -402,7 +402,7 @@ impl RowSpanView {
         let layout = attachment
             .descriptor
             .layout()
-            .column(spec.name)
+            .column(spec.name())
             .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
 
         if spec.nullable && !read_active_validity(attachment, layout, row)? {

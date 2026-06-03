@@ -60,7 +60,7 @@ pub struct SegmentHeader {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SealedUtf8Column {
-    pub(crate) offsets: Vec<u32>,
+    pub(crate) offsets: Vec<i32>,
     pub(crate) values: Vec<u8>,
 }
 
@@ -71,10 +71,10 @@ pub(crate) struct SealedSegmentData {
     pub(crate) segment_id: u64,
     pub(crate) _generation: u64,
     pub(crate) row_count: usize,
-    pub(crate) validity: HashMap<&'static str, Vec<bool>>,
-    pub(crate) i64_columns: HashMap<&'static str, Vec<i64>>,
-    pub(crate) f64_columns: HashMap<&'static str, Vec<f64>>,
-    pub(crate) utf8_columns: HashMap<&'static str, SealedUtf8Column>,
+    pub(crate) validity: HashMap<Arc<str>, Vec<bool>>,
+    pub(crate) i64_columns: HashMap<Arc<str>, Vec<i64>>,
+    pub(crate) f64_columns: HashMap<Arc<str>, Vec<f64>>,
+    pub(crate) utf8_columns: HashMap<Arc<str>, SealedUtf8Column>,
 }
 
 /// 已 seal segment 的最小只读句柄。

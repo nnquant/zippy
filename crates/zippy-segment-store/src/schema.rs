@@ -1,39 +1,78 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 /// 列的数据类型定义。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ColumnType {
     Int64,
     Float64,
     Utf8,
     TimestampNsTz(&'static str),
+    TimestampNsTzOwned(Arc<str>),
 }
+
+impl ColumnType {
+    /// Construct a timestamp column type with an owned timezone name.
+    pub fn timestamp_ns_tz(timezone: impl Into<Arc<str>>) -> Self {
+        Self::TimestampNsTzOwned(timezone.into())
+    }
+
+    /// Return the timezone name for timestamp columns.
+    pub fn timezone(&self) -> Option<&str> {
+        match self {
+            Self::TimestampNsTz(timezone) => Some(timezone),
+            Self::TimestampNsTzOwned(timezone) => Some(timezone.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for ColumnType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int64, Self::Int64)
+            | (Self::Float64, Self::Float64)
+            | (Self::Utf8, Self::Utf8) => true,
+            (Self::TimestampNsTz(left), Self::TimestampNsTz(right)) => left == right,
+            (Self::TimestampNsTz(left), Self::TimestampNsTzOwned(right)) => *left == right.as_ref(),
+            (Self::TimestampNsTzOwned(left), Self::TimestampNsTz(right)) => left.as_ref() == *right,
+            (Self::TimestampNsTzOwned(left), Self::TimestampNsTzOwned(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ColumnType {}
 
 /// 列规格定义。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnSpec {
-    pub name: &'static str,
+    pub name: Arc<str>,
     pub data_type: ColumnType,
     pub nullable: bool,
 }
 
 impl ColumnSpec {
     /// 构造一个列规格。
-    pub fn new(name: &'static str, data_type: ColumnType) -> Self {
+    pub fn new(name: impl Into<Arc<str>>, data_type: ColumnType) -> Self {
         Self {
-            name,
+            name: name.into(),
             data_type,
             nullable: false,
         }
     }
 
     /// 构造一个可空列规格。
-    pub fn nullable(name: &'static str, data_type: ColumnType) -> Self {
+    pub fn nullable(name: impl Into<Arc<str>>, data_type: ColumnType) -> Self {
         Self {
-            name,
+            name: name.into(),
             data_type,
             nullable: true,
         }
+    }
+
+    /// Return the column name.
+    pub fn name(&self) -> &str {
+        self.name.as_ref()
     }
 }
 
@@ -72,6 +111,11 @@ pub fn compile_schema(columns: &[ColumnSpec]) -> Result<CompiledSchema, &'static
                 write_u64(bytes, timezone.len() as u64);
                 bytes.extend_from_slice(timezone.as_bytes());
             }
+            ColumnType::TimestampNsTzOwned(timezone) => {
+                bytes.push(4);
+                write_u64(bytes, timezone.len() as u64);
+                bytes.extend_from_slice(timezone.as_bytes());
+            }
         }
     }
 
@@ -83,8 +127,8 @@ pub fn compile_schema(columns: &[ColumnSpec]) -> Result<CompiledSchema, &'static
         write_u64(&mut bytes, columns.len() as u64);
 
         for column in columns {
-            write_u64(&mut bytes, column.name.len() as u64);
-            bytes.extend_from_slice(column.name.as_bytes());
+            write_u64(&mut bytes, column.name().len() as u64);
+            bytes.extend_from_slice(column.name().as_bytes());
             bytes.push(u8::from(column.nullable));
             push_type_fingerprint(&mut bytes, &column.data_type);
         }
@@ -100,7 +144,7 @@ pub fn compile_schema(columns: &[ColumnSpec]) -> Result<CompiledSchema, &'static
 
     let mut names = HashSet::with_capacity(columns.len());
     for column in columns {
-        if !names.insert(column.name) {
+        if !names.insert(column.name()) {
             return Err("duplicate column name");
         }
     }

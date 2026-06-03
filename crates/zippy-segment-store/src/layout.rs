@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use crate::{ColumnType, CompiledSchema};
 
 /// 单列的物理布局描述。
 #[derive(Debug, Clone)]
 pub struct ColumnLayout {
-    pub name: &'static str,
+    pub name: Arc<str>,
     pub values_offset: usize,
     /// Values buffer bytes reserved by the layout plan.
     ///
@@ -49,9 +51,10 @@ impl LayoutPlan {
             rows: usize,
         ) -> Result<usize, &'static str> {
             match data_type {
-                ColumnType::Int64 | ColumnType::Float64 | ColumnType::TimestampNsTz(_) => {
-                    checked_mul(rows, 8)
-                }
+                ColumnType::Int64
+                | ColumnType::Float64
+                | ColumnType::TimestampNsTz(_)
+                | ColumnType::TimestampNsTzOwned(_) => checked_mul(rows, 8),
                 ColumnType::Utf8 => checked_mul(rows, 32),
             }
         }
@@ -94,7 +97,7 @@ impl LayoutPlan {
             cursor = checked_add(cursor, values_len)?;
 
             columns.push(ColumnLayout {
-                name: spec.name,
+                name: Arc::clone(&spec.name),
                 values_offset,
                 values_len,
                 offsets_offset,
@@ -117,7 +120,7 @@ impl LayoutPlan {
 
     /// 按列名查找布局。
     pub fn column(&self, name: &str) -> Option<&ColumnLayout> {
-        self.columns.iter().find(|col| col.name == name)
+        self.columns.iter().find(|col| col.name.as_ref() == name)
     }
 
     /// 返回 payload 需要的最小总字节数。

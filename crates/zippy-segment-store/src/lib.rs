@@ -18,7 +18,8 @@ pub use active_reader::ActiveSegmentReader;
 pub use arrow_bridge::RowSpanBatchReader;
 pub use builder::{ActiveSegmentShmLayout, ActiveSegmentWriter};
 pub use catalog::{
-    PartitionHandle, PartitionRowWriter, PartitionWriterHandle, SegmentStore, SegmentStoreConfig,
+    PartitionHandle, PartitionRowUpdater, PartitionRowWriter, PartitionWriterHandle, SegmentStore,
+    SegmentStoreConfig,
 };
 pub use debug::debug_snapshot_record_batch_for_test;
 pub use layout::{ColumnLayout, LayoutPlan};
