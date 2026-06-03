@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, StringArray, TimestampNanosecondArray};
@@ -15,6 +15,7 @@ use crate::table_view::{
 
 const UTC_TIMEZONE: &str = "UTC";
 const VWAP_DENOMINATOR_ZERO_STATUS: &str = "vwap denominator is zero";
+type TimeSeriesIdKey = u32;
 
 /// Aggregate per-id float64 inputs into fixed-width nanosecond windows.
 pub struct TimeSeriesEngine {
@@ -31,8 +32,9 @@ pub struct TimeSeriesEngine {
     specs: Vec<Box<dyn AggregationSpec>>,
     pre_factors: Vec<Box<dyn ReactiveFactor>>,
     post_factors: Vec<Box<dyn ReactiveFactor>>,
-    open_windows: BTreeMap<String, OpenWindow>,
-    last_dt_by_id: BTreeMap<String, i64>,
+    id_registry: IdRegistry,
+    open_windows: BTreeMap<TimeSeriesIdKey, OpenWindow>,
+    last_dt_by_id: BTreeMap<TimeSeriesIdKey, i64>,
     pending_late_rows: u64,
     pending_filtered_rows: u64,
 }
@@ -153,6 +155,7 @@ impl TimeSeriesEngine {
             specs,
             pre_factors,
             post_factors,
+            id_registry: IdRegistry::default(),
             open_windows: BTreeMap::new(),
             last_dt_by_id: BTreeMap::new(),
             pending_late_rows: 0,
@@ -264,6 +267,7 @@ impl Engine for TimeSeriesEngine {
                     ids,
                     dts,
                     &candidate_rows,
+                    &self.id_registry,
                     &self.last_dt_by_id,
                 )?;
                 candidate_rows
@@ -272,6 +276,7 @@ impl Engine for TimeSeriesEngine {
                 ids,
                 dts,
                 &candidate_rows,
+                &self.id_registry,
                 &self.last_dt_by_id,
                 &mut self.pending_late_rows,
             ),
@@ -345,6 +350,7 @@ impl Engine for TimeSeriesEngine {
         let txn_result = apply_timeseries_rows(
             &mut self.open_windows,
             &mut self.last_dt_by_id,
+            &mut self.id_registry,
             &self.specs,
             self.window_ns,
             &processed_input,
@@ -357,9 +363,11 @@ impl Engine for TimeSeriesEngine {
         match self.finalize_windows(txn_result.completed) {
             Ok(output) => Ok(vec![SegmentTableView::from_record_batch(output)]),
             Err(error) => {
-                txn_result
-                    .rollback
-                    .restore(&mut self.open_windows, &mut self.last_dt_by_id);
+                txn_result.rollback.restore(
+                    &mut self.id_registry,
+                    &mut self.open_windows,
+                    &mut self.last_dt_by_id,
+                );
                 Err(error)
             }
         }
@@ -370,7 +378,8 @@ impl Engine for TimeSeriesEngine {
             return Ok(vec![]);
         }
 
-        let windows = self.open_windows.values().cloned().collect::<Vec<_>>();
+        let mut windows = self.open_windows.values().cloned().collect::<Vec<_>>();
+        windows.sort_by(|left, right| left.id.cmp(&right.id));
         let output = self.finalize_windows(windows)?;
         self.open_windows.clear();
 
@@ -574,20 +583,60 @@ struct TimeSeriesStateUndo {
     last_dt: Option<i64>,
 }
 
+#[derive(Default)]
+struct IdRegistry {
+    id_to_key: HashMap<String, TimeSeriesIdKey>,
+    ids: Vec<String>,
+}
+
+impl IdRegistry {
+    fn lookup(&self, id: &str) -> Option<TimeSeriesIdKey> {
+        self.id_to_key.get(id).copied()
+    }
+
+    fn intern(&mut self, id: &str) -> TimeSeriesIdKey {
+        if let Some(key) = self.lookup(id) {
+            return key;
+        }
+
+        let key = TimeSeriesIdKey::try_from(self.ids.len()).expect("too many timeseries ids");
+        self.ids.push(id.to_string());
+        self.id_to_key.insert(id.to_string(), key);
+        key
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn rollback(&mut self, checkpoint: usize) {
+        for id in self.ids.drain(checkpoint..) {
+            self.id_to_key.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 struct TimeSeriesRollback {
-    undo: BTreeMap<String, TimeSeriesStateUndo>,
+    undo: BTreeMap<TimeSeriesIdKey, TimeSeriesStateUndo>,
+    id_registry_checkpoint: usize,
 }
 
 impl TimeSeriesRollback {
     fn restore(
         self,
-        open_windows: &mut BTreeMap<String, OpenWindow>,
-        last_dt_by_id: &mut BTreeMap<String, i64>,
+        id_registry: &mut IdRegistry,
+        open_windows: &mut BTreeMap<TimeSeriesIdKey, OpenWindow>,
+        last_dt_by_id: &mut BTreeMap<TimeSeriesIdKey, i64>,
     ) {
         for (id, undo) in self.undo {
             match undo.open_window {
                 Some(open_window) => {
-                    open_windows.insert(id.clone(), open_window);
+                    open_windows.insert(id, open_window);
                 }
                 None => {
                     open_windows.remove(&id);
@@ -603,65 +652,77 @@ impl TimeSeriesRollback {
                 }
             }
         }
+        id_registry.rollback(self.id_registry_checkpoint);
     }
 }
 
 struct TimeSeriesStateTxn<'a> {
-    open_windows: &'a mut BTreeMap<String, OpenWindow>,
-    last_dt_by_id: &'a mut BTreeMap<String, i64>,
-    undo: BTreeMap<String, TimeSeriesStateUndo>,
+    open_windows: &'a mut BTreeMap<TimeSeriesIdKey, OpenWindow>,
+    last_dt_by_id: &'a mut BTreeMap<TimeSeriesIdKey, i64>,
+    undo: BTreeMap<TimeSeriesIdKey, TimeSeriesStateUndo>,
+    id_registry_checkpoint: usize,
 }
 
 impl<'a> TimeSeriesStateTxn<'a> {
     fn new(
-        open_windows: &'a mut BTreeMap<String, OpenWindow>,
-        last_dt_by_id: &'a mut BTreeMap<String, i64>,
+        open_windows: &'a mut BTreeMap<TimeSeriesIdKey, OpenWindow>,
+        last_dt_by_id: &'a mut BTreeMap<TimeSeriesIdKey, i64>,
+        id_registry_checkpoint: usize,
     ) -> Self {
         Self {
             open_windows,
             last_dt_by_id,
             undo: BTreeMap::new(),
+            id_registry_checkpoint,
         }
     }
 
-    fn take_open_window(&mut self, id: &str) -> Option<OpenWindow> {
+    fn take_open_window(&mut self, id: TimeSeriesIdKey) -> Option<OpenWindow> {
         self.touch(id);
-        self.open_windows.remove(id)
+        self.open_windows.remove(&id)
     }
 
-    fn insert_open_window(&mut self, id: &str, open_window: OpenWindow) {
+    fn insert_open_window(&mut self, id: TimeSeriesIdKey, open_window: OpenWindow) {
         self.touch(id);
-        self.open_windows.insert(id.to_string(), open_window);
+        self.open_windows.insert(id, open_window);
     }
 
-    fn set_last_dt(&mut self, id: &str, dt: i64) {
+    fn set_last_dt(&mut self, id: TimeSeriesIdKey, dt: i64) {
         self.touch(id);
-        self.last_dt_by_id.insert(id.to_string(), dt);
+        self.last_dt_by_id.insert(id, dt);
     }
 
     fn into_rollback(self) -> TimeSeriesRollback {
-        TimeSeriesRollback { undo: self.undo }
+        TimeSeriesRollback {
+            undo: self.undo,
+            id_registry_checkpoint: self.id_registry_checkpoint,
+        }
     }
 
-    fn rollback(self) {
+    fn rollback(self, id_registry: &mut IdRegistry) {
         let Self {
             open_windows,
             last_dt_by_id,
             undo,
+            id_registry_checkpoint,
         } = self;
-        TimeSeriesRollback { undo }.restore(open_windows, last_dt_by_id);
+        TimeSeriesRollback {
+            undo,
+            id_registry_checkpoint,
+        }
+        .restore(id_registry, open_windows, last_dt_by_id);
     }
 
-    fn touch(&mut self, id: &str) {
-        if self.undo.contains_key(id) {
+    fn touch(&mut self, id: TimeSeriesIdKey) {
+        if self.undo.contains_key(&id) {
             return;
         }
 
         self.undo.insert(
-            id.to_string(),
+            id,
             TimeSeriesStateUndo {
-                open_window: self.open_windows.get(id).cloned(),
-                last_dt: self.last_dt_by_id.get(id).copied(),
+                open_window: self.open_windows.get(&id).cloned(),
+                last_dt: self.last_dt_by_id.get(&id).copied(),
             },
         );
     }
@@ -893,22 +954,23 @@ fn collect_accepted_rows_for_rows(
     ids: &StringArray,
     dts: &TimestampNanosecondArray,
     row_selection: &RowSelection,
-    last_dt_by_id: &BTreeMap<String, i64>,
+    id_registry: &IdRegistry,
+    last_dt_by_id: &BTreeMap<TimeSeriesIdKey, i64>,
     pending_late_rows: &mut u64,
 ) -> RowSelection {
     let mut accepted_rows = Vec::with_capacity(row_selection.len());
-    let mut batch_last_dt_by_id = BTreeMap::new();
+    let mut batch_last_dt_by_id = HashMap::new();
 
     for row_index in row_selection.iter() {
         let id = ids.value(row_index);
         let dt = dts.value(row_index);
 
-        if is_late_row(id, dt, &batch_last_dt_by_id, last_dt_by_id) {
+        if is_late_row(id, dt, &batch_last_dt_by_id, id_registry, last_dt_by_id) {
             *pending_late_rows += 1;
             continue;
         }
 
-        batch_last_dt_by_id.insert(id.to_string(), dt);
+        batch_last_dt_by_id.insert(id, dt);
         accepted_rows.push(row_index as u32);
     }
 
@@ -918,36 +980,46 @@ fn collect_accepted_rows_for_rows(
 fn is_late_row(
     id: &str,
     dt: i64,
-    batch_last_dt_by_id: &BTreeMap<String, i64>,
-    last_dt_by_id: &BTreeMap<String, i64>,
+    batch_last_dt_by_id: &HashMap<&str, i64>,
+    id_registry: &IdRegistry,
+    last_dt_by_id: &BTreeMap<TimeSeriesIdKey, i64>,
 ) -> bool {
-    let last_dt = batch_last_dt_by_id
-        .get(id)
-        .copied()
-        .or_else(|| last_dt_by_id.get(id).copied());
+    let last_dt = batch_last_dt_by_id.get(id).copied().or_else(|| {
+        id_registry
+            .lookup(id)
+            .and_then(|id_key| last_dt_by_id.get(&id_key).copied())
+    });
 
     matches!(last_dt, Some(last_dt) if dt < last_dt)
 }
 
 fn apply_timeseries_rows(
-    open_windows: &mut BTreeMap<String, OpenWindow>,
-    last_dt_by_id: &mut BTreeMap<String, i64>,
+    open_windows: &mut BTreeMap<TimeSeriesIdKey, OpenWindow>,
+    last_dt_by_id: &mut BTreeMap<TimeSeriesIdKey, i64>,
+    id_registry: &mut IdRegistry,
     specs: &[Box<dyn AggregationSpec>],
     window_ns: i64,
     processed_input: &ProcessedInput<'_>,
 ) -> Result<TimeSeriesTxnResult> {
     let mut completed = Vec::new();
-    let mut txn = TimeSeriesStateTxn::new(open_windows, last_dt_by_id);
+    let id_registry_checkpoint = id_registry.checkpoint();
+    let mut txn = TimeSeriesStateTxn::new(open_windows, last_dt_by_id, id_registry_checkpoint);
 
     for row_index in processed_input.row_selection() {
-        let row_result =
-            apply_timeseries_row(&mut txn, specs, window_ns, processed_input, row_index);
+        let row_result = apply_timeseries_row(
+            &mut txn,
+            id_registry,
+            specs,
+            window_ns,
+            processed_input,
+            row_index,
+        );
 
         match row_result {
             Ok(Some(completed_window)) => completed.push(completed_window),
             Ok(None) => {}
             Err(error) => {
-                txn.rollback();
+                txn.rollback(id_registry);
                 return Err(error);
             }
         }
@@ -961,12 +1033,14 @@ fn apply_timeseries_rows(
 
 fn apply_timeseries_row(
     txn: &mut TimeSeriesStateTxn<'_>,
+    id_registry: &mut IdRegistry,
     specs: &[Box<dyn AggregationSpec>],
     window_ns: i64,
     processed_input: &ProcessedInput<'_>,
     row_index: usize,
 ) -> Result<Option<OpenWindow>> {
-    let id = processed_input.id_value(row_index)?.to_string();
+    let id = processed_input.id_value(row_index)?;
+    let id_key = id_registry.intern(id);
     let dt = processed_input.dt_value(row_index)?;
     let window_start = align_window_start(dt, window_ns);
     let window_end = window_start
@@ -975,29 +1049,29 @@ fn apply_timeseries_row(
             status: "window end overflow",
         })?;
 
-    let completed = match txn.take_open_window(&id) {
+    let completed = match txn.take_open_window(id_key) {
         Some(mut open_window) if open_window.window_start == window_start => {
             open_window.update(specs, processed_input.spec_inputs(), row_index)?;
-            txn.insert_open_window(&id, open_window);
+            txn.insert_open_window(id_key, open_window);
             None
         }
         Some(open_window) => {
             let mut next_window =
-                OpenWindow::new(id.clone(), window_start, window_end, specs.len());
+                OpenWindow::new(id.to_string(), window_start, window_end, specs.len());
             next_window.update(specs, processed_input.spec_inputs(), row_index)?;
-            txn.insert_open_window(&id, next_window);
+            txn.insert_open_window(id_key, next_window);
             Some(open_window)
         }
         None => {
             let mut open_window =
-                OpenWindow::new(id.clone(), window_start, window_end, specs.len());
+                OpenWindow::new(id.to_string(), window_start, window_end, specs.len());
             open_window.update(specs, processed_input.spec_inputs(), row_index)?;
-            txn.insert_open_window(&id, open_window);
+            txn.insert_open_window(id_key, open_window);
             None
         }
     };
 
-    txn.set_last_dt(&id, dt);
+    txn.set_last_dt(id_key, dt);
     Ok(completed)
 }
 
@@ -1146,17 +1220,19 @@ fn validate_non_decreasing_dts_for_rows(
     ids: &StringArray,
     dts: &TimestampNanosecondArray,
     row_selection: &RowSelection,
-    last_dt_by_id: &BTreeMap<String, i64>,
+    id_registry: &IdRegistry,
+    last_dt_by_id: &BTreeMap<TimeSeriesIdKey, i64>,
 ) -> Result<()> {
-    let mut batch_last_dt_by_id = BTreeMap::new();
+    let mut batch_last_dt_by_id = HashMap::new();
 
     for row_index in row_selection.iter() {
         let id = ids.value(row_index);
         let dt = dts.value(row_index);
-        let last_dt = batch_last_dt_by_id
-            .get(id)
-            .copied()
-            .or_else(|| last_dt_by_id.get(id).copied());
+        let last_dt = batch_last_dt_by_id.get(id).copied().or_else(|| {
+            id_registry
+                .lookup(id)
+                .and_then(|id_key| last_dt_by_id.get(&id_key).copied())
+        });
 
         if let Some(last_dt) = last_dt {
             if dt < last_dt {
@@ -1164,7 +1240,7 @@ fn validate_non_decreasing_dts_for_rows(
             }
         }
 
-        batch_last_dt_by_id.insert(id.to_string(), dt);
+        batch_last_dt_by_id.insert(id, dt);
     }
 
     Ok(())
@@ -1178,19 +1254,35 @@ fn align_window_start(dt: i64, window_ns: i64) -> i64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{OpenWindow, RowSelection, TimeSeriesStateTxn};
+    use super::{IdRegistry, OpenWindow, RowSelection, TimeSeriesStateTxn};
+
+    #[test]
+    fn time_series_id_registry_rollback_removes_new_ids() {
+        let mut registry = IdRegistry::default();
+        let checkpoint = registry.checkpoint();
+
+        assert_eq!(registry.intern("A"), 0);
+        assert_eq!(registry.len(), 1);
+        registry.rollback(checkpoint);
+
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.intern("A"), 0);
+    }
 
     #[test]
     fn time_series_state_txn_rollback_removes_new_id() {
+        let mut registry = IdRegistry::default();
+        let id = registry.intern("A");
+        let checkpoint = registry.checkpoint();
         let mut open_windows = BTreeMap::new();
         let mut last_dt_by_id = BTreeMap::new();
-        let mut txn = TimeSeriesStateTxn::new(&mut open_windows, &mut last_dt_by_id);
+        let mut txn = TimeSeriesStateTxn::new(&mut open_windows, &mut last_dt_by_id, checkpoint);
 
-        txn.insert_open_window("A", OpenWindow::new("A".to_string(), 0, 10, 1));
-        txn.set_last_dt("A", 5);
+        txn.insert_open_window(id, OpenWindow::new("A".to_string(), 0, 10, 1));
+        txn.set_last_dt(id, 5);
         let rollback = txn.into_rollback();
 
-        rollback.restore(&mut open_windows, &mut last_dt_by_id);
+        rollback.restore(&mut registry, &mut open_windows, &mut last_dt_by_id);
 
         assert!(open_windows.is_empty());
         assert!(last_dt_by_id.is_empty());
@@ -1198,27 +1290,30 @@ mod tests {
 
     #[test]
     fn time_series_state_txn_rollback_restores_existing_id_once() {
+        let mut registry = IdRegistry::default();
+        let id = registry.intern("A");
+        let checkpoint = registry.checkpoint();
         let original = OpenWindow::new("A".to_string(), 0, 10, 1);
-        let mut open_windows = BTreeMap::from([("A".to_string(), original.clone())]);
-        let mut last_dt_by_id = BTreeMap::from([("A".to_string(), 5)]);
-        let mut txn = TimeSeriesStateTxn::new(&mut open_windows, &mut last_dt_by_id);
+        let mut open_windows = BTreeMap::from([(id, original.clone())]);
+        let mut last_dt_by_id = BTreeMap::from([(id, 5)]);
+        let mut txn = TimeSeriesStateTxn::new(&mut open_windows, &mut last_dt_by_id, checkpoint);
 
-        txn.take_open_window("A");
-        txn.insert_open_window("A", OpenWindow::new("A".to_string(), 10, 20, 1));
-        txn.set_last_dt("A", 15);
+        txn.take_open_window(id);
+        txn.insert_open_window(id, OpenWindow::new("A".to_string(), 10, 20, 1));
+        txn.set_last_dt(id, 15);
         let rollback = txn.into_rollback();
 
-        rollback.restore(&mut open_windows, &mut last_dt_by_id);
+        rollback.restore(&mut registry, &mut open_windows, &mut last_dt_by_id);
 
         assert_eq!(
-            open_windows.get("A").unwrap().window_start,
+            open_windows.get(&id).unwrap().window_start,
             original.window_start
         );
         assert_eq!(
-            open_windows.get("A").unwrap().window_end,
+            open_windows.get(&id).unwrap().window_end,
             original.window_end
         );
-        assert_eq!(last_dt_by_id.get("A"), Some(&5));
+        assert_eq!(last_dt_by_id.get(&id), Some(&5));
     }
 
     #[test]

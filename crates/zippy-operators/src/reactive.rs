@@ -10,6 +10,16 @@ use arrow::record_batch::RecordBatch;
 use zippy_core::{Result, ZippyError};
 
 const LOG_INPUT_MUST_BE_POSITIVE: &str = "log input must be positive";
+const STATE_INPUT_SENTINEL_ABS_MIN: f64 = 1.0e300;
+
+/// Policy for invalid numeric inputs before they update stateful reactive factors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactiveInvalidValuePolicy {
+    /// Treat invalid state inputs as fatal.
+    Reject,
+    /// Emit null and leave the existing per-id state untouched.
+    Skip,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum StatefulFloatKind {
@@ -24,23 +34,26 @@ pub(crate) enum StatefulFloatKind {
 pub struct StatefulFloatById {
     state: StatefulFloatState,
     undo_log: Option<StatefulFloatUndoLog>,
+    id_registry: HashMap<String, u32>,
+    id_values: Vec<String>,
 }
 
 enum StatefulFloatState {
     Ema {
         alpha: f64,
-        state_by_id: HashMap<String, f64>,
+        state_by_id: HashMap<u32, f64>,
     },
     Window {
         size: usize,
         kind: WindowHistoryKind,
-        history_by_id: HashMap<String, WindowHistory>,
+        history_by_id: HashMap<u32, WindowHistory>,
     },
 }
 
 #[derive(Default)]
 struct StatefulFloatUndoLog {
-    entries: HashMap<String, StatefulFloatUndoEntry>,
+    entries: HashMap<u32, StatefulFloatUndoEntry>,
+    id_registry_len: Option<usize>,
 }
 
 enum StatefulFloatUndoEntry {
@@ -53,6 +66,7 @@ pub struct ReactiveFactorContext<'a> {
     schema: Arc<Schema>,
     columns: &'a [ArrayRef],
     row_count: usize,
+    invalid_value_policy: ReactiveInvalidValuePolicy,
 }
 
 impl<'a> ReactiveFactorContext<'a> {
@@ -86,7 +100,19 @@ impl<'a> ReactiveFactorContext<'a> {
             schema: Arc::clone(schema),
             columns,
             row_count,
+            invalid_value_policy: ReactiveInvalidValuePolicy::Reject,
         })
+    }
+
+    /// Create a factor context with an explicit invalid-value policy.
+    pub fn new_with_invalid_value_policy(
+        schema: &Arc<Schema>,
+        columns: &'a [ArrayRef],
+        invalid_value_policy: ReactiveInvalidValuePolicy,
+    ) -> Result<Self> {
+        let mut context = Self::new(schema, columns)?;
+        context.invalid_value_policy = invalid_value_policy;
+        Ok(context)
     }
 
     /// Create a factor context from an existing record batch.
@@ -95,6 +121,7 @@ impl<'a> ReactiveFactorContext<'a> {
             schema: batch.schema(),
             columns: batch.columns(),
             row_count: batch.num_rows(),
+            invalid_value_policy: ReactiveInvalidValuePolicy::Reject,
         }
     }
 
@@ -106,6 +133,11 @@ impl<'a> ReactiveFactorContext<'a> {
     /// Return the schema visible to the factor.
     pub fn schema(&self) -> &Schema {
         self.schema.as_ref()
+    }
+
+    /// Return the invalid-value policy active for this evaluation.
+    pub fn invalid_value_policy(&self) -> ReactiveInvalidValuePolicy {
+        self.invalid_value_policy
     }
 
     /// Resolve a field name to a column index.
@@ -145,6 +177,33 @@ impl<'a> ReactiveFactorContext<'a> {
                 ),
             }
         })
+    }
+}
+
+/// Classify a numeric input before it can mutate stateful reactive factor state.
+pub fn classify_reactive_state_input(
+    input: Option<f64>,
+    policy: ReactiveInvalidValuePolicy,
+    field: &str,
+    row: usize,
+) -> Result<Option<f64>> {
+    match input {
+        Some(value) if value.is_finite() && value.abs() < STATE_INPUT_SENTINEL_ABS_MIN => {
+            Ok(Some(value))
+        }
+        _ if policy == ReactiveInvalidValuePolicy::Skip => Ok(None),
+        Some(value) => Err(ZippyError::SchemaMismatch {
+            reason: format!(
+                "invalid reactive state input field=[{}] row=[{}] value=[{}]",
+                field, row, value
+            ),
+        }),
+        None => Err(ZippyError::SchemaMismatch {
+            reason: format!(
+                "invalid reactive state input field=[{}] row=[{}] value=[null]",
+                field, row
+            ),
+        }),
     }
 }
 
@@ -278,6 +337,8 @@ impl StatefulFloatById {
         Self {
             state,
             undo_log: None,
+            id_registry: HashMap::new(),
+            id_values: Vec::new(),
         }
     }
 
@@ -290,15 +351,16 @@ impl StatefulFloatById {
             return Ok(None);
         };
 
-        self.record_undo(id);
+        let id_key = self.intern_id(id);
+        self.record_undo(id_key);
 
         match &mut self.state {
             StatefulFloatState::Ema { alpha, state_by_id } => {
-                let next = match state_by_id.get(id).copied() {
+                let next = match state_by_id.get(&id_key).copied() {
                     Some(previous) => *alpha * value + (1.0 - *alpha) * previous,
                     None => value,
                 };
-                state_by_id.insert(id.to_string(), next);
+                state_by_id.insert(id_key, next);
                 Ok(Some(next))
             }
             StatefulFloatState::Window {
@@ -306,7 +368,7 @@ impl StatefulFloatById {
                 kind,
                 history_by_id,
             } => {
-                let history = history_by_id.entry(id.to_string()).or_default();
+                let history = history_by_id.entry(id_key).or_default();
 
                 let output = match kind {
                     WindowHistoryKind::Mean => {
@@ -420,27 +482,56 @@ impl StatefulFloatById {
             }
         }
 
+        self.rollback_new_interned_ids(undo_log.id_registry_len);
         Ok(())
     }
 
-    fn record_undo(&mut self, id: &str) {
+    fn intern_id(&mut self, id: &str) -> u32 {
+        if let Some(id_key) = self.id_registry.get(id).copied() {
+            return id_key;
+        }
+
+        let id_key = u32::try_from(self.id_values.len()).unwrap_or(u32::MAX);
+        if let Some(undo_log) = self.undo_log.as_mut() {
+            undo_log.id_registry_len.get_or_insert(self.id_values.len());
+        }
+        self.id_values.push(id.to_string());
+        self.id_registry.insert(id.to_string(), id_key);
+        id_key
+    }
+
+    fn rollback_new_interned_ids(&mut self, registry_len: Option<usize>) {
+        let Some(registry_len) = registry_len else {
+            return;
+        };
+        for id in self.id_values.drain(registry_len..) {
+            self.id_registry.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    fn interned_id_count_for_test(&self) -> usize {
+        self.id_values.len()
+    }
+
+    fn record_undo(&mut self, id: u32) {
         let Some(undo_log) = self.undo_log.as_mut() else {
             return;
         };
 
-        if undo_log.entries.contains_key(id) {
+        if undo_log.entries.contains_key(&id) {
             return;
         }
 
         let entry = match &self.state {
             StatefulFloatState::Ema { state_by_id, .. } => {
-                StatefulFloatUndoEntry::Ema(state_by_id.get(id).copied())
+                StatefulFloatUndoEntry::Ema(state_by_id.get(&id).copied())
             }
             StatefulFloatState::Window { history_by_id, .. } => {
-                StatefulFloatUndoEntry::Window(history_by_id.get(id).cloned())
+                StatefulFloatUndoEntry::Window(history_by_id.get(&id).cloned())
             }
         };
-        undo_log.entries.insert(id.to_string(), entry);
+        undo_log.entries.insert(id, entry);
     }
 }
 
@@ -718,8 +809,9 @@ impl ReactiveFactor for TsEmaFactor {
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
-        let (ids, values) = extract_context_columns(ctx, &self.id_field, &self.value_field)?;
-        self.evaluate_arrays(ids, values)
+        let (ids, values) = extract_context_state_columns(ctx, &self.id_field, &self.value_field)?;
+        let value_field = self.value_field.clone();
+        self.evaluate_arrays_with_policy(ids, values, ctx.invalid_value_policy(), &value_field)
     }
 
     fn begin_transaction(&mut self) {
@@ -737,16 +829,36 @@ impl ReactiveFactor for TsEmaFactor {
 
 impl TsEmaFactor {
     fn evaluate_arrays(&mut self, ids: &StringArray, values: &Float64Array) -> Result<ArrayRef> {
+        let value_field = self.value_field.clone();
+        self.evaluate_arrays_with_policy(
+            ids,
+            values,
+            ReactiveInvalidValuePolicy::Reject,
+            &value_field,
+        )
+    }
+
+    fn evaluate_arrays_with_policy(
+        &mut self,
+        ids: &StringArray,
+        values: &Float64Array,
+        invalid_value_policy: ReactiveInvalidValuePolicy,
+        value_field: &str,
+    ) -> Result<ArrayRef> {
         let mut builder = Float64Builder::with_capacity(values.len());
 
         for index in 0..values.len() {
             let id = ids.value(index);
-            let value = values.value(index);
-            let next = self
-                .state
-                .evaluate_optional(id, Some(value))?
-                .expect("ema emits a value for non-null input");
-            builder.append_value(next);
+            let input = classify_reactive_state_input(
+                (!values.is_null(index)).then(|| values.value(index)),
+                invalid_value_policy,
+                value_field,
+                index,
+            )?;
+            match self.state.evaluate_optional(id, input)? {
+                Some(value) => builder.append_value(value),
+                None => builder.append_null(),
+            }
         }
 
         Ok(Arc::new(builder.finish()))
@@ -820,8 +932,9 @@ impl ReactiveFactor for WindowHistoryFactor {
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
-        let (ids, values) = extract_context_columns(ctx, &self.id_field, &self.value_field)?;
-        self.evaluate_arrays(ids, values)
+        let (ids, values) = extract_context_state_columns(ctx, &self.id_field, &self.value_field)?;
+        let value_field = self.value_field.clone();
+        self.evaluate_arrays_with_policy(ids, values, ctx.invalid_value_policy(), &value_field)
     }
 
     fn begin_transaction(&mut self) {
@@ -839,12 +952,33 @@ impl ReactiveFactor for WindowHistoryFactor {
 
 impl WindowHistoryFactor {
     fn evaluate_arrays(&mut self, ids: &StringArray, values: &Float64Array) -> Result<ArrayRef> {
+        let value_field = self.value_field.clone();
+        self.evaluate_arrays_with_policy(
+            ids,
+            values,
+            ReactiveInvalidValuePolicy::Reject,
+            &value_field,
+        )
+    }
+
+    fn evaluate_arrays_with_policy(
+        &mut self,
+        ids: &StringArray,
+        values: &Float64Array,
+        invalid_value_policy: ReactiveInvalidValuePolicy,
+        value_field: &str,
+    ) -> Result<ArrayRef> {
         let mut builder = Float64Builder::with_capacity(values.len());
 
         for index in 0..values.len() {
             let id = ids.value(index);
-            let value = values.value(index);
-            match self.state.evaluate_optional(id, Some(value))? {
+            let input = classify_reactive_state_input(
+                (!values.is_null(index)).then(|| values.value(index)),
+                invalid_value_policy,
+                value_field,
+                index,
+            )?;
+            match self.state.evaluate_optional(id, input)? {
                 Some(value) => builder.append_value(value),
                 None => builder.append_null(),
             }
@@ -1031,6 +1165,17 @@ fn extract_context_columns<'a>(
     id_field: &str,
     value_field: &str,
 ) -> Result<(&'a StringArray, &'a Float64Array)> {
+    let (id_array, value_array) = extract_context_state_columns(ctx, id_field, value_field)?;
+
+    validate_id_value_arrays(id_array, value_array, id_field, value_field)?;
+    Ok((id_array, value_array))
+}
+
+fn extract_context_state_columns<'a>(
+    ctx: &'a ReactiveFactorContext<'_>,
+    id_field: &str,
+    value_field: &str,
+) -> Result<(&'a StringArray, &'a Float64Array)> {
     let id_array = ctx
         .column_by_name(id_field)?
         .as_any()
@@ -1046,7 +1191,7 @@ fn extract_context_columns<'a>(
             reason: format!("value field must be float64 field=[{}]", value_field),
         })?;
 
-    validate_id_value_arrays(id_array, value_array, id_field, value_field)?;
+    validate_id_array(id_array, id_field)?;
     Ok((id_array, value_array))
 }
 
@@ -1094,11 +1239,7 @@ fn validate_id_value_arrays(
     id_field: &str,
     value_field: &str,
 ) -> Result<()> {
-    if id_array.null_count() > 0 {
-        return Err(ZippyError::SchemaMismatch {
-            reason: format!("id field contains nulls field=[{}]", id_field),
-        });
-    }
+    validate_id_array(id_array, id_field)?;
 
     if value_array.null_count() > 0 {
         return Err(ZippyError::SchemaMismatch {
@@ -1121,6 +1262,16 @@ fn validate_id_value_arrays(
     Ok(())
 }
 
+fn validate_id_array(id_array: &StringArray, id_field: &str) -> Result<()> {
+    if id_array.null_count() > 0 {
+        return Err(ZippyError::SchemaMismatch {
+            reason: format!("id field contains nulls field=[{}]", id_field),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1128,7 +1279,7 @@ mod tests {
     use arrow::array::{ArrayRef, Float64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use super::{ReactiveFactorContext, WindowHistory};
+    use super::{ReactiveFactorContext, StatefulFloatById, StatefulFloatKind, WindowHistory};
 
     #[test]
     fn reactive_factor_context_resolves_columns_by_name() {
@@ -1178,5 +1329,25 @@ mod tests {
         assert_eq!(history.front(), Some(4.0));
         assert_eq!(history.sum(), 18.0);
         assert_eq!(history.sum_squares(), 116.0);
+    }
+
+    #[test]
+    fn stateful_float_rollback_removes_new_interned_ids() {
+        let mut state = StatefulFloatById::new(StatefulFloatKind::Ema { span: 2 });
+
+        state.begin_transaction();
+        assert_eq!(
+            state.evaluate_optional("A", Some(10.0)).unwrap(),
+            Some(10.0)
+        );
+        assert_eq!(state.interned_id_count_for_test(), 1);
+        state.rollback_transaction().unwrap();
+
+        assert_eq!(state.interned_id_count_for_test(), 0);
+        assert_eq!(
+            state.evaluate_optional("A", Some(20.0)).unwrap(),
+            Some(20.0)
+        );
+        assert_eq!(state.interned_id_count_for_test(), 1);
     }
 }

@@ -14,7 +14,7 @@ pub use bar_generator::{
     BootstrapPolicy, DtLabelPolicy, SessionWindow, VolumeOutputDtype, VolumeSpec,
 };
 pub use cross_sectional::CrossSectionalEngine;
-pub use reactive::{ReactiveStateEngine, ReactiveStateFailurePolicy};
+pub use reactive::{ReactiveInvalidValuePolicy, ReactiveStateEngine, ReactiveStateFailurePolicy};
 pub use reactive_latest::ReactiveLatestEngine;
 pub use stream_table::{
     KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,

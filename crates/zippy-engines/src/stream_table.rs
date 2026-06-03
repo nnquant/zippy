@@ -17,12 +17,12 @@ use arrow::{
 use parquet::arrow::ArrowWriter;
 use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
-    compile_schema, ColumnSpec, ColumnType, PartitionHandle, PartitionRowWriter,
-    PartitionWriterHandle, ReaderSession, RowSpanView, SealedSegmentHandle, SegmentLease,
-    SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
+    compile_schema, ColumnSpec, ColumnType, PartitionHandle, PartitionRowUpdater,
+    PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView, SealedSegmentHandle,
+    SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
 
-use crate::latest_state::LatestColumnarState;
+use crate::latest_state::{LatestColumnarState, LatestUpdateSet};
 
 const STREAM_TABLE_PARTITION: &str = "all";
 pub const DEFAULT_STREAM_TABLE_ROW_CAPACITY: usize = 65_536;
@@ -1079,6 +1079,80 @@ impl StreamTableMaterializer {
         Ok(())
     }
 
+    fn try_rewrite_active_with_table(&mut self, table: &SegmentTableView) -> Result<bool> {
+        self.ensure_persist_healthy()?;
+        if table.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "input batch schema does not match stream table input schema engine=[{}]",
+                    self.name
+                ),
+            });
+        }
+        if !self.sealed_segment_descriptors.is_empty() {
+            return Ok(false);
+        }
+
+        self.forwarded_active_descriptor = None;
+        let fields = self.input_schema.fields().clone();
+        let columns = (0..fields.len())
+            .map(|index| table.column_at(index))
+            .collect::<Result<Vec<_>>>()?;
+        let writer = self.partition.writer();
+        match writer.rewrite_rows(table.num_rows(), |row, row_index| {
+            Self::write_materialized_row_fields(row, &fields, &columns, row_index)
+        }) {
+            Ok(_) => {
+                self.publish_active_descriptor()?;
+                Ok(true)
+            }
+            Err(ZippySegmentStoreError::Writer("segment is full")) => Ok(false),
+            Err(error) => Err(segment_error(error)),
+        }
+    }
+
+    fn update_rows_in_place(
+        &mut self,
+        batch: &RecordBatch,
+        target_rows: &[usize],
+        skip_columns: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.ensure_persist_healthy()?;
+        if batch.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(ZippyError::SchemaMismatch {
+                reason: format!(
+                    "input batch schema does not match stream table input schema engine=[{}]",
+                    self.name
+                ),
+            });
+        }
+        if batch.num_rows() != target_rows.len() {
+            return Err(ZippyError::InvalidState {
+                status: "in-place row update target length mismatch",
+            });
+        }
+
+        let fields = self.input_schema.fields().clone();
+        let columns = (0..fields.len())
+            .map(|index| batch.column(index).clone())
+            .collect::<Vec<_>>();
+        let writer = self.partition.writer();
+        writer
+            .update_rows_at(target_rows, |row, update_index| {
+                Self::update_materialized_row_fields(
+                    row,
+                    &fields,
+                    &columns,
+                    update_index,
+                    skip_columns,
+                )
+            })
+            .map_err(segment_error)?;
+        self.forwarded_active_descriptor = None;
+        self.publish_active_descriptor()?;
+        Ok(())
+    }
+
     fn write_materialized_row(
         &self,
         writer: &PartitionWriterHandle,
@@ -1087,6 +1161,66 @@ impl StreamTableMaterializer {
         row_index: usize,
     ) -> std::result::Result<(), ZippySegmentStoreError> {
         writer.write_row(|row| Self::write_materialized_row_fields(row, fields, columns, row_index))
+    }
+
+    fn update_materialized_row_fields(
+        row: &mut PartitionRowUpdater<'_>,
+        fields: &Fields,
+        columns: &[ArrayRef],
+        row_index: usize,
+        skip_columns: &BTreeSet<String>,
+    ) -> std::result::Result<(), ZippySegmentStoreError> {
+        for (field_index, field) in fields.iter().enumerate() {
+            if skip_columns.contains(field.name().as_str()) {
+                continue;
+            }
+
+            let array = columns[field_index].as_ref();
+            if array.is_null(row_index) {
+                if field.is_nullable() {
+                    row.write_null(field.name())?;
+                    continue;
+                }
+                return Err(ZippySegmentStoreError::Schema(
+                    "non-nullable stream table column received null",
+                ));
+            }
+
+            match field.data_type() {
+                DataType::Int64 => {
+                    let values = array.as_any().downcast_ref::<Int64Array>().ok_or(
+                        ZippySegmentStoreError::Schema("int64 column downcast failed"),
+                    )?;
+                    row.write_i64(field.name(), values.value(row_index))?;
+                }
+                DataType::Float64 => {
+                    let values = array.as_any().downcast_ref::<Float64Array>().ok_or(
+                        ZippySegmentStoreError::Schema("float64 column downcast failed"),
+                    )?;
+                    row.write_f64(field.name(), values.value(row_index))?;
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or(ZippySegmentStoreError::Schema(
+                            "timestamp[ns] column downcast failed",
+                        ))?;
+                    row.write_i64(field.name(), values.value(row_index))?;
+                }
+                DataType::Utf8 => {
+                    return Err(ZippySegmentStoreError::Schema(
+                        "utf8 column cannot be updated in place",
+                    ));
+                }
+                _ => {
+                    return Err(ZippySegmentStoreError::Schema(
+                        "unsupported stream table column type",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn write_materialized_row_fields(
@@ -1631,6 +1765,49 @@ impl KeyValueTableMaterializer {
         metadata.snapshot_version = self.snapshot_version;
         metadata.last_changelog_seq = self.last_changelog_seq;
     }
+
+    fn in_place_snapshot_rows(&self, update: &LatestUpdateSet) -> Option<Vec<usize>> {
+        if self.snapshot_version == 0 || update.has_new_slots() {
+            return None;
+        }
+        if self.table.active_committed_row_count() != self.latest_state.len() {
+            return None;
+        }
+        if self.input_schema.fields().iter().any(|field| {
+            field.data_type() == &DataType::Utf8 && !self.by.iter().any(|key| key == field.name())
+        }) {
+            return None;
+        }
+
+        let rows = self.latest_state.snapshot_rows_for_slots(update.slots());
+        if rows.len() != update.slots().len() {
+            return None;
+        }
+        if rows
+            .iter()
+            .any(|row| *row >= self.table.active_committed_row_count())
+        {
+            return None;
+        }
+        Some(rows)
+    }
+
+    fn update_snapshot_storage(
+        &mut self,
+        update: &LatestUpdateSet,
+        update_batch: &RecordBatch,
+    ) -> Result<SegmentTableView> {
+        let snapshot = self.build_snapshot_batch()?;
+        let view = SegmentTableView::from_record_batch(snapshot);
+        if let Some(rows) = self.in_place_snapshot_rows(update) {
+            let skip_columns = self.by.iter().cloned().collect::<BTreeSet<_>>();
+            self.table
+                .update_rows_in_place(update_batch, &rows, &skip_columns)?;
+        } else if !self.table.try_rewrite_active_with_table(&view)? {
+            self.table.replace_with_table(&view)?;
+        }
+        Ok(view)
+    }
 }
 
 impl Engine for KeyValueTableMaterializer {
@@ -1679,9 +1856,7 @@ impl Engine for KeyValueTableMaterializer {
             self.snapshot_version = self.snapshot_version.saturating_add(1);
         }
         self.update_descriptor_metadata();
-        let snapshot = self.build_snapshot_batch()?;
-        let view = SegmentTableView::from_record_batch(snapshot);
-        self.table.replace_with_table(&view)?;
+        let view = self.update_snapshot_storage(&update, &update_batch)?;
         Ok(vec![view])
     }
 
@@ -2342,7 +2517,6 @@ fn compile_arrow_schema(schema: &SchemaRef) -> Result<zippy_segment_store::Compi
         .fields()
         .iter()
         .map(|field| {
-            let name: &'static str = Box::leak(field.name().to_string().into_boxed_str());
             let data_type = match field.data_type() {
                 DataType::Int64 => ColumnType::Int64,
                 DataType::Float64 => ColumnType::Float64,
@@ -2352,7 +2526,7 @@ fn compile_arrow_schema(schema: &SchemaRef) -> Result<zippy_segment_store::Compi
                         .as_ref()
                         .map(ToString::to_string)
                         .unwrap_or_else(|| "UTC".to_string());
-                    ColumnType::TimestampNsTz(Box::leak(timezone.into_boxed_str()))
+                    ColumnType::timestamp_ns_tz(timezone)
                 }
                 _ => {
                     return Err(ZippyError::SchemaMismatch {
@@ -2366,9 +2540,9 @@ fn compile_arrow_schema(schema: &SchemaRef) -> Result<zippy_segment_store::Compi
             };
 
             Ok(if field.is_nullable() {
-                ColumnSpec::nullable(name, data_type)
+                ColumnSpec::nullable(field.name().as_str(), data_type)
             } else {
-                ColumnSpec::new(name, data_type)
+                ColumnSpec::new(field.name().as_str(), data_type)
             })
         })
         .collect::<Result<Vec<_>>>()?;

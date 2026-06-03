@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "crosssectional_pipeline"
 harness = false
+
+[[bench]]
+name = "key_value_materializer"
+harness = false

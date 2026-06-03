@@ -6,6 +6,7 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use zippy_core::{Engine, EngineMetricsDelta, Result, SchemaRef, SegmentTableView, ZippyError};
+pub use zippy_operators::ReactiveInvalidValuePolicy;
 use zippy_operators::{ReactiveFactor, ReactiveFactorContext};
 
 use crate::table_view::{project_columns, string_array};
@@ -40,6 +41,7 @@ pub struct ReactiveStateEngine {
     id_column_index: Option<usize>,
     pending_filtered_rows: u64,
     state_failure_policy: ReactiveStateFailurePolicy,
+    invalid_value_policy: ReactiveInvalidValuePolicy,
     transaction_active: bool,
 }
 
@@ -89,6 +91,24 @@ impl ReactiveStateEngine {
         )
     }
 
+    /// Create a new reactive state engine with explicit invalid-value handling.
+    pub fn new_with_invalid_value_policy(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        factors: Vec<Box<dyn ReactiveFactor>>,
+        invalid_value_policy: ReactiveInvalidValuePolicy,
+    ) -> Result<Self> {
+        Self::new_with_id_filter_state_failure_and_invalid_value_policy(
+            name,
+            input_schema,
+            factors,
+            "",
+            None,
+            ReactiveStateFailurePolicy::FailFast,
+            invalid_value_policy,
+        )
+    }
+
     /// Create a new reactive state engine with an optional id whitelist.
     ///
     /// :param name: Engine instance name.
@@ -134,7 +154,29 @@ impl ReactiveStateEngine {
         id_filter: Option<Vec<String>>,
         state_failure_policy: ReactiveStateFailurePolicy,
     ) -> Result<Self> {
-        let output_schema = build_output_schema(&input_schema, &factors)?;
+        Self::new_with_id_filter_state_failure_and_invalid_value_policy(
+            name,
+            input_schema,
+            factors,
+            id_field,
+            id_filter,
+            state_failure_policy,
+            ReactiveInvalidValuePolicy::Reject,
+        )
+    }
+
+    /// Create a new reactive state engine with id filtering, state-failure handling, and
+    /// invalid-value handling.
+    pub fn new_with_id_filter_state_failure_and_invalid_value_policy(
+        name: impl Into<String>,
+        input_schema: SchemaRef,
+        factors: Vec<Box<dyn ReactiveFactor>>,
+        id_field: &str,
+        id_filter: Option<Vec<String>>,
+        state_failure_policy: ReactiveStateFailurePolicy,
+        invalid_value_policy: ReactiveInvalidValuePolicy,
+    ) -> Result<Self> {
+        let output_schema = build_output_schema(&input_schema, &factors, invalid_value_policy)?;
         let id_column_index = if id_field.is_empty() {
             None
         } else {
@@ -152,6 +194,7 @@ impl ReactiveStateEngine {
             id_column_index,
             pending_filtered_rows: 0,
             state_failure_policy,
+            invalid_value_policy,
             transaction_active: false,
         })
     }
@@ -159,6 +202,11 @@ impl ReactiveStateEngine {
     /// Return the configured state failure policy.
     pub fn state_failure_policy(&self) -> ReactiveStateFailurePolicy {
         self.state_failure_policy
+    }
+
+    /// Return the configured invalid-value policy.
+    pub fn invalid_value_policy(&self) -> ReactiveInvalidValuePolicy {
+        self.invalid_value_policy
     }
 }
 
@@ -280,13 +328,20 @@ impl ReactiveStateEngine {
         let mut current_schema = Arc::clone(&self.input_schema);
 
         for factor in &mut self.factors {
-            let context = ReactiveFactorContext::new(&current_schema, &columns)?;
+            let context = ReactiveFactorContext::new_with_invalid_value_policy(
+                &current_schema,
+                &columns,
+                self.invalid_value_policy,
+            )?;
             let output_field = factor.output_field();
             let output_column: ArrayRef = factor.evaluate_with_context(&context)?;
             columns.push(output_column);
 
             let mut fields = current_schema.fields().iter().cloned().collect::<Vec<_>>();
-            fields.push(Arc::new(output_field));
+            fields.push(Arc::new(output_field_for_invalid_value_policy(
+                output_field,
+                self.invalid_value_policy,
+            )));
             current_schema = Arc::new(Schema::new(fields));
         }
 
@@ -356,6 +411,7 @@ impl ReactiveStateEngine {
 fn build_output_schema(
     input_schema: &SchemaRef,
     factors: &[Box<dyn ReactiveFactor>],
+    invalid_value_policy: ReactiveInvalidValuePolicy,
 ) -> Result<SchemaRef> {
     let mut field_names = input_schema
         .fields()
@@ -377,10 +433,25 @@ fn build_output_schema(
             });
         }
 
-        fields.push(Arc::new(output_field));
+        fields.push(Arc::new(output_field_for_invalid_value_policy(
+            output_field,
+            invalid_value_policy,
+        )));
     }
 
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn output_field_for_invalid_value_policy(
+    field: arrow::datatypes::Field,
+    invalid_value_policy: ReactiveInvalidValuePolicy,
+) -> arrow::datatypes::Field {
+    if invalid_value_policy != ReactiveInvalidValuePolicy::Skip || field.is_nullable() {
+        return field;
+    }
+
+    arrow::datatypes::Field::new(field.name(), field.data_type().clone(), true)
+        .with_metadata(field.metadata().clone())
 }
 
 fn validate_id_field(schema: &Schema, id_field: &str) -> Result<usize> {

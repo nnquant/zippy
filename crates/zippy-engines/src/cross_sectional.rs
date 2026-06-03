@@ -88,12 +88,11 @@ impl CrossSectionalEngine {
         })
     }
 
-    fn finalize_bucket(
+    fn finalize_bucket_batch(
         &mut self,
         bucket_start: i64,
-        rows: &CrossSectionalBucketState,
+        bucket_batch: RecordBatch,
     ) -> Result<RecordBatch> {
-        let bucket_batch = rows.materialize()?;
         let id_index = self.input_schema.index_of(&self.id_column).map_err(|_| {
             ZippyError::SchemaMismatch {
                 reason: format!(
@@ -102,6 +101,7 @@ impl CrossSectionalEngine {
                 ),
             }
         })?;
+        let row_count = bucket_batch.num_rows();
         let dt_field = self
             .output_schema
             .field_with_name(&self.dt_column)
@@ -113,7 +113,7 @@ impl CrossSectionalEngine {
             })?;
         let mut columns = vec![
             Arc::clone(bucket_batch.column(id_index)),
-            bucket_start_array(bucket_start, rows.len(), dt_field.data_type())?,
+            bucket_start_array(bucket_start, row_count, dt_field.data_type())?,
         ];
 
         let mut context = CrossSectionalFactorContext::new(&bucket_batch);
@@ -183,64 +183,85 @@ impl Engine for CrossSectionalEngine {
         let _ids = checked_id_array(&id_array, &self.id_column)?;
         let dt_array = table.column(&self.dt_column)?;
         let dts = checked_dt_array(&dt_array, &self.dt_column)?;
-        let mut outputs = Vec::new();
+        let original_current_bucket_start = self.current_bucket_start;
+        let original_last_closed_bucket_start = self.last_closed_bucket_start;
+        let original_pending_late_rows = self.pending_late_rows;
+        let mut rows_undo = self.current_rows.begin_undo_log();
         let mut next_current_bucket_start = self.current_bucket_start;
-        let mut next_current_rows = self.current_rows.clone();
         let mut next_last_closed_bucket_start = self.last_closed_bucket_start;
         let mut next_pending_late_rows = self.pending_late_rows;
         let row_order = build_row_order(dts, table.num_rows(), self.trigger_interval);
 
-        for row_index in row_order.iter() {
-            let dt = dts.value(row_index);
-            let bucket_start = align_bucket_start(dt, self.trigger_interval);
+        let result = (|| -> Result<Vec<SegmentTableView>> {
+            let mut outputs = Vec::new();
+            for row_index in row_order.iter() {
+                let dt = dts.value(row_index);
+                let bucket_start = align_bucket_start(dt, self.trigger_interval);
 
-            match next_current_bucket_start {
-                Some(current_bucket_start) if bucket_start < current_bucket_start => {
-                    self.handle_late_row(
-                        dt,
-                        next_current_bucket_start,
-                        next_last_closed_bucket_start,
-                        &mut next_pending_late_rows,
-                    )?;
-                }
-                Some(current_bucket_start) if bucket_start == current_bucket_start => {
-                    next_current_rows.apply_row(&table, row_index)?;
-                }
-                Some(current_bucket_start) => {
-                    outputs.push(self.finalize_bucket(current_bucket_start, &next_current_rows)?);
-                    next_last_closed_bucket_start = Some(current_bucket_start);
-                    next_current_bucket_start = Some(bucket_start);
-                    next_current_rows.clear();
-                    next_current_rows.apply_row(&table, row_index)?;
-                }
-                None => {
-                    if matches!(
-                        next_last_closed_bucket_start,
-                        Some(last_closed_bucket_start) if bucket_start <= last_closed_bucket_start
-                    ) {
+                match next_current_bucket_start {
+                    Some(current_bucket_start) if bucket_start < current_bucket_start => {
                         self.handle_late_row(
                             dt,
                             next_current_bucket_start,
                             next_last_closed_bucket_start,
                             &mut next_pending_late_rows,
                         )?;
-                    } else {
+                    }
+                    Some(current_bucket_start) if bucket_start == current_bucket_start => {
+                        self.current_rows
+                            .apply_row_with_undo(&table, row_index, &mut rows_undo)?;
+                    }
+                    Some(current_bucket_start) => {
+                        let bucket_batch = self.current_rows.materialize()?;
+                        outputs
+                            .push(self.finalize_bucket_batch(current_bucket_start, bucket_batch)?);
+                        next_last_closed_bucket_start = Some(current_bucket_start);
                         next_current_bucket_start = Some(bucket_start);
-                        next_current_rows.apply_row(&table, row_index)?;
+                        self.current_rows.clear_with_undo(&mut rows_undo);
+                        self.current_rows
+                            .apply_row_with_undo(&table, row_index, &mut rows_undo)?;
+                    }
+                    None => {
+                        if matches!(
+                            next_last_closed_bucket_start,
+                            Some(last_closed_bucket_start) if bucket_start <= last_closed_bucket_start
+                        ) {
+                            self.handle_late_row(
+                                dt,
+                                next_current_bucket_start,
+                                next_last_closed_bucket_start,
+                                &mut next_pending_late_rows,
+                            )?;
+                        } else {
+                            next_current_bucket_start = Some(bucket_start);
+                            self.current_rows.apply_row_with_undo(
+                                &table,
+                                row_index,
+                                &mut rows_undo,
+                            )?;
+                        }
                     }
                 }
             }
+
+            self.current_bucket_start = next_current_bucket_start;
+            self.last_closed_bucket_start = next_last_closed_bucket_start;
+            self.pending_late_rows = next_pending_late_rows;
+
+            Ok(outputs
+                .into_iter()
+                .map(SegmentTableView::from_record_batch)
+                .collect())
+        })();
+
+        if result.is_err() {
+            self.current_rows.rollback_undo(rows_undo);
+            self.current_bucket_start = original_current_bucket_start;
+            self.last_closed_bucket_start = original_last_closed_bucket_start;
+            self.pending_late_rows = original_pending_late_rows;
         }
 
-        self.current_bucket_start = next_current_bucket_start;
-        self.current_rows = next_current_rows;
-        self.last_closed_bucket_start = next_last_closed_bucket_start;
-        self.pending_late_rows = next_pending_late_rows;
-
-        Ok(outputs
-            .into_iter()
-            .map(SegmentTableView::from_record_batch)
-            .collect())
+        result
     }
 
     fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
@@ -253,8 +274,8 @@ impl Engine for CrossSectionalEngine {
             return Ok(vec![]);
         }
 
-        let current_rows = self.current_rows.clone();
-        let output = self.finalize_bucket(bucket_start, &current_rows)?;
+        let bucket_batch = self.current_rows.materialize()?;
+        let output = self.finalize_bucket_batch(bucket_start, bucket_batch)?;
         self.last_closed_bucket_start = Some(bucket_start);
         self.current_bucket_start = None;
         self.current_rows.clear();

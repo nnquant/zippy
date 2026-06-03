@@ -13,8 +13,9 @@ pub use cross_sectional::{
 };
 pub use expression::ExpressionSpec;
 pub use reactive::{
-    AbsSpec, CastSpec, ClipSpec, LogSpec, ReactiveFactor, ReactiveFactorContext, TsDelaySpec,
-    TsDiffSpec, TsEmaSpec, TsMeanSpec, TsReturnSpec, TsStdSpec,
+    AbsSpec, CastSpec, ClipSpec, LogSpec, ReactiveFactor, ReactiveFactorContext,
+    ReactiveInvalidValuePolicy, TsDelaySpec, TsDiffSpec, TsEmaSpec, TsMeanSpec, TsReturnSpec,
+    TsStdSpec,
 };
 
 pub fn crate_name() -> &'static str {

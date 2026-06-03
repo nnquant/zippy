@@ -63,6 +63,29 @@ fn batch_with_schema(
     SegmentTableView::from_record_batch(record_batch_with_schema(schema, symbols, dts, values))
 }
 
+fn nullable_symbol_batch(
+    schema: Arc<Schema>,
+    symbols: Vec<Option<&str>>,
+    dts: Vec<i64>,
+    values: Vec<f64>,
+) -> SegmentTableView {
+    let timezone = match schema.field_with_name("dt").unwrap().data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) => timezone.clone(),
+        data_type => panic!("unexpected dt data type [{data_type:?}]"),
+    };
+    SegmentTableView::from_record_batch(
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(symbols)) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(dts).with_timezone(timezone)) as ArrayRef,
+                Arc::new(Float64Array::from(values)) as ArrayRef,
+            ],
+        )
+        .unwrap(),
+    )
+}
+
 fn string_values(array: zippy_core::Result<ArrayRef>) -> Vec<String> {
     let array = array.unwrap();
     let values = array.as_any().downcast_ref::<StringArray>().unwrap();
@@ -479,6 +502,41 @@ fn cross_sectional_engine_rejects_late_data_for_closed_bucket() {
             ..
         }
     ));
+}
+
+#[test]
+fn cross_sectional_engine_rolls_back_touched_rows_when_batch_fails() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, true),
+        Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("ret_1m", DataType::Float64, false),
+    ]));
+    let mut engine = CrossSectionalEngine::new(
+        "cs",
+        Arc::clone(&schema),
+        "symbol",
+        "dt",
+        MINUTE_NS,
+        LateDataPolicy::Reject,
+        vec![CSRankSpec::new("ret_1m", "ret_rank").build().unwrap()],
+    )
+    .unwrap();
+
+    let error = engine
+        .on_data(nullable_symbol_batch(
+            schema,
+            vec![Some("A"), None],
+            vec![1_000_000_000, 2_000_000_000],
+            vec![1.0, 2.0],
+        ))
+        .unwrap_err();
+
+    assert!(matches!(error, ZippyError::SchemaMismatch { .. }));
+    assert!(engine.on_flush().unwrap().is_empty());
 }
 
 #[test]

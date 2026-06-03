@@ -4365,7 +4365,6 @@ fn compile_segment_schema_from_stream_metadata(schema: &Value) -> Result<Compile
                     reason: "stream schema field missing nullable".to_string(),
                 })?;
             let timezone = field.get("timezone").and_then(Value::as_str);
-            let name: &'static str = Box::leak(name.to_string().into_boxed_str());
             let data_type = parse_segment_schema_metadata_data_type(segment_type, timezone)?;
             Ok(if nullable {
                 ColumnSpec::nullable(name, data_type)
@@ -4418,8 +4417,7 @@ fn parse_segment_schema_metadata_data_type(
             let timezone = timezone.ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "timestamp_ns_tz stream schema field missing timezone".to_string(),
             })?;
-            let timezone: &'static str = Box::leak(timezone.to_string().into_boxed_str());
-            Ok(ColumnType::TimestampNsTz(timezone))
+            Ok(ColumnType::timestamp_ns_tz(timezone))
         }
         "timestamp_ns" => Err(ZippyError::InvalidConfig {
             reason: "segment stream timestamp columns must include an explicit timezone"
@@ -5030,19 +5028,9 @@ fn evaluate_is_in_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<Boole
                 ),
             })?;
     let column = batch.column(column_index);
+    let membership = GatewayIsInMembership::from_json_values(column.data_type().clone(), values)?;
     let mask = match column.data_type() {
         DataType::Utf8 => {
-            let values = values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| ZippyError::InvalidConfig {
-                            reason: "string is_in literal values must be strings".to_string(),
-                        })
-                })
-                .collect::<Result<Vec<_>>>()?;
             let column = column
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -5050,65 +5038,47 @@ fn evaluate_is_in_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<Boole
             BooleanArray::from(
                 (0..column.len())
                     .map(|index| {
-                        !column.is_null(index) && values.iter().any(|v| v == column.value(index))
+                        !column.is_null(index) && membership.contains_string(column.value(index))
                     })
                     .collect::<Vec<_>>(),
             )
         }
         DataType::Float64 => {
-            let values = values
-                .iter()
-                .map(|value| {
-                    value.as_f64().ok_or_else(|| ZippyError::InvalidConfig {
-                        reason: "float is_in literal values must be numeric".to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
             let column = column
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .expect("float64 array must downcast to Float64Array");
             BooleanArray::from(
                 (0..column.len())
-                    .map(|index| !column.is_null(index) && values.contains(&column.value(index)))
+                    .map(|index| {
+                        !column.is_null(index) && membership.contains_f64(column.value(index))
+                    })
                     .collect::<Vec<_>>(),
             )
         }
         DataType::Int64 => {
-            let values = values
-                .iter()
-                .map(|value| {
-                    value.as_i64().ok_or_else(|| ZippyError::InvalidConfig {
-                        reason: "int is_in literal values must be integers".to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
             let column = column
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("int64 array must downcast to Int64Array");
             BooleanArray::from(
                 (0..column.len())
-                    .map(|index| !column.is_null(index) && values.contains(&column.value(index)))
+                    .map(|index| {
+                        !column.is_null(index) && membership.contains_i64(column.value(index))
+                    })
                     .collect::<Vec<_>>(),
             )
         }
         DataType::Boolean => {
-            let values = values
-                .iter()
-                .map(|value| {
-                    value.as_bool().ok_or_else(|| ZippyError::InvalidConfig {
-                        reason: "boolean is_in literal values must be boolean".to_string(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
             let column = column
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .expect("boolean array must downcast to BooleanArray");
             BooleanArray::from(
                 (0..column.len())
-                    .map(|index| !column.is_null(index) && values.contains(&column.value(index)))
+                    .map(|index| {
+                        !column.is_null(index) && membership.contains_bool(column.value(index))
+                    })
                     .collect::<Vec<_>>(),
             )
         }
@@ -5119,6 +5089,121 @@ fn evaluate_is_in_filter_expr(batch: &RecordBatch, expr: &Value) -> Result<Boole
         }
     };
     Ok(mask)
+}
+
+enum GatewayIsInMembership {
+    Strings(HashSet<String>),
+    Float64(HashSet<u64>),
+    Int64(HashSet<i64>),
+    Boolean { allow_true: bool, allow_false: bool },
+}
+
+impl GatewayIsInMembership {
+    fn from_json_values(data_type: DataType, values: &[Value]) -> Result<Self> {
+        match data_type {
+            DataType::Utf8 => Ok(Self::Strings(
+                values
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            ZippyError::InvalidConfig {
+                                reason: "string is_in literal values must be strings".to_string(),
+                            }
+                        })
+                    })
+                    .collect::<Result<HashSet<_>>>()?,
+            )),
+            DataType::Float64 => Ok(Self::Float64(
+                values
+                    .iter()
+                    .map(|value| {
+                        value.as_f64().map(Self::float_key).ok_or_else(|| {
+                            ZippyError::InvalidConfig {
+                                reason: "float is_in literal values must be numeric".to_string(),
+                            }
+                        })
+                    })
+                    .collect::<Result<HashSet<_>>>()?,
+            )),
+            DataType::Int64 => Ok(Self::Int64(
+                values
+                    .iter()
+                    .map(|value| {
+                        value.as_i64().ok_or_else(|| ZippyError::InvalidConfig {
+                            reason: "int is_in literal values must be integers".to_string(),
+                        })
+                    })
+                    .collect::<Result<HashSet<_>>>()?,
+            )),
+            DataType::Boolean => {
+                let mut allow_true = false;
+                let mut allow_false = false;
+                for value in values {
+                    match value.as_bool() {
+                        Some(true) => allow_true = true,
+                        Some(false) => allow_false = true,
+                        None => {
+                            return Err(ZippyError::InvalidConfig {
+                                reason: "boolean is_in literal values must be boolean".to_string(),
+                            });
+                        }
+                    }
+                }
+                Ok(Self::Boolean {
+                    allow_true,
+                    allow_false,
+                })
+            }
+            other => Err(ZippyError::InvalidConfig {
+                reason: format!("unsupported gateway is_in filter type=[{:?}]", other),
+            }),
+        }
+    }
+
+    fn contains_string(&self, value: &str) -> bool {
+        match self {
+            Self::Strings(values) => values.contains(value),
+            _ => false,
+        }
+    }
+
+    fn contains_f64(&self, value: f64) -> bool {
+        match self {
+            Self::Float64(values) => values.contains(&Self::float_key(value)),
+            _ => false,
+        }
+    }
+
+    fn contains_i64(&self, value: i64) -> bool {
+        match self {
+            Self::Int64(values) => values.contains(&value),
+            _ => false,
+        }
+    }
+
+    fn contains_bool(&self, value: bool) -> bool {
+        match self {
+            Self::Boolean {
+                allow_true,
+                allow_false,
+            } => {
+                if value {
+                    *allow_true
+                } else {
+                    *allow_false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn float_key(value: f64) -> u64 {
+        if value == 0.0 {
+            0.0_f64.to_bits()
+        } else {
+            value.to_bits()
+        }
+    }
 }
 
 fn compare_filter_expr(
@@ -5778,6 +5863,57 @@ mod tests {
             .unwrap();
         assert_eq!(result.num_rows(), 1);
         assert_eq!(seq.value(0), 2);
+    }
+
+    #[test]
+    fn gateway_is_in_filter_uses_compiled_membership_for_common_types() {
+        let string_values = (0..256)
+            .map(|index| json!(format!("IF{index:04}")))
+            .collect::<Vec<_>>();
+        let string_membership =
+            GatewayIsInMembership::from_json_values(DataType::Utf8, &string_values).unwrap();
+        assert!(string_membership.contains_string("IF0255"));
+        assert!(!string_membership.contains_string("IF9999"));
+
+        let int_values = (0..256).map(|index| json!(index)).collect::<Vec<_>>();
+        let int_membership =
+            GatewayIsInMembership::from_json_values(DataType::Int64, &int_values).unwrap();
+        assert!(int_membership.contains_i64(255));
+        assert!(!int_membership.contains_i64(9999));
+
+        let bool_membership =
+            GatewayIsInMembership::from_json_values(DataType::Boolean, &[json!(true)]).unwrap();
+        assert!(bool_membership.contains_bool(true));
+        assert!(!bool_membership.contains_bool(false));
+    }
+
+    #[test]
+    #[ignore = "micro profile; run explicitly with --ignored --nocapture"]
+    fn gateway_is_in_large_literal_membership_profile() {
+        let literal_count = 50_000;
+        let row_count = 200_000;
+        let values = (0..literal_count)
+            .map(|index| json!(format!("IF{index:05}")))
+            .collect::<Vec<_>>();
+
+        let build_start = std::time::Instant::now();
+        let membership = GatewayIsInMembership::from_json_values(DataType::Utf8, &values).unwrap();
+        let build_elapsed = build_start.elapsed();
+
+        let contains_start = std::time::Instant::now();
+        let matches = (0..row_count)
+            .filter(|index| membership.contains_string(&format!("IF{:05}", index % literal_count)))
+            .count();
+        let contains_elapsed = contains_start.elapsed();
+
+        eprintln!(
+            "gateway is_in profile literal_count=[{}] row_count=[{}] build_us=[{}] contains_us=[{}]",
+            literal_count,
+            row_count,
+            build_elapsed.as_micros(),
+            contains_elapsed.as_micros()
+        );
+        assert_eq!(matches, row_count);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use zippy_core::{
     spawn_engine, Engine, EngineConfig, EngineMetricsSnapshot, LateDataPolicy, OverflowPolicy,
     SegmentTableView, ZippyError,
 };
-use zippy_engines::{ReactiveStateEngine, ReactiveStateFailurePolicy};
+use zippy_engines::{ReactiveInvalidValuePolicy, ReactiveStateEngine, ReactiveStateFailurePolicy};
 use zippy_operators::{
     CastSpec, ExpressionSpec, ReactiveFactor, ReactiveFactorContext, TsDiffSpec, TsEmaSpec,
     TsReturnSpec,
@@ -236,6 +236,64 @@ fn reactive_engine_keeps_factor_state_across_on_data_calls() {
     assert_float_options_eq(
         &float64_values(second.column_at(3)),
         vec![Some(0.9), Some(0.5625)].as_slice(),
+    );
+}
+
+#[test]
+fn reactive_engine_rejects_dbl_max_sentinel_by_default() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let mut engine = ReactiveStateEngine::new("reactive", input_schema(), factors).unwrap();
+
+    let error = engine
+        .on_data(batch(vec!["a"], vec![f64::MAX]))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("invalid reactive state input"));
+}
+
+#[test]
+fn reactive_engine_skip_invalid_values_does_not_pollute_ema_state() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_invalid_value_policy(
+        "reactive",
+        input_schema(),
+        factors,
+        ReactiveInvalidValuePolicy::Skip,
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["a", "a", "a"], vec![10.0, f64::MAX, 16.0]))
+        .unwrap();
+    let output = &outputs[0];
+
+    assert!(output.schema().field(2).is_nullable());
+    assert_float_options_eq(
+        &float64_values(output.column_at(2)),
+        &[Some(10.0), None, Some(14.0)],
+    );
+}
+
+#[test]
+fn reactive_engine_skip_invalid_values_does_not_pollute_expression_ts_state() {
+    let factors = vec![ExpressionSpec::new("TS_RETURN(value, 1)", "ret_1")
+        .build_reactive_factor(input_schema().as_ref(), "id")
+        .unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_invalid_value_policy(
+        "reactive",
+        input_schema(),
+        factors,
+        ReactiveInvalidValuePolicy::Skip,
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(vec!["a", "a", "a"], vec![10.0, f64::MAX, 15.0]))
+        .unwrap();
+
+    assert_float_options_eq(
+        &float64_values(outputs[0].column_at(2)),
+        &[None, None, Some(0.5)],
     );
 }
 

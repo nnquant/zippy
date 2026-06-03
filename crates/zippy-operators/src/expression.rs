@@ -10,7 +10,8 @@ use arrow::record_batch::RecordBatch;
 use zippy_core::{Result, ZippyError};
 
 use crate::reactive::{
-    ReactiveFactor, ReactiveFactorContext, StatefulFloatById, StatefulFloatKind,
+    classify_reactive_state_input, ReactiveFactor, ReactiveFactorContext,
+    ReactiveInvalidValuePolicy, StatefulFloatById, StatefulFloatKind,
 };
 
 const EXPRESSION_LOG_INPUT_MUST_BE_POSITIVE: &str = "expression log input must be positive";
@@ -173,7 +174,16 @@ impl ReactiveFactor for PlannedExpressionFactor {
                         let state = self.node_states[node.id.as_usize()]
                             .as_mut()
                             .expect("ts state initialized for ts nodes");
-                        match state.evaluate_optional(id, input.as_f64()?)? {
+                        let input = match input.as_f64()? {
+                            Some(value) => classify_reactive_state_input(
+                                Some(value),
+                                ReactiveInvalidValuePolicy::Reject,
+                                self.plan.output_field.name(),
+                                row,
+                            )?,
+                            None => None,
+                        };
+                        match state.evaluate_optional(id, input)? {
                             Some(value) => EvalValue::Float64(value),
                             None => EvalValue::Null,
                         }
@@ -233,7 +243,16 @@ impl ReactiveFactor for PlannedExpressionFactor {
                         let state = self.node_states[node.id.as_usize()]
                             .as_mut()
                             .expect("ts state initialized for ts nodes");
-                        match state.evaluate_optional(id, input.as_f64()?)? {
+                        let input = match input.as_f64()? {
+                            Some(value) => classify_reactive_state_input(
+                                Some(value),
+                                ctx.invalid_value_policy(),
+                                self.plan.output_field.name(),
+                                row,
+                            )?,
+                            None => None,
+                        };
+                        match state.evaluate_optional(id, input)? {
                             Some(value) => EvalValue::Float64(value),
                             None => EvalValue::Null,
                         }

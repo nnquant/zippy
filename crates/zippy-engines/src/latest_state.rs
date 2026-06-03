@@ -22,11 +22,20 @@ pub(crate) struct LatestColumnarState {
 #[derive(Debug)]
 pub(crate) struct LatestUpdateSet {
     slots: Vec<usize>,
+    new_slots: Vec<usize>,
 }
 
 impl LatestUpdateSet {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    pub(crate) fn slots(&self) -> &[usize] {
+        &self.slots
+    }
+
+    pub(crate) fn has_new_slots(&self) -> bool {
+        !self.new_slots.is_empty()
     }
 }
 
@@ -137,6 +146,10 @@ impl LatestColumnarState {
         self.key_to_slot.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.key_to_slot.len()
+    }
+
     pub(crate) fn apply_batch(&mut self, table: &SegmentTableView) -> Result<LatestUpdateSet> {
         if table.schema().as_ref() != self.schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
@@ -155,6 +168,17 @@ impl LatestColumnarState {
     pub(crate) fn materialize_snapshot(&self) -> Result<RecordBatch> {
         let slots = self.key_to_slot.values().copied().collect::<Vec<_>>();
         self.materialize_slots(&slots)
+    }
+
+    pub(crate) fn snapshot_rows_for_slots(&self, slots: &[usize]) -> Vec<usize> {
+        let mut slot_to_row = BTreeMap::new();
+        for (row_index, slot) in self.key_to_slot.values().copied().enumerate() {
+            slot_to_row.insert(slot, row_index);
+        }
+        slots
+            .iter()
+            .filter_map(|slot| slot_to_row.get(slot).copied())
+            .collect()
     }
 
     fn prepare_batch_update(&self, table: &SegmentTableView) -> Result<PreparedLatestUpdate> {
@@ -204,11 +228,16 @@ impl LatestColumnarState {
 
     fn commit_batch_update(&mut self, update: PreparedLatestUpdate) -> Result<LatestUpdateSet> {
         let mut updated_slots = Vec::with_capacity(update.rows.len());
+        let mut new_slots = Vec::new();
 
         for (key, cells) in update.rows {
             let slot = match self.key_to_slot.get(&key).copied() {
                 Some(slot) => slot,
-                None => self.allocate_slot(key.clone()),
+                None => {
+                    let slot = self.allocate_slot(key.clone());
+                    new_slots.push(slot);
+                    slot
+                }
             };
             self.sequence += 1;
             self.slots[slot]._sequence = self.sequence;
@@ -221,6 +250,7 @@ impl LatestColumnarState {
 
         Ok(LatestUpdateSet {
             slots: updated_slots,
+            new_slots,
         })
     }
 
