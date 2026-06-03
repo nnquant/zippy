@@ -29,6 +29,7 @@ pub struct MasterClient {
     endpoint: ControlEndpoint,
     process_id: Option<String>,
     process_token: Option<String>,
+    process_app: Option<String>,
     token: Option<String>,
 }
 
@@ -52,6 +53,7 @@ impl MasterClient {
             endpoint,
             process_id: None,
             process_token: None,
+            process_app: None,
             token: None,
         })
     }
@@ -66,6 +68,10 @@ impl MasterClient {
 
     pub fn process_token(&self) -> Option<&str> {
         self.process_token.as_deref()
+    }
+
+    pub fn process_app(&self) -> Option<&str> {
+        self.process_app.as_deref()
     }
 
     pub fn set_token(&mut self, token: impl Into<String>) {
@@ -85,10 +91,20 @@ impl MasterClient {
             } => {
                 self.process_id = Some(process_id.clone());
                 self.process_token = Some(process_token);
+                self.process_app = Some(app.to_string());
                 Ok(process_id)
             }
             other => Err(unexpected_response("ProcessRegistered", other)),
         }
+    }
+
+    pub fn reregister_process(&mut self) -> Result<String> {
+        let app = self.process_app.clone().ok_or(ZippyError::InvalidState {
+            status: "master client process app missing",
+        })?;
+        self.process_id = None;
+        self.process_token = None;
+        self.register_process(&app)
     }
 
     pub fn heartbeat(&self) -> Result<()> {
@@ -141,6 +157,7 @@ impl MasterClient {
             ControlResponse::ProcessUnregistered { .. } => {
                 self.process_id = None;
                 self.process_token = None;
+                self.process_app = None;
                 Ok(())
             }
             other => Err(unexpected_response("ProcessUnregistered", other)),
@@ -476,11 +493,26 @@ impl MasterClient {
     pub fn release_segment_reader_lease(&self, stream_name: &str, lease_id: &str) -> Result<()> {
         let process_id = self.require_process_id()?;
         let process_token = Some(self.require_process_token()?);
+        self.release_segment_reader_lease_for_process(
+            stream_name,
+            lease_id,
+            &process_id,
+            process_token.as_deref(),
+        )
+    }
+
+    pub fn release_segment_reader_lease_for_process(
+        &self,
+        stream_name: &str,
+        lease_id: &str,
+        process_id: &str,
+        process_token: Option<&str>,
+    ) -> Result<()> {
         let response = self.send_request(ControlRequest::ReleaseSegmentReaderLease(
             ReleaseSegmentReaderLeaseRequest {
                 stream_name: stream_name.to_string(),
-                process_id,
-                process_token,
+                process_id: process_id.to_string(),
+                process_token: process_token.map(ToOwned::to_owned),
                 lease_id: lease_id.to_string(),
             },
         ))?;

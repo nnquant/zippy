@@ -35,6 +35,7 @@ use zippy_engines::{
     BarSessionSpec as RustBarSessionSpec, BootstrapPolicy as RustBootstrapPolicy,
     CrossSectionalEngine as RustCrossSectionalEngine, DtLabelPolicy as RustDtLabelPolicy,
     KeyValueTableMaterializer as RustKeyValueTableMaterializer,
+    ReactiveInvalidValuePolicy as RustReactiveInvalidValuePolicy,
     ReactiveLatestEngine as RustReactiveLatestEngine,
     ReactiveStateEngine as RustReactiveStateEngine,
     ReactiveStateFailurePolicy as RustReactiveStateFailurePolicy,
@@ -826,14 +827,12 @@ fn compile_segment_schema_from_arrow(schema: &Schema) -> PyResult<CompiledSchema
         .fields()
         .iter()
         .map(|field| {
-            let name: &'static str = Box::leak(field.name().clone().into_boxed_str());
             let data_type = match field.data_type() {
                 DataType::Int64 => ColumnType::Int64,
                 DataType::Float64 => ColumnType::Float64,
                 DataType::Utf8 => ColumnType::Utf8,
                 DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone)) => {
-                    let timezone: &'static str = Box::leak(timezone.to_string().into_boxed_str());
-                    ColumnType::TimestampNsTz(timezone)
+                    ColumnType::timestamp_ns_tz(timezone.to_string())
                 }
                 DataType::Timestamp(TimeUnit::Nanosecond, None) => {
                     return Err(py_value_error(
@@ -849,9 +848,9 @@ fn compile_segment_schema_from_arrow(schema: &Schema) -> PyResult<CompiledSchema
                 }
             };
             Ok(if field.is_nullable() {
-                ColumnSpec::nullable(name, data_type)
+                ColumnSpec::nullable(field.name().as_str(), data_type)
             } else {
-                ColumnSpec::new(name, data_type)
+                ColumnSpec::new(field.name().as_str(), data_type)
             })
         })
         .collect::<PyResult<Vec<_>>>()?;
@@ -881,7 +880,6 @@ fn compile_segment_schema_from_stream_metadata(
                 .get("nullable")
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| py_value_error("stream schema field missing nullable"))?;
-            let name: &'static str = Box::leak(name.to_string().into_boxed_str());
             let timezone = field.get("timezone").and_then(serde_json::Value::as_str);
             let data_type = parse_segment_schema_metadata_data_type(data_type, timezone)?;
             Ok(if nullable {
@@ -942,8 +940,7 @@ fn parse_segment_schema_metadata_data_type(
         let timezone = timezone.ok_or_else(|| {
             py_value_error("timestamp_ns_tz stream schema field missing timezone")
         })?;
-        let timezone: &'static str = Box::leak(timezone.to_string().into_boxed_str());
-        return Ok(ColumnType::TimestampNsTz(timezone));
+        return Ok(ColumnType::timestamp_ns_tz(timezone));
     }
     if segment_type == "timestamp_ns" {
         return Err(py_value_error(
@@ -2257,6 +2254,8 @@ struct SegmentReaderLeaseGuard {
     master: SharedMasterClient,
     source: String,
     lease_id: Option<String>,
+    process_id: String,
+    process_token: String,
 }
 
 #[derive(Clone)]
@@ -2270,6 +2269,8 @@ struct ActiveSegmentReaderHandle {
     reader_lease: Option<SegmentReaderLeaseGuard>,
 }
 
+type InitialSegmentReaderHandle = (ActiveSegmentReaderHandle, String, u64, usize);
+
 struct SegmentReaderLeaseSet {
     _leases: Vec<SegmentReaderLeaseGuard>,
 }
@@ -2282,14 +2283,30 @@ impl SegmentReaderLeaseGuard {
     ) -> zippy_core::Result<Self> {
         let source = source.into();
         let (segment_id, generation) = descriptor_segment_identity(descriptor)?;
-        let lease_id = master
-            .lock()
-            .unwrap()
-            .acquire_segment_reader_lease(&source, segment_id, generation)?;
+        let (lease_id, process_id, process_token) = match acquire_segment_reader_lease_once(
+            Arc::clone(&master),
+            &source,
+            segment_id,
+            generation,
+        ) {
+            Ok(lease_id) => lease_id,
+            Err(error) if is_master_process_invalid_error(&error) => {
+                reregister_shared_master_process(Arc::clone(&master))?;
+                acquire_segment_reader_lease_once(
+                    Arc::clone(&master),
+                    &source,
+                    segment_id,
+                    generation,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             master,
             source,
             lease_id: Some(lease_id),
+            process_id,
+            process_token,
         })
     }
 
@@ -2310,8 +2327,16 @@ impl Drop for SegmentReaderLeaseGuard {
             .master
             .lock()
             .unwrap()
-            .release_segment_reader_lease(&self.source, &lease_id)
+            .release_segment_reader_lease_for_process(
+                &self.source,
+                &lease_id,
+                &self.process_id,
+                Some(&self.process_token),
+            )
         {
+            if is_reclaimed_segment_reader_lease_error(&error) {
+                return;
+            }
             error!(
                 event = "release_segment_reader_lease",
                 source = %self.source,
@@ -2321,6 +2346,33 @@ impl Drop for SegmentReaderLeaseGuard {
             );
         }
     }
+}
+
+fn acquire_segment_reader_lease_once(
+    master: SharedMasterClient,
+    source: &str,
+    segment_id: u64,
+    generation: u64,
+) -> zippy_core::Result<(String, String, String)> {
+    let client = master.lock().unwrap();
+    let process_id = client
+        .process_id()
+        .ok_or(ZippyError::InvalidState {
+            status: "master client process not registered",
+        })?
+        .to_string();
+    let process_token = client
+        .process_token()
+        .ok_or(ZippyError::InvalidState {
+            status: "master client process token missing",
+        })?
+        .to_string();
+    let lease_id = client.acquire_segment_reader_lease(source, segment_id, generation)?;
+    Ok((lease_id, process_id, process_token))
+}
+
+fn reregister_shared_master_process(master: SharedMasterClient) -> zippy_core::Result<String> {
+    master.lock().unwrap().reregister_process()
 }
 
 impl SegmentReaderLeaseSet {
@@ -3063,6 +3115,8 @@ struct SubscriberMetrics {
     batches_delivered_total: AtomicU64,
     descriptor_updates_total: AtomicU64,
     descriptor_rebinds_total: AtomicU64,
+    layout_mismatch_rebind_total: AtomicU64,
+    stale_rows_skipped_total: AtomicU64,
     current_descriptor_generation: AtomicU64,
     current_segment_id: AtomicU64,
     current_segment_generation: AtomicU64,
@@ -3105,6 +3159,16 @@ impl SubscriberMetrics {
             .store(descriptor_generation, Ordering::SeqCst);
         self.last_descriptor_update_ns
             .store(current_localtime_ns() as u64, Ordering::SeqCst);
+    }
+
+    fn record_layout_mismatch_rebind(&self) {
+        self.layout_mismatch_rebind_total
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_stale_rows_skipped(&self, row_count: usize) {
+        self.stale_rows_skipped_total
+            .fetch_add(row_count as u64, Ordering::SeqCst);
     }
 
     fn record_descriptor_state(&self, descriptor_generation: u64, descriptor: &serde_json::Value) {
@@ -3217,6 +3281,9 @@ fn apply_segment_descriptor_update(
         Err(error) if is_segment_reader_lease_target_not_found(&error) => {
             return Ok(DescriptorApplyOutcome::TransientMissing);
         }
+        Err(error) if is_transient_segment_reader_layout_mismatch(&error) => {
+            return Ok(DescriptorApplyOutcome::TransientLayoutMismatch);
+        }
         Err(error) => return Err(error.to_string()),
     };
     let descriptor_generation = update.descriptor_generation;
@@ -3232,6 +3299,15 @@ fn is_transient_missing_segment_reader_error(error: &ZippyError) -> bool {
         || message.contains("The system cannot find the file specified")
 }
 
+fn is_transient_segment_reader_layout_mismatch(error: &ZippyError) -> bool {
+    is_transient_segment_reader_layout_mismatch_message(&error.to_string())
+}
+
+fn is_transient_segment_reader_layout_mismatch_message(message: &str) -> bool {
+    message.contains("active segment descriptor schema id mismatch")
+        || message.contains("active segment schema id mismatch")
+}
+
 enum SegmentReaderDriverEvent {
     Rows(RowSpanView),
     DescriptorUpdated(u64),
@@ -3241,6 +3317,7 @@ enum SegmentReaderDriverEvent {
 enum DescriptorApplyOutcome {
     Applied(u64),
     TransientMissing,
+    TransientLayoutMismatch,
 }
 
 impl fmt::Debug for SegmentReaderDriverEvent {
@@ -3309,18 +3386,17 @@ impl SegmentReaderDriver {
         }
         self.record_pending_descriptor_updates();
 
-        let observed_notification_seq = self
-            .reader_handle
-            .reader
-            .notification_sequence()
-            .map_err(|error| error.to_string())?;
-        match self
-            .reader_handle
-            .reader
-            .read_available()
-            .map_err(|error| error.to_string())?
-        {
-            Some(span) => {
+        let observed_notification_seq = match self.reader_handle.reader.notification_sequence() {
+            Ok(sequence) => sequence,
+            Err(error)
+                if is_transient_segment_reader_layout_mismatch_message(&error.to_string()) =>
+            {
+                return self.recover_from_reader_layout_mismatch();
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        match self.reader_handle.reader.read_available() {
+            Ok(Some(span)) => {
                 let _ = take_descriptor_update_after_poll(
                     SubscriberReadOutcome::Rows,
                     self.descriptor_updates.as_ref(),
@@ -3328,7 +3404,13 @@ impl SegmentReaderDriver {
                 );
                 Ok(SegmentReaderDriverEvent::Rows(span))
             }
-            None => {
+            Err(error)
+                if is_transient_segment_reader_layout_mismatch_message(&error.to_string()) =>
+            {
+                self.recover_from_reader_layout_mismatch()
+            }
+            Err(error) => Err(error.to_string()),
+            Ok(None) => {
                 if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
                     return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
                         descriptor_generation,
@@ -3449,6 +3531,21 @@ impl SegmentReaderDriver {
         self.apply_descriptor_update_or_retry(update)
     }
 
+    fn recover_from_reader_layout_mismatch(
+        &mut self,
+    ) -> std::result::Result<SegmentReaderDriverEvent, String> {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_layout_mismatch_rebind();
+        }
+        self.next_descriptor_refresh_at = Instant::now();
+        if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
+            return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                descriptor_generation,
+            ));
+        }
+        Ok(SegmentReaderDriverEvent::Idle)
+    }
+
     fn latest_descriptor_update(&self) -> std::result::Result<Option<DescriptorUpdate>, String> {
         let Some(reader_lease) = self.reader_handle.reader_lease.as_ref() else {
             return Ok(None);
@@ -3495,6 +3592,13 @@ impl SegmentReaderDriver {
                 self.defer_descriptor_retry(update);
                 Ok(None)
             }
+            DescriptorApplyOutcome::TransientLayoutMismatch => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.record_layout_mismatch_rebind();
+                }
+                self.defer_descriptor_retry(update);
+                Ok(None)
+            }
         }
     }
 
@@ -3530,6 +3634,13 @@ impl SegmentReaderDriver {
                 Ok(Some(descriptor_generation))
             }
             DescriptorApplyOutcome::TransientMissing => {
+                self.defer_descriptor_retry(update);
+                Ok(None)
+            }
+            DescriptorApplyOutcome::TransientLayoutMismatch => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.record_layout_mismatch_rebind();
+                }
                 self.defer_descriptor_retry(update);
                 Ok(None)
             }
@@ -3626,6 +3737,18 @@ fn spawn_segment_descriptor_watcher(
             ) {
                 Ok(Some(update)) => update,
                 Ok(None) => continue,
+                Err(error) if is_master_process_invalid_error(&error) => {
+                    if let Err(recovery_error) =
+                        reregister_shared_master_process(Arc::clone(&master))
+                    {
+                        *descriptor_refresh_error.lock().unwrap() =
+                            Some(recovery_error.to_string());
+                        descriptor_updates.notify();
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     *descriptor_refresh_error.lock().unwrap() = Some(error.to_string());
                     descriptor_updates.notify();
@@ -3642,6 +3765,9 @@ fn spawn_segment_descriptor_watcher(
                             descriptor_updates.set(update);
                         }
                         Err(error) if is_transient_missing_segment_reader_error(&error) => {
+                            descriptor_updates.set(update);
+                        }
+                        Err(error) if is_transient_segment_reader_layout_mismatch(&error) => {
                             descriptor_updates.set(update);
                         }
                         Err(error) => {
@@ -3808,8 +3934,12 @@ impl StreamSubscriber {
                         poll_interval.max(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN),
                     )?,
                 };
-                let Some((reader_handle, descriptor_text, descriptor_generation)) =
-                    initial_reader_handle
+                let Some((
+                    reader_handle,
+                    descriptor_text,
+                    descriptor_generation,
+                    stale_rows_skipped,
+                )) = initial_reader_handle
                 else {
                     return Ok(());
                 };
@@ -3826,6 +3956,7 @@ impl StreamSubscriber {
                             .store(descriptor_generation, Ordering::SeqCst);
                     }
                 }
+                metrics.record_stale_rows_skipped(stale_rows_skipped);
 
                 let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
                 let descriptor_refresh_error = Arc::new(Mutex::new(None));
@@ -3939,10 +4070,32 @@ impl StreamSubscriber {
             self.metrics.descriptor_rebinds_total.load(Ordering::SeqCst),
         )?;
         dict.set_item(
+            "layout_mismatch_rebind_total",
+            self.metrics
+                .layout_mismatch_rebind_total
+                .load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
+            "stale_rows_skipped_total",
+            self.metrics.stale_rows_skipped_total.load(Ordering::SeqCst),
+        )?;
+        dict.set_item(
             "current_descriptor_generation",
             self.metrics
                 .current_descriptor_generation
                 .load(Ordering::SeqCst),
+        )?;
+        let current_descriptor_generation = self
+            .metrics
+            .current_descriptor_generation
+            .load(Ordering::SeqCst);
+        let master_descriptor_generation = self
+            .metrics
+            .master_descriptor_generation
+            .load(Ordering::SeqCst);
+        dict.set_item(
+            "descriptor_generation_lag",
+            master_descriptor_generation.saturating_sub(current_descriptor_generation),
         )?;
         dict.set_item(
             "current_segment_id",
@@ -4041,8 +4194,7 @@ fn wait_for_initial_segment_reader_handle(
     start_from: i64,
     running: Arc<AtomicBool>,
     wait_interval: Duration,
-) -> std::result::Result<Option<(ActiveSegmentReaderHandle, String, u64)>, String> {
-    let start_from_after_recovery = if start_from == -1 { 0 } else { start_from };
+) -> std::result::Result<Option<InitialSegmentReaderHandle>, String> {
     while running.load(Ordering::SeqCst) {
         let client = master.lock().unwrap().clone();
         let stream = match client.get_stream(source) {
@@ -4064,7 +4216,7 @@ fn wait_for_initial_segment_reader_handle(
                         Arc::clone(&master),
                         source,
                         segment_schema,
-                        start_from_after_recovery,
+                        start_from,
                         update.descriptor_generation,
                         update.descriptor,
                     )? {
@@ -4073,6 +4225,11 @@ fn wait_for_initial_segment_reader_handle(
                     thread::sleep(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN);
                 }
                 Ok(None) => {}
+                Err(error) if is_master_process_invalid_error(&error) => {
+                    reregister_shared_master_process(Arc::clone(&master))
+                        .map_err(|error| error.to_string())?;
+                    thread::sleep(wait_interval);
+                }
                 Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
                     thread::sleep(wait_interval);
                 }
@@ -4085,7 +4242,7 @@ fn wait_for_initial_segment_reader_handle(
                 Arc::clone(&master),
                 source,
                 segment_schema,
-                start_from_after_recovery,
+                start_from,
                 stream.descriptor_generation,
                 descriptor,
             )? {
@@ -4103,7 +4260,7 @@ fn wait_for_initial_segment_reader_handle(
                     Arc::clone(&master),
                     source,
                     segment_schema,
-                    start_from_after_recovery,
+                    start_from,
                     update.descriptor_generation,
                     update.descriptor,
                 )? {
@@ -4112,6 +4269,11 @@ fn wait_for_initial_segment_reader_handle(
                 thread::sleep(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN);
             }
             Ok(None) => {}
+            Err(error) if is_master_process_invalid_error(&error) => {
+                reregister_shared_master_process(Arc::clone(&master))
+                    .map_err(|error| error.to_string())?;
+                thread::sleep(wait_interval);
+            }
             Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
                 thread::sleep(wait_interval);
             }
@@ -4138,7 +4300,7 @@ fn open_initial_segment_reader_handle(
     start_from: i64,
     descriptor_generation: u64,
     descriptor: serde_json::Value,
-) -> std::result::Result<Option<(ActiveSegmentReaderHandle, String, u64)>, String> {
+) -> std::result::Result<Option<InitialSegmentReaderHandle>, String> {
     let descriptor_text = serde_json::to_string(&descriptor).map_err(|error| error.to_string())?;
     let mut reader_handle = match open_active_segment_reader_handle(
         &descriptor,
@@ -4155,14 +4317,23 @@ fn open_initial_segment_reader_handle(
         Err(error) if is_segment_reader_lease_target_not_found(&error) => {
             return Ok(None);
         }
+        Err(error) if is_transient_segment_reader_layout_mismatch(&error) => {
+            return Ok(None);
+        }
         Err(error) => return Err(error.to_string()),
     };
-    seek_active_segment_reader_start_from(&mut reader_handle.reader, start_from)
-        .map_err(|error| error.to_string())?;
+    let stale_rows_skipped =
+        seek_active_segment_reader_start_from(&mut reader_handle.reader, start_from)
+            .map_err(|error| error.to_string())?;
     Ok(Some((
         reader_handle,
         descriptor_text,
         descriptor_generation,
+        if start_from == -1 {
+            stale_rows_skipped
+        } else {
+            0
+        },
     )))
 }
 
@@ -4285,10 +4456,11 @@ fn row_span_row_to_pydict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let values = PyDict::new_bound(py);
     for column in span.schema().columns() {
+        let name = column.name();
         let value = span
-            .cell_value(row_offset, column.name)
+            .cell_value(row_offset, name)
             .map_err(|error| py_runtime_error(error.to_string()))?;
-        values.set_item(column.name, segment_cell_value_to_py(py, value)?)?;
+        values.set_item(name, segment_cell_value_to_py(py, value)?)?;
     }
     Ok(values)
 }
@@ -4579,7 +4751,7 @@ impl Source for SegmentSourceBridge {
                 Ok(initial_reader_handle) => initial_reader_handle,
                 Err(error) => return Err(string_zippy_error(error)),
             };
-            let Some((reader_handle, descriptor_text, descriptor_generation)) =
+            let Some((reader_handle, descriptor_text, descriptor_generation, _)) =
                 initial_reader_handle
             else {
                 return Ok(());
@@ -4666,6 +4838,22 @@ fn is_segment_reader_lease_target_not_found(error: &ZippyError) -> bool {
         .contains("segment reader lease target not found")
 }
 
+fn is_master_process_invalid_error(error: &ZippyError) -> bool {
+    is_master_process_invalid_message(&error.to_string())
+}
+
+fn is_reclaimed_segment_reader_lease_error(error: &ZippyError) -> bool {
+    let message = error.to_string();
+    is_master_process_invalid_message(&message)
+        || message.contains("segment reader lease not found")
+}
+
+fn is_master_process_invalid_message(message: &str) -> bool {
+    message.contains("process lease expired")
+        || message.contains("process not found")
+        || message.contains("process token invalid")
+}
+
 fn build_active_segment_reader(
     descriptor: &serde_json::Value,
     segment_schema: &CompiledSchema,
@@ -4716,6 +4904,7 @@ struct ReactiveStateEngine {
     id_column: String,
     id_filter: Option<Vec<String>>,
     state_failure_policy: String,
+    invalid_value_policy: String,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
@@ -4868,7 +5057,7 @@ struct KeyValueTableMaterializer {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", invalid_value_policy="reject", source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=1024, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -4878,6 +5067,7 @@ impl ReactiveStateEngine {
         target: &Bound<'_, PyAny>,
         id_filter: Option<&Bound<'_, PyAny>>,
         state_failure_policy: &str,
+        invalid_value_policy: &str,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
         parquet_sink: Option<&Bound<'_, PyAny>>,
@@ -4892,16 +5082,19 @@ impl ReactiveStateEngine {
         );
         let id_filter = parse_id_filter(id_filter)?;
         let state_failure_policy_enum = parse_reactive_state_failure_policy(state_failure_policy)?;
+        let invalid_value_policy_enum = parse_reactive_invalid_value_policy(invalid_value_policy)?;
         let factor_specs = build_reactive_specs(py, &schema, &id_column, factors)?;
-        let engine = RustReactiveStateEngine::new_with_id_filter_and_state_failure_policy(
-            &name,
-            Arc::clone(&schema),
-            factor_specs,
-            &id_column,
-            id_filter.clone(),
-            state_failure_policy_enum,
-        )
-        .map_err(|error| py_value_error(error.to_string()))?;
+        let engine =
+            RustReactiveStateEngine::new_with_id_filter_state_failure_and_invalid_value_policy(
+                &name,
+                Arc::clone(&schema),
+                factor_specs,
+                &id_column,
+                id_filter.clone(),
+                state_failure_policy_enum,
+                invalid_value_policy_enum,
+            )
+            .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
         let parquet_sink = parse_parquet_sink(parquet_sink)?;
@@ -4936,6 +5129,8 @@ impl ReactiveStateEngine {
             id_column,
             id_filter,
             state_failure_policy: state_failure_policy_enum.as_str().to_string(),
+            invalid_value_policy: reactive_invalid_value_policy_as_str(invalid_value_policy_enum)
+                .to_string(),
             input_schema: schema,
             output_schema,
             target,
@@ -5036,6 +5231,7 @@ impl ReactiveStateEngine {
         dict.set_item("id_column", &self.id_column)?;
         dict.set_item("id_filter", self.id_filter.clone())?;
         dict.set_item("state_failure_policy", &self.state_failure_policy)?;
+        dict.set_item("invalid_value_policy", &self.invalid_value_policy)?;
         Ok(dict.into_any().unbind())
     }
 
@@ -7794,6 +7990,23 @@ fn parse_reactive_state_failure_policy(value: &str) -> PyResult<RustReactiveStat
     }
 }
 
+fn parse_reactive_invalid_value_policy(value: &str) -> PyResult<RustReactiveInvalidValuePolicy> {
+    match value {
+        "reject" => Ok(RustReactiveInvalidValuePolicy::Reject),
+        "skip" => Ok(RustReactiveInvalidValuePolicy::Skip),
+        _ => Err(py_value_error(
+            "invalid_value_policy must be 'reject' or 'skip'",
+        )),
+    }
+}
+
+fn reactive_invalid_value_policy_as_str(value: RustReactiveInvalidValuePolicy) -> &'static str {
+    match value {
+        RustReactiveInvalidValuePolicy::Reject => "reject",
+        RustReactiveInvalidValuePolicy::Skip => "skip",
+    }
+}
+
 fn parse_source_mode(value: &Bound<'_, PyAny>) -> PyResult<RustSourceMode> {
     let value = parse_required_policy_value(value, "mode", "source_mode", "SourceMode")?;
     match value.as_str() {
@@ -9008,6 +9221,459 @@ mod tests {
         }
         drop(driver);
         let _ = std::fs::remove_file(target_shm_path);
+    }
+
+    #[test]
+    fn segment_reader_driver_treats_schema_mismatch_descriptor_update_as_transient() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let mismatched_schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("volume", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema("ticks", "schema-race-current", schema.clone())
+            .unwrap();
+        let current_descriptor: serde_json::Value = serde_json::from_slice(
+            &current_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let mismatched_partition = store
+            .open_partition_with_schema("ticks", "schema-race-mismatch", mismatched_schema.clone())
+            .unwrap();
+        let mismatched_descriptor: serde_json::Value = serde_json::from_slice(
+            &mismatched_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let next_partition = store
+            .open_partition_with_schema("ticks", "schema-race-next", schema.clone())
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "TL2606")?;
+                row.write_f64("last_price", 113.15)?;
+                Ok(())
+            })
+            .unwrap();
+        let next_descriptor: serde_json::Value =
+            serde_json::from_slice(&next_partition.active_descriptor_envelope_bytes().unwrap())
+                .unwrap();
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        descriptor_updates.set(descriptor_update_from_value(2, mismatched_descriptor).unwrap());
+        descriptor_updates.set(descriptor_update_from_value(3, next_descriptor).unwrap());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(SubscriberMetrics::default());
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: None,
+            },
+            serde_json::to_string(&current_descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            Some(Arc::clone(&metrics)),
+        );
+
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => assert_eq!(generation, 3),
+            other => panic!("expected valid descriptor after schema race got [{other:?}]"),
+        }
+        assert_eq!(
+            metrics.layout_mismatch_rebind_total.load(Ordering::SeqCst),
+            1
+        );
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected rows after schema race recovery got [{other:?}]"),
+        }
+    }
+
+    #[test]
+    fn wait_for_initial_segment_reader_handle_preserves_tail_start_after_recovery() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "initial-recovery-tail",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "TL2606")?;
+                row.write_f64("last_price", 113.05)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("initial_recovery_tail_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "initial_recovery_tail_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor("ticks", publishable_descriptor_from_partition(&partition))
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint).unwrap();
+        reader_master
+            .register_process("initial_recovery_tail_reader")
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let running = Arc::new(AtomicBool::new(true));
+        let handle = wait_for_initial_segment_reader_handle(
+            Arc::clone(&reader_master),
+            "ticks",
+            &schema,
+            -1,
+            Arc::clone(&running),
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(handle.3, 1);
+        let mut reader_handle = handle.0;
+
+        assert!(reader_handle.reader.read_available().unwrap().is_none());
+
+        partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "TL2606")?;
+                row.write_f64("last_price", 113.06)?;
+                Ok(())
+            })
+            .unwrap();
+        let span = reader_handle.reader.read_available().unwrap().unwrap();
+        assert_eq!(span.row_count(), 1);
+        assert_eq!(
+            span.cell_value(0, "last_price").unwrap(),
+            SegmentCellValue::Float64(113.06)
+        );
+
+        running.store(false, Ordering::SeqCst);
+        drop(reader_handle);
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn segment_descriptor_watcher_reregisters_after_process_lease_expired() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "watch-process-current",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        let next_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "watch-process-next",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("watch_process_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "watch_process_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&current_partition),
+            )
+            .unwrap();
+        let current_stream = writer_master.get_stream("ticks").unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        let old_process_id = reader_master
+            .register_process("descriptor_watch_reader")
+            .unwrap();
+        server
+            .registry()
+            .lock()
+            .unwrap()
+            .force_expire_process(&old_process_id)
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let running = Arc::new(AtomicBool::new(true));
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let watcher = spawn_segment_descriptor_watcher(
+            Arc::clone(&running),
+            Arc::clone(&reader_master),
+            "ticks".to_string(),
+            current_stream.descriptor_generation,
+            schema.clone(),
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+        );
+
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&next_partition),
+            )
+            .unwrap();
+        let next_stream = writer_master.get_stream("ticks").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while descriptor_updates.pending_update_count() == 0 && Instant::now() < deadline {
+            assert!(
+                take_descriptor_refresh_error(descriptor_refresh_error.as_ref()).is_none(),
+                "descriptor watcher should recover expired process instead of surfacing fatal error"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(descriptor_updates.pending_update_count(), 1);
+        let update = descriptor_updates
+            .take_after_poll(
+                SubscriberReadOutcome::Empty,
+                &serde_json::to_string(current_stream.active_segment_descriptor.as_ref().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            update.descriptor_generation,
+            next_stream.descriptor_generation
+        );
+        let new_process_id = reader_master
+            .lock()
+            .unwrap()
+            .process_id()
+            .unwrap()
+            .to_string();
+        assert_ne!(old_process_id, new_process_id);
+
+        running.store(false, Ordering::SeqCst);
+        let stop_partition = store
+            .open_partition_with_schema_and_writer_epoch("ticks", "watch-process-stop", schema, 1)
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&stop_partition),
+            )
+            .unwrap();
+        watcher.join().unwrap();
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn segment_reader_lease_acquire_reregisters_after_process_lease_expired() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "lease-process-recovery",
+                schema,
+                1,
+            )
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("lease_process_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "lease_process_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor("ticks", publishable_descriptor_from_partition(&partition))
+            .unwrap();
+        let descriptor = writer_master
+            .get_segment_descriptor("ticks")
+            .unwrap()
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint).unwrap();
+        let old_process_id = reader_master
+            .register_process("lease_process_reader")
+            .unwrap();
+        server
+            .registry()
+            .lock()
+            .unwrap()
+            .force_expire_process(&old_process_id)
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+
+        let lease =
+            SegmentReaderLeaseGuard::acquire(Arc::clone(&reader_master), "ticks", &descriptor)
+                .unwrap();
+        let new_process_id = reader_master
+            .lock()
+            .unwrap()
+            .process_id()
+            .unwrap()
+            .to_string();
+        assert_ne!(old_process_id, new_process_id);
+        drop(lease);
+
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn segment_reader_lease_release_uses_original_process_capability() {
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "lease-release-process",
+                schema,
+                1,
+            )
+            .unwrap();
+
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("lease_release_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "lease_release_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor("ticks", publishable_descriptor_from_partition(&partition))
+            .unwrap();
+        let descriptor = writer_master
+            .get_segment_descriptor("ticks")
+            .unwrap()
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint).unwrap();
+        reader_master
+            .register_process("lease_release_reader")
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let lease =
+            SegmentReaderLeaseGuard::acquire(Arc::clone(&reader_master), "ticks", &descriptor)
+                .unwrap();
+        reader_master.lock().unwrap().reregister_process().unwrap();
+        drop(lease);
+
+        let stream = writer_master.get_stream("ticks").unwrap();
+        assert!(stream.segment_reader_leases.is_empty());
+
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
     }
 
     #[test]

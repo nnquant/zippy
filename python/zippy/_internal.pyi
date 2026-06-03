@@ -397,6 +397,7 @@ class ReactiveStateEngine:
         *,
         id_filter: list[str] | None = None,
         state_failure_policy: Literal["fail_fast", "rollback"] = "fail_fast",
+        invalid_value_policy: Literal["reject", "skip"] = "reject",
         source: (
             str
             | ReactiveStateEngine

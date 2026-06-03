@@ -1949,6 +1949,71 @@ def test_parquet_replay_engine_callback_respects_replay_rate(
     assert fake_clock.sleeps == pytest.approx([0.1, 0.1])
 
 
+def test_parquet_replay_engine_table_callback_matches_row_callback_order(tmp_path: Path) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("last_price", pa.float64()),
+        ]
+    )
+    table = pa.table(
+        {
+            "instrument_id": ["IF2606", "IH2606", "IC2606"],
+            "dt": [1777017600000000000, 1777017600000001000, 1777017600000002000],
+            "last_price": [3898.0, 2675.0, 6123.0],
+        },
+        schema=schema,
+    )
+    parquet_path = tmp_path / "ticks.parquet"
+    pq.write_table(table, parquet_path)
+    row_received: list[dict[str, object]] = []
+    table_received: list[object] = []
+
+    zippy.ParquetReplayEngine(
+        parquet_path,
+        callback=lambda row: row_received.append(row.to_dict()),
+        schema=schema,
+        batch_size=2,
+    ).run()
+    table_engine = zippy.ParquetReplayEngine(
+        parquet_path,
+        callback=table_received.append,
+        table_callback=True,
+        schema=schema,
+        batch_size=2,
+    ).run()
+
+    assert row_received == table.to_pylist()
+    assert [batch.num_rows for batch in table_received] == [2, 1]
+    assert pa.concat_tables(table_received).to_pylist() == row_received
+    assert table_engine.metrics()["callback_mode"] == "table"
+    assert table_engine.metrics()["batches_delivered_total"] == 2
+    assert table_engine.metrics()["rows_delivered_total"] == 3
+
+
+@pytest.mark.parametrize("table_callback", [False, True])
+def test_parquet_replay_engine_callback_errors_propagate(
+    tmp_path: Path,
+    table_callback: bool,
+) -> None:
+    schema = pa.schema([("seq", pa.int64())])
+    parquet_path = tmp_path / "ticks.parquet"
+    pq.write_table(pa.table({"seq": [1, 2]}, schema=schema), parquet_path)
+
+    def on_replay(_payload) -> None:
+        raise ValueError("replay callback failed")
+
+    with pytest.raises(RuntimeError, match="callback replay failed"):
+        zippy.ParquetReplayEngine(
+            parquet_path,
+            callback=on_replay,
+            table_callback=table_callback,
+            schema=schema,
+            batch_size=2,
+        ).run()
+
+
 def test_pipeline_stop_unregisters_registered_source(tmp_path: Path) -> None:
     schema = pa.schema(
         [
@@ -3698,7 +3763,7 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
     )
 
     assert engine.status() == "created"
-    assert engine.metrics() == {
+    expected_metrics = {
         "processed_batches_total": 0,
         "processed_rows_total": 0,
         "output_batches_total": 0,
@@ -3708,6 +3773,8 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
         "publish_errors_total": 0,
         "queue_depth": 0,
     }
+    metrics = engine.metrics()
+    assert {key: metrics[key] for key in expected_metrics} == expected_metrics
 
     config = engine.config()
     assert config["engine_type"] == "reactive"
@@ -3717,6 +3784,7 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
     assert config["targets"] == [{"type": "null"}]
     assert config["source_linked"] is False
     assert config["state_failure_policy"] == "fail_fast"
+    assert config["invalid_value_policy"] == "reject"
     assert config["parquet_sink"] == {
         "path": str(tmp_path),
         "rotation": "none",
@@ -13897,6 +13965,29 @@ def test_remote_stream_subscriber_metrics_use_live_health_contract() -> None:
     assert metrics["last_event_ns"] == 0
     assert health["kind"] == "remote_stream_subscriber"
     assert health["restart_required"] is False
+
+
+def test_live_health_preserves_subscriber_descriptor_diagnostics() -> None:
+    class FakeSubscriber:
+        def metrics(self) -> dict[str, object]:
+            return {
+                "source": "ctp_ticks",
+                "running": True,
+                "last_error": None,
+                "current_descriptor_generation": 41,
+                "master_descriptor_generation": 45,
+                "descriptor_generation_lag": 4,
+                "descriptor_rebinds_total": 3,
+                "layout_mismatch_rebind_total": 2,
+                "stale_rows_skipped_total": 128,
+                "pending_descriptor_updates": 1,
+            }
+
+    health = zippy.live_health(FakeSubscriber())
+
+    assert health["descriptor_generation_lag"] == 4
+    assert health["layout_mismatch_rebind_total"] == 2
+    assert health["stale_rows_skipped_total"] == 128
 
 
 def test_session_status_metrics_and_health_aggregate_runtime_engines() -> None:

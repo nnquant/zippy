@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+_PROFILE_CLOCK_NS = time.perf_counter_ns
 _NATIVE_IMPORT_ERROR: BaseException | None = None
 _NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
 _DEFAULT_REMOTE_GATEWAY_TIMEOUT_SEC = 60.0
@@ -54,6 +55,10 @@ _TEMPORAL_LITERAL_RE = re.compile(
 
 def _current_time_ns() -> int:
     return time.time_ns()
+
+
+def _profile_time_ns() -> int:
+    return _PROFILE_CLOCK_NS()
 
 
 def _live_status_from_metrics(metrics: dict[str, object]) -> str:
@@ -99,7 +104,10 @@ def _live_health_from_metrics(
         "current_segment_generation": metrics.get("current_segment_generation"),
         "current_descriptor_generation": metrics.get("current_descriptor_generation"),
         "master_descriptor_generation": metrics.get("master_descriptor_generation"),
+        "descriptor_generation_lag": int(metrics.get("descriptor_generation_lag", 0) or 0),
         "descriptor_rebinds_total": int(metrics.get("descriptor_rebinds_total", 0) or 0),
+        "layout_mismatch_rebind_total": int(metrics.get("layout_mismatch_rebind_total", 0) or 0),
+        "stale_rows_skipped_total": int(metrics.get("stale_rows_skipped_total", 0) or 0),
         "reconnects_total": int(metrics.get("reconnects_total", 0) or 0),
         "pending_descriptor_updates": int(metrics.get("pending_descriptor_updates", 0) or 0),
     }
@@ -3276,7 +3284,7 @@ class RemoteGatewayWriter:
         self.flush_interval_ms = flush_interval_ms
         self.token = token
         self._rows: list[dict[str, object]] = []
-        self._last_flush_ns = time.perf_counter_ns()
+        self._last_flush_ns = _profile_time_ns()
         self._closed = False
 
     def write(self, value: object) -> None:
@@ -3313,7 +3321,7 @@ class RemoteGatewayWriter:
         table = _value_to_pyarrow_table(list(self._rows), self.schema)
         self._rows = []
         self._send_table(table)
-        self._last_flush_ns = time.perf_counter_ns()
+        self._last_flush_ns = _profile_time_ns()
 
     def close(self) -> None:
         if self._closed:
@@ -3332,7 +3340,7 @@ class RemoteGatewayWriter:
     def _flush_interval_elapsed(self) -> bool:
         if self.flush_interval_ms is None:
             return False
-        elapsed_ns = time.perf_counter_ns() - self._last_flush_ns
+        elapsed_ns = _profile_time_ns() - self._last_flush_ns
         return elapsed_ns >= int(self.flush_interval_ms) * 1_000_000
 
     def _send_table(self, table: object) -> None:
@@ -4061,10 +4069,10 @@ class Table:
         import time
 
         metrics = self._new_query_metrics()
-        started_ns = time.perf_counter_ns()
+        started_ns = _profile_time_ns()
         result = self._collect_query(metrics=metrics)
         metrics["returned_rows"] = result.num_rows
-        metrics["elapsed_ms"] = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        metrics["elapsed_ms"] = (_profile_time_ns() - started_ns) / 1_000_000.0
         return {"result": result, "metrics": metrics}
 
     def _collect_query(self, metrics: dict[str, object] | None, stream: bool = False):
@@ -5750,6 +5758,8 @@ class StreamSubscriber:
     Live subscriptions are best-effort: a running subscriber can attach to a
     restarted writer and continue receiving new rows, but rows missed while the
     writer or reader is unavailable are not automatically backfilled.
+    For high-frequency subscriptions, prefer :func:`subscribe_table`, which
+    delivers Arrow tables in batches and avoids per-row Python object creation.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6170,6 +6180,8 @@ def subscribe(
     This is a best-effort live subscription. It can resume on new writer
     descriptors, but does not automatically backfill rows missed during writer
     downtime.
+    This row-callback API is a low-frequency compatibility path. For high-frequency
+    live data, use :func:`subscribe_table` so callbacks receive Arrow table batches.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6363,6 +6375,8 @@ def subscribe_table(
     Append streams use incremental active-segment row batches. Key-value/latest
     snapshot tables are detected from table metadata and use full latest snapshot
     callbacks on each descriptor generation change.
+    This is the preferred high-frequency subscription path because it keeps data
+    in Arrow batches instead of allocating one Python ``Row`` object per row.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6757,14 +6771,19 @@ class ParquetReplaySource:
 
 
 class _CallbackReplayHandle:
-    """Background handle for direct row-callback replay."""
+    """Background handle for direct callback replay."""
 
-    def __init__(self, source: ParquetReplaySource, callback) -> None:
+    def __init__(self, source: ParquetReplaySource, callback, *, table_callback: bool) -> None:
         self._source = source
         self._callback = callback
+        self._table_callback = bool(table_callback)
         self._stop_event = threading.Event()
         self._done_event = threading.Event()
         self._error: Exception | None = None
+        self._rows_delivered_total = 0
+        self._batches_delivered_total = 0
+        self._started_ns = _profile_time_ns()
+        self._finished_ns = 0
         self._thread = threading.Thread(
             target=self._run,
             name=f"zippy-callback-replay-{source.source_name}",
@@ -6787,20 +6806,50 @@ class _CallbackReplayHandle:
             raise RuntimeError(f"callback replay failed reason=[{self._error}]")
         return completed
 
+    def metrics(self) -> dict[str, object]:
+        """Return callback replay counters for row-vs-table profile checks."""
+        elapsed_ns = (
+            max(0, self._finished_ns - self._started_ns)
+            if self._finished_ns
+            else max(0, _profile_time_ns() - self._started_ns)
+        )
+        return {
+            "callback_mode": "table" if self._table_callback else "row",
+            "rows_delivered_total": self._rows_delivered_total,
+            "batches_delivered_total": self._batches_delivered_total,
+            "elapsed_ns": elapsed_ns,
+            "rows_per_callback": (
+                self._rows_delivered_total / self._batches_delivered_total
+                if self._batches_delivered_total
+                else 0.0
+            ),
+        }
+
     def _run(self) -> None:
         try:
             rate_limiter = _ReplayRateLimiter(self._source.replay_rate)
             for table in self._source._iter_tables():
                 if self._stop_event.is_set():
                     break
-                for row in _iter_arrow_rows(table):
+                if self._table_callback and not rate_limiter.enabled:
+                    self._callback(table)
+                    self._rows_delivered_total += int(getattr(table, "num_rows", 0))
+                    self._batches_delivered_total += 1
+                    continue
+                for row_index, row in enumerate(_iter_arrow_rows(table)):
                     if self._stop_event.is_set():
                         break
                     rate_limiter.wait_before_emit()
-                    self._callback(row)
+                    if self._table_callback:
+                        self._callback(table.slice(row_index, 1))
+                        self._batches_delivered_total += 1
+                    else:
+                        self._callback(row)
+                    self._rows_delivered_total += 1
         except Exception as error:
             self._error = error
         finally:
+            self._finished_ns = _profile_time_ns()
             self._done_event.set()
 
 
@@ -6814,6 +6863,9 @@ class ParquetReplayEngine:
     ``start`` and ``end`` are inclusive bounds over ``time_column``. They are applied
     before rows are emitted, so both callback replay and stream replay see the same
     filtered row set. ``replay_rate`` enables fixed-rate replay in rows per second.
+    Callback replay defaults to row callbacks for compatibility; set
+    ``table_callback=True`` to receive ``pyarrow.Table`` batches for high-frequency
+    replay/profile workflows.
     """
 
     def __init__(
@@ -6822,6 +6874,7 @@ class ParquetReplayEngine:
         *,
         output_stream: str | None = None,
         callback=None,
+        table_callback: bool = False,
         schema=None,
         master: MasterClient | None = None,
         name: str | None = None,
@@ -6854,6 +6907,7 @@ class ParquetReplayEngine:
         self.source = _normalize_parquet_replay_paths(source)
         self.output_stream = output_stream
         self.callback = callback
+        self.table_callback = bool(table_callback)
         self.schema = schema
         self.master = master
         self.name = name or f"replay_{output_stream or 'callback'}"
@@ -6890,7 +6944,11 @@ class ParquetReplayEngine:
         if self.callback is not None:
             if self._source is None:
                 raise RuntimeError("replay source is not initialized")
-            self._callback_handle = _CallbackReplayHandle(self._source, self.callback)
+            self._callback_handle = _CallbackReplayHandle(
+                self._source,
+                self.callback,
+                table_callback=self.table_callback,
+            )
             self._status = "running"
             return self
 
@@ -7013,6 +7071,23 @@ class ParquetReplayEngine:
             end=self.end_bound,
         )._zippy_output_schema()
 
+    def metrics(self) -> dict[str, object]:
+        """
+        Return replay callback counters.
+
+        :returns: Callback mode, delivered rows/batches, elapsed nanoseconds, and rows per callback.
+        :rtype: dict[str, object]
+        """
+        if self._callback_handle is None:
+            return {
+                "callback_mode": "table" if self.table_callback else "row",
+                "rows_delivered_total": 0,
+                "batches_delivered_total": 0,
+                "elapsed_ns": 0,
+                "rows_per_callback": 0.0,
+            }
+        return self._callback_handle.metrics()
+
     def table(self) -> Table:
         """Open the replay output as a queryable Zippy table."""
         if self.output_stream is None:
@@ -7049,6 +7124,8 @@ class TableReplayEngine:
     ``start`` and ``end`` are inclusive bounds over ``time_column``. Use
     ``time_column="dt"`` for event-time windows, or a sequence column for deterministic
     sequence-range replay. ``replay_rate`` enables fixed-rate replay in rows per second.
+    Callback replay defaults to row callbacks for compatibility; set
+    ``table_callback=True`` to receive ``pyarrow.Table`` batches.
     """
 
     def __init__(
@@ -7057,6 +7134,7 @@ class TableReplayEngine:
         *,
         output_stream: str | None = None,
         callback=None,
+        table_callback: bool = False,
         schema=None,
         master: MasterClient | None = None,
         name: str | None = None,
@@ -7087,6 +7165,7 @@ class TableReplayEngine:
         self.source = source
         self.output_stream = output_stream
         self.callback = callback
+        self.table_callback = bool(table_callback)
         self.schema = schema
         self.master = master or _default_master()
         self.name = name or f"replay_{output_stream or source}"
@@ -7138,6 +7217,7 @@ class TableReplayEngine:
             paths,
             output_stream=self.output_stream,
             callback=self.callback,
+            table_callback=self.table_callback,
             schema=schema,
             master=self.master,
             name=self.name,
@@ -7196,6 +7276,18 @@ class TableReplayEngine:
             return self._delegate.output_schema()
         return self.schema or read_table(self.source, master=self.master).schema()
 
+    def metrics(self) -> dict[str, object]:
+        """Return callback replay counters when replaying to callbacks."""
+        if self._delegate is None:
+            return {
+                "callback_mode": "table" if self.table_callback else "row",
+                "rows_delivered_total": 0,
+                "batches_delivered_total": 0,
+                "elapsed_ns": 0,
+                "rows_per_callback": 0.0,
+            }
+        return self._delegate.metrics()
+
     def table(self) -> Table:
         """Open the replay output as a queryable Zippy table."""
         if self.output_stream is None:
@@ -7226,6 +7318,7 @@ def replay(
     *,
     output_stream: str | None = None,
     callback=None,
+    table_callback: bool = False,
     schema=None,
     master: MasterClient | None = None,
     name: str | None = None,
@@ -7256,8 +7349,10 @@ def replay(
     :type source: str
     :param output_stream: Optional replay output stream table.
     :type output_stream: str | None
-    :param callback: Optional row callback receiving :class:`Row`.
+    :param callback: Optional callback. By default it receives one :class:`Row` per replayed row.
     :type callback: callable | None
+    :param table_callback: When true, callback receives ``pyarrow.Table`` batches instead of rows.
+    :type table_callback: bool
     :param replay_rate: Fixed replay rate in rows per second. When provided, fixed-rate replay
         is enabled.
     :type replay_rate: float | None
@@ -7276,6 +7371,7 @@ def replay(
         source,
         output_stream=output_stream,
         callback=callback,
+        table_callback=table_callback,
         schema=schema,
         master=master,
         name=name,
