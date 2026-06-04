@@ -1976,6 +1976,24 @@ impl MasterClient {
         Ok(records.into_py(py))
     }
 
+    #[pyo3(signature = (include_internal=false))]
+    fn list_streams_status(&self, py: Python<'_>, include_internal: bool) -> PyResult<PyObject> {
+        let streams = self
+            .client
+            .lock()
+            .unwrap()
+            .list_streams_status()
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        let records = PyList::empty_bound(py);
+        for stream in streams {
+            if !include_internal && is_internal_stream_name(&stream.stream_name) {
+                continue;
+            }
+            records.append(stream_info_to_pydict(py, &stream)?)?;
+        }
+        Ok(records.into_py(py))
+    }
+
     fn get_stream(&self, py: Python<'_>, stream_name: String) -> PyResult<PyObject> {
         let stream = self
             .client
@@ -2017,6 +2035,16 @@ impl MasterClient {
         dict.set_item("reader_count", stream.reader_count)?;
         dict.set_item("status", stream.status)?;
         Ok(dict.into_py(py))
+    }
+
+    fn get_stream_status(&self, py: Python<'_>, stream_name: String) -> PyResult<PyObject> {
+        let stream = self
+            .client
+            .lock()
+            .unwrap()
+            .get_stream_status(&stream_name)
+            .map_err(|error| py_runtime_error(error.to_string()))?;
+        Ok(stream_info_to_pydict(py, &stream)?.into_py(py))
     }
 
     fn get_config(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -2429,7 +2457,7 @@ impl Query {
             .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
         let shared_master = Arc::clone(&master.client);
         let stream = py
-            .allow_threads(|| shared_master.lock().unwrap().get_stream(&source))
+            .allow_threads(|| shared_master.lock().unwrap().get_stream_status(&source))
             .map_err(|error| py_runtime_error(error.to_string()))?;
         if stream.data_path != "segment" {
             return Err(py_value_error(format!(
@@ -2615,7 +2643,7 @@ impl Query {
 
     fn scan_live(&self, py: Python<'_>) -> PyResult<PyObject> {
         let stream = py
-            .allow_threads(|| self.master.lock().unwrap().get_stream(&self.source))
+            .allow_threads(|| self.master.lock().unwrap().get_stream_status(&self.source))
             .map_err(|error| py_runtime_error(error.to_string()))?;
         ensure_stream_live_readable(&stream)?;
         let Some(descriptor) = stream.active_segment_descriptor.clone() else {
@@ -3554,7 +3582,7 @@ impl SegmentReaderDriver {
             .master
             .lock()
             .unwrap()
-            .get_stream(&reader_lease.source)
+            .get_stream_status(&reader_lease.source)
             .map_err(|error| error.to_string())?;
         let Some(descriptor) = stream.active_segment_descriptor else {
             return Ok(None);
@@ -3848,7 +3876,7 @@ impl StreamSubscriber {
             .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
         let shared_master = Arc::clone(&master.client);
         let stream = py
-            .allow_threads(|| shared_master.lock().unwrap().get_stream(&source))
+            .allow_threads(|| shared_master.lock().unwrap().get_stream_status(&source))
             .map_err(|error| py_runtime_error(error.to_string()))?;
         if stream.data_path != "segment" {
             return Err(py_value_error(format!(
@@ -3887,7 +3915,7 @@ impl StreamSubscriber {
                     .master
                     .lock()
                     .unwrap()
-                    .get_stream(&self.source)
+                    .get_stream_status(&self.source)
                     .map_err(|error| error.to_string())?;
                 let Some(descriptor) = stream.active_segment_descriptor.clone() else {
                     return Ok(None);
@@ -4197,7 +4225,7 @@ fn wait_for_initial_segment_reader_handle(
 ) -> std::result::Result<Option<InitialSegmentReaderHandle>, String> {
     while running.load(Ordering::SeqCst) {
         let client = master.lock().unwrap().clone();
-        let stream = match client.get_stream(source) {
+        let stream = match client.get_stream_status(source) {
             Ok(stream) => stream,
             Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
                 thread::sleep(wait_interval);
@@ -7235,7 +7263,7 @@ fn segment_source_config_from_named_stream(
         .map_err(|_| py_value_error("master must be zippy.MasterClient"))?;
     let shared_master = Arc::clone(&master.client);
     let stream = py
-        .allow_threads(|| shared_master.lock().unwrap().get_stream(stream_name))
+        .allow_threads(|| shared_master.lock().unwrap().get_stream_status(stream_name))
         .map_err(|error| py_runtime_error(error.to_string()))?;
     if stream.data_path != "segment" {
         return Err(py_value_error(format!(

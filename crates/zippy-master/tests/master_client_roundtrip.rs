@@ -998,6 +998,60 @@ fn master_client_publishes_persisted_file_metadata() {
 }
 
 #[test]
+fn master_client_status_fetches_omit_historical_metadata() {
+    let socket_path = unique_socket_path();
+    let temp = tempfile::tempdir().unwrap();
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let parquet_file = persist_root.join("part-000001.parquet");
+    fs::write(&parquet_file, b"not really parquet").unwrap();
+    let (server, join_handle) =
+        spawn_test_server_with_config(&socket_path, persist_root_config(&persist_root));
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("persist_writer").unwrap();
+    client
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    client
+        .register_source("openctp_md", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "ticks",
+            serde_json::json!({
+                "file_path": parquet_file.to_string_lossy(),
+                "row_count": 1024,
+                "min_seq": 1,
+                "max_seq": 1024,
+                "source_segment_id": 1
+            }),
+        )
+        .unwrap();
+
+    let full_stream = client.get_stream("ticks").unwrap();
+    assert_eq!(full_stream.persisted_files.len(), 1);
+
+    let status_stream = client.get_stream_status("ticks").unwrap();
+    assert_eq!(status_stream.stream_name, "ticks");
+    assert_eq!(status_stream.schema_hash, full_stream.schema_hash);
+    assert!(status_stream.persisted_files.is_empty());
+    assert!(status_stream.persist_events.is_empty());
+    assert!(status_stream.sealed_segments.is_empty());
+
+    let listed = client.list_streams_status().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].stream_name, "ticks");
+    assert!(listed[0].persisted_files.is_empty());
+    assert!(listed[0].persist_events.is_empty());
+    assert!(listed[0].sealed_segments.is_empty());
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
 fn master_client_upserts_persisted_file_metadata_by_persist_file_id() {
     let socket_path = unique_socket_path();
     let temp = tempfile::tempdir().unwrap();

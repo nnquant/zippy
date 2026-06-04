@@ -419,7 +419,17 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         streams: vec![test_stream_info()],
                     })
                 }
+                ControlRequest::ListStreamStatuses(_) => {
+                    ControlResponse::StreamsListed(zippy_core::ListStreamsResponse {
+                        streams: vec![test_stream_info()],
+                    })
+                }
                 ControlRequest::GetStream(_) => {
+                    ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
+                        stream: test_stream_info(),
+                    })
+                }
+                ControlRequest::GetStreamStatus(_) => {
                     ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
                         stream: test_stream_info(),
                     })
@@ -508,6 +518,29 @@ fn master_client_lists_streams() {
 }
 
 #[test]
+fn master_client_lists_stream_statuses() {
+    let socket_path = unique_socket_path();
+    let server = spawn_fake_server(&socket_path, 3);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client
+        .register_stream("ticks", empty_schema(), 1024, 256)
+        .unwrap();
+
+    let streams = client.list_streams_status().unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].stream_name, "ticks");
+    assert_eq!(streams[0].buffer_size, 1024);
+    assert_eq!(streams[0].frame_size, 256);
+    assert_eq!(streams[0].write_seq, 42);
+    assert_eq!(streams[0].status, "registered");
+
+    server.join().unwrap();
+}
+
+#[test]
 fn master_client_gets_single_stream() {
     let socket_path = unique_socket_path();
     let server = spawn_fake_server(&socket_path, 3);
@@ -520,6 +553,28 @@ fn master_client_gets_single_stream() {
         .unwrap();
 
     let stream = client.get_stream("ticks").unwrap();
+    assert_eq!(stream.stream_name, "ticks");
+    assert_eq!(stream.buffer_size, 1024);
+    assert_eq!(stream.frame_size, 256);
+    assert_eq!(stream.write_seq, 42);
+    assert_eq!(stream.status, "registered");
+
+    server.join().unwrap();
+}
+
+#[test]
+fn master_client_gets_single_stream_status() {
+    let socket_path = unique_socket_path();
+    let server = spawn_fake_server(&socket_path, 3);
+    wait_for_socket(&socket_path);
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client
+        .register_stream("ticks", empty_schema(), 1024, 256)
+        .unwrap();
+
+    let stream = client.get_stream_status("ticks").unwrap();
     assert_eq!(stream.stream_name, "ticks");
     assert_eq!(stream.buffer_size, 1024);
     assert_eq!(stream.frame_size, 256);

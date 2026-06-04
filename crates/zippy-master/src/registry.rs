@@ -1922,6 +1922,10 @@ impl Registry {
         self.streams.values().cloned().collect()
     }
 
+    pub fn stream_records(&self) -> impl Iterator<Item = &StreamRecord> {
+        self.streams.values()
+    }
+
     pub fn list_sources(&self) -> Vec<SourceRecord> {
         self.sources.values().cloned().collect()
     }

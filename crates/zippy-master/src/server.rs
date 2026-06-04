@@ -1189,6 +1189,14 @@ impl MasterServer {
                     .collect();
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
+            ControlRequest::ListStreamStatuses(_) => {
+                let registry = self.registry.lock().unwrap();
+                let streams: Vec<_> = registry
+                    .stream_records()
+                    .map(stream_status_with_active_preflight)
+                    .collect();
+                ControlResponse::StreamsListed(ListStreamsResponse { streams })
+            }
             ControlRequest::GetConfig(_) => ControlResponse::ConfigFetched {
                 config: self.config.to_json_value(),
             },
@@ -2593,6 +2601,21 @@ impl MasterServer {
                 );
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
+            ControlRequest::ListStreamStatuses(_) => {
+                let registry = self.registry.lock().unwrap();
+                let streams: Vec<_> = registry
+                    .stream_records()
+                    .map(stream_status_with_active_preflight)
+                    .collect();
+                tracing::debug!(
+                    component = "master_server",
+                    event = "list_stream_statuses",
+                    status = "success",
+                    stream_count = streams.len(),
+                    "listed stream statuses"
+                );
+                ControlResponse::StreamsListed(ListStreamsResponse { streams })
+            }
             ControlRequest::GetStream(request) => match self
                 .registry
                 .lock()
@@ -2626,6 +2649,39 @@ impl MasterServer {
                     }
                 }
             },
+            ControlRequest::GetStreamStatus(request) => {
+                let registry = self.registry.lock().unwrap();
+                match registry.get_stream(&request.stream_name) {
+                    Some(stream) => {
+                        tracing::debug!(
+                            component = "master_server",
+                            event = "get_stream_status",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            "fetched stream status"
+                        );
+                        ControlResponse::StreamFetched(GetStreamResponse {
+                            stream: stream_status_with_active_preflight(stream),
+                        })
+                    }
+                    None => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "get_stream_status",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            error = "stream not found",
+                            "failed to fetch stream status"
+                        );
+                        ControlResponse::Error {
+                            reason: format!(
+                                "stream not found stream_name=[{}]",
+                                request.stream_name
+                            ),
+                        }
+                    }
+                }
+            }
             ControlRequest::DropTable(request) => {
                 if !self.token_matches(request.token.as_deref()) {
                     let Some(process_id) = request.process_id.as_deref() else {
@@ -4067,11 +4123,41 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
 
 fn stream_info_with_active_preflight(stream: crate::registry::StreamRecord) -> StreamInfo {
     let mut info = StreamInfo::from(stream);
+    attach_active_preflight(&mut info);
+    info
+}
+
+fn stream_status_with_active_preflight(stream: &crate::registry::StreamRecord) -> StreamInfo {
+    let mut info = StreamInfo {
+        stream_name: stream.stream_name.clone(),
+        schema: stream.schema.clone(),
+        schema_hash: stream.schema_hash.clone(),
+        data_path: stream.data_path.clone(),
+        descriptor_generation: stream.descriptor_generation,
+        active_segment_descriptor: stream.active_segment_descriptor.clone(),
+        active_segment_preflight: None,
+        segment_row_capacity: None,
+        sealed_segments: Vec::new(),
+        persisted_files: Vec::new(),
+        persist_events: Vec::new(),
+        segment_reader_leases: stream.segment_reader_leases.clone(),
+        buffer_size: stream.buffer_size,
+        frame_size: stream.frame_size,
+        write_seq: 0,
+        writer_process_id: stream.writer_process_id.clone(),
+        writer_epoch: stream.writer_epoch,
+        reader_count: stream.reader_count,
+        status: stream.status.clone(),
+    };
+    attach_active_preflight(&mut info);
+    info
+}
+
+fn attach_active_preflight(info: &mut StreamInfo) {
     if let Some(descriptor) = info.active_segment_descriptor.as_ref() {
         info.segment_row_capacity = descriptor_row_capacity(descriptor);
         info.active_segment_preflight = Some(active_segment_preflight(descriptor));
     }
-    info
 }
 
 fn active_segment_preflight(descriptor: &serde_json::Value) -> serde_json::Value {

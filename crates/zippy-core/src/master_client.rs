@@ -320,8 +320,29 @@ impl MasterClient {
         }
     }
 
+    pub fn list_streams_status(&self) -> Result<Vec<StreamInfo>> {
+        let response =
+            self.send_request(ControlRequest::ListStreamStatuses(ListStreamsRequest {}))?;
+
+        match response {
+            ControlResponse::StreamsListed(response) => Ok(response.streams),
+            other => Err(unexpected_response("StreamsListed", other)),
+        }
+    }
+
     pub fn get_stream(&self, stream_name: &str) -> Result<StreamInfo> {
         let response = self.send_request(ControlRequest::GetStream(GetStreamRequest {
+            stream_name: stream_name.to_string(),
+        }))?;
+
+        match response {
+            ControlResponse::StreamFetched(response) => Ok(response.stream),
+            other => Err(unexpected_response("StreamFetched", other)),
+        }
+    }
+
+    pub fn get_stream_status(&self, stream_name: &str) -> Result<StreamInfo> {
+        let response = self.send_request(ControlRequest::GetStreamStatus(GetStreamRequest {
             stream_name: stream_name.to_string(),
         }))?;
 

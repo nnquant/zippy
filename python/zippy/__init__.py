@@ -2485,6 +2485,13 @@ def _parse_timeout_seconds(timeout: float | str | None) -> float | None:
     return seconds
 
 
+def _get_stream_status_or_full(master: MasterClient, source: str) -> dict[str, object]:
+    get_stream_status = getattr(master, "get_stream_status", None)
+    if callable(get_stream_status):
+        return get_stream_status(source)
+    return master.get_stream(source)
+
+
 def _wait_for_table_ready(
     source: str,
     master: MasterClient,
@@ -2496,7 +2503,7 @@ def _wait_for_table_ready(
 
     while True:
         try:
-            stream = master.get_stream(source)
+            stream = _get_stream_status_or_full(master, source)
         except RuntimeError as error:
             if "stream not found" not in str(error):
                 raise
@@ -5571,7 +5578,7 @@ def _uses_key_value_snapshot_subscription(
     if wait:
         _wait_for_table_ready(source, master, timeout)
     try:
-        stream = get_stream(source)
+        stream = _get_stream_status_or_full(master, source)
     except RuntimeError as error:
         if "stream not found" not in str(error):
             raise
@@ -5592,7 +5599,7 @@ def _key_value_changelog_subscription_source(
     if wait:
         _wait_for_table_ready(source, master, timeout)
     try:
-        stream = get_stream(source)
+        stream = _get_stream_status_or_full(master, source)
     except RuntimeError as error:
         if "stream not found" not in str(error):
             raise
@@ -6116,7 +6123,7 @@ class _TableSnapshotWatcher:
             self._stopped_event.set()
 
     def _descriptor_generation(self) -> int:
-        stream = self._master.get_stream(self.source)
+        stream = _get_stream_status_or_full(self._master, self.source)
         return int(stream.get("descriptor_generation", 0))
 
     def _collect_snapshot(self):
