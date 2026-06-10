@@ -11,6 +11,7 @@ from .cli_master import master_group
 from .cli_pm import pm_group
 from .cli_stream import stream_group
 from .cli_table import table_group
+from .cli_webui import webui_command
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -25,6 +26,7 @@ main.add_command(gateway_group)
 main.add_command(stream_group)
 main.add_command(table_group)
 main.add_command(pm_group)
+main.add_command(webui_command)
 
 
 if __name__ == "__main__":

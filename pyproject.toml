@@ -25,6 +25,7 @@ module-name = "zippy._internal"
 python-source = "python"
 manifest-path = "crates/zippy-python/Cargo.toml"
 features = ["extension-module"]
+include = [{ path = "python/zippy/assets/zippy-logo.png", format = ["sdist", "wheel"] }]
 
 [tool.uv.sources]
 rspm = { path = "../rspm/python", editable = true }
@@ -53,6 +54,8 @@ files = [
     "python/zippy/cli_pm.py",
     "python/zippy/cli_stream.py",
     "python/zippy/pm_bridge.py",
+    "python/zippy/cli_webui.py",
+    "python/zippy/webui.py",
 ]
 ignore_missing_imports = true
 follow_imports = "silent"

@@ -61,6 +61,7 @@ def test_cli_root_help() -> None:
     assert "stream" in result.output
     assert "table" in result.output
     assert "pm" in result.output
+    assert "webui" in result.output
 
 
 def test_python_module_entrypoint_shows_root_help() -> None:
@@ -78,6 +79,18 @@ def test_python_module_entrypoint_shows_root_help() -> None:
     assert "stream" in result.stdout
     assert "table" in result.stdout
     assert "pm" in result.stdout
+    assert "webui" in result.stdout
+
+
+def test_webui_once_emits_dashboard_json_for_unreachable_master() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["webui", "--uri", unused_loopback_uri(), "--once"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["master"]["status"] == "error"
+    assert payload["master"]["error"]
+    assert payload["tables"] == []
 
 
 def test_gateway_run_starts_gateway_server_once(monkeypatch: pytest.MonkeyPatch) -> None:
