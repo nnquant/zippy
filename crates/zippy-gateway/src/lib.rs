@@ -1192,6 +1192,16 @@ impl GatewayAsyncMasterClient {
         })
     }
 
+    fn get_stream_status_blocking(&self, source: &str) -> Result<StreamInfo> {
+        self.send_request_blocking(ControlRequest::GetStreamStatus(GetStreamRequest {
+            stream_name: source.to_string(),
+        }))
+        .and_then(|response| match response {
+            ControlResponse::StreamFetched(response) => Ok(response.stream),
+            other => Err(unexpected_response("StreamFetched", other)),
+        })
+    }
+
     fn list_streams_blocking(&self) -> Result<Vec<StreamInfo>> {
         self.send_request_blocking(ControlRequest::ListStreams(ListStreamsRequest {}))
             .and_then(|response| match response {
@@ -1927,7 +1937,10 @@ impl GatewayState {
             .register_stream_blocking(stream_name, Arc::clone(&schema), 64, 4096)?;
         self.master
             .register_source_blocking(&source_name, "gateway", stream_name, json!({}))?;
-        let writer_epoch = self.master.get_stream_blocking(stream_name)?.writer_epoch;
+        let writer_epoch = self
+            .master
+            .get_stream_status_blocking(stream_name)?
+            .writer_epoch;
 
         let publisher = Arc::new(MasterDescriptorPublisher {
             master: Arc::clone(&self.master),
@@ -5649,6 +5662,136 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, TimestampNanosecondArray};
     use parquet::arrow::ArrowWriter;
+    use std::io::{BufRead, BufReader, Write};
+
+    #[test]
+    fn gateway_writer_creation_fetches_writer_epoch_with_stream_status_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let response_schema = Arc::clone(&schema);
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+
+                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
+                let mut done = false;
+                let response = match request {
+                    ControlRequest::RegisterProcess(RegisterProcessRequest { app }) => {
+                        assert_eq!(app, "zippy_gateway");
+                        ControlResponse::ProcessRegistered {
+                            process_id: "proc_gateway".to_string(),
+                            process_token: "token_gateway".to_string(),
+                        }
+                    }
+                    ControlRequest::RegisterStream(request) => {
+                        assert_eq!(request.stream_name, "gateway_status_ticks");
+                        ControlResponse::StreamRegistered {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    ControlRequest::RegisterSource(request) => {
+                        assert_eq!(request.source_name, "gateway.gateway_status_ticks");
+                        assert_eq!(request.output_stream, "gateway_status_ticks");
+                        ControlResponse::SourceRegistered {
+                            source_name: request.source_name,
+                        }
+                    }
+                    ControlRequest::GetStreamStatus(request) => {
+                        assert_eq!(request.stream_name, "gateway_status_ticks");
+                        ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
+                            stream: stream_info_for_gateway_status_test(
+                                "gateway_status_ticks",
+                                Arc::clone(&response_schema),
+                                3,
+                            ),
+                        })
+                    }
+                    ControlRequest::GetStream(request) => {
+                        let response = ControlResponse::Error {
+                            reason: format!(
+                                "gateway writer epoch preflight must use GetStreamStatus stream_name=[{}]",
+                                request.stream_name
+                            ),
+                        };
+                        let response = serde_json::to_string(&response).unwrap();
+                        stream.write_all(response.as_bytes()).unwrap();
+                        stream.write_all(b"\n").unwrap();
+                        break;
+                    }
+                    ControlRequest::PublishSegmentDescriptor(request) => {
+                        assert_eq!(request.stream_name, "gateway_status_ticks");
+                        assert_eq!(request.descriptor["writer_epoch"], json!(3));
+                        done = true;
+                        ControlResponse::SegmentDescriptorPublished {
+                            stream_name: request.stream_name,
+                        }
+                    }
+                    other => panic!("unexpected control request request=[{other:?}]"),
+                };
+
+                let response = serde_json::to_string(&response).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+
+                if done {
+                    break;
+                }
+            }
+        });
+
+        let gateway = GatewayServer::new(GatewayServerConfig {
+            endpoint: "127.0.0.1:0".to_string(),
+            master_endpoint: endpoint,
+            token: None,
+            max_write_rows: None,
+            max_connections: None,
+            max_subscribers: None,
+            max_blocking_requests: None,
+            write_timeout_ms: None,
+        })
+        .unwrap();
+
+        let result = gateway
+            .state
+            .create_writer("gateway_status_ticks", Arc::clone(&schema));
+
+        server.join().unwrap();
+        if let Err(error) = result {
+            panic!("create_writer failed error=[{error}]");
+        }
+    }
+
+    fn stream_info_for_gateway_status_test(
+        stream_name: &str,
+        schema: SchemaRef,
+        writer_epoch: u64,
+    ) -> StreamInfo {
+        StreamInfo {
+            stream_name: stream_name.to_string(),
+            schema: schema_metadata(&schema),
+            schema_hash: canonical_schema_hash(&schema),
+            data_path: "segment".to_string(),
+            descriptor_generation: 0,
+            active_segment_descriptor: None,
+            active_segment_preflight: None,
+            segment_row_capacity: Some(DEFAULT_STREAM_TABLE_ROW_CAPACITY),
+            sealed_segments: Vec::new(),
+            persisted_files: Vec::new(),
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: Some("proc_gateway".to_string()),
+            writer_epoch,
+            reader_count: 0,
+            status: "active".to_string(),
+        }
+    }
 
     #[test]
     fn materialized_stream_producer_splits_batches_by_chunk_rows() {

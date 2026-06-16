@@ -2199,7 +2199,6 @@ name = "zippy-io"
 version = "0.5.0"
 dependencies = [
  "arrow",
- "parquet",
  "zippy-core",
  "zmq",
 ]

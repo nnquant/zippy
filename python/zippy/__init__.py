@@ -6322,8 +6322,8 @@ def _watch_table_latest(
     """
     Watch a named table and invoke callbacks with full latest snapshots.
 
-    Use this for ``ReactiveLatestEngine.stream_table(...)`` outputs and other
-    key-value snapshot tables. Unlike :func:`subscribe_table`, this API does not
+    Use this for ``key_value_table(...).publish(...)`` outputs and other key-value
+    snapshot tables. Unlike :func:`subscribe_table`, this API does not
     follow active-segment row offsets; it treats descriptor generation changes as
     snapshot boundaries and recollects the table.
 
@@ -7868,8 +7868,9 @@ class Session:
             ``zippy.ReactiveLatestEngine``.
         :type engine: object
         :param kwargs: Constructor arguments when ``engine`` is a class.
-            ``output_stream="name"`` remains a shortcut for ``.stream_table("name")``.
-            Prefer ``.append_table(...).publish(persist=True|False)`` for new code.
+            ``output_stream="name"`` remains a shortcut for automatic table materialization.
+            Prefer explicit ``.append_table(...).publish(...)`` or
+            ``.key_value_table(...).publish(...)`` for new code.
         :type kwargs: object
         :returns: This session for fluent ``.engine(...).run()`` usage.
         :rtype: Session
@@ -8043,8 +8044,8 @@ class Session:
         :type name: str
         :param by: Key columns used to identify the latest value for each key.
         :type by: str | list[str] | tuple[str, ...] | None
-        :param persist: Reserved for compatibility with ``stream_table``. Key-value tables do not
-            currently support parquet persistence.
+        :param persist: Reserved for API compatibility. Key-value tables do not currently support
+            parquet persistence.
         :type persist: bool
         :returns: This session for fluent ``.publish_key_value_table(...).run()`` usage.
         :rtype: Session
@@ -8078,8 +8079,8 @@ class Session:
         :type name: str
         :param by: Key columns used to identify the latest value for each key.
         :type by: str | list[str] | tuple[str, ...] | None
-        :param persist: Reserved for compatibility with ``stream_table``. Key-value tables do not
-            currently support parquet persistence.
+        :param persist: Reserved for API compatibility. Key-value tables do not currently support
+            parquet persistence.
         :type persist: bool
         :returns: This session for fluent ``.run()`` usage.
         :rtype: Session
@@ -8503,10 +8504,12 @@ class Session:
         if explicit_target:
             raise TypeError(
                 "target is not supported in Session.engine(); publish engine output with "
-                "append_table(...).publish(...) or stream_table(...)"
+                "append_table(...).publish(...) or key_value_table(...).publish(...)"
             )
         if "output" in kwargs:
-            raise TypeError("output is not supported; use output_stream or .stream_table(...)")
+            raise TypeError(
+                "output is not supported; use output_stream or append_table(...).publish(...)"
+            )
         output_stream = kwargs.pop("output_stream", None)
         if output_stream is not None and not isinstance(output_stream, str):
             raise TypeError("output_stream must be a stream table name")
@@ -9036,7 +9039,7 @@ class Pipeline:
     """
     Own a simple Python-defined Zippy data pipeline.
 
-    The first implementation focuses on one stream table materializer sink and hides
+    The first implementation focuses on one stream table materializer target and hides
     stream/source registration plus active descriptor publication.
 
     :param name: Pipeline/process name.

@@ -78,7 +78,8 @@ def main() -> None:
                 zp.AGG_SUM(column="volume", output="volume"),
             ],
         )
-        .stream_table(args.output, persist=False)
+        .append_table(args.output)
+        .publish(persist=False)
         .run()
     )
 

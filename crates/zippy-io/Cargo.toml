@@ -9,6 +9,5 @@ zmq-publisher = ["dep:zmq"]
 
 [dependencies]
 arrow.workspace = true
-parquet.workspace = true
 zippy-core = { path = "../zippy-core" }
 zmq = { version = "0.10.0", optional = true }

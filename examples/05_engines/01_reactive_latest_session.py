@@ -61,7 +61,8 @@ def main() -> None:
         )
         # latest 表是在线快照，默认只保留当前最新值。
         # 如果需要历史数据，请对上游 StreamTable 开启 persist="parquet"。
-        .stream_table(args.output, persist=False)
+        .key_value_table(args.output, by=parse_by(args.by))
+        .publish(persist=False)
         .run()
     )
 

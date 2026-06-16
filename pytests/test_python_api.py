@@ -1682,7 +1682,7 @@ def test_session_engine_rejects_legacy_output_parameter() -> None:
     master = zippy.MasterClient(control_endpoint="/tmp/zippy-session-test.sock")
     session = zippy.Session(name="latest_session", master=master)
 
-    with pytest.raises(TypeError, match="use output_stream or .stream_table"):
+    with pytest.raises(TypeError, match="use output_stream or append_table"):
         session.engine(
             CapturingEngine,
             name="latest_engine",
@@ -4078,6 +4078,12 @@ def test_parquet_sink_constructor_signature_hides_legacy_parameters() -> None:
     assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
 
 
+def test_zippy_io_does_not_export_removed_parquet_sink_api() -> None:
+    zippy_io_lib = (WORKSPACE_ROOT / "crates/zippy-io/src/lib.rs").read_text()
+    assert "pub mod parquet_sink" not in zippy_io_lib
+    assert "ParquetSink" not in zippy_io_lib
+
+
 @pytest.mark.parametrize(
     "engine_type,legacy_parameters",
     [
@@ -6023,6 +6029,12 @@ def test_legacy_bus_ring_api_is_not_exported() -> None:
     assert "class BusReader" not in internal_stub
     assert "def write_to" not in internal_stub
     assert "def read_from" not in internal_stub
+
+
+def test_master_client_type_stub_exposes_stream_status_lookup() -> None:
+    internal_stub = Path(zippy.__file__).with_name("_internal.pyi").read_text()
+
+    assert "def get_stream_status(self, stream_name: str) -> dict[str, object]: ..." in internal_stub
 
 
 def test_stream_table_engine_can_publish_to_zmq_direct_reader() -> None:

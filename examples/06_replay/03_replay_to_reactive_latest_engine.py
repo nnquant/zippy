@@ -141,7 +141,8 @@ def main() -> None:
                 source=args.replay_stream,
                 by="instrument_id",
             )
-            .stream_table(args.latest_table, persist=False)
+            .key_value_table(args.latest_table, by="instrument_id")
+            .publish(persist=False)
             .run()
         )
 

@@ -85,7 +85,8 @@ def main() -> None:
             factors=[zp.CS_RANK(column="ret_1m", output="ret_rank")],
             source=args.input,
         )
-        .stream_table(args.output, persist=False)
+        .append_table(args.output)
+        .publish(persist=False)
         .run()
     )
     try:

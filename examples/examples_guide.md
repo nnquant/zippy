@@ -82,7 +82,8 @@ uv run zippy stream ls --uri default
   StreamTable 的推荐入口，Ctrl-C 后统一停止 source 和 engine。
 - `zp.Pipeline(...).stream_table(...)`：一次性写入或测试时，可以手动
   `start()` / `write()` / `flush()` / `stop()`。
-- `zp.Session(...).engine(...).stream_table(...).run()`：编排下游 Engine，并把输出注册成可查询表。
+- `zp.Session(...).engine(...).append_table(...).publish().run()`：编排下游 Engine，并把 append 输出注册成可查询表。
+- `zp.Session(...).engine(...).key_value_table(...).publish().run()`：把 latest/key-value 输出注册成可查询表。
 - `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
   若监控或策略进程需要先于 producer 启动，可用
   `zp.read_table("table_name", wait=True, timeout="30s")` 等待表注册。
@@ -117,5 +118,5 @@ uv run zippy stream ls --uri default
 - 示例中的时间列使用 UTC 时间戳，字段名使用小写 snake_case。
 - 会写数据的示例默认使用 `/tmp/zippy-examples`，避免污染工作目录。
 - 持久化示例使用 `persist="parquet"`；不需要落盘时传 `persist=None` 或使用高层
-  `Session.stream_table(..., persist=False)`。
+  `Session.append_table(...).publish(persist=False)` / `Session.key_value_table(...).publish()`。
 - 多数脚本提供 `--drop-existing`，便于重复运行。生产环境不要随意使用这个参数。
