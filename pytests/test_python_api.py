@@ -1049,9 +1049,9 @@ def test_session_append_table_publish_uses_stream_status_for_writer_epoch(
 
     monkeypatch.setattr(zippy, "_StreamTableMaterializer", CapturingStreamTableMaterializer)
 
-    zippy.Session(name="factor_session", master=FakeMaster()).engine(
-        FakeEngine()
-    ).append_table("factor_events").publish()
+    zippy.Session(name="factor_session", master=FakeMaster()).engine(FakeEngine()).append_table(
+        "factor_events"
+    ).publish()
 
     assert captured_materializer["writer_epoch"] == 7
 
@@ -1381,6 +1381,21 @@ def test_session_source_key_value_table_requires_explicit_tail_until_replay_exis
                 "latest_factors",
                 by=["instrument_id"],
             )
+
+
+def test_session_source_key_value_table_publish_replay_error_uses_current_api_name() -> None:
+    session = zippy.Session(name="source_session", master=zippy.MasterClient())
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"source\(\.\.\.\)\.key_value_table\(\.\.\.\)\.publish\(\)",
+    ) as excinfo:
+        session.source("factor_events").key_value_table(
+            "latest_factors",
+            by=["instrument_id"],
+        ).publish()
+
+    assert "publish_key_value_table" not in str(excinfo.value)
 
 
 def test_session_source_publish_key_value_table_tail_registers_materializer(monkeypatch) -> None:
@@ -4202,8 +4217,7 @@ def test_engine_rejects_invalid_runtime_config_keywords(tmp_path: Path) -> None:
         )
 
 
-def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
-) -> None:
+def test_reactive_engine_exposes_status_metrics_and_config_lifecycle() -> None:
     schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -6034,7 +6048,9 @@ def test_legacy_bus_ring_api_is_not_exported() -> None:
 def test_master_client_type_stub_exposes_stream_status_lookup() -> None:
     internal_stub = Path(zippy.__file__).with_name("_internal.pyi").read_text()
 
-    assert "def get_stream_status(self, stream_name: str) -> dict[str, object]: ..." in internal_stub
+    assert (
+        "def get_stream_status(self, stream_name: str) -> dict[str, object]: ..." in internal_stub
+    )
 
 
 def test_stream_table_engine_can_publish_to_zmq_direct_reader() -> None:

@@ -4075,8 +4075,6 @@ class Table:
         :returns: Dictionary with ``result`` and ``metrics`` entries.
         :rtype: dict[str, object]
         """
-        import time
-
         metrics = self._new_query_metrics()
         started_ns = _profile_time_ns()
         result = self._collect_query(metrics=metrics)
@@ -8750,7 +8748,7 @@ class Session:
             raise ValueError("start_from must be 'replay' or 'tail'")
         if start_from == "replay":
             raise NotImplementedError(
-                "source(...).publish_key_value_table start_from='replay' is not implemented; "
+                f"{method} start_from='replay' is not implemented; "
                 "use start_from='tail' for an explicit live-only view"
             )
 

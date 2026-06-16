@@ -48,12 +48,12 @@ current key-value state
 The public API should make this split visible:
 
 ```python
-session.publish_append_table("factor_events", persist=True)
+session.append_table("factor_events").publish(persist=True)
 
-session.publish_key_value_table(
+session.key_value_table(
     "latest_factors",
     by=["instrument_id"],
-)
+).publish()
 ```
 
 Do not add `kv_table` or `keyvalue_table` aliases. The canonical public name is
@@ -71,28 +71,30 @@ by a user remembering which engine produced the table.
 
 ## Publish API
 
-`Session.publish_append_table(...)` materializes the latest engine output as an
+`Session.append_table(...).publish(...)` materializes the latest engine output as an
 append table:
 
 ```python
 (
     session
     .engine(factor_engine)
-    .publish_append_table("factor_events", persist=True)
+    .append_table("factor_events")
+    .publish(persist=True)
 )
 ```
 
-`Session.publish_key_value_table(...)` materializes the latest engine output as a
+`Session.key_value_table(...).publish(...)` materializes the latest engine output as a
 key-value table:
 
 ```python
 (
     session
     .engine(factor_engine)
-    .publish_key_value_table(
+    .key_value_table(
         "latest_factors",
         by=["instrument_id"],
     )
+    .publish()
 )
 ```
 
@@ -102,18 +104,19 @@ The method can also derive a key-value table from an existing append table:
 (
     session
     .source("factor_events")
-    .publish_key_value_table(
+    .key_value_table(
         "latest_factors",
         by=["instrument_id"],
-        start_from="replay",
     )
+    .publish(start_from="tail")
 )
 ```
 
-`start_from="replay"` is the default for append-table-derived key-value views. It means
-the materializer should rebuild state from the append table's readable history and then
-follow the live tail. `start_from="tail"` is allowed only when the caller explicitly
-wants a live-only view from the current point forward.
+`start_from="replay"` is the target default for append-table-derived key-value views.
+It means the materializer should rebuild state from the append table's readable history
+and then follow the live tail. Until replay-backed construction exists, the
+implementation must reject replay mode and require `start_from="tail"` for an explicit
+live-only view from the current point forward.
 
 ## Compatibility
 
@@ -215,11 +218,10 @@ This is the only default that matches user expectations for a current-state tabl
 live-only view is valid but must be explicit:
 
 ```python
-session.source("factor_events").publish_key_value_table(
+session.source("factor_events").key_value_table(
     "latest_factors",
     by=["instrument_id"],
-    start_from="tail",
-)
+).publish(start_from="tail")
 ```
 
 The first implementation may stage replay support behind the API boundary, but it must
@@ -229,8 +231,8 @@ not silently present a live-only table as a complete replay-backed table.
 
 ### Phase 1: API and metadata
 
-- Add `Session.publish_append_table(...)`.
-- Add `Session.publish_key_value_table(...)`.
+- Add `Session.append_table(...).publish(...)`.
+- Add `Session.key_value_table(...).publish(...)`.
 - Add `Session.source(...)` for source-table-derived materialization.
 - Write `zippy_table_kind` for newly materialized tables.
 - Keep `stream_table()` and `output_stream` as compatibility wrappers.
@@ -238,14 +240,14 @@ not silently present a live-only table as a complete replay-backed table.
 
 ### Phase 2: Key-value table alignment
 
-- Route `publish_key_value_table(...)` through `KeyValueTableMaterializer`.
+- Route `key_value_table(...).publish(...)` through `KeyValueTableMaterializer`.
 - Keep snapshot, changelog, and watermark metadata in one semantic boundary.
 - Hide internal changelog streams from default list APIs.
 - Preserve `subscribe()` and `subscribe_table()` behavior for existing key-value users.
 
 ### Phase 3: Append-table-derived key-value views
 
-- Support `source("append_table").publish_key_value_table(...)`.
+- Support `source("append_table").key_value_table(...).publish(...)`.
 - Implement `start_from="tail"` for explicit live-only views.
 - Implement `start_from="replay"` by reading append table history, building initial
   key-value state, then following the live tail.
@@ -259,12 +261,12 @@ not silently present a live-only table as a complete replay-backed table.
 
 ## Test Matrix
 
-- `publish_append_table(...)` creates `zippy_table_kind=append_table`.
-- `publish_key_value_table(...)` creates `zippy_table_kind=key_value_table`.
+- `append_table(...).publish(...)` creates `zippy_table_kind=append_table`.
+- `key_value_table(...).publish(...)` creates `zippy_table_kind=key_value_table`.
 - `stream_table()` remains compatible for normal engines.
 - `ReactiveLatestEngine.stream_table()` maps to `key_value_table`.
-- `ReactiveLatestEngine.publish_append_table(...)` raises a clear error.
-- `ReactiveStateEngine.publish_append_table(...)` remains supported.
+- `ReactiveLatestEngine.append_table(...).publish(...)` raises a clear error.
+- `ReactiveStateEngine.append_table(...).publish(...)` remains supported.
 - `subscribe()` on append tables emits appended rows.
 - `subscribe()` on key-value tables emits changelog events and hides internal fields.
 - `subscribe_table()` on key-value tables emits full snapshots.
