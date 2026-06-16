@@ -3988,14 +3988,14 @@ def test_engine_rejects_invalid_runtime_config_keywords(tmp_path: Path) -> None:
             overflow_policy="block",
         )
 
-    with pytest.raises(ValueError, match="archive_buffer_capacity"):
+    with pytest.raises(TypeError, match="archive_buffer_capacity is no longer supported"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=schema,
             id_column="symbol",
             factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
             target=zippy.NullPublisher(),
-            archive_buffer_capacity=0,
+            archive_buffer_capacity=8,
         )
 
 
@@ -4016,7 +4016,6 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
         target=zippy.NullPublisher(),
         buffer_capacity=32,
         overflow_policy=zippy.OverflowPolicy.REJECT,
-        archive_buffer_capacity=8,
     )
 
     assert engine.status() == "created"
@@ -4037,12 +4036,13 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle(
     assert config["engine_type"] == "reactive"
     assert config["buffer_capacity"] == 32
     assert config["overflow_policy"] == "reject"
-    assert config["archive_buffer_capacity"] == 8
     assert config["targets"] == [{"type": "null"}]
     assert config["source_linked"] is False
     assert config["state_failure_policy"] == "fail_fast"
     assert config["invalid_value_policy"] == "reject"
-    assert config["parquet_sink"] is None
+    assert "archive_buffer_capacity" not in config
+    assert "has_sink" not in config
+    assert "parquet_sink" not in config
 
     engine.start()
     assert engine.status() == "running"
@@ -4225,7 +4225,6 @@ def test_timeseries_engine_config_and_lifecycle_roundtrip() -> None:
         target=zippy.NullPublisher(),
         buffer_capacity=17,
         overflow_policy=zippy.OverflowPolicy.DROP_OLDEST,
-        archive_buffer_capacity=9,
     )
 
     config = engine.config()
@@ -4234,8 +4233,9 @@ def test_timeseries_engine_config_and_lifecycle_roundtrip() -> None:
     assert config["late_data_policy"] == "reject"
     assert config["buffer_capacity"] == 17
     assert config["overflow_policy"] == "drop_oldest"
-    assert config["archive_buffer_capacity"] == 9
-    assert config["parquet_sink"] is None
+    assert "archive_buffer_capacity" not in config
+    assert "has_sink" not in config
+    assert "parquet_sink" not in config
 
     engine.start()
     engine.write(
@@ -4515,8 +4515,8 @@ def test_stream_table_engine_supports_source_and_target_config() -> None:
 
     assert config["engine_type"] == "stream_table"
     assert config["source_linked"] is True
-    assert config["has_sink"] is False
-    assert config["sink"] is None
+    assert "has_sink" not in config
+    assert "sink" not in config
     assert "parquet_sink" not in config
 
 
@@ -5716,7 +5716,9 @@ def test_cross_sectional_engine_config_and_lifecycle() -> None:
 
     config = engine.config()
     assert config["engine_type"] == "cross_sectional"
-    assert config["parquet_sink"] is None
+    assert "archive_buffer_capacity" not in config
+    assert "has_sink" not in config
+    assert "parquet_sink" not in config
 
     engine.start()
     engine.write(

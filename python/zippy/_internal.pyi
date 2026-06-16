@@ -417,10 +417,8 @@ class ReactiveStateEngine:
             | None
         ) = None,
         master: MasterClient | None = None,
-        parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
         descriptor_publisher: object | None = None,
     ) -> None: ...
@@ -453,10 +451,8 @@ class ReactiveLatestEngine:
             | None
         ) = None,
         master: MasterClient | None = None,
-        parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
     ) -> None: ...
     def start(self) -> None: ...
@@ -487,10 +483,8 @@ class StreamTableMaterializer:
             | None
         ) = None,
         master: MasterClient | None = None,
-        sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
         descriptor_publisher: object | None = None,
         row_capacity: int | None = None,
@@ -535,10 +529,8 @@ class KeyValueTableMaterializer:
             | None
         ) = None,
         master: MasterClient | None = None,
-        sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
         descriptor_publisher: object | None = None,
         row_capacity: int | None = None,
@@ -588,10 +580,8 @@ class TimeSeriesEngine:
             | None
         ) = None,
         master: MasterClient | None = None,
-        parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
     ) -> None: ...
 
@@ -634,10 +624,8 @@ class BarGeneratorEngine:
             | None
         ) = None,
         master: MasterClient | None = None,
-        parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
     ) -> None: ...
     def start(self) -> None: ...
@@ -663,10 +651,8 @@ class CrossSectionalEngine:
         *,
         source: str | TimeSeriesEngine | BarGeneratorEngine | ZmqSource | None = None,
         master: MasterClient | None = None,
-        parquet_sink: ParquetSink | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
-        archive_buffer_capacity: int = 1024,
         xfast: bool = False,
     ) -> None: ...
     def start(self) -> None: ...
