@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
@@ -78,20 +78,9 @@ pub struct EngineRecord {
     pub process_id: String,
     pub input_stream: String,
     pub output_stream: String,
-    pub sink_names: Vec<String>,
     pub config: serde_json::Value,
     pub status: String,
     pub metrics: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SinkRecord {
-    pub sink_name: String,
-    pub sink_type: String,
-    pub process_id: String,
-    pub input_stream: String,
-    pub config: serde_json::Value,
-    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,9 +178,6 @@ pub enum RegistryError {
     EngineNotFound {
         engine_name: String,
     },
-    SinkNotFound {
-        sink_name: String,
-    },
     SourceAlreadyExists {
         source_name: String,
     },
@@ -202,9 +188,6 @@ pub enum RegistryError {
     },
     EngineAlreadyExists {
         engine_name: String,
-    },
-    SinkAlreadyExists {
-        sink_name: String,
     },
     InvalidRecordKind {
         kind: String,
@@ -371,9 +354,6 @@ impl fmt::Display for RegistryError {
             Self::EngineNotFound { engine_name } => {
                 write!(f, "engine not found engine_name=[{}]", engine_name)
             }
-            Self::SinkNotFound { sink_name } => {
-                write!(f, "sink not found sink_name=[{}]", sink_name)
-            }
             Self::SourceAlreadyExists { source_name } => {
                 write!(f, "source already exists source_name=[{}]", source_name)
             }
@@ -388,9 +368,6 @@ impl fmt::Display for RegistryError {
             ),
             Self::EngineAlreadyExists { engine_name } => {
                 write!(f, "engine already exists engine_name=[{}]", engine_name)
-            }
-            Self::SinkAlreadyExists { sink_name } => {
-                write!(f, "sink already exists sink_name=[{}]", sink_name)
             }
             Self::InvalidRecordKind { kind } => {
                 write!(f, "invalid record kind kind=[{}]", kind)
@@ -426,7 +403,6 @@ pub struct Registry {
     streams: BTreeMap<String, StreamRecord>,
     sources: BTreeMap<String, SourceRecord>,
     engines: BTreeMap<String, EngineRecord>,
-    sinks: BTreeMap<String, SinkRecord>,
     next_process_id: u64,
     next_segment_reader_lease_id: u64,
     control_revision: u64,
@@ -437,7 +413,6 @@ pub struct DroppedTableRecords {
     pub stream: Option<StreamRecord>,
     pub sources: Vec<SourceRecord>,
     pub engines: Vec<EngineRecord>,
-    pub sinks: Vec<SinkRecord>,
 }
 
 fn split_active_segment_descriptor(
@@ -969,10 +944,6 @@ impl Registry {
         self.engines.len()
     }
 
-    pub fn sinks_len(&self) -> usize {
-        self.sinks.len()
-    }
-
     pub fn get_process(&self, process_id: &str) -> Option<&ProcessRecord> {
         self.processes.get(process_id)
     }
@@ -1091,10 +1062,6 @@ impl Registry {
 
     pub fn get_engine(&self, engine_name: &str) -> Option<&EngineRecord> {
         self.engines.get(engine_name)
-    }
-
-    pub fn get_sink(&self, sink_name: &str) -> Option<&SinkRecord> {
-        self.sinks.get(sink_name)
     }
 
     pub fn register_source(
@@ -1264,7 +1231,6 @@ impl Registry {
         process_id: &str,
         input_stream: &str,
         output_stream: &str,
-        sink_names: Vec<String>,
         config: serde_json::Value,
     ) -> Result<(), RegistryError> {
         if self.engines.contains_key(engine_name) {
@@ -1280,37 +1246,9 @@ impl Registry {
                 process_id: process_id.to_string(),
                 input_stream: input_stream.to_string(),
                 output_stream: output_stream.to_string(),
-                sink_names,
                 config,
                 status: "registered".to_string(),
                 metrics: serde_json::json!({}),
-            },
-        );
-        Ok(())
-    }
-
-    pub fn register_sink(
-        &mut self,
-        sink_name: &str,
-        sink_type: &str,
-        process_id: &str,
-        input_stream: &str,
-        config: serde_json::Value,
-    ) -> Result<(), RegistryError> {
-        if self.sinks.contains_key(sink_name) {
-            return Err(RegistryError::SinkAlreadyExists {
-                sink_name: sink_name.to_string(),
-            });
-        }
-        self.sinks.insert(
-            sink_name.to_string(),
-            SinkRecord {
-                sink_name: sink_name.to_string(),
-                sink_type: sink_type.to_string(),
-                process_id: process_id.to_string(),
-                input_stream: input_stream.to_string(),
-                config,
-                status: "registered".to_string(),
             },
         );
         Ok(())
@@ -1421,17 +1359,6 @@ impl Registry {
         Ok(())
     }
 
-    pub fn set_sink_status(&mut self, sink_name: &str, status: &str) -> Result<(), RegistryError> {
-        let sink = self
-            .sinks
-            .get_mut(sink_name)
-            .ok_or_else(|| RegistryError::SinkNotFound {
-                sink_name: sink_name.to_string(),
-            })?;
-        sink.status = status.to_string();
-        Ok(())
-    }
-
     pub fn attach_writer(
         &mut self,
         stream_name: &str,
@@ -1512,12 +1439,7 @@ impl Registry {
                 })?;
         let writer_owner = self.stream_writer_process_authorized(stream, process_id);
         let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
-        let sink_owner = self.sinks.values().any(|sink| {
-            sink.input_stream == stream_name
-                && sink.process_id == process_id
-                && sink.status != "lost"
-        });
-        if !writer_owner && !source_owner && !sink_owner {
+        if !writer_owner && !source_owner {
             return Err(RegistryError::PersistedFilePublisherNotAuthorized {
                 stream_name: stream_name.to_string(),
                 process_id: process_id.to_string(),
@@ -1609,12 +1531,7 @@ impl Registry {
                 })?;
         let writer_owner = self.stream_writer_process_authorized(stream, process_id);
         let source_owner = self.stream_active_source_owned_by(stream_name, process_id);
-        let sink_owner = self.sinks.values().any(|sink| {
-            sink.input_stream == stream_name
-                && sink.process_id == process_id
-                && sink.status != "lost"
-        });
-        if !writer_owner && !source_owner && !sink_owner {
+        if !writer_owner && !source_owner {
             return Err(RegistryError::PersistEventPublisherNotAuthorized {
                 stream_name: stream_name.to_string(),
                 process_id: process_id.to_string(),
@@ -1937,22 +1854,10 @@ impl Registry {
         self.engines.values().cloned().collect()
     }
 
-    pub fn list_sinks(&self) -> Vec<SinkRecord> {
-        self.sinks.values().cloned().collect()
-    }
-
     pub fn sources_for_stream(&self, stream_name: &str) -> Vec<SourceRecord> {
         self.sources
             .values()
             .filter(|source| source.output_stream == stream_name)
-            .cloned()
-            .collect()
-    }
-
-    pub fn sinks_for_stream(&self, stream_name: &str) -> Vec<SinkRecord> {
-        self.sinks
-            .values()
-            .filter(|sink| sink.input_stream == stream_name)
             .cloned()
             .collect()
     }
@@ -2014,11 +1919,6 @@ impl Registry {
                 engine.status = "lost".to_string();
             }
         }
-        for sink in self.sinks.values_mut() {
-            if sink.process_id == process_id {
-                sink.status = "lost".to_string();
-            }
-        }
     }
 
     pub fn unregister_source(&mut self, source_name: &str) -> Option<SourceRecord> {
@@ -2077,10 +1977,6 @@ impl Registry {
         self.engines.remove(engine_name)
     }
 
-    pub fn unregister_sink(&mut self, sink_name: &str) -> Option<SinkRecord> {
-        self.sinks.remove(sink_name)
-    }
-
     pub fn unregister_stream(&mut self, stream_name: &str) -> Option<StreamRecord> {
         self.streams.remove(stream_name)
     }
@@ -2107,33 +2003,17 @@ impl Registry {
             })
             .map(|engine| engine.engine_name.clone())
             .collect::<Vec<_>>();
-        let mut engine_sink_names = BTreeSet::new();
         let mut engines = Vec::new();
         for engine_name in engine_names {
             if let Some(engine) = self.engines.remove(&engine_name) {
-                engine_sink_names.extend(engine.sink_names.iter().cloned());
                 engines.push(engine);
             }
         }
-
-        let sink_names = self
-            .sinks
-            .values()
-            .filter(|sink| {
-                sink.input_stream == table_name || engine_sink_names.contains(&sink.sink_name)
-            })
-            .map(|sink| sink.sink_name.clone())
-            .collect::<Vec<_>>();
-        let sinks = sink_names
-            .into_iter()
-            .filter_map(|sink_name| self.sinks.remove(&sink_name))
-            .collect::<Vec<_>>();
 
         DroppedTableRecords {
             stream,
             sources,
             engines,
-            sinks,
         }
     }
 }

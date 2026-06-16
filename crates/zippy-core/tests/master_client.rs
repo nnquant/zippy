@@ -12,8 +12,8 @@ use arrow::datatypes::Schema;
 use zippy_core::{
     canonical_schema_hash, schema_metadata, ControlEndpoint, ControlRequest, ControlResponse,
     HeartbeatRequest, MasterClient, RegisterEngineRequest, RegisterProcessRequest,
-    RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest, SchemaRef, StreamInfo,
-    UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
+    RegisterSourceRequest, RegisterStreamRequest, SchemaRef, StreamInfo, UnregisterSourceRequest,
+    UpdateRecordStatusRequest, WatchResource,
 };
 
 fn empty_schema() -> SchemaRef {
@@ -303,24 +303,12 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                     engine_type,
                     input_stream,
                     output_stream,
-                    sink_names,
                     ..
                 }) => {
                     assert_eq!(engine_type, "reactive");
                     assert_eq!(input_stream, "openctp_ticks");
                     assert_eq!(output_stream, "openctp_mid_price_factors");
-                    assert_eq!(sink_names, vec!["factor_sink".to_string()]);
                     ControlResponse::EngineRegistered { engine_name }
-                }
-                ControlRequest::RegisterSink(RegisterSinkRequest {
-                    sink_name,
-                    sink_type,
-                    input_stream,
-                    ..
-                }) => {
-                    assert_eq!(sink_type, "parquet");
-                    assert_eq!(input_stream, "openctp_mid_price_factors");
-                    ControlResponse::SinkRegistered { sink_name }
                 }
                 ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
                     kind,
@@ -460,7 +448,6 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         dropped: true,
                         sources_removed: 0,
                         engines_removed: 0,
-                        sinks_removed: 0,
                         persisted_files_deleted: 0,
                     })
                 }
@@ -664,7 +651,7 @@ fn master_client_unregisters_registered_process() {
 #[test]
 fn master_client_registers_control_plane_entities_and_updates_status() {
     let socket_path = unique_socket_path();
-    let server = spawn_fake_server(&socket_path, 5);
+    let server = spawn_fake_server(&socket_path, 4);
     wait_for_socket(&socket_path);
 
     let mut client = MasterClient::connect(&socket_path).unwrap();
@@ -685,19 +672,8 @@ fn master_client_registers_control_plane_entities_and_updates_status() {
             "reactive",
             "openctp_ticks",
             "openctp_mid_price_factors",
-            vec!["factor_sink".to_string()],
             serde_json::json!({
                 "id_filter": ["IF2606"],
-            }),
-        )
-        .unwrap();
-    client
-        .register_sink(
-            "factor_sink",
-            "parquet",
-            "openctp_mid_price_factors",
-            serde_json::json!({
-                "path": "data/openctp_mid_price_factors",
             }),
         )
         .unwrap();

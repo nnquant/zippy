@@ -2,16 +2,17 @@
 
 use zippy_core::bus_protocol::{
     AcquireSegmentReaderLeaseRequest, ControlEnvelopeRequest, ControlRequest, ControlResponse,
-    ListStreamsRequest, RegisterEngineRequest, RegisterProcessRequest, RegisterSinkRequest,
-    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest,
-    UnregisterProcessRequest, UpdateRecordStatusRequest, WatchRequest, WatchResource,
-    CONTROL_PROTOCOL_VERSION,
+    ListStreamsRequest, RegisterEngineRequest, RegisterProcessRequest, RegisterSourceRequest,
+    RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest, UnregisterProcessRequest,
+    UpdateRecordStatusRequest, WatchRequest, WatchResource, CONTROL_PROTOCOL_VERSION,
 };
 use zippy_core::{setup_log, LogConfig, ZippyConfig};
 use zippy_master::registry::{Registry, RegistryError};
 use zippy_master::server::MasterServer;
-use zippy_master::snapshot::{RegistrySnapshot, SnapshotStore, SnapshotStreamRecord};
-use zippy_master::snapshot::{SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord};
+use zippy_master::snapshot::{
+    RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
+    SnapshotStreamRecord,
+};
 
 use std::fs;
 use std::io::{Read, Write};
@@ -1261,7 +1262,6 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
             }],
             sources: vec![],
             engines: vec![],
-            sinks: vec![],
         },
     )
     .unwrap();
@@ -1296,8 +1296,7 @@ fn master_restores_legacy_snapshot_without_frame_size() {
     }
   ],
   "sources": [],
-  "engines": [],
-  "sinks": []
+  "engines": []
 }"#,
     )
     .unwrap();
@@ -1357,18 +1356,9 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 process_id: "proc_2".to_string(),
                 input_stream: "openctp_ticks".to_string(),
                 output_stream: "openctp_mid_price_factors".to_string(),
-                sink_names: vec!["factor_sink".to_string()],
                 config: serde_json::json!({"id_filter": ["IF2606"]}),
                 status: "running".to_string(),
                 metrics: serde_json::json!({}),
-            }],
-            sinks: vec![SnapshotSinkRecord {
-                sink_name: "factor_sink".to_string(),
-                sink_type: "parquet".to_string(),
-                process_id: "proc_3".to_string(),
-                input_stream: "openctp_mid_price_factors".to_string(),
-                config: serde_json::json!({"path": "data/factors"}),
-                status: "running".to_string(),
             }],
         },
     )
@@ -1397,7 +1387,6 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
         registry.get_engine("mid_price_factor").unwrap().status,
         "restored"
     );
-    assert_eq!(registry.get_sink("factor_sink").unwrap().status, "restored");
 }
 
 #[test]
@@ -1532,8 +1521,7 @@ fn snapshot_store_reads_legacy_ring_capacity_into_buffer_and_frame_size() {
     }
   ],
   "sources": [],
-  "engines": [],
-  "sinks": []
+  "engines": []
 }"#,
     )
     .unwrap();
@@ -1915,29 +1903,12 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
             process_token: Some(process_token.clone()),
             input_stream: "openctp_ticks".to_string(),
             output_stream: "openctp_mid_price_factors".to_string(),
-            sink_names: vec!["factor_sink".to_string()],
             config: serde_json::json!({"id_filter": ["IF2606"]}),
         }),
     );
     assert!(matches!(
         engine_response,
         ControlResponse::EngineRegistered { .. }
-    ));
-
-    let sink_response = send_control_request(
-        &socket_path,
-        ControlRequest::RegisterSink(RegisterSinkRequest {
-            sink_name: "factor_sink".to_string(),
-            sink_type: "parquet".to_string(),
-            process_id: process_id.clone(),
-            process_token: Some(process_token.clone()),
-            input_stream: "openctp_mid_price_factors".to_string(),
-            config: serde_json::json!({"path": "data/factors"}),
-        }),
-    );
-    assert!(matches!(
-        sink_response,
-        ControlResponse::SinkRegistered { .. }
     ));
 
     let status_response = send_control_request(
@@ -1970,7 +1941,6 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
         registry.get_engine("mid_price_factor").unwrap().status,
         "lost"
     );
-    assert_eq!(registry.get_sink("factor_sink").unwrap().status, "lost");
     drop(registry);
 
     server.shutdown();

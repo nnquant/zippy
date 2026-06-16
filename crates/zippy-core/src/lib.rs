@@ -22,7 +22,7 @@ pub use bus_protocol::{
     DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
     GetStreamRequest, GetStreamResponse, HeartbeatRequest, ListStreamsRequest, ListStreamsResponse,
     PublishPersistedFileRequest, PublishSegmentDescriptorRequest, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    RegisterProcessRequest, RegisterSourceRequest, RegisterStreamRequest,
     ReplacePersistedFilesRequest, ResourceEvent, StreamInfo, UnregisterProcessRequest,
     UnregisterSourceRequest, UpdateRecordStatusRequest, WatchRequest, WatchResource,
     CONTROL_PROTOCOL_VERSION,

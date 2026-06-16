@@ -7491,6 +7491,7 @@ class _SessionSourceBinding:
             name,
             by=by,
             start_from=start_from,
+            method="source(...).publish_key_value_table()",
         )
 
 
@@ -7553,15 +7554,21 @@ class _SessionTablePublishBinding:
                 self._name,
                 by=self._by,
                 start_from=start_from,
+                method="source(...).key_value_table(...).publish()",
             )
 
         if self._table_kind == _APPEND_TABLE_KIND:
-            return self._session._publish_append_table(self._name, persist=persist)
+            return self._session._publish_append_table(
+                self._name,
+                persist=persist,
+                method="append_table(...).publish()",
+            )
         if self._table_kind == _KEY_VALUE_TABLE_KIND:
             return self._session._publish_key_value_table(
                 self._name,
                 by=self._by,
                 persist=persist,
+                method="key_value_table(...).publish()",
             )
         raise ValueError(f"unsupported table kind table_kind=[{self._table_kind}]")
 
@@ -7975,9 +7982,19 @@ class Session:
             DeprecationWarning,
             stacklevel=2,
         )
-        return self._publish_append_table(name, persist=persist)
+        return self._publish_append_table(
+            name,
+            persist=persist,
+            method="publish_append_table()",
+        )
 
-    def _publish_append_table(self, name: str, *, persist: bool = False) -> "Session":
+    def _publish_append_table(
+        self,
+        name: str,
+        *,
+        persist: bool = False,
+        method: str = "publish_append_table()",
+    ) -> "Session":
         """
         Publish the latest engine output as an append-only table.
 
@@ -7990,11 +8007,11 @@ class Session:
         :raises RuntimeError: If no engine has been added.
         :raises ValueError: If the latest engine already has an output table.
         """
-        self._validate_publish_table_name(name, method="publish_append_table")
+        self._validate_publish_table_name(name, method=method)
         if not isinstance(persist, bool):
             raise TypeError("persist must be True or False")
         if not self._engines:
-            raise RuntimeError("publish_append_table() requires an engine() before it")
+            raise RuntimeError(f"{method} requires an engine() before it")
 
         engine = self._engines[-1]
         if _engine_latest_by(engine) is not None:
@@ -8039,7 +8056,12 @@ class Session:
             DeprecationWarning,
             stacklevel=2,
         )
-        return self._publish_key_value_table(name, by=by, persist=persist)
+        return self._publish_key_value_table(
+            name,
+            by=by,
+            persist=persist,
+            method="publish_key_value_table()",
+        )
 
     def _publish_key_value_table(
         self,
@@ -8047,6 +8069,7 @@ class Session:
         *,
         by: str | list[str] | tuple[str, ...] | None = None,
         persist: bool = False,
+        method: str = "publish_key_value_table()",
     ) -> "Session":
         """
         Publish the latest engine output as a key-value latest table.
@@ -8063,13 +8086,13 @@ class Session:
         :raises RuntimeError: If no engine has been added.
         :raises ValueError: If key columns are missing or the latest output is already materialized.
         """
-        self._validate_publish_table_name(name, method="publish_key_value_table")
+        self._validate_publish_table_name(name, method=method)
         if not isinstance(persist, bool):
             raise TypeError("persist must be True or False")
         if persist:
             raise ValueError("key_value_table does not support persist=True")
         if not self._engines:
-            raise RuntimeError("publish_key_value_table() requires an engine() before it")
+            raise RuntimeError(f"{method} requires an engine() before it")
 
         engine = self._engines[-1]
         latest_by = _engine_latest_by(engine)
@@ -8716,8 +8739,9 @@ class Session:
         *,
         by: str | list[str] | tuple[str, ...],
         start_from: str,
+        method: str = "source(...).publish_key_value_table()",
     ) -> "Session":
-        self._validate_publish_table_name(table_name, method="publish_key_value_table")
+        self._validate_publish_table_name(table_name, method=method)
         key_fields = _normalize_key_value_by(by)
         if start_from not in {"replay", "tail"}:
             raise ValueError("start_from must be 'replay' or 'tail'")
@@ -8727,9 +8751,10 @@ class Session:
                 "use start_from='tail' for an explicit live-only view"
             )
 
+        get_stream_status = getattr(self.master, "get_stream_status", None)
         get_stream = getattr(self.master, "get_stream", None)
-        if callable(get_stream):
-            source_stream = get_stream(source)
+        if callable(get_stream_status) or callable(get_stream):
+            source_stream = _get_stream_status_or_full(self.master, source)
             source_kind = _descriptor_table_kind(source_stream)
             if source_kind == _KEY_VALUE_TABLE_KIND:
                 raise ValueError("key_value_table source cannot publish another key_value_table")
@@ -9437,10 +9462,11 @@ def _master_config(master: MasterClient) -> dict[str, object]:
 
 
 def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:
+    get_stream_status = getattr(master, "get_stream_status", None)
     get_stream = getattr(master, "get_stream", None)
-    if get_stream is None:
+    if not callable(get_stream_status) and not callable(get_stream):
         return None
-    stream = get_stream(table_name)
+    stream = _get_stream_status_or_full(master, table_name)
     if not isinstance(stream, dict):
         stream = dict(stream)
     writer_epoch = stream.get("writer_epoch")

@@ -34,8 +34,8 @@ use zippy_segment_store::ShmRegion;
 
 use crate::registry::{Registry, RegistryError, StreamRecord};
 use crate::snapshot::{
-    RegistrySnapshot, SnapshotEngineRecord, SnapshotSinkRecord, SnapshotSourceRecord,
-    SnapshotStore, SnapshotStreamRecord,
+    RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
+    SnapshotStreamRecord,
 };
 
 const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -225,29 +225,11 @@ impl MasterServer {
                         &engine.process_id,
                         &engine.input_stream,
                         &engine.output_stream,
-                        engine.sink_names,
                         engine.config,
                     )
                     .map_err(registry_error)?;
                 registry
                     .set_engine_status(&engine.engine_name, &status, Some(engine.metrics))
-                    .map_err(registry_error)?;
-            }
-
-            for sink in snapshot.sinks {
-                registry.reserve_process_id(&sink.process_id);
-                let status = restored_record_status(&sink.status).to_string();
-                registry
-                    .register_sink(
-                        &sink.sink_name,
-                        &sink.sink_type,
-                        &sink.process_id,
-                        &sink.input_stream,
-                        sink.config,
-                    )
-                    .map_err(registry_error)?;
-                registry
-                    .set_sink_status(&sink.sink_name, &status)
                     .map_err(registry_error)?;
             }
         }
@@ -1396,9 +1378,6 @@ impl MasterServer {
                 "engine" => registry
                     .get_engine(name)
                     .map(|record| record.process_id.as_str()),
-                "sink" => registry
-                    .get_sink(name)
-                    .map(|record| record.process_id.as_str()),
                 _ => None,
             };
             if owner_process_id != Some(process_id) {
@@ -1428,14 +1407,6 @@ impl MasterServer {
                 (
                     result,
                     previous.map(|record| ("engine", serde_json::to_value(record).unwrap())),
-                )
-            }
-            "sink" => {
-                let previous = registry.get_sink(name).cloned();
-                let result = registry.set_sink_status(name, status);
-                (
-                    result,
-                    previous.map(|record| ("sink", serde_json::to_value(record).unwrap())),
                 )
             }
             _ => (
@@ -1938,7 +1909,6 @@ impl MasterServer {
                     &request.process_id,
                     &request.input_stream,
                     &request.output_stream,
-                    request.sink_names,
                     request.config,
                 ) {
                     Ok(()) => {
@@ -1979,59 +1949,6 @@ impl MasterServer {
                     },
                 }
             }
-            ControlRequest::RegisterSink(request) => {
-                if let Some(response) = self.require_process_capability_response(
-                    &request.process_id,
-                    request.process_token.as_deref(),
-                ) {
-                    return write_control_response(&mut stream, &response);
-                }
-                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
-                let mut registry = self.registry.lock().unwrap();
-                match registry.register_sink(
-                    &request.sink_name,
-                    &request.sink_type,
-                    &request.process_id,
-                    &request.input_stream,
-                    request.config,
-                ) {
-                    Ok(()) => {
-                        let snapshot = Self::snapshot_from_registry(&registry);
-                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            registry.unregister_sink(&request.sink_name);
-                            tracing::error!(
-                                component = "master_server",
-                                event = "snapshot_write_failure",
-                                status = "error",
-                                sink_name = request.sink_name.as_str(),
-                                error = %error,
-                                "failed to persist sink snapshot"
-                            );
-                            return write_control_response(
-                                &mut stream,
-                                &ControlResponse::Error {
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
-                        tracing::info!(
-                            component = "master_server",
-                            event = "register_sink",
-                            status = "success",
-                            sink_name = request.sink_name.as_str(),
-                            process_id = request.process_id.as_str(),
-                            input_stream = request.input_stream.as_str(),
-                            "registered sink"
-                        );
-                        ControlResponse::SinkRegistered {
-                            sink_name: request.sink_name,
-                        }
-                    }
-                    Err(error) => ControlResponse::Error {
-                        reason: error.to_string(),
-                    },
-                }
-            }
             ControlRequest::UpdateStatus(request) => {
                 if !self.token_matches(request.token.as_deref()) {
                     let Some(process_id) = request.process_id.as_deref() else {
@@ -2055,9 +1972,6 @@ impl MasterServer {
                             .map(|record| record.process_id.as_str()),
                         "engine" => registry
                             .get_engine(&request.name)
-                            .map(|record| record.process_id.as_str()),
-                        "sink" => registry
-                            .get_sink(&request.name)
                             .map(|record| record.process_id.as_str()),
                         _ => None,
                     };
@@ -2100,14 +2014,6 @@ impl MasterServer {
                             result,
                             previous
                                 .map(|record| ("engine", serde_json::to_value(record).unwrap())),
-                        )
-                    }
-                    "sink" => {
-                        let previous = registry.get_sink(&request.name).cloned();
-                        let result = registry.set_sink_status(&request.name, &request.status);
-                        (
-                            result,
-                            previous.map(|record| ("sink", serde_json::to_value(record).unwrap())),
                         )
                     }
                     _ => (
@@ -2310,11 +2216,7 @@ impl MasterServer {
                             .iter()
                             .any(|source| {
                                 source.process_id == process_id && source.status != "lost"
-                            })
-                        || registry
-                            .sinks_for_stream(&request.stream_name)
-                            .iter()
-                            .any(|sink| sink.process_id == process_id && sink.status != "lost");
+                            });
                     if !authorized {
                         return write_control_response(
                             &mut stream,
@@ -2709,11 +2611,7 @@ impl MasterServer {
                             .unwrap_or(false)
                             || registry.sources_for_stream(&request.table_name).iter().any(
                                 |source| source.process_id == process_id && source.status != "lost",
-                            )
-                            || registry
-                                .sinks_for_stream(&request.table_name)
-                                .iter()
-                                .any(|sink| sink.process_id == process_id && sink.status != "lost");
+                            );
                     if !authorized {
                         return write_control_response(
                             &mut stream,
@@ -2789,7 +2687,6 @@ impl MasterServer {
                     dropped = drop_result.stream.is_some(),
                     sources_removed = drop_result.sources.len(),
                     engines_removed = drop_result.engines.len(),
-                    sinks_removed = drop_result.sinks.len(),
                     persisted_files_deleted,
                     "dropped table"
                 );
@@ -2798,7 +2695,6 @@ impl MasterServer {
                     dropped: drop_result.stream.is_some(),
                     sources_removed: drop_result.sources.len(),
                     engines_removed: drop_result.engines.len(),
-                    sinks_removed: drop_result.sinks.len(),
                     persisted_files_deleted,
                 })
             }
@@ -3148,22 +3044,9 @@ impl MasterServer {
                     process_id: engine.process_id,
                     input_stream: engine.input_stream,
                     output_stream: engine.output_stream,
-                    sink_names: engine.sink_names,
                     config: engine.config,
                     status: engine.status,
                     metrics: engine.metrics,
-                })
-                .collect(),
-            sinks: registry
-                .list_sinks()
-                .into_iter()
-                .map(|sink| SnapshotSinkRecord {
-                    sink_name: sink.sink_name,
-                    sink_type: sink.sink_type,
-                    process_id: sink.process_id,
-                    input_stream: sink.input_stream,
-                    config: sink.config,
-                    status: sink.status,
                 })
                 .collect(),
         }
@@ -3214,13 +3097,6 @@ fn restore_previous_record(
                 serde_json::from_value(previous).map_err(json_error)?;
             registry
                 .set_engine_status(&record.engine_name, &record.status, Some(record.metrics))
-                .map_err(registry_error)
-        }
-        "sink" => {
-            let record: crate::snapshot::SnapshotSinkRecord =
-                serde_json::from_value(previous).map_err(json_error)?;
-            registry
-                .set_sink_status(&record.sink_name, &record.status)
                 .map_err(registry_error)
         }
         _ => Err(ZippyError::Io {

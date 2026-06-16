@@ -7,7 +7,7 @@ use crate::bus_protocol::{
     DropTableRequest, DropTableResult, GetConfigRequest, GetSegmentDescriptorRequest,
     GetStreamRequest, HeartbeatRequest, ListStreamsRequest, PublishPersistEventRequest,
     PublishPersistedFileRequest, PublishSegmentDescriptorRequest, RegisterEngineRequest,
-    RegisterProcessRequest, RegisterSinkRequest, RegisterSourceRequest, RegisterStreamRequest,
+    RegisterProcessRequest, RegisterSourceRequest, RegisterStreamRequest,
     ReleaseSegmentReaderLeaseRequest, ReplacePersistedFilesRequest, StreamInfo,
     UnregisterProcessRequest, UnregisterSourceRequest, UpdateRecordStatusRequest, WatchResource,
 };
@@ -239,7 +239,6 @@ impl MasterClient {
         engine_type: &str,
         input_stream: &str,
         output_stream: &str,
-        sink_names: Vec<String>,
         config: serde_json::Value,
     ) -> Result<()> {
         let process_id = self.require_process_id()?;
@@ -252,37 +251,12 @@ impl MasterClient {
                 process_token,
                 input_stream: input_stream.to_string(),
                 output_stream: output_stream.to_string(),
-                sink_names,
                 config,
             }))?;
 
         match response {
             ControlResponse::EngineRegistered { .. } => Ok(()),
             other => Err(unexpected_response("EngineRegistered", other)),
-        }
-    }
-
-    pub fn register_sink(
-        &mut self,
-        sink_name: &str,
-        sink_type: &str,
-        input_stream: &str,
-        config: serde_json::Value,
-    ) -> Result<()> {
-        let process_id = self.require_process_id()?;
-        let process_token = Some(self.require_process_token()?);
-        let response = self.send_request(ControlRequest::RegisterSink(RegisterSinkRequest {
-            sink_name: sink_name.to_string(),
-            sink_type: sink_type.to_string(),
-            process_id,
-            process_token,
-            input_stream: input_stream.to_string(),
-            config,
-        }))?;
-
-        match response {
-            ControlResponse::SinkRegistered { .. } => Ok(()),
-            other => Err(unexpected_response("SinkRegistered", other)),
         }
     }
 

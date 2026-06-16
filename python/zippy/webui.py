@@ -264,7 +264,6 @@ class DashboardService:
                 "error": snapshot.get("error"),
                 "sources": _list_len(snapshot.get("sources")),
                 "engines": _list_len(snapshot.get("engines")),
-                "sinks": _list_len(snapshot.get("sinks")),
             },
         }
 
@@ -546,7 +545,6 @@ def _task_summaries(
     for kind, key in [
         ("source", "sources"),
         ("engine", "engines"),
-        ("sink", "sinks"),
     ]:
         for item in _dict_items(snapshot.get(key)):
             name = item.get(f"{kind}_name") or item.get("name")
@@ -712,7 +710,6 @@ def _load_registry_snapshot(uri: str) -> dict[str, object]:
         "streams": [],
         "sources": [],
         "engines": [],
-        "sinks": [],
         "error": None,
     }
     if path is None or not path.exists():
@@ -731,7 +728,6 @@ def _load_registry_snapshot(uri: str) -> dict[str, object]:
             "streams": payload.get("streams") or [],
             "sources": payload.get("sources") or [],
             "engines": payload.get("engines") or [],
-            "sinks": payload.get("sinks") or [],
         }
     )
     return result

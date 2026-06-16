@@ -461,22 +461,6 @@ impl Source for PythonSourceBridge {
     }
 }
 
-#[derive(Clone)]
-enum ParquetRotation {
-    None,
-    Hourly,
-}
-
-impl ParquetRotation {
-    fn parse(value: &str) -> PyResult<Self> {
-        match value {
-            "none" => Ok(Self::None),
-            "1h" => Ok(Self::Hourly),
-            _ => Err(py_value_error("rotation must be 'none' or '1h'")),
-        }
-    }
-}
-
 fn current_localtime_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1085,21 +1069,17 @@ impl ParquetSink {
         rows_per_batch: usize,
         flush_interval_ms: u64,
     ) -> PyResult<Self> {
-        let _ = path;
-        let _ = flush_interval_ms;
-        ParquetRotation::parse(rotation)?;
-        if !write_input && !write_output {
-            return Err(py_value_error(
-                "parquet_sink must enable write_input or write_output",
-            ));
-        }
-        if rows_per_batch == 0 {
-            return Err(py_value_error(
-                "parquet_sink rows_per_batch must be greater than zero",
-            ));
-        }
-
-        Ok(Self)
+        let _ = (
+            path,
+            rotation,
+            write_input,
+            write_output,
+            rows_per_batch,
+            flush_interval_ms,
+        );
+        Err(PyTypeError::new_err(
+            "ParquetSink is no longer supported as an engine sink; publish engine output with append_table(...).publish(persist=True)",
+        ))
     }
 }
 
@@ -1377,8 +1357,7 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))
     }
 
-    #[pyo3(signature = (engine_name, engine_type, input_stream, output_stream, sink_names, config))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (engine_name, engine_type, input_stream, output_stream, config))]
     fn register_engine(
         &self,
         py: Python<'_>,
@@ -1386,7 +1365,6 @@ impl MasterClient {
         engine_type: String,
         input_stream: String,
         output_stream: String,
-        sink_names: Vec<String>,
         config: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let config_text = python_json_dumps(py, config)?;
@@ -1398,7 +1376,6 @@ impl MasterClient {
                 &engine_type,
                 &input_stream,
                 &output_stream,
-                sink_names,
                 config,
             )
         })
@@ -1414,16 +1391,8 @@ impl MasterClient {
         input_stream: String,
         config: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let config_text = python_json_dumps(py, config)?;
-        let config = serde_json::from_str::<serde_json::Value>(&config_text)
-            .map_err(|error| py_value_error(error.to_string()))?;
-        py.allow_threads(|| {
-            self.client
-                .lock()
-                .unwrap()
-                .register_sink(&sink_name, &sink_type, &input_stream, config)
-        })
-        .map_err(|error| py_runtime_error(error.to_string()))
+        let _ = (py, sink_name, sink_type, input_stream, config);
+        Err(PyTypeError::new_err("register_sink is no longer supported"))
     }
 
     #[pyo3(signature = (kind, name, status, metrics=None))]
@@ -1925,7 +1894,6 @@ fn drop_table_result_to_pydict<'py>(
     dict.set_item("dropped", result.dropped)?;
     dict.set_item("sources_removed", result.sources_removed)?;
     dict.set_item("engines_removed", result.engines_removed)?;
-    dict.set_item("sinks_removed", result.sinks_removed)?;
     dict.set_item("persisted_files_deleted", result.persisted_files_deleted)?;
     Ok(dict)
 }

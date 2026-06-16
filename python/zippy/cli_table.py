@@ -241,7 +241,6 @@ def drop_table(
         f"dropped={result.get('dropped')} "
         f"sources_removed={result.get('sources_removed')} "
         f"engines_removed={result.get('engines_removed')} "
-        f"sinks_removed={result.get('sinks_removed')} "
         f"persisted_files_deleted={result.get('persisted_files_deleted')}"
     )
 

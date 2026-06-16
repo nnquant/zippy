@@ -125,20 +125,9 @@ pub struct SnapshotEngineRecord {
     pub process_id: String,
     pub input_stream: String,
     pub output_stream: String,
-    pub sink_names: Vec<String>,
     pub config: serde_json::Value,
     pub status: String,
     pub metrics: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotSinkRecord {
-    pub sink_name: String,
-    pub sink_type: String,
-    pub process_id: String,
-    pub input_stream: String,
-    pub config: serde_json::Value,
-    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -146,7 +135,6 @@ pub struct RegistrySnapshot {
     pub streams: Vec<SnapshotStreamRecord>,
     pub sources: Vec<SnapshotSourceRecord>,
     pub engines: Vec<SnapshotEngineRecord>,
-    pub sinks: Vec<SnapshotSinkRecord>,
 }
 
 pub struct SnapshotStore;

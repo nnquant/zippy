@@ -1420,12 +1420,8 @@ fn master_client_drop_table_removes_catalog_dependencies_and_persisted_files() {
             "reactive",
             "ticks",
             "tick_factors",
-            Vec::new(),
             serde_json::json!({}),
         )
-        .unwrap();
-    client
-        .register_sink("tick_sink", "parquet", "ticks", serde_json::json!({}))
         .unwrap();
     client
         .publish_persisted_file(
@@ -1454,7 +1450,6 @@ fn master_client_drop_table_removes_catalog_dependencies_and_persisted_files() {
     assert!(snapshot.streams.is_empty());
     assert!(snapshot.sources.is_empty());
     assert!(snapshot.engines.is_empty());
-    assert!(snapshot.sinks.is_empty());
 
     server.shutdown();
     join_handle.join().unwrap();

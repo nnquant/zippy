@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, NoReturn
 
 import polars as pl
 import pyarrow as pa
@@ -182,15 +182,7 @@ class NullPublisher:
     def __init__(self) -> None: ...
 
 class ParquetSink:
-    def __init__(
-        self,
-        path: str,
-        rotation: str = "none",
-        write_input: bool = False,
-        write_output: bool = True,
-        rows_per_batch: int = 8192,
-        flush_interval_ms: int = 1000,
-    ) -> None: ...
+    def __init__(self, *args: object, **kwargs: object) -> NoReturn: ...
 
 class ZmqPublisher:
     def __init__(self, endpoint: str) -> None: ...
@@ -266,14 +258,6 @@ class MasterClient:
         engine_type: str,
         input_stream: str,
         output_stream: str,
-        sink_names: list[str],
-        config: object,
-    ) -> None: ...
-    def register_sink(
-        self,
-        sink_name: str,
-        sink_type: str,
-        input_stream: str,
         config: object,
     ) -> None: ...
     def update_status(

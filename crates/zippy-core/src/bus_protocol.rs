@@ -133,18 +133,6 @@ pub struct RegisterEngineRequest {
     pub process_token: Option<String>,
     pub input_stream: String,
     pub output_stream: String,
-    pub sink_names: Vec<String>,
-    pub config: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterSinkRequest {
-    pub sink_name: String,
-    pub sink_type: String,
-    pub process_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_token: Option<String>,
-    pub input_stream: String,
     pub config: serde_json::Value,
 }
 
@@ -298,7 +286,6 @@ pub struct DropTableResult {
     pub dropped: bool,
     pub sources_removed: usize,
     pub engines_removed: usize,
-    pub sinks_removed: usize,
     pub persisted_files_deleted: usize,
 }
 
@@ -313,7 +300,6 @@ pub enum ControlRequest {
     RegisterSource(RegisterSourceRequest),
     UnregisterSource(UnregisterSourceRequest),
     RegisterEngine(RegisterEngineRequest),
-    RegisterSink(RegisterSinkRequest),
     UpdateStatus(UpdateRecordStatusRequest),
     ListStreams(ListStreamsRequest),
     ListStreamStatuses(ListStreamsRequest),
@@ -358,9 +344,6 @@ pub enum ControlResponse {
     },
     EngineRegistered {
         engine_name: String,
-    },
-    SinkRegistered {
-        sink_name: String,
     },
     StatusUpdated {
         kind: String,
@@ -438,9 +421,6 @@ impl fmt::Display for ControlResponse {
             Self::EngineRegistered { engine_name } => {
                 write!(f, "engine registered engine_name=[{}]", engine_name)
             }
-            Self::SinkRegistered { sink_name } => {
-                write!(f, "sink registered sink_name=[{}]", sink_name)
-            }
             Self::StatusUpdated { kind, name } => {
                 write!(f, "status updated kind=[{}] name=[{}]", kind, name)
             }
@@ -475,12 +455,11 @@ impl fmt::Display for ControlResponse {
             ),
             Self::TableDropped(result) => write!(
                 f,
-                "table dropped table_name=[{}] dropped=[{}] sources_removed=[{}] engines_removed=[{}] sinks_removed=[{}] persisted_files_deleted=[{}]",
+                "table dropped table_name=[{}] dropped=[{}] sources_removed=[{}] engines_removed=[{}] persisted_files_deleted=[{}]",
                 result.table_name,
                 result.dropped,
                 result.sources_removed,
                 result.engines_removed,
-                result.sinks_removed,
                 result.persisted_files_deleted
             ),
             Self::SegmentDescriptorPublished { stream_name } => write!(

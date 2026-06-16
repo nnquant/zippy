@@ -121,15 +121,16 @@ Keep `Session.stream_table(...)` as a compatibility wrapper:
 
 ```text
 normal engine + stream_table(name)
-  -> publish_append_table(name)
+  -> append_table(name).publish(...)
 
 ReactiveLatestEngine + stream_table(name)
-  -> publish_key_value_table(name, by=engine.by)
+  -> key_value_table(name, by=engine.by).publish(...)
 ```
 
-New documentation should prefer `publish_append_table(...)` and
-`publish_key_value_table(...)`. `output_stream=...` remains a legacy shortcut and should
-follow the same compatibility mapping.
+New documentation should prefer `append_table(...).publish(...)` and
+`key_value_table(...).publish(...)`. `publish_append_table(...)` and
+`publish_key_value_table(...)` remain deprecated aliases for compatibility.
+`output_stream=...` remains a legacy shortcut and should follow the same compatibility mapping.
 
 ## Engine Support Matrix
 

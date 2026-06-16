@@ -960,7 +960,6 @@ def test_webui_dashboard_processes_use_pm_ls_not_registry_snapshot(
                     }
                 ],
                 "engines": [],
-                "sinks": [],
             }
         ),
         encoding="utf-8",

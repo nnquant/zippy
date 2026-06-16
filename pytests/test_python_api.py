@@ -987,6 +987,93 @@ def test_session_append_table_publish_sets_append_table_kind(monkeypatch) -> Non
     )
 
 
+def test_session_append_table_publish_uses_stream_status_for_writer_epoch(
+    monkeypatch,
+) -> None:
+    schema = pa.schema([("instrument_id", pa.string())])
+    captured_materializer: dict[str, object] = {}
+
+    class FakeMaster:
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "retention_segments": None,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def register_stream(self, stream_name, stream_schema, buffer_size, frame_size) -> None:
+            assert stream_name == "factor_events"
+            assert stream_schema == schema
+
+        def register_source(self, source_name, source_type, output_stream, config) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name, descriptor) -> None:
+            return None
+
+        def get_stream_status(self, stream_name: str) -> dict[str, object]:
+            assert stream_name == "factor_events"
+            return {"writer_epoch": 7}
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            raise AssertionError("writer_epoch lookup should not fetch full stream metadata")
+
+    class FakeEngine:
+        def output_schema(self) -> pa.Schema:
+            return schema
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> str:
+            return "created"
+
+    class CapturingStreamTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            captured_materializer.update(kwargs)
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", CapturingStreamTableMaterializer)
+
+    zippy.Session(name="factor_session", master=FakeMaster()).engine(
+        FakeEngine()
+    ).append_table("factor_events").publish()
+
+    assert captured_materializer["writer_epoch"] == 7
+
+
+def test_session_append_table_publish_error_mentions_current_api() -> None:
+    session = zippy.Session(name="factor_session", master=zippy.MasterClient())
+
+    with pytest.raises(RuntimeError, match=r"append_table\(\.\.\.\)\.publish\(\) requires"):
+        session.append_table("factor_events").publish()
+
+
+def test_session_source_key_value_table_publish_error_mentions_current_api() -> None:
+    session = zippy.Session(name="factor_session", master=zippy.MasterClient())
+
+    with pytest.raises(
+        ValueError,
+        match=r"source\(\.\.\.\)\.key_value_table\(\.\.\.\)\.publish\(\) table name",
+    ):
+        session.source("factor_events").key_value_table("", by=["instrument_id"]).publish(
+            start_from="tail"
+        )
+
+
 def test_session_publish_key_value_table_sets_key_value_table_kind(monkeypatch) -> None:
     schema = pa.schema(
         [
@@ -1385,6 +1472,83 @@ def test_session_source_publish_key_value_table_tail_registers_materializer(monk
     assert master.registered_streams[0][0] == "latest_factors"
     assert master.registered_streams[1][0] == "latest_factors.__kv_changelog"
     assert master.published_descriptors[-1][1]["zippy_table_kind"] == "key_value_table"
+
+
+def test_session_source_key_value_table_publish_uses_stream_status_for_source_kind(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("last_price", pa.float64()),
+        ]
+    )
+
+    class FakeMaster:
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "replacement_retention_snapshots": 3,
+                    "persist": {
+                        "enabled": False,
+                        "partition": {},
+                    },
+                },
+            }
+
+        def get_stream_schema(self, stream_name: str) -> pa.Schema:
+            assert stream_name == "factor_events"
+            return schema
+
+        def get_stream_status(self, stream_name: str) -> dict[str, object]:
+            if stream_name == "factor_events":
+                return {
+                    "active_segment_descriptor": {
+                        "zippy_table_kind": "append_table",
+                    },
+                }
+            return {"writer_epoch": 7}
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            raise AssertionError("source kind check should not fetch full stream metadata")
+
+        def register_stream(self, stream_name, stream_schema, buffer_size, frame_size) -> None:
+            return None
+
+        def register_source(self, source_name, source_type, output_stream, config) -> None:
+            return None
+
+        def publish_segment_descriptor(self, stream_name, descriptor) -> None:
+            return None
+
+    class CapturingKeyValueTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            return None
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def changelog_active_descriptor(self) -> dict[str, object]:
+            return {}
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def status(self) -> str:
+            return "created"
+
+    monkeypatch.setattr(zippy, "_KeyValueTableMaterializer", CapturingKeyValueTableMaterializer)
+
+    zippy.Session(name="source_session", master=FakeMaster()).source(
+        "factor_events"
+    ).key_value_table("latest_factors", by=["instrument_id"]).publish(start_from="tail")
 
 
 def test_session_source_key_value_table_publish_tail_registers_materializer(monkeypatch) -> None:
@@ -3900,7 +4064,12 @@ def test_zmq_subscriber_receives_record_batch_from_engine() -> None:
     subscriber.close()
 
 
-def test_engine_parquet_sink_keyword_is_rejected(tmp_path: Path) -> None:
+def test_parquet_sink_constructor_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="ParquetSink is no longer supported"):
+        zippy.ParquetSink(path=str(tmp_path), rotation="none")
+
+
+def test_engine_parquet_sink_keyword_is_rejected() -> None:
     tick_schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -3914,19 +4083,17 @@ def test_engine_parquet_sink_keyword_is_rejected(tmp_path: Path) -> None:
             ("price", pa.float64()),
         ]
     )
-    legacy_sink = zippy.ParquetSink(path=str(tmp_path), rotation="none")
-
-    with pytest.raises(TypeError, match="ParquetSink is no longer supported"):
+    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=tick_schema,
             id_column="symbol",
             factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
             target=zippy.NullPublisher(),
-            parquet_sink=legacy_sink,
+            parquet_sink=object(),
         )
 
-    with pytest.raises(TypeError, match="ParquetSink is no longer supported"):
+    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
         zippy.TimeSeriesEngine(
             name="bar_1m",
             input_schema=timed_schema,
@@ -3937,10 +4104,10 @@ def test_engine_parquet_sink_keyword_is_rejected(tmp_path: Path) -> None:
             late_data_policy=zippy.LateDataPolicy.REJECT,
             factors=[zippy.AGG_FIRST(column="price", output="open")],
             target=zippy.NullPublisher(),
-            parquet_sink=legacy_sink,
+            parquet_sink=object(),
         )
 
-    with pytest.raises(TypeError, match="ParquetSink is no longer supported"):
+    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
         zippy.CrossSectionalEngine(
             name="cs_1m",
             input_schema=pa.schema(
@@ -3956,7 +4123,7 @@ def test_engine_parquet_sink_keyword_is_rejected(tmp_path: Path) -> None:
             late_data_policy=zippy.LateDataPolicy.REJECT,
             factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
             target=zippy.NullPublisher(),
-            parquet_sink=legacy_sink,
+            parquet_sink=object(),
         )
 
 
@@ -4455,7 +4622,7 @@ def test_timeseries_engine_metrics_report_late_rows() -> None:
     assert engine.status() == "stopped"
 
 
-def test_reactive_engine_legacy_parquet_sink_is_rejected(tmp_path: Path) -> None:
+def test_reactive_engine_legacy_parquet_sink_is_rejected() -> None:
     schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -4463,14 +4630,14 @@ def test_reactive_engine_legacy_parquet_sink_is_rejected(tmp_path: Path) -> None
         ]
     )
 
-    with pytest.raises(TypeError, match="ParquetSink is no longer supported"):
+    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=schema,
             id_column="symbol",
             factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
             target=zippy.NullPublisher(),
-            parquet_sink=zippy.ParquetSink(path=str(tmp_path), rotation="none"),
+            parquet_sink=object(),
         )
 
 
@@ -4537,7 +4704,7 @@ def test_stream_table_engine_rejects_invalid_sink_type() -> None:
         )
 
 
-def test_stream_table_engine_rejects_legacy_parquet_sink(tmp_path: Path) -> None:
+def test_stream_table_engine_rejects_legacy_parquet_sink() -> None:
     schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -4545,12 +4712,12 @@ def test_stream_table_engine_rejects_legacy_parquet_sink(tmp_path: Path) -> None
         ]
     )
 
-    with pytest.raises(TypeError, match="ParquetSink is no longer supported"):
+    with pytest.raises(TypeError, match="sink must be zippy.ParquetSink"):
         zippy._internal.StreamTableMaterializer(
             name="ticks",
             input_schema=schema,
             target=zippy.NullPublisher(),
-            sink=zippy.ParquetSink(path=str(tmp_path), rotation="none"),
+            sink=object(),
         )
 
 
@@ -16182,19 +16349,19 @@ def test_master_client_registers_control_plane_entities_and_updates_status(
         "reactive",
         "openctp_ticks",
         "openctp_mid_price_factors",
-        ["factor_sink"],
         {
             "id_filter": ["IF2606"],
         },
     )
-    client.register_sink(
-        "factor_sink",
-        "parquet",
-        "openctp_mid_price_factors",
-        {
-            "path": "data/openctp_mid_price_factors",
-        },
-    )
+    with pytest.raises(TypeError, match="register_sink is no longer supported"):
+        client.register_sink(
+            "factor_sink",
+            "parquet",
+            "openctp_mid_price_factors",
+            {
+                "path": "data/openctp_mid_price_factors",
+            },
+        )
     client.update_status(
         "engine",
         "mid_price_factor",
