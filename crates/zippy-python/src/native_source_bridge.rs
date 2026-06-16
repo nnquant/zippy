@@ -1,7 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use arrow::datatypes::Schema;
 use arrow::ipc::reader::StreamReader;
@@ -12,6 +13,29 @@ use zippy_core::{SegmentTableView, SourceEvent, SourceSink, StreamHello, ZippyEr
 use zippy_segment_store::{ActiveSegmentDescriptor, CompiledSchema, LayoutPlan, RowSpanView};
 
 pub const NATIVE_SOURCE_SINK_CAPSULE_NAME: &str = "zippy.native_source_sink.v2";
+
+fn native_source_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_RUNTIME_LATENCY_TRACE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    })
+}
+
+fn write_latency_trace_line(mut line: String) {
+    use std::io::Write;
+
+    line.push('\n');
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+}
+
+fn instant_delta_us(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -175,6 +199,8 @@ fn emit_data_segment_impl(
             reason: "native source sink segment descriptor is empty".to_string(),
         });
     }
+    let trace_enabled = native_source_latency_trace_enabled();
+    let emit_started_at = trace_enabled.then(Instant::now);
     let descriptor_bytes = unsafe { std::slice::from_raw_parts(descriptor, descriptor_len) };
     let row_capacity = usize::try_from(row_capacity).map_err(|_| ZippyError::Io {
         reason: "native source sink segment row capacity overflows usize".to_string(),
@@ -185,11 +211,14 @@ fn emit_data_segment_impl(
     let end_row = usize::try_from(end_row).map_err(|_| ZippyError::Io {
         reason: "native source sink segment end row overflows usize".to_string(),
     })?;
+    let layout_started_at = trace_enabled.then(Instant::now);
     let layout = LayoutPlan::for_schema(&state.segment_schema, row_capacity).map_err(|error| {
         ZippyError::Io {
             reason: format!("native source sink segment layout failed error=[{error}]"),
         }
     })?;
+    let layout_done_at = trace_enabled.then(Instant::now);
+    let descriptor_decode_started_at = trace_enabled.then(Instant::now);
     let descriptor = ActiveSegmentDescriptor::from_envelope_bytes(
         descriptor_bytes,
         state.segment_schema.clone(),
@@ -198,15 +227,59 @@ fn emit_data_segment_impl(
     .map_err(|error| ZippyError::Io {
         reason: format!("native source sink segment descriptor decode failed error=[{error}]"),
     })?;
+    let descriptor_decode_done_at = trace_enabled.then(Instant::now);
+    let attach_started_at = trace_enabled.then(Instant::now);
     let span =
         RowSpanView::from_active_descriptor(descriptor, start_row, end_row).map_err(|error| {
             ZippyError::Io {
                 reason: format!("native source sink segment attach failed error=[{error}]"),
             }
         })?;
-    state
-        .sink
-        .emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))
+    let attach_done_at = trace_enabled.then(Instant::now);
+    let table_view_started_at = trace_enabled.then(Instant::now);
+    let table = SegmentTableView::from_row_span(span);
+    let table_view_done_at = trace_enabled.then(Instant::now);
+    let sink_emit_started_at = trace_enabled.then(Instant::now);
+    let result = state.sink.emit(SourceEvent::Data(table));
+    let sink_emit_done_at = trace_enabled.then(Instant::now);
+    if let (
+        Some(emit_started_at),
+        Some(layout_started_at),
+        Some(layout_done_at),
+        Some(descriptor_decode_started_at),
+        Some(descriptor_decode_done_at),
+        Some(attach_started_at),
+        Some(attach_done_at),
+        Some(table_view_started_at),
+        Some(table_view_done_at),
+        Some(sink_emit_started_at),
+        Some(sink_emit_done_at),
+    ) = (
+        emit_started_at,
+        layout_started_at,
+        layout_done_at,
+        descriptor_decode_started_at,
+        descriptor_decode_done_at,
+        attach_started_at,
+        attach_done_at,
+        table_view_started_at,
+        table_view_done_at,
+        sink_emit_started_at,
+        sink_emit_done_at,
+    ) {
+        write_latency_trace_line(format!(
+            "zippy_native_source_latency_trace event=[bridge_data_segment] rows=[{}] descriptor_len=[{}] layout_us=[{:.3}] descriptor_decode_us=[{:.3}] attach_us=[{:.3}] table_view_us=[{:.3}] sink_emit_us=[{:.3}] total_us=[{:.3}]",
+            end_row.saturating_sub(start_row),
+            descriptor_len,
+            instant_delta_us(layout_started_at, layout_done_at),
+            instant_delta_us(descriptor_decode_started_at, descriptor_decode_done_at),
+            instant_delta_us(attach_started_at, attach_done_at),
+            instant_delta_us(table_view_started_at, table_view_done_at),
+            instant_delta_us(sink_emit_started_at, sink_emit_done_at),
+            instant_delta_us(emit_started_at, sink_emit_done_at),
+        ));
+    }
+    result
 }
 
 fn emit_simple_event(ctx: *mut c_void, event: SourceEvent) -> Result<(), ZippyError> {

@@ -2170,6 +2170,8 @@ dependencies = [
  "md5",
  "parquet",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "zippy-core",
  "zippy-operators",
  "zippy-segment-store",

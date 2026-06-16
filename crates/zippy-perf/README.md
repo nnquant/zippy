@@ -9,6 +9,10 @@
 - `remote-pipeline-downstream`
 - `stream-table-segment-copy`
 - `stream-table-segment-forward`
+- `single-row-low-rate`
+- `write-to-subscribe-e2e`
+- `runtime-stream-table-e2e`
+- `stream-table-subscriber-e2e`
 
 ## 最小用法
 
@@ -68,6 +72,58 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
   --warmup-sec 0 \
   --report-json /tmp/zippy-perf-report.json
 ```
+
+低频单行写入基准：
+
+```bash
+TMPDIR=/dev/shm cargo run -p zippy-perf --release -- single-row-low-rate \
+  --target-rows-per-sec 200 \
+  --duration-sec 60 \
+  --warmup-sec 5 \
+  --symbols 32 \
+  --max-p99-micros 200
+```
+
+`single-row-low-rate` 会强制 `rows_per_batch=1`，测量单行 `StreamTableMaterializer::on_data()` 同步调用耗时。它会按目标行数预设 active segment 容量，避免 rollover 尖峰混入低频常态指标。
+
+写入到同机 reader 可见性基准：
+
+```bash
+TMPDIR=/dev/shm cargo run -p zippy-perf --release -- write-to-subscribe-e2e \
+  --target-rows-per-sec 200 \
+  --duration-sec 60 \
+  --warmup-sec 5 \
+  --symbols 32 \
+  --max-p99-micros 300
+```
+
+`write-to-subscribe-e2e` 同样强制 `rows_per_batch=1`。它直接在 segment-store 内执行 `write row -> commit prefix -> ActiveSegmentReader::read_available()`，测量 committed prefix 对同机 reader 可见的延迟。这个 profile 不包含 runtime queue、worker 调度、Python callback、watcher 打印或真实 CTP 回调，因此适合和 LDC watcher 结果拆口径对比。
+
+runtime fast data path 基准：
+
+```bash
+TMPDIR=/dev/shm cargo run -p zippy-perf --release -- runtime-stream-table-e2e \
+  --target-rows-per-sec 200 \
+  --duration-sec 60 \
+  --warmup-sec 5 \
+  --symbols 32 \
+  --max-p99-micros 500
+```
+
+`runtime-stream-table-e2e` 强制 `rows_per_batch=1`。它启动一个 synthetic native source，按低频单行发送 `SegmentTableView` 给 `StreamTableMaterializer`，主 `latency_micros` 表示行内时间戳到 publisher 收到输出的端到端耗时，覆盖 `SourceSink::emit -> fast data queue -> worker -> stream_table on_data -> publisher`。`secondary_latency_micros` 表示 source 线程里 `sink.emit(SourceEvent::Data)` 返回耗时，通常主要反映入队和唤醒通知成本。这个 profile 不包含 Python callback 或 watcher 打印。
+
+stream_table 目标表 external reader 基准：
+
+```bash
+TMPDIR=/dev/shm cargo run -p zippy-perf --release -- stream-table-subscriber-e2e \
+  --target-rows-per-sec 200 \
+  --duration-sec 60 \
+  --warmup-sec 5 \
+  --symbols 32 \
+  --max-p99-micros 200
+```
+
+`stream-table-subscriber-e2e` 强制 `rows_per_batch=1`。它同步调用 `StreamTableMaterializer::on_data()` 写入目标 active segment，然后用外部 `ActiveSegmentReader::read_available()` 读取目标表新增 committed row。主 `latency_micros` 表示 `on_data -> external reader` 完整耗时，`secondary_latency_micros` 表示单独的 `on_data` 耗时。这个 profile 用来拆 `stream_table active segment -> subscriber read`，不包含 runtime queue 或 Python callback。
 
 ## 性能门禁
 

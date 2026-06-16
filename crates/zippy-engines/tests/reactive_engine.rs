@@ -439,6 +439,28 @@ fn reactive_engine_supports_mixed_output_dtypes() {
 }
 
 #[test]
+fn reactive_engine_rejects_factor_output_length_mismatch() {
+    let mut engine = ReactiveStateEngine::new(
+        "reactive",
+        input_schema(),
+        vec![Box::new(WrongLengthFactor)],
+    )
+    .unwrap();
+
+    let error = engine
+        .on_data(batch(vec!["A"], vec![10.0]))
+        .expect_err("wrong length factor output should fail");
+
+    match error {
+        ZippyError::SchemaMismatch { reason } => {
+            assert!(reason.contains("reactive factor output length mismatch"));
+            assert!(reason.contains("field=[bad_length]"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn reactive_engine_expression_factor_can_reference_previous_factor_output() {
     let expr_schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -499,6 +521,39 @@ fn reactive_engine_filters_rows_by_id_whitelist_before_state_updates() {
     );
     assert_float_options_eq(&float64_values(output.column_at(2)), &[Some(10.0)]);
     assert_eq!(engine.drain_metrics().filtered_rows_total, 1);
+}
+
+#[test]
+fn reactive_engine_filters_contiguous_middle_rows_by_id_whitelist() {
+    let factors = vec![TsEmaSpec::new("id", "value", 2, "ema_2").build().unwrap()];
+    let mut engine = ReactiveStateEngine::new_with_id_filter(
+        "reactive",
+        input_schema(),
+        factors,
+        "id",
+        Some(vec!["A".to_string()]),
+    )
+    .unwrap();
+
+    let outputs = engine
+        .on_data(batch(
+            vec!["B", "A", "A", "C"],
+            vec![1.0, 10.0, 16.0, 100.0],
+        ))
+        .unwrap();
+
+    assert_eq!(outputs.len(), 1);
+    let output = &outputs[0];
+    assert_eq!(output.num_rows(), 2);
+    assert_float_options_eq(
+        &float64_values(output.column_at(1)),
+        &[Some(10.0), Some(16.0)],
+    );
+    assert_float_options_eq(
+        &float64_values(output.column_at(2)),
+        &[Some(10.0), Some(14.0)],
+    );
+    assert_eq!(engine.drain_metrics().filtered_rows_total, 2);
 }
 
 #[test]
@@ -709,5 +764,17 @@ impl zippy_operators::ReactiveFactor for PanicOnUnexpectedIdFactor {
         self.seen_ids.lock().unwrap().push(seen);
 
         Ok(Arc::new(Float64Array::from(vec![0.0; batch.num_rows()])) as ArrayRef)
+    }
+}
+
+struct WrongLengthFactor;
+
+impl ReactiveFactor for WrongLengthFactor {
+    fn output_field(&self) -> Field {
+        Field::new("bad_length", DataType::Float64, false)
+    }
+
+    fn evaluate(&mut self, batch: &RecordBatch) -> zippy_core::Result<ArrayRef> {
+        Ok(Arc::new(Float64Array::from(vec![1.0; batch.num_rows() + 1])) as ArrayRef)
     }
 }

@@ -1,8 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::array::{Array, Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Sender};
@@ -36,6 +37,112 @@ fn zippy_debug_stop_log(message: &str) {
     }
 }
 
+fn runtime_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_RUNTIME_LATENCY_TRACE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    })
+}
+
+fn write_latency_trace_line(mut line: String) {
+    use std::io::Write;
+
+    line.push('\n');
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeLatencyStats {
+    count: usize,
+    min_ns: i64,
+    max_ns: i64,
+    sum_ns: i128,
+}
+
+impl RuntimeLatencyStats {
+    fn record(&mut self, value_ns: i64) {
+        if self.count == 0 {
+            self.min_ns = value_ns;
+            self.max_ns = value_ns;
+        } else {
+            self.min_ns = self.min_ns.min(value_ns);
+            self.max_ns = self.max_ns.max(value_ns);
+        }
+        self.count += 1;
+        self.sum_ns += i128::from(value_ns);
+    }
+
+    fn format_us(&self, name: &str) -> String {
+        if self.count == 0 {
+            return format!("{name}_count=[0]");
+        }
+        let avg_ns = self.sum_ns as f64 / self.count as f64;
+        format!(
+            "{name}_count=[{}] {name}_min_us=[{:.3}] {name}_avg_us=[{:.3}] {name}_max_us=[{:.3}]",
+            self.count,
+            self.min_ns as f64 / 1_000.0,
+            avg_ns / 1_000.0,
+            self.max_ns as f64 / 1_000.0,
+        )
+    }
+}
+
+fn current_unix_epoch_ns() -> Option<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_nanos()).ok()
+}
+
+fn instant_elapsed_us(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
+}
+
+fn source_emit_to_runtime_stats(table: &SegmentTableView, now_ns: i64) -> RuntimeLatencyStats {
+    let mut stats = RuntimeLatencyStats::default();
+    let Ok(column) = table.column("source_emit_ns") else {
+        return stats;
+    };
+    if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+        for index in 0..values.len() {
+            if !values.is_null(index) {
+                stats.record(now_ns.saturating_sub(values.value(index)));
+            }
+        }
+        return stats;
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        for index in 0..values.len() {
+            if !values.is_null(index) {
+                stats.record(now_ns.saturating_sub(values.value(index)));
+            }
+        }
+    }
+    stats
+}
+
+fn single_row_source_emit_ns(table: &SegmentTableView) -> Option<i64> {
+    if table.num_rows() != 1 {
+        return None;
+    }
+    let column = table.column("source_emit_ns").ok()?;
+    if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+        if !values.is_null(0) {
+            return Some(values.value(0));
+        }
+        return None;
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        if !values.is_null(0) {
+            return Some(values.value(0));
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 struct NoopPublisher;
 
@@ -55,11 +162,16 @@ enum Command {
 }
 
 struct FastDataPath {
-    data_queue: Arc<SpscDataQueue<SegmentTableView>>,
+    data_queue: Arc<SpscDataQueue<QueuedData>>,
     worker_thread: Mutex<Option<std::thread::Thread>>,
     worker_running: Arc<AtomicBool>,
     xfast: bool,
     emit_lock: Mutex<()>,
+}
+
+struct QueuedData {
+    table: SegmentTableView,
+    enqueued_at: Option<Instant>,
 }
 
 impl FastDataPath {
@@ -274,11 +386,51 @@ impl EngineHandle {
 impl SourceSink for SourceRuntimeSink {
     fn emit(&self, event: SourceEvent) -> Result<()> {
         if let Some(path) = &self.fast_data_path {
+            let trace_enabled = runtime_latency_trace_enabled();
+            let emit_started_at = trace_enabled.then(Instant::now);
+            let lock_started_at = trace_enabled.then(Instant::now);
             let _emit_guard = path.emit_lock.lock().unwrap();
+            let lock_done_at = trace_enabled.then(Instant::now);
             return match event {
                 SourceEvent::Data(batch) => {
-                    path.data_queue.push_blocking(batch)?;
+                    let rows = trace_enabled.then(|| batch.num_rows());
+                    let source_emit_ns = trace_enabled
+                        .then(|| single_row_source_emit_ns(&batch))
+                        .flatten();
+                    let enqueued_at = trace_enabled.then(Instant::now);
+                    let push_started_at = trace_enabled.then(Instant::now);
+                    path.data_queue.push_blocking(QueuedData {
+                        table: batch,
+                        enqueued_at,
+                    })?;
+                    let push_done_at = trace_enabled.then(Instant::now);
                     path.notify_worker();
+                    let notify_done_at = trace_enabled.then(Instant::now);
+                    if let (
+                        Some(emit_started_at),
+                        Some(lock_started_at),
+                        Some(lock_done_at),
+                        Some(push_started_at),
+                        Some(push_done_at),
+                        Some(notify_done_at),
+                    ) = (
+                        emit_started_at,
+                        lock_started_at,
+                        lock_done_at,
+                        push_started_at,
+                        push_done_at,
+                        notify_done_at,
+                    ) {
+                        write_latency_trace_line(format!(
+                            "zippy_runtime_latency_trace event=[source_sink_emit] rows=[{}] source_emit_ns=[{}] emit_lock_wait_us=[{:.3}] push_blocking_us=[{:.3}] notify_worker_us=[{:.3}] emit_total_us=[{:.3}]",
+                            rows.unwrap_or_default(),
+                            source_emit_ns.unwrap_or_default(),
+                            instant_elapsed_us(lock_started_at, lock_done_at),
+                            instant_elapsed_us(push_started_at, push_done_at),
+                            instant_elapsed_us(push_done_at, notify_done_at),
+                            instant_elapsed_us(emit_started_at, notify_done_at),
+                        ));
+                    }
                     Ok(())
                 }
                 other => {
@@ -635,7 +787,7 @@ impl PreparedSourceRuntime {
                             continue;
                         }
 
-                        if let Some(batch) = data_queue.try_pop() {
+                        if let Some(queued) = data_queue.try_pop() {
                             if !hello_seen {
                                 return fail_worker(
                                     &mut engine,
@@ -645,10 +797,16 @@ impl PreparedSourceRuntime {
                                     },
                                 );
                             }
-                            process_data_event(&mut engine, &mut publisher, &metrics_clone, batch)
-                                .inspect_err(|_| {
-                                    *status_clone.lock().unwrap() = EngineStatus::Failed;
-                                })?;
+                            process_data_event(
+                                &mut engine,
+                                &mut publisher,
+                                &metrics_clone,
+                                queued.table,
+                                queued.enqueued_at,
+                            )
+                            .inspect_err(|_| {
+                                *status_clone.lock().unwrap() = EngineStatus::Failed;
+                            })?;
                             continue;
                         }
 
@@ -857,7 +1015,7 @@ fn runtime_idle_wait(xfast: bool) {
 }
 
 fn wait_for_fast_data_queue_drain(
-    data_queue: &SpscDataQueue<SegmentTableView>,
+    data_queue: &SpscDataQueue<QueuedData>,
     worker_running: &AtomicBool,
     xfast: bool,
 ) {
@@ -866,7 +1024,7 @@ fn wait_for_fast_data_queue_drain(
     }
 }
 
-fn drain_fast_data_queue(data_queue: &SpscDataQueue<SegmentTableView>) {
+fn drain_fast_data_queue(data_queue: &SpscDataQueue<QueuedData>) {
     while data_queue.try_pop().is_some() {}
 }
 
@@ -876,7 +1034,7 @@ fn handle_source_control_command<E, P>(
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
     status: &Arc<Mutex<EngineStatus>>,
-    fast_data_queue: Option<&SpscDataQueue<SegmentTableView>>,
+    fast_data_queue: Option<&SpscDataQueue<QueuedData>>,
     source_mode: SourceMode,
     source_schema: &Arc<Schema>,
     engine_schema: &Arc<Schema>,
@@ -891,7 +1049,7 @@ where
 {
     match command {
         Command::Data(batch) => {
-            process_data_event(engine, publisher, metrics, batch)?;
+            process_data_event(engine, publisher, metrics, batch, None)?;
         }
         Command::Flush(reply_tx) => {
             process_flush_event(engine, publisher, metrics, true)
@@ -989,7 +1147,7 @@ where
                         },
                     )?;
                 }
-                process_data_event(engine, publisher, metrics, batch).inspect_err(|_| {
+                process_data_event(engine, publisher, metrics, batch, None).inspect_err(|_| {
                     *status.lock().unwrap() = EngineStatus::Failed;
                 })?;
             }
@@ -1071,14 +1229,14 @@ fn drain_fast_data_events<E, P>(
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
     status: &Arc<Mutex<EngineStatus>>,
-    data_queue: &SpscDataQueue<SegmentTableView>,
+    data_queue: &SpscDataQueue<QueuedData>,
     hello_seen: &mut bool,
 ) -> Result<()>
 where
     E: Engine,
     P: Publisher,
 {
-    while let Some(batch) = data_queue.try_pop() {
+    while let Some(queued) = data_queue.try_pop() {
         if !*hello_seen {
             return fail_worker(
                 engine,
@@ -1088,9 +1246,10 @@ where
                 },
             );
         }
-        process_data_event(engine, publisher, metrics, batch).inspect_err(|_| {
-            *status.lock().unwrap() = EngineStatus::Failed;
-        })?;
+        process_data_event(engine, publisher, metrics, queued.table, queued.enqueued_at)
+            .inspect_err(|_| {
+                *status.lock().unwrap() = EngineStatus::Failed;
+            })?;
     }
 
     Ok(())
@@ -1101,25 +1260,83 @@ fn process_data_event<E, P>(
     publisher: &mut P,
     metrics: &Arc<EngineMetrics>,
     table: SegmentTableView,
+    queued_at: Option<Instant>,
 ) -> Result<()>
 where
     E: Engine,
     P: Publisher,
 {
+    let trace_enabled = runtime_latency_trace_enabled();
+    let runtime_started_at = trace_enabled.then(Instant::now);
+    let runtime_local_queue_wait_us = match (queued_at, runtime_started_at) {
+        (Some(queued_at), Some(runtime_started_at)) => {
+            Some(instant_elapsed_us(queued_at, runtime_started_at))
+        }
+        _ => None,
+    };
+    let source_emit_to_runtime_stats = if trace_enabled {
+        current_unix_epoch_ns().map(|now_ns| source_emit_to_runtime_stats(&table, now_ns))
+    } else {
+        None
+    };
+    let source_emit_ns = trace_enabled
+        .then(|| single_row_source_emit_ns(&table))
+        .flatten();
+    let rows = table.num_rows();
     metrics.inc_processed_batch(table.num_rows());
     engine.begin_transaction();
+    let on_data_started_at = trace_enabled.then(Instant::now);
     let result = (|| -> Result<()> {
         let outputs = engine.on_data(table).inspect_err(|_| {
             metrics.apply_delta(engine.drain_metrics());
         })?;
+        let on_data_done_at = trace_enabled.then(Instant::now);
         metrics.apply_delta(engine.drain_metrics());
         metrics.inc_output_batches(outputs.len());
-        publish_tables(publisher, metrics, &outputs)
+        let publish_started_at = trace_enabled.then(Instant::now);
+        let publish_result = publish_tables(publisher, metrics, &outputs);
+        let publish_done_at = trace_enabled.then(Instant::now);
+        if let (Some(runtime_started_at), Some(on_data_started_at), Some(on_data_done_at)) =
+            (runtime_started_at, on_data_started_at, on_data_done_at)
+        {
+            if let (Some(publish_started_at), Some(publish_done_at)) =
+                (publish_started_at, publish_done_at)
+            {
+                write_latency_trace_line(format!(
+                    "zippy_runtime_latency_trace event=[data] rows=[{}] outputs=[{}] source_emit_ns=[{}] {} runtime_local_queue_wait_us=[{:.3}] runtime_on_data_us=[{:.3}] runtime_publish_us=[{:.3}] runtime_pre_publish_us=[{:.3}] runtime_data_before_commit_us=[{:.3}]",
+                    rows,
+                    outputs.len(),
+                    source_emit_ns.unwrap_or_default(),
+                    source_emit_to_runtime_stats
+                        .unwrap_or_default()
+                        .format_us("source_emit_to_runtime_start"),
+                    runtime_local_queue_wait_us.unwrap_or_default(),
+                    instant_elapsed_us(on_data_started_at, on_data_done_at),
+                    instant_elapsed_us(publish_started_at, publish_done_at),
+                    instant_elapsed_us(runtime_started_at, publish_started_at),
+                    instant_elapsed_us(runtime_started_at, publish_done_at),
+                ));
+            }
+        }
+        publish_result
     })();
 
     match result {
         Ok(()) => {
+            let commit_started_at = trace_enabled.then(Instant::now);
             engine.commit_transaction();
+            let commit_done_at = trace_enabled.then(Instant::now);
+            if let (Some(runtime_started_at), Some(commit_started_at), Some(commit_done_at)) =
+                (runtime_started_at, commit_started_at, commit_done_at)
+            {
+                write_latency_trace_line(format!(
+                    "zippy_runtime_latency_trace event=[commit] rows=[{}] source_emit_ns=[{}] runtime_commit_us=[{:.3}] runtime_data_total_us=[{:.3}]",
+                    rows,
+                    source_emit_ns.unwrap_or_default(),
+                    instant_elapsed_us(commit_started_at, commit_done_at),
+                    instant_elapsed_us(runtime_started_at, commit_done_at),
+                ));
+            }
             Ok(())
         }
         Err(err) => Err(rollback_engine_transaction(engine, err)),

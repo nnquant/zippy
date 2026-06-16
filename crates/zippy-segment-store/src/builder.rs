@@ -2,8 +2,9 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    time::Instant,
 };
 
 use crate::{
@@ -20,6 +21,29 @@ use crate::{
     ColumnLayout, ColumnType, CompiledSchema, LayoutPlan, RowSpanView, SealedSegmentHandle,
     SegmentCellValue, SegmentHeader, ShmRegion,
 };
+
+fn active_writer_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_STREAM_TABLE_LATENCY_TRACE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    })
+}
+
+fn write_latency_trace_line(mut line: String) {
+    use std::io::Write;
+
+    line.push('\n');
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+}
+
+fn instant_delta_us(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
+}
 
 /// Active segment 在共享内存中的最小布局信息。
 #[derive(Debug, Clone, Copy)]
@@ -1137,6 +1161,8 @@ impl ActiveSegmentWriter {
         start_offset: usize,
         rows_to_copy: usize,
     ) -> Result<Option<usize>, &'static str> {
+        let trace_enabled = active_writer_latency_trace_enabled();
+        let append_started_at = trace_enabled.then(Instant::now);
         let RowSpanBacking::Active(attachment) = &span.backing else {
             return Ok(None);
         };
@@ -1148,6 +1174,7 @@ impl ActiveSegmentWriter {
         if rows_to_copy == 0 {
             return Ok(Some(0));
         }
+        let utf8_fit_started_at = trace_enabled.then(Instant::now);
         if !self.active_row_span_utf8_ranges_fit(
             attachment,
             span.start_row + start_offset,
@@ -1155,11 +1182,22 @@ impl ActiveSegmentWriter {
         )? {
             return Ok(None);
         }
+        let utf8_fit_done_at = trace_enabled.then(Instant::now);
 
         let source_start_row = span.start_row + start_offset;
         let target_start_row = self.row_cursor;
         let columns = self.schema.columns().to_vec();
+        let mut layout_lookup_us = 0.0_f64;
+        let mut i64_copy_us = 0.0_f64;
+        let mut f64_copy_us = 0.0_f64;
+        let mut utf8_copy_us = 0.0_f64;
+        let mut validity_copy_us = 0.0_f64;
+        let mut nullable_columns = 0_usize;
+        let mut i64_columns = 0_usize;
+        let mut f64_columns = 0_usize;
+        let mut utf8_columns = 0_usize;
         for spec in &columns {
+            let layout_started_at = trace_enabled.then(Instant::now);
             let source_layout = attachment
                 .descriptor
                 .layout()
@@ -1170,6 +1208,10 @@ impl ActiveSegmentWriter {
                 .column(spec.name())
                 .ok_or("missing target column layout")?
                 .clone();
+            if let Some(layout_started_at) = layout_started_at {
+                layout_lookup_us += instant_delta_us(layout_started_at, Instant::now());
+            }
+            let copy_started_at = trace_enabled.then(Instant::now);
             match spec.data_type {
                 ColumnType::Int64
                 | ColumnType::TimestampNsTz(_)
@@ -1183,6 +1225,10 @@ impl ActiveSegmentWriter {
                         target_start_row,
                         rows_to_copy,
                     )?;
+                    if let Some(copy_started_at) = copy_started_at {
+                        i64_copy_us += instant_delta_us(copy_started_at, Instant::now());
+                    }
+                    i64_columns += 1;
                 }
                 ColumnType::Float64 => {
                     self.copy_active_f64_column(
@@ -1194,6 +1240,10 @@ impl ActiveSegmentWriter {
                         target_start_row,
                         rows_to_copy,
                     )?;
+                    if let Some(copy_started_at) = copy_started_at {
+                        f64_copy_us += instant_delta_us(copy_started_at, Instant::now());
+                    }
+                    f64_columns += 1;
                 }
                 ColumnType::Utf8 => {
                     self.copy_active_utf8_column(
@@ -1205,9 +1255,15 @@ impl ActiveSegmentWriter {
                         target_start_row,
                         rows_to_copy,
                     )?;
+                    if let Some(copy_started_at) = copy_started_at {
+                        utf8_copy_us += instant_delta_us(copy_started_at, Instant::now());
+                    }
+                    utf8_columns += 1;
                 }
             }
             if spec.nullable {
+                nullable_columns += 1;
+                let validity_started_at = trace_enabled.then(Instant::now);
                 self.copy_active_validity_column(
                     attachment,
                     source_layout,
@@ -1217,12 +1273,48 @@ impl ActiveSegmentWriter {
                     target_start_row,
                     rows_to_copy,
                 )?;
+                if let Some(validity_started_at) = validity_started_at {
+                    validity_copy_us += instant_delta_us(validity_started_at, Instant::now());
+                }
             }
         }
 
         self.header.row_count += rows_to_copy;
         self.row_cursor += rows_to_copy;
+        let publish_started_at = trace_enabled.then(Instant::now);
         self.publish_committed_prefix()?;
+        let publish_done_at = trace_enabled.then(Instant::now);
+        if let (
+            Some(append_started_at),
+            Some(utf8_fit_started_at),
+            Some(utf8_fit_done_at),
+            Some(publish_started_at),
+            Some(publish_done_at),
+        ) = (
+            append_started_at,
+            utf8_fit_started_at,
+            utf8_fit_done_at,
+            publish_started_at,
+            publish_done_at,
+        ) {
+            write_latency_trace_line(format!(
+                "zippy_segment_store_latency_trace event=[active_append_detail] rows=[{}] columns=[{}] i64_columns=[{}] f64_columns=[{}] utf8_columns=[{}] nullable_columns=[{}] utf8_fit_us=[{:.3}] layout_lookup_us=[{:.3}] i64_copy_us=[{:.3}] f64_copy_us=[{:.3}] utf8_copy_us=[{:.3}] validity_copy_us=[{:.3}] publish_committed_us=[{:.3}] total_us=[{:.3}]",
+                rows_to_copy,
+                columns.len(),
+                i64_columns,
+                f64_columns,
+                utf8_columns,
+                nullable_columns,
+                instant_delta_us(utf8_fit_started_at, utf8_fit_done_at),
+                layout_lookup_us,
+                i64_copy_us,
+                f64_copy_us,
+                utf8_copy_us,
+                validity_copy_us,
+                instant_delta_us(publish_started_at, publish_done_at),
+                instant_delta_us(append_started_at, publish_done_at),
+            ));
+        }
         Ok(Some(rows_to_copy))
     }
 

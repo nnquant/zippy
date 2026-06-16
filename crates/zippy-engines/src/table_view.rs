@@ -19,6 +19,15 @@ pub(crate) fn project_columns(
         .collect::<Result<Vec<_>>>()
 }
 
+pub(crate) fn project_columns_by_position(
+    table: &SegmentTableView,
+    column_count: usize,
+) -> Result<Vec<ArrayRef>> {
+    (0..column_count)
+        .map(|index| table.column_at(index))
+        .collect::<Result<Vec<_>>>()
+}
+
 pub(crate) fn record_batch_from_table_rows(
     table: &SegmentTableView,
     schema: &SchemaRef,

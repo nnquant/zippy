@@ -288,6 +288,12 @@ class MasterClient:
         stream_name: str,
         descriptor: object,
     ) -> None: ...
+    def publish_segment_descriptor_envelope(
+        self,
+        stream_name: str,
+        descriptor_envelope: bytes,
+        metadata: object | None = None,
+    ) -> None: ...
     def publish_persisted_file(
         self,
         stream_name: str,

@@ -10,12 +10,14 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import queue
 import re
 import socket
 import struct
 import tempfile
 import threading
 import time
+import warnings
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -3943,7 +3945,7 @@ class Table:
         :returns: Live segment batches.
         :rtype: pyarrow.RecordBatchReader
         """
-        return self._inner.scan_live()
+        return self._scan_live_snapshot(self.snapshot())
 
     def select(self, *columns: object, **named_exprs: object) -> Table:
         """
@@ -7435,6 +7437,30 @@ class _SessionSourceBinding:
         self._session = session
         self._source = source
 
+    def key_value_table(
+        self,
+        name: str,
+        *,
+        by: str | list[str] | tuple[str, ...],
+    ) -> "_SessionTablePublishBinding":
+        """
+        Configure a key-value stream table derived from this source table.
+
+        :param name: Output key-value stream table name.
+        :type name: str
+        :param by: Key columns used to identify the latest value for each key.
+        :type by: str | list[str] | tuple[str, ...]
+        :returns: Publish binding. Call ``.publish(start_from="tail")`` to materialize it.
+        :rtype: _SessionTablePublishBinding
+        """
+        return _SessionTablePublishBinding(
+            self._session,
+            table_kind=_KEY_VALUE_TABLE_KIND,
+            name=name,
+            by=by,
+            source=self._source,
+        )
+
     def publish_key_value_table(
         self,
         name: str,
@@ -7454,12 +7480,183 @@ class _SessionSourceBinding:
         :returns: Owning session for fluent ``.run()`` usage.
         :rtype: Session
         """
+        warnings.warn(
+            "source(...).publish_key_value_table() is deprecated; use "
+            "source(...).key_value_table(name, by=...).publish(...)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._session._publish_source_key_value_table(
             self._source,
             name,
             by=by,
             start_from=start_from,
         )
+
+
+class _SessionTablePublishBinding:
+    """
+    Fluent binding for publishing an engine output or source view as a stream table.
+
+    :param session: Owning session.
+    :type session: Session
+    :param table_kind: Internal table storage kind.
+    :type table_kind: str
+    :param name: Output stream table name.
+    :type name: str
+    :param by: Optional key columns for key-value tables.
+    :type by: list[str] | tuple[str, ...] | str | None
+    :param source: Optional existing source table name.
+    :type source: str | None
+    """
+
+    def __init__(
+        self,
+        session: "Session",
+        *,
+        table_kind: str,
+        name: str,
+        by: str | list[str] | tuple[str, ...] | None = None,
+        source: str | None = None,
+    ) -> None:
+        self._session = session
+        self._table_kind = table_kind
+        self._name = name
+        self._by = by
+        self._source = source
+
+    def publish(
+        self,
+        *,
+        persist: bool = False,
+        start_from: str = "replay",
+    ) -> "Session":
+        """
+        Publish the configured table as a subscribable stream table.
+
+        :param persist: Whether append stream table history should be persisted as parquet.
+        :type persist: bool
+        :param start_from: Source table start mode for source-derived key-value tables.
+        :type start_from: str
+        :returns: Owning session for fluent ``.run()`` usage.
+        :rtype: Session
+        """
+        if self._source is not None:
+            if self._table_kind != _KEY_VALUE_TABLE_KIND:
+                raise NotImplementedError("source append_table publish is not implemented")
+            if persist:
+                raise ValueError("source key_value_table does not support persist=True")
+            if self._by is None:
+                raise ValueError("key_value_table requires by")
+            return self._session._publish_source_key_value_table(
+                self._source,
+                self._name,
+                by=self._by,
+                start_from=start_from,
+            )
+
+        if self._table_kind == _APPEND_TABLE_KIND:
+            return self._session._publish_append_table(self._name, persist=persist)
+        if self._table_kind == _KEY_VALUE_TABLE_KIND:
+            return self._session._publish_key_value_table(
+                self._name,
+                by=self._by,
+                persist=persist,
+            )
+        raise ValueError(f"unsupported table kind table_kind=[{self._table_kind}]")
+
+
+class _PipelineAppendTablePublishBinding:
+    """
+    Fluent binding for publishing a pipeline source as an append stream table.
+
+    :param pipeline: Owning pipeline.
+    :type pipeline: Pipeline
+    :param name: Output stream table name.
+    :type name: str
+    :param options: Stream table options except ``persist``.
+    :type options: dict[str, object]
+    """
+
+    def __init__(self, pipeline: "Pipeline", name: str, options: dict[str, object]) -> None:
+        self._pipeline = pipeline
+        self._name = name
+        self._options = dict(options)
+
+    def publish(self, *, persist=_USE_MASTER_CONFIG) -> "Pipeline":
+        """
+        Publish the pipeline source as an append stream table.
+
+        :param persist: Optional persistence method. Omit to use master config, pass
+            ``True``/``"parquet"`` to force parquet, or ``False``/``None`` to disable.
+        :type persist: bool | str | None
+        :returns: Owning pipeline.
+        :rtype: Pipeline
+        """
+        return self._pipeline.stream_table(
+            self._name,
+            persist=persist,
+            **self._options,
+        )
+
+
+class _AsyncDescriptorEnvelopePublisher:
+    """
+    Publish stream descriptor envelopes on a background control-plane thread.
+
+    :param master: Master client exposing ``publish_segment_descriptor_envelope``.
+    :type master: object
+    :param stream_name: Stream name whose descriptor is published.
+    :type stream_name: str
+    :param descriptor_metadata: Optional table metadata merged into the descriptor.
+    :type descriptor_metadata: dict[str, object] | None
+    """
+
+    def __init__(
+        self,
+        master: object,
+        stream_name: str,
+        descriptor_metadata: dict[str, object] | None,
+    ) -> None:
+        self._master = master
+        self._stream_name = stream_name
+        self._descriptor_metadata = descriptor_metadata
+        self._queue: queue.SimpleQueue[bytes] = queue.SimpleQueue()
+        self._warning_emitted = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"zippy-descriptor-publisher-{stream_name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def publish(self, payload: bytes | bytearray | memoryview) -> None:
+        """
+        Enqueue one descriptor envelope for background publication.
+
+        :param payload: Descriptor envelope bytes.
+        :type payload: bytes | bytearray | memoryview
+        :returns: None
+        :rtype: None
+        """
+
+        self._queue.put(bytes(payload))
+
+    def _run(self) -> None:
+        publish_envelope = self._master.publish_segment_descriptor_envelope
+        while True:
+            payload = self._queue.get()
+            try:
+                publish_envelope(self._stream_name, payload, self._descriptor_metadata)
+            except BaseException as error:
+                if not self._warning_emitted:
+                    self._warning_emitted = True
+                    warnings.warn(
+                        "async descriptor publish failed "
+                        f"stream_name=[{self._stream_name}] error=[{error}]",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
 
 class Lifespan:
@@ -7665,7 +7862,7 @@ class Session:
         :type engine: object
         :param kwargs: Constructor arguments when ``engine`` is a class.
             ``output_stream="name"`` remains a shortcut for ``.stream_table("name")``.
-            Prefer ``.stream_table(..., persist=True|False)`` for new code.
+            Prefer ``.append_table(...).publish(persist=True|False)`` for new code.
         :type kwargs: object
         :returns: This session for fluent ``.engine(...).run()`` usage.
         :rtype: Session
@@ -7701,9 +7898,8 @@ class Session:
         """
         Materialize the latest engine output into a named table.
 
-        This is a compatibility wrapper. Normal engine outputs become
-        ``append_table`` outputs. ``ReactiveLatestEngine`` outputs become
-        ``key_value_table`` outputs.
+        Normal engine outputs become append stream tables. ``ReactiveLatestEngine`` outputs become
+        key-value stream tables.
 
         :param name: Output stream table name.
         :type name: str
@@ -7720,10 +7916,68 @@ class Session:
         engine = self._engines[-1]
         latest_by = _engine_latest_by(engine)
         if latest_by is not None:
-            return self.publish_key_value_table(name, by=latest_by, persist=persist)
-        return self.publish_append_table(name, persist=persist)
+            return self.key_value_table(name, by=latest_by).publish(persist=persist)
+        return self.append_table(name).publish(persist=persist)
+
+    def append_table(self, name: str) -> _SessionTablePublishBinding:
+        """
+        Configure the latest engine output as an append stream table.
+
+        :param name: Output append stream table name.
+        :type name: str
+        :returns: Publish binding. Call ``.publish(persist=True|False)`` to materialize it.
+        :rtype: _SessionTablePublishBinding
+        """
+        self._validate_publish_table_name(name, method="append_table")
+        return _SessionTablePublishBinding(
+            self,
+            table_kind=_APPEND_TABLE_KIND,
+            name=name,
+        )
+
+    def key_value_table(
+        self,
+        name: str,
+        *,
+        by: str | list[str] | tuple[str, ...] | None = None,
+    ) -> _SessionTablePublishBinding:
+        """
+        Configure the latest engine output as a key-value stream table.
+
+        :param name: Output key-value stream table name.
+        :type name: str
+        :param by: Key columns used to identify the latest value for each key.
+        :type by: str | list[str] | tuple[str, ...] | None
+        :returns: Publish binding. Call ``.publish()`` to materialize it.
+        :rtype: _SessionTablePublishBinding
+        """
+        self._validate_publish_table_name(name, method="key_value_table")
+        return _SessionTablePublishBinding(
+            self,
+            table_kind=_KEY_VALUE_TABLE_KIND,
+            name=name,
+            by=by,
+        )
 
     def publish_append_table(self, name: str, *, persist: bool = False) -> "Session":
+        """
+        Deprecated alias for ``append_table(name).publish(persist=...)``.
+
+        :param name: Output append table name.
+        :type name: str
+        :param persist: Whether to persist the append table as parquet.
+        :type persist: bool
+        :returns: This session for fluent ``.run()`` usage.
+        :rtype: Session
+        """
+        warnings.warn(
+            "publish_append_table() is deprecated; use append_table(name).publish(...)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._publish_append_table(name, persist=persist)
+
+    def _publish_append_table(self, name: str, *, persist: bool = False) -> "Session":
         """
         Publish the latest engine output as an append-only table.
 
@@ -7776,6 +8030,35 @@ class Session:
             currently support parquet persistence.
         :type persist: bool
         :returns: This session for fluent ``.publish_key_value_table(...).run()`` usage.
+        :rtype: Session
+        :raises RuntimeError: If no engine has been added.
+        :raises ValueError: If key columns are missing or the latest output is already materialized.
+        """
+        warnings.warn(
+            "publish_key_value_table() is deprecated; use key_value_table(name, by=...).publish()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._publish_key_value_table(name, by=by, persist=persist)
+
+    def _publish_key_value_table(
+        self,
+        name: str,
+        *,
+        by: str | list[str] | tuple[str, ...] | None = None,
+        persist: bool = False,
+    ) -> "Session":
+        """
+        Publish the latest engine output as a key-value latest table.
+
+        :param name: Output key-value table name.
+        :type name: str
+        :param by: Key columns used to identify the latest value for each key.
+        :type by: str | list[str] | tuple[str, ...] | None
+        :param persist: Reserved for compatibility with ``stream_table``. Key-value tables do not
+            currently support parquet persistence.
+        :type persist: bool
+        :returns: This session for fluent ``.run()`` usage.
         :rtype: Session
         :raises RuntimeError: If no engine has been added.
         :raises ValueError: If key columns are missing or the latest output is already materialized.
@@ -8194,6 +8477,11 @@ class Session:
 
     def _build_engine(self, engine_cls: type, kwargs: dict[str, object]):
         explicit_target = "target" in kwargs
+        if explicit_target:
+            raise TypeError(
+                "target is not supported in Session.engine(); publish engine output with "
+                "append_table(...).publish(...) or stream_table(...)"
+            )
         if "output" in kwargs:
             raise TypeError("output is not supported; use output_stream or .stream_table(...)")
         output_stream = kwargs.pop("output_stream", None)
@@ -8201,8 +8489,6 @@ class Session:
             raise TypeError("output_stream must be a stream table name")
         if output_stream == "":
             raise ValueError("output_stream must not be empty")
-        if output_stream is not None and explicit_target:
-            raise ValueError("output_stream cannot be combined with explicit target")
         persist = kwargs.pop("persist", False)
         if not isinstance(persist, bool):
             raise TypeError("persist must be True or False")
@@ -8621,7 +8907,16 @@ class Session:
         *,
         descriptor_metadata: dict[str, object] | None = None,
     ):
+        async_publisher = (
+            _AsyncDescriptorEnvelopePublisher(self.master, stream_name, descriptor_metadata)
+            if callable(getattr(self.master, "publish_segment_descriptor_envelope", None))
+            else None
+        )
+
         def publish(payload) -> None:
+            if isinstance(payload, (bytes, bytearray, memoryview)) and async_publisher is not None:
+                async_publisher.publish(payload)
+                return
             if isinstance(payload, (bytes, bytearray, memoryview)):
                 descriptor = json.loads(bytes(payload).decode("utf-8"))
             elif isinstance(payload, str):
@@ -8766,6 +9061,70 @@ class Pipeline:
         )
         return self
 
+    def append_table(
+        self,
+        name: str,
+        *,
+        schema=None,
+        buffer_size: int = 64,
+        frame_size: int = 4096,
+        row_capacity: int | None = None,
+        retention_segments: int | None = None,
+        dt_column: str | None = None,
+        id_column: str | None = None,
+        dt_part: str | None = None,
+        data_dir: str | os.PathLike[str] | None = None,
+        persist_path: ParquetPersist | str | os.PathLike[str] | None = None,
+    ) -> _PipelineAppendTablePublishBinding:
+        """
+        Configure pipeline input as an append stream table.
+
+        :param name: Named append stream table.
+        :type name: str
+        :param schema: Arrow schema for the stream.
+        :type schema: pyarrow.Schema | None
+        :param buffer_size: Control-plane bus compatibility buffer size.
+        :type buffer_size: int
+        :param frame_size: Control-plane bus compatibility frame size.
+        :type frame_size: int
+        :param row_capacity: Optional active segment row capacity before rollover.
+        :type row_capacity: int | None
+        :param retention_segments: Optional sealed segment count retained in live descriptors.
+        :type retention_segments: int | None
+        :param dt_column: Optional timestamp column used to derive parquet date partitions.
+        :type dt_column: str | None
+        :param id_column: Optional identifier column used for parquet partitioning.
+        :type id_column: str | None
+        :param dt_part: Date partition format derived from ``dt_column``.
+        :type dt_part: str | None
+        :param data_dir: Optional persistence root directory.
+        :type data_dir: str | os.PathLike[str] | None
+        :param persist_path: Explicit directory used to store this stream table's parquet files.
+        :type persist_path: ParquetPersist | str | os.PathLike[str] | None
+        :returns: Publish binding. Call ``.publish(persist=True|False)`` to materialize it.
+        :rtype: _PipelineAppendTablePublishBinding
+        """
+        if not isinstance(name, str):
+            raise TypeError("append_table name must be a string")
+        if not name:
+            raise ValueError("append_table name must not be empty")
+        return _PipelineAppendTablePublishBinding(
+            self,
+            name,
+            {
+                "schema": schema,
+                "buffer_size": buffer_size,
+                "frame_size": frame_size,
+                "row_capacity": row_capacity,
+                "retention_segments": retention_segments,
+                "dt_column": dt_column,
+                "id_column": id_column,
+                "dt_part": dt_part,
+                "data_dir": data_dir,
+                "persist_path": persist_path,
+            },
+        )
+
     def stream_table(
         self,
         name: str,
@@ -8868,9 +9227,7 @@ class Pipeline:
                 # upstream source retires a segment, so default to a table-owned
                 # live segment there unless callers opt in at the native layer.
                 descriptor_forwarding=(
-                    table_options["persist_path"] is None
-                    and table_options["retention_segments"] is None
-                    and os.name != "nt"
+                    table_options["retention_segments"] is None and os.name != "nt"
                 ),
             )
             self.master.publish_segment_descriptor(
@@ -8992,7 +9349,16 @@ class Pipeline:
         *,
         descriptor_metadata: dict[str, object] | None = None,
     ):
+        async_publisher = (
+            _AsyncDescriptorEnvelopePublisher(self.master, stream_name, descriptor_metadata)
+            if callable(getattr(self.master, "publish_segment_descriptor_envelope", None))
+            else None
+        )
+
         def publish(payload) -> None:
+            if isinstance(payload, (bytes, bytearray, memoryview)) and async_publisher is not None:
+                async_publisher.publish(payload)
+                return
             if isinstance(payload, (bytes, bytearray, memoryview)):
                 descriptor = json.loads(bytes(payload).decode("utf-8"))
             elif isinstance(payload, str):
@@ -9630,7 +9996,6 @@ __all__ = [
     "ParquetPersist",
     "ParquetReplayEngine",
     "ParquetReplaySource",
-    "ParquetSink",
     "Pipeline",
     "ReactiveLatestEngine",
     "ReactiveStateEngine",

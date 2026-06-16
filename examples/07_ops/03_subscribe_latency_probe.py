@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -123,6 +124,42 @@ def slowest_latency_rows(samples: list[dict[str, Any]], limit: int) -> list[dict
     ]
 
 
+def _callback_row_values(row: zp.Row, callback_work: str) -> tuple[dict[str, Any], str | None]:
+    """
+    Materialize row data according to the configured callback workload.
+
+    :param row: Zippy row object delivered to the Python callback.
+    :type row: zippy.Row
+    :param callback_work: Callback workload mode.
+    :type callback_work: str
+    :returns: Row values and an optional rendered line.
+    :rtype: tuple[dict[str, typing.Any], str | None]
+    :raises ValueError: If ``callback_work`` is unknown.
+    """
+    if callback_work == "minimal":
+        return {
+            "seq": row["seq"],
+            "localtime_ns": row["localtime_ns"],
+        }, None
+
+    values = row.to_dict()
+    if callback_work == "to_dict":
+        return values, None
+
+    rendered = (
+        f"seq={values['seq']} instrument_id={values['instrument_id']} "
+        f"dt={values['dt']} localtime_ns={values['localtime_ns']} "
+        f"last_price={values['last_price']}"
+    )
+    if callback_work == "format":
+        return values, rendered
+    if callback_work == "print":
+        print(rendered, file=sys.stderr)
+        return values, rendered
+
+    raise ValueError(f"unsupported callback_work=[{callback_work}]")
+
+
 def make_tick(seq: int, localtime_ns: int) -> pl.DataFrame:
     """
     构造单行 tick。
@@ -179,7 +216,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     latencies_ms: list[float] = []
     rollover_first_latencies_ms: list[float] = []
     latency_samples: list[dict[str, Any]] = []
+    callback_work_latencies_ms: list[float] = []
+    callback_done_latencies_ms: list[float] = []
     append_latencies_ms: list[float] = []
+    append_latency_by_seq_ms: list[float | None] = [None] * args.rows
+    callback_enter_minus_append_ms: list[float] = []
     rollover_append_latencies_ms: list[float] = []
     received_rows = 0
 
@@ -194,20 +235,34 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         """
         nonlocal received_rows
         callback_started_ns = time.time_ns()
-        values = row.to_dict()
+        callback_work_started_ns = time.perf_counter_ns()
+        values, _rendered = _callback_row_values(row, args.callback_work)
+        callback_work_latency_ms = (time.perf_counter_ns() - callback_work_started_ns) / 1_000_000.0
         seq = int(values["seq"])
         localtime_ns = int(values["localtime_ns"])
         latency_ms = (callback_started_ns - localtime_ns) / 1_000_000.0
+        callback_done_latency_ms = (time.time_ns() - localtime_ns) / 1_000_000.0
+        append_latency_ms = append_latency_by_seq_ms[seq] if 0 <= seq < args.rows else None
+        latency_after_append_ms = (
+            latency_ms - append_latency_ms if append_latency_ms is not None else None
+        )
         rollover_first_row = seq > 0 and seq % args.row_capacity == 0
         measured = seq >= args.discard_first_rows
 
         with lock:
             if measured:
                 latencies_ms.append(latency_ms)
+                callback_work_latencies_ms.append(callback_work_latency_ms)
+                callback_done_latencies_ms.append(callback_done_latency_ms)
+                if latency_after_append_ms is not None:
+                    callback_enter_minus_append_ms.append(latency_after_append_ms)
                 latency_samples.append(
                     {
                         "seq": seq,
                         "latency_ms": latency_ms,
+                        "callback_enter_minus_append_ms": latency_after_append_ms,
+                        "callback_work_ms": callback_work_latency_ms,
+                        "callback_done_delay_ms": callback_done_latency_ms,
                         "rollover_first_row": rollover_first_row,
                     }
                 )
@@ -234,6 +289,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             append_started_ns = time.perf_counter_ns()
             pipeline.write(tick)
             append_latency_ms = (time.perf_counter_ns() - append_started_ns) / 1_000_000.0
+            append_latency_by_seq_ms[seq] = append_latency_ms
             append_latencies_ms.append(append_latency_ms)
             if seq > 0 and seq % args.row_capacity == 0:
                 rollover_append_latencies_ms.append(append_latency_ms)
@@ -262,9 +318,14 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "idle_spin_checks": args.idle_spin_checks,
             "warmup_ms": args.warmup_ms,
             "discard_first_rows": args.discard_first_rows,
+            "callback_work": args.callback_work,
             "measured_rows": len(all_latencies),
             "append_latency_ms": summarize_samples_ms(append_latencies_ms),
             "rollover_append_latency_ms": summarize_samples_ms(rollover_append_latencies_ms),
+            "callback_enter_delay_ms": summarize_samples_ms(all_latencies),
+            "callback_enter_minus_append_ms": summarize_samples_ms(callback_enter_minus_append_ms),
+            "callback_work_ms": summarize_samples_ms(callback_work_latencies_ms),
+            "callback_done_delay_ms": summarize_samples_ms(callback_done_latencies_ms),
             "latency_ms": summarize_samples_ms(all_latencies),
             "slowest_rows": slowest_latency_rows(row_samples, args.slowest_rows),
             "rollover_first_row_latency_ms": summarize_samples_ms(rollover_latencies),
@@ -309,6 +370,15 @@ def main() -> None:
         type=int,
         default=0,
         help="从延迟统计中丢弃前 N 条行样本，用于排除首条写入/attach 噪声",
+    )
+    parser.add_argument(
+        "--callback-work",
+        choices=("minimal", "to_dict", "format", "print"),
+        default="to_dict",
+        help=(
+            "callback 内部工作负载：minimal 只取 seq/localtime_ns，to_dict 做浅拷贝，"
+            "format 模拟 watcher 字符串格式化，print 额外写 stderr"
+        ),
     )
     parser.add_argument(
         "--slowest-rows",

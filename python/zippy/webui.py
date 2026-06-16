@@ -6,16 +6,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import mimetypes
 import os
 from pathlib import Path
 import subprocess
 import time
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import Any
+
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, Response
+import uvicorn
 
 import zippy
+from .pm_bridge import PmCommandRunner, PmTaskInfo
+
+SENSITIVE_LOG_FIELD_NAMES = {
+    "api_key",
+    "access_key",
+    "credential",
+    "credentials",
+    "password",
+    "secret",
+    "secret_key",
+    "token",
+}
 
 
 @dataclass(frozen=True)
@@ -24,22 +39,139 @@ class WebuiConfig:
     host: str
     port: int
     log_dir: Path
+    debug: bool = False
+    static_dir: Path | None = None
 
 
 def run_webui(config: WebuiConfig) -> None:
     """
     Start the local Web UI HTTP server.
     """
+    if config.debug:
+        os.environ["ZIPPY_WEBUI_URI"] = config.uri
+        os.environ["ZIPPY_WEBUI_HOST"] = config.host
+        os.environ["ZIPPY_WEBUI_PORT"] = str(config.port)
+        os.environ["ZIPPY_WEBUI_LOG_DIR"] = str(config.log_dir)
+        uvicorn.run(
+            "zippy.webui:create_app_from_env",
+            host=config.host,
+            port=config.port,
+            access_log=True,
+            log_level="debug",
+            reload=True,
+            reload_dirs=[str(Path(__file__).resolve().parents[1])],
+            factory=True,
+        )
+        return
+
+    uvicorn.run(
+        create_app(config),
+        host=config.host,
+        port=config.port,
+        access_log=True,
+        log_level="info",
+    )
+
+
+def create_app_from_env() -> FastAPI:
+    """
+    Create a Web UI app from environment variables for uvicorn reload workers.
+    """
+    return create_app(
+        WebuiConfig(
+            uri=os.environ.get("ZIPPY_WEBUI_URI", "zippy://default"),
+            host=os.environ.get("ZIPPY_WEBUI_HOST", "127.0.0.1"),
+            port=int(os.environ.get("ZIPPY_WEBUI_PORT", "17688")),
+            log_dir=Path(os.environ.get("ZIPPY_WEBUI_LOG_DIR", "logs")),
+            debug=True,
+        )
+    )
+
+
+def create_app(config: WebuiConfig) -> FastAPI:
+    """
+    Create the read-only FastAPI application for the Zippy Web UI.
+    """
+    app = FastAPI(title="Zippy WebUI")
     service = DashboardService(config)
+    app.state.dashboard_service = service
 
-    class Handler(ZippyWebuiHandler):
-        dashboard_service = service
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> HTMLResponse:
+        return HTMLResponse(_read_webui_index(config))
 
-    server = ThreadingHTTPServer((config.host, config.port), Handler)
+    @app.get("/assets/zippy-logo.png")
+    def zippy_logo() -> Response:
+        path = Path(__file__).with_name("assets") / "zippy-logo.png"
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return Response("asset not found", status_code=404, media_type="text/plain")
+        return Response(
+            content=data,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    @app.get("/assets/{asset_path:path}")
+    def webui_asset(asset_path: str) -> Response:
+        path = (_webui_static_dir(config) / "assets" / asset_path).resolve()
+        root = (_webui_static_dir(config) / "assets").resolve()
+        try:
+            path.relative_to(root)
+            data = path.read_bytes()
+        except (OSError, ValueError):
+            return Response("asset not found", status_code=404, media_type="text/plain")
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    @app.get("/api/dashboard")
+    def dashboard(uri: str | None = Query(default=None)) -> dict[str, object]:
+        return service.dashboard(uri=uri)
+
+    @app.get("/api/table/{table_name:path}/data")
+    def table_data(
+        table_name: str,
+        mode: str = Query(default="tail"),
+        limit: int = Query(default=100),
+        uri: str | None = Query(default=None),
+    ) -> dict[str, object]:
+        return _table_data_preview(
+            table_name=table_name,
+            uri=uri or config.uri,
+            mode=mode,
+            limit=limit,
+        )
+
+    @app.get("/api/table/{table_name:path}")
+    def table_detail(
+        table_name: str,
+        uri: str | None = Query(default=None),
+    ) -> dict[str, object]:
+        return _table_detail(table_name, uri or config.uri)
+
+    return app
+
+
+def _webui_static_dir(config: WebuiConfig) -> Path:
+    return config.static_dir or Path(__file__).with_name("webui_static")
+
+
+def _read_webui_index(config: WebuiConfig) -> str:
+    path = _webui_static_dir(config) / "index.html"
     try:
-        server.serve_forever()
-    finally:
-        server.server_close()
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            "<!doctype html><html><head><title>Zippy Console</title></head>"
+            "<body><main><h1>Zippy Console static assets are missing</h1>"
+            "<p>Run npm run build in app/zippy-console and package the dist output.</p>"
+            "</main></body></html>"
+        )
 
 
 class DashboardService:
@@ -57,19 +189,19 @@ class DashboardService:
             started_at=self.started_at,
             logs=logs,
         )
+        gateway = _gateway_unavailable("master connection not established")
         try:
             client = zippy.connect(uri=query_uri)
+            gateway = _gateway_summary(client)
             tables = list(zippy.ops.list_tables(master=client))
             table_details = [_table_summary(table, client) for table in tables]
             alerts = [
-                alert
-                for table in table_details
-                for alert in table.get("alerts", [])
-                if isinstance(alert, dict)
+                alert for table in table_details for alert in _dict_items(table.get("alerts"))
             ]
+            overall_status = _overall_status(table_details, alerts)
             master.update(
                 {
-                    "status": _overall_status(table_details, alerts),
+                    "status": "ok",
                     "table_count": len(table_details),
                     "error": None,
                 }
@@ -77,6 +209,7 @@ class DashboardService:
         except Exception as error:
             table_details = []
             alerts = []
+            overall_status = "error"
             master.update(
                 {
                     "status": "error",
@@ -85,7 +218,8 @@ class DashboardService:
                 }
             )
 
-        tasks = _task_summaries(snapshot, table_details)
+        pm = _pm_summary()
+        tasks = _dict_items(pm.get("tasks"))
         events = _recent_events(logs, snapshot, alerts)
         stale_error_tables = [
             table
@@ -97,7 +231,9 @@ class DashboardService:
             "tables": len(table_details),
             "tasks": len(tasks),
             "alerts": len(alerts),
-            "sealed_segments": sum(_int_value(table.get("sealed_count")) for table in table_details),
+            "sealed_segments": sum(
+                _int_value(table.get("sealed_count")) for table in table_details
+            ),
             "persisted_files": sum(
                 _int_value(table.get("persisted_count")) for table in table_details
             ),
@@ -112,6 +248,10 @@ class DashboardService:
                 "port": self.config.port,
             },
             "master": master,
+            "overall_status": overall_status,
+            "gateway": gateway,
+            "gateway_status": gateway.get("status"),
+            "pm": pm,
             "totals": totals,
             "tasks": tasks,
             "tables": table_details,
@@ -122,69 +262,11 @@ class DashboardService:
                 "path": snapshot.get("path"),
                 "loaded": bool(snapshot.get("loaded")),
                 "error": snapshot.get("error"),
-                "sources": len(snapshot.get("sources", [])),
-                "engines": len(snapshot.get("engines", [])),
-                "sinks": len(snapshot.get("sinks", [])),
+                "sources": _list_len(snapshot.get("sources")),
+                "engines": _list_len(snapshot.get("engines")),
+                "sinks": _list_len(snapshot.get("sinks")),
             },
         }
-
-
-class ZippyWebuiHandler(BaseHTTPRequestHandler):
-    dashboard_service: DashboardService
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._send_html(INDEX_HTML)
-            return
-        if parsed.path == "/assets/zippy-logo.png":
-            self._send_asset(Path(__file__).with_name("assets") / "zippy-logo.png", "image/png")
-            return
-        if parsed.path == "/api/dashboard":
-            query = parse_qs(parsed.query)
-            uri = query.get("uri", [None])[0]
-            self._send_json(self.dashboard_service.dashboard(uri=uri))
-            return
-        if parsed.path.startswith("/api/table/"):
-            table_name = unquote(parsed.path.removeprefix("/api/table/"))
-            query = parse_qs(parsed.query)
-            uri = query.get("uri", [self.dashboard_service.config.uri])[0]
-            self._send_json(_table_detail(table_name, uri))
-            return
-        self.send_error(HTTPStatus.NOT_FOUND, "not found")
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-    def _send_html(self, body: str) -> None:
-        data = body.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _send_json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
-        data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _send_asset(self, path: Path, content_type: str) -> None:
-        try:
-            data = path.read_bytes()
-        except OSError:
-            self.send_error(HTTPStatus.NOT_FOUND, "asset not found")
-            return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "public, max-age=3600")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
 
 def _table_detail(table_name: str, uri: str) -> dict[str, object]:
@@ -197,7 +279,55 @@ def _table_detail(table_name: str, uri: str) -> dict[str, object]:
         return {"ok": False, "error": str(error), "table_name": table_name}
 
 
-def _table_summary(table: dict[str, object], client: object) -> dict[str, object]:
+def _table_data_preview(
+    *,
+    table_name: str,
+    uri: str,
+    mode: str,
+    limit: int,
+) -> dict[str, object]:
+    normalized_mode = mode if mode in {"head", "tail"} else "tail"
+    normalized_limit = min(max(int(limit), 1), 1000)
+    try:
+        client = zippy.connect(uri=uri)
+        query = zippy.read_table(table_name, master=client)
+        selected = (
+            query.head(normalized_limit)
+            if normalized_mode == "head"
+            else query.tail(normalized_limit)
+        )
+        table = selected.collect()
+        columns = list(table.column_names)
+        rows = [
+            {key: _json_safe_value(value) for key, value in row.items()}
+            for row in table.to_pylist()
+        ]
+        return {
+            "ok": True,
+            "table_name": table_name,
+            "mode": normalized_mode,
+            "limit": normalized_limit,
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "truncated": len(rows) >= normalized_limit,
+            "error": None,
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "table_name": table_name,
+            "mode": normalized_mode,
+            "limit": normalized_limit,
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "truncated": False,
+            "error": str(error),
+        }
+
+
+def _table_summary(table: dict[str, object], client: Any) -> dict[str, object]:
     table_name = str(table.get("stream_name") or "")
     try:
         info = zippy.ops.table_info(table_name, master=client)
@@ -237,9 +367,9 @@ def _table_summary(table: dict[str, object], client: object) -> dict[str, object
         "writer_epoch": info.get("writer_epoch"),
         "reader_count": info.get("reader_count"),
         "descriptor_generation": info.get("descriptor_generation"),
-        "sealed_count": len(info.get("sealed_segments") or []),
-        "persisted_count": len(info.get("persisted_files") or []),
-        "persist_event_count": len(info.get("persist_events") or []),
+        "sealed_count": _list_len(info.get("sealed_segments")),
+        "persisted_count": _list_len(info.get("persisted_files")),
+        "persist_event_count": _list_len(info.get("persist_events")),
         "active_rows": _descriptor_rows(active),
         "row_count": _table_row_count(info),
         "alerts": health.get("alerts") or [],
@@ -266,6 +396,120 @@ def _master_health(
         "started_at": master_start.get("timestamp") if isinstance(master_start, dict) else None,
         "table_count": 0,
         "error": None,
+    }
+
+
+def _gateway_summary(client: object) -> dict[str, object]:
+    get_config = getattr(client, "get_config", None)
+    config: dict[str, object] = {}
+    if get_config is not None:
+        try:
+            loaded_config = get_config()
+        except Exception as error:
+            return _gateway_unavailable(str(error))
+        if isinstance(loaded_config, dict):
+            config = loaded_config
+
+    gateway = config.get("gateway", {})
+    if not isinstance(gateway, dict):
+        gateway = {}
+    enabled = gateway.get("enabled", True)
+    endpoint = gateway.get("endpoint")
+    protocol_version = gateway.get("protocol_version")
+    if enabled is False or not endpoint:
+        return {
+            "status": "ok",
+            "healthy": True,
+            "enabled": bool(enabled) if enabled is not None else True,
+            "endpoint": endpoint,
+            "protocol_version": protocol_version,
+            "metrics": {},
+            "error": None,
+        }
+
+    metrics: dict[str, object] = {}
+    gateway_metrics = getattr(client, "gateway_metrics", None)
+    if gateway_metrics is not None:
+        try:
+            loaded_metrics = gateway_metrics()
+        except Exception as error:
+            return {
+                "status": "error",
+                "healthy": False,
+                "enabled": True,
+                "endpoint": endpoint,
+                "protocol_version": protocol_version,
+                "metrics": {},
+                "error": str(error),
+            }
+        if isinstance(loaded_metrics, dict):
+            metrics = loaded_metrics
+    return {
+        "status": "ok",
+        "healthy": True,
+        "enabled": True,
+        "endpoint": endpoint,
+        "protocol_version": protocol_version,
+        "metrics": metrics,
+        "error": None,
+    }
+
+
+def _gateway_unavailable(error: str) -> dict[str, object]:
+    return {
+        "status": "error",
+        "healthy": False,
+        "enabled": None,
+        "endpoint": None,
+        "protocol_version": None,
+        "metrics": {},
+        "error": error,
+    }
+
+
+def _pm_summary() -> dict[str, object]:
+    try:
+        tasks = [_pm_task_summary(task) for task in PmCommandRunner.default().list_tasks()]
+    except Exception as error:
+        return {
+            "status": "error",
+            "error": str(error),
+            "task_count": 0,
+            "tasks": [],
+        }
+    return {
+        "status": "ok",
+        "error": None,
+        "task_count": len(tasks),
+        "tasks": tasks,
+    }
+
+
+def _pm_task_summary(task: PmTaskInfo) -> dict[str, object]:
+    return {
+        "kind": task.run_mode or "pm",
+        "name": task.name,
+        "status": task.status,
+        "process_id": task.pid,
+        "input_stream": None,
+        "output_stream": None,
+        "writer_epoch": None,
+        "metrics": {
+            "task_id": task.task_id,
+            "health": task.health,
+            "uptime_ms": task.uptime_ms,
+            "memory_bytes": task.memory_bytes,
+            "restart_count": task.restart_count,
+            "last_exit_code": task.last_exit_code,
+            "cpu_percent": task.cpu_percent,
+            "schedule_state": task.schedule_state,
+            "started_at": task.started_at,
+            "stopped_at": task.stopped_at,
+        },
+        "cmd": task.cmd,
+        "cwd": task.cwd,
+        "dependencies": task.dependencies or [],
+        "dependents": task.dependents or [],
     }
 
 
@@ -304,9 +548,7 @@ def _task_summaries(
         ("engine", "engines"),
         ("sink", "sinks"),
     ]:
-        for item in snapshot.get(key, []) or []:
-            if not isinstance(item, dict):
-                continue
+        for item in _dict_items(snapshot.get(key)):
             name = item.get(f"{kind}_name") or item.get("name")
             tasks.append(
                 {
@@ -373,11 +615,13 @@ def _read_recent_logs(log_dir: Path) -> list[dict[str, object]]:
     files = sorted((log_dir / "zippy-master").glob("*.jsonl"), key=_mtime, reverse=True)
     if not files:
         files = sorted(log_dir.glob("**/*.jsonl"), key=_mtime, reverse=True)[:3]
-    rows: list[dict[str, object]] = []
+    rows: list[tuple[tuple[float, str, int], dict[str, object]]] = []
     for path in files[:3]:
-        for line in _tail_lines(path, 80):
-            rows.append(_parse_log_line(line, path))
-    return rows[-160:]
+        for line_index, line in enumerate(_tail_lines(path, 80)):
+            row = _parse_log_line(line, path)
+            rows.append((_log_sort_key(row, path, line_index), row))
+    rows.sort(key=lambda item: item[0])
+    return [row for _, row in rows[-160:]]
 
 
 def _parse_log_line(line: str, path: Path) -> dict[str, object]:
@@ -385,10 +629,26 @@ def _parse_log_line(line: str, path: Path) -> dict[str, object]:
         payload = json.loads(line)
         if isinstance(payload, dict):
             payload.setdefault("log_file", str(path))
-            return payload
+            redacted = _redact_log_payload(payload)
+            return redacted if isinstance(redacted, dict) else {}
     except json.JSONDecodeError:
         pass
     return {"message": line, "log_file": str(path)}
+
+
+def _redact_log_payload(value: object) -> object:
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.lower() in SENSITIVE_LOG_FIELD_NAMES:
+                result[key_text] = "[redacted]"
+            else:
+                result[key_text] = _redact_log_payload(item)
+        return result
+    if isinstance(value, list):
+        return [_redact_log_payload(item) for item in value]
+    return value
 
 
 def _tail_lines(path: Path, limit: int) -> list[str]:
@@ -398,6 +658,50 @@ def _tail_lines(path: Path, limit: int) -> list[str]:
     except OSError:
         return []
     return [line.rstrip("\n") for line in lines[-limit:] if line.strip()]
+
+
+def _log_sort_key(row: dict[str, object], path: Path, line_index: int) -> tuple[float, str, int]:
+    timestamp = _log_timestamp(row)
+    return (timestamp if timestamp is not None else _mtime(path), str(path), line_index)
+
+
+def _log_timestamp(row: dict[str, object]) -> float | None:
+    for key in ("timestamp", "time", "ts"):
+        timestamp = _parse_timestamp(row.get(key))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _parse_timestamp(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return _normalize_numeric_timestamp(float(value))
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return _normalize_numeric_timestamp(float(text))
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _normalize_numeric_timestamp(value: float) -> float:
+    if value > 1_000_000_000_000_000:
+        return value / 1_000_000_000
+    if value > 1_000_000_000_000:
+        return value / 1_000
+    return value
 
 
 def _load_registry_snapshot(uri: str) -> dict[str, object]:
@@ -455,15 +759,24 @@ def _registry_snapshot_path(uri: str) -> Path | None:
 def _schema_fields(schema: object) -> list[dict[str, object]]:
     if not isinstance(schema, dict):
         return []
-    fields = schema.get("fields") or []
-    return [field for field in fields if isinstance(field, dict)]
+    return _dict_items(schema.get("fields"))
 
 
 def _table_row_count(info: dict[str, object]) -> int:
     total = _descriptor_rows(info.get("active_segment_descriptor"))
-    for segment in info.get("sealed_segments") or []:
+    for segment in _dict_items(info.get("sealed_segments")):
         total += _descriptor_rows(segment)
     return total
+
+
+def _dict_items(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _list_len(value: object) -> int:
+    return len(value) if isinstance(value, list) else 0
 
 
 def _descriptor_rows(descriptor: object) -> int:
@@ -486,836 +799,26 @@ def _int_value(value: object) -> int:
     return value if isinstance(value, int) else 0
 
 
+def _json_safe_value(value: object) -> object:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    return str(value)
+
+
 def _mtime(path: Path) -> float:
     try:
         return path.stat().st_mtime
     except OSError:
         return 0.0
-
-
-INDEX_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Zippy WebUI</title>
-  <style>
-    :root {
-      --canvas: #ffffff;
-      --sidebar: #f3f4f6;
-      --surface: #ffffff;
-      --surface-soft: #fafafa;
-      --ink: #111827;
-      --ink-secondary: #374151;
-      --ink-muted: #6b7280;
-      --ink-faint: #9ca3af;
-      --hairline: #e5e7eb;
-      --shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
-      --accent: #0075de;
-      --accent-soft: #eef6ff;
-      --red: #dc2626;
-      --red-soft: #fff1f2;
-      --orange: #f97316;
-      --orange-soft: #fff7ed;
-      --blue: #2563eb;
-      --blue-soft: #eff6ff;
-      --green: #16a34a;
-      --green-soft: #ecfdf3;
-      --purple: #7c3aed;
-      --cyan: #0891b2;
-    }
-    * { box-sizing: border-box; }
-    html {
-      width: 100%;
-      height: 100%;
-      overflow-x: hidden;
-    }
-    body {
-      margin: 0;
-      width: 100%;
-      height: 100%;
-      max-width: 100%;
-      overflow-x: hidden;
-      overflow-y: hidden;
-      background: var(--canvas);
-      color: var(--ink);
-      font-family: "Noto Sans", "Noto Sans SC", -apple-system, BlinkMacSystemFont,
-        "Segoe UI", Helvetica, Arial, sans-serif;
-      letter-spacing: 0;
-    }
-    button, input { font: inherit; }
-    button { cursor: pointer; }
-    .lucide {
-      width: 18px;
-      height: 18px;
-      stroke-width: 2.3;
-      flex: 0 0 auto;
-    }
-    .sidebar {
-      position: fixed;
-      inset: 0 auto 0 0;
-      width: 230px;
-      display: flex;
-      flex-direction: column;
-      padding: 22px 16px;
-      border-right: 1px solid var(--hairline);
-      background: var(--sidebar);
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 54px;
-      margin-bottom: 22px;
-    }
-    .brand-logo {
-      display: block;
-      width: 106px;
-      max-width: 78%;
-      height: auto;
-      image-rendering: pixelated;
-    }
-    .nav-item {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      height: 48px;
-      padding: 0 16px;
-      border-radius: 8px;
-      color: var(--ink-secondary);
-      font-size: 16px;
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-    .nav-item.active {
-      background: var(--accent);
-      color: #ffffff;
-    }
-    .nav-icon {
-      width: 21px;
-      height: 21px;
-      text-align: center;
-      line-height: 1;
-    }
-    .sidebar-footer {
-      margin-top: auto;
-      display: grid;
-      gap: 14px;
-    }
-    .user-card {
-      border: 1px solid var(--hairline);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 12px 14px;
-    }
-    .small-label {
-      color: var(--ink-muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .user-card {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .avatar {
-      display: grid;
-      place-items: center;
-      width: 30px;
-      height: 30px;
-      border-radius: 999px;
-      background: #818cf8;
-      color: #fff;
-      font-size: 14px;
-      font-weight: 900;
-    }
-    main {
-      margin-left: 230px;
-      padding: 20px 26px 32px;
-      width: calc(100% - 230px);
-      max-width: calc(100vw - 230px);
-      height: 100vh;
-      min-width: 0;
-      overflow-x: hidden;
-      overflow-y: auto;
-    }
-    .topline {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 18px;
-    }
-    .top-left, .top-right {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-    }
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      height: 38px;
-      padding: 0 14px;
-      border: 0;
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--ink);
-      font-size: 14px;
-      font-weight: 800;
-      box-shadow: none;
-      white-space: nowrap;
-    }
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: var(--ink-faint);
-    }
-    .dot.ok { background: var(--green); }
-    .dot.error { background: var(--red); }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      height: 38px;
-      padding: 0 14px;
-      border: 1px solid var(--hairline);
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--ink);
-      font-size: 14px;
-      font-weight: 800;
-      box-shadow: 0 2px 10px rgba(15, 23, 42, 0.03);
-    }
-    .btn.danger {
-      border-color: var(--accent);
-      background: var(--accent);
-      color: #fff;
-    }
-    .problem-banner {
-      display: none;
-      position: relative;
-      align-items: center;
-      gap: 18px;
-      min-height: 100px;
-      padding: 20px 22px;
-      margin-bottom: 24px;
-      border: 1px solid var(--red);
-      border-radius: 8px;
-      background: var(--red-soft);
-    }
-    .problem-banner.show { display: flex; }
-    .problem-banner.warning {
-      border-color: var(--orange);
-      background: #ffedd5;
-    }
-    .problem-banner.error {
-      border-color: var(--red);
-      background: #fee2e2;
-    }
-    .problem-banner.critical {
-      border-color: #ef4444;
-      background: #ffe4e6;
-    }
-    .problem-icon {
-      display: grid;
-      place-items: center;
-      flex: 0 0 auto;
-      width: 38px;
-      height: 38px;
-      color: var(--red);
-      font-weight: 900;
-    }
-    .problem-icon .lucide {
-      width: 36px;
-      height: 36px;
-      stroke-width: 2.4;
-    }
-    .problem-content {
-      min-width: 0;
-      flex: 1;
-    }
-    .problem-title {
-      color: var(--ink);
-      font-size: 16px;
-      font-weight: 900;
-      line-height: 1.45;
-    }
-    .problem-message {
-      margin-top: 8px;
-      color: var(--ink-muted);
-      font-size: 14px;
-      line-height: 1.5;
-    }
-    .problem-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .problem-action-icon {
-      display: grid;
-      place-items: center;
-      width: 34px;
-      height: 34px;
-      padding: 0;
-      border: 0;
-      border-radius: 8px;
-      background: transparent;
-      color: var(--ink);
-      box-shadow: none;
-    }
-    .problem-action-icon:hover {
-      background: rgba(17, 24, 39, 0.06);
-    }
-    .problem-action-icon .lucide {
-      width: 20px;
-      height: 20px;
-      stroke-width: 2.4;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(5, minmax(140px, 1fr));
-      gap: 14px;
-      margin-bottom: 26px;
-    }
-    .metric {
-      min-height: 96px;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 34px;
-      gap: 14px;
-      align-items: center;
-      padding: 20px 16px 18px;
-      border: 1px solid var(--hairline);
-      border-radius: 8px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      min-width: 0;
-      text-align: left;
-    }
-    .metric-icon {
-      display: grid;
-      place-items: center;
-      width: 42px;
-      height: 42px;
-      justify-self: end;
-      color: var(--ink-faint);
-    }
-    .metric-icon .lucide {
-      width: 32px;
-      height: 32px;
-      stroke-width: 2.2;
-    }
-    .metric-label {
-      color: var(--ink-secondary);
-      font-size: 14px;
-      font-weight: 800;
-      line-height: 1.2;
-    }
-    .metric-value {
-      margin-top: 12px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      color: var(--ink);
-      font-size: 28px;
-      line-height: 1;
-      font-weight: 900;
-    }
-    .metric-value.red { color: var(--red); }
-    .metric-value.green { color: var(--green); }
-    .workspace {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 18px;
-      align-items: start;
-      min-width: 0;
-    }
-    .panel {
-      overflow: hidden;
-      min-width: 0;
-      background: var(--surface);
-      border: 1px solid var(--hairline);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-    }
-    .panel-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      min-height: 52px;
-      padding: 0 16px;
-      border-bottom: 1px solid var(--hairline);
-    }
-    .panel-head h2 {
-      margin: 0;
-      font-size: 17px;
-      line-height: 1.3;
-      font-weight: 900;
-    }
-    .panel-tools {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .search-box {
-      width: 200px;
-      height: 30px;
-      padding: 0 10px;
-      border: 1px solid var(--hairline);
-      border-radius: 6px;
-      color: var(--ink-muted);
-      background: var(--surface);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-      font-size: 13px;
-    }
-    th {
-      padding: 10px 14px;
-      background: var(--surface-soft);
-      color: var(--ink-secondary);
-      font-size: 14px;
-      font-weight: 900;
-      text-align: left;
-      border-bottom: 1px solid var(--hairline);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    td {
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--hairline);
-      vertical-align: top;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    tr.clickable { cursor: pointer; }
-    tr.clickable:hover { background: var(--surface-soft); }
-    tr.selected { background: var(--blue-soft); }
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-height: 23px;
-      padding: 3px 8px;
-      border-radius: 999px;
-      background: var(--surface-soft);
-      color: var(--ink-secondary);
-      font-size: 11px;
-      font-weight: 900;
-    }
-    .status-pill.error {
-      background: #fee2e2;
-      color: var(--red);
-    }
-    .status-pill.warning {
-      background: #ffedd5;
-      color: var(--orange);
-    }
-    .status-pill.ok {
-      background: var(--green-soft);
-      color: var(--green);
-    }
-    .empty-state {
-      display: grid;
-      place-items: center;
-      min-height: 230px;
-      padding: 28px;
-      text-align: center;
-    }
-    .empty-icon {
-      display: grid;
-      place-items: center;
-      width: 68px;
-      height: 68px;
-      margin: 0 auto 14px;
-      border-radius: 18px;
-      background: #f3f4f6;
-      color: #d1d5db;
-      font-weight: 900;
-    }
-    .empty-icon .lucide {
-      width: 36px;
-      height: 36px;
-      stroke-width: 1.8;
-    }
-    .empty-title {
-      font-size: 18px;
-      font-weight: 900;
-      line-height: 1.35;
-    }
-    .events-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      color: var(--blue);
-      font-size: 13px;
-      font-weight: 900;
-      text-decoration: none;
-    }
-    .diag-body {
-      padding: 16px;
-    }
-    .diag-card {
-      padding: 16px;
-      border: 1px solid var(--hairline);
-      border-radius: 8px;
-      background: var(--surface);
-    }
-    .diag-block {
-      display: grid;
-      grid-template-columns: 18px minmax(0, 1fr);
-      gap: 10px;
-      padding-bottom: 18px;
-      margin-bottom: 18px;
-      border-left: 2px solid transparent;
-    }
-    .diag-block:last-child {
-      padding-bottom: 0;
-      margin-bottom: 0;
-    }
-    .diag-block.red { border-left-color: var(--red); }
-    .diag-block.orange { border-left-color: var(--orange); }
-    .diag-block.blue { border-left-color: var(--blue); }
-    .diag-dot {
-      display: grid;
-      place-items: center;
-      width: 14px;
-      height: 14px;
-      border-radius: 999px;
-      color: #fff;
-      font-weight: 900;
-      margin-left: -8px;
-      margin-top: 2px;
-    }
-    .diag-dot .lucide {
-      width: 12px;
-      height: 12px;
-      stroke-width: 3;
-    }
-    .row-action-icon {
-      width: 16px;
-      height: 16px;
-      color: var(--ink-muted);
-    }
-    .diag-dot.red { background: var(--red); }
-    .diag-dot.orange { background: var(--orange); }
-    .diag-dot.blue { background: var(--blue); }
-    .diag-title {
-      font-size: 14px;
-      font-weight: 900;
-      line-height: 1.4;
-    }
-    .diag-text {
-      margin-top: 8px;
-      color: var(--ink-secondary);
-      font-size: 13px;
-      line-height: 1.6;
-    }
-    .diag-text ul, .diag-text ol {
-      margin: 6px 0 0 18px;
-      padding: 0;
-    }
-    pre {
-      margin: 0;
-      max-height: 260px;
-      overflow: auto;
-      padding: 14px;
-      border-radius: 6px;
-      background: #111820;
-      color: #f8fafc;
-      font-size: 12px;
-      line-height: 1.6;
-    }
-    .log-error { color: #f87171; font-weight: 900; }
-    .log-info { color: #e5e7eb; font-weight: 900; }
-    .muted { color: var(--ink-muted); }
-    .strong { font-weight: 900; }
-    @media (max-width: 1400px) {
-      .metrics { grid-template-columns: repeat(4, minmax(160px, 1fr)); }
-      .workspace { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 860px) {
-      .sidebar { display: none; }
-      main { margin-left: 0; padding: 16px; width: 100%; max-width: 100vw; }
-      .topline, .top-left, .top-right { align-items: stretch; flex-direction: column; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .problem-banner { align-items: flex-start; flex-direction: column; padding: 18px; }
-      .panel-head { align-items: flex-start; flex-direction: column; padding: 14px 16px; }
-      .search-box { width: 100%; }
-    }
-    @media (max-width: 520px) {
-      .metrics { grid-template-columns: 1fr; }
-    }
-  </style>
-</head>
-<body>
-  <aside class="sidebar">
-    <div class="brand"><img class="brand-logo" src="/assets/zippy-logo.png" alt="zippy" /></div>
-    <div class="nav-item active"><i data-lucide="layout-dashboard" class="nav-icon" aria-hidden="true"></i><span>Dashborad</span></div>
-    <div class="nav-item"><i data-lucide="table" class="nav-icon" aria-hidden="true"></i><span>Tables</span></div>
-    <div class="nav-item"><i data-lucide="workflow" class="nav-icon" aria-hidden="true"></i><span>Processes</span></div>
-    <div class="nav-item"><i data-lucide="scroll-text" class="nav-icon" aria-hidden="true"></i><span>Logs</span></div>
-    <div class="sidebar-footer">
-      <div class="user-card">
-        <div class="avatar">A</div>
-        <div><div class="strong">admin</div><div class="small-label">超级管理员</div></div>
-      </div>
-    </div>
-  </aside>
-  <main>
-    <section class="topline">
-      <div class="top-left">
-        <div id="masterChip" class="chip"><span class="dot"></span><span>Master</span></div>
-        <div id="gatewayChip" class="chip"><span class="dot"></span><span>Gateway</span></div>
-      </div>
-      <div class="top-right">
-        <div id="lastRefresh" class="chip"><i data-lucide="clock" aria-hidden="true"></i><span>最后刷新 --:--:--</span></div>
-      </div>
-    </section>
-
-    <section id="problemBanner" class="problem-banner"></section>
-    <section id="metricStrip" class="metrics"></section>
-
-    <section class="workspace">
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Tables</h2>
-          <div class="panel-tools">
-            <input class="search-box" value="搜索表名、ID 或描述" readonly />
-            <button class="btn"><i data-lucide="list-filter" aria-hidden="true"></i><span>筛选</span></button>
-            <button id="tableRefreshBtn" class="btn" aria-label="刷新表列表"><i data-lucide="refresh-cw" aria-hidden="true"></i></button>
-          </div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th style="width:18%">表名</th>
-              <th style="width:12%">状态</th>
-              <th style="width:20%">Writer Process ID</th>
-              <th style="width:13%">Writer Epoch</th>
-              <th style="width:11%">Readers</th>
-              <th style="width:10%">已封板</th>
-              <th style="width:10%">已持久化</th>
-              <th style="width:6%">操作</th>
-            </tr>
-          </thead>
-          <tbody id="tableRows"></tbody>
-        </table>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>Processes</h2></div>
-        <table>
-          <thead><tr><th>任务名称</th><th>类型</th><th>状态</th><th>Process</th><th>Stream</th><th>更新时间</th></tr></thead>
-          <tbody id="taskRows"></tbody>
-        </table>
-      </section>
-
-      <section id="logPanel" class="panel">
-        <div class="panel-head"><h2>Logs</h2></div>
-        <table>
-          <thead><tr><th style="width:14%">时间</th><th style="width:12%">级别</th><th style="width:18%">来源</th><th>消息</th></tr></thead>
-          <tbody id="logRows"></tbody>
-        </table>
-      </section>
-    </section>
-  </main>
-  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
-  <script>
-    const DEFAULT_URI = "zippy://default";
-    const state = { data: null, selected: null, timer: null, bannerHidden: false };
-    const $ = (id) => document.getElementById(id);
-    const value = (v) => (v === null || v === undefined || v === "" ? "-" : String(v));
-    const number = (v) => Number.isFinite(Number(v)) ? Number(v).toLocaleString() : value(v);
-    const escapeHtml = (text) => value(text).replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[m]));
-    const statusClass = (status) => ["ok", "ready", "registered", "running"].includes(status) ? "ok" : (["warning", "stale"].includes(status) ? "warning" : (["error", "failed"].includes(status) ? "error" : ""));
-    const healthClass = (status) => statusClass(String(status || "").toLowerCase()) === "ok" ? "ok" : "error";
-    const icon = (name, className = "") => `<i data-lucide="${name}" class="${className}" aria-hidden="true"></i>`;
-    function hydrateIcons() {
-      if (window.lucide) window.lucide.createIcons();
-    }
-    async function refresh() {
-      const res = await fetch(`/api/dashboard?uri=${encodeURIComponent(DEFAULT_URI)}`, { cache: "no-store" });
-      state.data = await res.json();
-      if (!state.selected && state.data.tables.length) state.selected = state.data.tables[0].stream_name;
-      if (!state.data.tables.find((item) => item.stream_name === state.selected)) state.selected = state.data.tables[0]?.stream_name || null;
-      render();
-    }
-    function issueSummary() {
-      const data = state.data;
-      if (data.master?.error) {
-        return {
-          level: "critical",
-          title: "MasterClient 初始化失败，缺少平台对应的 zippy wheel，影响表注册和读写连接。",
-          message: "当前 Master 无法提供元数据服务，Tables 无法注册，读写请求可能失败。",
-        };
-      }
-      const bad = data.stale_error_tables || [];
-      if (bad.length) {
-        return {
-          level: "error",
-          title: `${bad.length} 张表存在 stale/error 状态。`,
-          message: "请优先检查 writer ownership、descriptor_generation 和 persist 事件。",
-        };
-      }
-      return null;
-    }
-    function render() {
-      const data = state.data;
-      if (!data) return;
-      const master = data.master;
-      const masterStatus = master.status || "unknown";
-      const gateway = data.gateway || {};
-      const gatewayStatus = gateway.status || data.gateway_status || (gateway.healthy === true ? "ok" : "error");
-      $("masterChip").className = "chip";
-      $("masterChip").innerHTML = `<span class="dot ${healthClass(masterStatus)}"></span><span>Master</span>`;
-      $("gatewayChip").className = "chip";
-      $("gatewayChip").innerHTML = `<span class="dot ${healthClass(gatewayStatus)}"></span><span>Gateway</span>`;
-      $("lastRefresh").innerHTML = `${icon("clock")}<span>最后刷新 ${new Date().toLocaleTimeString()}</span>`;
-      renderProblemBanner();
-      renderMetrics();
-      renderTables();
-      renderTasks();
-      renderLogs();
-      hydrateIcons();
-    }
-    function metricCard(label, val, iconName, color = "") {
-      return `<div class="metric"><div><div class="metric-label">${escapeHtml(label)}</div><div class="metric-value ${color === "red" ? "red" : color === "green" ? "green" : ""}" title="${escapeHtml(val)}">${escapeHtml(value(val))}</div></div><div class="metric-icon ${color}">${icon(iconName)}</div></div>`;
-    }
-    function renderMetrics() {
-      const data = state.data;
-      const writers = new Set((data.tables || []).map((table) => table.writer_process_id).filter(Boolean)).size;
-      const masterHealthy = healthClass(data.master.status) === "ok";
-      $("metricStrip").innerHTML = [
-        metricCard("Status", masterHealthy ? "Health" : "Error", "server", masterHealthy ? "green" : "red"),
-        metricCard("Tables", number(data.totals.tables), "table"),
-        metricCard("Readers", number(data.totals.readers), "users-round"),
-        metricCard("Writers", number(writers), "pen-line"),
-        metricCard("Processes", number(data.totals.tasks), "list-checks"),
-      ].join("");
-    }
-    function renderProblemBanner() {
-      const issue = issueSummary();
-      if (!issue || state.bannerHidden) {
-        $("problemBanner").className = "problem-banner";
-        $("problemBanner").innerHTML = "";
-        return;
-      }
-      $("problemBanner").className = `problem-banner show ${issue.level || "error"}`;
-      $("problemBanner").innerHTML = `
-        <div class="problem-icon">${icon("triangle-alert")}</div>
-        <div class="problem-content">
-          <div class="problem-title">${escapeHtml(issue.title)}</div>
-          <div class="problem-message">${escapeHtml(issue.message)}</div>
-        </div>
-        <div class="problem-actions">
-          <button class="problem-action-icon" onclick="scrollToDiagnostics()" aria-label="查看诊断">${icon("stethoscope")}</button>
-          <button class="problem-action-icon" onclick="copyProblem()" aria-label="复制错误">${icon("copy")}</button>
-          <button class="problem-action-icon" onclick="refresh()" aria-label="重试连接">${icon("refresh-cw")}</button>
-          <button class="problem-action-icon banner-close" onclick="state.bannerHidden = true; renderProblemBanner()" aria-label="关闭错误横幅">${icon("x")}</button>
-        </div>`;
-    }
-    function renderTables() {
-      const rows = state.data.tables || [];
-      $("tableRows").innerHTML = rows.length ? rows.map((table) => `
-        <tr class="clickable ${table.stream_name === state.selected ? "selected" : ""}" onclick="selectTable('${encodeURIComponent(table.stream_name)}')">
-          <td class="strong" title="${escapeHtml(table.stream_name)}">${escapeHtml(table.stream_name)}</td>
-          <td><span class="status-pill ${statusClass(table.health_status || table.status)}">${escapeHtml(table.health_status || table.status)}</span></td>
-          <td title="${escapeHtml(table.writer_process_id)}">${escapeHtml(table.writer_process_id)}</td>
-          <td>${escapeHtml(table.writer_epoch)}</td>
-          <td>${number(table.reader_count)}</td>
-          <td>${number(table.sealed_count)}</td>
-          <td>${number(table.persisted_count)}</td>
-          <td>${icon("chevron-right", "row-action-icon")}</td>
-        </tr>`).join("") : `<tr><td colspan="8">${emptyState("No tables")}</td></tr>`;
-    }
-    function emptyState(title) {
-      return `<div class="empty-state"><div><div class="empty-icon">${icon("package-open")}</div><div class="empty-title">${escapeHtml(title)}</div></div></div>`;
-    }
-    function selectTable(encoded) {
-      state.selected = decodeURIComponent(encoded);
-      renderTables();
-      hydrateIcons();
-    }
-    function renderTasks() {
-      const tasks = state.data.tasks || [];
-      $("taskRows").innerHTML = tasks.length ? tasks.slice(0, 80).map((task) => `<tr><td class="strong">${escapeHtml(task.name)}</td><td>${escapeHtml(task.kind)}</td><td>${escapeHtml(task.status)}</td><td>${escapeHtml(task.process_id)}</td><td>${escapeHtml(task.output_stream || task.input_stream)}</td><td>-</td></tr>`).join("") : `<tr><td colspan="6">${emptyState("No processes")}</td></tr>`;
-    }
-    function renderLogs() {
-      const rows = logRows();
-      $("logRows").innerHTML = rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.time)}</td><td><span class="status-pill ${statusClass(row.level)}">${escapeHtml(row.level.toUpperCase())}</span></td><td>${escapeHtml(row.source)}</td><td title="${escapeHtml(row.message)}">${escapeHtml(row.message)}</td></tr>`).join("") : `<tr><td colspan="4">${emptyState("No Logs")}</td></tr>`;
-    }
-    function logRows() {
-      const lines = (state.data.log_tail || []).slice(-80);
-      if (!lines.length && state.data.master?.error) {
-        const now = new Date().toLocaleTimeString();
-        return [
-          { time: now, level: "error", source: "MasterClient", message: "Failed to initialize MasterClient" },
-          { time: now, level: "error", source: "MasterClient", message: state.data.master.error },
-          { time: now, level: "error", source: "Schema", message: "Master unavailable, cannot fetch schema" },
-          { time: now, level: "info", source: "System", message: "Waiting for reconnect..." },
-        ];
-      }
-      return lines.map(normalizeLogEntry).filter(Boolean);
-    }
-    function normalizeLogEntry(entry) {
-      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-        const message = entry.message || entry.msg || entry.summary || JSON.stringify(entry);
-        return {
-          time: entry.time || entry.timestamp || entry.ts || "-",
-          level: String(entry.level || entry.severity || inferLevel(message)).toLowerCase(),
-          source: entry.source || entry.component || entry.logger || inferSource(message),
-          message,
-        };
-      }
-      const text = value(entry);
-      return {
-        time: inferTime(text),
-        level: inferLevel(text).toLowerCase(),
-        source: inferSource(text),
-        message: text,
-      };
-    }
-    function inferTime(text) {
-      return (String(text).match(/\b\d{1,2}:\d{2}:\d{2}\b/) || [])[0] || "-";
-    }
-    function inferLevel(text) {
-      return (String(text).match(/\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b/i) || ["info"])[0].replace(/^warn$/i, "warning");
-    }
-    function inferSource(text) {
-      return (String(text).match(/\[([^\]]+)\]/) || [null, "-"])[1];
-    }
-    function scrollToDiagnostics() {
-      document.querySelector("#logPanel").scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-    async function copyProblem() {
-      const issue = issueSummary();
-      if (!issue) return;
-      try { await navigator.clipboard.writeText(`${issue.title}\n${issue.message}`); } catch (error) {}
-    }
-    $("tableRefreshBtn").addEventListener("click", refresh);
-    refresh().catch((error) => {
-      $("metricStrip").innerHTML = metricCard("WebUI request failed", error.message, "wifi-off", "blue");
-      hydrateIcons();
-    });
-    state.timer = setInterval(refresh, 3000);
-    window.addEventListener("load", hydrateIcons);
-  </script>
-</body>
-</html>
-"""
 
 
 def webui_url(host: str, port: int) -> str:

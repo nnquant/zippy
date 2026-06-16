@@ -20,3 +20,8 @@ crates/zippy-master/--no-console-log/
 /ROADMAP
 /ROADMAP.md
 .worktrees/
+
+# Frontend local artifacts.
+/app/zippy-console/node_modules/
+/app/zippy-console/dist/
+/app/zippy-console/tsconfig.tsbuildinfo

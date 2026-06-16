@@ -466,13 +466,16 @@ fn validate_metadata_writer_epoch(
     writer_epoch: u64,
     unauthorized: impl FnOnce() -> RegistryError,
 ) -> Result<(), RegistryError> {
-    let Some(value) = metadata.get("writer_epoch") else {
+    let Some(value) = metadata
+        .get("control_writer_epoch")
+        .or_else(|| metadata.get("writer_epoch"))
+    else {
         return Ok(());
     };
     let Some(metadata_writer_epoch) = value.as_u64() else {
         return Err(RegistryError::InvalidSegmentDescriptor {
             stream_name: stream_name.to_string(),
-            reason: "writer_epoch must be an unsigned integer".to_string(),
+            reason: "writer epoch metadata must be an unsigned integer".to_string(),
         });
     };
     if metadata_writer_epoch != writer_epoch {

@@ -14,6 +14,10 @@ enum CliProfile {
     RemotePipelineDownstream,
     StreamTableSegmentCopy,
     StreamTableSegmentForward,
+    SingleRowLowRate,
+    WriteToSubscribeE2e,
+    RuntimeStreamTableE2e,
+    StreamTableSubscriberE2e,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -71,6 +75,10 @@ fn main() {
             CliProfile::RemotePipelineDownstream => PerfProfile::RemotePipelineDownstream,
             CliProfile::StreamTableSegmentCopy => PerfProfile::StreamTableSegmentCopy,
             CliProfile::StreamTableSegmentForward => PerfProfile::StreamTableSegmentForward,
+            CliProfile::SingleRowLowRate => PerfProfile::SingleRowLowRate,
+            CliProfile::WriteToSubscribeE2e => PerfProfile::WriteToSubscribeE2e,
+            CliProfile::RuntimeStreamTableE2e => PerfProfile::RuntimeStreamTableE2e,
+            CliProfile::StreamTableSubscriberE2e => PerfProfile::StreamTableSubscriberE2e,
         },
         rows_per_batch: cli.rows_per_batch,
         target_rows_per_sec: cli.target_rows_per_sec,

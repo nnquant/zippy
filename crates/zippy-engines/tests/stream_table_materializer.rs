@@ -8,6 +8,10 @@ use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tracing::field::{Field as TracingField, Visit};
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::prelude::*;
 use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::{
     KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,
@@ -653,6 +657,42 @@ struct RecordingDescriptorPublisher {
     envelopes: Mutex<Vec<Vec<u8>>>,
 }
 
+#[derive(Default)]
+struct RecordingWarnLayer {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl<S> Layer<S> for RecordingWarnLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if *event.metadata().level() != Level::WARN {
+            return;
+        }
+
+        let mut visitor = RecordingWarnVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(format!(
+            "{} {}",
+            event.metadata().target(),
+            visitor.message
+        ));
+    }
+}
+
+#[derive(Default)]
+struct RecordingWarnVisitor {
+    message: String,
+}
+
+impl Visit for RecordingWarnVisitor {
+    fn record_debug(&mut self, field: &TracingField, value: &dyn std::fmt::Debug) {
+        self.message
+            .push_str(&format!(" {}={:?}", field.name(), value));
+    }
+}
+
 impl StreamTableDescriptorPublisher for RecordingDescriptorPublisher {
     fn publish(&self, descriptor_envelope: Vec<u8>) -> zippy_core::Result<()> {
         self.envelopes.lock().unwrap().push(descriptor_envelope);
@@ -1031,6 +1071,144 @@ fn stream_table_materializer_forwards_segment_descriptor_without_copying() {
         .unwrap();
     assert_eq!(instrument_ids.value(4), "IF2606");
     assert_eq!(prices.value(4), 3916.4);
+}
+
+#[test]
+fn stream_table_materializer_annotates_forwarded_descriptor_control_writer_epoch() {
+    let publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let mut materializer = StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+        "ticks",
+        input_schema(),
+        2,
+        Some(42),
+    )
+    .unwrap()
+    .with_descriptor_publisher(publisher.clone())
+    .with_descriptor_forwarding(true);
+    let source_store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 5,
+    })
+    .unwrap();
+    let source_handle = source_store
+        .open_partition_with_schema_and_writer_epoch("ticks", "source", segment_schema(), 7)
+        .unwrap();
+    let writer = source_handle.writer();
+    writer
+        .write_row(|row| {
+            row.write_utf8("instrument_id", "IF2606")?;
+            row.write_i64("dt", 1_710_000_000_000_000_000_i64)?;
+            row.write_f64("last_price", 3912.4)?;
+            Ok(())
+        })
+        .unwrap();
+    let input = SegmentTableView::from_row_span(source_handle.active_row_span(0, 1).unwrap());
+
+    materializer.on_data(input).unwrap();
+
+    let envelopes = publisher.envelopes.lock().unwrap();
+    assert_eq!(envelopes.len(), 1);
+    let descriptor: serde_json::Value = serde_json::from_slice(&envelopes[0]).unwrap();
+    assert_eq!(descriptor["writer_epoch"], 7);
+    assert_eq!(descriptor["control_writer_epoch"], 42);
+}
+
+#[test]
+fn stream_table_materializer_forwards_descriptor_and_persists_source_rows() {
+    let descriptor_publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let persist_publisher = Arc::new(RecordingPersistPublisher::default());
+    let persist_root = temp_persist_root("forwarded-source");
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 2)
+            .unwrap()
+            .with_descriptor_publisher(descriptor_publisher.clone())
+            .with_descriptor_forwarding(true)
+            .with_parquet_persist(StreamTablePersistConfig::new(&persist_root))
+            .with_persist_publisher(persist_publisher.clone());
+    let source_store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 5,
+    })
+    .unwrap();
+    let source_handle = source_store
+        .open_partition_with_schema("ticks", "source", segment_schema())
+        .unwrap();
+    let writer = source_handle.writer();
+    for row_index in 0..5 {
+        writer
+            .write_row(|row| {
+                row.write_utf8(
+                    "instrument_id",
+                    if row_index % 2 == 0 {
+                        "IF2606"
+                    } else {
+                        "IH2606"
+                    },
+                )?;
+                row.write_i64("dt", 1_710_000_000_000_000_000_i64 + row_index as i64)?;
+                row.write_f64("last_price", 3912.4 + row_index as f64)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let input = SegmentTableView::from_row_span(source_handle.active_row_span(0, 5).unwrap());
+
+    materializer.on_data(input).unwrap();
+    materializer.on_stop().unwrap();
+
+    assert_eq!(materializer.active_committed_row_count(), 0);
+    let envelopes = descriptor_publisher.envelopes.lock().unwrap();
+    assert!(!envelopes.is_empty());
+    let files = persist_publisher.files.lock().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["row_count"], 5);
+    assert_eq!(files[0]["source_segment_id"], 1);
+    let file_path = PathBuf::from(files[0]["file_path"].as_str().unwrap());
+    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(file_path).unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
+    let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(batches[0].num_rows(), 5);
+}
+
+#[test]
+fn stream_table_materializer_warns_once_when_descriptor_forwarding_falls_back_to_copy() {
+    let publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), 8)
+            .unwrap()
+            .with_retention_segments(1)
+            .with_descriptor_publisher(publisher)
+            .with_descriptor_forwarding(true);
+    let layer = RecordingWarnLayer::default();
+    let events = Arc::clone(&layer.events);
+    let subscriber = tracing_subscriber::registry().with(layer);
+
+    tracing::subscriber::with_default(subscriber, || {
+        materializer
+            .on_data(segment_table_view_with_rows(2))
+            .unwrap();
+        materializer
+            .on_data(segment_table_view_with_rows(2))
+            .unwrap();
+    });
+
+    assert_eq!(materializer.active_committed_row_count(), 4);
+    let events = events.lock().unwrap();
+    let forwarding_warnings = events
+        .iter()
+        .filter(|message| message.contains("descriptor_forwarding_fallback"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        forwarding_warnings.len(),
+        1,
+        "expected exactly one descriptor forwarding fallback warning, got {events:?}",
+    );
+    assert!(forwarding_warnings[0].contains("stream"));
+    assert!(forwarding_warnings[0].contains("ticks"));
+    assert!(forwarding_warnings[0].contains("fallback"));
+    assert!(forwarding_warnings[0].contains("copy"));
+    assert!(forwarding_warnings[0].contains("reason"));
+    assert!(forwarding_warnings[0].contains("retention_configured"));
 }
 
 #[test]

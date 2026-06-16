@@ -2,8 +2,9 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
+    time::Instant,
 };
 
 use arrow::record_batch::RecordBatch;
@@ -14,6 +15,29 @@ use crate::{
     PersistenceRetryPolicy, PersistenceWorker, ReaderSession, RowSpanView, SealedSegmentHandle,
     SegmentNotifier, ShmRegion, ZippySegmentStoreError,
 };
+
+fn segment_store_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_STREAM_TABLE_LATENCY_TRACE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    })
+}
+
+fn write_latency_trace_line(mut line: String) {
+    use std::io::Write;
+
+    line.push('\n');
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+}
+
+fn instant_delta_us(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
+}
 
 /// Segment store 的最小配置。
 #[derive(Debug, Clone)]
@@ -677,8 +701,16 @@ impl PartitionWriterHandle {
             return Ok(0);
         }
 
-        let written = {
+        let trace_enabled = segment_store_latency_trace_enabled();
+        let write_started_at = trace_enabled.then(Instant::now);
+        let lock_started_at = trace_enabled.then(Instant::now);
+        let mut begin_row_us = 0.0_f64;
+        let mut row_write_us = 0.0_f64;
+        let mut finish_row_us = 0.0_f64;
+        let mut publish_committed_us = 0.0_f64;
+        let (written, lock_done_at) = {
             let mut state = self.handle.inner.state.lock().unwrap();
+            let lock_done_at = trace_enabled.then(Instant::now);
             if state.writer.has_open_row() {
                 return Err(ZippySegmentStoreError::Writer("row already open"));
             }
@@ -690,19 +722,28 @@ impl PartitionWriterHandle {
 
             let mut written = 0;
             for index in 0..rows_to_write {
+                let begin_started_at = trace_enabled.then(Instant::now);
                 state
                     .writer
                     .begin_row()
                     .map_err(ZippySegmentStoreError::Writer)?;
+                if let Some(begin_started_at) = begin_started_at {
+                    begin_row_us += instant_delta_us(begin_started_at, Instant::now());
+                }
 
+                let row_write_started_at = trace_enabled.then(Instant::now);
                 let write_result = {
                     let mut row_writer = PartitionRowWriter {
                         writer: &mut state.writer,
                     };
                     write(&mut row_writer, index)
                 };
+                if let Some(row_write_started_at) = row_write_started_at {
+                    row_write_us += instant_delta_us(row_write_started_at, Instant::now());
+                }
                 match write_result {
                     Ok(()) => {
+                        let finish_started_at = trace_enabled.then(Instant::now);
                         if let Err(error) = state.writer.finish_open_row() {
                             if state.writer.has_open_row() {
                                 let _ = state.writer.abort_row();
@@ -715,6 +756,9 @@ impl PartitionWriterHandle {
                                 return Ok(written);
                             }
                             return Err(ZippySegmentStoreError::Writer(error));
+                        }
+                        if let Some(finish_started_at) = finish_started_at {
+                            finish_row_us += instant_delta_us(finish_started_at, Instant::now());
                         }
                         written += 1;
                     }
@@ -734,19 +778,51 @@ impl PartitionWriterHandle {
                 }
             }
 
+            let publish_started_at = trace_enabled.then(Instant::now);
             state
                 .writer
                 .publish_committed_prefix()
                 .map_err(ZippySegmentStoreError::Writer)?;
-            written
+            if let Some(publish_started_at) = publish_started_at {
+                publish_committed_us += instant_delta_us(publish_started_at, Instant::now());
+            }
+            (written, lock_done_at)
         };
 
+        let notify_started_at = trace_enabled.then(Instant::now);
         if written > 0 {
             self.handle
                 .inner
                 .broadcaster
                 .notify_all()
                 .map_err(ZippySegmentStoreError::Io)?;
+        }
+        let notify_done_at = trace_enabled.then(Instant::now);
+        if let (
+            Some(write_started_at),
+            Some(lock_started_at),
+            Some(lock_done_at),
+            Some(notify_started_at),
+            Some(notify_done_at),
+        ) = (
+            write_started_at,
+            lock_started_at,
+            lock_done_at,
+            notify_started_at,
+            notify_done_at,
+        ) {
+            write_latency_trace_line(format!(
+                "zippy_segment_store_latency_trace event=[write_rows] requested_rows=[{}] written_rows=[{}] state_lock_wait_us=[{:.3}] begin_row_us=[{:.3}] row_write_us=[{:.3}] finish_row_us=[{:.3}] publish_committed_us=[{:.3}] broadcast_notify_us=[{:.3}] total_us=[{:.3}]",
+                row_count,
+                written,
+                instant_delta_us(lock_started_at, lock_done_at),
+                begin_row_us,
+                row_write_us,
+                finish_row_us,
+                publish_committed_us,
+                instant_delta_us(notify_started_at, notify_done_at),
+                instant_delta_us(write_started_at, notify_done_at),
+            ));
         }
         Ok(written)
     }
@@ -1023,20 +1099,54 @@ impl PartitionWriterHandle {
         start_offset: usize,
         max_rows: usize,
     ) -> Result<usize, ZippySegmentStoreError> {
-        let copied = {
+        let trace_enabled = segment_store_latency_trace_enabled();
+        let append_started_at = trace_enabled.then(Instant::now);
+        let lock_started_at = trace_enabled.then(Instant::now);
+        let (copied, lock_done_at, inner_done_at) = {
             let mut state = self.handle.inner.state.lock().unwrap();
-            state
+            let lock_done_at = trace_enabled.then(Instant::now);
+            let copied = state
                 .writer
                 .append_row_span(span, start_offset, max_rows)
-                .map_err(ZippySegmentStoreError::Writer)?
+                .map_err(ZippySegmentStoreError::Writer)?;
+            (copied, lock_done_at, trace_enabled.then(Instant::now))
         };
 
+        let notify_started_at = trace_enabled.then(Instant::now);
         if copied > 0 {
             self.handle
                 .inner
                 .broadcaster
                 .notify_all()
                 .map_err(ZippySegmentStoreError::Io)?;
+        }
+        let notify_done_at = trace_enabled.then(Instant::now);
+
+        if let (
+            Some(append_started_at),
+            Some(lock_started_at),
+            Some(lock_done_at),
+            Some(inner_done_at),
+            Some(notify_started_at),
+            Some(notify_done_at),
+        ) = (
+            append_started_at,
+            lock_started_at,
+            lock_done_at,
+            inner_done_at,
+            notify_started_at,
+            notify_done_at,
+        ) {
+            write_latency_trace_line(format!(
+                "zippy_segment_store_latency_trace event=[append_row_span] requested_rows=[{}] copied_rows=[{}] start_offset=[{}] state_lock_wait_us=[{:.3}] inner_append_us=[{:.3}] broadcast_notify_us=[{:.3}] append_total_us=[{:.3}]",
+                max_rows,
+                copied,
+                start_offset,
+                instant_delta_us(lock_started_at, lock_done_at),
+                instant_delta_us(lock_done_at, inner_done_at),
+                instant_delta_us(notify_started_at, notify_done_at),
+                instant_delta_us(append_started_at, notify_done_at),
+            ));
         }
         Ok(copied)
     }

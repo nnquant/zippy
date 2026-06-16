@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -57,10 +59,47 @@ fn spsc_queue_close_wakes_blocked_producer() {
 }
 
 #[test]
+fn spsc_queue_preserves_order_across_concurrent_wraparound() {
+    let queue = Arc::new(SpscDataQueue::new(64).unwrap());
+    let producer_queue = Arc::clone(&queue);
+    let total = 10_000_u64;
+
+    let producer = thread::spawn(move || {
+        for value in 0..total {
+            producer_queue.push_blocking(value).unwrap();
+        }
+    });
+
+    let mut next = 0_u64;
+    while next < total {
+        if let Some(value) = queue.try_pop() {
+            assert_eq!(value, next);
+            next += 1;
+        } else {
+            thread::yield_now();
+        }
+    }
+
+    producer.join().unwrap();
+    assert!(queue.is_empty());
+}
+
+#[test]
 fn spsc_queue_rejects_push_after_close() {
     let queue = SpscDataQueue::new(1).unwrap();
     queue.close();
 
     let err = queue.push_blocking(1).unwrap_err();
     assert!(err.to_string().contains("queue closed"));
+}
+
+#[test]
+fn spsc_queue_uses_atomic_ring_storage() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = fs::read_to_string(manifest_dir.join("src/spsc_data_queue.rs")).unwrap();
+
+    assert!(source.contains("AtomicUsize"));
+    assert!(source.contains("UnsafeCell<MaybeUninit<T>>"));
+    assert!(!source.contains("VecDeque"));
+    assert!(!source.contains("Mutex<State"));
 }

@@ -115,6 +115,32 @@ impl<'a> ReactiveFactorContext<'a> {
         Ok(context)
     }
 
+    /// Create a factor context from columns already validated by an engine.
+    ///
+    /// :param schema: Schema matching ``columns``.
+    /// :type schema: Arc<Schema>
+    /// :param columns: Columns visible to the factor.
+    /// :type columns: &[ArrayRef]
+    /// :param row_count: Shared row count for all columns.
+    /// :type row_count: usize
+    /// :param invalid_value_policy: Numeric invalid-value handling policy.
+    /// :type invalid_value_policy: ReactiveInvalidValuePolicy
+    /// :returns: Context without repeating schema and column length validation.
+    /// :rtype: ReactiveFactorContext
+    pub fn new_trusted_with_invalid_value_policy(
+        schema: &Arc<Schema>,
+        columns: &'a [ArrayRef],
+        row_count: usize,
+        invalid_value_policy: ReactiveInvalidValuePolicy,
+    ) -> Self {
+        Self {
+            schema: Arc::clone(schema),
+            columns,
+            row_count,
+            invalid_value_policy,
+        }
+    }
+
     /// Create a factor context from an existing record batch.
     pub fn from_batch(batch: &'a RecordBatch) -> Self {
         Self {
@@ -177,6 +203,87 @@ impl<'a> ReactiveFactorContext<'a> {
                 ),
             }
         })
+    }
+
+    fn state_columns_by_indices(
+        &self,
+        id_index: usize,
+        value_index: usize,
+        id_field: &str,
+        value_field: &str,
+    ) -> Result<(&'a StringArray, &'a Float64Array)> {
+        let id_array = self
+            .column(id_index)?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ZippyError::SchemaMismatch {
+                reason: format!("id field must be utf8 field=[{}]", id_field),
+            })?;
+        let value_array = self
+            .column(value_index)?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| ZippyError::SchemaMismatch {
+                reason: format!("value field must be float64 field=[{}]", value_field),
+            })?;
+
+        validate_id_array(id_array, id_field)?;
+        Ok((id_array, value_array))
+    }
+
+    fn resolve_state_columns<'b>(
+        &'a self,
+        cache: &'b mut Option<ReactiveStateColumnCache>,
+        id_field: &str,
+        value_field: &str,
+    ) -> Result<(&'a StringArray, &'a Float64Array)> {
+        if let Some(cache) = cache.as_ref() {
+            if cache.matches(self.schema(), id_field, value_field) {
+                return self.state_columns_by_indices(
+                    cache.id_index,
+                    cache.value_index,
+                    id_field,
+                    value_field,
+                );
+            }
+        }
+
+        let id_index = self.index_of(id_field)?;
+        let value_index = self.index_of(value_field)?;
+        *cache = Some(ReactiveStateColumnCache {
+            id_index,
+            value_index,
+            id_field: id_field.to_string(),
+            value_field: value_field.to_string(),
+            schema_field_count: self.schema().fields().len(),
+        });
+
+        self.state_columns_by_indices(id_index, value_index, id_field, value_field)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ReactiveStateColumnCache {
+    id_index: usize,
+    value_index: usize,
+    id_field: String,
+    value_field: String,
+    schema_field_count: usize,
+}
+
+impl ReactiveStateColumnCache {
+    fn matches(&self, schema: &Schema, id_field: &str, value_field: &str) -> bool {
+        self.id_field == id_field
+            && self.value_field == value_field
+            && self.schema_field_count == schema.fields().len()
+            && schema
+                .fields()
+                .get(self.id_index)
+                .is_some_and(|field| field.name() == id_field)
+            && schema
+                .fields()
+                .get(self.value_index)
+                .is_some_and(|field| field.name() == value_field)
     }
 }
 
@@ -265,6 +372,7 @@ impl TsEmaSpec {
             value_field: self.value_field.clone(),
             output_field: Field::new(&self.output_field, DataType::Float64, false),
             state: StatefulFloatById::new(StatefulFloatKind::Ema { span: self.span }),
+            column_cache: None,
         }))
     }
 }
@@ -796,6 +904,7 @@ struct TsEmaFactor {
     value_field: String,
     output_field: Field,
     state: StatefulFloatById,
+    column_cache: Option<ReactiveStateColumnCache>,
 }
 
 impl ReactiveFactor for TsEmaFactor {
@@ -809,7 +918,8 @@ impl ReactiveFactor for TsEmaFactor {
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
-        let (ids, values) = extract_context_state_columns(ctx, &self.id_field, &self.value_field)?;
+        let (ids, values) =
+            ctx.resolve_state_columns(&mut self.column_cache, &self.id_field, &self.value_field)?;
         let value_field = self.value_field.clone();
         self.evaluate_arrays_with_policy(ids, values, ctx.invalid_value_policy(), &value_field)
     }
@@ -919,6 +1029,7 @@ struct WindowHistoryFactor {
     value_field: String,
     output_field: Field,
     state: StatefulFloatById,
+    column_cache: Option<ReactiveStateColumnCache>,
 }
 
 impl ReactiveFactor for WindowHistoryFactor {
@@ -932,7 +1043,8 @@ impl ReactiveFactor for WindowHistoryFactor {
     }
 
     fn evaluate_with_context(&mut self, ctx: &ReactiveFactorContext<'_>) -> Result<ArrayRef> {
-        let (ids, values) = extract_context_state_columns(ctx, &self.id_field, &self.value_field)?;
+        let (ids, values) =
+            ctx.resolve_state_columns(&mut self.column_cache, &self.id_field, &self.value_field)?;
         let value_field = self.value_field.clone();
         self.evaluate_arrays_with_policy(ids, values, ctx.invalid_value_policy(), &value_field)
     }
@@ -1157,6 +1269,7 @@ fn build_window_history_factor(
             WindowHistoryKind::Diff => StatefulFloatKind::Diff { period: size },
             WindowHistoryKind::Return => StatefulFloatKind::Return { period: size },
         }),
+        column_cache: None,
     }))
 }
 

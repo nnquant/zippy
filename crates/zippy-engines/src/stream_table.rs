@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::{
     array::{
@@ -19,7 +19,7 @@ use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, Zi
 use zippy_segment_store::{
     compile_schema, ColumnSpec, ColumnType, PartitionHandle, PartitionRowUpdater,
     PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView, SealedSegmentHandle,
-    SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
+    SegmentCellValue, SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
 
 use crate::latest_state::{LatestColumnarState, LatestUpdateSet};
@@ -41,6 +41,59 @@ const KEY_VALUE_SCHEMA_VERSION_PUBLIC_FIELD: &str = "zippy_key_value_schema_vers
 const KEY_VALUE_SCHEMA_VERSION: u64 = 1;
 type SegmentIdentity = (u64, u64);
 
+fn stream_table_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_STREAM_TABLE_LATENCY_TRACE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    })
+}
+
+fn write_latency_trace_line(mut line: String) {
+    use std::io::Write;
+
+    line.push('\n');
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+}
+
+fn instant_delta_us(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
+}
+
+fn single_row_table_source_emit_ns(table: &SegmentTableView) -> Option<i64> {
+    if table.num_rows() != 1 {
+        return None;
+    }
+    let column = table.column("source_emit_ns").ok()?;
+    if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+        if !values.is_null(0) {
+            return Some(values.value(0));
+        }
+        return None;
+    }
+    if let Some(values) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        if !values.is_null(0) {
+            return Some(values.value(0));
+        }
+    }
+    None
+}
+
+fn single_row_segment_source_emit_ns(row_view: &SegmentRowView) -> Option<i64> {
+    if row_view.num_rows() != 1 {
+        return None;
+    }
+    match row_view.row_span().cell_value(0, "source_emit_ns").ok()? {
+        SegmentCellValue::Int64(value) | SegmentCellValue::TimestampNs(value) => Some(value),
+        SegmentCellValue::Null => None,
+        _ => None,
+    }
+}
+
 /// Materializes an input stream into an active segment-backed stream table.
 pub struct StreamTableMaterializer {
     name: String,
@@ -54,11 +107,41 @@ pub struct StreamTableMaterializer {
     persisted_segment_identities: BTreeSet<SegmentIdentity>,
     descriptor_publisher: Option<Arc<dyn StreamTableDescriptorPublisher>>,
     descriptor_forwarding: bool,
+    descriptor_forwarding_fallback_warned: bool,
     forwarded_active_descriptor: Option<serde_json::Value>,
+    forwarded_active_row_span: Option<RowSpanView>,
     persist_config: Option<StreamTablePersistConfig>,
     persist_publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
     retention_guard: Option<Arc<dyn StreamTableRetentionGuard>>,
     persist_worker: Option<StreamTablePersistWorker>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DescriptorForwardingOutcome {
+    Forwarded,
+    Copy,
+    Fallback(DescriptorForwardingFallbackReason),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DescriptorForwardingFallbackReason {
+    PublisherMissing,
+    RetentionConfigured,
+    SealedHistoryPresent,
+    TargetAlreadyCommitted,
+    DescriptorUnavailable,
+}
+
+impl DescriptorForwardingFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PublisherMissing => "publisher_missing",
+            Self::RetentionConfigured => "retention_configured",
+            Self::SealedHistoryPresent => "sealed_history_present",
+            Self::TargetAlreadyCommitted => "target_already_committed",
+            Self::DescriptorUnavailable => "descriptor_unavailable",
+        }
+    }
 }
 
 /// Materializes keyed rows into a replace-style active segment snapshot.
@@ -192,11 +275,44 @@ pub trait StreamTablePersistPublisher: Send + Sync {
     }
 }
 
+#[derive(Debug)]
 struct StreamTablePersistTask {
-    sealed: SealedSegmentHandle,
+    rows: StreamTablePersistRows,
     source_generation: serde_json::Value,
     writer_epoch: u64,
     identity: SegmentIdentity,
+}
+
+#[derive(Debug)]
+enum StreamTablePersistRows {
+    Sealed(SealedSegmentHandle),
+    RowSpan(RowSpanView),
+}
+
+impl StreamTablePersistRows {
+    fn segment_id(&self) -> u64 {
+        match self {
+            Self::Sealed(sealed) => sealed.segment_id(),
+            Self::RowSpan(row_span) => row_span
+                .active_descriptor()
+                .map(|descriptor| descriptor.segment_id())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn as_record_batch(&self) -> Result<RecordBatch> {
+        match self {
+            Self::Sealed(sealed) => sealed.as_record_batch().map_err(|error| ZippyError::Io {
+                reason: format!("failed to export sealed segment to arrow error=[{}]", error),
+            }),
+            Self::RowSpan(row_span) => row_span.as_record_batch().map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to export forwarded row span to arrow error=[{}]",
+                    error
+                ),
+            }),
+        }
+    }
 }
 
 struct StreamTablePersistOutcome {
@@ -690,7 +806,9 @@ impl StreamTableMaterializer {
             persisted_segment_identities: BTreeSet::new(),
             descriptor_publisher: None,
             descriptor_forwarding: false,
+            descriptor_forwarding_fallback_warned: false,
             forwarded_active_descriptor: None,
+            forwarded_active_row_span: None,
             persist_config: None,
             persist_publisher: None,
             retention_guard: None,
@@ -766,11 +884,13 @@ impl StreamTableMaterializer {
 
     /// Export the active segment descriptor envelope for cross-process readers.
     pub fn active_descriptor_envelope_bytes(&self) -> Result<Vec<u8>> {
-        let mut descriptor = self
-            .forwarded_active_descriptor
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(|| self.active_descriptor_value())?;
+        let mut descriptor = match self.forwarded_active_descriptor.clone() {
+            Some(mut descriptor) => {
+                self.annotate_forwarded_descriptor_control_writer_epoch(&mut descriptor)?;
+                descriptor
+            }
+            None => self.active_descriptor_value()?,
+        };
         descriptor["sealed_segments"] =
             serde_json::Value::Array(self.sealed_segment_descriptors.clone());
         let retained_replacements = self
@@ -869,6 +989,7 @@ impl StreamTableMaterializer {
         }
 
         self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
             .map(|index| table.column_at(index))
@@ -963,17 +1084,45 @@ impl StreamTableMaterializer {
         row_view: &SegmentRowView,
         publish_rollovers: bool,
     ) -> Result<()> {
-        if self.try_forward_segment_descriptor(row_view)? {
-            return Ok(());
+        let trace_enabled = stream_table_latency_trace_enabled();
+        let segment_started_at = trace_enabled.then(Instant::now);
+        let source_emit_ns = trace_enabled
+            .then(|| single_row_segment_source_emit_ns(row_view))
+            .flatten();
+        let mut append_call_us = 0.0_f64;
+        let mut append_calls = 0_usize;
+        let mut rollover_count = 0_usize;
+        match self.try_forward_segment_descriptor(row_view)? {
+            DescriptorForwardingOutcome::Forwarded => {
+                if let Some(segment_started_at) = segment_started_at {
+                    write_latency_trace_line(format!(
+                        "zippy_stream_table_latency_trace event=[segment_append] rows=[{}] source_emit_ns=[{}] forwarded=[true] append_calls=[0] rollovers=[0] append_row_span_us=[0.000] segment_append_total_us=[{:.3}]",
+                        row_view.num_rows(),
+                        source_emit_ns.unwrap_or_default(),
+                        instant_delta_us(segment_started_at, Instant::now()),
+                    ));
+                }
+                return Ok(());
+            }
+            DescriptorForwardingOutcome::Copy => {}
+            DescriptorForwardingOutcome::Fallback(reason) => {
+                self.warn_descriptor_forwarding_fallback_once(reason);
+            }
         }
 
         self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
         let writer = self.partition.writer();
         let total_rows = row_view.num_rows();
         let mut copied = 0;
         while copied < total_rows {
+            let append_started_at = trace_enabled.then(Instant::now);
             match writer.append_row_span(row_view.row_span(), copied, total_rows - copied) {
                 Ok(rows) if rows > 0 => {
+                    if let Some(append_started_at) = append_started_at {
+                        append_call_us += instant_delta_us(append_started_at, Instant::now());
+                        append_calls += 1;
+                    }
                     copied += rows;
                 }
                 Ok(_) => {
@@ -982,6 +1131,11 @@ impl StreamTableMaterializer {
                     });
                 }
                 Err(ZippySegmentStoreError::Writer("segment is full")) => {
+                    if let Some(append_started_at) = append_started_at {
+                        append_call_us += instant_delta_us(append_started_at, Instant::now());
+                        append_calls += 1;
+                    }
+                    rollover_count += 1;
                     let sealed_descriptor = self.active_descriptor_value()?;
                     let sealed = writer
                         .rollover_without_persistence()
@@ -1000,20 +1154,51 @@ impl StreamTableMaterializer {
             }
         }
 
+        if let Some(segment_started_at) = segment_started_at {
+            write_latency_trace_line(format!(
+                "zippy_stream_table_latency_trace event=[segment_append] rows=[{}] source_emit_ns=[{}] forwarded=[false] append_calls=[{}] rollovers=[{}] append_row_span_us=[{:.3}] segment_append_total_us=[{:.3}]",
+                total_rows,
+                source_emit_ns.unwrap_or_default(),
+                append_calls,
+                rollover_count,
+                append_call_us,
+                instant_delta_us(segment_started_at, Instant::now()),
+            ));
+        }
         Ok(())
     }
 
-    fn try_forward_segment_descriptor(&mut self, row_view: &SegmentRowView) -> Result<bool> {
-        if !self.descriptor_forwarding
-            || self.descriptor_publisher.is_none()
-            || self.persist_config.is_some()
-            || self.retention_segments.is_some()
-            || !self.sealed_segment_descriptors.is_empty()
-            || self.active_committed_row_count() != 0
-        {
-            return Ok(false);
+    fn try_forward_segment_descriptor(
+        &mut self,
+        row_view: &SegmentRowView,
+    ) -> Result<DescriptorForwardingOutcome> {
+        if !self.descriptor_forwarding {
+            return Ok(DescriptorForwardingOutcome::Copy);
+        }
+        if self.descriptor_publisher.is_none() {
+            return Ok(DescriptorForwardingOutcome::Fallback(
+                DescriptorForwardingFallbackReason::PublisherMissing,
+            ));
+        }
+        if self.retention_segments.is_some() {
+            return Ok(DescriptorForwardingOutcome::Fallback(
+                DescriptorForwardingFallbackReason::RetentionConfigured,
+            ));
+        }
+        if !self.sealed_segment_descriptors.is_empty() {
+            return Ok(DescriptorForwardingOutcome::Fallback(
+                DescriptorForwardingFallbackReason::SealedHistoryPresent,
+            ));
+        }
+        if self.active_committed_row_count() != 0 {
+            return Ok(DescriptorForwardingOutcome::Fallback(
+                DescriptorForwardingFallbackReason::TargetAlreadyCommitted,
+            ));
         }
 
+        let trace_enabled = stream_table_latency_trace_enabled();
+        let total_started_at = trace_enabled.then(Instant::now);
+        let active_envelope_started_at = trace_enabled.then(Instant::now);
         let Some(envelope) = row_view
             .row_span()
             .active_descriptor_envelope_bytes()
@@ -1021,30 +1206,113 @@ impl StreamTableMaterializer {
                 reason: reason.to_string(),
             })?
         else {
-            return Ok(false);
+            return Ok(DescriptorForwardingOutcome::Fallback(
+                DescriptorForwardingFallbackReason::DescriptorUnavailable,
+            ));
         };
+        let active_envelope_us = active_envelope_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
+        let json_decode_started_at = trace_enabled.then(Instant::now);
         let mut descriptor: serde_json::Value =
             serde_json::from_slice(&envelope).map_err(|error| ZippyError::Io {
                 reason: error.to_string(),
             })?;
+        let json_decode_us = json_decode_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
+        let annotate_started_at = trace_enabled.then(Instant::now);
+        self.annotate_forwarded_descriptor_control_writer_epoch(&mut descriptor)?;
+        let annotate_us = annotate_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
         descriptor["sealed_segments"] = serde_json::Value::Array(Vec::new());
+        let source_span_started_at = trace_enabled.then(Instant::now);
+        let source_row_span = self.forwarded_source_row_span(row_view)?;
+        let source_span_us = source_span_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
 
         if self
             .forwarded_active_descriptor
             .as_ref()
             .is_some_and(|current| current == &descriptor)
         {
-            return Ok(true);
+            self.forwarded_active_row_span = source_row_span;
+            return Ok(DescriptorForwardingOutcome::Forwarded);
         }
+        let previous_persist_started_at = trace_enabled.then(Instant::now);
+        if let Some(previous_row_span) = self.forwarded_active_row_span.take() {
+            self.enqueue_persist_row_span_task(previous_row_span)?;
+        }
+        let previous_persist_us = previous_persist_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
 
+        let encode_started_at = trace_enabled.then(Instant::now);
         let payload = serde_json::to_vec(&descriptor).map_err(|error| ZippyError::Io {
             reason: error.to_string(),
         })?;
+        let encode_us = encode_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
+        let publish_started_at = trace_enabled.then(Instant::now);
         if let Some(publisher) = &self.descriptor_publisher {
             publisher.publish(payload)?;
         }
+        let publish_us = publish_started_at
+            .map(|started_at| instant_delta_us(started_at, Instant::now()))
+            .unwrap_or_default();
         self.forwarded_active_descriptor = Some(descriptor);
-        Ok(true)
+        self.forwarded_active_row_span = source_row_span;
+        if let Some(total_started_at) = total_started_at {
+            write_latency_trace_line(format!(
+                "zippy_stream_table_latency_trace event=[descriptor_forward] rows=[{}] active_envelope_us=[{:.3}] json_decode_us=[{:.3}] annotate_us=[{:.3}] source_span_us=[{:.3}] previous_persist_us=[{:.3}] encode_us=[{:.3}] publish_us=[{:.3}] total_us=[{:.3}]",
+                row_view.num_rows(),
+                active_envelope_us,
+                json_decode_us,
+                annotate_us,
+                source_span_us,
+                previous_persist_us,
+                encode_us,
+                publish_us,
+                instant_delta_us(total_started_at, Instant::now()),
+            ));
+        }
+        Ok(DescriptorForwardingOutcome::Forwarded)
+    }
+
+    fn forwarded_source_row_span(&self, row_view: &SegmentRowView) -> Result<Option<RowSpanView>> {
+        if self.persist_config.is_none() {
+            return Ok(None);
+        }
+        let span = row_view.row_span();
+        let Some(descriptor) = span.active_descriptor().cloned() else {
+            return Ok(None);
+        };
+        RowSpanView::from_active_descriptor(descriptor, 0, span.end_row())
+            .map(Some)
+            .map_err(|reason| ZippyError::Io {
+                reason: format!("failed to retain forwarded source row span reason=[{reason}]"),
+            })
+    }
+
+    fn warn_descriptor_forwarding_fallback_once(
+        &mut self,
+        reason: DescriptorForwardingFallbackReason,
+    ) {
+        if self.descriptor_forwarding_fallback_warned {
+            return;
+        }
+
+        self.descriptor_forwarding_fallback_warned = true;
+        tracing::warn!(
+            event = "descriptor_forwarding_fallback",
+            stream = %self.name,
+            fallback = "copy",
+            reason = reason.as_str(),
+            "descriptor_forwarding_fallback"
+        );
     }
 
     fn replace_with_table(&mut self, table: &SegmentTableView) -> Result<()> {
@@ -1067,6 +1335,7 @@ impl StreamTableMaterializer {
             .rollover_without_persistence()
             .map_err(segment_error)?;
         self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
         self.replacement_retained_snapshots.push(old_snapshot);
         self.sealed_segment_descriptors.clear();
         self.persisted_segment_identities.clear();
@@ -1094,6 +1363,7 @@ impl StreamTableMaterializer {
         }
 
         self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
         let fields = self.input_schema.fields().clone();
         let columns = (0..fields.len())
             .map(|index| table.column_at(index))
@@ -1149,6 +1419,7 @@ impl StreamTableMaterializer {
             })
             .map_err(segment_error)?;
         self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
         self.publish_active_descriptor()?;
         Ok(())
     }
@@ -1358,6 +1629,21 @@ impl StreamTableMaterializer {
         })
     }
 
+    fn annotate_forwarded_descriptor_control_writer_epoch(
+        &self,
+        descriptor: &mut serde_json::Value,
+    ) -> Result<()> {
+        let writer_epoch = self
+            .active_descriptor_value()?
+            .get("writer_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| ZippyError::Io {
+                reason: "stream table active descriptor missing writer_epoch".to_string(),
+            })?;
+        descriptor["control_writer_epoch"] = serde_json::Value::from(writer_epoch);
+        Ok(())
+    }
+
     fn enqueue_persist_task(
         &mut self,
         sealed: SealedSegmentHandle,
@@ -1383,10 +1669,36 @@ impl StreamTableMaterializer {
             source_generation.as_u64().unwrap_or_default(),
         ));
         worker.enqueue(StreamTablePersistTask {
-            sealed,
+            rows: StreamTablePersistRows::Sealed(sealed),
             source_generation,
             writer_epoch,
             identity,
+        })
+    }
+
+    fn enqueue_persist_row_span_task(&mut self, row_span: RowSpanView) -> Result<()> {
+        if self.persist_config.is_none() || row_span.row_count() == 0 {
+            return Ok(());
+        }
+        let Some(descriptor) = row_span.active_descriptor() else {
+            return Ok(());
+        };
+        let segment_id = descriptor.segment_id();
+        let generation = descriptor.generation();
+        let writer_epoch = descriptor.writer_epoch();
+        let identity = (segment_id, generation);
+        if self.persisted_segment_identities.contains(&identity) {
+            return Ok(());
+        }
+        self.ensure_persist_worker()?;
+        let Some(worker) = &self.persist_worker else {
+            return Ok(());
+        };
+        worker.enqueue(StreamTablePersistTask {
+            source_generation: serde_json::Value::from(generation),
+            writer_epoch,
+            identity,
+            rows: StreamTablePersistRows::RowSpan(row_span),
         })
     }
 
@@ -1507,6 +1819,10 @@ impl StreamTableMaterializer {
     }
 
     fn seal_active_for_persist_on_stop(&mut self) -> Result<bool> {
+        if let Some(row_span) = self.forwarded_active_row_span.take() {
+            self.enqueue_persist_row_span_task(row_span)?;
+            return Ok(true);
+        }
         if self.persist_config.is_none() || self.active_committed_row_count() == 0 {
             return Ok(false);
         }
@@ -1517,6 +1833,7 @@ impl StreamTableMaterializer {
             .rollover_without_persistence()
             .map_err(segment_error)?;
         self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
         self.sealed_segment_descriptors
             .push(sealed_descriptor.clone());
         self.enqueue_persist_task(sealed, &sealed_descriptor)?;
@@ -1941,18 +2258,17 @@ fn validate_latest_by_columns(schema: &Schema, by: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn write_sealed_segment_parquet(
+fn write_persist_rows_parquet(
     stream_name: &str,
-    sealed: &SealedSegmentHandle,
+    rows: &StreamTablePersistRows,
     source_generation: serde_json::Value,
     writer_epoch: u64,
     config: &StreamTablePersistConfig,
 ) -> Result<Vec<serde_json::Value>> {
-    let batch = sealed.as_record_batch().map_err(|error| ZippyError::Io {
-        reason: format!("failed to export sealed segment to arrow error=[{}]", error),
-    })?;
+    let batch = rows.as_record_batch()?;
     let partitions = partition_record_batch(&batch, config.partition_spec.as_ref())?;
     let generation = source_generation.as_u64().unwrap_or_default();
+    let segment_id = rows.segment_id();
     let mut files = Vec::with_capacity(partitions.len());
     for (part_index, partition) in partitions.into_iter().enumerate() {
         let target_dir = persist_partition_dir(config.root(), &partition.values);
@@ -1968,13 +2284,13 @@ fn write_sealed_segment_parquet(
             format!(
                 "{}-segment-{:020}.parquet",
                 sanitize_persist_file_component(stream_name),
-                sealed.segment_id()
+                segment_id
             )
         } else {
             format!(
                 "{}-segment-{:020}-generation-{:020}-part-{:05}.parquet",
                 sanitize_persist_file_component(stream_name),
-                sealed.segment_id(),
+                segment_id,
                 generation,
                 part_index
             )
@@ -1984,10 +2300,10 @@ fn write_sealed_segment_parquet(
 
         files.push(serde_json::json!({
             "stream_name": stream_name,
-            "persist_file_id": persist_file_id(stream_name, sealed.segment_id(), generation, part_index),
+            "persist_file_id": persist_file_id(stream_name, segment_id, generation, part_index),
             "file_path": target_path.to_string_lossy().to_string(),
             "row_count": partition.batch.num_rows(),
-            "source_segment_id": sealed.segment_id(),
+            "source_segment_id": segment_id,
             "source_generation": source_generation.clone(),
             "writer_epoch": writer_epoch,
             "partition": partition_values_json(&partition.values.raw),
@@ -2006,9 +2322,9 @@ fn write_and_publish_persisted_files(
     config: &StreamTablePersistConfig,
     publisher: Option<&dyn StreamTablePersistPublisher>,
 ) -> Result<StreamTablePersistOutcome> {
-    let persisted_files = write_sealed_segment_parquet(
+    let persisted_files = write_persist_rows_parquet(
         stream_name,
-        &task.sealed,
+        &task.rows,
         task.source_generation.clone(),
         task.writer_epoch,
         config,
@@ -2479,7 +2795,16 @@ impl Engine for StreamTableMaterializer {
     }
 
     fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        let trace_enabled = stream_table_latency_trace_enabled();
+        let on_data_started_at = trace_enabled.then(Instant::now);
+        let source_emit_ns = trace_enabled
+            .then(|| single_row_table_source_emit_ns(&table))
+            .flatten();
+        let rows = table.num_rows();
+        let ensure_started_at = trace_enabled.then(Instant::now);
         self.ensure_persist_healthy()?;
+        let ensure_done_at = trace_enabled.then(Instant::now);
+        let schema_check_started_at = trace_enabled.then(Instant::now);
         if table.schema().as_ref() != self.input_schema.as_ref() {
             return Err(ZippyError::SchemaMismatch {
                 reason: format!(
@@ -2488,8 +2813,38 @@ impl Engine for StreamTableMaterializer {
                 ),
             });
         }
+        let schema_check_done_at = trace_enabled.then(Instant::now);
 
+        let materialize_started_at = trace_enabled.then(Instant::now);
         self.materialize_table(&table)?;
+        let materialize_done_at = trace_enabled.then(Instant::now);
+        if let (
+            Some(on_data_started_at),
+            Some(ensure_started_at),
+            Some(ensure_done_at),
+            Some(schema_check_started_at),
+            Some(schema_check_done_at),
+            Some(materialize_started_at),
+            Some(materialize_done_at),
+        ) = (
+            on_data_started_at,
+            ensure_started_at,
+            ensure_done_at,
+            schema_check_started_at,
+            schema_check_done_at,
+            materialize_started_at,
+            materialize_done_at,
+        ) {
+            write_latency_trace_line(format!(
+                "zippy_stream_table_latency_trace event=[on_data] rows=[{}] source_emit_ns=[{}] ensure_persist_us=[{:.3}] schema_check_us=[{:.3}] materialize_us=[{:.3}] on_data_total_us=[{:.3}]",
+                rows,
+                source_emit_ns.unwrap_or_default(),
+                instant_delta_us(ensure_started_at, ensure_done_at),
+                instant_delta_us(schema_check_started_at, schema_check_done_at),
+                instant_delta_us(materialize_started_at, materialize_done_at),
+                instant_delta_us(on_data_started_at, materialize_done_at),
+            ));
+        }
         Ok(vec![table])
     }
 

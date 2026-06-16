@@ -650,6 +650,49 @@ fn expired_source_writer_cannot_publish_after_new_source_takeover() {
 }
 
 #[test]
+fn forwarded_segment_descriptor_can_use_control_writer_epoch_for_authorization() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let mut writer = MasterClient::connect(&socket_path).unwrap();
+    writer.register_process("writer").unwrap();
+    writer
+        .register_stream("ticks", test_schema(), 64, 4096)
+        .unwrap();
+    writer
+        .register_source("openctp", "openctp", "ticks", serde_json::json!({}))
+        .unwrap();
+    let stream = writer.get_stream("ticks").unwrap();
+
+    writer
+        .publish_segment_descriptor(
+            "ticks",
+            serde_json::json!({
+                "magic": "zippy.segment.active",
+                "version": 1,
+                "schema_id": 7,
+                "row_capacity": 64,
+                "shm_os_id": "/tmp/zippy-segment-forwarded",
+                "payload_offset": 64,
+                "committed_row_count_offset": 40,
+                "segment_id": 1,
+                "generation": 0,
+                "writer_epoch": 7,
+                "control_writer_epoch": stream.writer_epoch,
+            }),
+        )
+        .unwrap();
+    let stream = writer.get_stream("ticks").unwrap();
+    let descriptor = stream.active_segment_descriptor.unwrap();
+    assert_eq!(descriptor["writer_epoch"], 7);
+    assert_eq!(descriptor["control_writer_epoch"], stream.writer_epoch);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
+}
+
+#[test]
 fn os_process_source_writer_takeover_rejects_stale_publish() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("master.sock");

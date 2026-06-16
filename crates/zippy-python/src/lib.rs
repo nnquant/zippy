@@ -9,7 +9,7 @@ use std::hint::spin_loop;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver as StdReceiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,6 +75,14 @@ use zippy_segment_store::{
 };
 
 use native_source_bridge::create_native_source_sink_capsule;
+
+fn write_latency_trace_line(mut line: String) {
+    use std::io::Write;
+
+    line.push('\n');
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
+}
 
 fn py_value_error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
@@ -1822,6 +1830,43 @@ impl MasterClient {
         .map_err(|error| py_runtime_error(error.to_string()))
     }
 
+    #[pyo3(signature = (stream_name, descriptor_envelope, metadata=None))]
+    fn publish_segment_descriptor_envelope(
+        &self,
+        py: Python<'_>,
+        stream_name: String,
+        descriptor_envelope: &Bound<'_, PyAny>,
+        metadata: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let descriptor_bytes = match descriptor_envelope.downcast::<PyBytes>() {
+            Ok(bytes) => bytes.as_bytes().to_vec(),
+            Err(_) => descriptor_envelope
+                .extract::<Vec<u8>>()
+                .map_err(|error| py_value_error(error.to_string()))?,
+        };
+        let mut descriptor = serde_json::from_slice::<serde_json::Value>(&descriptor_bytes)
+            .map_err(|error| py_value_error(error.to_string()))?;
+        if let Some(metadata) = metadata {
+            let metadata_text = python_json_dumps(py, metadata)?;
+            let metadata = serde_json::from_str::<serde_json::Value>(&metadata_text)
+                .map_err(|error| py_value_error(error.to_string()))?;
+            if let (Some(descriptor), Some(metadata)) =
+                (descriptor.as_object_mut(), metadata.as_object())
+            {
+                for (key, value) in metadata {
+                    descriptor.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        py.allow_threads(|| {
+            self.client
+                .lock()
+                .unwrap()
+                .publish_segment_descriptor(&stream_name, descriptor)
+        })
+        .map_err(|error| py_runtime_error(error.to_string()))
+    }
+
     fn publish_persisted_file(
         &self,
         py: Python<'_>,
@@ -3361,6 +3406,268 @@ impl fmt::Debug for SegmentReaderDriverEvent {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SubscriberLatencyStats {
+    count: usize,
+    min_ns: i64,
+    max_ns: i64,
+    sum_ns: i128,
+}
+
+impl SubscriberLatencyStats {
+    fn record(&mut self, value_ns: i64) {
+        if self.count == 0 {
+            self.min_ns = value_ns;
+            self.max_ns = value_ns;
+        } else {
+            self.min_ns = self.min_ns.min(value_ns);
+            self.max_ns = self.max_ns.max(value_ns);
+        }
+        self.count += 1;
+        self.sum_ns += i128::from(value_ns);
+    }
+
+    fn format_us(&self, name: &str) -> String {
+        if self.count == 0 {
+            return format!("{name}_count=[0]");
+        }
+        let avg_ns = self.sum_ns as f64 / self.count as f64;
+        format!(
+            "{name}_count=[{}] {name}_min_us=[{:.3}] {name}_avg_us=[{:.3}] {name}_max_us=[{:.3}]",
+            self.count,
+            self.min_ns as f64 / 1_000.0,
+            avg_ns / 1_000.0,
+            self.max_ns as f64 / 1_000.0,
+        )
+    }
+}
+
+fn subscriber_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_SUBSCRIBER_LATENCY_TRACE") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    })
+}
+
+fn segment_source_latency_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        for key in [
+            "ZIPPY_SEGMENT_SOURCE_LATENCY_TRACE",
+            "ZIPPY_RUNTIME_LATENCY_TRACE",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                let normalized = value.trim().to_ascii_lowercase();
+                if matches!(normalized.as_str(), "1" | "true" | "yes" | "on") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+fn current_unix_epoch_ns() -> Option<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_nanos()).ok()
+}
+
+fn instant_delta_us(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_secs_f64() * 1_000_000.0
+}
+
+fn trace_subscriber_read_latency(
+    source: &str,
+    span: &RowSpanView,
+) -> std::result::Result<Option<i64>, String> {
+    if !subscriber_latency_trace_enabled() {
+        return Ok(None);
+    }
+
+    let Some(read_ready_ns) = current_unix_epoch_ns() else {
+        return Ok(None);
+    };
+    let row_count = span.row_count();
+    let has_source_emit_ns = span.column_index("source_emit_ns").is_ok();
+    let has_localtime_ns = span.column_index("localtime_ns").is_ok();
+    let mut source_emit_stats = SubscriberLatencyStats::default();
+    let mut localtime_stats = SubscriberLatencyStats::default();
+
+    for row_offset in 0..row_count {
+        if has_source_emit_ns {
+            if let Some(value) = span_i64_value(span, row_offset, "source_emit_ns")? {
+                source_emit_stats.record(read_ready_ns.saturating_sub(value));
+            }
+        }
+        if has_localtime_ns {
+            if let Some(value) = span_i64_value(span, row_offset, "localtime_ns")? {
+                localtime_stats.record(read_ready_ns.saturating_sub(value));
+            }
+        }
+    }
+
+    write_latency_trace_line(format!(
+        "zippy_subscriber_latency_trace event=[rows_read] source=[{}] rows=[{}] read_ready_ns=[{}] {} {}",
+        source,
+        row_count,
+        read_ready_ns,
+        source_emit_stats.format_us("source_emit_to_read"),
+        localtime_stats.format_us("localtime_to_read"),
+    ));
+    Ok(Some(read_ready_ns))
+}
+
+fn trace_segment_source_rows_latency(
+    source: &str,
+    span: &RowSpanView,
+    read_ready_ns: i64,
+    poll_started_at: Instant,
+    rows_ready_at: Instant,
+    sink_emit_us: f64,
+) -> std::result::Result<(), String> {
+    let row_count = span.row_count();
+    let has_source_emit_ns = span.column_index("source_emit_ns").is_ok();
+    let mut source_emit_stats = SubscriberLatencyStats::default();
+
+    for row_offset in 0..row_count {
+        if has_source_emit_ns {
+            if let Some(value) = span_i64_value(span, row_offset, "source_emit_ns")? {
+                source_emit_stats.record(read_ready_ns.saturating_sub(value));
+            }
+        }
+    }
+
+    write_latency_trace_line(format!(
+        "zippy_segment_source_latency_trace event=[rows] source=[{}] rows=[{}] read_ready_ns=[{}] {} poll_next_us=[{:.3}] sink_emit_us=[{:.3}] total_us=[{:.3}]",
+        source,
+        row_count,
+        read_ready_ns,
+        source_emit_stats.format_us("source_emit_to_rows_ready"),
+        instant_delta_us(poll_started_at, rows_ready_at),
+        sink_emit_us,
+        instant_delta_us(poll_started_at, Instant::now()),
+    ));
+    Ok(())
+}
+
+fn trace_table_delivery_latency(
+    source: &str,
+    rows: usize,
+    read_ready_ns: Option<i64>,
+    record_batch_started_at: Instant,
+    record_batch_done_at: Instant,
+    callback_done_at: Instant,
+) {
+    if !subscriber_latency_trace_enabled() {
+        return;
+    }
+
+    write_latency_trace_line(format!(
+        "zippy_subscriber_latency_trace event=[delivery] mode=[table] source=[{}] rows=[{}] read_ready_ns=[{}] span_to_record_batch_us=[{:.3}] py_callback_us=[{:.3}] delivery_total_us=[{:.3}]",
+        source,
+        rows,
+        read_ready_ns.unwrap_or_default(),
+        instant_delta_us(record_batch_started_at, record_batch_done_at),
+        instant_delta_us(record_batch_done_at, callback_done_at),
+        instant_delta_us(record_batch_started_at, callback_done_at),
+    ));
+}
+
+fn trace_row_delivery_latency(
+    source: &str,
+    rows: usize,
+    delivered_rows: usize,
+    read_ready_ns: Option<i64>,
+    delivery_started_at: Instant,
+    delivery_done_at: Instant,
+) {
+    if !subscriber_latency_trace_enabled() {
+        return;
+    }
+
+    write_latency_trace_line(format!(
+        "zippy_subscriber_latency_trace event=[delivery] mode=[row] source=[{}] rows=[{}] delivered_rows=[{}] read_ready_ns=[{}] row_delivery_total_us=[{:.3}]",
+        source,
+        rows,
+        delivered_rows,
+        read_ready_ns.unwrap_or_default(),
+        instant_delta_us(delivery_started_at, delivery_done_at),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_row_delivery_detail_latency(
+    rows: usize,
+    delivered_rows: usize,
+    filter_us: f64,
+    row_dict_us: f64,
+    row_factory_us: f64,
+    py_callback_us: f64,
+    total_us: f64,
+) {
+    if !subscriber_latency_trace_enabled() {
+        return;
+    }
+
+    write_latency_trace_line(format!(
+        "zippy_subscriber_latency_trace event=[row_delivery_detail] rows=[{}] delivered_rows=[{}] filter_us=[{:.3}] row_dict_us=[{:.3}] row_factory_us=[{:.3}] py_callback_us=[{:.3}] total_us=[{:.3}]",
+        rows,
+        delivered_rows,
+        filter_us,
+        row_dict_us,
+        row_factory_us,
+        py_callback_us,
+        total_us,
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_subscriber_driver_poll_trace(
+    outcome: &str,
+    rows: usize,
+    poll_started_at: Instant,
+    notification_sequence_started_at: Instant,
+    notification_sequence_done_at: Instant,
+    read_available_started_at: Instant,
+    read_available_done_at: Instant,
+    event_done_at: Instant,
+) -> String {
+    format!(
+        "zippy_subscriber_latency_trace event=[driver_poll] outcome=[{}] rows=[{}] notification_sequence_us=[{:.3}] read_available_us=[{:.3}] poll_to_event_us=[{:.3}]",
+        outcome,
+        rows,
+        instant_delta_us(notification_sequence_started_at, notification_sequence_done_at),
+        instant_delta_us(read_available_started_at, read_available_done_at),
+        instant_delta_us(poll_started_at, event_done_at),
+    )
+}
+
+fn trace_subscriber_driver_poll(trace_line: String) {
+    if !subscriber_latency_trace_enabled() {
+        return;
+    }
+    write_latency_trace_line(trace_line);
+}
+
+fn span_i64_value(
+    span: &RowSpanView,
+    row_offset: usize,
+    field_name: &str,
+) -> std::result::Result<Option<i64>, String> {
+    match span
+        .cell_value(row_offset, field_name)
+        .map_err(|error| error.to_string())?
+    {
+        SegmentCellValue::Int64(value) | SegmentCellValue::TimestampNs(value) => Ok(Some(value)),
+        SegmentCellValue::Null => Ok(None),
+        _ => Ok(None),
+    }
+}
+
 struct SegmentReaderDriver {
     reader_handle: ActiveSegmentReaderHandle,
     descriptor_text: String,
@@ -3406,6 +3713,7 @@ impl SegmentReaderDriver {
     }
 
     fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
+        let poll_started_at = Instant::now();
         if let Some(error) = take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref()) {
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics.record_descriptor_refresh_error();
@@ -3414,6 +3722,7 @@ impl SegmentReaderDriver {
         }
         self.record_pending_descriptor_updates();
 
+        let notification_sequence_started_at = Instant::now();
         let observed_notification_seq = match self.reader_handle.reader.notification_sequence() {
             Ok(sequence) => sequence,
             Err(error)
@@ -3423,13 +3732,28 @@ impl SegmentReaderDriver {
             }
             Err(error) => return Err(error.to_string()),
         };
-        match self.reader_handle.reader.read_available() {
+        let notification_sequence_done_at = Instant::now();
+        let read_available_started_at = Instant::now();
+        let read_available_result = self.reader_handle.reader.read_available();
+        let read_available_done_at = Instant::now();
+        match read_available_result {
             Ok(Some(span)) => {
+                let rows = span.row_count();
                 let _ = take_descriptor_update_after_poll(
                     SubscriberReadOutcome::Rows,
                     self.descriptor_updates.as_ref(),
                     &self.descriptor_text,
                 );
+                trace_subscriber_driver_poll(format_subscriber_driver_poll_trace(
+                    "rows",
+                    rows,
+                    poll_started_at,
+                    notification_sequence_started_at,
+                    notification_sequence_done_at,
+                    read_available_started_at,
+                    read_available_done_at,
+                    Instant::now(),
+                ));
                 Ok(SegmentReaderDriverEvent::Rows(span))
             }
             Err(error)
@@ -3909,7 +4233,7 @@ impl StreamSubscriber {
             return Err(py_runtime_error("stream subscriber is already started"));
         }
 
-        let initial_reader_handle = py
+        let (initial_reader_handle, descriptor_missing_at_start) = py
             .allow_threads(|| {
                 let stream = self
                     .master
@@ -3918,7 +4242,7 @@ impl StreamSubscriber {
                     .get_stream_status(&self.source)
                     .map_err(|error| error.to_string())?;
                 let Some(descriptor) = stream.active_segment_descriptor.clone() else {
-                    return Ok(None);
+                    return Ok((None, true));
                 };
                 open_initial_segment_reader_handle(
                     Arc::clone(&self.master),
@@ -3928,6 +4252,7 @@ impl StreamSubscriber {
                     stream.descriptor_generation,
                     descriptor,
                 )
+                .map(|handle| (handle, false))
             })
             .map_err(py_runtime_error)?;
 
@@ -3958,6 +4283,7 @@ impl StreamSubscriber {
                         &source,
                         &segment_schema,
                         start_from,
+                        descriptor_missing_at_start,
                         Arc::clone(&running),
                         poll_interval.max(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN),
                     )?,
@@ -4014,20 +4340,43 @@ impl StreamSubscriber {
                     while running.load(Ordering::SeqCst) {
                         match driver.poll_next()? {
                             SegmentReaderDriverEvent::Rows(span) => {
+                                let read_ready_ns = trace_subscriber_read_latency(&source, &span)?;
+                                let span_row_count = span.row_count();
                                 if let Some(row_factory) = row_factory.as_ref() {
+                                    let delivery_started_at = Instant::now();
                                     let delivered_rows = invoke_stream_row_callbacks(
                                         &callback,
                                         row_factory,
                                         span,
                                         instrument_filter.as_ref(),
                                     )?;
+                                    let delivery_done_at = Instant::now();
+                                    trace_row_delivery_latency(
+                                        &source,
+                                        span_row_count,
+                                        delivered_rows,
+                                        read_ready_ns,
+                                        delivery_started_at,
+                                        delivery_done_at,
+                                    );
                                     metrics.record_rows_delivered(delivered_rows);
                                 } else {
+                                    let record_batch_started_at = Instant::now();
                                     let batch = span
                                         .as_record_batch()
                                         .map_err(|error| error.to_string())?;
+                                    let record_batch_done_at = Instant::now();
                                     let row_count = batch.num_rows();
                                     invoke_stream_callback(&callback, batch)?;
+                                    let callback_done_at = Instant::now();
+                                    trace_table_delivery_latency(
+                                        &source,
+                                        row_count,
+                                        read_ready_ns,
+                                        record_batch_started_at,
+                                        record_batch_done_at,
+                                        callback_done_at,
+                                    );
                                     metrics.record_batch_delivered(row_count);
                                 }
                             }
@@ -4220,31 +4569,39 @@ fn wait_for_initial_segment_reader_handle(
     source: &str,
     segment_schema: &CompiledSchema,
     start_from: i64,
+    descriptor_missing_at_start: bool,
     running: Arc<AtomicBool>,
     wait_interval: Duration,
 ) -> std::result::Result<Option<InitialSegmentReaderHandle>, String> {
+    let mut future_descriptor_start_from_zero = descriptor_missing_at_start;
     while running.load(Ordering::SeqCst) {
         let client = master.lock().unwrap().clone();
         let stream = match client.get_stream_status(source) {
             Ok(stream) => stream,
             Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
+                future_descriptor_start_from_zero = true;
                 thread::sleep(wait_interval);
                 continue;
             }
             Err(error) => return Err(error.to_string()),
         };
         if stream.status == "stale" {
+            future_descriptor_start_from_zero = true;
             match client.wait_segment_descriptor(
                 source,
                 stream.descriptor_generation,
                 wait_interval,
             ) {
                 Ok(Some(update)) => {
+                    let effective_start_from = initial_descriptor_start_from(
+                        start_from,
+                        future_descriptor_start_from_zero,
+                    );
                     if let Some(handle) = open_initial_segment_reader_handle(
                         Arc::clone(&master),
                         source,
                         segment_schema,
-                        start_from,
+                        effective_start_from,
                         update.descriptor_generation,
                         update.descriptor,
                     )? {
@@ -4266,11 +4623,13 @@ fn wait_for_initial_segment_reader_handle(
             continue;
         }
         if let Some(descriptor) = stream.active_segment_descriptor.clone() {
+            let effective_start_from =
+                initial_descriptor_start_from(start_from, future_descriptor_start_from_zero);
             match open_initial_segment_reader_handle(
                 Arc::clone(&master),
                 source,
                 segment_schema,
-                start_from,
+                effective_start_from,
                 stream.descriptor_generation,
                 descriptor,
             )? {
@@ -4282,13 +4641,16 @@ fn wait_for_initial_segment_reader_handle(
             }
         }
 
+        future_descriptor_start_from_zero = true;
         match client.wait_segment_descriptor(source, stream.descriptor_generation, wait_interval) {
             Ok(Some(update)) => {
+                let effective_start_from =
+                    initial_descriptor_start_from(start_from, future_descriptor_start_from_zero);
                 if let Some(handle) = open_initial_segment_reader_handle(
                     Arc::clone(&master),
                     source,
                     segment_schema,
-                    start_from,
+                    effective_start_from,
                     update.descriptor_generation,
                     update.descriptor,
                 )? {
@@ -4309,6 +4671,14 @@ fn wait_for_initial_segment_reader_handle(
         }
     }
     Ok(None)
+}
+
+fn initial_descriptor_start_from(start_from: i64, descriptor_missing_at_start: bool) -> i64 {
+    if descriptor_missing_at_start && start_from == -1 {
+        0
+    } else {
+        start_from
+    }
 }
 
 fn is_transient_segment_source_start_error(message: &str) -> bool {
@@ -4383,13 +4753,46 @@ fn invoke_stream_row_callbacks(
     span: RowSpanView,
     instrument_filter: Option<&BTreeSet<String>>,
 ) -> std::result::Result<usize, String> {
+    let trace_enabled = subscriber_latency_trace_enabled();
+    let total_started_at = trace_enabled.then(Instant::now);
+    let mut filter_us = 0.0_f64;
+    let mut row_dict_us = 0.0_f64;
+    let mut row_factory_us = 0.0_f64;
+    let mut py_callback_us = 0.0_f64;
     if let Some(instrument_filter) = instrument_filter {
+        let filter_started_at = trace_enabled.then(Instant::now);
         let matching_rows = matching_instrument_row_indices(&span, instrument_filter)?;
+        if let Some(filter_started_at) = filter_started_at {
+            filter_us += instant_delta_us(filter_started_at, Instant::now());
+        }
         return Python::with_gil(|py| -> PyResult<usize> {
             for row_index in matching_rows.iter().copied() {
+                let row_dict_started_at = trace_enabled.then(Instant::now);
                 let values = row_span_row_to_pydict(py, &span, row_index)?;
+                if let Some(row_dict_started_at) = row_dict_started_at {
+                    row_dict_us += instant_delta_us(row_dict_started_at, Instant::now());
+                }
+                let row_factory_started_at = trace_enabled.then(Instant::now);
                 let row = row_factory.call1(py, (values,))?;
+                if let Some(row_factory_started_at) = row_factory_started_at {
+                    row_factory_us += instant_delta_us(row_factory_started_at, Instant::now());
+                }
+                let callback_started_at = trace_enabled.then(Instant::now);
                 callback.call1(py, (row,))?;
+                if let Some(callback_started_at) = callback_started_at {
+                    py_callback_us += instant_delta_us(callback_started_at, Instant::now());
+                }
+            }
+            if let Some(total_started_at) = total_started_at {
+                trace_row_delivery_detail_latency(
+                    span.row_count(),
+                    matching_rows.len(),
+                    filter_us,
+                    row_dict_us,
+                    row_factory_us,
+                    py_callback_us,
+                    instant_delta_us(total_started_at, Instant::now()),
+                );
             }
             Ok(matching_rows.len())
         })
@@ -4398,9 +4801,32 @@ fn invoke_stream_row_callbacks(
 
     Python::with_gil(|py| -> PyResult<usize> {
         for row_index in 0..span.row_count() {
+            let row_dict_started_at = trace_enabled.then(Instant::now);
             let values = row_span_row_to_pydict(py, &span, row_index)?;
+            if let Some(row_dict_started_at) = row_dict_started_at {
+                row_dict_us += instant_delta_us(row_dict_started_at, Instant::now());
+            }
+            let row_factory_started_at = trace_enabled.then(Instant::now);
             let row = row_factory.call1(py, (values,))?;
+            if let Some(row_factory_started_at) = row_factory_started_at {
+                row_factory_us += instant_delta_us(row_factory_started_at, Instant::now());
+            }
+            let callback_started_at = trace_enabled.then(Instant::now);
             callback.call1(py, (row,))?;
+            if let Some(callback_started_at) = callback_started_at {
+                py_callback_us += instant_delta_us(callback_started_at, Instant::now());
+            }
+        }
+        if let Some(total_started_at) = total_started_at {
+            trace_row_delivery_detail_latency(
+                span.row_count(),
+                span.row_count(),
+                filter_us,
+                row_dict_us,
+                row_factory_us,
+                py_callback_us,
+                instant_delta_us(total_started_at, Instant::now()),
+            );
         }
         Ok(span.row_count())
     })
@@ -4767,17 +5193,48 @@ impl Source for SegmentSourceBridge {
         let segment_schema = self.segment_schema.clone();
         let xfast = self.xfast;
         let start_from = self.start_from;
+        let mut descriptor_missing_at_start = false;
+        let initial_reader_handle = {
+            let client = self.master.lock().unwrap().clone();
+            match client.get_stream_status(&stream_name) {
+                Ok(stream) => {
+                    if let Some(descriptor) = stream.active_segment_descriptor.clone() {
+                        open_initial_segment_reader_handle(
+                            Arc::clone(&master),
+                            &stream_name,
+                            &segment_schema,
+                            start_from,
+                            stream.descriptor_generation,
+                            descriptor,
+                        )
+                        .map_err(string_zippy_error)?
+                    } else {
+                        descriptor_missing_at_start = true;
+                        None
+                    }
+                }
+                Err(error) if is_transient_segment_source_start_error(&error.to_string()) => {
+                    descriptor_missing_at_start = true;
+                    None
+                }
+                Err(error) => return Err(string_zippy_error(error.to_string())),
+            }
+        };
         let join_handle = thread::spawn(move || {
-            let initial_reader_handle = match wait_for_initial_segment_reader_handle(
-                Arc::clone(&master),
-                &stream_name,
-                &segment_schema,
-                start_from,
-                Arc::clone(&running_flag),
-                SEGMENT_DESCRIPTOR_RETRY_COOLDOWN,
-            ) {
-                Ok(initial_reader_handle) => initial_reader_handle,
-                Err(error) => return Err(string_zippy_error(error)),
+            let initial_reader_handle = match initial_reader_handle {
+                Some(handle) => Some(handle),
+                None => match wait_for_initial_segment_reader_handle(
+                    Arc::clone(&master),
+                    &stream_name,
+                    &segment_schema,
+                    start_from,
+                    descriptor_missing_at_start,
+                    Arc::clone(&running_flag),
+                    SEGMENT_DESCRIPTOR_RETRY_COOLDOWN,
+                ) {
+                    Ok(initial_reader_handle) => initial_reader_handle,
+                    Err(error) => return Err(string_zippy_error(error)),
+                },
             };
             let Some((reader_handle, descriptor_text, descriptor_generation, _)) =
                 initial_reader_handle
@@ -4810,9 +5267,33 @@ impl Source for SegmentSourceBridge {
 
             let result = (|| -> zippy_core::Result<()> {
                 while running_flag.load(Ordering::SeqCst) {
+                    let poll_started_at = Instant::now();
                     match driver.poll_next().map_err(string_zippy_error)? {
                         SegmentReaderDriverEvent::Rows(span) => {
+                            let rows_ready_at = Instant::now();
+                            let trace_enabled = segment_source_latency_trace_enabled();
+                            let trace_span = trace_enabled.then(|| span.clone());
+                            let read_ready_ns = if trace_enabled {
+                                current_unix_epoch_ns()
+                            } else {
+                                None
+                            };
+                            let emit_started_at = Instant::now();
                             sink.emit(SourceEvent::Data(SegmentTableView::from_row_span(span)))?;
+                            let emit_done_at = Instant::now();
+                            if let (Some(trace_span), Some(read_ready_ns)) =
+                                (trace_span.as_ref(), read_ready_ns)
+                            {
+                                trace_segment_source_rows_latency(
+                                    &stream_name,
+                                    trace_span,
+                                    read_ready_ns,
+                                    poll_started_at,
+                                    rows_ready_at,
+                                    instant_delta_us(emit_started_at, emit_done_at),
+                                )
+                                .map_err(string_zippy_error)?;
+                            }
                         }
                         SegmentReaderDriverEvent::DescriptorUpdated(_) => {}
                         SegmentReaderDriverEvent::Idle => {}
@@ -7231,6 +7712,12 @@ fn parse_parquet_sink(
         return Ok(None);
     };
 
+    if parquet_sink.extract::<PyRef<'_, ParquetSink>>().is_ok() {
+        return Err(PyTypeError::new_err(
+            "ParquetSink is no longer supported as an engine sink; publish engine output with append_table(...).publish(persist=True)",
+        ));
+    }
+
     let sink = parquet_sink
         .extract::<PyRef<'_, ParquetSink>>()
         .map_err(|_| PyTypeError::new_err("parquet_sink must be zippy.ParquetSink"))?;
@@ -8928,6 +9415,32 @@ mod tests {
     }
 
     #[test]
+    fn format_subscriber_driver_poll_trace_renders_expected_segments() {
+        let poll_started_at = Instant::now();
+        let notification_sequence_started_at = poll_started_at + Duration::from_micros(5);
+        let notification_sequence_done_at = poll_started_at + Duration::from_micros(15);
+        let read_available_started_at = poll_started_at + Duration::from_micros(16);
+        let read_available_done_at = poll_started_at + Duration::from_micros(36);
+        let event_done_at = poll_started_at + Duration::from_micros(40);
+
+        let trace_line = format_subscriber_driver_poll_trace(
+            "rows",
+            1,
+            poll_started_at,
+            notification_sequence_started_at,
+            notification_sequence_done_at,
+            read_available_started_at,
+            read_available_done_at,
+            event_done_at,
+        );
+
+        assert_eq!(
+            trace_line,
+            "zippy_subscriber_latency_trace event=[driver_poll] outcome=[rows] rows=[1] notification_sequence_us=[10.000] read_available_us=[20.000] poll_to_event_us=[40.000]",
+        );
+    }
+
+    #[test]
     fn descriptor_update_slot_is_consumed_only_after_empty_segment_poll() {
         let descriptor_updates = DescriptorUpdateSlot::default();
         descriptor_updates.set(DescriptorUpdate {
@@ -9400,6 +9913,7 @@ mod tests {
             "ticks",
             &schema,
             -1,
+            false,
             Arc::clone(&running),
             Duration::from_millis(1),
         )
