@@ -635,7 +635,7 @@ impl MasterClient {
             return Ok(metadata);
         }
 
-        let writer_epoch = self.get_stream(stream_name)?.writer_epoch;
+        let writer_epoch = self.get_stream_status(stream_name)?.writer_epoch;
         if let Some(object) = metadata.as_object_mut() {
             object.insert(
                 "writer_epoch".to_string(),

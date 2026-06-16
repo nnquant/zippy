@@ -735,6 +735,79 @@ fn control_request_serialization_uses_buffer_and_frame_sizes() {
 }
 
 #[test]
+fn publish_segment_descriptor_fetches_writer_epoch_with_status_request() {
+    let socket_path = unique_socket_path();
+    let server_socket_path = socket_path.clone();
+    let server = thread::spawn(move || {
+        if server_socket_path.exists() {
+            let _ = fs::remove_file(&server_socket_path);
+        }
+
+        let listener = UnixListener::bind(&server_socket_path).unwrap();
+        for (index, stream) in listener.incoming().take(3).enumerate() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut line).unwrap();
+
+            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
+            let response = match (index, request) {
+                (0, ControlRequest::RegisterProcess(RegisterProcessRequest { app })) => {
+                    assert_eq!(app, "local_dc");
+                    ControlResponse::ProcessRegistered {
+                        process_id: "proc_1".to_string(),
+                        process_token: "token_1".to_string(),
+                    }
+                }
+                (1, ControlRequest::GetStreamStatus(request)) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
+                        stream: test_stream_info(),
+                    })
+                }
+                (1, ControlRequest::GetStream(_)) => {
+                    panic!("writer_epoch preflight must use GetStreamStatus, not GetStream")
+                }
+                (2, ControlRequest::PublishSegmentDescriptor(request)) => {
+                    assert_eq!(request.stream_name, "ticks");
+                    assert_eq!(request.descriptor["writer_epoch"], 0);
+                    ControlResponse::SegmentDescriptorPublished {
+                        stream_name: request.stream_name,
+                    }
+                }
+                (_, other) => panic!("unexpected request index={index} request={other:?}"),
+            };
+
+            let response = serde_json::to_string(&response).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    });
+    wait_for_socket(&socket_path);
+
+    let descriptor = serde_json::json!({
+        "magic": "zippy.segment.active",
+        "version": 1,
+        "schema_id": 7,
+        "row_capacity": 64,
+        "shm_os_id": "/tmp/zippy-segment",
+        "payload_offset": 64,
+        "committed_row_count_offset": 40,
+        "segment_id": 1,
+        "generation": 0,
+    });
+    let bytes = serde_json::to_vec(&descriptor).unwrap();
+
+    let mut client = MasterClient::connect(&socket_path).unwrap();
+    client.register_process("local_dc").unwrap();
+    client
+        .publish_segment_descriptor_bytes("ticks", &bytes)
+        .unwrap();
+
+    server.join().unwrap();
+}
+
+#[test]
 fn master_client_publishes_and_fetches_segment_descriptor() {
     let socket_path = unique_socket_path();
     let server = spawn_fake_server(&socket_path, 8);

@@ -1060,23 +1060,9 @@ struct ParquetSink;
 #[pymethods]
 impl ParquetSink {
     #[new]
-    #[pyo3(signature = (path, rotation="none", write_input=false, write_output=true, rows_per_batch=8192, flush_interval_ms=1000))]
-    fn new(
-        path: String,
-        rotation: &str,
-        write_input: bool,
-        write_output: bool,
-        rows_per_batch: usize,
-        flush_interval_ms: u64,
-    ) -> PyResult<Self> {
-        let _ = (
-            path,
-            rotation,
-            write_input,
-            write_output,
-            rows_per_batch,
-            flush_interval_ms,
-        );
+    #[pyo3(signature = (*args, **kwargs))]
+    fn new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let _ = (args, kwargs);
         Err(PyTypeError::new_err(
             "ParquetSink is no longer supported as an engine sink; publish engine output with append_table(...).publish(persist=True)",
         ))
@@ -1382,16 +1368,13 @@ impl MasterClient {
         .map_err(|error| py_runtime_error(error.to_string()))
     }
 
-    #[pyo3(signature = (sink_name, sink_type, input_stream, config))]
+    #[pyo3(signature = (*args, **kwargs))]
     fn register_sink(
         &self,
-        py: Python<'_>,
-        sink_name: String,
-        sink_type: String,
-        input_stream: String,
-        config: &Bound<'_, PyAny>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let _ = (py, sink_name, sink_type, input_stream, config);
+        let _ = (args, kwargs);
         Err(PyTypeError::new_err("register_sink is no longer supported"))
     }
 
@@ -5162,7 +5145,7 @@ struct KeyValueTableMaterializer {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", invalid_value_policy="reject", source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", invalid_value_policy="reject", source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5175,10 +5158,8 @@ impl ReactiveStateEngine {
         invalid_value_policy: &str,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -5202,13 +5183,7 @@ impl ReactiveStateEngine {
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(parquet_sink, "parquet_sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -5338,7 +5313,7 @@ impl ReactiveStateEngine {
 impl ReactiveLatestEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema=None, by=None, target=None, *, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false))]
+    #[pyo3(signature = (name, input_schema=None, by=None, target=None, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5347,23 +5322,15 @@ impl ReactiveLatestEngine {
         target: Option<&Bound<'_, PyAny>>,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
     ) -> PyResult<Self> {
         let by = by.ok_or_else(|| py_value_error("by is required"))?;
         let target = target.ok_or_else(|| py_value_error("target is required"))?;
         let by = parse_by_columns(by)?;
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(parquet_sink, "parquet_sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -5527,7 +5494,7 @@ impl ReactiveLatestEngine {
 impl StreamTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5535,10 +5502,8 @@ impl StreamTableMaterializer {
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
         descriptor_publisher: Option<Py<PyAny>>,
         row_capacity: Option<usize>,
@@ -5611,13 +5576,7 @@ impl StreamTableMaterializer {
         }
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(sink, "sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -5752,7 +5711,7 @@ impl StreamTableMaterializer {
 impl KeyValueTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_guard=None, replacement_retention_snapshots=None, changelog_name=None, changelog_descriptor_publisher=None, changelog_writer_epoch=None))]
+    #[pyo3(signature = (name, input_schema, by, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_guard=None, replacement_retention_snapshots=None, changelog_name=None, changelog_descriptor_publisher=None, changelog_writer_epoch=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5761,10 +5720,8 @@ impl KeyValueTableMaterializer {
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
         descriptor_publisher: Option<Py<PyAny>>,
         row_capacity: Option<usize>,
@@ -5838,13 +5795,7 @@ impl KeyValueTableMaterializer {
         }
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(sink, "sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -5995,7 +5946,7 @@ impl KeyValueTableMaterializer {
 impl TimeSeriesEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, late_data_policy, factors, target, *, window=None, window_type=None, window_ns=None, pre_factors=None, post_factors=None, id_filter=None, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -6013,10 +5964,8 @@ impl TimeSeriesEngine {
         id_filter: Option<&Bound<'_, PyAny>>,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -6052,13 +6001,7 @@ impl TimeSeriesEngine {
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(parquet_sink, "parquet_sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -6189,7 +6132,7 @@ impl TimeSeriesEngine {
 impl BarGeneratorEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, profile, target, *, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false))]
+    #[pyo3(signature = (name, input_schema, profile, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -6198,10 +6141,8 @@ impl BarGeneratorEngine {
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -6213,13 +6154,7 @@ impl BarGeneratorEngine {
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(parquet_sink, "parquet_sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -6342,7 +6277,7 @@ impl BarGeneratorEngine {
 impl CrossSectionalEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, master=None, parquet_sink=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, dt_column, trigger_interval, late_data_policy, factors, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -6355,10 +6290,8 @@ impl CrossSectionalEngine {
         target: &Bound<'_, PyAny>,
         source: Option<&Bound<'_, PyAny>>,
         master: Option<&Bound<'_, PyAny>>,
-        parquet_sink: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
-        archive_buffer_capacity: Option<usize>,
         xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -6391,13 +6324,7 @@ impl CrossSectionalEngine {
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        reject_legacy_parquet_sink(parquet_sink, "parquet_sink")?;
-        let runtime_options = parse_runtime_options(
-            buffer_capacity,
-            overflow_policy,
-            archive_buffer_capacity,
-            xfast,
-        )?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -7150,25 +7077,6 @@ fn parse_single_target(target: &Bound<'_, PyAny>) -> PyResult<TargetConfig> {
     ))
 }
 
-fn reject_legacy_parquet_sink(
-    parquet_sink: Option<&Bound<'_, PyAny>>,
-    parameter_name: &str,
-) -> PyResult<()> {
-    let Some(parquet_sink) = parquet_sink else {
-        return Ok(());
-    };
-
-    if parquet_sink.extract::<PyRef<'_, ParquetSink>>().is_ok() {
-        return Err(PyTypeError::new_err(
-            "ParquetSink is no longer supported as an engine sink; publish engine output with append_table(...).publish(persist=True)",
-        ));
-    }
-
-    Err(PyTypeError::new_err(format!(
-        "{parameter_name} must be zippy.ParquetSink"
-    )))
-}
-
 fn segment_source_config_from_named_stream(
     py: Python<'_>,
     stream_name: &str,
@@ -7904,17 +7812,10 @@ fn map_python_source_error(error: PyErr) -> ZippyError {
 fn parse_runtime_options(
     buffer_capacity: usize,
     overflow_policy: Option<&Bound<'_, PyAny>>,
-    archive_buffer_capacity: Option<usize>,
     xfast: bool,
 ) -> PyResult<RuntimeOptions> {
     if buffer_capacity == 0 {
         return Err(py_value_error("buffer_capacity must be greater than zero"));
-    }
-
-    if archive_buffer_capacity.is_some() {
-        return Err(PyTypeError::new_err(
-            "archive_buffer_capacity is no longer supported",
-        ));
     }
 
     Ok(RuntimeOptions {

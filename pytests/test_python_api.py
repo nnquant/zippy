@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import importlib.util
 import tomllib
@@ -4069,6 +4070,35 @@ def test_parquet_sink_constructor_is_rejected(tmp_path: Path) -> None:
         zippy.ParquetSink(path=str(tmp_path), rotation="none")
 
 
+def test_parquet_sink_constructor_signature_hides_legacy_parameters() -> None:
+    signature = inspect.signature(zippy.ParquetSink)
+
+    assert list(signature.parameters) == ["args", "kwargs"]
+    assert signature.parameters["args"].kind is inspect.Parameter.VAR_POSITIONAL
+    assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
+
+
+@pytest.mark.parametrize(
+    "engine_type,legacy_parameters",
+    [
+        (zippy.ReactiveStateEngine, {"parquet_sink", "archive_buffer_capacity"}),
+        (zippy.ReactiveLatestEngine, {"parquet_sink", "archive_buffer_capacity"}),
+        (zippy._internal.StreamTableMaterializer, {"sink", "archive_buffer_capacity"}),
+        (zippy._internal.KeyValueTableMaterializer, {"sink", "archive_buffer_capacity"}),
+        (zippy.TimeSeriesEngine, {"parquet_sink", "archive_buffer_capacity"}),
+        (zippy.BarGeneratorEngine, {"parquet_sink", "archive_buffer_capacity"}),
+        (zippy.CrossSectionalEngine, {"parquet_sink", "archive_buffer_capacity"}),
+    ],
+)
+def test_engine_constructor_signatures_hide_removed_sink_archive_parameters(
+    engine_type: type,
+    legacy_parameters: set[str],
+) -> None:
+    signature = inspect.signature(engine_type)
+
+    assert legacy_parameters.isdisjoint(signature.parameters)
+
+
 def test_engine_parquet_sink_keyword_is_rejected() -> None:
     tick_schema = pa.schema(
         [
@@ -4083,7 +4113,7 @@ def test_engine_parquet_sink_keyword_is_rejected() -> None:
             ("price", pa.float64()),
         ]
     )
-    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'parquet_sink'"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=tick_schema,
@@ -4093,7 +4123,7 @@ def test_engine_parquet_sink_keyword_is_rejected() -> None:
             parquet_sink=object(),
         )
 
-    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'parquet_sink'"):
         zippy.TimeSeriesEngine(
             name="bar_1m",
             input_schema=timed_schema,
@@ -4107,7 +4137,7 @@ def test_engine_parquet_sink_keyword_is_rejected() -> None:
             parquet_sink=object(),
         )
 
-    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'parquet_sink'"):
         zippy.CrossSectionalEngine(
             name="cs_1m",
             input_schema=pa.schema(
@@ -4155,7 +4185,7 @@ def test_engine_rejects_invalid_runtime_config_keywords(tmp_path: Path) -> None:
             overflow_policy="block",
         )
 
-    with pytest.raises(TypeError, match="archive_buffer_capacity is no longer supported"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'archive_buffer_capacity'"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=schema,
@@ -4630,7 +4660,7 @@ def test_reactive_engine_legacy_parquet_sink_is_rejected() -> None:
         ]
     )
 
-    with pytest.raises(TypeError, match="parquet_sink must be zippy.ParquetSink"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'parquet_sink'"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=schema,
@@ -4687,7 +4717,7 @@ def test_stream_table_engine_supports_source_and_target_config() -> None:
     assert "parquet_sink" not in config
 
 
-def test_stream_table_engine_rejects_invalid_sink_type() -> None:
+def test_stream_table_engine_rejects_removed_sink_keyword() -> None:
     schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -4695,7 +4725,7 @@ def test_stream_table_engine_rejects_invalid_sink_type() -> None:
         ]
     )
 
-    with pytest.raises(TypeError, match="sink must be zippy.ParquetSink"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'sink'"):
         zippy._internal.StreamTableMaterializer(
             name="ticks",
             input_schema=schema,
@@ -4712,7 +4742,7 @@ def test_stream_table_engine_rejects_legacy_parquet_sink() -> None:
         ]
     )
 
-    with pytest.raises(TypeError, match="sink must be zippy.ParquetSink"):
+    with pytest.raises(TypeError, match="unexpected keyword argument 'sink'"):
         zippy._internal.StreamTableMaterializer(
             name="ticks",
             input_schema=schema,
@@ -16362,6 +16392,12 @@ def test_master_client_registers_control_plane_entities_and_updates_status(
                 "path": "data/openctp_mid_price_factors",
             },
         )
+
+    signature = inspect.signature(zippy.MasterClient.register_sink)
+    assert list(signature.parameters) == ["self", "args", "kwargs"]
+    assert signature.parameters["args"].kind is inspect.Parameter.VAR_POSITIONAL
+    assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
+
     client.update_status(
         "engine",
         "mid_price_factor",
