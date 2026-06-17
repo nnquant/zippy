@@ -9166,6 +9166,8 @@ class Pipeline:
         persist=_USE_MASTER_CONFIG,
         data_dir: str | os.PathLike[str] | None = None,
         persist_path: ParquetPersist | str | os.PathLike[str] | None = None,
+        shard_key=None,
+        shard_nums=None,
     ) -> "Pipeline":
         """
         Materialize pipeline input into a named stream table.
@@ -9196,11 +9198,23 @@ class Pipeline:
         :type data_dir: str | os.PathLike[str] | None
         :param persist_path: Explicit directory used to store this stream table's parquet files.
         :type persist_path: ParquetPersist | str | os.PathLike[str] | None
+        :param shard_key: Column name or ordered column names used to shard rows. Omit together
+            with ``shard_nums`` to keep the default single-materializer path.
+        :type shard_key: str | list[str] | tuple[str, ...] | None
+        :param shard_nums: Number of shards, or ``"auto"`` to use up to 16 CPU-backed shards.
+            This first-stage Python API validates and parses sharding options only; it does not
+            register shard streams or enable a sharded native materializer yet.
+        :type shard_nums: int | str | None
         :returns: This pipeline.
         :rtype: Pipeline
         """
         self._ensure_process()
         schema = schema or self._infer_source_schema()
+        _resolve_stream_table_sharding(
+            schema=schema,
+            shard_key=shard_key,
+            shard_nums=shard_nums,
+        )
         table_options = _resolve_stream_table_options(
             name=name,
             master=self.master,
@@ -9603,6 +9617,76 @@ def _resolve_stream_table_options(
         "persist_path": str(root / name),
         "persist_data_root": str(root),
     }
+
+
+@dataclass(frozen=True)
+class _StreamTableSharding:
+    """
+    Parsed Python-side sharding options for ``Pipeline.stream_table()``.
+
+    This stage intentionally validates only the public API contract. Shard stream
+    registration and native materializer wiring are handled by later implementation tasks.
+    """
+
+    shard_key: tuple[str, ...]
+    shard_nums: int
+
+
+def _resolve_stream_table_sharding(
+    *,
+    schema,
+    shard_key,
+    shard_nums,
+) -> _StreamTableSharding | None:
+    if shard_key is None and shard_nums is None:
+        return None
+    if shard_key is not None and shard_nums is None:
+        raise ValueError("shard_key requires shard_nums")
+    if shard_nums is not None and shard_key is None:
+        raise ValueError("shard_nums requires shard_key")
+
+    parsed_shard_nums = _resolve_stream_table_shard_nums(shard_nums)
+    if parsed_shard_nums == 1 and shard_nums != "auto":
+        raise ValueError("shard_nums=1 disables sharding; omit shard_key")
+
+    parsed_shard_key = _resolve_stream_table_shard_key(shard_key)
+    schema_names = set(schema.names)
+    for column in parsed_shard_key:
+        if column not in schema_names:
+            raise ValueError(f"shard_key column [{column}] is not in schema")
+
+    return _StreamTableSharding(shard_key=parsed_shard_key, shard_nums=parsed_shard_nums)
+
+
+def _resolve_stream_table_shard_nums(shard_nums) -> int:
+    if shard_nums == "auto":
+        return min(os.cpu_count() or 1, 16)
+    if isinstance(shard_nums, bool) or not isinstance(shard_nums, int):
+        raise ValueError("shard_nums must be a positive integer or 'auto'")
+    if shard_nums <= 0:
+        raise ValueError("shard_nums must be a positive integer or 'auto'")
+    return shard_nums
+
+
+def _resolve_stream_table_shard_key(shard_key) -> tuple[str, ...]:
+    if isinstance(shard_key, str):
+        columns = (shard_key,)
+    elif isinstance(shard_key, (list, tuple)):
+        columns = tuple(shard_key)
+    else:
+        raise ValueError("shard_key must be a string or a non-empty sequence of strings")
+
+    if not columns:
+        raise ValueError("shard_key must be a string or a non-empty sequence of strings")
+
+    seen: set[str] = set()
+    for column in columns:
+        if not isinstance(column, str) or not column:
+            raise ValueError("shard_key must contain non-empty strings")
+        if column in seen:
+            raise ValueError(f"shard_key column [{column}] is duplicated")
+        seen.add(column)
+    return columns
 
 
 def _optional_config_string(value: object) -> str | None:
