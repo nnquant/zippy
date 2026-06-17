@@ -5790,7 +5790,7 @@ impl ReactiveLatestEngine {
 impl StreamTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false, shard_key=None, shard_nums=None, shard_version=None, shard_stream_names=None))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false, shard_key=None, shard_nums=None, shard_version=None, shard_stream_names=None, shard_writer_epochs=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5816,6 +5816,7 @@ impl StreamTableMaterializer {
         shard_nums: Option<usize>,
         shard_version: Option<u32>,
         shard_stream_names: Option<Vec<String>>,
+        shard_writer_epochs: Option<Vec<u64>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
@@ -5828,6 +5829,11 @@ impl StreamTableMaterializer {
                 if shard_stream_names.is_some() {
                     return Err(py_value_error(
                         "shard_stream_names requires shard_key and shard_nums",
+                    ));
+                }
+                if shard_writer_epochs.is_some() {
+                    return Err(py_value_error(
+                        "shard_writer_epochs requires shard_key and shard_nums",
                     ));
                 }
                 if shard_version.is_some() {
@@ -5942,13 +5948,15 @@ impl StreamTableMaterializer {
                         ));
                     }
                 }
-                let engine = RustShardedStreamTableMaterializer::new_with_row_capacity(
-                    &name,
-                    Arc::clone(&schema),
-                    config,
-                    row_capacity,
-                )
-                .map_err(|error| py_value_error(error.to_string()))?;
+                let engine =
+                    RustShardedStreamTableMaterializer::new_with_row_capacity_and_writer_epochs(
+                        &name,
+                        Arc::clone(&schema),
+                        config,
+                        row_capacity,
+                        shard_writer_epochs,
+                    )
+                    .map_err(|error| py_value_error(error.to_string()))?;
                 let output_schema = engine.output_schema();
                 let shard_failures = engine.failed_shards_handle();
                 let shard_metadata = StreamTableShardMetadata {

@@ -1920,19 +1920,52 @@ impl ShardedStreamTableMaterializer {
         config: ShardConfig,
         row_capacity: usize,
     ) -> Result<Self> {
+        Self::new_with_row_capacity_and_writer_epochs(
+            logical_name,
+            input_schema,
+            config,
+            row_capacity,
+            None,
+        )
+    }
+
+    pub fn new_with_row_capacity_and_writer_epochs(
+        logical_name: impl Into<String>,
+        input_schema: SchemaRef,
+        config: ShardConfig,
+        row_capacity: usize,
+        shard_writer_epochs: Option<Vec<u64>>,
+    ) -> Result<Self> {
         let logical_name = logical_name.into();
         let shard_count = config.shard_nums();
+        if let Some(writer_epochs) = shard_writer_epochs.as_ref() {
+            if writer_epochs.len() != shard_count {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "shard_writer_epochs length mismatch logical=[{}] expected=[{}] actual=[{}]",
+                        logical_name,
+                        shard_count,
+                        writer_epochs.len()
+                    ),
+                });
+            }
+        }
         let router = ShardRouter::try_new(Arc::clone(&input_schema), config)?;
         let shard_names = (0..shard_count)
             .map(|shard_index| Self::shard_stream_name(&logical_name, shard_index))
             .collect::<Vec<_>>();
         let shards = shard_names
             .iter()
-            .map(|shard_name| {
-                StreamTableMaterializer::new_with_row_capacity(
+            .enumerate()
+            .map(|(shard_index, shard_name)| {
+                let writer_epoch = shard_writer_epochs
+                    .as_ref()
+                    .and_then(|epochs| epochs.get(shard_index).copied());
+                StreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
                     shard_name.clone(),
                     Arc::clone(&input_schema),
                     row_capacity,
+                    writer_epoch,
                 )
             })
             .collect::<Result<Vec<_>>>()?;

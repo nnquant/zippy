@@ -9427,6 +9427,7 @@ class Pipeline:
         self._schema = None
         self._engine: _StreamTableMaterializer | None = None
         self._registered_source_name: str | None = None
+        self._registered_source_names: list[str] = []
         self._started = False
         self._shutdown_hook_unregister = None
 
@@ -9625,7 +9626,23 @@ class Pipeline:
                 _stream_table_source_config(table_options, **logical_metadata),
             )
             self._registered_source_name = source_name
+            self._registered_source_names = [source_name]
             try:
+                for shard_index, shard_name in enumerate(shard_names):
+                    shard_source_name = f"{source_name}.{shard_name}"
+                    shard_metadata = _stream_table_physical_shard_metadata(
+                        sharding,
+                        logical_name=name,
+                        shard_index=shard_index,
+                    )
+                    self.master.register_source(
+                        shard_source_name,
+                        self._source_type,
+                        shard_name,
+                        _stream_table_source_config(table_options, **shard_metadata),
+                    )
+                    self._registered_source_names.append(shard_source_name)
+                shard_writer_epochs = _stream_writer_epochs(self.master, shard_names)
                 self._engine = _StreamTableMaterializer(
                     name=name,
                     input_schema=schema,
@@ -9636,6 +9653,7 @@ class Pipeline:
                     shard_nums=sharding.shard_nums,
                     shard_version=sharding.shard_version,
                     shard_stream_names=shard_names,
+                    shard_writer_epochs=shard_writer_epochs,
                 )
                 self.master.publish_segment_descriptor(
                     name,
@@ -9657,7 +9675,10 @@ class Pipeline:
                     )
                     self.master.publish_segment_descriptor(
                         shard_name,
-                        _annotate_table_descriptor(descriptor, shard_metadata),
+                        _annotate_table_descriptor(
+                            _descriptor_without_control_writer_epoch(descriptor),
+                            shard_metadata,
+                        ),
                     )
             except BaseException:
                 self._engine = None
@@ -9676,6 +9697,7 @@ class Pipeline:
             _stream_table_source_config(table_options, **descriptor_metadata),
         )
         self._registered_source_name = source_name
+        self._registered_source_names = [source_name]
         try:
             writer_epoch = _stream_writer_epoch(self.master, name)
             self._engine = _StreamTableMaterializer(
@@ -9790,19 +9812,24 @@ class Pipeline:
             raise first_error
 
     def _unregister_registered_source(self) -> None:
-        source_name = self._registered_source_name
-        if source_name is None:
+        source_names = list(self._registered_source_names)
+        if not source_names and self._registered_source_name is not None:
+            source_names = [self._registered_source_name]
+        if not source_names:
             return
         unregister_source = getattr(self.master, "unregister_source", None)
         if unregister_source is None:
             self._registered_source_name = None
+            self._registered_source_names = []
             return
-        try:
-            unregister_source(source_name)
-        except RuntimeError as error:
-            if "source not found" not in str(error):
-                raise
+        for source_name in reversed(source_names):
+            try:
+                unregister_source(source_name)
+            except RuntimeError as error:
+                if "source not found" not in str(error):
+                    raise
         self._registered_source_name = None
+        self._registered_source_names = []
 
     def _ensure_process(self) -> None:
         _ensure_master_process(self.master, self.name)
@@ -9935,6 +9962,16 @@ def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:
     return writer_epoch_int
 
 
+def _stream_writer_epochs(master: MasterClient, table_names: list[str]) -> list[int] | None:
+    writer_epochs: list[int] = []
+    for table_name in table_names:
+        writer_epoch = _stream_writer_epoch(master, table_name)
+        if writer_epoch is None:
+            return None
+        writer_epochs.append(writer_epoch)
+    return writer_epochs
+
+
 def _annotate_table_descriptor(
     descriptor: object,
     metadata: dict[str, object] | None,
@@ -9944,6 +9981,15 @@ def _annotate_table_descriptor(
     annotated = dict(descriptor)
     annotated.update(metadata)
     return annotated
+
+
+def _descriptor_without_control_writer_epoch(descriptor: object) -> object:
+    if not isinstance(descriptor, dict):
+        return descriptor
+    cleaned = dict(descriptor)
+    cleaned.pop("writer_epoch", None)
+    cleaned.pop("control_writer_epoch", None)
+    return cleaned
 
 
 def _stream_table_source_config(

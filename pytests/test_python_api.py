@@ -9325,14 +9325,26 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
 
 
 class _FakeShardedSubscribeMaster:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        logical_descriptor: dict[str, object] | None = None,
+        source_configs: list[dict[str, object]] | None = None,
+    ) -> None:
         self.shard_names = ["ticks.__shard_0000", "ticks.__shard_0001"]
+        self.logical_descriptor = (
+            {"zippy_shards": list(self.shard_names)}
+            if logical_descriptor is None and source_configs is None
+            else logical_descriptor
+        )
+        self.source_configs = list(source_configs or [])
 
     def get_stream(self, source: str) -> dict[str, object]:
         if source == "ticks":
             return {
                 "stream_name": "ticks",
-                "active_segment_descriptor": {"zippy_shards": list(self.shard_names)},
+                "active_segment_descriptor": self.logical_descriptor,
+                "source_configs": list(self.source_configs),
             }
         if source in self.shard_names:
             return {
@@ -9355,6 +9367,22 @@ def test_logical_sharded_subscribe_is_rejected(api_name: str) -> None:
         match="logical sharded subscribe is not implemented",
     ):
         api("ticks", callback=lambda value: None, master=master)
+
+
+@pytest.mark.parametrize("api_name", ["subscribe", "subscribe_table"])
+def test_logical_sharded_subscribe_uses_source_config_fallback(api_name: str) -> None:
+    master = _FakeShardedSubscribeMaster(
+        logical_descriptor=None,
+        source_configs=[
+            {"zippy_shards": ["ticks.__shard_0000", "ticks.__shard_0001"]},
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="logical sharded subscribe is not implemented",
+    ):
+        getattr(zippy, api_name)("ticks", callback=lambda value: None, master=master)
 
 
 @pytest.mark.parametrize("api_name", ["subscribe", "subscribe_table"])
@@ -16183,6 +16211,135 @@ def test_pipeline_source_stream_table_lifecycle_feeds_query_tail(tmp_path: Path)
     assert source.handle.stopped.is_set()
 
 
+def test_pipeline_source_sharded_stream_table_e2e(tmp_path: Path) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    try:
+        server, control_endpoint = start_master_server(tmp_path)
+    except RuntimeError as error:
+        if "Operation not permitted" in str(error):
+            pytest.skip("unix socket bind is not permitted in this test environment")
+        raise
+
+    tick_schema = pa.schema(
+        [
+            ("row_id", pa.int64()),
+            ("instrument_id", pa.string()),
+            ("price", pa.float64()),
+        ]
+    )
+    rows = {
+        "row_id": [0, 1, 2, 3],
+        "instrument_id": ["au2606", "ag2606", "au2606", "cu2606"],
+        "price": [1.0, 2.0, 3.0, 4.0],
+    }
+
+    class BatchHandle:
+        def __init__(self, sink) -> None:
+            self.sink = sink
+            self.stopped = threading.Event()
+            self.thread = threading.Thread(target=self._run)
+            self.thread.start()
+
+        def _run(self) -> None:
+            self.sink.emit_hello("mock_ticks")
+            self.sink.emit_data(rows)
+            self.stopped.wait(timeout=5.0)
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+        def join(self) -> None:
+            self.thread.join(timeout=5.0)
+
+    class BatchSource:
+        def __init__(self) -> None:
+            self.handle: BatchHandle | None = None
+
+        def _zippy_output_schema(self) -> pa.Schema:
+            return tick_schema
+
+        def _zippy_source_name(self) -> str:
+            return "mock_ticks"
+
+        def _zippy_start(self, sink) -> BatchHandle:
+            self.handle = BatchHandle(sink)
+            return self.handle
+
+    zippy.connect(uri=control_endpoint)
+    client = zippy.MasterClient(control_endpoint=control_endpoint)
+    pipeline = None
+    source = BatchSource()
+
+    try:
+        pipeline = (
+            zippy.Pipeline("test_ingest", master=client)
+            .source(source)
+            .stream_table(
+                "sharded_ticks",
+                schema=tick_schema,
+                row_capacity=8,
+                persist=False,
+                shard_key="instrument_id",
+                shard_nums=4,
+            )
+            .start()
+        )
+
+        logical = client.get_stream("sharded_ticks")
+        logical_descriptor = logical["active_segment_descriptor"]
+        shard_names = [f"sharded_ticks.__shard_{index:04d}" for index in range(4)]
+        assert logical_descriptor["zippy_sharded"] is True
+        assert logical_descriptor["zippy_shard_key"] == ["instrument_id"]
+        assert logical_descriptor["zippy_shard_nums"] == 4
+        assert logical_descriptor["zippy_shards"] == shard_names
+
+        assert {stream["stream_name"] for stream in client.list_streams()} == {
+            "sharded_ticks"
+        }
+        assert {stream["stream_name"] for stream in client.list_streams(include_internal=True)} == {
+            "sharded_ticks",
+            *shard_names,
+        }
+
+        deadline = time.time() + 2.0
+        latest = zippy.read_table("sharded_ticks", master=client, snapshot=False).sort(
+            "row_id"
+        ).collect()
+        while latest.num_rows != 4 and time.time() < deadline:
+            time.sleep(0.01)
+            latest = zippy.read_table("sharded_ticks", master=client, snapshot=False).sort(
+                "row_id"
+            ).collect()
+
+        assert latest.to_pydict() == rows
+
+        drop_result = zippy.ops.drop_table(
+            "sharded_ticks",
+            drop_persisted=False,
+            master=client,
+        )
+
+        assert drop_result["table_name"] == "sharded_ticks"
+        assert drop_result["dropped"] is True
+        assert drop_result["shards"] == shard_names
+        assert client.list_streams(include_internal=True) == []
+
+        pipeline.stop()
+        pipeline = None
+    finally:
+        if pipeline is not None:
+            pipeline.stop()
+        if reset_default_master is not None:
+            reset_default_master()
+        server.stop()
+
+    assert source.handle is not None
+    assert source.handle.stopped.is_set()
+
+
 def test_stream_table_source_stop_can_reenter_engine_status() -> None:
     tick_schema = pa.schema(
         [
@@ -16568,6 +16725,7 @@ def test_pipeline_stream_table_shard_auto_registers_logical_and_physical_streams
                     "segment_id": index,
                     "generation": 1,
                     "row_count": 0,
+                    "writer_epoch": index + 1,
                 }
                 for index in range(shard_nums)
             ]
@@ -16594,22 +16752,32 @@ def test_pipeline_stream_table_shard_auto_registers_logical_and_physical_streams
     ]
     assert [record[0] for record in master.stream_records] == ["openctp_ticks", *shard_names]
     assert all(record[1] == tick_schema for record in master.stream_records)
-    assert master.source_records == [
-        (
-            "test_ingest.openctp_ticks",
-            "pipeline",
-            "openctp_ticks",
-            {
-                "zippy_table_kind": "append_table",
-                "zippy_sharded": True,
-                "zippy_shard_key": ["instrument_id"],
-                "zippy_shard_nums": 3,
-                "zippy_shard_mode": "hash",
-                "zippy_shard_version": 1,
-                "zippy_shards": shard_names,
-            },
-        )
+    assert master.source_records[0] == (
+        "test_ingest.openctp_ticks",
+        "pipeline",
+        "openctp_ticks",
+        {
+            "zippy_table_kind": "append_table",
+            "zippy_sharded": True,
+            "zippy_shard_key": ["instrument_id"],
+            "zippy_shard_nums": 3,
+            "zippy_shard_mode": "hash",
+            "zippy_shard_version": 1,
+            "zippy_shards": shard_names,
+        },
+    )
+    assert [(source, output) for source, _kind, output, _config in master.source_records[1:]] == [
+        ("test_ingest.openctp_ticks.openctp_ticks.__shard_0000", shard_names[0]),
+        ("test_ingest.openctp_ticks.openctp_ticks.__shard_0001", shard_names[1]),
+        ("test_ingest.openctp_ticks.openctp_ticks.__shard_0002", shard_names[2]),
     ]
+    for shard_index, (_source, _kind, _output, config) in enumerate(master.source_records[1:]):
+        assert config["zippy_table_kind"] == "append_table"
+        assert config["zippy_internal"] is True
+        assert config["zippy_logical_parent"] == "openctp_ticks"
+        assert config["zippy_shard_index"] == shard_index
+        assert config["zippy_shard_nums"] == 3
+        assert config["zippy_shard_key"] == ["instrument_id"]
 
     assert len(materializers) == 1
     kwargs = materializers[0].kwargs
@@ -16645,6 +16813,7 @@ def test_pipeline_stream_table_shard_auto_registers_logical_and_physical_streams
         assert descriptor["zippy_shard_key"] == ["instrument_id"]
         assert descriptor["zippy_shard_mode"] == "hash"
         assert descriptor["zippy_shard_version"] == 1
+        assert "writer_epoch" not in descriptor
 
 
 @pytest.mark.parametrize(
@@ -16689,10 +16858,14 @@ def test_pipeline_stream_table_shard_unregisters_source_after_late_failure(
             persist=None,
             shard_key="instrument_id",
             shard_nums=2,
-        )
+    )
 
     assert master.source_records[0][0] == "test_ingest.openctp_ticks"
-    assert master.unregistered_sources == ["test_ingest.openctp_ticks"]
+    assert master.unregistered_sources == [
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0001",
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0000",
+        "test_ingest.openctp_ticks",
+    ]
 
 
 def test_pipeline_stream_table_shard_rejects_source_registration_failure_without_unregister(
