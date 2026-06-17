@@ -4262,6 +4262,35 @@ class Table:
         """
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        shard_names = self._logical_shard_names_for_collect()
+        if shard_names:
+            no_pushdown_plan = {"row_range": None, "columns": None, "filters": None}
+            return {
+                "source": self.source,
+                "snapshot": self._snapshot_enabled,
+                "executor": "sharded_fanout",
+                "sharded": True,
+                "shards": list(shard_names),
+                "original_plan": _query_plan_to_json(self._plan_ops),
+                "optimized_plan": _query_plan_to_json(optimized_plan),
+                "pushdown": {
+                    "tail": None,
+                    "head": None,
+                    "slice": None,
+                    "columns": None,
+                    "filters": None,
+                },
+                "pushdown_plan": no_pushdown_plan,
+                "global_plan": _query_plan_to_json(optimized_plan),
+                "residual_plan": _query_plan_to_json(optimized_plan),
+                "capability": {
+                    "executor": "sharded_fanout",
+                    "fanout": "physical_shards",
+                    "residual_execution": "local_after_concat",
+                    "unsupported_gateway_ops": [],
+                },
+            }
+
         pushdown_plan = self._pushdown_plan_summary(schema, optimized_plan)
         explanation = {
             "source": self.source,
@@ -4446,6 +4475,26 @@ class Table:
     def _new_query_metrics(self) -> dict[str, object]:
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        shard_names = self._logical_shard_names_for_collect()
+        if shard_names:
+            no_pushdown_plan = {"row_range": None, "columns": None, "filters": None}
+            return {
+                "executor": "sharded_fanout",
+                "sharded": True,
+                "shards_scanned": len(shard_names),
+                "shard_names": list(shard_names),
+                "original_plan": _query_plan_to_json(self._plan_ops),
+                "optimized_plan": _query_plan_to_json(optimized_plan),
+                "pushdown_plan": no_pushdown_plan,
+                "global_plan": _query_plan_to_json(optimized_plan),
+                "residual_plan": _query_plan_to_json(optimized_plan),
+                "scanned_files": [],
+                "scanned_rows": 0,
+                "scanned_live_rows": 0,
+                "returned_rows": None,
+                "elapsed_ms": None,
+            }
+
         return {
             "executor": self._executor_kind(),
             "original_plan": _query_plan_to_json(self._plan_ops),
@@ -4500,9 +4549,12 @@ class Table:
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         if metrics is not None:
+            metrics["executor"] = "sharded_fanout"
             metrics["sharded"] = True
             metrics["shards_scanned"] = len(shard_names)
             metrics["shard_names"] = list(shard_names)
+            metrics["global_plan"] = _query_plan_to_json(optimized_plan)
+            metrics["residual_plan"] = _query_plan_to_json(optimized_plan)
 
         shard_tables = []
         fixed_shard_snapshots = None

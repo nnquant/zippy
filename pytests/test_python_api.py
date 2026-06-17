@@ -12284,9 +12284,41 @@ def test_read_table_and_shard_profile_marks_sharded(monkeypatch) -> None:
     profile = zippy.read_table("ticks", master=master, snapshot=False).head(3).profile()
 
     assert profile["result"].column("seq").to_pylist() == [1, 2, 3]
+    assert profile["metrics"]["executor"] == "sharded_fanout"
     assert profile["metrics"]["returned_rows"] == 3
     assert profile["metrics"]["sharded"] is True
     assert profile["metrics"]["shards_scanned"] == 2
+    assert profile["metrics"]["shard_names"] == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert profile["metrics"]["pushdown_plan"] == {
+        "row_range": None,
+        "columns": None,
+        "filters": None,
+    }
+
+
+def test_read_table_and_shard_explain_marks_global_execution(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    explain = zippy.read_table("ticks", master=master, snapshot=False).head(3).explain()
+
+    assert explain["executor"] == "sharded_fanout"
+    assert explain["sharded"] is True
+    assert explain["shards"] == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert explain["pushdown"] == {
+        "tail": None,
+        "head": None,
+        "slice": None,
+        "columns": None,
+        "filters": None,
+    }
+    assert explain["pushdown_plan"] == {"row_range": None, "columns": None, "filters": None}
+    assert explain["global_plan"] == explain["residual_plan"]
+    assert explain["capability"] == {
+        "executor": "sharded_fanout",
+        "fanout": "physical_shards",
+        "residual_execution": "local_after_concat",
+        "unsupported_gateway_ops": [],
+    }
 
 
 def test_read_table_and_shard_physical_stream_does_not_fan_out(monkeypatch) -> None:
