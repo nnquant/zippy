@@ -5934,8 +5934,19 @@ impl StreamTableMaterializer {
 
     fn failed_shards(&self, py: Python<'_>) -> PyResult<PyObject> {
         let failures = PyList::empty_bound(py);
-        let Some(StreamTableEngineVariant::Sharded(engine)) = self.engine.as_ref() else {
+        if self.shard_metadata.is_none() {
             return Ok(failures.into_any().unbind());
+        }
+
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            py_runtime_error(
+                "sharded stream table failed shards are unavailable after the engine has started",
+            )
+        })?;
+        let StreamTableEngineVariant::Sharded(engine) = engine else {
+            return Err(py_runtime_error(
+                "sharded stream table failed shards are unavailable for non-sharded engine state",
+            ));
         };
 
         for failure in engine.failed_shards() {
@@ -10522,17 +10533,89 @@ mod tests {
         prepare_python_for_tests();
         Python::with_gil(|py| {
             let (_module, class, target) = stream_table_class(py);
+            let callable = PyModule::import_bound(py, "builtins")
+                .unwrap()
+                .getattr("print")
+                .unwrap()
+                .into_py(py);
+            let cases = vec![
+                (
+                    "descriptor_publisher",
+                    callable.clone_ref(py),
+                    "descriptor_publisher",
+                ),
+                (
+                    "descriptor_forwarding",
+                    true.into_py(py),
+                    "descriptor_forwarding",
+                ),
+                (
+                    "persist_path",
+                    "/tmp/zippy-sharded-stream-table".into_py(py),
+                    "persist_path",
+                ),
+                (
+                    "persist_publisher",
+                    callable.clone_ref(py),
+                    "persist_publisher",
+                ),
+                (
+                    "retention_segments",
+                    2usize.into_py(py),
+                    "retention_segments",
+                ),
+                ("retention_guard", callable.clone_ref(py), "retention_guard"),
+                ("writer_epoch", 7u64.into_py(py), "writer_epoch"),
+            ];
+
+            for (option, value, expected) in cases {
+                let kwargs = PyDict::new_bound(py);
+                kwargs.set_item("shard_key", vec!["symbol"]).unwrap();
+                kwargs.set_item("shard_nums", 2).unwrap();
+                kwargs.set_item(option, value).unwrap();
+
+                let error = class
+                    .call(
+                        ("ticks", py_stream_table_schema(py), target.clone_ref(py)),
+                        Some(&kwargs),
+                    )
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!(
+                        "{} currently unsupported for sharded stream tables",
+                        expected
+                    )),
+                    "expected unsupported error for option=[{}], got [{}]",
+                    option,
+                    error
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn stream_table_materializer_rejects_failed_shards_after_sharded_engine_start() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
             let kwargs = PyDict::new_bound(py);
             kwargs.set_item("shard_key", vec!["symbol"]).unwrap();
             kwargs.set_item("shard_nums", 2).unwrap();
-            kwargs.set_item("descriptor_forwarding", true).unwrap();
 
-            let error = class
+            let engine = class
                 .call(("ticks", py_stream_table_schema(py), target), Some(&kwargs))
+                .unwrap();
+            engine.call_method0("start").unwrap();
+
+            let error = engine
+                .call_method0("failed_shards")
                 .unwrap_err()
                 .to_string();
-            assert!(error
-                .contains("descriptor_forwarding currently unsupported for sharded stream tables"));
+            assert!(error.contains(
+                "sharded stream table failed shards are unavailable after the engine has started"
+            ));
+            engine.call_method0("stop").unwrap();
         });
     }
 
