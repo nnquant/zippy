@@ -22,6 +22,8 @@ use zippy_segment_store::{
     SegmentCellValue, SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
 };
 
+use crate::stream_table_shard::{ShardConfig, ShardRouter};
+
 use crate::latest_state::{LatestColumnarState, LatestUpdateSet};
 
 const STREAM_TABLE_PARTITION: &str = "all";
@@ -114,6 +116,33 @@ pub struct StreamTableMaterializer {
     persist_publisher: Option<Arc<dyn StreamTablePersistPublisher>>,
     retention_guard: Option<Arc<dyn StreamTableRetentionGuard>>,
     persist_worker: Option<StreamTablePersistWorker>,
+}
+
+/// A shard-level write or lifecycle failure captured by a sharded materializer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardFailure {
+    /// Lifecycle action that produced the failure.
+    pub action: String,
+    /// Zero-based shard index.
+    pub shard_index: usize,
+    /// Physical stream table name for the shard.
+    pub shard_name: String,
+    /// Root error text returned by the shard materializer.
+    pub error: String,
+}
+
+/// Routes logical stream-table batches into per-shard stream table materializers.
+///
+/// Routing and split failures are all-or-fail at the logical batch boundary before any shard is
+/// written. If a shard write commits and a later shard write fails, the failure is recorded and
+/// returned, but this first version does not attempt cross-shard rollback.
+pub struct ShardedStreamTableMaterializer {
+    logical_name: String,
+    input_schema: SchemaRef,
+    router: ShardRouter,
+    shard_names: Vec<String>,
+    shards: Vec<StreamTableMaterializer>,
+    failed_shards: Vec<ShardFailure>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1849,6 +1878,174 @@ impl StreamTableMaterializer {
     }
 }
 
+impl ShardedStreamTableMaterializer {
+    /// Create a sharded stream table materializer with the default row capacity.
+    ///
+    /// :param logical_name: Logical stream table name exposed to downstream engines.
+    /// :type logical_name: impl Into<String>
+    /// :param input_schema: Input schema consumed by every shard.
+    /// :type input_schema: SchemaRef
+    /// :param config: Deterministic shard routing configuration.
+    /// :type config: ShardConfig
+    /// :returns: Initialized sharded materializer.
+    /// :rtype: Result<ShardedStreamTableMaterializer>
+    pub fn new(
+        logical_name: impl Into<String>,
+        input_schema: SchemaRef,
+        config: ShardConfig,
+    ) -> Result<Self> {
+        Self::new_with_row_capacity(
+            logical_name,
+            input_schema,
+            config,
+            DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+        )
+    }
+
+    /// Create a sharded stream table materializer with an explicit row capacity.
+    ///
+    /// :param logical_name: Logical stream table name exposed to downstream engines.
+    /// :type logical_name: impl Into<String>
+    /// :param input_schema: Input schema consumed by every shard.
+    /// :type input_schema: SchemaRef
+    /// :param config: Deterministic shard routing configuration.
+    /// :type config: ShardConfig
+    /// :param row_capacity: Active segment row capacity for each shard.
+    /// :type row_capacity: usize
+    /// :returns: Initialized sharded materializer.
+    /// :rtype: Result<ShardedStreamTableMaterializer>
+    pub fn new_with_row_capacity(
+        logical_name: impl Into<String>,
+        input_schema: SchemaRef,
+        config: ShardConfig,
+        row_capacity: usize,
+    ) -> Result<Self> {
+        let logical_name = logical_name.into();
+        let shard_count = config.shard_nums();
+        let router = ShardRouter::try_new(Arc::clone(&input_schema), config)?;
+        let shard_names = (0..shard_count)
+            .map(|shard_index| Self::shard_stream_name(&logical_name, shard_index))
+            .collect::<Vec<_>>();
+        let shards = shard_names
+            .iter()
+            .map(|shard_name| {
+                StreamTableMaterializer::new_with_row_capacity(
+                    shard_name.clone(),
+                    Arc::clone(&input_schema),
+                    row_capacity,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            logical_name,
+            input_schema,
+            router,
+            shard_names,
+            shards,
+            failed_shards: Vec::new(),
+        })
+    }
+
+    /// Return the deterministic physical stream name for a logical shard.
+    pub fn shard_stream_name(logical_name: &str, shard_index: usize) -> String {
+        format!("{}.__shard_{:04}", logical_name, shard_index)
+    }
+
+    /// Return all physical shard stream names.
+    pub fn shard_names(&self) -> &[String] {
+        &self.shard_names
+    }
+
+    /// Export one shard's active segment descriptor envelope.
+    pub fn active_descriptor_envelope_bytes(&self, shard_index: usize) -> Result<Vec<u8>> {
+        self.shard(shard_index)?.active_descriptor_envelope_bytes()
+    }
+
+    /// Export every shard's active segment descriptor envelope.
+    pub fn active_descriptors_envelope_bytes(&self) -> Result<Vec<Vec<u8>>> {
+        self.shards
+            .iter()
+            .map(StreamTableMaterializer::active_descriptor_envelope_bytes)
+            .collect()
+    }
+
+    /// Return a debug Arrow snapshot of one shard's active segment.
+    pub fn shard_active_record_batch(&self, shard_index: usize) -> Result<RecordBatch> {
+        self.shard(shard_index)?.active_record_batch()
+    }
+
+    /// Return committed active row counts for all shards.
+    pub fn shard_row_counts(&self) -> Vec<usize> {
+        self.shards
+            .iter()
+            .map(StreamTableMaterializer::active_committed_row_count)
+            .collect()
+    }
+
+    /// Return shard write or lifecycle failures observed by this wrapper.
+    pub fn failed_shards(&self) -> &[ShardFailure] {
+        &self.failed_shards
+    }
+
+    fn shard(&self, shard_index: usize) -> Result<&StreamTableMaterializer> {
+        self.shards
+            .get(shard_index)
+            .ok_or_else(|| self.shard_index_error(shard_index))
+    }
+
+    fn shard_index_error(&self, shard_index: usize) -> ZippyError {
+        ZippyError::InvalidConfig {
+            reason: format!(
+                "stream table shard index out of bounds logical=[{}] shard_index=[{}] shard_count=[{}]",
+                self.logical_name,
+                shard_index,
+                self.shards.len()
+            ),
+        }
+    }
+
+    fn route_error(&self, action: &str, error: ZippyError) -> ZippyError {
+        ZippyError::Io {
+            reason: format!(
+                "sharded stream table materializer failed action=[{}] logical=[{}] error=[{}]",
+                action, self.logical_name, error
+            ),
+        }
+    }
+
+    fn record_shard_failure(
+        &mut self,
+        action: &str,
+        shard_index: usize,
+        error: ZippyError,
+    ) -> ZippyError {
+        let shard_name = self.shard_names[shard_index].clone();
+        let root_error = error.to_string();
+        if let Some(failure) = self
+            .failed_shards
+            .iter_mut()
+            .find(|failure| failure.action == action && failure.shard_index == shard_index)
+        {
+            failure.shard_name.clone_from(&shard_name);
+            failure.error.clone_from(&root_error);
+        } else {
+            self.failed_shards.push(ShardFailure {
+                action: action.to_string(),
+                shard_index,
+                shard_name: shard_name.clone(),
+                error: root_error.clone(),
+            });
+        }
+        ZippyError::Io {
+            reason: format!(
+                "sharded stream table materializer failed action=[{}] logical=[{}] shard_index=[{}] shard_name=[{}] error=[{}]",
+                action, self.logical_name, shard_index, shard_name, root_error
+            ),
+        }
+    }
+}
+
 impl KeyValueTableMaterializer {
     /// Create a new key-value table materializer.
     ///
@@ -2867,6 +3064,79 @@ impl Engine for StreamTableMaterializer {
     }
 }
 
+impl Engine for ShardedStreamTableMaterializer {
+    fn name(&self) -> &str {
+        &self.logical_name
+    }
+
+    fn input_schema(&self) -> SchemaRef {
+        Arc::clone(&self.input_schema)
+    }
+
+    fn output_schema(&self) -> SchemaRef {
+        Arc::clone(&self.input_schema)
+    }
+
+    fn on_data(&mut self, table: SegmentTableView) -> Result<Vec<SegmentTableView>> {
+        // Split the whole logical batch before writing any shard. Later shard write failures are
+        // reported and recorded without cross-shard rollback.
+        let batch = table
+            .to_record_batch()
+            .map_err(|error| self.route_error("prepare_batch", error))?;
+        let split_batches = self
+            .router
+            .split_batch(&batch)
+            .map_err(|error| self.route_error("split_batch", error))?;
+
+        for (shard_index, split_batch) in split_batches.into_iter().enumerate() {
+            let Some(split_batch) = split_batch else {
+                continue;
+            };
+            let result =
+                self.shards[shard_index].on_data(SegmentTableView::from_record_batch(split_batch));
+            if let Err(error) = result {
+                return Err(self.record_shard_failure("write", shard_index, error));
+            }
+        }
+
+        Ok(vec![table])
+    }
+
+    fn on_flush(&mut self) -> Result<Vec<SegmentTableView>> {
+        let mut first_error = None;
+        for shard_index in 0..self.shards.len() {
+            let result = self.shards[shard_index].on_flush();
+            if let Err(error) = result {
+                let wrapped = self.record_shard_failure("flush", shard_index, error);
+                if first_error.is_none() {
+                    first_error = Some(wrapped);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(vec![])
+    }
+
+    fn on_stop(&mut self) -> Result<Vec<SegmentTableView>> {
+        let mut first_error = None;
+        for shard_index in 0..self.shards.len() {
+            let result = self.shards[shard_index].on_stop();
+            if let Err(error) = result {
+                let wrapped = self.record_shard_failure("stop", shard_index, error);
+                if first_error.is_none() {
+                    first_error = Some(wrapped);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(vec![])
+    }
+}
+
 fn compile_arrow_schema(schema: &SchemaRef) -> Result<zippy_segment_store::CompiledSchema> {
     let columns = schema
         .fields()
@@ -2910,5 +3180,56 @@ fn compile_arrow_schema(schema: &SchemaRef) -> Result<zippy_segment_store::Compi
 fn segment_error(error: ZippySegmentStoreError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod sharded_materializer_tests {
+    use super::*;
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Arc::new(Field::new("instrument_id", DataType::Utf8, false)),
+            Arc::new(Field::new("last_price", DataType::Float64, false)),
+        ]))
+    }
+
+    #[test]
+    fn sharded_materializer_replaces_repeated_failure_for_same_action_and_shard() {
+        let config = ShardConfig::new(vec!["instrument_id".to_string()], 2, 1).unwrap();
+        let mut materializer =
+            ShardedStreamTableMaterializer::new("ticks", test_schema(), config).unwrap();
+
+        let _ = materializer.record_shard_failure(
+            "flush",
+            0,
+            ZippyError::Io {
+                reason: "first failure".to_string(),
+            },
+        );
+        let _ = materializer.record_shard_failure(
+            "flush",
+            0,
+            ZippyError::Io {
+                reason: "second failure".to_string(),
+            },
+        );
+
+        assert_eq!(materializer.failed_shards().len(), 1);
+        assert_eq!(materializer.failed_shards()[0].action, "flush");
+        assert_eq!(materializer.failed_shards()[0].shard_index, 0);
+        assert!(materializer.failed_shards()[0]
+            .error
+            .contains("second failure"));
+
+        let _ = materializer.record_shard_failure(
+            "stop",
+            0,
+            ZippyError::Io {
+                reason: "stop failure".to_string(),
+            },
+        );
+
+        assert_eq!(materializer.failed_shards().len(), 2);
     }
 }

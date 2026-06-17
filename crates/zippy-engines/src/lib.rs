@@ -18,9 +18,10 @@ pub use cross_sectional::CrossSectionalEngine;
 pub use reactive::{ReactiveInvalidValuePolicy, ReactiveStateEngine, ReactiveStateFailurePolicy};
 pub use reactive_latest::ReactiveLatestEngine;
 pub use stream_table::{
-    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,
-    StreamTablePersistConfig, StreamTablePersistPartitionSpec, StreamTablePersistPublisher,
-    StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+    KeyValueTableMaterializer, ShardFailure, ShardedStreamTableMaterializer,
+    StreamTableDescriptorPublisher, StreamTableMaterializer, StreamTablePersistConfig,
+    StreamTablePersistPartitionSpec, StreamTablePersistPublisher, StreamTableRetentionGuard,
+    DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
 pub use stream_table_shard::{ShardConfig, ShardRouter, ShardValue};
 pub use testing::hash_record_batches;

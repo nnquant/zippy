@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,9 +15,10 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use zippy_core::{Engine, SegmentTableView, ZippyError};
 use zippy_engines::{
-    KeyValueTableMaterializer, StreamTableDescriptorPublisher, StreamTableMaterializer,
-    StreamTablePersistConfig, StreamTablePersistPartitionSpec, StreamTablePersistPublisher,
-    StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
+    KeyValueTableMaterializer, ShardConfig, ShardedStreamTableMaterializer,
+    StreamTableDescriptorPublisher, StreamTableMaterializer, StreamTablePersistConfig,
+    StreamTablePersistPartitionSpec, StreamTablePersistPublisher, StreamTableRetentionGuard,
+    DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
@@ -26,6 +28,18 @@ use zippy_segment_store::{
 fn input_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Arc::new(Field::new("instrument_id", DataType::Utf8, false)),
+        Arc::new(Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        )),
+        Arc::new(Field::new("last_price", DataType::Float64, false)),
+    ]))
+}
+
+fn nullable_shard_key_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Arc::new(Field::new("instrument_id", DataType::Utf8, true)),
         Arc::new(Field::new(
             "dt",
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -105,6 +119,24 @@ fn input_batch_with_rows(rows: usize) -> RecordBatch {
     .unwrap()
 }
 
+fn nullable_shard_key_batch_with_null() -> RecordBatch {
+    RecordBatch::try_new(
+        nullable_shard_key_schema(),
+        vec![
+            Arc::new(StringArray::from(vec![Some("IF2606"), None])) as ArrayRef,
+            Arc::new(
+                TimestampNanosecondArray::from(vec![
+                    1_710_000_000_000_000_000_i64,
+                    1_710_000_000_100_000_000_i64,
+                ])
+                .with_timezone("UTC"),
+            ) as ArrayRef,
+            Arc::new(Float64Array::from(vec![3912.4, 2740.8])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
 fn segment_table_view_with_rows(rows: usize) -> SegmentTableView {
     let store = SegmentStore::new(SegmentStoreConfig {
         default_row_capacity: rows.max(1),
@@ -179,6 +211,107 @@ fn empty_input_batch() -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[test]
+fn sharded_materializer_stream_names_are_zero_padded() {
+    assert_eq!(
+        ShardedStreamTableMaterializer::shard_stream_name("ticks", 0),
+        "ticks.__shard_0000"
+    );
+    assert_eq!(
+        ShardedStreamTableMaterializer::shard_stream_name("ticks", 42),
+        "ticks.__shard_0042"
+    );
+}
+
+#[test]
+fn sharded_materializer_writes_rows_to_stable_key_shards_and_passes_input_through() {
+    let config = ShardConfig::new(vec!["instrument_id".to_string()], 4, 1).unwrap();
+    let mut materializer =
+        ShardedStreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), config, 32)
+            .unwrap();
+    let batch = input_batch_with_rows(8);
+
+    let outputs = materializer
+        .on_data(SegmentTableView::from_record_batch(batch.clone()))
+        .unwrap();
+
+    assert_eq!(materializer.name(), "ticks");
+    assert_eq!(materializer.input_schema(), batch.schema());
+    assert_eq!(materializer.output_schema(), batch.schema());
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].num_rows(), batch.num_rows());
+    assert_eq!(
+        outputs[0].column("instrument_id").unwrap().to_data(),
+        batch.column(0).to_data()
+    );
+    assert_eq!(materializer.shard_row_counts().iter().sum::<usize>(), 8);
+
+    let mut shard_by_key = BTreeMap::<String, usize>::new();
+    for shard_index in 0..materializer.shard_row_counts().len() {
+        let shard_batch = materializer.shard_active_record_batch(shard_index).unwrap();
+        let instruments = shard_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row_index in 0..shard_batch.num_rows() {
+            let key = instruments.value(row_index).to_string();
+            if let Some(previous_shard_index) = shard_by_key.insert(key, shard_index) {
+                assert_eq!(previous_shard_index, shard_index);
+            }
+        }
+    }
+    assert_eq!(shard_by_key.len(), 2);
+    assert!(materializer.failed_shards().is_empty());
+}
+
+#[test]
+fn sharded_materializer_rejects_null_shard_key_without_writing_any_shard() {
+    let config = ShardConfig::new(vec!["instrument_id".to_string()], 4, 1).unwrap();
+    let mut materializer =
+        ShardedStreamTableMaterializer::new("ticks", nullable_shard_key_schema(), config).unwrap();
+
+    let error = materializer
+        .on_data(SegmentTableView::from_record_batch(
+            nullable_shard_key_batch_with_null(),
+        ))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("null"));
+    assert_eq!(materializer.shard_row_counts(), vec![0, 0, 0, 0]);
+}
+
+#[test]
+fn sharded_materializer_flush_and_stop_do_not_panic() {
+    let config = ShardConfig::new(vec!["instrument_id".to_string()], 3, 1).unwrap();
+    let mut materializer =
+        ShardedStreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), config, 32)
+            .unwrap();
+
+    assert!(materializer.on_flush().unwrap().is_empty());
+    assert!(materializer.on_stop().unwrap().is_empty());
+}
+
+#[test]
+fn sharded_materializer_exports_one_active_descriptor_per_shard() {
+    let config = ShardConfig::new(vec!["instrument_id".to_string()], 5, 1).unwrap();
+    let materializer =
+        ShardedStreamTableMaterializer::new_with_row_capacity("ticks", input_schema(), config, 32)
+            .unwrap();
+
+    let descriptors = materializer.active_descriptors_envelope_bytes().unwrap();
+
+    assert_eq!(descriptors.len(), 5);
+    fn accepts_borrowed_shard_names(_names: &[String]) {}
+
+    accepts_borrowed_shard_names(materializer.shard_names());
+    assert_eq!(materializer.shard_names().len(), 5);
+    assert_eq!(
+        materializer.active_descriptor_envelope_bytes(0).unwrap(),
+        descriptors[0]
+    );
 }
 
 #[test]
