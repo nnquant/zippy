@@ -9544,6 +9544,9 @@ class Pipeline:
         """
         Materialize pipeline input into a named stream table.
 
+        See ``docs/stream-table-sharding.md`` for sharding semantics and
+        first-version operational boundaries.
+
         :param name: Named stream table.
         :type name: str
         :param schema: Arrow schema for the stream. When omitted, ``source._zippy_output_schema()``
