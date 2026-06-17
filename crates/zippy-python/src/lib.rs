@@ -39,7 +39,7 @@ use zippy_engines::{
     ReactiveLatestEngine as RustReactiveLatestEngine,
     ReactiveStateEngine as RustReactiveStateEngine,
     ReactiveStateFailurePolicy as RustReactiveStateFailurePolicy,
-    SessionWindow as RustSessionWindow, ShardConfig,
+    SessionWindow as RustSessionWindow, ShardConfig, ShardFailure as RustShardFailure,
     ShardedStreamTableMaterializer as RustShardedStreamTableMaterializer,
     StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
     StreamTableMaterializer as RustStreamTableMaterializer, StreamTablePersistConfig,
@@ -5218,6 +5218,7 @@ struct StreamTableMaterializer {
     handle: SharedHandle,
     engine: Option<StreamTableEngineVariant>,
     shard_metadata: Option<StreamTableShardMetadata>,
+    shard_failures: Option<Arc<Mutex<Vec<RustShardFailure>>>>,
     remote_source: Option<RemoteSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
@@ -5629,7 +5630,8 @@ impl StreamTableMaterializer {
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let row_capacity = row_capacity.unwrap_or(DEFAULT_STREAM_TABLE_ROW_CAPACITY);
-        let (engine, output_schema, shard_metadata) = match (shard_key, shard_nums) {
+        let (engine, output_schema, shard_metadata, shard_failures) = match (shard_key, shard_nums)
+        {
             (None, None) => {
                 if shard_stream_names.is_some() {
                     return Err(py_value_error(
@@ -5702,6 +5704,7 @@ impl StreamTableMaterializer {
                     StreamTableEngineVariant::Single(engine),
                     output_schema,
                     None,
+                    None,
                 )
             }
             (Some(_), None) => {
@@ -5755,6 +5758,7 @@ impl StreamTableMaterializer {
                 )
                 .map_err(|error| py_value_error(error.to_string()))?;
                 let output_schema = engine.output_schema();
+                let shard_failures = engine.failed_shards_handle();
                 let shard_metadata = StreamTableShardMetadata {
                     shard_key,
                     shard_nums,
@@ -5765,6 +5769,7 @@ impl StreamTableMaterializer {
                     StreamTableEngineVariant::Sharded(engine),
                     output_schema,
                     Some(shard_metadata),
+                    Some(shard_failures),
                 )
             }
         };
@@ -5795,6 +5800,7 @@ impl StreamTableMaterializer {
             handle,
             engine: Some(engine),
             shard_metadata,
+            shard_failures,
             remote_source,
             segment_source,
             python_source,
@@ -5934,22 +5940,11 @@ impl StreamTableMaterializer {
 
     fn failed_shards(&self, py: Python<'_>) -> PyResult<PyObject> {
         let failures = PyList::empty_bound(py);
-        if self.shard_metadata.is_none() {
+        let Some(shard_failures) = self.shard_failures.as_ref() else {
             return Ok(failures.into_any().unbind());
-        }
-
-        let engine = self.engine.as_ref().ok_or_else(|| {
-            py_runtime_error(
-                "sharded stream table failed shards are unavailable after the engine has started",
-            )
-        })?;
-        let StreamTableEngineVariant::Sharded(engine) = engine else {
-            return Err(py_runtime_error(
-                "sharded stream table failed shards are unavailable for non-sharded engine state",
-            ));
         };
 
-        for failure in engine.failed_shards() {
+        for failure in shard_failures.lock().unwrap().iter() {
             let item = PyDict::new_bound(py);
             item.set_item("action", &failure.action)?;
             item.set_item("shard_index", failure.shard_index)?;
@@ -8792,7 +8787,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use pyo3::types::PyList;
     use std::process::Command;
-    use std::sync::Once;
+    use std::sync::{Once, OnceLock};
     use zippy_engines::{
         ReactiveStateEngine as RustReactiveStateEngine, TimeSeriesEngine as RustTimeSeriesEngine,
     };
@@ -8800,17 +8795,13 @@ mod tests {
 
     const MINUTE_NS: i64 = 60_000_000_000;
     static PYTHON_TEST_INIT: Once = Once::new();
+    static PYTHON_SITE_PACKAGES: OnceLock<Vec<String>> = OnceLock::new();
 
     fn prepare_python_for_tests() {
         PYTHON_TEST_INIT.call_once(|| {
             if std::env::var_os("PYTHONHOME").is_none() {
                 if let Some(home) = python_base_prefix_for_tests() {
                     std::env::set_var("PYTHONHOME", home);
-                }
-            }
-            if std::env::var_os("PYTHONPATH").is_none() {
-                if let Some(path) = python_site_packages_for_tests() {
-                    std::env::set_var("PYTHONPATH", path);
                 }
             }
             pyo3::prepare_freethreaded_python();
@@ -8831,18 +8822,44 @@ mod tests {
         (!home.is_empty()).then_some(home)
     }
 
-    fn python_site_packages_for_tests() -> Option<String> {
-        let python = std::env::var_os("PYO3_PYTHON")?;
-        let output = Command::new(python)
-            .arg("-c")
-            .arg("import site; print(':'.join(site.getsitepackages()))")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+    fn python_site_packages_for_tests() -> &'static Vec<String> {
+        PYTHON_SITE_PACKAGES.get_or_init(|| {
+            let Some(python) = std::env::var_os("PYO3_PYTHON") else {
+                return Vec::new();
+            };
+            let Ok(output) = Command::new(python)
+                .arg("-c")
+                .arg("import site; print('\\n'.join(site.getsitepackages()))")
+                .output()
+            else {
+                return Vec::new();
+            };
+            if !output.status.success() {
+                return Vec::new();
+            }
+            let Ok(text) = String::from_utf8(output.stdout) else {
+                return Vec::new();
+            };
+            text.lines()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+    }
+
+    fn ensure_python_site_packages_on_sys_path(py: Python<'_>) -> PyResult<()> {
+        let sys = PyModule::import_bound(py, "sys")?;
+        let sys_path = sys.getattr("path")?;
+        for path in python_site_packages_for_tests() {
+            let contains = sys_path
+                .call_method1("__contains__", (path.as_str(),))?
+                .extract::<bool>()?;
+            if !contains {
+                sys_path.call_method1("append", (path.as_str(),))?;
+            }
         }
-        let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-        (!path.is_empty()).then_some(path)
+        Ok(())
     }
 
     fn tick_schema() -> Arc<Schema> {
@@ -10375,6 +10392,7 @@ mod tests {
     fn stream_table_class<'py>(
         py: Python<'py>,
     ) -> (Bound<'py, PyModule>, Bound<'py, PyAny>, Py<PyAny>) {
+        ensure_python_site_packages_on_sys_path(py).unwrap();
         let module = PyModule::new_bound(py, "zippy._internal").unwrap();
         _internal(py, &module).unwrap();
         let class = module.getattr("StreamTableMaterializer").unwrap();
@@ -10383,6 +10401,7 @@ mod tests {
     }
 
     fn py_stream_table_schema(py: Python<'_>) -> PyObject {
+        ensure_python_site_packages_on_sys_path(py).unwrap();
         tick_schema()
             .as_ref()
             .to_pyarrow(py)
@@ -10595,7 +10614,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_table_materializer_rejects_failed_shards_after_sharded_engine_start() {
+    fn stream_table_materializer_reads_failed_shards_after_sharded_engine_start() {
         prepare_python_for_tests();
         Python::with_gil(|py| {
             let (_module, class, target) = stream_table_class(py);
@@ -10608,13 +10627,13 @@ mod tests {
                 .unwrap();
             engine.call_method0("start").unwrap();
 
-            let error = engine
+            let failures = engine
                 .call_method0("failed_shards")
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(
-                "sharded stream table failed shards are unavailable after the engine has started"
-            ));
+                .unwrap()
+                .downcast::<PyList>()
+                .unwrap()
+                .len();
+            assert_eq!(failures, 0);
             engine.call_method0("stop").unwrap();
         });
     }

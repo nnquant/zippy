@@ -142,7 +142,7 @@ pub struct ShardedStreamTableMaterializer {
     router: ShardRouter,
     shard_names: Vec<String>,
     shards: Vec<StreamTableMaterializer>,
-    failed_shards: Vec<ShardFailure>,
+    failed_shards: Arc<Mutex<Vec<ShardFailure>>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1943,7 +1943,7 @@ impl ShardedStreamTableMaterializer {
             router,
             shard_names,
             shards,
-            failed_shards: Vec::new(),
+            failed_shards: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1984,8 +1984,13 @@ impl ShardedStreamTableMaterializer {
     }
 
     /// Return shard write or lifecycle failures observed by this wrapper.
-    pub fn failed_shards(&self) -> &[ShardFailure] {
-        &self.failed_shards
+    pub fn failed_shards(&self) -> Vec<ShardFailure> {
+        self.failed_shards.lock().unwrap().clone()
+    }
+
+    /// Return a shared failure-state handle for observers outside the engine runtime.
+    pub fn failed_shards_handle(&self) -> Arc<Mutex<Vec<ShardFailure>>> {
+        Arc::clone(&self.failed_shards)
     }
 
     fn shard(&self, shard_index: usize) -> Result<&StreamTableMaterializer> {
@@ -2022,20 +2027,22 @@ impl ShardedStreamTableMaterializer {
     ) -> ZippyError {
         let shard_name = self.shard_names[shard_index].clone();
         let root_error = error.to_string();
-        if let Some(failure) = self
-            .failed_shards
-            .iter_mut()
-            .find(|failure| failure.action == action && failure.shard_index == shard_index)
         {
-            failure.shard_name.clone_from(&shard_name);
-            failure.error.clone_from(&root_error);
-        } else {
-            self.failed_shards.push(ShardFailure {
-                action: action.to_string(),
-                shard_index,
-                shard_name: shard_name.clone(),
-                error: root_error.clone(),
-            });
+            let mut failed_shards = self.failed_shards.lock().unwrap();
+            if let Some(failure) = failed_shards
+                .iter_mut()
+                .find(|failure| failure.action == action && failure.shard_index == shard_index)
+            {
+                failure.shard_name.clone_from(&shard_name);
+                failure.error.clone_from(&root_error);
+            } else {
+                failed_shards.push(ShardFailure {
+                    action: action.to_string(),
+                    shard_index,
+                    shard_name: shard_name.clone(),
+                    error: root_error.clone(),
+                });
+            }
         }
         ZippyError::Io {
             reason: format!(
@@ -3231,5 +3238,28 @@ mod sharded_materializer_tests {
         );
 
         assert_eq!(materializer.failed_shards().len(), 2);
+    }
+
+    #[test]
+    fn sharded_materializer_failure_state_is_shared_after_move() {
+        let config = ShardConfig::new(vec!["instrument_id".to_string()], 2, 1).unwrap();
+        let materializer =
+            ShardedStreamTableMaterializer::new("ticks", test_schema(), config).unwrap();
+        let failure_state = materializer.failed_shards_handle();
+
+        let mut materializer = materializer;
+        let _ = materializer.record_shard_failure(
+            "flush",
+            1,
+            ZippyError::Io {
+                reason: "shared failure".to_string(),
+            },
+        );
+
+        let failures = failure_state.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].action, "flush");
+        assert_eq!(failures[0].shard_index, 1);
+        assert!(failures[0].error.contains("shared failure"));
     }
 }
