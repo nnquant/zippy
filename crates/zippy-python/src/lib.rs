@@ -10865,6 +10865,42 @@ mod tests {
     }
 
     #[test]
+    fn stream_table_materializer_rejects_shard_writer_epochs_without_sharding() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
+            let kwargs = PyDict::new_bound(py);
+            kwargs
+                .set_item("shard_writer_epochs", vec![1u64, 2u64])
+                .unwrap();
+
+            let error = class
+                .call(("ticks", py_stream_table_schema(py), target), Some(&kwargs))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shard_writer_epochs requires shard_key and shard_nums"));
+        });
+    }
+
+    #[test]
+    fn stream_table_materializer_rejects_shard_writer_epoch_length_mismatch() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("shard_key", vec!["symbol"]).unwrap();
+            kwargs.set_item("shard_nums", 2).unwrap();
+            kwargs.set_item("shard_writer_epochs", vec![1u64]).unwrap();
+
+            let error = class
+                .call(("ticks", py_stream_table_schema(py), target), Some(&kwargs))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shard_writer_epochs length mismatch"));
+        });
+    }
+
+    #[test]
     fn stream_table_materializer_rejects_unsupported_sharded_options() {
         prepare_python_for_tests();
         Python::with_gil(|py| {

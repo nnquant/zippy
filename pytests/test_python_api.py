@@ -16868,6 +16868,40 @@ def test_pipeline_stream_table_shard_unregisters_source_after_late_failure(
     ]
 
 
+def test_pipeline_unregister_registered_sources_is_best_effort() -> None:
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def unregister_source(self, source_name: str) -> None:
+            self.calls.append(source_name)
+            if source_name == "test_ingest.openctp_ticks.openctp_ticks.__shard_0001":
+                raise RuntimeError("control plane unavailable")
+
+    pipeline = zippy.Pipeline("test_ingest", master=FakeMaster())
+    pipeline._registered_source_name = "test_ingest.openctp_ticks"
+    pipeline._registered_source_names = [
+        "test_ingest.openctp_ticks",
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0000",
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0001",
+    ]
+
+    with pytest.raises(RuntimeError, match="control plane unavailable"):
+        pipeline._unregister_registered_source()
+
+    assert pipeline.master.calls == [
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0001",
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0000",
+        "test_ingest.openctp_ticks",
+    ]
+    assert pipeline._registered_source_name == (
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0001"
+    )
+    assert pipeline._registered_source_names == [
+        "test_ingest.openctp_ticks.openctp_ticks.__shard_0001"
+    ]
+
+
 def test_pipeline_stream_table_shard_rejects_source_registration_failure_without_unregister(
     monkeypatch,
 ) -> None:

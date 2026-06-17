@@ -9825,14 +9825,24 @@ class Pipeline:
             self._registered_source_name = None
             self._registered_source_names = []
             return
+        first_error: BaseException | None = None
+        remaining_source_names: list[str] = []
         for source_name in reversed(source_names):
             try:
                 unregister_source(source_name)
             except RuntimeError as error:
                 if "source not found" not in str(error):
-                    raise
-        self._registered_source_name = None
-        self._registered_source_names = []
+                    remaining_source_names.append(source_name)
+                    first_error = first_error or error
+            except BaseException as error:
+                remaining_source_names.append(source_name)
+                first_error = first_error or error
+        self._registered_source_names = list(reversed(remaining_source_names))
+        self._registered_source_name = (
+            self._registered_source_names[0] if self._registered_source_names else None
+        )
+        if first_error is not None:
+            raise first_error
 
     def _ensure_process(self) -> None:
         _ensure_master_process(self.master, self.name)
