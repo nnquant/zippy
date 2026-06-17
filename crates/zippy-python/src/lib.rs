@@ -291,7 +291,65 @@ struct StreamTableShardMetadata {
 }
 
 fn is_internal_stream_name(stream_name: &str) -> bool {
-    stream_name.ends_with(".__kv_changelog")
+    stream_name.ends_with(".__kv_changelog") || shard_parent_from_name(stream_name).is_some()
+}
+
+fn stream_metadata_value<'a>(stream: &'a StreamInfo, field: &str) -> Option<&'a serde_json::Value> {
+    stream
+        .active_segment_descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.get(field))
+}
+
+fn is_internal_stream(stream: &StreamInfo) -> bool {
+    if let Some(value) =
+        stream_metadata_value(stream, "zippy_internal").and_then(|value| value.as_bool())
+    {
+        return value;
+    }
+    is_internal_stream_name(&stream.stream_name)
+}
+
+fn stream_logical_shard_names(stream: &StreamInfo) -> Vec<String> {
+    let Some(value) = stream_metadata_value(stream, "zippy_shards") else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Null => None,
+            other => Some(other.to_string()),
+        })
+        .collect()
+}
+
+fn stream_logical_parent_name(stream: &StreamInfo) -> Option<String> {
+    stream_metadata_value(stream, "zippy_logical_parent").map(|value| match value {
+        serde_json::Value::String(parent) => parent.clone(),
+        other => other.to_string(),
+    })
+}
+
+fn shard_parent_from_name(stream_name: &str) -> Option<String> {
+    let (parent, shard_index) = stream_name.rsplit_once(".__shard_")?;
+    if parent.is_empty()
+        || shard_index.len() != 4
+        || !shard_index.chars().all(|value| value.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(parent.to_string())
+}
+
+fn internal_shard_drop_error(parent: &str) -> PyErr {
+    py_runtime_error(format!(
+        "drop logical table [{}] or pass include_internal maintenance flag",
+        parent
+    ))
 }
 
 #[derive(Clone)]
@@ -1676,7 +1734,7 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         let records = PyList::empty_bound(py);
         for stream in streams {
-            if !include_internal && is_internal_stream_name(&stream.stream_name) {
+            if !include_internal && is_internal_stream(&stream) {
                 continue;
             }
             let dict = PyDict::new_bound(py);
@@ -1727,7 +1785,7 @@ impl MasterClient {
             .map_err(|error| py_runtime_error(error.to_string()))?;
         let records = PyList::empty_bound(py);
         for stream in streams {
-            if !include_internal && is_internal_stream_name(&stream.stream_name) {
+            if !include_internal && is_internal_stream(&stream) {
                 continue;
             }
             records.append(stream_info_to_pydict(py, &stream)?)?;
@@ -1805,16 +1863,82 @@ impl MasterClient {
         table_name: String,
         drop_persisted: bool,
     ) -> PyResult<PyObject> {
-        let result = py
-            .allow_threads(|| {
+        let stream_result =
+            py.allow_threads(|| self.client.lock().unwrap().get_stream(&table_name));
+        if let Ok(stream) = stream_result.as_ref() {
+            let internal_metadata =
+                stream_metadata_value(stream, "zippy_internal").and_then(|value| value.as_bool());
+            if internal_metadata == Some(true) {
+                let parent = stream_logical_parent_name(stream)
+                    .or_else(|| shard_parent_from_name(&table_name))
+                    .unwrap_or_else(|| table_name.clone());
+                return Err(internal_shard_drop_error(&parent));
+            }
+            if internal_metadata.is_none() {
+                if let Some(parent) = shard_parent_from_name(&table_name) {
+                    return Err(internal_shard_drop_error(&parent));
+                }
+            }
+        } else if let Some(parent) = shard_parent_from_name(&table_name) {
+            return Err(internal_shard_drop_error(&parent));
+        }
+
+        let shard_names = stream_result
+            .as_ref()
+            .map(stream_logical_shard_names)
+            .unwrap_or_default();
+        if shard_names.is_empty() {
+            let result = py
+                .allow_threads(|| {
+                    self.client
+                        .lock()
+                        .unwrap()
+                        .drop_table(&table_name, drop_persisted)
+                })
+                .map_err(|error| py_runtime_error(error.to_string()))?;
+            self.schemas.lock().unwrap().remove(&table_name);
+            return Ok(drop_table_result_to_pydict(py, &result)?.into_py(py));
+        }
+
+        let mut drops = Vec::new();
+        for drop_name in shard_names.iter().chain(std::iter::once(&table_name)) {
+            let result = py.allow_threads(|| {
                 self.client
                     .lock()
                     .unwrap()
-                    .drop_table(&table_name, drop_persisted)
-            })
-            .map_err(|error| py_runtime_error(error.to_string()))?;
-        self.schemas.lock().unwrap().remove(&table_name);
-        Ok(drop_table_result_to_pydict(py, &result)?.into_py(py))
+                    .drop_table(drop_name, drop_persisted)
+            });
+            match result {
+                Ok(result) => drops.push(result),
+                Err(error) => {
+                    let partial = serde_json::json!({
+                        "table_name": table_name,
+                        "shards": shard_names,
+                        "drops": drops,
+                    });
+                    return Err(py_runtime_error(format!(
+                        "failed to drop sharded table table_name=[{}] partial outcome=[{}] error=[{}]",
+                        table_name, partial, error
+                    )));
+                }
+            }
+        }
+
+        {
+            let mut schemas = self.schemas.lock().unwrap();
+            schemas.remove(&table_name);
+            for shard_name in &shard_names {
+                schemas.remove(shard_name);
+            }
+        }
+
+        let logical_result = drops
+            .last()
+            .expect("sharded drop sequence always includes logical table");
+        Ok(
+            sharded_drop_table_result_to_pydict(py, logical_result, &shard_names, &drops)?
+                .into_py(py),
+        )
     }
 
     fn process_id(&self) -> PyResult<Option<String>> {
@@ -1980,6 +2104,29 @@ fn drop_table_result_to_pydict<'py>(
     dict.set_item("sources_removed", result.sources_removed)?;
     dict.set_item("engines_removed", result.engines_removed)?;
     dict.set_item("persisted_files_deleted", result.persisted_files_deleted)?;
+    Ok(dict)
+}
+
+fn drop_table_results_to_pylist<'py>(
+    py: Python<'py>,
+    results: &[DropTableResult],
+) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty_bound(py);
+    for result in results {
+        list.append(drop_table_result_to_pydict(py, result)?)?;
+    }
+    Ok(list)
+}
+
+fn sharded_drop_table_result_to_pydict<'py>(
+    py: Python<'py>,
+    logical_result: &DropTableResult,
+    shard_names: &[String],
+    drops: &[DropTableResult],
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = drop_table_result_to_pydict(py, logical_result)?;
+    dict.set_item("shards", PyList::new_bound(py, shard_names))?;
+    dict.set_item("drops", drop_table_results_to_pylist(py, drops)?)?;
     Ok(dict)
 }
 
@@ -8796,6 +8943,83 @@ mod tests {
     const MINUTE_NS: i64 = 60_000_000_000;
     static PYTHON_TEST_INIT: Once = Once::new();
     static PYTHON_SITE_PACKAGES: OnceLock<Vec<String>> = OnceLock::new();
+
+    fn stream_info_for_drop_table_test(
+        stream_name: &str,
+        active_segment_descriptor: Option<serde_json::Value>,
+    ) -> StreamInfo {
+        StreamInfo {
+            stream_name: stream_name.to_string(),
+            schema: serde_json::json!({"fields": []}),
+            schema_hash: "schema_hash".to_string(),
+            data_path: "segment".to_string(),
+            descriptor_generation: u64::from(active_segment_descriptor.is_some()),
+            active_segment_descriptor,
+            active_segment_preflight: None,
+            segment_row_capacity: None,
+            sealed_segments: Vec::new(),
+            persisted_files: Vec::new(),
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: None,
+            writer_epoch: 0,
+            reader_count: 0,
+            status: "registered".to_string(),
+        }
+    }
+
+    #[test]
+    fn drop_table_internal_stream_detection_uses_metadata_before_name_fallback() {
+        let metadata_internal = stream_info_for_drop_table_test(
+            "ticks.physical",
+            Some(serde_json::json!({"zippy_internal": true})),
+        );
+        let named_internal = stream_info_for_drop_table_test("ticks.__shard_0000", None);
+        let logical = stream_info_for_drop_table_test(
+            "ticks",
+            Some(serde_json::json!({"zippy_internal": false})),
+        );
+        let explicit_public = stream_info_for_drop_table_test(
+            "ticks.__shard_0000",
+            Some(serde_json::json!({"zippy_internal": false})),
+        );
+
+        assert!(is_internal_stream(&metadata_internal));
+        assert!(is_internal_stream(&named_internal));
+        assert!(!is_internal_stream(&logical));
+        assert!(!is_internal_stream(&explicit_public));
+    }
+
+    #[test]
+    fn drop_table_logical_shard_names_reads_active_descriptor_metadata() {
+        let stream = stream_info_for_drop_table_test(
+            "ticks",
+            Some(serde_json::json!({
+                "zippy_shards": ["ticks.__shard_0000", "ticks.__shard_0001"],
+            })),
+        );
+
+        assert_eq!(
+            stream_logical_shard_names(&stream),
+            vec![
+                "ticks.__shard_0000".to_string(),
+                "ticks.__shard_0001".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_table_shard_parent_name_rejects_non_shard_names() {
+        assert_eq!(
+            shard_parent_from_name("ticks.__shard_0000"),
+            Some("ticks".to_string())
+        );
+        assert_eq!(shard_parent_from_name("ticks.__shard_zero"), None);
+        assert_eq!(shard_parent_from_name("ticks.__kv_changelog"), None);
+    }
 
     fn prepare_python_for_tests() {
         PYTHON_TEST_INIT.call_once(|| {

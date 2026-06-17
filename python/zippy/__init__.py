@@ -32,6 +32,10 @@ _TABLE_SEMANTICS_FIELD = "zippy_table_semantics"
 _KEY_VALUE_SNAPSHOT_SEMANTICS = "key_value_snapshot"
 _LATEST_BY_FIELD = "zippy_latest_by"
 _KEY_VALUE_CHANGELOG_SUFFIX = ".__kv_changelog"
+_STREAM_TABLE_SHARD_SUFFIX_RE = re.compile(r"\.__shard_\d{4}$")
+_STREAM_TABLE_SHARDS_FIELD = "zippy_shards"
+_STREAM_TABLE_INTERNAL_FIELD = "zippy_internal"
+_STREAM_TABLE_LOGICAL_PARENT_FIELD = "zippy_logical_parent"
 _KV_SEQ_FIELD = "_zippy_kv_seq"
 _KV_OP_FIELD = "_zippy_kv_op"
 _KV_SNAPSHOT_VERSION_FIELD = "_zippy_kv_snapshot_version"
@@ -1745,6 +1749,67 @@ def _table_health_status(alerts: list[dict[str, object]]) -> str:
     return "ok"
 
 
+def _is_native_master_client(master: object) -> bool:
+    return type(master).__module__ == "zippy._internal"
+
+
+def _stream_for_drop(master: object, table_name: str) -> dict[str, object] | None:
+    get_stream = getattr(master, "get_stream", None)
+    if callable(get_stream):
+        try:
+            stream = get_stream(table_name)
+        except Exception:
+            stream = None
+        if isinstance(stream, dict):
+            return stream
+
+    list_streams = getattr(master, "list_streams", None)
+    if not callable(list_streams):
+        return None
+    try:
+        streams = list_streams(include_internal=True)
+    except TypeError:
+        streams = list_streams()
+    for stream in streams:
+        if isinstance(stream, dict) and stream.get("stream_name") == table_name:
+            return stream
+    return None
+
+
+def _internal_shard_drop_error(parent: str) -> RuntimeError:
+    return RuntimeError(f"drop logical table [{parent}] or pass include_internal maintenance flag")
+
+
+def _drop_logical_sharded_table(
+    master: object,
+    table_name: str,
+    shard_names: list[str],
+    *,
+    drop_persisted: bool,
+) -> dict[str, object]:
+    drops: list[dict[str, object]] = []
+    try:
+        for shard_name in shard_names:
+            drops.append(master.drop_table(shard_name, drop_persisted))
+        logical_result = master.drop_table(table_name, drop_persisted)
+        drops.append(logical_result)
+    except Exception as exc:
+        partial = {
+            "table_name": table_name,
+            "shards": shard_names,
+            "drops": drops,
+        }
+        raise RuntimeError(
+            f"failed to drop sharded table table_name=[{table_name}] "
+            f"partial outcome=[{partial}] error=[{exc}]"
+        ) from exc
+
+    result = dict(logical_result)
+    result["shards"] = list(shard_names)
+    result["drops"] = drops
+    return result
+
+
 def _drop_table(
     table_name: str,
     *,
@@ -1770,7 +1835,30 @@ def _drop_table(
     """
     if not table_name:
         raise ValueError("table_name must not be empty")
-    return (master or _default_master()).drop_table(table_name, drop_persisted)
+    selected_master = master or _default_master()
+    if _is_native_master_client(selected_master):
+        return selected_master.drop_table(table_name, drop_persisted)
+
+    stream = _stream_for_drop(selected_master, table_name)
+    if stream is not None and _is_internal_stream(stream):
+        parent = _internal_shard_parent_name(table_name, stream) or table_name
+        raise _internal_shard_drop_error(parent)
+
+    fallback_parent = _internal_shard_parent_name(table_name)
+    if fallback_parent is not None and (
+        stream is None or _descriptor_metadata_value(stream, _STREAM_TABLE_INTERNAL_FIELD) is None
+    ):
+        raise _internal_shard_drop_error(fallback_parent)
+
+    if stream is not None and _is_logical_sharded_stream(stream):
+        return _drop_logical_sharded_table(
+            selected_master,
+            table_name,
+            _logical_shard_stream_names(stream),
+            drop_persisted=drop_persisted,
+        )
+
+    return selected_master.drop_table(table_name, drop_persisted)
 
 
 def _compact_table(
@@ -5487,6 +5575,68 @@ def _descriptor_metadata_value(stream: dict[str, object], field: str) -> object 
         if value is not None:
             return value
     return stream.get(field)
+
+
+def _is_internal_stream(stream: dict[str, object]) -> bool:
+    """
+    Return whether a stream should be treated as an internal implementation stream.
+
+    :param stream: Stream metadata returned by master.
+    :type stream: dict[str, object]
+    :returns: ``True`` when descriptor metadata marks the stream as internal.
+    :rtype: bool
+    """
+    return _descriptor_metadata_value(stream, _STREAM_TABLE_INTERNAL_FIELD) is True
+
+
+def _is_logical_sharded_stream(stream: dict[str, object]) -> bool:
+    """
+    Return whether stream metadata declares physical shard streams.
+
+    :param stream: Stream metadata returned by master.
+    :type stream: dict[str, object]
+    :returns: ``True`` when ``zippy_shards`` contains at least one shard name.
+    :rtype: bool
+    """
+    return bool(_logical_shard_stream_names(stream))
+
+
+def _logical_shard_stream_names(stream: dict[str, object]) -> list[str]:
+    """
+    Extract logical stream shard names from descriptor metadata.
+
+    :param stream: Stream metadata returned by master.
+    :type stream: dict[str, object]
+    :returns: Ordered physical shard stream names.
+    :rtype: list[str]
+    """
+    value = _descriptor_metadata_value(stream, _STREAM_TABLE_SHARDS_FIELD)
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item is not None]
+
+
+def _internal_shard_parent_name(
+    stream_name: str,
+    stream: dict[str, object] | None = None,
+) -> str | None:
+    """
+    Resolve the logical parent for a physical shard stream.
+
+    :param stream_name: Candidate stream name.
+    :type stream_name: str
+    :param stream: Optional stream metadata.
+    :type stream: dict[str, object] | None
+    :returns: Logical parent name when known.
+    :rtype: str | None
+    """
+    if stream is not None:
+        value = _descriptor_metadata_value(stream, _STREAM_TABLE_LOGICAL_PARENT_FIELD)
+        if value is not None:
+            return str(value)
+    if _STREAM_TABLE_SHARD_SUFFIX_RE.search(stream_name):
+        return _STREAM_TABLE_SHARD_SUFFIX_RE.sub("", stream_name)
+    return None
 
 
 def _key_value_changelog_stream_name(table_name: str) -> str:

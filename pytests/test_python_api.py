@@ -6249,6 +6249,107 @@ def test_ops_namespace_exposes_table_observability_methods() -> None:
     assert not hasattr(zippy.ops, "start_compaction_worker")
 
 
+def test_drop_table_shard_fake_master_drops_physical_shards_before_logical() -> None:
+    shard_names = ["ctp_ticks.__shard_0000", "ctp_ticks.__shard_0001"]
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.dropped: list[tuple[str, bool]] = []
+            self.streams: dict[str, dict[str, object]] = {
+                "ctp_ticks": {
+                    "stream_name": "ctp_ticks",
+                    "active_segment_descriptor": {"zippy_shards": shard_names},
+                },
+                shard_names[0]: {
+                    "stream_name": shard_names[0],
+                    "active_segment_descriptor": {
+                        "zippy_internal": True,
+                        "zippy_logical_parent": "ctp_ticks",
+                    },
+                },
+                shard_names[1]: {
+                    "stream_name": shard_names[1],
+                    "active_segment_descriptor": {
+                        "zippy_internal": True,
+                        "zippy_logical_parent": "ctp_ticks",
+                    },
+                },
+            }
+
+        def list_streams(self, include_internal: bool = False) -> list[dict[str, object]]:
+            if include_internal:
+                return list(self.streams.values())
+            return [
+                stream
+                for stream in self.streams.values()
+                if not stream["stream_name"].endswith(".__shard_0000")
+                and not stream["stream_name"].endswith(".__shard_0001")
+            ]
+
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            return self.streams[table_name]
+
+        def drop_table(
+            self,
+            table_name: str,
+            drop_persisted: bool = True,
+        ) -> dict[str, object]:
+            self.dropped.append((table_name, drop_persisted))
+            self.streams.pop(table_name)
+            return {
+                "table_name": table_name,
+                "dropped": True,
+                "sources_removed": 0,
+                "engines_removed": 0,
+                "persisted_files_deleted": 0,
+            }
+
+    master = FakeMaster()
+
+    result = zippy.ops.drop_table("ctp_ticks", drop_persisted=False, master=master)
+
+    assert master.dropped == [
+        ("ctp_ticks.__shard_0000", False),
+        ("ctp_ticks.__shard_0001", False),
+        ("ctp_ticks", False),
+    ]
+    assert result["table_name"] == "ctp_ticks"
+    assert result["dropped"] is True
+    assert result["shards"] == shard_names
+    assert [item["table_name"] for item in result["drops"]] == [*shard_names, "ctp_ticks"]
+
+
+def test_drop_table_shard_fake_master_rejects_direct_internal_drop() -> None:
+    class FakeMaster:
+        def list_streams(self, include_internal: bool = False) -> list[dict[str, object]]:
+            return [
+                {
+                    "stream_name": "ctp_ticks.__shard_0000",
+                    "active_segment_descriptor": {
+                        "zippy_internal": True,
+                        "zippy_logical_parent": "ctp_ticks",
+                    },
+                }
+            ]
+
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            assert table_name == "ctp_ticks.__shard_0000"
+            return self.list_streams(include_internal=True)[0]
+
+        def drop_table(
+            self,
+            table_name: str,
+            drop_persisted: bool = True,
+        ) -> dict[str, object]:
+            raise AssertionError("direct internal shard drop must be rejected before master call")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"drop logical table \[ctp_ticks\] or pass include_internal maintenance flag",
+    ):
+        zippy.ops.drop_table("ctp_ticks.__shard_0000", master=FakeMaster())
+
+
 def test_ops_compact_tables_discovers_persisted_tables(monkeypatch) -> None:
     class FakeMaster:
         def list_streams(self) -> list[dict[str, object]]:
@@ -7277,6 +7378,89 @@ def test_master_client_drop_table_removes_stream_and_persisted_files(tmp_path: P
         client.get_stream("openctp_ticks")
 
     server.stop()
+
+
+def test_master_client_drop_table_shard_roundtrip_lists_and_drops_logical_table(
+    tmp_path: Path,
+) -> None:
+    try:
+        server, control_endpoint = start_master_server(
+            tmp_path,
+            config={"table": {"persist": {"data_dir": str(tmp_path)}}},
+        )
+    except RuntimeError as error:
+        if "Operation not permitted" in str(error):
+            pytest.skip("unix socket bind is not permitted in this test environment")
+        raise
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    shard_names = ["openctp_ticks.__shard_0000", "openctp_ticks.__shard_0001"]
+
+    try:
+        client = zippy.MasterClient(control_endpoint=control_endpoint)
+        client.register_process("drop_table_shard_test")
+        client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+        client.register_source(
+            "drop_table_shard_test.logical",
+            "pipeline",
+            "openctp_ticks",
+            {},
+        )
+        for shard_name in shard_names:
+            client.register_stream(shard_name, tick_schema, 64, 4096)
+            client.register_source(
+                f"drop_table_shard_test.{shard_name}",
+                "pipeline",
+                shard_name,
+                {},
+            )
+
+        client.publish_segment_descriptor(
+            "openctp_ticks",
+            {
+                "zippy_table_kind": "append_table",
+                "zippy_sharded": True,
+                "zippy_shard_key": ["instrument_id"],
+                "zippy_shard_nums": 2,
+                "zippy_shard_mode": "hash",
+                "zippy_shard_version": 1,
+                "zippy_shards": shard_names,
+                "writer_epoch": client.get_stream("openctp_ticks")["writer_epoch"],
+            },
+        )
+        for index, shard_name in enumerate(shard_names):
+            client.publish_segment_descriptor(
+                shard_name,
+                {
+                    "zippy_table_kind": "append_table",
+                    "zippy_internal": True,
+                    "zippy_logical_parent": "openctp_ticks",
+                    "zippy_shard_index": index,
+                    "zippy_shard_nums": 2,
+                    "zippy_shard_key": ["instrument_id"],
+                    "zippy_shard_mode": "hash",
+                    "zippy_shard_version": 1,
+                    "writer_epoch": client.get_stream(shard_name)["writer_epoch"],
+                },
+            )
+
+        assert {stream["stream_name"] for stream in client.list_streams()} == {"openctp_ticks"}
+        assert {stream["stream_name"] for stream in client.list_streams_status()} == {
+            "openctp_ticks"
+        }
+        assert {stream["stream_name"] for stream in client.list_streams(include_internal=True)} == {
+            "openctp_ticks",
+            *shard_names,
+        }
+
+        result = client.drop_table("openctp_ticks")
+
+        assert result["table_name"] == "openctp_ticks"
+        assert result["dropped"] is True
+        assert result["shards"] == shard_names
+        assert [item["table_name"] for item in result["drops"]] == [*shard_names, "openctp_ticks"]
+        assert client.list_streams(include_internal=True) == []
+    finally:
+        server.stop()
 
 
 def test_read_table_collects_persisted_only_stream_without_active_descriptor(
