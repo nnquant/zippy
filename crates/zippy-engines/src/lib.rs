@@ -5,6 +5,7 @@ mod latest_state;
 pub mod reactive;
 pub mod reactive_latest;
 pub mod stream_table;
+mod stream_table_shard;
 mod table_view;
 pub mod testing;
 pub mod timeseries;
@@ -21,6 +22,7 @@ pub use stream_table::{
     StreamTablePersistConfig, StreamTablePersistPartitionSpec, StreamTablePersistPublisher,
     StreamTableRetentionGuard, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
+pub use stream_table_shard::{ShardConfig, ShardRouter, ShardValue};
 pub use testing::hash_record_batches;
 pub use timeseries::TimeSeriesEngine;
 
