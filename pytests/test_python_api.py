@@ -15711,6 +15711,131 @@ def test_pipeline_source_uses_python_source_control_plane_metadata() -> None:
     ]
 
 
+class _PipelineStreamTableShardingFakeMaster:
+    def __init__(self) -> None:
+        self.stream_records: list[tuple[str, pa.Schema, int, int]] = []
+        self.source_records: list[tuple[str, str, str, object]] = []
+        self.descriptors: list[tuple[str, object]] = []
+
+    def process_id(self) -> str | None:
+        return "proc_1"
+
+    def register_stream(
+        self,
+        stream_name: str,
+        schema: pa.Schema,
+        buffer_size: int,
+        frame_size: int,
+    ) -> None:
+        self.stream_records.append((stream_name, schema, buffer_size, frame_size))
+
+    def register_source(
+        self,
+        source_name: str,
+        source_type: str,
+        output_stream: str,
+        config: object,
+    ) -> None:
+        self.source_records.append((source_name, source_type, output_stream, config))
+
+    def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+        self.descriptors.append((stream_name, descriptor))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"shard_key": "instrument_id"}, "shard_key requires shard_nums"),
+        ({"shard_nums": 4}, "shard_nums requires shard_key"),
+        (
+            {"shard_key": "instrument_id", "shard_nums": 1},
+            "shard_nums=1 disables sharding",
+        ),
+        (
+            {"shard_key": "instrument_id", "shard_nums": 0},
+            "shard_nums must be a positive integer or 'auto'",
+        ),
+        (
+            {"shard_key": "instrument_id", "shard_nums": -1},
+            "shard_nums must be a positive integer or 'auto'",
+        ),
+    ],
+)
+def test_pipeline_stream_table_rejects_invalid_sharding_arguments(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    master = _PipelineStreamTableShardingFakeMaster()
+
+    with pytest.raises(ValueError, match=message):
+        zippy.Pipeline("test_ingest", master=master).stream_table(
+            "openctp_ticks",
+            schema=tick_schema,
+            **kwargs,
+        )
+
+    assert master.stream_records == []
+    assert master.source_records == []
+    assert master.descriptors == []
+
+
+def test_pipeline_stream_table_sharding_rejects_shard_key_missing_from_schema() -> None:
+    tick_schema = pa.schema([("dt", pa.timestamp("ns", tz="UTC"))])
+    master = _PipelineStreamTableShardingFakeMaster()
+
+    with pytest.raises(
+        ValueError,
+        match=r"shard_key column \[instrument_id\] is not in schema",
+    ):
+        zippy.Pipeline("test_ingest", master=master).stream_table(
+            "openctp_ticks",
+            schema=tick_schema,
+            shard_key="instrument_id",
+            shard_nums=2,
+        )
+
+    assert master.stream_records == []
+    assert master.source_records == []
+    assert master.descriptors == []
+
+
+def test_pipeline_stream_table_without_sharding_uses_single_materializer(
+    monkeypatch,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    materializers: list[object] = []
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            materializers.append(self)
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+
+    master = _PipelineStreamTableShardingFakeMaster()
+    zippy.Pipeline("test_ingest", master=master).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        persist=None,
+    )
+
+    assert len(materializers) == 1
+    assert master.stream_records == [("openctp_ticks", tick_schema, 64, 4096)]
+    assert master.source_records == [
+        (
+            "test_ingest.openctp_ticks",
+            "pipeline",
+            "openctp_ticks",
+            {"zippy_table_kind": "append_table"},
+        )
+    ]
+
+
 def test_pipeline_stream_table_persist_publishes_master_metadata(
     monkeypatch,
     tmp_path: Path,
