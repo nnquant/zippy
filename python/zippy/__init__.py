@@ -5732,6 +5732,45 @@ def _logical_shard_stream_names(stream: dict[str, object]) -> list[str]:
     return shard_names
 
 
+def _reject_logical_sharded_subscribe(
+    source: str,
+    master: MasterClient,
+    *,
+    wait: bool,
+    timeout: float | str | None,
+) -> None:
+    """
+    Reject logical sharded stream subscriptions until fan-in semantics are explicit.
+
+    :param source: Stream requested by the caller.
+    :type source: str
+    :param master: Master client used for metadata lookup.
+    :type master: MasterClient
+    :param wait: Whether to wait for stream readiness before checking metadata.
+    :type wait: bool
+    :param timeout: Optional wait timeout.
+    :type timeout: float | str | None
+    :raises RuntimeError: If ``source`` is a logical sharded stream.
+    """
+    get_stream = getattr(master, "get_stream", None)
+    if not callable(get_stream):
+        return
+    if wait:
+        _wait_for_table_ready(source, master, timeout)
+    try:
+        stream = _get_stream_status_or_full(master, source)
+    except RuntimeError as error:
+        if "stream not found" not in str(error):
+            raise
+        return
+    if _is_logical_sharded_stream(stream):
+        raise RuntimeError(
+            "logical sharded subscribe is not implemented; "
+            "subscribe internal shard streams explicitly or use collect/read_table "
+            f"table_name=[{source}]"
+        )
+
+
 def _internal_shard_parent_name(
     stream_name: str,
     stream: dict[str, object] | None = None,
@@ -6523,6 +6562,13 @@ def subscribe(
             timeout=timeout,
         )
 
+    _reject_logical_sharded_subscribe(
+        source,
+        selected_master,
+        wait=wait and changelog_source is None,
+        timeout=timeout,
+    )
+
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None and start_from != -1:
         raise ValueError("remote subscribe only supports start_from=-1")
@@ -6705,6 +6751,13 @@ def subscribe_table(
             wait=False,
             timeout=timeout,
         )
+
+    _reject_logical_sharded_subscribe(
+        source,
+        selected_master,
+        wait=wait,
+        timeout=timeout,
+    )
 
     remote_endpoint = _remote_gateway_endpoint_for_data(selected_master)
     if remote_endpoint is not None and start_from != -1:

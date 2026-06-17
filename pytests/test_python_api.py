@@ -9324,6 +9324,84 @@ def test_subscribe_table_keeps_batch_friendly_default_poll_interval(monkeypatch)
     assert created["instrument_ids"] is None
 
 
+class _FakeShardedSubscribeMaster:
+    def __init__(self) -> None:
+        self.shard_names = ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+    def get_stream(self, source: str) -> dict[str, object]:
+        if source == "ticks":
+            return {
+                "stream_name": "ticks",
+                "active_segment_descriptor": {"zippy_shards": list(self.shard_names)},
+            }
+        if source in self.shard_names:
+            return {
+                "stream_name": source,
+                "active_segment_descriptor": {
+                    "zippy_internal": True,
+                    "zippy_logical_parent": "ticks",
+                },
+            }
+        raise RuntimeError(f"stream not found source=[{source}]")
+
+
+@pytest.mark.parametrize("api_name", ["subscribe", "subscribe_table"])
+def test_logical_sharded_subscribe_is_rejected(api_name: str) -> None:
+    master = _FakeShardedSubscribeMaster()
+    api = getattr(zippy, api_name)
+
+    with pytest.raises(
+        RuntimeError,
+        match="logical sharded subscribe is not implemented",
+    ):
+        api("ticks", callback=lambda value: None, master=master)
+
+
+@pytest.mark.parametrize("api_name", ["subscribe", "subscribe_table"])
+def test_internal_shard_stream_can_be_subscribed_explicitly(
+    monkeypatch,
+    api_name: str,
+) -> None:
+    created: dict[str, object] = {}
+
+    class FakeNativeStreamSubscriber:
+        def __init__(
+            self,
+            source: str,
+            master: object,
+            callback: object,
+            poll_interval_ms: int = 1,
+            xfast: bool = False,
+            idle_spin_checks: int = 64,
+            row_factory: object | None = None,
+            instrument_ids: object | None = None,
+            start_from: int = -1,
+        ) -> None:
+            del callback, poll_interval_ms, xfast, idle_spin_checks, instrument_ids, start_from
+            created["source"] = source
+            created["master"] = master
+            created["row_factory"] = row_factory
+
+        def start(self) -> None:
+            return None
+
+    master = _FakeShardedSubscribeMaster()
+    monkeypatch.setattr(zippy, "_NativeStreamSubscriber", FakeNativeStreamSubscriber)
+
+    getattr(zippy, api_name)(
+        "ticks.__shard_0000",
+        callback=lambda value: None,
+        master=master,
+    )
+
+    assert created["source"] == "ticks.__shard_0000"
+    assert created["master"] is master
+    if api_name == "subscribe_table":
+        assert created["row_factory"] is None
+    else:
+        assert created["row_factory"] is zippy.Row
+
+
 def test_subscribe_table_filters_batches_and_limits_latest_count(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
