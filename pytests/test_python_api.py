@@ -15715,6 +15715,7 @@ class _PipelineStreamTableShardingFakeMaster:
     def __init__(self) -> None:
         self.stream_records: list[tuple[str, pa.Schema, int, int]] = []
         self.source_records: list[tuple[str, str, str, object]] = []
+        self.unregistered_sources: list[str] = []
         self.descriptors: list[tuple[str, object]] = []
 
     def process_id(self) -> str | None:
@@ -15737,6 +15738,9 @@ class _PipelineStreamTableShardingFakeMaster:
         config: object,
     ) -> None:
         self.source_records.append((source_name, source_type, output_stream, config))
+
+    def unregister_source(self, source_name: str) -> None:
+        self.unregistered_sources.append(source_name)
 
     def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
         self.descriptors.append((stream_name, descriptor))
@@ -15834,6 +15838,269 @@ def test_pipeline_stream_table_without_sharding_uses_single_materializer(
             {"zippy_table_kind": "append_table"},
         )
     ]
+    assert master.descriptors == [("openctp_ticks", {"zippy_table_kind": "append_table"})]
+
+
+def test_pipeline_stream_table_shard_auto_registers_logical_and_physical_streams(
+    monkeypatch,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string()), ("last_price", pa.float64())])
+    materializers: list[object] = []
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+            materializers.append(self)
+
+        def active_descriptors(self) -> list[dict[str, object]]:
+            shard_nums = self.kwargs["shard_nums"]
+            return [
+                {
+                    "segment_id": index,
+                    "generation": 1,
+                    "row_count": 0,
+                }
+                for index in range(shard_nums)
+            ]
+
+        def shard_names(self) -> list[str]:
+            return list(self.kwargs["shard_stream_names"])
+
+    monkeypatch.setattr(zippy.os, "cpu_count", lambda: 3)
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+
+    master = _PipelineStreamTableShardingFakeMaster()
+    zippy.Pipeline("test_ingest", master=master).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        persist=None,
+        shard_key="instrument_id",
+        shard_nums="auto",
+    )
+
+    shard_names = [
+        "openctp_ticks.__shard_0000",
+        "openctp_ticks.__shard_0001",
+        "openctp_ticks.__shard_0002",
+    ]
+    assert [record[0] for record in master.stream_records] == ["openctp_ticks", *shard_names]
+    assert all(record[1] == tick_schema for record in master.stream_records)
+    assert master.source_records == [
+        (
+            "test_ingest.openctp_ticks",
+            "pipeline",
+            "openctp_ticks",
+            {
+                "zippy_table_kind": "append_table",
+                "zippy_sharded": True,
+                "zippy_shard_key": ["instrument_id"],
+                "zippy_shard_nums": 3,
+                "zippy_shard_mode": "hash",
+                "zippy_shard_version": 1,
+                "zippy_shards": shard_names,
+            },
+        )
+    ]
+
+    assert len(materializers) == 1
+    kwargs = materializers[0].kwargs
+    assert kwargs["shard_key"] == ["instrument_id"]
+    assert kwargs["shard_nums"] == 3
+    assert isinstance(kwargs["shard_nums"], int)
+    assert kwargs["shard_version"] == 1
+    assert kwargs["shard_stream_names"] == shard_names
+    assert "descriptor_publisher" not in kwargs or kwargs["descriptor_publisher"] is None
+    assert kwargs.get("persist_path") is None
+    assert kwargs.get("persist_publisher") is None
+    assert kwargs.get("retention_segments") is None
+    assert kwargs.get("retention_guard") is None
+    assert kwargs.get("descriptor_forwarding", False) is False
+
+    descriptor_by_stream = dict(master.descriptors)
+    assert descriptor_by_stream["openctp_ticks"] == {
+        "zippy_table_kind": "append_table",
+        "zippy_sharded": True,
+        "zippy_shard_key": ["instrument_id"],
+        "zippy_shard_nums": 3,
+        "zippy_shard_mode": "hash",
+        "zippy_shard_version": 1,
+        "zippy_shards": shard_names,
+    }
+    for shard_index, shard_name in enumerate(shard_names):
+        descriptor = descriptor_by_stream[shard_name]
+        assert descriptor["zippy_table_kind"] == "append_table"
+        assert descriptor["zippy_internal"] is True
+        assert descriptor["zippy_logical_parent"] == "openctp_ticks"
+        assert descriptor["zippy_shard_index"] == shard_index
+        assert descriptor["zippy_shard_nums"] == 3
+        assert descriptor["zippy_shard_key"] == ["instrument_id"]
+        assert descriptor["zippy_shard_mode"] == "hash"
+        assert descriptor["zippy_shard_version"] == 1
+
+
+@pytest.mark.parametrize(
+    ("failing_stage", "message"),
+    [
+        ("engine", "engine failed"),
+        ("descriptor", "descriptor failed"),
+    ],
+)
+def test_pipeline_stream_table_shard_unregisters_source_after_late_failure(
+    monkeypatch,
+    failing_stage: str,
+    message: str,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    class FailingMaster(_PipelineStreamTableShardingFakeMaster):
+        def publish_segment_descriptor(self, stream_name: str, descriptor: object) -> None:
+            if failing_stage == "descriptor":
+                raise RuntimeError("descriptor failed")
+            super().publish_segment_descriptor(stream_name, descriptor)
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            if failing_stage == "engine":
+                raise RuntimeError("engine failed")
+            self.kwargs = kwargs
+
+        def active_descriptors(self) -> list[dict[str, object]]:
+            return [{"segment_id": 0}, {"segment_id": 1}]
+
+        def shard_names(self) -> list[str]:
+            return list(self.kwargs["shard_stream_names"])
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+
+    master = FailingMaster()
+    with pytest.raises(RuntimeError, match=message):
+        zippy.Pipeline("test_ingest", master=master).stream_table(
+            "openctp_ticks",
+            schema=tick_schema,
+            persist=None,
+            shard_key="instrument_id",
+            shard_nums=2,
+        )
+
+    assert master.source_records[0][0] == "test_ingest.openctp_ticks"
+    assert master.unregistered_sources == ["test_ingest.openctp_ticks"]
+
+
+def test_pipeline_stream_table_shard_rejects_source_registration_failure_without_unregister(
+    monkeypatch,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    class FailingMaster(_PipelineStreamTableShardingFakeMaster):
+        def register_source(
+            self,
+            source_name: str,
+            source_type: str,
+            output_stream: str,
+            config: object,
+        ) -> None:
+            raise RuntimeError("source failed")
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("engine must not be constructed after source failure")
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+
+    master = FailingMaster()
+    with pytest.raises(RuntimeError, match="source failed"):
+        zippy.Pipeline("test_ingest", master=master).stream_table(
+            "openctp_ticks",
+            schema=tick_schema,
+            persist=None,
+            shard_key="instrument_id",
+            shard_nums=2,
+        )
+
+    assert master.unregistered_sources == []
+
+
+def test_pipeline_stream_table_shard_rejects_master_default_persist_and_allows_persist_none(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    created: dict[str, object] = {}
+
+    class PersistDefaultMaster(_PipelineStreamTableShardingFakeMaster):
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "persist": {
+                        "enabled": True,
+                        "method": "parquet",
+                        "data_dir": str(tmp_path),
+                    },
+                }
+            }
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            created["kwargs"] = kwargs
+
+        def active_descriptors(self) -> list[dict[str, object]]:
+            return [{"segment_id": 0}, {"segment_id": 1}]
+
+        def shard_names(self) -> list[str]:
+            return list(self.kwargs["shard_stream_names"])
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+
+    with pytest.raises(ValueError, match="persist currently unsupported for sharded stream tables"):
+        zippy.Pipeline("test_ingest", master=PersistDefaultMaster()).stream_table(
+            "openctp_ticks",
+            schema=tick_schema,
+            shard_key="instrument_id",
+            shard_nums=2,
+        )
+
+    master = PersistDefaultMaster()
+    zippy.Pipeline("test_ingest", master=master).stream_table(
+        "openctp_ticks",
+        schema=tick_schema,
+        persist=None,
+        shard_key="instrument_id",
+        shard_nums=2,
+    )
+
+    assert created["kwargs"].get("persist_path") is None
+    assert [record[0] for record in master.stream_records] == [
+        "openctp_ticks",
+        "openctp_ticks.__shard_0000",
+        "openctp_ticks.__shard_0001",
+    ]
+
+
+def test_pipeline_stream_table_shard_rejects_retention_segments(monkeypatch) -> None:
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+
+    class FakeStreamTableMaterializer:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("engine must not be constructed with unsupported retention")
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", FakeStreamTableMaterializer)
+
+    with pytest.raises(
+        ValueError,
+        match="retention_segments currently unsupported for sharded stream tables",
+    ):
+        zippy.Pipeline(
+            "test_ingest",
+            master=_PipelineStreamTableShardingFakeMaster(),
+        ).stream_table(
+            "openctp_ticks",
+            schema=tick_schema,
+            persist=None,
+            retention_segments=2,
+            shard_key="instrument_id",
+            shard_nums=2,
+        )
 
 
 def test_pipeline_stream_table_persist_publishes_master_metadata(

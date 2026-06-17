@@ -9202,15 +9202,15 @@ class Pipeline:
             with ``shard_nums`` to keep the default single-materializer path.
         :type shard_key: str | list[str] | tuple[str, ...] | None
         :param shard_nums: Number of shards, or ``"auto"`` to use up to 16 CPU-backed shards.
-            This first-stage Python API validates and parses sharding options only; it does not
-            register shard streams or enable a sharded native materializer yet.
+            When provided with ``shard_key``, stream_table creates a logical stream plus internal
+            physical shard streams backed by a sharded native materializer.
         :type shard_nums: int | str | None
         :returns: This pipeline.
         :rtype: Pipeline
         """
         self._ensure_process()
         schema = schema or self._infer_source_schema()
-        _resolve_stream_table_sharding(
+        sharding = _resolve_stream_table_sharding(
             schema=schema,
             shard_key=shard_key,
             shard_nums=shard_nums,
@@ -9228,6 +9228,72 @@ class Pipeline:
             persist_path=persist_path,
         )
         descriptor_metadata = _append_table_descriptor_metadata()
+        if sharding is not None:
+            if table_options["persist_path"] is not None:
+                raise ValueError("persist currently unsupported for sharded stream tables")
+            if table_options["retention_segments"] is not None:
+                raise ValueError(
+                    "retention_segments currently unsupported for sharded stream tables"
+                )
+
+            shard_names = _stream_table_shard_names(name, sharding.shard_nums)
+            logical_metadata = {
+                **descriptor_metadata,
+                **_stream_table_logical_shard_metadata(sharding, shard_names),
+            }
+            self._stream_name = name
+            self._schema = schema
+            self.master.register_stream(name, schema, buffer_size, frame_size)
+            for shard_name in shard_names:
+                self.master.register_stream(shard_name, schema, buffer_size, frame_size)
+            source_name = self._source_name or f"{self.name}.{name}"
+            self.master.register_source(
+                source_name,
+                self._source_type,
+                name,
+                _stream_table_source_config(table_options, **logical_metadata),
+            )
+            self._registered_source_name = source_name
+            try:
+                self._engine = _StreamTableMaterializer(
+                    name=name,
+                    input_schema=schema,
+                    source=self._source,
+                    target=NullPublisher(),
+                    row_capacity=table_options["row_capacity"],
+                    shard_key=list(sharding.shard_key),
+                    shard_nums=sharding.shard_nums,
+                    shard_version=sharding.shard_version,
+                    shard_stream_names=shard_names,
+                )
+                self.master.publish_segment_descriptor(
+                    name,
+                    _annotate_table_descriptor({}, logical_metadata),
+                )
+                active_descriptors = list(self._engine.active_descriptors())
+                if len(active_descriptors) != len(shard_names):
+                    raise RuntimeError(
+                        "sharded stream table descriptor count mismatch "
+                        f"expected=[{len(shard_names)}] actual=[{len(active_descriptors)}]"
+                    )
+                for shard_index, (shard_name, descriptor) in enumerate(
+                    zip(shard_names, active_descriptors, strict=True)
+                ):
+                    shard_metadata = _stream_table_physical_shard_metadata(
+                        sharding,
+                        logical_name=name,
+                        shard_index=shard_index,
+                    )
+                    self.master.publish_segment_descriptor(
+                        shard_name,
+                        _annotate_table_descriptor(descriptor, shard_metadata),
+                    )
+            except BaseException:
+                self._engine = None
+                self._unregister_registered_source()
+                raise
+            return self
+
         self._stream_name = name
         self._schema = schema
         self.master.register_stream(name, schema, buffer_size, frame_size)
@@ -9623,13 +9689,46 @@ def _resolve_stream_table_options(
 class _StreamTableSharding:
     """
     Parsed Python-side sharding options for ``Pipeline.stream_table()``.
-
-    This stage intentionally validates only the public API contract. Shard stream
-    registration and native materializer wiring are handled by later implementation tasks.
     """
 
     shard_key: tuple[str, ...]
     shard_nums: int
+    shard_version: int = 1
+
+
+def _stream_table_shard_names(name: str, shard_nums: int) -> list[str]:
+    return [f"{name}.__shard_{index:04d}" for index in range(shard_nums)]
+
+
+def _stream_table_logical_shard_metadata(
+    sharding: _StreamTableSharding,
+    shard_names: list[str],
+) -> dict[str, object]:
+    return {
+        "zippy_sharded": True,
+        "zippy_shard_key": list(sharding.shard_key),
+        "zippy_shard_nums": sharding.shard_nums,
+        "zippy_shard_mode": "hash",
+        "zippy_shard_version": sharding.shard_version,
+        "zippy_shards": list(shard_names),
+    }
+
+
+def _stream_table_physical_shard_metadata(
+    sharding: _StreamTableSharding,
+    logical_name: str,
+    shard_index: int,
+) -> dict[str, object]:
+    return {
+        "zippy_table_kind": _APPEND_TABLE_KIND,
+        "zippy_internal": True,
+        "zippy_logical_parent": logical_name,
+        "zippy_shard_index": shard_index,
+        "zippy_shard_nums": sharding.shard_nums,
+        "zippy_shard_key": list(sharding.shard_key),
+        "zippy_shard_mode": "hash",
+        "zippy_shard_version": sharding.shard_version,
+    }
 
 
 def _resolve_stream_table_sharding(
