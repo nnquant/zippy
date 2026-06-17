@@ -39,7 +39,8 @@ use zippy_engines::{
     ReactiveLatestEngine as RustReactiveLatestEngine,
     ReactiveStateEngine as RustReactiveStateEngine,
     ReactiveStateFailurePolicy as RustReactiveStateFailurePolicy,
-    SessionWindow as RustSessionWindow,
+    SessionWindow as RustSessionWindow, ShardConfig,
+    ShardedStreamTableMaterializer as RustShardedStreamTableMaterializer,
     StreamTableDescriptorPublisher as RustStreamTableDescriptorPublisher,
     StreamTableMaterializer as RustStreamTableMaterializer, StreamTablePersistConfig,
     StreamTablePersistPartitionSpec,
@@ -89,6 +90,16 @@ fn py_value_error(message: impl Into<String>) -> PyErr {
 
 fn py_runtime_error(message: impl Into<String>) -> PyErr {
     PyRuntimeError::new_err(message.into())
+}
+
+fn reject_sharded_stream_table_option(enabled: bool, option: &str) -> PyResult<()> {
+    if enabled {
+        return Err(py_value_error(format!(
+            "{} currently unsupported for sharded stream tables",
+            option
+        )));
+    }
+    Ok(())
 }
 
 fn resolve_control_endpoint_value(control_endpoint: &str) -> PyResult<ControlEndpoint> {
@@ -176,6 +187,12 @@ fn serde_json_option_to_py(
     }
 }
 
+fn descriptor_envelope_to_py(py: Python<'_>, envelope: &[u8]) -> PyResult<PyObject> {
+    let envelope_text =
+        std::str::from_utf8(envelope).map_err(|error| py_value_error(error.to_string()))?;
+    Ok(python_json_loads(py, envelope_text)?.into_py(py))
+}
+
 type SharedHandle = Arc<Mutex<Option<EngineHandle>>>;
 type SharedStatus = Arc<Mutex<EngineStatus>>;
 type SharedMetrics = Arc<Mutex<EngineMetricsSnapshot>>;
@@ -187,6 +204,91 @@ type RegisteredSource = (
     Option<SegmentSourceConfig>,
     Option<PythonSourceConfig>,
 );
+
+enum StreamTableEngineVariant {
+    Single(RustStreamTableMaterializer),
+    Sharded(RustShardedStreamTableMaterializer),
+}
+
+impl Engine for StreamTableEngineVariant {
+    fn name(&self) -> &str {
+        match self {
+            Self::Single(engine) => engine.name(),
+            Self::Sharded(engine) => engine.name(),
+        }
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        match self {
+            Self::Single(engine) => engine.input_schema(),
+            Self::Sharded(engine) => engine.input_schema(),
+        }
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        match self {
+            Self::Single(engine) => engine.output_schema(),
+            Self::Sharded(engine) => engine.output_schema(),
+        }
+    }
+
+    fn on_data(&mut self, table: SegmentTableView) -> zippy_core::Result<Vec<SegmentTableView>> {
+        match self {
+            Self::Single(engine) => engine.on_data(table),
+            Self::Sharded(engine) => engine.on_data(table),
+        }
+    }
+
+    fn begin_transaction(&mut self) {
+        match self {
+            Self::Single(engine) => engine.begin_transaction(),
+            Self::Sharded(engine) => engine.begin_transaction(),
+        }
+    }
+
+    fn commit_transaction(&mut self) {
+        match self {
+            Self::Single(engine) => engine.commit_transaction(),
+            Self::Sharded(engine) => engine.commit_transaction(),
+        }
+    }
+
+    fn rollback_transaction(&mut self) -> zippy_core::Result<()> {
+        match self {
+            Self::Single(engine) => engine.rollback_transaction(),
+            Self::Sharded(engine) => engine.rollback_transaction(),
+        }
+    }
+
+    fn on_flush(&mut self) -> zippy_core::Result<Vec<SegmentTableView>> {
+        match self {
+            Self::Single(engine) => engine.on_flush(),
+            Self::Sharded(engine) => engine.on_flush(),
+        }
+    }
+
+    fn on_stop(&mut self) -> zippy_core::Result<Vec<SegmentTableView>> {
+        match self {
+            Self::Single(engine) => engine.on_stop(),
+            Self::Sharded(engine) => engine.on_stop(),
+        }
+    }
+
+    fn drain_metrics(&mut self) -> zippy_core::EngineMetricsDelta {
+        match self {
+            Self::Single(engine) => engine.drain_metrics(),
+            Self::Sharded(engine) => engine.drain_metrics(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StreamTableShardMetadata {
+    shard_key: Vec<String>,
+    shard_nums: usize,
+    shard_version: u32,
+    shard_names: Vec<String>,
+}
 
 fn is_internal_stream_name(stream_name: &str) -> bool {
     stream_name.ends_with(".__kv_changelog")
@@ -5114,7 +5216,8 @@ struct StreamTableMaterializer {
     status: SharedStatus,
     metrics: SharedMetrics,
     handle: SharedHandle,
-    engine: Option<RustStreamTableMaterializer>,
+    engine: Option<StreamTableEngineVariant>,
+    shard_metadata: Option<StreamTableShardMetadata>,
     remote_source: Option<RemoteSourceConfig>,
     segment_source: Option<SegmentSourceConfig>,
     python_source: Option<PythonSourceConfig>,
@@ -5494,7 +5597,7 @@ impl ReactiveLatestEngine {
 impl StreamTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false, shard_key=None, shard_nums=None, shard_version=None, shard_stream_names=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5516,65 +5619,155 @@ impl StreamTableMaterializer {
         persist_path: Option<String>,
         persist_publisher: Option<Py<PyAny>>,
         descriptor_forwarding: bool,
+        shard_key: Option<Vec<String>>,
+        shard_nums: Option<usize>,
+        shard_version: Option<u32>,
+        shard_stream_names: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let schema = Arc::new(
             Schema::from_pyarrow_bound(input_schema)
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let row_capacity = row_capacity.unwrap_or(DEFAULT_STREAM_TABLE_ROW_CAPACITY);
-        let mut engine = RustStreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
-            &name,
-            Arc::clone(&schema),
-            row_capacity,
-            writer_epoch,
-        )
-        .map_err(|error| py_value_error(error.to_string()))?;
-        if let Some(retention_segments) = retention_segments {
-            engine = engine.with_retention_segments(retention_segments);
-        }
-        if let Some(callback) = retention_guard {
-            if !callback.bind(py).is_callable() {
-                return Err(PyTypeError::new_err("retention_guard must be callable"));
+        let (engine, output_schema, shard_metadata) = match (shard_key, shard_nums) {
+            (None, None) => {
+                if shard_stream_names.is_some() {
+                    return Err(py_value_error(
+                        "shard_stream_names requires shard_key and shard_nums",
+                    ));
+                }
+                if shard_version.is_some() {
+                    return Err(py_value_error(
+                        "shard_version requires shard_key and shard_nums",
+                    ));
+                }
+                let mut engine =
+                    RustStreamTableMaterializer::new_with_row_capacity_and_writer_epoch(
+                        &name,
+                        Arc::clone(&schema),
+                        row_capacity,
+                        writer_epoch,
+                    )
+                    .map_err(|error| py_value_error(error.to_string()))?;
+                if let Some(retention_segments) = retention_segments {
+                    engine = engine.with_retention_segments(retention_segments);
+                }
+                if let Some(callback) = retention_guard {
+                    if !callback.bind(py).is_callable() {
+                        return Err(PyTypeError::new_err("retention_guard must be callable"));
+                    }
+                    engine = engine
+                        .with_retention_guard(Arc::new(PyStreamTableRetentionGuard { callback }));
+                }
+                if let Some(callback) = descriptor_publisher {
+                    if !callback.bind(py).is_callable() {
+                        return Err(PyTypeError::new_err(
+                            "descriptor_publisher must be callable",
+                        ));
+                    }
+                    engine = engine.with_descriptor_publisher(Arc::new(
+                        PyStreamTableDescriptorPublisher { callback },
+                    ));
+                }
+                if descriptor_forwarding {
+                    engine = engine.with_descriptor_forwarding(true);
+                }
+                let persist_path_provided = persist_path.is_some();
+                if let Some(path) = persist_path {
+                    let mut config = StreamTablePersistConfig::new(PathBuf::from(path));
+                    if dt_column.is_some() || id_column.is_some() || dt_part.is_some() {
+                        let partition_spec =
+                            StreamTablePersistPartitionSpec::new(dt_column, id_column, dt_part)
+                                .map_err(|error| py_value_error(error.to_string()))?;
+                        config = config.with_partition_spec(partition_spec);
+                    }
+                    engine = engine.with_parquet_persist(config);
+                }
+                if let Some(callback) = persist_publisher {
+                    if !persist_path_provided {
+                        return Err(PyValueError::new_err(
+                            "persist_path is required when persist_publisher is provided",
+                        ));
+                    }
+                    if !callback.bind(py).is_callable() {
+                        return Err(PyTypeError::new_err("persist_publisher must be callable"));
+                    }
+                    engine =
+                        engine.with_persist_publisher(Arc::new(PyStreamTablePersistPublisher {
+                            callback,
+                        }));
+                }
+                let output_schema = engine.output_schema();
+                (
+                    StreamTableEngineVariant::Single(engine),
+                    output_schema,
+                    None,
+                )
             }
-            engine =
-                engine.with_retention_guard(Arc::new(PyStreamTableRetentionGuard { callback }));
-        }
-        if let Some(callback) = descriptor_publisher {
-            if !callback.bind(py).is_callable() {
-                return Err(PyTypeError::new_err(
-                    "descriptor_publisher must be callable",
-                ));
+            (Some(_), None) => {
+                return Err(py_value_error("shard_key requires shard_nums"));
             }
-            engine = engine
-                .with_descriptor_publisher(Arc::new(PyStreamTableDescriptorPublisher { callback }));
-        }
-        if descriptor_forwarding {
-            engine = engine.with_descriptor_forwarding(true);
-        }
-        let persist_path_provided = persist_path.is_some();
-        if let Some(path) = persist_path {
-            let mut config = StreamTablePersistConfig::new(PathBuf::from(path));
-            if dt_column.is_some() || id_column.is_some() || dt_part.is_some() {
-                let partition_spec =
-                    StreamTablePersistPartitionSpec::new(dt_column, id_column, dt_part)
-                        .map_err(|error| py_value_error(error.to_string()))?;
-                config = config.with_partition_spec(partition_spec);
+            (None, Some(_)) => {
+                return Err(py_value_error("shard_nums requires shard_key"));
             }
-            engine = engine.with_parquet_persist(config);
-        }
-        if let Some(callback) = persist_publisher {
-            if !persist_path_provided {
-                return Err(PyValueError::new_err(
-                    "persist_path is required when persist_publisher is provided",
-                ));
+            (Some(shard_key), Some(shard_nums)) => {
+                reject_sharded_stream_table_option(
+                    descriptor_publisher.is_some(),
+                    "descriptor_publisher",
+                )?;
+                reject_sharded_stream_table_option(descriptor_forwarding, "descriptor_forwarding")?;
+                reject_sharded_stream_table_option(persist_path.is_some(), "persist_path")?;
+                reject_sharded_stream_table_option(
+                    persist_publisher.is_some(),
+                    "persist_publisher",
+                )?;
+                reject_sharded_stream_table_option(
+                    retention_segments.is_some(),
+                    "retention_segments",
+                )?;
+                reject_sharded_stream_table_option(retention_guard.is_some(), "retention_guard")?;
+                reject_sharded_stream_table_option(writer_epoch.is_some(), "writer_epoch")?;
+                if shard_nums <= 1 {
+                    return Err(py_value_error(
+                        "shard_nums must be greater than 1 for sharded stream tables",
+                    ));
+                }
+                let shard_version = shard_version.unwrap_or(1);
+                let config = ShardConfig::new(shard_key.clone(), shard_nums, shard_version)
+                    .map_err(|error| py_value_error(error.to_string()))?;
+                let expected_shard_names = (0..shard_nums)
+                    .map(|index| {
+                        RustShardedStreamTableMaterializer::shard_stream_name(&name, index)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(shard_stream_names) = shard_stream_names {
+                    if shard_stream_names != expected_shard_names {
+                        return Err(py_value_error(
+                            "shard_stream_names currently supports only default names",
+                        ));
+                    }
+                }
+                let engine = RustShardedStreamTableMaterializer::new_with_row_capacity(
+                    &name,
+                    Arc::clone(&schema),
+                    config,
+                    row_capacity,
+                )
+                .map_err(|error| py_value_error(error.to_string()))?;
+                let output_schema = engine.output_schema();
+                let shard_metadata = StreamTableShardMetadata {
+                    shard_key,
+                    shard_nums,
+                    shard_version,
+                    shard_names: expected_shard_names,
+                };
+                (
+                    StreamTableEngineVariant::Sharded(engine),
+                    output_schema,
+                    Some(shard_metadata),
+                )
             }
-            if !callback.bind(py).is_callable() {
-                return Err(PyTypeError::new_err("persist_publisher must be callable"));
-            }
-            engine =
-                engine.with_persist_publisher(Arc::new(PyStreamTablePersistPublisher { callback }));
-        }
-        let output_schema = engine.output_schema();
+        };
         let target = parse_targets(target)?;
         let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
         let handle = Arc::new(Mutex::new(None));
@@ -5601,6 +5794,7 @@ impl StreamTableMaterializer {
             metrics,
             handle,
             engine: Some(engine),
+            shard_metadata,
             remote_source,
             segment_source,
             python_source,
@@ -5678,21 +5872,81 @@ impl StreamTableMaterializer {
                 &self.python_source,
             ),
         )?;
+        if let Some(shard_metadata) = self.shard_metadata.as_ref() {
+            dict.set_item("shard_key", shard_metadata.shard_key.clone())?;
+            dict.set_item("shard_nums", shard_metadata.shard_nums)?;
+            dict.set_item("shard_version", shard_metadata.shard_version)?;
+            dict.set_item("shard_names", shard_metadata.shard_names.clone())?;
+        }
         Ok(dict.into_any().unbind())
     }
 
     fn active_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
+        if self.shard_metadata.is_some() {
+            return Err(py_runtime_error(
+                "sharded stream table has multiple active descriptors; use active_descriptors()",
+            ));
+        }
         let engine = self.engine.as_ref().ok_or_else(|| {
             py_runtime_error(
                 "stream table active descriptor is unavailable after the engine has started",
             )
         })?;
+        let StreamTableEngineVariant::Single(engine) = engine else {
+            return Err(py_runtime_error(
+                "sharded stream table has multiple active descriptors; use active_descriptors()",
+            ));
+        };
         let envelope = engine
             .active_descriptor_envelope_bytes()
             .map_err(|error| py_runtime_error(error.to_string()))?;
-        let envelope_text =
-            std::str::from_utf8(&envelope).map_err(|error| py_value_error(error.to_string()))?;
-        Ok(python_json_loads(py, envelope_text)?.into_py(py))
+        descriptor_envelope_to_py(py, &envelope)
+    }
+
+    fn shard_names(&self) -> Vec<String> {
+        self.shard_metadata
+            .as_ref()
+            .map(|metadata| metadata.shard_names.clone())
+            .unwrap_or_default()
+    }
+
+    fn active_descriptors(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            py_runtime_error(
+                "stream table active descriptors are unavailable after the engine has started",
+            )
+        })?;
+        let envelopes = match engine {
+            StreamTableEngineVariant::Single(engine) => vec![engine
+                .active_descriptor_envelope_bytes()
+                .map_err(|error| py_runtime_error(error.to_string()))?],
+            StreamTableEngineVariant::Sharded(engine) => engine
+                .active_descriptors_envelope_bytes()
+                .map_err(|error| py_runtime_error(error.to_string()))?,
+        };
+
+        let descriptors = PyList::empty_bound(py);
+        for envelope in envelopes {
+            descriptors.append(descriptor_envelope_to_py(py, &envelope)?)?;
+        }
+        Ok(descriptors.into_any().unbind())
+    }
+
+    fn failed_shards(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let failures = PyList::empty_bound(py);
+        let Some(StreamTableEngineVariant::Sharded(engine)) = self.engine.as_ref() else {
+            return Ok(failures.into_any().unbind());
+        };
+
+        for failure in engine.failed_shards() {
+            let item = PyDict::new_bound(py);
+            item.set_item("action", &failure.action)?;
+            item.set_item("shard_index", failure.shard_index)?;
+            item.set_item("shard_name", &failure.shard_name)?;
+            item.set_item("error", &failure.error)?;
+            failures.append(item)?;
+        }
+        Ok(failures.into_any().unbind())
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
@@ -8543,6 +8797,11 @@ mod tests {
                     std::env::set_var("PYTHONHOME", home);
                 }
             }
+            if std::env::var_os("PYTHONPATH").is_none() {
+                if let Some(path) = python_site_packages_for_tests() {
+                    std::env::set_var("PYTHONPATH", path);
+                }
+            }
             pyo3::prepare_freethreaded_python();
         });
     }
@@ -8559,6 +8818,20 @@ mod tests {
         }
         let home = String::from_utf8(output.stdout).ok()?.trim().to_string();
         (!home.is_empty()).then_some(home)
+    }
+
+    fn python_site_packages_for_tests() -> Option<String> {
+        let python = std::env::var_os("PYO3_PYTHON")?;
+        let output = Command::new(python)
+            .arg("-c")
+            .arg("import site; print(':'.join(site.getsitepackages()))")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!path.is_empty()).then_some(path)
     }
 
     fn tick_schema() -> Arc<Schema> {
@@ -10085,6 +10358,181 @@ mod tests {
 
             let empty_string = pyo3::types::PyString::new_bound(py, "");
             assert!(parse_instrument_ids(Some(empty_string.as_any())).is_err());
+        });
+    }
+
+    fn stream_table_class<'py>(
+        py: Python<'py>,
+    ) -> (Bound<'py, PyModule>, Bound<'py, PyAny>, Py<PyAny>) {
+        let module = PyModule::new_bound(py, "zippy._internal").unwrap();
+        _internal(py, &module).unwrap();
+        let class = module.getattr("StreamTableMaterializer").unwrap();
+        let target = Py::new(py, NullPublisher).unwrap().into_any();
+        (module, class, target)
+    }
+
+    fn py_stream_table_schema(py: Python<'_>) -> PyObject {
+        tick_schema()
+            .as_ref()
+            .to_pyarrow(py)
+            .map_err(|error| py_value_error(error.to_string()))
+            .unwrap()
+    }
+
+    #[test]
+    fn stream_table_materializer_accepts_shard_config_and_exposes_metadata() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("shard_key", vec!["symbol"]).unwrap();
+            kwargs.set_item("shard_nums", 3).unwrap();
+            kwargs.set_item("shard_version", 2).unwrap();
+
+            let engine = class
+                .call(
+                    ("ticks", py_stream_table_schema(py), target.clone_ref(py)),
+                    Some(&kwargs),
+                )
+                .unwrap();
+
+            let config = engine.call_method0("config").unwrap();
+            let config = config.downcast::<PyDict>().unwrap();
+            assert_eq!(
+                config
+                    .get_item("shard_key")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<Vec<String>>()
+                    .unwrap(),
+                vec!["symbol".to_string()]
+            );
+            assert_eq!(
+                config
+                    .get_item("shard_nums")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                3
+            );
+            assert_eq!(
+                config
+                    .get_item("shard_version")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<u32>()
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                config
+                    .get_item("shard_names")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<Vec<String>>()
+                    .unwrap(),
+                vec![
+                    "ticks.__shard_0000".to_string(),
+                    "ticks.__shard_0001".to_string(),
+                    "ticks.__shard_0002".to_string()
+                ]
+            );
+
+            assert_eq!(
+                engine
+                    .call_method0("shard_names")
+                    .unwrap()
+                    .extract::<Vec<String>>()
+                    .unwrap()
+                    .len(),
+                3
+            );
+            let descriptors = engine.call_method0("active_descriptors").unwrap();
+            assert_eq!(descriptors.downcast::<PyList>().unwrap().len(), 3);
+            assert!(engine
+                .call_method0("active_descriptor")
+                .unwrap_err()
+                .to_string()
+                .contains("use active_descriptors()"));
+            assert_eq!(
+                engine
+                    .call_method0("failed_shards")
+                    .unwrap()
+                    .downcast::<PyList>()
+                    .unwrap()
+                    .len(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn stream_table_materializer_rejects_partial_shard_config() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
+
+            let missing_nums = PyDict::new_bound(py);
+            missing_nums.set_item("shard_key", vec!["symbol"]).unwrap();
+            let error = class
+                .call(
+                    ("ticks", py_stream_table_schema(py), target.clone_ref(py)),
+                    Some(&missing_nums),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shard_key requires shard_nums"));
+
+            let missing_key = PyDict::new_bound(py);
+            missing_key.set_item("shard_nums", 3).unwrap();
+            let error = class
+                .call(
+                    ("ticks", py_stream_table_schema(py), target.clone_ref(py)),
+                    Some(&missing_key),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shard_nums requires shard_key"));
+        });
+    }
+
+    #[test]
+    fn stream_table_materializer_rejects_non_default_shard_stream_names() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("shard_key", vec!["symbol"]).unwrap();
+            kwargs.set_item("shard_nums", 2).unwrap();
+            kwargs
+                .set_item("shard_stream_names", vec!["ticks_a", "ticks_b"])
+                .unwrap();
+
+            let error = class
+                .call(("ticks", py_stream_table_schema(py), target), Some(&kwargs))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shard_stream_names currently supports only default names"));
+        });
+    }
+
+    #[test]
+    fn stream_table_materializer_rejects_unsupported_sharded_options() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let (_module, class, target) = stream_table_class(py);
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("shard_key", vec!["symbol"]).unwrap();
+            kwargs.set_item("shard_nums", 2).unwrap();
+            kwargs.set_item("descriptor_forwarding", true).unwrap();
+
+            let error = class
+                .call(("ticks", py_stream_table_schema(py), target), Some(&kwargs))
+                .unwrap_err()
+                .to_string();
+            assert!(error
+                .contains("descriptor_forwarding currently unsupported for sharded stream tables"));
         });
     }
 
