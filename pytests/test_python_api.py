@@ -6350,6 +6350,101 @@ def test_drop_table_shard_fake_master_rejects_direct_internal_drop() -> None:
         zippy.ops.drop_table("ctp_ticks.__shard_0000", master=FakeMaster())
 
 
+def test_drop_table_shard_fake_master_uses_source_config_metadata_fallback() -> None:
+    shard_names = ["ctp_ticks.__shard_0000", "ctp_ticks.__shard_0001"]
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.dropped: list[tuple[str, bool]] = []
+
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            return {
+                "stream_name": table_name,
+                "active_segment_descriptor": None,
+                "source_configs": [
+                    {
+                        "zippy_sharded": True,
+                        "zippy_shards": shard_names,
+                    }
+                ],
+            }
+
+        def drop_table(
+            self,
+            table_name: str,
+            drop_persisted: bool = True,
+        ) -> dict[str, object]:
+            self.dropped.append((table_name, drop_persisted))
+            return {"table_name": table_name, "dropped": True}
+
+    master = FakeMaster()
+
+    result = zippy.ops.drop_table("ctp_ticks", master=master)
+
+    assert master.dropped == [
+        ("ctp_ticks.__shard_0000", True),
+        ("ctp_ticks.__shard_0001", True),
+        ("ctp_ticks", True),
+    ]
+    assert result["shards"] == shard_names
+
+
+def test_drop_table_shard_fake_master_rejects_invalid_shard_metadata() -> None:
+    class FakeMaster:
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            return {
+                "stream_name": table_name,
+                "active_segment_descriptor": {"zippy_shards": ["ctp_ticks.__shard_0000", 42]},
+            }
+
+        def drop_table(
+            self,
+            table_name: str,
+            drop_persisted: bool = True,
+        ) -> dict[str, object]:
+            raise AssertionError("invalid shard metadata must be rejected before drop")
+
+    with pytest.raises(ValueError, match="zippy_shards must be a list of strings"):
+        zippy.ops.drop_table("ctp_ticks", master=FakeMaster())
+
+
+def test_drop_table_shard_fake_master_rejects_foreign_shard_name() -> None:
+    class FakeMaster:
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            return {
+                "stream_name": table_name,
+                "active_segment_descriptor": {
+                    "zippy_shards": ["other_ticks.__shard_0000"],
+                },
+            }
+
+        def drop_table(
+            self,
+            table_name: str,
+            drop_persisted: bool = True,
+        ) -> dict[str, object]:
+            raise AssertionError("foreign shard metadata must be rejected before drop")
+
+    with pytest.raises(ValueError, match=r"shard name \[other_ticks.__shard_0000\]"):
+        zippy.ops.drop_table("ctp_ticks", master=FakeMaster())
+
+
+def test_drop_table_shard_fake_master_propagates_get_stream_runtime_error() -> None:
+    class FakeMaster:
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            raise RuntimeError("permission denied")
+
+        def drop_table(
+            self,
+            table_name: str,
+            drop_persisted: bool = True,
+        ) -> dict[str, object]:
+            raise AssertionError("get_stream permission error must stop drop")
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        zippy.ops.drop_table("ctp_ticks.__shard_0000", master=FakeMaster())
+
+
 def test_ops_compact_tables_discovers_persisted_tables(monkeypatch) -> None:
     class FakeMaster:
         def list_streams(self) -> list[dict[str, object]]:
@@ -7453,6 +7548,57 @@ def test_master_client_drop_table_shard_roundtrip_lists_and_drops_logical_table(
         }
 
         result = client.drop_table("openctp_ticks")
+
+        assert result["table_name"] == "openctp_ticks"
+        assert result["dropped"] is True
+        assert result["shards"] == shard_names
+        assert [item["table_name"] for item in result["drops"]] == [*shard_names, "openctp_ticks"]
+        assert client.list_streams(include_internal=True) == []
+    finally:
+        server.stop()
+
+
+def test_ops_drop_table_with_native_master_drops_source_config_shards(
+    tmp_path: Path,
+) -> None:
+    try:
+        server, control_endpoint = start_master_server(
+            tmp_path,
+            config={"table": {"persist": {"data_dir": str(tmp_path)}}},
+        )
+    except RuntimeError as error:
+        if "Operation not permitted" in str(error):
+            pytest.skip("unix socket bind is not permitted in this test environment")
+        raise
+    tick_schema = pa.schema([("instrument_id", pa.string())])
+    shard_names = ["openctp_ticks.__shard_0000", "openctp_ticks.__shard_0001"]
+
+    try:
+        client = zippy.MasterClient(control_endpoint=control_endpoint)
+        client.register_process("ops_drop_table_shard_test")
+        client.register_stream("openctp_ticks", tick_schema, 64, 4096)
+        client.register_source(
+            "ops_drop_table_shard_test.logical",
+            "pipeline",
+            "openctp_ticks",
+            {
+                "zippy_sharded": True,
+                "zippy_shards": shard_names,
+            },
+        )
+        for shard_name in shard_names:
+            client.register_stream(shard_name, tick_schema, 64, 4096)
+            client.register_source(
+                f"ops_drop_table_shard_test.{shard_name}",
+                "pipeline",
+                shard_name,
+                {
+                    "zippy_internal": True,
+                    "zippy_logical_parent": "openctp_ticks",
+                },
+            )
+
+        result = zippy.ops.drop_table("openctp_ticks", master=client)
 
         assert result["table_name"] == "openctp_ticks"
         assert result["dropped"] is True

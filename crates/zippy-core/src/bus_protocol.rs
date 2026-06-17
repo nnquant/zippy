@@ -159,6 +159,8 @@ pub struct StreamInfo {
     pub descriptor_generation: u64,
     #[serde(default)]
     pub active_segment_descriptor: Option<serde_json::Value>,
+    #[serde(default)]
+    pub source_configs: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_segment_preflight: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

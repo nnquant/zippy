@@ -295,10 +295,17 @@ fn is_internal_stream_name(stream_name: &str) -> bool {
 }
 
 fn stream_metadata_value<'a>(stream: &'a StreamInfo, field: &str) -> Option<&'a serde_json::Value> {
-    stream
+    if let Some(value) = stream
         .active_segment_descriptor
         .as_ref()
         .and_then(|descriptor| descriptor.get(field))
+    {
+        return Some(value);
+    }
+    stream
+        .source_configs
+        .iter()
+        .find_map(|config| config.get(field))
 }
 
 fn is_internal_stream(stream: &StreamInfo) -> bool {
@@ -310,28 +317,39 @@ fn is_internal_stream(stream: &StreamInfo) -> bool {
     is_internal_stream_name(&stream.stream_name)
 }
 
-fn stream_logical_shard_names(stream: &StreamInfo) -> Vec<String> {
+fn stream_logical_shard_names(stream: &StreamInfo) -> PyResult<Vec<String>> {
     let Some(value) = stream_metadata_value(stream, "zippy_shards") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(items) = value.as_array() else {
-        return Vec::new();
+        return Err(py_value_error(format!(
+            "zippy_shards must be a list of strings table_name=[{}]",
+            stream.stream_name
+        )));
     };
-    items
-        .iter()
-        .filter_map(|item| match item {
-            serde_json::Value::String(value) => Some(value.clone()),
-            serde_json::Value::Null => None,
-            other => Some(other.to_string()),
-        })
-        .collect()
+    let mut shard_names = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(shard_name) = item.as_str() else {
+            return Err(py_value_error(format!(
+                "zippy_shards must be a list of strings table_name=[{}]",
+                stream.stream_name
+            )));
+        };
+        if shard_parent_from_name(shard_name).as_deref() != Some(stream.stream_name.as_str()) {
+            return Err(py_value_error(format!(
+                "shard name [{}] must match logical table [{}].__shard_####",
+                shard_name, stream.stream_name
+            )));
+        }
+        shard_names.push(shard_name.to_string());
+    }
+    Ok(shard_names)
 }
 
 fn stream_logical_parent_name(stream: &StreamInfo) -> Option<String> {
-    stream_metadata_value(stream, "zippy_logical_parent").map(|value| match value {
-        serde_json::Value::String(parent) => parent.clone(),
-        other => other.to_string(),
-    })
+    stream_metadata_value(stream, "zippy_logical_parent")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 fn shard_parent_from_name(stream_name: &str) -> Option<String> {
@@ -1748,6 +1766,10 @@ impl MasterClient {
                 serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
             )?;
             dict.set_item(
+                "source_configs",
+                serde_json_value_to_py(py, &stream.source_configs.clone().into())?,
+            )?;
+            dict.set_item(
                 "sealed_segments",
                 serde_json_value_to_py(py, &stream.sealed_segments.into())?,
             )?;
@@ -1811,6 +1833,10 @@ impl MasterClient {
             serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
         )?;
         dict.set_item(
+            "source_configs",
+            serde_json_value_to_py(py, &stream.source_configs.clone().into())?,
+        )?;
+        dict.set_item(
             "sealed_segments",
             serde_json_value_to_py(py, &stream.sealed_segments.into())?,
         )?;
@@ -1865,7 +1891,21 @@ impl MasterClient {
     ) -> PyResult<PyObject> {
         let stream_result =
             py.allow_threads(|| self.client.lock().unwrap().get_stream(&table_name));
-        if let Ok(stream) = stream_result.as_ref() {
+        let stream = match stream_result {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                let error_text = error.to_string();
+                if error_text.contains("stream not found") {
+                    if let Some(parent) = shard_parent_from_name(&table_name) {
+                        return Err(internal_shard_drop_error(&parent));
+                    }
+                    None
+                } else {
+                    return Err(py_runtime_error(error_text));
+                }
+            }
+        };
+        if let Some(stream) = stream.as_ref() {
             let internal_metadata =
                 stream_metadata_value(stream, "zippy_internal").and_then(|value| value.as_bool());
             if internal_metadata == Some(true) {
@@ -1883,9 +1923,10 @@ impl MasterClient {
             return Err(internal_shard_drop_error(&parent));
         }
 
-        let shard_names = stream_result
+        let shard_names = stream
             .as_ref()
             .map(stream_logical_shard_names)
+            .transpose()?
             .unwrap_or_default();
         if shard_names.is_empty() {
             let result = py
@@ -2062,6 +2103,10 @@ fn stream_info_to_pydict<'py>(
     dict.set_item(
         "active_segment_descriptor",
         serde_json_option_to_py(py, stream.active_segment_descriptor.as_ref())?,
+    )?;
+    dict.set_item(
+        "source_configs",
+        serde_json_value_to_py(py, &stream.source_configs.clone().into())?,
     )?;
     dict.set_item(
         "active_segment_preflight",
@@ -8955,6 +9000,7 @@ mod tests {
             data_path: "segment".to_string(),
             descriptor_generation: u64::from(active_segment_descriptor.is_some()),
             active_segment_descriptor,
+            source_configs: Vec::new(),
             active_segment_preflight: None,
             segment_row_capacity: None,
             sealed_segments: Vec::new(),
@@ -9003,12 +9049,50 @@ mod tests {
         );
 
         assert_eq!(
-            stream_logical_shard_names(&stream),
+            stream_logical_shard_names(&stream).unwrap(),
             vec![
                 "ticks.__shard_0000".to_string(),
                 "ticks.__shard_0001".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn drop_table_logical_shard_names_reads_source_config_metadata_fallback() {
+        let mut stream = stream_info_for_drop_table_test("ticks", None);
+        stream.source_configs = vec![serde_json::json!({
+            "zippy_shards": ["ticks.__shard_0000", "ticks.__shard_0001"],
+        })];
+
+        assert_eq!(
+            stream_logical_shard_names(&stream).unwrap(),
+            vec![
+                "ticks.__shard_0000".to_string(),
+                "ticks.__shard_0001".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_table_logical_shard_names_rejects_invalid_metadata() {
+        prepare_python_for_tests();
+        let non_string = stream_info_for_drop_table_test(
+            "ticks",
+            Some(serde_json::json!({"zippy_shards": ["ticks.__shard_0000", 1]})),
+        );
+        let foreign = stream_info_for_drop_table_test(
+            "ticks",
+            Some(serde_json::json!({"zippy_shards": ["other.__shard_0000"]})),
+        );
+
+        assert!(stream_logical_shard_names(&non_string)
+            .unwrap_err()
+            .to_string()
+            .contains("zippy_shards must be a list of strings"));
+        assert!(stream_logical_shard_names(&foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("shard name [other.__shard_0000]"));
     }
 
     #[test]
@@ -10518,6 +10602,7 @@ mod tests {
             data_path: "segment".to_string(),
             descriptor_generation: 7,
             active_segment_descriptor: None,
+            source_configs: Vec::new(),
             active_segment_preflight: None,
             segment_row_capacity: None,
             sealed_segments: vec![serde_json::json!({

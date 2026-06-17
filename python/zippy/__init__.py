@@ -1750,16 +1750,25 @@ def _table_health_status(alerts: list[dict[str, object]]) -> str:
 
 
 def _is_native_master_client(master: object) -> bool:
-    return type(master).__module__ == "zippy._internal"
+    try:
+        return isinstance(master, MasterClient)
+    except TypeError:
+        return False
+
+
+def _is_stream_not_found_error(exc: BaseException) -> bool:
+    return "stream not found" in str(exc)
 
 
 def _stream_for_drop(master: object, table_name: str) -> dict[str, object] | None:
     get_stream = getattr(master, "get_stream", None)
     if callable(get_stream):
+        stream = None
         try:
             stream = get_stream(table_name)
-        except Exception:
-            stream = None
+        except Exception as exc:
+            if not _is_stream_not_found_error(exc):
+                raise
         if isinstance(stream, dict):
             return stream
 
@@ -5574,7 +5583,18 @@ def _descriptor_metadata_value(stream: dict[str, object], field: str) -> object 
         value = descriptor.get(field)
         if value is not None:
             return value
-    return stream.get(field)
+    value = stream.get(field)
+    if value is not None:
+        return value
+    source_configs = stream.get("source_configs")
+    if isinstance(source_configs, list):
+        for config in source_configs:
+            if not isinstance(config, dict):
+                continue
+            value = config.get(field)
+            if value is not None:
+                return value
+    return None
 
 
 def _is_internal_stream(stream: dict[str, object]) -> bool:
@@ -5611,9 +5631,22 @@ def _logical_shard_stream_names(stream: dict[str, object]) -> list[str]:
     :rtype: list[str]
     """
     value = _descriptor_metadata_value(stream, _STREAM_TABLE_SHARDS_FIELD)
-    if not isinstance(value, list):
+    if value is None:
         return []
-    return [str(item) for item in value if item is not None]
+    stream_name = str(stream.get("stream_name") or "")
+    if not isinstance(value, list):
+        raise ValueError(f"zippy_shards must be a list of strings table_name=[{stream_name}]")
+    shard_names: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"zippy_shards must be a list of strings table_name=[{stream_name}]")
+        expected_parent = _internal_shard_parent_name(item)
+        if expected_parent != stream_name:
+            raise ValueError(
+                f"shard name [{item}] must match logical table [{stream_name}].__shard_####"
+            )
+        shard_names.append(item)
+    return shard_names
 
 
 def _internal_shard_parent_name(
@@ -5632,8 +5665,8 @@ def _internal_shard_parent_name(
     """
     if stream is not None:
         value = _descriptor_metadata_value(stream, _STREAM_TABLE_LOGICAL_PARENT_FIELD)
-        if value is not None:
-            return str(value)
+        if isinstance(value, str):
+            return value
     if _STREAM_TABLE_SHARD_SUFFIX_RE.search(stream_name):
         return _STREAM_TABLE_SHARD_SUFFIX_RE.sub("", stream_name)
     return None

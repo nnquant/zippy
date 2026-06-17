@@ -36,6 +36,7 @@ fn test_stream_info() -> StreamInfo {
         data_path: "segment".to_string(),
         descriptor_generation: 0,
         active_segment_descriptor: None,
+        source_configs: Vec::new(),
         active_segment_preflight: None,
         segment_row_capacity: None,
         sealed_segments: Vec::new(),

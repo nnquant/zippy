@@ -1161,13 +1161,11 @@ impl MasterServer {
             },
             ControlRequest::Watch(request) => self.handle_watch_request(request),
             ControlRequest::ListStreams(_) => {
-                let streams: Vec<_> = self
-                    .registry
-                    .lock()
-                    .unwrap()
+                let registry = self.registry.lock().unwrap();
+                let streams: Vec<_> = registry
                     .list_streams()
                     .into_iter()
-                    .map(stream_info_with_active_preflight)
+                    .map(|stream| stream_info_with_registry_metadata(&registry, stream))
                     .collect();
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
@@ -1175,7 +1173,7 @@ impl MasterServer {
                 let registry = self.registry.lock().unwrap();
                 let streams: Vec<_> = registry
                     .stream_records()
-                    .map(stream_status_with_active_preflight)
+                    .map(|stream| stream_status_with_registry_metadata(&registry, stream))
                     .collect();
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
@@ -1291,32 +1289,27 @@ impl MasterServer {
                 }
             }
             Some("get") => match envelope.resource {
-                Some(WatchResource::Stream { stream_name }) => match self
-                    .registry
-                    .lock()
-                    .unwrap()
-                    .get_stream(&stream_name)
-                    .cloned()
-                {
-                    Some(stream) => ControlResponse::StreamFetched(GetStreamResponse {
-                        stream: stream_info_with_active_preflight(stream),
-                    }),
-                    None => ControlResponse::Error {
-                        reason: format!("stream not found stream_name=[{}]", stream_name),
-                    },
-                },
+                Some(WatchResource::Stream { stream_name }) => {
+                    let registry = self.registry.lock().unwrap();
+                    match registry.get_stream(&stream_name).cloned() {
+                        Some(stream) => ControlResponse::StreamFetched(GetStreamResponse {
+                            stream: stream_info_with_registry_metadata(&registry, stream),
+                        }),
+                        None => ControlResponse::Error {
+                            reason: format!("stream not found stream_name=[{}]", stream_name),
+                        },
+                    }
+                }
                 _ => ControlResponse::Error {
                     reason: "control envelope get requires supported resource".to_string(),
                 },
             },
             Some("list") => {
-                let streams: Vec<_> = self
-                    .registry
-                    .lock()
-                    .unwrap()
+                let registry = self.registry.lock().unwrap();
+                let streams: Vec<_> = registry
                     .list_streams()
                     .into_iter()
-                    .map(stream_info_with_active_preflight)
+                    .map(|stream| stream_info_with_registry_metadata(&registry, stream))
                     .collect();
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
@@ -2486,13 +2479,11 @@ impl MasterServer {
                 }
             }
             ControlRequest::ListStreams(_) => {
-                let streams: Vec<_> = self
-                    .registry
-                    .lock()
-                    .unwrap()
+                let registry = self.registry.lock().unwrap();
+                let streams: Vec<_> = registry
                     .list_streams()
                     .into_iter()
-                    .map(stream_info_with_active_preflight)
+                    .map(|stream| stream_info_with_registry_metadata(&registry, stream))
                     .collect();
                 tracing::debug!(
                     component = "master_server",
@@ -2507,7 +2498,7 @@ impl MasterServer {
                 let registry = self.registry.lock().unwrap();
                 let streams: Vec<_> = registry
                     .stream_records()
-                    .map(stream_status_with_active_preflight)
+                    .map(|stream| stream_status_with_registry_metadata(&registry, stream))
                     .collect();
                 tracing::debug!(
                     component = "master_server",
@@ -2518,39 +2509,39 @@ impl MasterServer {
                 );
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
-            ControlRequest::GetStream(request) => match self
-                .registry
-                .lock()
-                .unwrap()
-                .get_stream(&request.stream_name)
-                .cloned()
-            {
-                Some(stream) => {
-                    tracing::debug!(
-                        component = "master_server",
-                        event = "get_stream",
-                        status = "success",
-                        stream_name = request.stream_name.as_str(),
-                        "fetched stream"
-                    );
-                    ControlResponse::StreamFetched(GetStreamResponse {
-                        stream: stream_info_with_active_preflight(stream),
-                    })
-                }
-                None => {
-                    tracing::error!(
-                        component = "master_server",
-                        event = "get_stream",
-                        status = "error",
-                        stream_name = request.stream_name.as_str(),
-                        error = "stream not found",
-                        "failed to fetch stream"
-                    );
-                    ControlResponse::Error {
-                        reason: format!("stream not found stream_name=[{}]", request.stream_name),
+            ControlRequest::GetStream(request) => {
+                let registry = self.registry.lock().unwrap();
+                match registry.get_stream(&request.stream_name).cloned() {
+                    Some(stream) => {
+                        tracing::debug!(
+                            component = "master_server",
+                            event = "get_stream",
+                            status = "success",
+                            stream_name = request.stream_name.as_str(),
+                            "fetched stream"
+                        );
+                        ControlResponse::StreamFetched(GetStreamResponse {
+                            stream: stream_info_with_registry_metadata(&registry, stream),
+                        })
+                    }
+                    None => {
+                        tracing::error!(
+                            component = "master_server",
+                            event = "get_stream",
+                            status = "error",
+                            stream_name = request.stream_name.as_str(),
+                            error = "stream not found",
+                            "failed to fetch stream"
+                        );
+                        ControlResponse::Error {
+                            reason: format!(
+                                "stream not found stream_name=[{}]",
+                                request.stream_name
+                            ),
+                        }
                     }
                 }
-            },
+            }
             ControlRequest::GetStreamStatus(request) => {
                 let registry = self.registry.lock().unwrap();
                 match registry.get_stream(&request.stream_name) {
@@ -2563,7 +2554,7 @@ impl MasterServer {
                             "fetched stream status"
                         );
                         ControlResponse::StreamFetched(GetStreamResponse {
-                            stream: stream_status_with_active_preflight(stream),
+                            stream: stream_status_with_registry_metadata(&registry, stream),
                         })
                     }
                     None => {
@@ -3980,6 +3971,7 @@ impl From<crate::registry::StreamRecord> for StreamInfo {
             data_path: stream.data_path,
             descriptor_generation: stream.descriptor_generation,
             active_segment_descriptor: stream.active_segment_descriptor,
+            source_configs: Vec::new(),
             active_segment_preflight: None,
             segment_row_capacity: None,
             sealed_segments: stream.sealed_segments,
@@ -4003,6 +3995,16 @@ fn stream_info_with_active_preflight(stream: crate::registry::StreamRecord) -> S
     info
 }
 
+fn stream_info_with_registry_metadata(
+    registry: &Registry,
+    stream: crate::registry::StreamRecord,
+) -> StreamInfo {
+    let stream_name = stream.stream_name.clone();
+    let mut info = stream_info_with_active_preflight(stream);
+    info.source_configs = source_configs_for_stream(registry, &stream_name);
+    info
+}
+
 fn stream_status_with_active_preflight(stream: &crate::registry::StreamRecord) -> StreamInfo {
     let mut info = StreamInfo {
         stream_name: stream.stream_name.clone(),
@@ -4011,6 +4013,7 @@ fn stream_status_with_active_preflight(stream: &crate::registry::StreamRecord) -
         data_path: stream.data_path.clone(),
         descriptor_generation: stream.descriptor_generation,
         active_segment_descriptor: stream.active_segment_descriptor.clone(),
+        source_configs: Vec::new(),
         active_segment_preflight: None,
         segment_row_capacity: None,
         sealed_segments: Vec::new(),
@@ -4027,6 +4030,23 @@ fn stream_status_with_active_preflight(stream: &crate::registry::StreamRecord) -
     };
     attach_active_preflight(&mut info);
     info
+}
+
+fn stream_status_with_registry_metadata(
+    registry: &Registry,
+    stream: &crate::registry::StreamRecord,
+) -> StreamInfo {
+    let mut info = stream_status_with_active_preflight(stream);
+    info.source_configs = source_configs_for_stream(registry, &stream.stream_name);
+    info
+}
+
+fn source_configs_for_stream(registry: &Registry, stream_name: &str) -> Vec<serde_json::Value> {
+    registry
+        .sources_for_stream(stream_name)
+        .into_iter()
+        .map(|source| source.config)
+        .collect()
 }
 
 fn attach_active_preflight(info: &mut StreamInfo) {
