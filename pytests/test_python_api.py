@@ -12051,6 +12051,274 @@ def test_read_table_snapshot_policy_controls_collect_boundary(monkeypatch) -> No
     assert fourth.column("value").to_pylist() == [3]
 
 
+def _install_fake_sharded_native_query(
+    monkeypatch,
+    *,
+    logical_name: str = "ticks",
+    rows_by_source: dict[str, pa.Table] | None = None,
+    logical_descriptor: dict[str, object] | None = None,
+    logical_source_configs: list[dict[str, object]] | None = None,
+) -> object:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("seq", pa.int64()),
+        ]
+    )
+    shard_names = [f"{logical_name}.__shard_0000", f"{logical_name}.__shard_0001"]
+    if rows_by_source is None:
+        rows_by_source = {
+            shard_names[0]: pa.table(
+                {"instrument_id": ["IF2606", "IH2606"], "seq": [1, 2]},
+                schema=schema,
+            ),
+            shard_names[1]: pa.table(
+                {"instrument_id": ["IF2606", "AU2606"], "seq": [3, 4]},
+                schema=schema,
+            ),
+        }
+    if logical_descriptor is None and logical_source_configs is None:
+        logical_descriptor = {"zippy_shards": shard_names}
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.stream_info_calls: list[str] = []
+            self.scanned_sources: list[str] = []
+
+        def get_stream(self, source: str) -> dict[str, object]:
+            self.stream_info_calls.append(source)
+            if source == logical_name:
+                return {
+                    "stream_name": logical_name,
+                    "schema_hash": "logical-schema",
+                    "active_segment_descriptor": logical_descriptor,
+                    "source_configs": list(logical_source_configs or []),
+                    "sealed_segments": [],
+                    "persisted_files": [],
+                    "descriptor_generation": 1,
+                }
+            return {
+                "stream_name": source,
+                "schema_hash": "physical-schema",
+                "active_segment_descriptor": {
+                    "segment_id": 1,
+                    "generation": 0,
+                    "zippy_internal": True,
+                    "zippy_logical_parent": logical_name,
+                },
+                "active_committed_row_high_watermark": rows_by_source[source].num_rows,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def stream_info(self) -> dict[str, object]:
+            return self.master.get_stream(self.source)
+
+        def snapshot(self) -> dict[str, object]:
+            return self.stream_info()
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            del snapshot
+            if self.source == logical_name:
+                raise AssertionError("logical sharded table must fan out to physical shards")
+            self.master.scanned_sources.append(self.source)
+            table = rows_by_source[self.source]
+            return pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    return FakeMaster()
+
+
+def test_read_table_and_shard_collect_fans_out_in_shard_order(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    result = zippy.read_table("ticks", master=master, snapshot=False).collect()
+
+    assert result.to_pydict() == {
+        "instrument_id": ["IF2606", "IH2606", "IF2606", "AU2606"],
+        "seq": [1, 2, 3, 4],
+    }
+    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+
+def test_stream_table_and_shard_table_constructor_collect_fans_out(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    result = zippy.Table("ticks", master=master, snapshot=False).collect()
+
+    assert result.column("seq").to_pylist() == [1, 2, 3, 4]
+    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+
+def test_read_table_and_shard_head_applies_after_concat(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    result = zippy.read_table("ticks", master=master, snapshot=False).head(2).collect()
+
+    assert result.to_pydict() == {
+        "instrument_id": ["IF2606", "IH2606"],
+        "seq": [1, 2],
+    }
+    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+
+def test_read_table_and_shard_filter_select_applies_after_concat(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    result = (
+        zippy.read_table("ticks", master=master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "IF2606")
+        .select("seq")
+        .collect()
+    )
+
+    assert result.to_pydict() == {"seq": [1, 3]}
+    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+
+def test_read_table_and_shard_uses_source_config_metadata_fallback(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(
+        monkeypatch,
+        logical_descriptor=None,
+        logical_source_configs=[
+            {"zippy_shards": ["ticks.__shard_0000", "ticks.__shard_0001"]},
+        ],
+    )
+
+    result = zippy.read_table("ticks", master=master, snapshot=False).collect()
+
+    assert result.column("seq").to_pylist() == [1, 2, 3, 4]
+    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+
+def test_read_table_and_shard_profile_marks_sharded(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    profile = zippy.read_table("ticks", master=master, snapshot=False).head(3).profile()
+
+    assert profile["result"].column("seq").to_pylist() == [1, 2, 3]
+    assert profile["metrics"]["returned_rows"] == 3
+    assert profile["metrics"]["sharded"] is True
+    assert profile["metrics"]["shards_scanned"] == 2
+
+
+def test_read_table_and_shard_physical_stream_does_not_fan_out(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    result = zippy.read_table("ticks.__shard_0000", master=master, snapshot=False).collect()
+
+    assert result.to_pydict() == {
+        "instrument_id": ["IF2606", "IH2606"],
+        "seq": [1, 2],
+    }
+    assert master.scanned_sources == ["ticks.__shard_0000"]
+
+
+def test_read_table_and_shard_invalid_metadata_raises_runtime_error(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(
+        monkeypatch,
+        logical_descriptor={"zippy_shards": ["ticks.__shard_0000", 42]},
+    )
+
+    with pytest.raises(RuntimeError, match="zippy_shards must be a list of strings"):
+        zippy.read_table("ticks", master=master, snapshot=False).collect()
+
+
+def test_read_table_and_shard_missing_metadata_raises_runtime_error(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(
+        monkeypatch,
+        logical_descriptor={"zippy_sharded": True},
+    )
+
+    with pytest.raises(RuntimeError, match="zippy_shards missing"):
+        zippy.read_table("ticks", master=master, snapshot=False).collect()
+
+
+def test_read_table_and_shard_snapshot_reuses_per_shard_boundaries(monkeypatch) -> None:
+    schema = pa.schema([("source", pa.string()), ("snapshot_value", pa.int64())])
+    shard_names = ["ticks.__shard_0000", "ticks.__shard_0001"]
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.snapshot_calls: dict[str, int] = {shard_names[0]: 0, shard_names[1]: 0}
+
+        def get_stream(self, source: str) -> dict[str, object]:
+            if source == "ticks":
+                return {
+                    "stream_name": "ticks",
+                    "schema_hash": "logical-schema",
+                    "active_segment_descriptor": {"zippy_shards": shard_names},
+                    "sealed_segments": [],
+                    "persisted_files": [],
+                    "descriptor_generation": 1,
+                }
+            return {
+                "stream_name": source,
+                "schema_hash": "physical-schema",
+                "active_segment_descriptor": {
+                    "segment_id": 1,
+                    "generation": 0,
+                    "zippy_internal": True,
+                    "zippy_logical_parent": "ticks",
+                },
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: FakeMaster) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def stream_info(self) -> dict[str, object]:
+            return self.master.get_stream(self.source)
+
+        def snapshot(self) -> dict[str, object]:
+            if self.source == "ticks":
+                return self.stream_info()
+            self.master.snapshot_calls[self.source] += 1
+            snapshot_value = self.master.snapshot_calls[self.source]
+            info = self.stream_info()
+            info["snapshot_value"] = snapshot_value
+            return info
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            table = pa.table(
+                {
+                    "source": [self.source],
+                    "snapshot_value": [snapshot["snapshot_value"]],
+                },
+                schema=schema,
+            )
+            return pa.RecordBatchReader.from_batches(schema, table.to_batches())
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+    master = FakeMaster()
+    query = zippy.read_table("ticks", master=master, snapshot=True)
+
+    first = query.collect()
+    second = query.collect()
+
+    assert first.to_pydict() == {
+        "source": ["ticks.__shard_0000", "ticks.__shard_0001"],
+        "snapshot_value": [1, 1],
+    }
+    assert second.to_pydict() == first.to_pydict()
+
+
 def test_lazy_table_api_supports_filter_select_join_with_columns_and_lit(monkeypatch) -> None:
     spot_schema = pa.schema(
         [

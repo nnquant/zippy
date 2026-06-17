@@ -3856,6 +3856,11 @@ class Table:
                 )
             else:
                 self._inner = _NativeQuery(source=source, master=selected_master)
+            self._master = selected_master
+            self._force_local = bool(_force_local)
+            self._logical_stream_info: dict[str, object] | None = None
+            self._shard_names: list[str] | None = None
+            self._fixed_shard_snapshots: dict[str, dict[str, object]] | None = None
             self._snapshot_enabled = bool(snapshot)
             self._fixed_snapshot: dict[str, object] | None = None
             self._plan_ops: list[tuple[str, object]] = []
@@ -4180,6 +4185,10 @@ class Table:
         return {"result": result, "metrics": metrics}
 
     def _collect_query(self, metrics: dict[str, object] | None, stream: bool = False):
+        shard_names = self._logical_shard_names_for_collect()
+        if shard_names:
+            return self._collect_logical_shards(shard_names, metrics=metrics, stream=stream)
+
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         remote_collect = getattr(self._inner, "collect_plan", None)
@@ -4388,6 +4397,11 @@ class Table:
         table = object.__new__(Table)
         table.source = self.source
         table._inner = self._inner
+        table._master = getattr(self, "_master", None)
+        table._force_local = bool(getattr(self, "_force_local", False))
+        table._logical_stream_info = getattr(self, "_logical_stream_info", None)
+        table._shard_names = getattr(self, "_shard_names", None)
+        table._fixed_shard_snapshots = getattr(self, "_fixed_shard_snapshots", None)
         table._snapshot_enabled = self._snapshot_enabled
         table._fixed_snapshot = self._fixed_snapshot
         table._plan_ops = list(self._plan_ops)
@@ -4444,6 +4458,75 @@ class Table:
             "returned_rows": None,
             "elapsed_ms": None,
         }
+
+    def _logical_shard_names_for_collect(self) -> list[str]:
+        if self._shard_names is not None:
+            return list(self._shard_names)
+
+        stream_info = self._logical_stream_info
+        if stream_info is None:
+            get_stream_info = getattr(self._inner, "stream_info", None)
+            if not callable(get_stream_info):
+                self._shard_names = []
+                return []
+            stream_info = get_stream_info()
+            self._logical_stream_info = stream_info
+
+        if _internal_shard_parent_name(self.source, stream_info) is not None:
+            self._shard_names = []
+            return []
+
+        try:
+            shard_names = _logical_shard_stream_names(stream_info)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+
+        if (
+            not shard_names
+            and _descriptor_metadata_value(stream_info, "zippy_sharded") is True
+        ):
+            raise RuntimeError(f"zippy_shards missing for sharded table table_name=[{self.source}]")
+
+        self._shard_names = list(shard_names)
+        return list(shard_names)
+
+    def _collect_logical_shards(
+        self,
+        shard_names: list[str],
+        *,
+        metrics: dict[str, object] | None,
+        stream: bool,
+    ):
+        schema = self.schema()
+        optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        if metrics is not None:
+            metrics["sharded"] = True
+            metrics["shards_scanned"] = len(shard_names)
+            metrics["shard_names"] = list(shard_names)
+
+        shard_tables = []
+        fixed_shard_snapshots = None
+        if self._snapshot_enabled:
+            fixed_shard_snapshots = getattr(self, "_fixed_shard_snapshots", None)
+            if fixed_shard_snapshots is None:
+                fixed_shard_snapshots = {}
+                self._fixed_shard_snapshots = fixed_shard_snapshots
+
+        for shard_name in shard_names:
+            shard_reader = Table(
+                shard_name,
+                master=getattr(self, "_master", None),
+                snapshot=self._snapshot_enabled,
+                _force_local=bool(getattr(self, "_force_local", False)),
+            )
+            if fixed_shard_snapshots is not None and shard_name in fixed_shard_snapshots:
+                shard_reader._fixed_snapshot = fixed_shard_snapshots[shard_name]
+            shard_tables.append(shard_reader._collect_query(metrics=None, stream=stream))
+            if fixed_shard_snapshots is not None and shard_reader._fixed_snapshot is not None:
+                fixed_shard_snapshots[shard_name] = shard_reader._fixed_snapshot
+
+        combined = _concat_query_tables(shard_tables, schema)
+        return self._apply_query_plan(combined, optimized_plan)
 
     def _pushdown_plan_summary(
         self,
