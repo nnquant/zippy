@@ -15059,8 +15059,10 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
         reset_default_master()
 
     pending_seen = threading.Event()
+    release_deadline = threading.Event()
     failed = threading.Event()
     callback_count = 0
+    next_delay_calls = 0
     flush_due_calls = 0
     base_adapter = zippy._TableSubscriptionCallback
 
@@ -15068,7 +15070,15 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
         def __call__(self, table: pa.Table) -> None:
             self._last_emit_ns = time.perf_counter_ns()
             super().__call__(table)
-            pending_seen.set()
+
+        def _zippy_next_flush_delay_ns(self) -> int | None:
+            nonlocal next_delay_calls
+            next_delay_calls += 1
+            if next_delay_calls == 1:
+                pending_seen.set()
+                if not release_deadline.wait(timeout=1.0):
+                    raise RuntimeError("test did not release callback flush deadline")
+            return super()._zippy_next_flush_delay_ns()
 
         def _zippy_flush_due(self) -> int | None:
             nonlocal flush_due_calls
@@ -15119,6 +15129,7 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
 
         assert pending_seen.wait(timeout=1.0)
         assert callback_count == 0
+        release_deadline.set()
         assert failed.wait(timeout=2.0)
 
         deadline = time.monotonic() + 2.0
@@ -15132,11 +15143,36 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
         assert flush_due_calls == 1
         assert callback_count == 1
 
-        with pytest.raises(RuntimeError, match="deadline callback failed"):
-            getattr(subscriber, terminal_method)()
+        terminal_done = threading.Event()
+        terminal_errors: list[BaseException] = []
+
+        def call_terminal_method() -> None:
+            try:
+                getattr(subscriber, terminal_method)()
+            except BaseException as error:
+                terminal_errors.append(error)
+            finally:
+                terminal_done.set()
+
+        terminal_thread = threading.Thread(target=call_terminal_method, daemon=True)
+        terminal_thread.start()
+        try:
+            assert terminal_done.wait(timeout=2.0)
+        finally:
+            if not terminal_done.is_set():
+                try:
+                    subscriber.stop()
+                except RuntimeError:
+                    pass
+        terminal_thread.join(timeout=0.1)
         subscriber = None
+        assert not terminal_thread.is_alive()
+        assert len(terminal_errors) == 1
+        assert isinstance(terminal_errors[0], RuntimeError)
+        assert "deadline callback failed" in str(terminal_errors[0])
         assert callback_count == 1
     finally:
+        release_deadline.set()
         try:
             if subscriber is not None:
                 try:
