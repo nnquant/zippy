@@ -15048,6 +15048,109 @@ def test_subscribe_table_flushes_silent_partial_batch_at_throttle_deadline(
             server.stop()
 
 
+@pytest.mark.parametrize("terminal_method", ["stop", "join"])
+def test_subscribe_table_deadline_callback_error_stops_subscriber(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_method: str,
+) -> None:
+    reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
+    if reset_default_master is not None:
+        reset_default_master()
+
+    pending_seen = threading.Event()
+    failed = threading.Event()
+    callback_count = 0
+    flush_due_calls = 0
+    base_adapter = zippy._TableSubscriptionCallback
+
+    class ControlledTableSubscriptionCallback(base_adapter):
+        def __call__(self, table: pa.Table) -> None:
+            self._last_emit_ns = time.perf_counter_ns()
+            super().__call__(table)
+            pending_seen.set()
+
+        def _zippy_flush_due(self) -> int | None:
+            nonlocal flush_due_calls
+            flush_due_calls += 1
+            return super()._zippy_flush_due()
+
+    monkeypatch.setattr(zippy, "_TableSubscriptionCallback", ControlledTableSubscriptionCallback)
+    subscriber = None
+    server, control_endpoint = start_master_server(tmp_path)
+    try:
+        tick_schema = pa.schema(
+            [
+                ("dt", pa.timestamp("ns", tz="UTC")),
+                ("instrument_id", pa.string()),
+                ("last_price", pa.float64()),
+            ]
+        )
+        process_name = f"subscriber_deadline_failure_{terminal_method}"
+        stream_name = f"deadline_failure_ticks_{terminal_method}"
+
+        client = zippy.connect(uri=control_endpoint)
+        client.register_process(process_name)
+        client.register_stream(stream_name, tick_schema, 64, 4096)
+        client.register_source(
+            f"deadline_failure_source_{terminal_method}",
+            "segment_test",
+            stream_name,
+            {},
+        )
+
+        writer = _segment_test_writer(client, stream_name, tick_schema, row_capacity=16)
+        client.publish_segment_descriptor(stream_name, writer.descriptor())
+
+        def on_table(table: pa.Table) -> None:
+            nonlocal callback_count
+            callback_count += 1
+            failed.set()
+            raise ValueError("deadline callback failed")
+
+        subscriber = zippy.subscribe_table(
+            stream_name,
+            callback=on_table,
+            poll_interval_ms=500,
+            batch_size=2,
+            throttle_ms=50,
+        )
+        writer.append_tick(1777017600000000000, "IF2606", 4102.5)
+
+        assert pending_seen.wait(timeout=1.0)
+        assert callback_count == 0
+        assert failed.wait(timeout=2.0)
+
+        deadline = time.monotonic() + 2.0
+        metrics = subscriber.metrics()
+        while metrics["running"] is True and time.monotonic() < deadline:
+            time.sleep(0.01)
+            metrics = subscriber.metrics()
+
+        assert metrics["running"] is False
+        assert "deadline callback failed" in metrics["last_error"]
+        assert flush_due_calls == 1
+        assert callback_count == 1
+
+        with pytest.raises(RuntimeError, match="deadline callback failed"):
+            getattr(subscriber, terminal_method)()
+        assert callback_count == 1
+        subscriber = None
+    finally:
+        try:
+            if subscriber is not None:
+                try:
+                    subscriber.stop()
+                except RuntimeError:
+                    pass
+        finally:
+            try:
+                if reset_default_master is not None:
+                    reset_default_master()
+            finally:
+                server.stop()
+
+
 def test_pipeline_stream_table_publishes_descriptor_for_query_tail(tmp_path: Path) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:

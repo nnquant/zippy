@@ -4297,6 +4297,10 @@ impl StreamSubscriber {
 
                     driver.finish()
                 })();
+                if let Err(error) = run_result.as_ref() {
+                    metrics.record_last_error(error.clone());
+                }
+                running.store(false, Ordering::SeqCst);
                 let _ = descriptor_refresh_handle.join();
                 run_result
             })();
