@@ -14937,60 +14937,115 @@ def test_subscribe_table_uses_default_master_and_invokes_callback_with_live_tabl
 
 def test_subscribe_table_flushes_silent_partial_batch_at_throttle_deadline(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reset_default_master = getattr(zippy, "_reset_default_master_for_test", None)
     if reset_default_master is not None:
         reset_default_master()
 
-    server, control_endpoint = start_master_server(tmp_path)
-    tick_schema = pa.schema(
-        [
-            ("dt", pa.timestamp("ns", tz="UTC")),
-            ("instrument_id", pa.string()),
-            ("last_price", pa.float64()),
-        ]
-    )
-
-    client = zippy.connect(uri=control_endpoint)
-    client.register_process("subscriber_throttle_test")
-    client.register_stream("throttled_ticks", tick_schema, 64, 4096)
-    client.register_source(
-        "throttled_ticks_source",
-        "segment_test",
-        "throttled_ticks",
-        {},
-    )
-
-    writer = _segment_test_writer(client, "throttled_ticks", tick_schema, row_capacity=16)
-    client.publish_segment_descriptor("throttled_ticks", writer.descriptor())
-
+    pending_seen = threading.Event()
+    release_deadline = threading.Event()
+    delivered = threading.Event()
     received: list[pa.Table] = []
-    ready = threading.Event()
+    callback_thread_ids: list[int] = []
+    next_delay_thread_ids: list[int] = []
+    flush_due_thread_ids: list[int] = []
+    next_delay_calls = 0
+    flush_due_calls = 0
+    base_adapter = zippy._TableSubscriptionCallback
 
-    def on_table(table: pa.Table) -> None:
-        received.append(table)
-        ready.set()
+    class ControlledTableSubscriptionCallback(base_adapter):
+        def __call__(self, table: pa.Table) -> None:
+            callback_thread_ids.append(threading.get_ident())
+            self._last_emit_ns = time.perf_counter_ns()
+            super().__call__(table)
 
-    subscriber = zippy.subscribe_table(
-        "throttled_ticks",
-        callback=on_table,
-        poll_interval_ms=2_000,
-        batch_size=2,
-        throttle_ms=250,
-    )
+        def _zippy_next_flush_delay_ns(self) -> int | None:
+            nonlocal next_delay_calls
+            next_delay_calls += 1
+            next_delay_thread_ids.append(threading.get_ident())
+            if next_delay_calls == 1:
+                pending_seen.set()
+                if not release_deadline.wait(timeout=1.0):
+                    raise TimeoutError("test did not release callback flush deadline")
+            return super()._zippy_next_flush_delay_ns()
 
+        def _zippy_flush_due(self) -> int | None:
+            nonlocal flush_due_calls
+            flush_due_calls += 1
+            flush_due_thread_ids.append(threading.get_ident())
+            return super()._zippy_flush_due()
+
+    monkeypatch.setattr(zippy, "_TableSubscriptionCallback", ControlledTableSubscriptionCallback)
+    server, control_endpoint = start_master_server(tmp_path)
+    subscriber = None
     try:
+        tick_schema = pa.schema(
+            [
+                ("dt", pa.timestamp("ns", tz="UTC")),
+                ("instrument_id", pa.string()),
+                ("last_price", pa.float64()),
+            ]
+        )
+
+        client = zippy.connect(uri=control_endpoint)
+        client.register_process("subscriber_throttle_test")
+        client.register_stream("throttled_ticks", tick_schema, 64, 4096)
+        client.register_source(
+            "throttled_ticks_source",
+            "segment_test",
+            "throttled_ticks",
+            {},
+        )
+
+        writer = _segment_test_writer(client, "throttled_ticks", tick_schema, row_capacity=16)
+        client.publish_segment_descriptor("throttled_ticks", writer.descriptor())
+
+        def on_table(table: pa.Table) -> None:
+            received.append(table)
+            delivered.set()
+
+        subscriber = zippy.subscribe_table(
+            "throttled_ticks",
+            callback=on_table,
+            poll_interval_ms=500,
+            batch_size=2,
+            throttle_ms=100,
+        )
         writer.append_tick(1777017600000000000, "IF2606", 4102.5)
 
-        assert ready.wait(timeout=1.25)
-        time.sleep(0.1)
+        assert pending_seen.wait(timeout=1.0)
+        assert received == []
+        assert not delivered.is_set()
+
+        release_deadline.set()
+        assert delivered.wait(timeout=1.0)
         assert len(received) == 1
         assert received[0].column("instrument_id").to_pylist() == ["IF2606"]
-    finally:
+        assert callback_thread_ids
+        assert next_delay_thread_ids
+        assert flush_due_thread_ids
+        assert len(set(callback_thread_ids + next_delay_thread_ids + flush_due_thread_ids)) == 1
+        assert next_delay_calls >= 1
+        assert flush_due_calls == 1
+
+        time.sleep(0.25)
+        assert len(received) == 1
+        assert flush_due_calls == 1
+
         subscriber.stop()
-        if reset_default_master is not None:
-            reset_default_master()
-        server.stop()
+        subscriber = None
+        assert len(received) == 1
+        assert flush_due_calls == 1
+    finally:
+        release_deadline.set()
+        try:
+            if subscriber is not None:
+                subscriber.stop()
+        finally:
+            if reset_default_master is not None:
+                reset_default_master()
+            server.stop()
 
 
 def test_pipeline_stream_table_publishes_descriptor_for_query_tail(tmp_path: Path) -> None:

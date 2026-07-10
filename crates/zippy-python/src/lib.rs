@@ -4236,7 +4236,7 @@ impl StreamSubscriber {
                     while running.load(Ordering::SeqCst) {
                         if flush_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                             flush_deadline =
-                                deadline_from_delay(invoke_stream_callback_flush_due(&callback)?);
+                                deadline_from_delay(invoke_stream_callback_flush_due(&callback)?)?;
                             continue;
                         }
                         let effective_wait = flush_deadline.map_or(poll_interval, |deadline| {
@@ -4275,7 +4275,7 @@ impl StreamSubscriber {
                                         &callback,
                                         batch,
                                         flush_deadline_enabled,
-                                    )?);
+                                    )?)?;
                                     let callback_done_at = Instant::now();
                                     trace_table_delivery_latency(
                                         &source,
@@ -4680,8 +4680,19 @@ fn callback_flush_delay(
         .map(|delay| delay.map(Duration::from_nanos))
 }
 
-fn deadline_from_delay(delay: Option<Duration>) -> Option<Instant> {
-    delay.map(|duration| Instant::now() + duration)
+fn deadline_from_delay(delay: Option<Duration>) -> std::result::Result<Option<Instant>, String> {
+    let Some(duration) = delay else {
+        return Ok(None);
+    };
+    Instant::now()
+        .checked_add(duration)
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "callback flush deadline exceeds instant range duration_ns=[{}]",
+                duration.as_nanos()
+            )
+        })
 }
 
 fn invoke_stream_callback_flush_due(
@@ -9053,6 +9064,15 @@ mod tests {
     const MINUTE_NS: i64 = 60_000_000_000;
     static PYTHON_TEST_INIT: Once = Once::new();
     static PYTHON_SITE_PACKAGES: OnceLock<Vec<String>> = OnceLock::new();
+
+    #[test]
+    fn callback_flush_deadline_rejects_unrepresentable_duration() {
+        let error = deadline_from_delay(Some(Duration::MAX))
+            .expect_err("unrepresentable callback flush deadline must be rejected");
+
+        assert!(error.contains("callback flush deadline"));
+        assert!(error.contains("range"));
+    }
 
     fn stream_info_for_drop_table_test(
         stream_name: &str,
