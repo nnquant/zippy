@@ -3227,12 +3227,24 @@ fn take_descriptor_refresh_error(error_slot: &Mutex<Option<String>>) -> Option<S
     error_slot.lock().unwrap().take()
 }
 
-fn apply_segment_descriptor_update(
-    reader_handle: &mut ActiveSegmentReaderHandle,
-    descriptor_text: &mut String,
+struct PreparedSegmentDescriptorUpdate {
+    next_handle: ActiveSegmentReaderHandle,
+    descriptor_generation: u64,
+    descriptor_text: String,
+    descriptor: serde_json::Value,
+}
+
+enum DescriptorPrepareOutcome {
+    Ready(PreparedSegmentDescriptorUpdate),
+    TransientMissing,
+    TransientLayoutMismatch,
+}
+
+fn prepare_segment_descriptor_update(
+    reader_handle: &ActiveSegmentReaderHandle,
     update: DescriptorUpdate,
     segment_schema: &CompiledSchema,
-) -> std::result::Result<DescriptorApplyOutcome, String> {
+) -> std::result::Result<DescriptorPrepareOutcome, String> {
     let lease_context = reader_handle
         .reader_lease
         .as_ref()
@@ -3244,20 +3256,24 @@ fn apply_segment_descriptor_update(
     ) {
         Ok(next_handle) => next_handle,
         Err(error) if is_transient_missing_segment_reader_error(&error) => {
-            return Ok(DescriptorApplyOutcome::TransientMissing);
+            return Ok(DescriptorPrepareOutcome::TransientMissing);
         }
         Err(error) if is_segment_reader_lease_target_not_found(&error) => {
-            return Ok(DescriptorApplyOutcome::TransientMissing);
+            return Ok(DescriptorPrepareOutcome::TransientMissing);
         }
         Err(error) if is_transient_segment_reader_layout_mismatch(&error) => {
-            return Ok(DescriptorApplyOutcome::TransientLayoutMismatch);
+            return Ok(DescriptorPrepareOutcome::TransientLayoutMismatch);
         }
         Err(error) => return Err(error.to_string()),
     };
-    let descriptor_generation = update.descriptor_generation;
-    *reader_handle = next_handle;
-    *descriptor_text = update.text;
-    Ok(DescriptorApplyOutcome::Applied(descriptor_generation))
+    Ok(DescriptorPrepareOutcome::Ready(
+        PreparedSegmentDescriptorUpdate {
+            next_handle,
+            descriptor_generation: update.descriptor_generation,
+            descriptor_text: update.text,
+            descriptor: update.descriptor,
+        },
+    ))
 }
 
 fn is_transient_missing_segment_reader_error(error: &ZippyError) -> bool {
@@ -3575,6 +3591,24 @@ struct SegmentReaderEmptyPollHook {
     resume: mpsc::Receiver<()>,
 }
 
+#[cfg(test)]
+struct SegmentReaderDescriptorPreCommitHook {
+    reached: mpsc::SyncSender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl SegmentReaderDescriptorPreCommitHook {
+    fn wait(self) {
+        self.reached
+            .send(())
+            .expect("descriptor pre-commit hook receiver should remain connected");
+        self.resume
+            .recv()
+            .expect("descriptor pre-commit hook sender should remain connected");
+    }
+}
+
 struct SegmentReaderDriver {
     reader_handle: ActiveSegmentReaderHandle,
     descriptor_text: String,
@@ -3590,6 +3624,8 @@ struct SegmentReaderDriver {
     metrics: Option<Arc<SubscriberMetrics>>,
     #[cfg(test)]
     empty_poll_hook: Option<SegmentReaderEmptyPollHook>,
+    #[cfg(test)]
+    descriptor_pre_commit_hook: Option<SegmentReaderDescriptorPreCommitHook>,
 }
 
 impl SegmentReaderDriver {
@@ -3620,6 +3656,8 @@ impl SegmentReaderDriver {
             metrics,
             #[cfg(test)]
             empty_poll_hook: None,
+            #[cfg(test)]
+            descriptor_pre_commit_hook: None,
         }
     }
 
@@ -3639,6 +3677,18 @@ impl SegmentReaderDriver {
         hook.resume
             .recv()
             .expect("empty poll hook resume sender should remain connected");
+    }
+
+    #[cfg(test)]
+    fn set_descriptor_pre_commit_hook(&mut self, hook: SegmentReaderDescriptorPreCommitHook) {
+        self.descriptor_pre_commit_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn wait_on_descriptor_pre_commit_hook(&mut self) {
+        if let Some(hook) = self.descriptor_pre_commit_hook.take() {
+            hook.wait();
+        }
     }
 
     fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
@@ -3883,11 +3933,15 @@ impl SegmentReaderDriver {
         if update.text == self.descriptor_text {
             return Ok(DescriptorPollOutcome::NoUpdate);
         }
-        match self.apply_descriptor_update_or_retry(update)? {
-            Some(descriptor_generation) => {
-                Ok(DescriptorPollOutcome::Applied(descriptor_generation))
+        match self.apply_descriptor_update_or_retry_after_notification_check(
+            update,
+            observed_notification_seq,
+        )? {
+            DescriptorPollOutcome::ReaderNotified => {
+                self.next_descriptor_refresh_at = Instant::now();
+                Ok(DescriptorPollOutcome::ReaderNotified)
             }
-            None => Ok(DescriptorPollOutcome::NoUpdate),
+            outcome => Ok(outcome),
         }
     }
 
@@ -3959,8 +4013,19 @@ impl SegmentReaderDriver {
                 self.record_pending_descriptor_updates();
                 return Ok(DescriptorPollOutcome::ReaderNotified);
             }
-            if let Some(descriptor_generation) = self.apply_descriptor_update_or_retry(update)? {
-                return Ok(DescriptorPollOutcome::Applied(descriptor_generation));
+            match self.apply_descriptor_update_or_retry_after_notification_check(
+                update.clone(),
+                observed_notification_seq,
+            )? {
+                DescriptorPollOutcome::Applied(descriptor_generation) => {
+                    return Ok(DescriptorPollOutcome::Applied(descriptor_generation));
+                }
+                DescriptorPollOutcome::ReaderNotified => {
+                    self.descriptor_updates.restore_front(update);
+                    self.record_pending_descriptor_updates();
+                    return Ok(DescriptorPollOutcome::ReaderNotified);
+                }
+                DescriptorPollOutcome::NoUpdate => {}
             }
         }
         self.retry_pending_descriptor_update_after_notification_check(observed_notification_seq)
@@ -3985,6 +4050,45 @@ impl SegmentReaderDriver {
                 }
                 self.defer_descriptor_retry(update);
                 Ok(None)
+            }
+        }
+    }
+
+    fn apply_descriptor_update_or_retry_after_notification_check(
+        &mut self,
+        update: DescriptorUpdate,
+        observed_notification_seq: u32,
+    ) -> std::result::Result<DescriptorPollOutcome, String> {
+        let outcome = prepare_segment_descriptor_update(
+            &self.reader_handle,
+            update.clone(),
+            &self.segment_schema,
+        )?;
+        match outcome {
+            DescriptorPrepareOutcome::Ready(prepared) => {
+                #[cfg(test)]
+                self.wait_on_descriptor_pre_commit_hook();
+                if self.reader_notification_changed(observed_notification_seq)? {
+                    self.record_pending_descriptor_updates();
+                    return Ok(DescriptorPollOutcome::ReaderNotified);
+                }
+                let descriptor_generation = self.commit_prepared_descriptor_update(prepared);
+                self.pending_descriptor_retry = None;
+                self.record_pending_descriptor_updates();
+                Ok(DescriptorPollOutcome::Applied(descriptor_generation))
+            }
+            DescriptorPrepareOutcome::TransientMissing => {
+                self.record_pending_descriptor_updates();
+                self.defer_descriptor_retry(update);
+                Ok(DescriptorPollOutcome::NoUpdate)
+            }
+            DescriptorPrepareOutcome::TransientLayoutMismatch => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.record_layout_mismatch_rebind();
+                }
+                self.record_pending_descriptor_updates();
+                self.defer_descriptor_retry(update);
+                Ok(DescriptorPollOutcome::NoUpdate)
             }
         }
     }
@@ -4059,33 +4163,46 @@ impl SegmentReaderDriver {
             Some(latest) if latest.text != pending.text => latest,
             _ => pending,
         };
-        match self.apply_descriptor_update_or_retry(update)? {
-            Some(descriptor_generation) => {
-                Ok(DescriptorPollOutcome::Applied(descriptor_generation))
-            }
-            None => Ok(DescriptorPollOutcome::NoUpdate),
-        }
+        self.apply_descriptor_update_or_retry_after_notification_check(
+            update,
+            observed_notification_seq,
+        )
     }
 
     fn apply_descriptor_update(
         &mut self,
         update: DescriptorUpdate,
     ) -> std::result::Result<DescriptorApplyOutcome, String> {
-        let descriptor_generation = update.descriptor_generation;
-        let descriptor = update.descriptor.clone();
-        let outcome = apply_segment_descriptor_update(
-            &mut self.reader_handle,
-            &mut self.descriptor_text,
+        let outcome = match prepare_segment_descriptor_update(
+            &self.reader_handle,
             update,
             &self.segment_schema,
-        )?;
-        if matches!(outcome, DescriptorApplyOutcome::Applied(_)) {
-            if let Some(metrics) = self.metrics.as_ref() {
-                metrics.record_descriptor_rebind(descriptor_generation, &descriptor);
+        )? {
+            DescriptorPrepareOutcome::Ready(prepared) => {
+                #[cfg(test)]
+                self.wait_on_descriptor_pre_commit_hook();
+                DescriptorApplyOutcome::Applied(self.commit_prepared_descriptor_update(prepared))
             }
-        }
+            DescriptorPrepareOutcome::TransientMissing => DescriptorApplyOutcome::TransientMissing,
+            DescriptorPrepareOutcome::TransientLayoutMismatch => {
+                DescriptorApplyOutcome::TransientLayoutMismatch
+            }
+        };
         self.record_pending_descriptor_updates();
         Ok(outcome)
+    }
+
+    fn commit_prepared_descriptor_update(
+        &mut self,
+        prepared: PreparedSegmentDescriptorUpdate,
+    ) -> u64 {
+        let descriptor_generation = prepared.descriptor_generation;
+        self.reader_handle = prepared.next_handle;
+        self.descriptor_text = prepared.descriptor_text;
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_descriptor_rebind(descriptor_generation, &prepared.descriptor);
+        }
+        descriptor_generation
     }
 
     fn wait_for_mmap_notification_after(
@@ -9522,6 +9639,363 @@ mod tests {
             object.remove("writer_epoch");
         }
         descriptor
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LateNotifyDescriptorSource {
+        Queued,
+        Master,
+        PendingRetry,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum ReportedDriverEvent {
+        Rows(Vec<String>),
+        DescriptorUpdated(u64),
+        Idle,
+    }
+
+    #[derive(Debug)]
+    struct LateNotifyDriverReport {
+        event: ReportedDriverEvent,
+        queued_updates: usize,
+        pending_generation: Option<u64>,
+        descriptor_refresh_due: bool,
+        descriptor_rebinds_total: u64,
+    }
+
+    fn reported_driver_event(event: SegmentReaderDriverEvent) -> ReportedDriverEvent {
+        match event {
+            SegmentReaderDriverEvent::Rows(span) => {
+                let instrument_index = span.column_index("instrument_id").unwrap();
+                let instruments = (0..span.row_count())
+                    .map(|row_offset| {
+                        span.utf8_cell_value_at(row_offset, instrument_index)
+                            .unwrap()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect();
+                ReportedDriverEvent::Rows(instruments)
+            }
+            SegmentReaderDriverEvent::DescriptorUpdated(generation) => {
+                ReportedDriverEvent::DescriptorUpdated(generation)
+            }
+            SegmentReaderDriverEvent::Idle => ReportedDriverEvent::Idle,
+        }
+    }
+
+    fn assert_descriptor_source_drains_notify_during_pre_commit(
+        source: LateNotifyDescriptorSource,
+    ) {
+        let suffix = match source {
+            LateNotifyDescriptorSource::Queued => "queued",
+            LateNotifyDescriptorSource::Master => "master",
+            LateNotifyDescriptorSource::PendingRetry => "pending",
+        };
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                &format!("late-notify-current-{suffix}"),
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        let next_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                &format!("late-notify-next-{suffix}"),
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let raw_current_descriptor: serde_json::Value = serde_json::from_slice(
+            &current_partition
+                .active_descriptor_envelope_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        let raw_next_descriptor: serde_json::Value =
+            serde_json::from_slice(&next_partition.active_descriptor_envelope_bytes().unwrap())
+                .unwrap();
+
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let metrics = Arc::new(SubscriberMetrics::default());
+        let mut master_runtime = None;
+        let mut writer_master = None;
+        let mut current_descriptor = raw_current_descriptor.clone();
+        let mut reader_lease = None;
+        let mut expected_generation = 2;
+
+        if source == LateNotifyDescriptorSource::Master {
+            let (endpoint, server, join_handle) = spawn_test_master();
+            let arrow_schema = Arc::new(Schema::new(vec![
+                Field::new("instrument_id", DataType::Utf8, false),
+                Field::new("last_price", DataType::Float64, false),
+            ]));
+            let mut master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+            master.register_process("late_notify_writer").unwrap();
+            master
+                .register_stream("ticks", arrow_schema, 4, 4096)
+                .unwrap();
+            master
+                .register_source(
+                    "late_notify_source",
+                    "stream_table",
+                    "ticks",
+                    serde_json::json!({}),
+                )
+                .unwrap();
+            master
+                .publish_segment_descriptor(
+                    "ticks",
+                    publishable_descriptor_from_partition(&current_partition),
+                )
+                .unwrap();
+            current_descriptor = master.get_segment_descriptor("ticks").unwrap().unwrap();
+
+            let mut reader_master = CoreMasterClient::connect_endpoint(endpoint).unwrap();
+            reader_master
+                .register_process("late_notify_reader")
+                .unwrap();
+            let reader_master = Arc::new(Mutex::new(reader_master));
+            reader_lease = Some(
+                SegmentReaderLeaseGuard::acquire(
+                    Arc::clone(&reader_master),
+                    "ticks",
+                    &current_descriptor,
+                )
+                .unwrap(),
+            );
+
+            master
+                .publish_segment_descriptor(
+                    "ticks",
+                    publishable_descriptor_from_partition(&next_partition),
+                )
+                .unwrap();
+            expected_generation = master.get_stream("ticks").unwrap().descriptor_generation;
+            writer_master = Some(master);
+            master_runtime = Some((server, join_handle));
+        }
+
+        if source == LateNotifyDescriptorSource::Queued {
+            descriptor_updates
+                .set(descriptor_update_from_value(2, raw_next_descriptor.clone()).unwrap());
+            let later_partition = store
+                .open_partition_with_schema_and_writer_epoch(
+                    "ticks",
+                    "late-notify-later-queued",
+                    schema.clone(),
+                    1,
+                )
+                .unwrap();
+            later_partition
+                .writer()
+                .write_row(|row| {
+                    row.write_utf8("instrument_id", "IF2608")?;
+                    row.write_f64("last_price", 4106.5)?;
+                    Ok(())
+                })
+                .unwrap();
+            let later_descriptor: serde_json::Value = serde_json::from_slice(
+                &later_partition.active_descriptor_envelope_bytes().unwrap(),
+            )
+            .unwrap();
+            descriptor_updates.set(descriptor_update_from_value(3, later_descriptor).unwrap());
+        }
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let current_identity = descriptor_segment_identity(&current_descriptor).unwrap();
+        let next_identity = descriptor_segment_identity(&raw_next_descriptor).unwrap();
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease,
+            },
+            serde_json::to_string(&current_descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            source == LateNotifyDescriptorSource::Queued,
+            Duration::ZERO,
+            0,
+            Some(Arc::clone(&metrics)),
+        );
+        if source == LateNotifyDescriptorSource::PendingRetry {
+            driver.pending_descriptor_retry =
+                Some(descriptor_update_from_value(2, raw_next_descriptor).unwrap());
+            driver.next_descriptor_retry_at = Instant::now();
+        }
+        let (pre_commit_reached_tx, pre_commit_reached_rx) = mpsc::sync_channel(0);
+        let (pre_commit_resume_tx, pre_commit_resume_rx) = mpsc::sync_channel(0);
+        driver.set_descriptor_pre_commit_hook(SegmentReaderDescriptorPreCommitHook {
+            reached: pre_commit_reached_tx,
+            resume: pre_commit_resume_rx,
+        });
+
+        let (event_tx, event_rx) = mpsc::sync_channel(0);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            for _ in 0..4 {
+                let event = reported_driver_event(driver.poll_next().unwrap());
+                let report = LateNotifyDriverReport {
+                    event,
+                    queued_updates: driver.descriptor_updates.pending_update_count(),
+                    pending_generation: driver
+                        .pending_descriptor_retry
+                        .as_ref()
+                        .map(|update| update.descriptor_generation),
+                    descriptor_refresh_due: Instant::now() >= driver.next_descriptor_refresh_at,
+                    descriptor_rebinds_total: metrics
+                        .descriptor_rebinds_total
+                        .load(Ordering::SeqCst),
+                };
+                event_tx.send(report).unwrap();
+                permit_rx.recv().unwrap();
+            }
+        });
+
+        pre_commit_reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("descriptor apply should reach pre-commit hook");
+        current_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2606")?;
+                row.write_f64("last_price", 4102.5)?;
+                Ok(())
+            })
+            .unwrap();
+        pre_commit_resume_tx.send(()).unwrap();
+
+        let first = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first.event, ReportedDriverEvent::Idle);
+        assert_eq!(first.descriptor_rebinds_total, 0);
+        match source {
+            LateNotifyDescriptorSource::Queued => {
+                assert_eq!(first.queued_updates, 2);
+                assert_eq!(first.pending_generation, None);
+            }
+            LateNotifyDescriptorSource::Master => {
+                assert_eq!(first.queued_updates, 0);
+                assert_eq!(first.pending_generation, None);
+                assert!(first.descriptor_refresh_due);
+            }
+            LateNotifyDescriptorSource::PendingRetry => {
+                assert_eq!(first.queued_updates, 0);
+                assert_eq!(first.pending_generation, Some(2));
+            }
+        }
+        if source == LateNotifyDescriptorSource::Master {
+            let stream = writer_master.as_ref().unwrap().get_stream("ticks").unwrap();
+            let lease_identities = stream
+                .segment_reader_leases
+                .iter()
+                .map(|lease| {
+                    (
+                        lease
+                            .get("source_segment_id")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap(),
+                        lease
+                            .get("source_generation")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lease_identities, vec![current_identity]);
+        }
+        permit_tx.send(()).unwrap();
+
+        let second = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            second.event,
+            ReportedDriverEvent::Rows(vec!["IF2606".to_string()])
+        );
+        permit_tx.send(()).unwrap();
+
+        let third = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            third.event,
+            ReportedDriverEvent::DescriptorUpdated(expected_generation)
+        );
+        assert_eq!(third.descriptor_rebinds_total, 1);
+        if source == LateNotifyDescriptorSource::Master {
+            let stream = writer_master.as_ref().unwrap().get_stream("ticks").unwrap();
+            let lease_identities = stream
+                .segment_reader_leases
+                .iter()
+                .map(|lease| {
+                    (
+                        lease
+                            .get("source_segment_id")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap(),
+                        lease
+                            .get("source_generation")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lease_identities, vec![next_identity]);
+        }
+        permit_tx.send(()).unwrap();
+
+        let fourth = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            fourth.event,
+            ReportedDriverEvent::Rows(vec!["IF2607".to_string()])
+        );
+        permit_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        drop(writer_master);
+        if let Some((server, join_handle)) = master_runtime {
+            server.shutdown();
+            join_handle.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn segment_reader_driver_queued_update_rechecks_notify_after_prepare_before_swap() {
+        assert_descriptor_source_drains_notify_during_pre_commit(
+            LateNotifyDescriptorSource::Queued,
+        );
+    }
+
+    #[test]
+    fn segment_reader_driver_master_refresh_rechecks_notify_after_prepare_before_swap() {
+        assert_descriptor_source_drains_notify_during_pre_commit(
+            LateNotifyDescriptorSource::Master,
+        );
+    }
+
+    #[test]
+    fn segment_reader_driver_pending_retry_rechecks_notify_after_prepare_before_swap() {
+        assert_descriptor_source_drains_notify_during_pre_commit(
+            LateNotifyDescriptorSource::PendingRetry,
+        );
     }
 
     #[test]
