@@ -17,7 +17,7 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyList, PyModule, PyTuple};
 use tracing::{error, info};
@@ -2990,6 +2990,9 @@ fn record_batches_to_pyarrow_record_batch_reader(
 const SEGMENT_DESCRIPTOR_WATCH_TIMEOUT: Duration = Duration::from_millis(500);
 const SEGMENT_DESCRIPTOR_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const SEGMENT_READER_IDLE_SPIN_CHECKS: u32 = 64;
+const CALLBACK_FLUSH_ENABLED_ATTR: &str = "_zippy_flush_deadline_enabled";
+const CALLBACK_NEXT_FLUSH_DELAY_METHOD: &str = "_zippy_next_flush_delay_ns";
+const CALLBACK_FLUSH_DUE_METHOD: &str = "_zippy_flush_due";
 
 #[derive(Clone, Debug)]
 struct DescriptorUpdate {
@@ -4122,6 +4125,8 @@ impl StreamSubscriber {
         if guard.is_some() {
             return Err(py_runtime_error("stream subscriber is already started"));
         }
+        let flush_deadline_enabled =
+            self.row_factory.is_none() && callback_flush_deadline_enabled(py, &self.callback)?;
 
         let (initial_reader_handle, descriptor_missing_at_start) = py
             .allow_threads(|| {
@@ -4227,8 +4232,17 @@ impl StreamSubscriber {
                 );
 
                 let run_result = (|| -> std::result::Result<(), String> {
+                    let mut flush_deadline = None;
                     while running.load(Ordering::SeqCst) {
-                        match driver.poll_next()? {
+                        if flush_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                            flush_deadline =
+                                deadline_from_delay(invoke_stream_callback_flush_due(&callback)?);
+                            continue;
+                        }
+                        let effective_wait = flush_deadline.map_or(poll_interval, |deadline| {
+                            poll_interval.min(deadline.saturating_duration_since(Instant::now()))
+                        });
+                        match driver.poll_next_with_idle_wait(effective_wait)? {
                             SegmentReaderDriverEvent::Rows(span) => {
                                 let read_ready_ns = trace_subscriber_read_latency(&source, &span)?;
                                 let span_row_count = span.row_count();
@@ -4257,7 +4271,11 @@ impl StreamSubscriber {
                                         .map_err(|error| error.to_string())?;
                                     let record_batch_done_at = Instant::now();
                                     let row_count = batch.num_rows();
-                                    invoke_stream_callback(&callback, batch)?;
+                                    flush_deadline = deadline_from_delay(invoke_stream_callback(
+                                        &callback,
+                                        batch,
+                                        flush_deadline_enabled,
+                                    )?);
                                     let callback_done_at = Instant::now();
                                     trace_table_delivery_latency(
                                         &source,
@@ -4628,13 +4646,49 @@ fn open_initial_segment_reader_handle(
 fn invoke_stream_callback(
     callback: &Py<PyAny>,
     batch: RecordBatch,
-) -> std::result::Result<(), String> {
-    Python::with_gil(|py| -> PyResult<()> {
+    flush_deadline_enabled: bool,
+) -> std::result::Result<Option<Duration>, String> {
+    Python::with_gil(|py| -> PyResult<Option<Duration>> {
         let table = record_batch_to_pyarrow_table(py, batch)?;
         callback.call1(py, (table,))?;
-        Ok(())
+        if flush_deadline_enabled {
+            callback_flush_delay(py, callback, CALLBACK_NEXT_FLUSH_DELAY_METHOD)
+        } else {
+            Ok(None)
+        }
     })
     .map_err(|error| error.to_string())
+}
+
+fn callback_flush_deadline_enabled(py: Python<'_>, callback: &Py<PyAny>) -> PyResult<bool> {
+    match callback.bind(py).getattr(CALLBACK_FLUSH_ENABLED_ATTR) {
+        Ok(value) => value.extract(),
+        Err(error) if error.is_instance_of::<PyAttributeError>(py) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn callback_flush_delay(
+    py: Python<'_>,
+    callback: &Py<PyAny>,
+    method: &str,
+) -> PyResult<Option<Duration>> {
+    callback
+        .bind(py)
+        .call_method0(method)?
+        .extract::<Option<u64>>()
+        .map(|delay| delay.map(Duration::from_nanos))
+}
+
+fn deadline_from_delay(delay: Option<Duration>) -> Option<Instant> {
+    delay.map(|duration| Instant::now() + duration)
+}
+
+fn invoke_stream_callback_flush_due(
+    callback: &Py<PyAny>,
+) -> std::result::Result<Option<Duration>, String> {
+    Python::with_gil(|py| callback_flush_delay(py, callback, CALLBACK_FLUSH_DUE_METHOD))
+        .map_err(|error| error.to_string())
 }
 
 fn invoke_stream_row_callbacks(
