@@ -15134,8 +15134,8 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
 
         with pytest.raises(RuntimeError, match="deadline callback failed"):
             getattr(subscriber, terminal_method)()
-        assert callback_count == 1
         subscriber = None
+        assert callback_count == 1
     finally:
         try:
             if subscriber is not None:
