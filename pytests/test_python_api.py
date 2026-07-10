@@ -15156,17 +15156,16 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
 
         terminal_thread = threading.Thread(target=call_terminal_method, daemon=True)
         terminal_thread.start()
-        try:
-            assert terminal_done.wait(timeout=2.0)
-        finally:
-            if not terminal_done.is_set():
-                try:
-                    subscriber.stop()
-                except RuntimeError:
-                    pass
-        terminal_thread.join(timeout=0.1)
+        terminal_completed = terminal_done.wait(timeout=2.0)
+        if not terminal_completed:
+            server.stop()
+            server = None
+            terminal_done.wait(timeout=2.0)
+        terminal_thread.join(timeout=2.0)
+        terminal_stopped = not terminal_thread.is_alive()
         subscriber = None
-        assert not terminal_thread.is_alive()
+        assert terminal_completed, f"subscriber {terminal_method} did not complete within 2 seconds"
+        assert terminal_stopped, f"subscriber {terminal_method} helper thread did not stop"
         assert len(terminal_errors) == 1
         assert isinstance(terminal_errors[0], RuntimeError)
         assert "deadline callback failed" in str(terminal_errors[0])
@@ -15184,7 +15183,8 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
                 if reset_default_master is not None:
                     reset_default_master()
             finally:
-                server.stop()
+                if server is not None:
+                    server.stop()
 
 
 def test_pipeline_stream_table_publishes_descriptor_for_query_tail(tmp_path: Path) -> None:
