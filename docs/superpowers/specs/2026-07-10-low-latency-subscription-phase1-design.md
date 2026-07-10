@@ -90,9 +90,13 @@ effective idle timeout. It must not first block on the descriptor condition vari
 `wait_for_notification_after()` rechecks `notify_seq` before entering futex wait, so a
 commit between steps 1 and 5 cannot be lost.
 
-After the mmap wait returns, the driver checks descriptor errors and ready descriptor
-updates before returning idle. A writer restart that publishes a descriptor without
-waking the old mmap is therefore observed no later than the effective idle timeout.
+When the mmap wait observes a notification, the driver returns to the outer loop before
+applying a descriptor update. The next poll reads the old active segment first, which
+preserves the existing rule that committed rows are drained before rebinding. When the
+mmap wait times out with no notification, the driver checks descriptor errors and ready
+descriptor updates before returning idle. A writer restart that publishes a descriptor
+without waking the old mmap is therefore observed no later than the effective idle
+timeout.
 
 For a sealed segment, the driver continues to wait for a descriptor update because the
 old segment cannot receive additional rows. Segment sealing increments `notify_seq` and
