@@ -6118,7 +6118,7 @@ class _TableSubscriptionCallback:
         if delay_ns is None or delay_ns > 0:
             return delay_ns
         self.flush()
-        return None
+        return self._zippy_next_flush_delay_ns()
 
     def _tail(self, table: object) -> object:
         if self._count is None:

@@ -9564,6 +9564,33 @@ def test_table_subscription_callback_flushes_only_when_deadline_is_due(monkeypat
     assert adapter._zippy_flush_due() is None
     assert [table.column("seq").to_pylist() for table in received] == [[1]]
     assert adapter._zippy_flush_due() is None
+    assert len(received) == 1
+
+
+def test_table_subscription_callback_preserves_reentrant_flush_deadline(monkeypatch) -> None:
+    times = iter(
+        [0, 1_000_000, 11_000_000, 11_000_000, 12_000_000, 13_000_000, 22_000_000, 22_000_000]
+    )
+    received: list[pa.Table] = []
+    holder: dict[str, object] = {}
+
+    def callback(table: pa.Table) -> None:
+        received.append(table)
+        if table.column("seq").to_pylist() == [1]:
+            holder["adapter"](pa.table({"seq": [2]}))
+
+    monkeypatch.setattr(zippy.time, "perf_counter_ns", lambda: next(times))
+    adapter = zippy._TableSubscriptionCallback(callback, throttle_ms=10)
+    holder["adapter"] = adapter
+
+    adapter(pa.table({"seq": [1]}))
+
+    assert adapter._zippy_flush_due() == 8_000_000
+    assert [table.column("seq").to_pylist() for table in received] == [[1]]
+    assert adapter._zippy_flush_due() is None
+    assert [table.column("seq").to_pylist() for table in received] == [[1], [2]]
+    assert adapter._zippy_flush_due() is None
+    assert len(received) == 2
 
 
 def test_subscribe_registers_default_master_process_before_native_subscriber(
