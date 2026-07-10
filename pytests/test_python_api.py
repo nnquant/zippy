@@ -9572,7 +9572,7 @@ def test_table_subscription_callback_preserves_reentrant_flush_deadline(monkeypa
         [0, 1_000_000, 11_000_000, 11_000_000, 12_000_000, 13_000_000, 22_000_000, 22_000_000]
     )
     received: list[pa.Table] = []
-    holder: dict[str, object] = {}
+    holder: dict[str, zippy._TableSubscriptionCallback] = {}
 
     def callback(table: pa.Table) -> None:
         received.append(table)
@@ -14952,9 +14952,8 @@ def test_subscribe_table_flushes_silent_partial_batch_at_throttle_deadline(
     flush_due_thread_ids: list[int] = []
     next_delay_calls = 0
     flush_due_calls = 0
-    base_adapter = zippy._TableSubscriptionCallback
 
-    class ControlledTableSubscriptionCallback(base_adapter):
+    class ControlledTableSubscriptionCallback(zippy._TableSubscriptionCallback):
         def __call__(self, table: pa.Table) -> None:
             callback_thread_ids.append(threading.get_ident())
             self._last_emit_ns = time.perf_counter_ns()
@@ -15064,9 +15063,8 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
     callback_count = 0
     next_delay_calls = 0
     flush_due_calls = 0
-    base_adapter = zippy._TableSubscriptionCallback
 
-    class ControlledTableSubscriptionCallback(base_adapter):
+    class ControlledTableSubscriptionCallback(zippy._TableSubscriptionCallback):
         def __call__(self, table: pa.Table) -> None:
             self._last_emit_ns = time.perf_counter_ns()
             super().__call__(table)
@@ -15087,6 +15085,7 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
 
     monkeypatch.setattr(zippy, "_TableSubscriptionCallback", ControlledTableSubscriptionCallback)
     subscriber = None
+    server: zippy.MasterServer | None
     server, control_endpoint = start_master_server(tmp_path)
     try:
         tick_schema = pa.schema(
@@ -15139,7 +15138,9 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
             metrics = subscriber.metrics()
 
         assert metrics["running"] is False
-        assert "deadline callback failed" in metrics["last_error"]
+        last_error = metrics["last_error"]
+        assert isinstance(last_error, str)
+        assert "deadline callback failed" in last_error
         assert flush_due_calls == 1
         assert callback_count == 1
 
@@ -15158,8 +15159,9 @@ def test_subscribe_table_deadline_callback_error_stops_subscriber(
         terminal_thread.start()
         terminal_completed = terminal_done.wait(timeout=2.0)
         if not terminal_completed:
-            server.stop()
-            server = None
+            if server is not None:
+                server.stop()
+                server = None
             terminal_done.wait(timeout=2.0)
         terminal_thread.join(timeout=2.0)
         terminal_stopped = not terminal_thread.is_alive()
