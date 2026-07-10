@@ -16402,25 +16402,23 @@ def test_pipeline_source_sharded_stream_table_e2e(tmp_path: Path) -> None:
         assert logical_descriptor["zippy_shard_nums"] == 4
         assert logical_descriptor["zippy_shards"] == shard_names
 
-        assert {stream["stream_name"] for stream in client.list_streams()} == {"sharded_ticks"}
+        assert {stream["stream_name"] for stream in client.list_streams()} == {
+            "sharded_ticks"
+        }
         assert {stream["stream_name"] for stream in client.list_streams(include_internal=True)} == {
             "sharded_ticks",
             *shard_names,
         }
 
         deadline = time.time() + 2.0
-        latest = (
-            zippy.read_table("sharded_ticks", master=client, snapshot=False)
-            .sort("row_id")
-            .collect()
-        )
+        latest = zippy.read_table("sharded_ticks", master=client, snapshot=False).sort(
+            "row_id"
+        ).collect()
         while latest.num_rows != 4 and time.time() < deadline:
             time.sleep(0.01)
-            latest = (
-                zippy.read_table("sharded_ticks", master=client, snapshot=False)
-                .sort("row_id")
-                .collect()
-            )
+            latest = zippy.read_table("sharded_ticks", master=client, snapshot=False).sort(
+                "row_id"
+            ).collect()
 
         assert latest.to_pydict() == rows
 
@@ -16966,7 +16964,7 @@ def test_pipeline_stream_table_shard_unregisters_source_after_late_failure(
             persist=None,
             shard_key="instrument_id",
             shard_nums=2,
-        )
+    )
 
     assert master.source_records[0][0] == "test_ingest.openctp_ticks"
     assert master.unregistered_sources == [
