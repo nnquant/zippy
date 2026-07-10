@@ -3013,6 +3013,11 @@ impl DescriptorUpdateSlot {
         self.changed.notify_all();
     }
 
+    fn restore_front(&self, update: DescriptorUpdate) {
+        self.updates.lock().unwrap().push_front(update);
+        self.changed.notify_all();
+    }
+
     fn notify(&self) {
         self.changed.notify_all();
     }
@@ -3281,6 +3286,12 @@ enum DescriptorApplyOutcome {
     Applied(u64),
     TransientMissing,
     TransientLayoutMismatch,
+}
+
+enum DescriptorPollOutcome {
+    Applied(u64),
+    ReaderNotified,
+    NoUpdate,
 }
 
 impl fmt::Debug for SegmentReaderDriverEvent {
@@ -3558,6 +3569,12 @@ fn span_i64_value(
     }
 }
 
+#[cfg(test)]
+struct SegmentReaderEmptyPollHook {
+    reached: mpsc::SyncSender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
 struct SegmentReaderDriver {
     reader_handle: ActiveSegmentReaderHandle,
     descriptor_text: String,
@@ -3571,6 +3588,8 @@ struct SegmentReaderDriver {
     idle_wait: Duration,
     idle_spin_checks: u32,
     metrics: Option<Arc<SubscriberMetrics>>,
+    #[cfg(test)]
+    empty_poll_hook: Option<SegmentReaderEmptyPollHook>,
 }
 
 impl SegmentReaderDriver {
@@ -3599,7 +3618,27 @@ impl SegmentReaderDriver {
             idle_wait,
             idle_spin_checks,
             metrics,
+            #[cfg(test)]
+            empty_poll_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn set_empty_poll_hook(&mut self, hook: SegmentReaderEmptyPollHook) {
+        self.empty_poll_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn wait_on_empty_poll_hook(&mut self) {
+        let Some(hook) = self.empty_poll_hook.take() else {
+            return;
+        };
+        hook.reached
+            .send(())
+            .expect("empty poll hook reached receiver should remain connected");
+        hook.resume
+            .recv()
+            .expect("empty poll hook resume sender should remain connected");
     }
 
     fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
@@ -3661,23 +3700,29 @@ impl SegmentReaderDriver {
             }
             Err(error) => Err(error.to_string()),
             Ok(None) => {
-                if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
-                    return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
-                        descriptor_generation,
-                    ));
-                }
-                if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
-                    return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
-                        descriptor_generation,
-                    ));
-                }
+                #[cfg(test)]
+                self.wait_on_empty_poll_hook();
 
                 let sealed = self
                     .reader_handle
                     .reader
                     .is_sealed()
                     .map_err(|error| error.to_string())?;
+                if self.reader_notification_changed(observed_notification_seq)? {
+                    return Ok(SegmentReaderDriverEvent::Idle);
+                }
                 if sealed {
+                    if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
+                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                            descriptor_generation,
+                        ));
+                    }
+                    if let Some(descriptor_generation) = self.refresh_latest_descriptor_update()? {
+                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                            descriptor_generation,
+                        ));
+                    }
+
                     let update = if self.xfast {
                         spin_loop();
                         None
@@ -3735,11 +3780,33 @@ impl SegmentReaderDriver {
                         }
                         return Err(error);
                     }
-                    if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
+                }
+
+                match self.apply_ready_descriptor_updates_after_notification_check(
+                    observed_notification_seq,
+                )? {
+                    DescriptorPollOutcome::Applied(descriptor_generation) => {
                         return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
                             descriptor_generation,
                         ));
                     }
+                    DescriptorPollOutcome::ReaderNotified => {
+                        return Ok(SegmentReaderDriverEvent::Idle);
+                    }
+                    DescriptorPollOutcome::NoUpdate => {}
+                }
+                match self.refresh_latest_descriptor_update_after_notification_check(
+                    observed_notification_seq,
+                )? {
+                    DescriptorPollOutcome::Applied(descriptor_generation) => {
+                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                            descriptor_generation,
+                        ));
+                    }
+                    DescriptorPollOutcome::ReaderNotified => {
+                        return Ok(SegmentReaderDriverEvent::Idle);
+                    }
+                    DescriptorPollOutcome::NoUpdate => {}
                 }
                 Ok(SegmentReaderDriverEvent::Idle)
             }
@@ -3774,6 +3841,54 @@ impl SegmentReaderDriver {
             return Ok(None);
         }
         self.apply_descriptor_update_or_retry(update)
+    }
+
+    fn refresh_latest_descriptor_update_after_notification_check(
+        &mut self,
+        observed_notification_seq: u32,
+    ) -> std::result::Result<DescriptorPollOutcome, String> {
+        if Instant::now() < self.next_descriptor_refresh_at {
+            return Ok(DescriptorPollOutcome::NoUpdate);
+        }
+        if self.reader_notification_changed(observed_notification_seq)? {
+            return Ok(DescriptorPollOutcome::ReaderNotified);
+        }
+
+        self.next_descriptor_refresh_at = Instant::now() + self.descriptor_refresh_interval();
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_descriptor_refresh();
+        }
+        let update = match self.latest_descriptor_update() {
+            Ok(update) => update,
+            Err(error) => {
+                if let Some(metrics) = self.metrics.as_ref() {
+                    metrics.record_descriptor_refresh_error();
+                }
+                return Err(error);
+            }
+        };
+        if let Some(update) = update.as_ref() {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.record_master_descriptor_generation(update.descriptor_generation);
+            }
+        }
+        if self.reader_notification_changed(observed_notification_seq)? {
+            self.next_descriptor_refresh_at = Instant::now();
+            return Ok(DescriptorPollOutcome::ReaderNotified);
+        }
+
+        let Some(update) = update else {
+            return Ok(DescriptorPollOutcome::NoUpdate);
+        };
+        if update.text == self.descriptor_text {
+            return Ok(DescriptorPollOutcome::NoUpdate);
+        }
+        match self.apply_descriptor_update_or_retry(update)? {
+            Some(descriptor_generation) => {
+                Ok(DescriptorPollOutcome::Applied(descriptor_generation))
+            }
+            None => Ok(DescriptorPollOutcome::NoUpdate),
+        }
     }
 
     fn recover_from_reader_layout_mismatch(
@@ -3822,6 +3937,33 @@ impl SegmentReaderDriver {
             }
         }
         self.retry_pending_descriptor_update()
+    }
+
+    fn apply_ready_descriptor_updates_after_notification_check(
+        &mut self,
+        observed_notification_seq: u32,
+    ) -> std::result::Result<DescriptorPollOutcome, String> {
+        loop {
+            if self.reader_notification_changed(observed_notification_seq)? {
+                return Ok(DescriptorPollOutcome::ReaderNotified);
+            }
+            let Some(update) = take_descriptor_update_after_poll(
+                SubscriberReadOutcome::Empty,
+                self.descriptor_updates.as_ref(),
+                &self.descriptor_text,
+            ) else {
+                break;
+            };
+            if self.reader_notification_changed(observed_notification_seq)? {
+                self.descriptor_updates.restore_front(update);
+                self.record_pending_descriptor_updates();
+                return Ok(DescriptorPollOutcome::ReaderNotified);
+            }
+            if let Some(descriptor_generation) = self.apply_descriptor_update_or_retry(update)? {
+                return Ok(DescriptorPollOutcome::Applied(descriptor_generation));
+            }
+        }
+        self.retry_pending_descriptor_update_after_notification_check(observed_notification_seq)
     }
 
     fn apply_descriptor_update_or_retry(
@@ -3892,6 +4034,39 @@ impl SegmentReaderDriver {
         }
     }
 
+    fn retry_pending_descriptor_update_after_notification_check(
+        &mut self,
+        observed_notification_seq: u32,
+    ) -> std::result::Result<DescriptorPollOutcome, String> {
+        if self.pending_descriptor_retry.is_none() || Instant::now() < self.next_descriptor_retry_at
+        {
+            return Ok(DescriptorPollOutcome::NoUpdate);
+        }
+        if self.reader_notification_changed(observed_notification_seq)? {
+            return Ok(DescriptorPollOutcome::ReaderNotified);
+        }
+
+        let pending = self.pending_descriptor_retry.clone().unwrap();
+        let latest = self.latest_descriptor_update()?;
+        if self.reader_notification_changed(observed_notification_seq)? {
+            return Ok(DescriptorPollOutcome::ReaderNotified);
+        }
+        let update = match latest {
+            Some(latest) if latest.text == self.descriptor_text => {
+                self.pending_descriptor_retry = None;
+                return Ok(DescriptorPollOutcome::NoUpdate);
+            }
+            Some(latest) if latest.text != pending.text => latest,
+            _ => pending,
+        };
+        match self.apply_descriptor_update_or_retry(update)? {
+            Some(descriptor_generation) => {
+                Ok(DescriptorPollOutcome::Applied(descriptor_generation))
+            }
+            None => Ok(DescriptorPollOutcome::NoUpdate),
+        }
+    }
+
     fn apply_descriptor_update(
         &mut self,
         update: DescriptorUpdate,
@@ -3943,6 +4118,14 @@ impl SegmentReaderDriver {
             metrics.record_mmap_futex_wait(notified);
         }
         Ok(notified)
+    }
+
+    fn reader_notification_changed(&self, observed: u32) -> std::result::Result<bool, String> {
+        self.reader_handle
+            .reader
+            .notification_sequence()
+            .map(|current| current != observed)
+            .map_err(|error| error.to_string())
     }
 
     fn finish(&self) -> std::result::Result<(), String> {
@@ -9415,6 +9598,13 @@ mod tests {
             "current",
         )
         .expect("first queued descriptor update should be returned");
+        descriptor_updates.restore_front(first.clone());
+        let restored = take_descriptor_update_after_poll(
+            SubscriberReadOutcome::Empty,
+            &descriptor_updates,
+            "current",
+        )
+        .expect("restored descriptor update should return to the front");
         let second = take_descriptor_update_after_poll(
             SubscriberReadOutcome::Empty,
             &descriptor_updates,
@@ -9423,6 +9613,7 @@ mod tests {
         .expect("second queued descriptor update should be returned");
 
         assert_eq!(first.descriptor_generation, 2);
+        assert_eq!(restored.descriptor_generation, 2);
         assert_eq!(second.descriptor_generation, 3);
         assert_eq!(descriptor_updates.pending_update_count(), 0);
     }
@@ -9513,7 +9704,136 @@ mod tests {
     }
 
     #[test]
+    fn segment_reader_driver_drains_row_committed_after_empty_poll_before_descriptor_rebind() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum ReportedEvent {
+            Rows(Vec<String>),
+            DescriptorUpdated(u64),
+            Idle,
+        }
+
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema("ticks", "empty-poll-race", schema.clone())
+            .unwrap();
+        let current_descriptor: serde_json::Value =
+            serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: None,
+            },
+            serde_json::to_string(&current_descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(1),
+            SEGMENT_READER_IDLE_SPIN_CHECKS,
+            None,
+        );
+        let (empty_reached_tx, empty_reached_rx) = mpsc::sync_channel(0);
+        let (empty_resume_tx, empty_resume_rx) = mpsc::sync_channel(0);
+        driver.set_empty_poll_hook(SegmentReaderEmptyPollHook {
+            reached: empty_reached_tx,
+            resume: empty_resume_rx,
+        });
+
+        let (event_tx, event_rx) = mpsc::sync_channel(0);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            for _ in 0..4 {
+                let event = match driver.poll_next().unwrap() {
+                    SegmentReaderDriverEvent::Rows(span) => {
+                        let instrument_index = span.column_index("instrument_id").unwrap();
+                        let instruments = (0..span.row_count())
+                            .map(|row_offset| {
+                                span.utf8_cell_value_at(row_offset, instrument_index)
+                                    .unwrap()
+                                    .unwrap()
+                                    .to_string()
+                            })
+                            .collect();
+                        ReportedEvent::Rows(instruments)
+                    }
+                    SegmentReaderDriverEvent::DescriptorUpdated(generation) => {
+                        ReportedEvent::DescriptorUpdated(generation)
+                    }
+                    SegmentReaderDriverEvent::Idle => ReportedEvent::Idle,
+                };
+                event_tx.send(event).unwrap();
+                permit_rx.recv().unwrap();
+            }
+        });
+
+        empty_reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader should reach the empty-poll hook");
+
+        let writer = partition.writer();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2606")?;
+                row.write_f64("last_price", 4102.5)?;
+                Ok(())
+            })
+            .unwrap();
+        writer.rollover_without_persistence().unwrap();
+        writer
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+        let next_descriptor: serde_json::Value =
+            serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+        descriptor_updates.set(descriptor_update_from_value(2, next_descriptor).unwrap());
+        empty_resume_tx.send(()).unwrap();
+
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ReportedEvent::Idle
+        );
+        permit_tx.send(()).unwrap();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ReportedEvent::Rows(vec!["IF2606".to_string()])
+        );
+        permit_tx.send(()).unwrap();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ReportedEvent::DescriptorUpdated(2)
+        );
+        permit_tx.send(()).unwrap();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ReportedEvent::Rows(vec!["IF2607".to_string()])
+        );
+        permit_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn segment_reader_driver_row_commit_wakes_before_idle_timeout() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum ReportedEvent {
+            Rows(Vec<String>),
+            DescriptorUpdated(u64),
+            Idle,
+        }
+
         let schema = compile_segment_schema(&[
             ColumnSpec::new("instrument_id", ColumnType::Utf8),
             ColumnSpec::new("last_price", ColumnType::Float64),
@@ -9529,6 +9849,7 @@ mod tests {
         let descriptor: serde_json::Value =
             serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
         let (reader, _) = build_active_segment_reader(&descriptor, &schema).unwrap();
+        let (monitor, _) = build_active_segment_reader(&descriptor, &schema).unwrap();
         let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
         let descriptor_refresh_error = Arc::new(Mutex::new(None));
         let mut driver = SegmentReaderDriver::new(
@@ -9541,39 +9862,63 @@ mod tests {
             Arc::clone(&descriptor_updates),
             Arc::clone(&descriptor_refresh_error),
             false,
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             0,
             None,
         );
 
-        let writer = partition.writer();
-        let writer_thread = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(25));
-            writer
-                .write_row(|row| {
-                    row.write_utf8("instrument_id", "IF2606")?;
-                    row.write_f64("last_price", 4102.5)?;
-                    Ok(())
-                })
-                .unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            for _ in 0..2 {
+                let event = match driver.poll_next().unwrap() {
+                    SegmentReaderDriverEvent::Rows(span) => {
+                        let instrument_index = span.column_index("instrument_id").unwrap();
+                        let instruments = (0..span.row_count())
+                            .map(|row_offset| {
+                                span.utf8_cell_value_at(row_offset, instrument_index)
+                                    .unwrap()
+                                    .unwrap()
+                                    .to_string()
+                            })
+                            .collect();
+                        ReportedEvent::Rows(instruments)
+                    }
+                    SegmentReaderDriverEvent::DescriptorUpdated(generation) => {
+                        ReportedEvent::DescriptorUpdated(generation)
+                    }
+                    SegmentReaderDriverEvent::Idle => ReportedEvent::Idle,
+                };
+                event_tx.send(event).unwrap();
+            }
         });
 
-        let poll_started_at = Instant::now();
-        match driver.poll_next().unwrap() {
-            SegmentReaderDriverEvent::Idle => {}
-            other => panic!("expected idle after mmap notification got [{other:?}]"),
+        let setup_deadline = Instant::now() + Duration::from_secs(2);
+        while monitor.control_snapshot().unwrap().waiter_count == 0 {
+            assert!(
+                Instant::now() < setup_deadline,
+                "reader did not register as mmap waiter"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
-        let poll_elapsed = poll_started_at.elapsed();
-        assert!(
-            poll_elapsed < Duration::from_millis(300),
-            "row commit should wake reader before idle timeout elapsed=[{poll_elapsed:?}]"
-        );
 
-        writer_thread.join().unwrap();
-        match driver.poll_next().unwrap() {
-            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
-            other => panic!("expected committed row after wake got [{other:?}]"),
-        }
+        partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2606")?;
+                row.write_f64("last_price", 4102.5)?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ReportedEvent::Idle
+        );
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            ReportedEvent::Rows(vec!["IF2606".to_string()])
+        );
+        worker.join().unwrap();
     }
 
     #[test]
