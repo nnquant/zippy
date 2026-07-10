@@ -6053,6 +6053,7 @@ class _TableSubscriptionCallback:
         self._filters = _pyarrow_filters_from_query_filter(filter_expr)
         self._batch_size = _require_positive_optional_int("batch_size", batch_size)
         self._throttle_ms = _require_positive_optional_int("throttle_ms", throttle_ms)
+        self._zippy_flush_deadline_enabled = self._throttle_ms is not None
         self._count = _require_positive_optional_int("count", count)
         self._pending: list[object] = []
         self._pending_rows = 0
@@ -6105,6 +6106,19 @@ class _TableSubscriptionCallback:
             return False
         elapsed_ns = time.perf_counter_ns() - self._last_emit_ns
         return elapsed_ns >= self._throttle_ms * 1_000_000
+
+    def _zippy_next_flush_delay_ns(self) -> int | None:
+        if self._throttle_ms is None or not self._pending:
+            return None
+        deadline_ns = self._last_emit_ns + self._throttle_ms * 1_000_000
+        return max(0, deadline_ns - time.perf_counter_ns())
+
+    def _zippy_flush_due(self) -> int | None:
+        delay_ns = self._zippy_next_flush_delay_ns()
+        if delay_ns is None or delay_ns > 0:
+            return delay_ns
+        self.flush()
+        return None
 
     def _tail(self, table: object) -> object:
         if self._count is None:

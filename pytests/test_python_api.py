@@ -9545,6 +9545,27 @@ def test_subscribe_table_throttle_ms_flushes_pending_rows(monkeypatch) -> None:
     }
 
 
+def test_table_subscription_callback_flushes_only_when_deadline_is_due(monkeypatch) -> None:
+    times = iter([0, 1_000_000, 4_000_000, 5_000_000, 11_000_000, 11_000_000])
+    received: list[pa.Table] = []
+    monkeypatch.setattr(zippy.time, "perf_counter_ns", lambda: next(times))
+    adapter = zippy._TableSubscriptionCallback(
+        received.append,
+        batch_size=2,
+        throttle_ms=10,
+    )
+
+    adapter(pa.table({"seq": [1]}))
+
+    assert adapter._zippy_flush_deadline_enabled is True
+    assert adapter._zippy_next_flush_delay_ns() == 6_000_000
+    assert adapter._zippy_flush_due() == 5_000_000
+    assert received == []
+    assert adapter._zippy_flush_due() is None
+    assert [table.column("seq").to_pylist() for table in received] == [[1]]
+    assert adapter._zippy_flush_due() is None
+
+
 def test_subscribe_registers_default_master_process_before_native_subscriber(
     monkeypatch,
 ) -> None:
