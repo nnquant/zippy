@@ -2216,6 +2216,8 @@ struct SegmentReaderLeaseGuard {
     lease_id: Option<String>,
     process_id: String,
     process_token: String,
+    #[cfg(test)]
+    drop_hook: Option<SegmentReaderLeaseDropHook>,
 }
 
 #[derive(Clone)]
@@ -2267,6 +2269,8 @@ impl SegmentReaderLeaseGuard {
             lease_id: Some(lease_id),
             process_id,
             process_token,
+            #[cfg(test)]
+            drop_hook: None,
         })
     }
 
@@ -2276,10 +2280,19 @@ impl SegmentReaderLeaseGuard {
             source: self.source.clone(),
         }
     }
+
+    #[cfg(test)]
+    fn set_drop_hook(&mut self, hook: SegmentReaderLeaseDropHook) {
+        self.drop_hook = Some(hook);
+    }
 }
 
 impl Drop for SegmentReaderLeaseGuard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(hook) = self.drop_hook.take() {
+            hook.wait();
+        }
         let Some(lease_id) = self.lease_id.take() else {
             return;
         };
@@ -3609,6 +3622,24 @@ impl SegmentReaderDescriptorPreCommitHook {
     }
 }
 
+#[cfg(test)]
+struct SegmentReaderLeaseDropHook {
+    reached: mpsc::SyncSender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl SegmentReaderLeaseDropHook {
+    fn wait(self) {
+        self.reached
+            .send(())
+            .expect("reader lease drop hook receiver should remain connected");
+        self.resume
+            .recv()
+            .expect("reader lease drop hook sender should remain connected");
+    }
+}
+
 struct SegmentReaderDriver {
     reader_handle: ActiveSegmentReaderHandle,
     descriptor_text: String,
@@ -3626,6 +3657,8 @@ struct SegmentReaderDriver {
     empty_poll_hook: Option<SegmentReaderEmptyPollHook>,
     #[cfg(test)]
     descriptor_pre_commit_hook: Option<SegmentReaderDescriptorPreCommitHook>,
+    #[cfg(test)]
+    descriptor_post_swap_signal: Option<mpsc::Sender<()>>,
 }
 
 impl SegmentReaderDriver {
@@ -3658,6 +3691,8 @@ impl SegmentReaderDriver {
             empty_poll_hook: None,
             #[cfg(test)]
             descriptor_pre_commit_hook: None,
+            #[cfg(test)]
+            descriptor_post_swap_signal: None,
         }
     }
 
@@ -3689,6 +3724,11 @@ impl SegmentReaderDriver {
         if let Some(hook) = self.descriptor_pre_commit_hook.take() {
             hook.wait();
         }
+    }
+
+    #[cfg(test)]
+    fn set_descriptor_post_swap_signal(&mut self, signal: mpsc::Sender<()>) {
+        self.descriptor_post_swap_signal = Some(signal);
     }
 
     fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
@@ -4196,12 +4236,25 @@ impl SegmentReaderDriver {
         &mut self,
         prepared: PreparedSegmentDescriptorUpdate,
     ) -> u64 {
-        let descriptor_generation = prepared.descriptor_generation;
-        self.reader_handle = prepared.next_handle;
-        self.descriptor_text = prepared.descriptor_text;
+        let PreparedSegmentDescriptorUpdate {
+            next_handle,
+            descriptor_generation,
+            descriptor_text,
+            descriptor,
+        } = prepared;
+        let previous_handle = std::mem::replace(&mut self.reader_handle, next_handle);
+        self.descriptor_text = descriptor_text;
         if let Some(metrics) = self.metrics.as_ref() {
-            metrics.record_descriptor_rebind(descriptor_generation, &prepared.descriptor);
+            metrics.record_descriptor_rebind(descriptor_generation, &descriptor);
         }
+        #[cfg(test)]
+        if let Some(signal) = self.descriptor_post_swap_signal.take() {
+            signal
+                .send(())
+                .expect("descriptor post-swap receiver should remain connected");
+        }
+        // Release the old lease only after the new reader state is committed; Drop may block.
+        drop(previous_handle);
         descriptor_generation
     }
 
@@ -9996,6 +10049,202 @@ mod tests {
         assert_descriptor_source_drains_notify_during_pre_commit(
             LateNotifyDescriptorSource::PendingRetry,
         );
+    }
+
+    #[test]
+    fn segment_reader_driver_commits_swap_before_releasing_old_lease() {
+        #[derive(Debug)]
+        struct SwapReport {
+            event: ReportedDriverEvent,
+            descriptor_identity: (u64, u64),
+            descriptor_rebinds_total: u64,
+        }
+
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let current_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "lease-drop-order-current",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        let next_partition = store
+            .open_partition_with_schema_and_writer_epoch(
+                "ticks",
+                "lease-drop-order-next",
+                schema.clone(),
+                1,
+            )
+            .unwrap();
+        next_partition
+            .writer()
+            .write_row(|row| {
+                row.write_utf8("instrument_id", "IF2607")?;
+                row.write_f64("last_price", 4104.5)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let (endpoint, server, join_handle) = spawn_test_master();
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("instrument_id", DataType::Utf8, false),
+            Field::new("last_price", DataType::Float64, false),
+        ]));
+        let mut writer_master = CoreMasterClient::connect_endpoint(endpoint.clone()).unwrap();
+        writer_master
+            .register_process("lease_drop_order_writer")
+            .unwrap();
+        writer_master
+            .register_stream("ticks", arrow_schema, 4, 4096)
+            .unwrap();
+        writer_master
+            .register_source(
+                "lease_drop_order_source",
+                "stream_table",
+                "ticks",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&current_partition),
+            )
+            .unwrap();
+        let current_descriptor = writer_master
+            .get_segment_descriptor("ticks")
+            .unwrap()
+            .unwrap();
+
+        let mut reader_master = CoreMasterClient::connect_endpoint(endpoint).unwrap();
+        reader_master
+            .register_process("lease_drop_order_reader")
+            .unwrap();
+        let reader_master = Arc::new(Mutex::new(reader_master));
+        let reader_lease = SegmentReaderLeaseGuard::acquire(
+            Arc::clone(&reader_master),
+            "ticks",
+            &current_descriptor,
+        )
+        .unwrap();
+
+        writer_master
+            .publish_segment_descriptor(
+                "ticks",
+                publishable_descriptor_from_partition(&next_partition),
+            )
+            .unwrap();
+        let next_stream = writer_master.get_stream("ticks").unwrap();
+        let next_descriptor = next_stream.active_segment_descriptor.unwrap();
+        let next_identity = descriptor_segment_identity(&next_descriptor).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        descriptor_updates.set(
+            descriptor_update_from_value(next_stream.descriptor_generation, next_descriptor)
+                .unwrap(),
+        );
+
+        let (reader, _) = build_active_segment_reader(&current_descriptor, &schema).unwrap();
+        let metrics = Arc::new(SubscriberMetrics::default());
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: Some(reader_lease),
+            },
+            serde_json::to_string(&current_descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::new(Mutex::new(None)),
+            false,
+            Duration::ZERO,
+            0,
+            Some(Arc::clone(&metrics)),
+        );
+        let (lease_drop_reached_tx, lease_drop_reached_rx) = mpsc::sync_channel(0);
+        let (lease_drop_resume_tx, lease_drop_resume_rx) = mpsc::sync_channel(0);
+        driver
+            .reader_handle
+            .reader_lease
+            .as_mut()
+            .unwrap()
+            .set_drop_hook(SegmentReaderLeaseDropHook {
+                reached: lease_drop_reached_tx,
+                resume: lease_drop_resume_rx,
+            });
+        let (post_swap_tx, post_swap_rx) = mpsc::channel();
+        driver.set_descriptor_post_swap_signal(post_swap_tx);
+
+        let (event_tx, event_rx) = mpsc::sync_channel(0);
+        let (permit_tx, permit_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            for _ in 0..2 {
+                let event = reported_driver_event(driver.poll_next().unwrap());
+                let descriptor: serde_json::Value =
+                    serde_json::from_str(&driver.descriptor_text).unwrap();
+                event_tx
+                    .send(SwapReport {
+                        event,
+                        descriptor_identity: descriptor_segment_identity(&descriptor).unwrap(),
+                        descriptor_rebinds_total: metrics
+                            .descriptor_rebinds_total
+                            .load(Ordering::SeqCst),
+                    })
+                    .unwrap();
+                permit_rx.recv().unwrap();
+            }
+        });
+
+        lease_drop_reached_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("old reader lease drop should reach the release barrier");
+        assert_eq!(post_swap_rx.try_recv(), Ok(()));
+        lease_drop_resume_tx.send(()).unwrap();
+
+        let first = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            first.event,
+            ReportedDriverEvent::DescriptorUpdated(next_stream.descriptor_generation)
+        );
+        assert_eq!(first.descriptor_identity, next_identity);
+        assert_eq!(first.descriptor_rebinds_total, 1);
+        let stream = writer_master.get_stream("ticks").unwrap();
+        let lease_identities = stream
+            .segment_reader_leases
+            .iter()
+            .map(|lease| {
+                (
+                    lease
+                        .get("source_segment_id")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap(),
+                    lease
+                        .get("source_generation")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lease_identities, vec![next_identity]);
+        permit_tx.send(()).unwrap();
+
+        let second = event_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            second.event,
+            ReportedDriverEvent::Rows(vec!["IF2607".to_string()])
+        );
+        permit_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        server.shutdown();
+        join_handle.join().unwrap().unwrap();
     }
 
     #[test]
