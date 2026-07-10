@@ -3600,6 +3600,14 @@ impl SegmentReaderDriver {
     }
 
     fn poll_next(&mut self) -> std::result::Result<SegmentReaderDriverEvent, String> {
+        self.poll_next_with_idle_wait(self.idle_wait)
+    }
+
+    fn poll_next_with_idle_wait(
+        &mut self,
+        requested_idle_wait: Duration,
+    ) -> std::result::Result<SegmentReaderDriverEvent, String> {
+        let effective_idle_wait = requested_idle_wait.min(self.idle_wait);
         let poll_started_at = Instant::now();
         if let Some(error) = take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref()) {
             if let Some(metrics) = self.metrics.as_ref() {
@@ -3672,7 +3680,7 @@ impl SegmentReaderDriver {
                         None
                     } else {
                         self.descriptor_updates
-                            .wait_for_update_after(&self.descriptor_text, self.idle_wait)
+                            .wait_for_update_after(&self.descriptor_text, effective_idle_wait)
                     };
                     if let Some(error) =
                         take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref())
@@ -3710,17 +3718,11 @@ impl SegmentReaderDriver {
                 if self.xfast {
                     spin_loop();
                 } else {
-                    if let Some(update) = self
-                        .descriptor_updates
-                        .wait_for_update_after(&self.descriptor_text, self.idle_wait)
-                    {
-                        if let Some(descriptor_generation) =
-                            self.apply_descriptor_update_or_retry(update)?
-                        {
-                            return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
-                                descriptor_generation,
-                            ));
-                        }
+                    if self.wait_for_mmap_notification_after(
+                        observed_notification_seq,
+                        effective_idle_wait,
+                    )? {
+                        return Ok(SegmentReaderDriverEvent::Idle);
                     }
                     if let Some(error) =
                         take_descriptor_refresh_error(self.descriptor_refresh_error.as_ref())
@@ -3730,10 +3732,11 @@ impl SegmentReaderDriver {
                         }
                         return Err(error);
                     }
-                    self.wait_for_mmap_notification_after(
-                        observed_notification_seq,
-                        Duration::ZERO,
-                    )?;
+                    if let Some(descriptor_generation) = self.apply_ready_descriptor_updates()? {
+                        return Ok(SegmentReaderDriverEvent::DescriptorUpdated(
+                            descriptor_generation,
+                        ));
+                    }
                 }
                 Ok(SegmentReaderDriverEvent::Idle)
             }
@@ -9428,6 +9431,70 @@ mod tests {
         match driver.poll_next().unwrap() {
             SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
             other => panic!("expected rows from next descriptor got [{other:?}]"),
+        }
+    }
+
+    #[test]
+    fn segment_reader_driver_row_commit_wakes_before_idle_timeout() {
+        let schema = compile_segment_schema(&[
+            ColumnSpec::new("instrument_id", ColumnType::Utf8),
+            ColumnSpec::new("last_price", ColumnType::Float64),
+        ])
+        .unwrap();
+        let store = SegmentStore::new(SegmentStoreConfig {
+            default_row_capacity: 4,
+        })
+        .unwrap();
+        let partition = store
+            .open_partition_with_schema("ticks", "current", schema.clone())
+            .unwrap();
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&partition.active_descriptor_envelope_bytes().unwrap()).unwrap();
+        let (reader, _) = build_active_segment_reader(&descriptor, &schema).unwrap();
+        let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
+        let descriptor_refresh_error = Arc::new(Mutex::new(None));
+        let mut driver = SegmentReaderDriver::new(
+            ActiveSegmentReaderHandle {
+                reader,
+                reader_lease: None,
+            },
+            serde_json::to_string(&descriptor).unwrap(),
+            schema,
+            Arc::clone(&descriptor_updates),
+            Arc::clone(&descriptor_refresh_error),
+            false,
+            Duration::from_millis(500),
+            0,
+            None,
+        );
+
+        let writer = partition.writer();
+        let writer_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            writer
+                .write_row(|row| {
+                    row.write_utf8("instrument_id", "IF2606")?;
+                    row.write_f64("last_price", 4102.5)?;
+                    Ok(())
+                })
+                .unwrap();
+        });
+
+        let poll_started_at = Instant::now();
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Idle => {}
+            other => panic!("expected idle after mmap notification got [{other:?}]"),
+        }
+        let poll_elapsed = poll_started_at.elapsed();
+        assert!(
+            poll_elapsed < Duration::from_millis(300),
+            "row commit should wake reader before idle timeout elapsed=[{poll_elapsed:?}]"
+        );
+
+        writer_thread.join().unwrap();
+        match driver.poll_next().unwrap() {
+            SegmentReaderDriverEvent::Rows(span) => assert_eq!(span.row_count(), 1),
+            other => panic!("expected committed row after wake got [{other:?}]"),
         }
     }
 
