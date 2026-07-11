@@ -2896,6 +2896,55 @@ mod tests {
     }
 
     #[test]
+    fn row_peak_tracker_uses_exact_second_boundary_and_skips_empty_buckets() {
+        let origin = Instant::now();
+        let mut tracker = RowPeakTracker::new(origin);
+
+        tracker.record(origin, 10).unwrap();
+        tracker.record(origin + Duration::from_secs(1), 20).unwrap();
+        tracker.record(origin + Duration::from_secs(4), 15).unwrap();
+
+        assert_eq!(tracker.finish(), 20);
+    }
+
+    #[test]
+    fn row_peak_tracker_rejects_pre_origin_and_out_of_order_buckets() {
+        let origin = Instant::now();
+        let mut tracker = RowPeakTracker::new(origin);
+        let before_origin = origin.checked_sub(Duration::from_nanos(1)).unwrap();
+
+        assert_eq!(
+            tracker.record(before_origin, 1).unwrap_err(),
+            "row peak observation predates origin"
+        );
+        tracker.record(origin + Duration::from_secs(2), 1).unwrap();
+        assert_eq!(
+            tracker
+                .record(origin + Duration::from_secs(1), 1)
+                .unwrap_err(),
+            "row peak tracker received out-of-order bucket current=[2] observed=[1]"
+        );
+    }
+
+    #[test]
+    fn row_peak_tracker_rejects_bucket_row_overflow() {
+        let origin = Instant::now();
+        let mut tracker = RowPeakTracker::new(origin);
+
+        tracker.record(origin, u64::MAX).unwrap();
+
+        assert_eq!(
+            tracker.record(origin, 1).unwrap_err(),
+            "row peak bucket row count overflowed"
+        );
+    }
+
+    #[test]
+    fn empty_row_peak_tracker_finishes_at_zero() {
+        assert_eq!(RowPeakTracker::new(Instant::now()).finish(), 0);
+    }
+
+    #[test]
     fn remote_upstream_driver_carries_sampled_queue_without_metrics_latency() {
         let metrics_sampled = Cell::new(false);
         let admission = FakeEngineBatchAdmission {
