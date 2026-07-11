@@ -105,6 +105,8 @@ pub struct EngineMetricsReport {
     pub late_rows_total: u64,
     pub publish_errors_total: u64,
     pub queue_depth: usize,
+    #[serde(default)]
+    pub max_observed_queue_depth: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -263,22 +265,30 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
     let mut handle = spawn_engine_with_publisher(engine, engine_config(config), publisher)
         .map_err(|error| error.to_string())?;
 
-    let drive_stats = drive_generator(config, &mut factory, |batch| {
-        handle.write(batch).map_err(|error| error.to_string())
-    })?;
+    let drive_stats = drive_inproc_generator(config, &mut factory, &mut handle)?;
 
     handle.flush().map_err(|error| error.to_string())?;
+    let drain_completed_at = Instant::now();
     handle.stop().map_err(|error| error.to_string())?;
 
-    let engine_metrics = engine_metrics_report(handle.metrics());
+    let mut engine_metrics = engine_metrics_report(handle.metrics());
+    engine_metrics.max_observed_queue_depth = engine_metrics
+        .max_observed_queue_depth
+        .max(drive_stats.max_observed_queue_depth);
+    validate_inproc_completion(
+        drive_stats.input_rows_total,
+        engine_metrics.processed_rows_total,
+    )?;
+    let steady_elapsed = drain_completed_at.duration_since(drive_stats.steady_started_at);
+    let actual_average_rows_per_sec =
+        count_per_sec_over_elapsed(drive_stats.steady_rows_total, steady_elapsed);
+    let batches_per_sec =
+        count_per_sec_over_elapsed(drive_stats.steady_batches_total, steady_elapsed);
     let output_rows_total = publisher_counters.output_rows_total.load(Ordering::Relaxed);
-    let output_batches_total = publisher_counters
-        .output_batches_total
-        .load(Ordering::Relaxed);
     let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let pass = evaluate_pass(
         config,
-        drive_stats.actual_average_rows_per_sec,
+        actual_average_rows_per_sec,
         handle.status(),
         &engine_metrics,
         None,
@@ -291,9 +301,9 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
         metadata: PerfReportMetadata::capture(),
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total,
-        actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
+        actual_average_rows_per_sec,
         actual_peak_rows_per_sec: drive_stats.actual_peak_rows_per_sec,
-        batches_per_sec: compute_batches_per_sec(output_batches_total, config.duration_sec as f64),
+        batches_per_sec,
         latency,
         secondary_latency: None,
         engine_status: handle.status().as_str().to_string(),
@@ -484,6 +494,7 @@ fn run_stream_table_segment_with_row_capacity(
         late_rows_total: 0,
         publish_errors_total: 0,
         queue_depth: 0,
+        max_observed_queue_depth: 0,
     };
     let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let pass = evaluate_pass(
@@ -550,6 +561,7 @@ fn run_write_to_subscribe_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
         late_rows_total: 0,
         publish_errors_total: 0,
         queue_depth: 0,
+        max_observed_queue_depth: 0,
     };
     let latency = build_latency_summary(&drive_stats.latency_samples_micros);
     let pass = evaluate_pass(
@@ -697,6 +709,7 @@ fn run_stream_table_subscriber_e2e(config: &PerfConfig) -> PerfResult<PerfReport
         late_rows_total: 0,
         publish_errors_total: 0,
         queue_depth: 0,
+        max_observed_queue_depth: 0,
     };
     let latency = build_latency_summary(&drive_stats.batch_latencies_micros);
     let secondary_latency = build_latency_summary(&drive_stats.secondary_latencies_micros);
@@ -1276,6 +1289,83 @@ struct DriveStats {
     actual_peak_rows_per_sec: f64,
     batch_latencies_micros: Vec<u64>,
     secondary_latencies_micros: Vec<u64>,
+}
+
+struct InprocDriveStats {
+    input_rows_total: u64,
+    steady_rows_total: u64,
+    steady_batches_total: u64,
+    steady_started_at: Instant,
+    actual_peak_rows_per_sec: f64,
+    batch_latencies_micros: Vec<u64>,
+    max_observed_queue_depth: usize,
+}
+
+fn drive_inproc_generator(
+    config: &PerfConfig,
+    factory: &mut TickBatchFactory,
+    handle: &mut zippy_core::EngineHandle,
+) -> PerfResult<InprocDriveStats> {
+    let warmup_duration = Duration::from_secs(config.warmup_sec);
+    let steady_duration = Duration::from_secs(config.duration_sec);
+    let total_duration = warmup_duration + steady_duration;
+    let batch_interval_ns = ((1_000_000_000_u128 * config.rows_per_batch as u128)
+        / config.target_rows_per_sec as u128)
+        .max(1) as u64;
+    let batch_interval = Duration::from_nanos(batch_interval_ns);
+    let start = Instant::now();
+    let steady_started_at = start + warmup_duration;
+    let end = steady_started_at + steady_duration;
+    let mut next_tick = start;
+    let mut input_rows_total = 0_u64;
+    let mut steady_rows_total = 0_u64;
+    let mut steady_batches_total = 0_u64;
+    let mut peak_rows_per_sec = 0_f64;
+    let mut batch_latencies_micros = Vec::new();
+    let mut second_window_start = steady_started_at;
+    let mut second_window_rows = 0_u64;
+    let mut max_observed_queue_depth = handle.metrics().queue_depth;
+
+    while Instant::now() < end {
+        let now = Instant::now();
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+        }
+        let batch = factory.next_batch()?;
+        let batch_start = Instant::now();
+        handle.write(batch).map_err(|error| error.to_string())?;
+        let write_completed_at = Instant::now();
+        max_observed_queue_depth = max_observed_queue_depth.max(handle.metrics().queue_depth);
+        let write_elapsed = write_completed_at.duration_since(batch_start);
+        input_rows_total += config.rows_per_batch as u64;
+        if batch_start >= steady_started_at {
+            steady_rows_total += config.rows_per_batch as u64;
+            steady_batches_total += 1;
+            batch_latencies_micros.push(write_elapsed.as_micros() as u64);
+            second_window_rows += config.rows_per_batch as u64;
+            while batch_start >= second_window_start + Duration::from_secs(1) {
+                peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+                second_window_rows = 0;
+                second_window_start += Duration::from_secs(1);
+            }
+        }
+        next_tick += batch_interval;
+        if Instant::now() - start >= total_duration {
+            break;
+        }
+    }
+
+    peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+
+    Ok(InprocDriveStats {
+        input_rows_total,
+        steady_rows_total,
+        steady_batches_total,
+        steady_started_at,
+        actual_peak_rows_per_sec: peak_rows_per_sec,
+        batch_latencies_micros,
+        max_observed_queue_depth,
+    })
 }
 
 fn drive_generator<F>(
@@ -2343,6 +2433,7 @@ fn engine_metrics_report(snapshot: EngineMetricsSnapshot) -> EngineMetricsReport
         late_rows_total: snapshot.late_rows_total,
         publish_errors_total: snapshot.publish_errors_total,
         queue_depth: snapshot.queue_depth,
+        max_observed_queue_depth: snapshot.queue_depth,
     }
 }
 
@@ -2361,6 +2452,20 @@ fn source_metrics_report(counters: &Arc<SourceCountersState>) -> SourceMetricsRe
 
 fn compute_batches_per_sec(output_batches_total: u64, observed_secs: f64) -> f64 {
     output_batches_total as f64 / observed_secs.max(1e-9)
+}
+
+fn count_per_sec_over_elapsed(count: u64, elapsed: Duration) -> f64 {
+    count as f64 / elapsed.as_secs_f64().max(1e-9)
+}
+
+fn validate_inproc_completion(input_rows_total: u64, processed_rows_total: u64) -> PerfResult<()> {
+    if input_rows_total != processed_rows_total {
+        return Err(format!(
+            "in-process row count mismatch input_rows_total=[{input_rows_total}] \
+             processed_rows_total=[{processed_rows_total}]"
+        ));
+    }
+    Ok(())
 }
 
 fn classify_source_error(error: &zippy_core::ZippyError, counters: &Arc<SourceCountersState>) {
@@ -2398,7 +2503,7 @@ fn evaluate_pass(
     }
     if config
         .max_queue_depth
-        .is_some_and(|max_queue_depth| engine_metrics.queue_depth > max_queue_depth)
+        .is_some_and(|max_queue_depth| engine_metrics.max_observed_queue_depth > max_queue_depth)
     {
         return false;
     }
@@ -2432,9 +2537,10 @@ mod tests {
     use super::{
         checked_write_to_subscribe_elapsed_ns, compute_remote_downstream_deadline,
         consume_write_to_subscribe_rows, consume_write_to_subscribe_span,
-        drive_segment_write_to_consumer, is_write_to_subscribe_measured,
-        merge_write_to_subscribe_results, merge_write_to_subscribe_startup_error,
-        produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
+        count_per_sec_over_elapsed, drive_segment_write_to_consumer,
+        is_write_to_subscribe_measured, merge_write_to_subscribe_results,
+        merge_write_to_subscribe_startup_error, produce_write_to_subscribe_rows,
+        remote_downstream_should_stop_for_idle, run_profile, validate_inproc_completion,
         validate_write_to_subscribe_counts, write_report_json,
         write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset,
         ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
@@ -2517,8 +2623,34 @@ mod tests {
             run_profile(&test_config(PerfProfile::InprocTimeseries, test_endpoint())).unwrap();
 
         assert!(report.input_rows_total > 0);
+        assert_eq!(
+            report.input_rows_total,
+            report.engine_metrics.processed_rows_total
+        );
+        assert!(
+            report.engine_metrics.max_observed_queue_depth >= report.engine_metrics.queue_depth
+        );
         assert!(report.actual_average_rows_per_sec > 0.0);
+        assert!(report.batches_per_sec > 0.0);
         assert!(report.pass);
+    }
+
+    #[test]
+    fn count_per_sec_uses_supplied_elapsed_time() {
+        assert_eq!(
+            count_per_sec_over_elapsed(100, Duration::from_secs(2)),
+            50.0
+        );
+    }
+
+    #[test]
+    fn inproc_completion_validation_reports_accepted_and_processed_counts() {
+        let error = validate_inproc_completion(100, 99).unwrap_err();
+
+        assert_eq!(
+            error,
+            "in-process row count mismatch input_rows_total=[100] processed_rows_total=[99]"
+        );
     }
 
     #[test]
@@ -3023,11 +3155,12 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_pass_rejects_queue_depth_above_configured_threshold() {
+    fn evaluate_pass_rejects_observed_queue_depth_above_configured_threshold() {
         let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
         config.max_queue_depth = Some(2);
         let engine_metrics = EngineMetricsReport {
-            queue_depth: 3,
+            queue_depth: 0,
+            max_observed_queue_depth: 3,
             ..EngineMetricsReport::default()
         };
 
@@ -3041,6 +3174,17 @@ mod tests {
         );
 
         assert!(!pass);
+    }
+
+    #[test]
+    fn engine_metrics_report_deserializes_legacy_json_without_observed_queue_depth() {
+        let metrics: EngineMetricsReport = serde_json::from_str(
+            r#"{"processed_batches_total":1,"processed_rows_total":2,"output_batches_total":1,"dropped_batches_total":0,"late_rows_total":0,"publish_errors_total":0,"queue_depth":0}"#,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.max_observed_queue_depth, 0);
+        assert_eq!(metrics.queue_depth, 0);
     }
 
     #[test]
