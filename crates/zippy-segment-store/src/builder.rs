@@ -1140,6 +1140,14 @@ impl ActiveSegmentWriter {
     }
 
     pub(crate) fn finish_columnar_rows(&mut self, row_count: usize) -> Result<(), &'static str> {
+        self.finish_columnar_rows_without_publish(row_count)?;
+        self.publish_committed_prefix()
+    }
+
+    pub(crate) fn finish_columnar_rows_without_publish(
+        &mut self,
+        row_count: usize,
+    ) -> Result<(), &'static str> {
         if self.current_row_open {
             return Err("row already open");
         }
@@ -1152,7 +1160,7 @@ impl ActiveSegmentWriter {
         }
         self.header.row_count += row_count;
         self.row_cursor = end_row;
-        self.publish_committed_prefix()
+        Ok(())
     }
 
     fn try_append_active_row_span(

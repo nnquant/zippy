@@ -17,9 +17,10 @@ use arrow::{
 use parquet::arrow::ArrowWriter;
 use zippy_core::{Engine, Result, SchemaRef, SegmentRowView, SegmentTableView, ZippyError};
 use zippy_segment_store::{
-    compile_schema, ColumnSpec, ColumnType, PartitionHandle, PartitionRowUpdater,
-    PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView, SealedSegmentHandle,
-    SegmentCellValue, SegmentLease, SegmentStore, SegmentStoreConfig, ZippySegmentStoreError,
+    compile_schema, ColumnSpec, ColumnType, PartitionColumnWriter, PartitionHandle,
+    PartitionRowUpdater, PartitionRowWriter, PartitionWriterHandle, ReaderSession, RowSpanView,
+    SealedSegmentHandle, SegmentCellValue, SegmentLease, SegmentStore, SegmentStoreConfig,
+    ZippySegmentStoreError,
 };
 
 use crate::stream_table_shard::{ShardConfig, ShardRouter};
@@ -100,6 +101,8 @@ fn single_row_segment_source_emit_ns(row_view: &SegmentRowView) -> Option<i64> {
 pub struct StreamTableMaterializer {
     name: String,
     input_schema: SchemaRef,
+    row_capacity: usize,
+    frame_per_batch: bool,
     store: SegmentStore,
     partition: PartitionHandle,
     sealed_segment_descriptors: Vec<serde_json::Value>,
@@ -826,6 +829,8 @@ impl StreamTableMaterializer {
         Ok(Self {
             name,
             input_schema,
+            row_capacity,
+            frame_per_batch: false,
             store,
             partition,
             sealed_segment_descriptors: Vec::new(),
@@ -857,6 +862,15 @@ impl StreamTableMaterializer {
     /// Allow zero-copy publication of upstream active segment descriptors.
     pub fn with_descriptor_forwarding(mut self, enabled: bool) -> Self {
         self.descriptor_forwarding = enabled;
+        self
+    }
+
+    /// Commit each input batch atomically into its own sealed segment.
+    ///
+    /// This mode preserves upstream batch boundaries for complete-frame consumers. A frame that
+    /// does not fit into one segment is rejected instead of being split across segments.
+    pub fn with_frame_per_batch(mut self, enabled: bool) -> Self {
+        self.frame_per_batch = enabled;
         self
     }
 
@@ -998,11 +1012,97 @@ impl StreamTableMaterializer {
         if table.num_rows() == 0 {
             return Ok(());
         }
+        if self.frame_per_batch {
+            return self.materialize_frame(table);
+        }
         if self.apply_retention()? {
             self.publish_active_descriptor()?;
         }
 
         self.materialize_table_rows(table, true)
+    }
+
+    fn materialize_frame(&mut self, table: &SegmentTableView) -> Result<()> {
+        if self.descriptor_forwarding {
+            return Err(ZippyError::InvalidConfig {
+                reason: "stream table frame_per_batch is incompatible with descriptor_forwarding"
+                    .to_string(),
+            });
+        }
+        if self.retention_segments == Some(0) {
+            return Err(ZippyError::InvalidConfig {
+                reason: "stream table frame_per_batch requires retention_segments >= 1".to_string(),
+            });
+        }
+        if self.active_committed_row_count() != 0 {
+            return Err(ZippyError::InvalidState {
+                status: "frame-per-batch active segment must be empty",
+            });
+        }
+        if table.num_rows() > self.row_capacity {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "stream table frame rows exceed segment capacity rows=[{}] row_capacity=[{}]",
+                    table.num_rows(),
+                    self.row_capacity,
+                ),
+            });
+        }
+
+        self.forwarded_active_descriptor = None;
+        self.forwarded_active_row_span = None;
+        let fields = self.input_schema.fields().clone();
+        let columns = (0..fields.len())
+            .map(|index| table.column_at(index))
+            .collect::<Result<Vec<_>>>()?;
+        let writer = self.partition.writer();
+        let write_result = if columns.iter().all(|column| column.null_count() == 0) {
+            writer.write_atomic_columnar_rows(table.num_rows(), |column_writer, rows_to_write| {
+                Self::write_materialized_columnar_values(
+                    column_writer,
+                    &fields,
+                    &columns,
+                    0,
+                    rows_to_write,
+                )
+            })
+        } else {
+            writer.rewrite_rows(table.num_rows(), |row, row_index| {
+                Self::write_materialized_row_fields(row, &fields, &columns, row_index)
+            })
+        };
+        match write_result {
+            Ok(written) if written == table.num_rows() => {}
+            Ok(written) => {
+                return Err(ZippyError::Io {
+                    reason: format!(
+                        "stream table frame rewrite was incomplete rows=[{}] written=[{}]",
+                        table.num_rows(),
+                        written,
+                    ),
+                });
+            }
+            Err(ZippySegmentStoreError::Writer("segment is full")) => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "stream table frame payload exceeds segment capacity rows=[{}] row_capacity=[{}]",
+                        table.num_rows(),
+                        self.row_capacity,
+                    ),
+                });
+            }
+            Err(error) => return Err(segment_error(error)),
+        }
+
+        let sealed_descriptor = self.active_descriptor_value()?;
+        let sealed = writer
+            .rollover_without_persistence()
+            .map_err(segment_error)?;
+        self.sealed_segment_descriptors
+            .push(sealed_descriptor.clone());
+        self.apply_retention()?;
+        self.publish_active_descriptor()?;
+        self.enqueue_persist_task(sealed, &sealed_descriptor)
     }
 
     fn materialize_table_rows(
@@ -1587,57 +1687,73 @@ impl StreamTableMaterializer {
         row_count: usize,
     ) -> std::result::Result<usize, ZippySegmentStoreError> {
         writer.write_columnar_rows(row_count, |column_writer, rows_to_write| {
-            for (field_index, field) in fields.iter().enumerate() {
-                let array = columns[field_index].as_ref();
-                match field.data_type() {
-                    DataType::Int64 => {
-                        let values = array.as_any().downcast_ref::<Int64Array>().ok_or(
-                            ZippySegmentStoreError::Schema("int64 column downcast failed"),
-                        )?;
-                        let batch_values = (0..rows_to_write)
-                            .map(|offset| values.value(start_row + offset))
-                            .collect::<Vec<_>>();
-                        column_writer.write_i64_values(field.name(), &batch_values)?;
-                    }
-                    DataType::Float64 => {
-                        let values = array.as_any().downcast_ref::<Float64Array>().ok_or(
-                            ZippySegmentStoreError::Schema("float64 column downcast failed"),
-                        )?;
-                        let batch_values = (0..rows_to_write)
-                            .map(|offset| values.value(start_row + offset))
-                            .collect::<Vec<_>>();
-                        column_writer.write_f64_values(field.name(), &batch_values)?;
-                    }
-                    DataType::Utf8 => {
-                        let values = array.as_any().downcast_ref::<StringArray>().ok_or(
-                            ZippySegmentStoreError::Schema("utf8 column downcast failed"),
-                        )?;
-                        let batch_values = (0..rows_to_write)
-                            .map(|offset| values.value(start_row + offset))
-                            .collect::<Vec<_>>();
-                        column_writer.write_utf8_values(field.name(), &batch_values)?;
-                    }
-                    DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                        let values = array
-                            .as_any()
-                            .downcast_ref::<TimestampNanosecondArray>()
-                            .ok_or(ZippySegmentStoreError::Schema(
-                                "timestamp[ns] column downcast failed",
-                            ))?;
-                        let batch_values = (0..rows_to_write)
-                            .map(|offset| values.value(start_row + offset))
-                            .collect::<Vec<_>>();
-                        column_writer.write_i64_values(field.name(), &batch_values)?;
-                    }
-                    _ => {
-                        return Err(ZippySegmentStoreError::Schema(
-                            "unsupported stream table column type",
-                        ));
-                    }
+            Self::write_materialized_columnar_values(
+                column_writer,
+                fields,
+                columns,
+                start_row,
+                rows_to_write,
+            )
+        })
+    }
+
+    fn write_materialized_columnar_values(
+        column_writer: &mut PartitionColumnWriter<'_>,
+        fields: &Fields,
+        columns: &[ArrayRef],
+        start_row: usize,
+        rows_to_write: usize,
+    ) -> std::result::Result<(), ZippySegmentStoreError> {
+        for (field_index, field) in fields.iter().enumerate() {
+            let array = columns[field_index].as_ref();
+            match field.data_type() {
+                DataType::Int64 => {
+                    let values = array.as_any().downcast_ref::<Int64Array>().ok_or(
+                        ZippySegmentStoreError::Schema("int64 column downcast failed"),
+                    )?;
+                    let batch_values = (0..rows_to_write)
+                        .map(|offset| values.value(start_row + offset))
+                        .collect::<Vec<_>>();
+                    column_writer.write_i64_values(field.name(), &batch_values)?;
+                }
+                DataType::Float64 => {
+                    let values = array.as_any().downcast_ref::<Float64Array>().ok_or(
+                        ZippySegmentStoreError::Schema("float64 column downcast failed"),
+                    )?;
+                    let batch_values = (0..rows_to_write)
+                        .map(|offset| values.value(start_row + offset))
+                        .collect::<Vec<_>>();
+                    column_writer.write_f64_values(field.name(), &batch_values)?;
+                }
+                DataType::Utf8 => {
+                    let values = array.as_any().downcast_ref::<StringArray>().ok_or(
+                        ZippySegmentStoreError::Schema("utf8 column downcast failed"),
+                    )?;
+                    let batch_values = (0..rows_to_write)
+                        .map(|offset| values.value(start_row + offset))
+                        .collect::<Vec<_>>();
+                    column_writer.write_utf8_values(field.name(), &batch_values)?;
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or(ZippySegmentStoreError::Schema(
+                            "timestamp[ns] column downcast failed",
+                        ))?;
+                    let batch_values = (0..rows_to_write)
+                        .map(|offset| values.value(start_row + offset))
+                        .collect::<Vec<_>>();
+                    column_writer.write_i64_values(field.name(), &batch_values)?;
+                }
+                _ => {
+                    return Err(ZippySegmentStoreError::Schema(
+                        "unsupported stream table column type",
+                    ));
                 }
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     fn publish_active_descriptor(&self) -> Result<()> {

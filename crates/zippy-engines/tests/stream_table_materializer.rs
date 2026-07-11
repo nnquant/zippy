@@ -49,11 +49,32 @@ fn nullable_shard_key_schema() -> Arc<Schema> {
     ]))
 }
 
+fn nullable_frame_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Arc::new(Field::new("instrument_id", DataType::Utf8, false)),
+        Arc::new(Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        )),
+        Arc::new(Field::new("last_price", DataType::Float64, true)),
+    ]))
+}
+
 fn segment_schema() -> zippy_segment_store::CompiledSchema {
     compile_schema(&[
         ColumnSpec::new("instrument_id", ColumnType::Utf8),
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
         ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap()
+}
+
+fn nullable_frame_segment_schema() -> zippy_segment_store::CompiledSchema {
+    compile_schema(&[
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("UTC")),
+        ColumnSpec::nullable("last_price", ColumnType::Float64),
     ])
     .unwrap()
 }
@@ -77,7 +98,15 @@ fn input_batch() -> RecordBatch {
 }
 
 fn descriptor_batch(descriptor: &[u8], row_capacity: usize, row_count: usize) -> RecordBatch {
-    let schema = segment_schema();
+    descriptor_batch_with_schema(descriptor, segment_schema(), row_capacity, row_count)
+}
+
+fn descriptor_batch_with_schema(
+    descriptor: &[u8],
+    schema: zippy_segment_store::CompiledSchema,
+    row_capacity: usize,
+    row_count: usize,
+) -> RecordBatch {
     let layout = LayoutPlan::for_schema(&schema, row_capacity).unwrap();
     let descriptor =
         ActiveSegmentDescriptor::from_envelope_bytes(descriptor, schema, layout).unwrap();
@@ -132,6 +161,21 @@ fn nullable_shard_key_batch_with_null() -> RecordBatch {
                 .with_timezone("UTC"),
             ) as ArrayRef,
             Arc::new(Float64Array::from(vec![3912.4, 2740.8])) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn nullable_frame_batch(timestamp_ns: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        nullable_frame_schema(),
+        vec![
+            Arc::new(StringArray::from(vec!["IF2606", "IH2606"])) as ArrayRef,
+            Arc::new(
+                TimestampNanosecondArray::from(vec![timestamp_ns, timestamp_ns])
+                    .with_timezone("UTC"),
+            ) as ArrayRef,
+            Arc::new(Float64Array::from(vec![Some(3912.4), None])) as ArrayRef,
         ],
     )
     .unwrap()
@@ -1094,6 +1138,62 @@ fn stream_table_materializer_rolls_over_full_active_segment_and_publishes_descri
     let descriptor: serde_json::Value = serde_json::from_slice(&envelopes[0]).unwrap();
     assert_eq!(descriptor["segment_id"], 2);
     assert_eq!(descriptor["generation"], 1);
+}
+
+#[test]
+fn stream_table_frame_per_batch_seals_each_nullable_batch_as_one_segment() {
+    let publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let mut materializer = StreamTableMaterializer::new_with_row_capacity(
+        "cross_section_frames",
+        nullable_frame_schema(),
+        4,
+    )
+    .unwrap()
+    .with_descriptor_publisher(publisher.clone())
+    .with_frame_per_batch(true);
+
+    for timestamp_ns in [1_710_000_000_000_000_000_i64, 1_710_000_060_000_000_000_i64] {
+        let batch = nullable_frame_batch(timestamp_ns);
+        let outputs = materializer
+            .on_data(SegmentTableView::from_record_batch(batch))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].num_rows(), 2);
+        assert_eq!(materializer.active_committed_row_count(), 0);
+    }
+
+    let envelopes = publisher.envelopes.lock().unwrap();
+    assert_eq!(envelopes.len(), 2);
+    let latest: serde_json::Value = serde_json::from_slice(envelopes.last().unwrap()).unwrap();
+    assert_eq!(latest["segment_id"], 3);
+    let sealed = latest["sealed_segments"].as_array().unwrap();
+    assert_eq!(sealed.len(), 2);
+    for descriptor in sealed {
+        let envelope = serde_json::to_vec(descriptor).unwrap();
+        let batch = descriptor_batch_with_schema(&envelope, nullable_frame_segment_schema(), 4, 2);
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.column(2).null_count(), 1);
+    }
+}
+
+#[test]
+fn stream_table_frame_per_batch_rejects_oversized_frame_without_partial_commit() {
+    let publisher = Arc::new(RecordingDescriptorPublisher::default());
+    let mut materializer =
+        StreamTableMaterializer::new_with_row_capacity("cross_section_frames", input_schema(), 1)
+            .unwrap()
+            .with_descriptor_publisher(publisher.clone())
+            .with_frame_per_batch(true);
+
+    let error = materializer
+        .on_data(SegmentTableView::from_record_batch(input_batch()))
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("frame rows exceed segment capacity"));
+    assert_eq!(materializer.active_committed_row_count(), 0);
+    assert!(publisher.envelopes.lock().unwrap().is_empty());
 }
 
 #[test]

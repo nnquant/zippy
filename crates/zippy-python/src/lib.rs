@@ -3015,6 +3015,12 @@ struct DescriptorUpdate {
     descriptor: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DescriptorWatchCursor {
+    descriptor_generation: u64,
+    segment_identity: (u64, u64),
+}
+
 #[derive(Debug, Default)]
 struct DescriptorUpdateSlot {
     updates: Mutex<VecDeque<DescriptorUpdate>>,
@@ -3093,6 +3099,7 @@ impl DescriptorUpdateSlot {
 
 #[derive(Default)]
 struct SubscriberMetrics {
+    ready: AtomicBool,
     rows_delivered_total: AtomicU64,
     batches_delivered_total: AtomicU64,
     descriptor_updates_total: AtomicU64,
@@ -3115,6 +3122,14 @@ struct SubscriberMetrics {
 }
 
 impl SubscriberMetrics {
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    fn clear_ready(&self) {
+        self.ready.store(false, Ordering::SeqCst);
+    }
+
     fn clear_last_error(&self) {
         *self.last_error.lock().unwrap() = None;
     }
@@ -3227,6 +3242,47 @@ fn descriptor_update_from_value(
         text,
         descriptor,
     })
+}
+
+fn descriptor_update_sequence_from_value(
+    descriptor_generation: u64,
+    current_segment_identity: (u64, u64),
+    descriptor: serde_json::Value,
+) -> std::result::Result<Vec<DescriptorUpdate>, String> {
+    let latest_identity =
+        descriptor_segment_identity(&descriptor).map_err(|error| error.to_string())?;
+    if latest_identity == current_segment_identity {
+        return descriptor_update_from_value(descriptor_generation, descriptor)
+            .map(|update| vec![update]);
+    }
+
+    let Some(sealed_segments) = descriptor
+        .get("sealed_segments")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return descriptor_update_from_value(descriptor_generation, descriptor)
+            .map(|update| vec![update]);
+    };
+    let Some(current_index) = sealed_segments.iter().position(|sealed| {
+        descriptor_segment_identity(sealed).ok() == Some(current_segment_identity)
+    }) else {
+        return descriptor_update_from_value(descriptor_generation, descriptor)
+            .map(|update| vec![update]);
+    };
+
+    let mut updates = Vec::with_capacity(sealed_segments.len() - current_index);
+    for sealed in sealed_segments.iter().skip(current_index + 1) {
+        descriptor_segment_identity(sealed).map_err(|error| error.to_string())?;
+        updates.push(descriptor_update_from_value(
+            descriptor_generation,
+            sealed.clone(),
+        )?);
+    }
+    updates.push(descriptor_update_from_value(
+        descriptor_generation,
+        descriptor,
+    )?);
+    Ok(updates)
 }
 
 fn take_descriptor_update_after_poll(
@@ -4321,7 +4377,7 @@ fn spawn_segment_descriptor_watcher(
     running: Arc<AtomicBool>,
     master: SharedMasterClient,
     stream_name: String,
-    mut descriptor_generation: u64,
+    mut cursor: DescriptorWatchCursor,
     segment_schema: CompiledSchema,
     descriptor_updates: Arc<DescriptorUpdateSlot>,
     descriptor_refresh_error: Arc<Mutex<Option<String>>>,
@@ -4331,7 +4387,7 @@ fn spawn_segment_descriptor_watcher(
             let client = master.lock().unwrap().clone();
             let update = match client.wait_segment_descriptor(
                 &stream_name,
-                descriptor_generation,
+                cursor.descriptor_generation,
                 SEGMENT_DESCRIPTOR_WATCH_TIMEOUT,
             ) {
                 Ok(Some(update)) => update,
@@ -4356,25 +4412,39 @@ fn spawn_segment_descriptor_watcher(
                 }
             };
 
-            descriptor_generation = update.descriptor_generation;
-            match descriptor_update_from_value(update.descriptor_generation, update.descriptor) {
-                Ok(update) => {
-                    match validate_descriptor_update_for_watcher(&update, &segment_schema) {
-                        Ok(()) => {
-                            descriptor_updates.set(update);
+            cursor.descriptor_generation = update.descriptor_generation;
+            match descriptor_update_sequence_from_value(
+                update.descriptor_generation,
+                cursor.segment_identity,
+                update.descriptor,
+            ) {
+                Ok(updates) => {
+                    let next_identity = updates
+                        .last()
+                        .and_then(|update| descriptor_segment_identity(&update.descriptor).ok());
+                    let mut validation_error = None;
+                    for update in &updates {
+                        match validate_descriptor_update_for_watcher(update, &segment_schema) {
+                            Ok(()) => {}
+                            Err(error) if is_transient_missing_segment_reader_error(&error) => {}
+                            Err(error) if is_transient_segment_reader_layout_mismatch(&error) => {}
+                            Err(error) => {
+                                validation_error = Some(error.to_string());
+                                break;
+                            }
                         }
-                        Err(error) if is_transient_missing_segment_reader_error(&error) => {
-                            descriptor_updates.set(update);
-                        }
-                        Err(error) if is_transient_segment_reader_layout_mismatch(&error) => {
-                            descriptor_updates.set(update);
-                        }
-                        Err(error) => {
-                            *descriptor_refresh_error.lock().unwrap() = Some(error.to_string());
-                            descriptor_updates.notify();
-                            running.store(false, Ordering::SeqCst);
-                            break;
-                        }
+                    }
+                    if let Some(error) = validation_error {
+                        *descriptor_refresh_error.lock().unwrap() = Some(error);
+                        descriptor_updates.notify();
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    for update in updates {
+                        descriptor_updates.set(update);
+                    }
+                    if let Some(next_identity) = next_identity {
+                        cursor.segment_identity = next_identity;
                     }
                 }
                 Err(error) => {
@@ -4506,6 +4576,7 @@ impl StreamSubscriber {
             .map_err(py_runtime_error)?;
 
         self.metrics.clear_last_error();
+        self.metrics.clear_ready();
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
         let metrics = Arc::clone(&self.metrics);
@@ -4546,19 +4617,12 @@ impl StreamSubscriber {
                 else {
                     return Ok(());
                 };
-                match serde_json::from_str::<serde_json::Value>(&descriptor_text) {
-                    Ok(descriptor) => {
-                        metrics.record_initial_descriptor(descriptor_generation, &descriptor);
-                    }
-                    Err(_) => {
-                        metrics
-                            .current_descriptor_generation
-                            .store(descriptor_generation, Ordering::SeqCst);
-                        metrics
-                            .master_descriptor_generation
-                            .store(descriptor_generation, Ordering::SeqCst);
-                    }
-                }
+                let initial_descriptor =
+                    serde_json::from_str::<serde_json::Value>(&descriptor_text)
+                        .map_err(|error| error.to_string())?;
+                let initial_segment_identity = descriptor_segment_identity(&initial_descriptor)
+                    .map_err(|error| error.to_string())?;
+                metrics.record_initial_descriptor(descriptor_generation, &initial_descriptor);
                 metrics.record_stale_rows_skipped(stale_rows_skipped);
 
                 let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
@@ -4567,7 +4631,10 @@ impl StreamSubscriber {
                     Arc::clone(&running),
                     Arc::clone(&master),
                     source.clone(),
-                    descriptor_generation,
+                    DescriptorWatchCursor {
+                        descriptor_generation,
+                        segment_identity: initial_segment_identity,
+                    },
                     segment_schema.clone(),
                     Arc::clone(&descriptor_updates),
                     Arc::clone(&descriptor_refresh_error),
@@ -4584,6 +4651,7 @@ impl StreamSubscriber {
                     idle_spin_checks,
                     Some(Arc::clone(&metrics)),
                 );
+                metrics.mark_ready();
 
                 let run_result = (|| -> std::result::Result<(), String> {
                     let mut flush_deadline = None;
@@ -4668,6 +4736,7 @@ impl StreamSubscriber {
                     "stream subscriber thread exited with error"
                 );
             }
+            metrics.clear_ready();
             running.store(false, Ordering::SeqCst);
             result
         }));
@@ -4695,6 +4764,7 @@ impl StreamSubscriber {
         let dict = PyDict::new_bound(py);
         dict.set_item("source", &self.source)?;
         dict.set_item("running", self.running.load(Ordering::SeqCst))?;
+        dict.set_item("ready", self.metrics.ready.load(Ordering::SeqCst))?;
         dict.set_item("idle_spin_checks", self.idle_spin_checks)?;
         dict.set_item(
             "rows_delivered_total",
@@ -5556,13 +5626,20 @@ impl Source for SegmentSourceBridge {
             else {
                 return Ok(());
             };
+            let initial_descriptor = serde_json::from_str::<serde_json::Value>(&descriptor_text)
+                .map_err(|error| string_zippy_error(error.to_string()))?;
+            let initial_segment_identity = descriptor_segment_identity(&initial_descriptor)
+                .map_err(|error| string_zippy_error(error.to_string()))?;
             let descriptor_updates = Arc::new(DescriptorUpdateSlot::default());
             let descriptor_refresh_error = Arc::new(Mutex::new(None));
             let descriptor_refresh_handle = spawn_segment_descriptor_watcher(
                 Arc::clone(&running_flag),
                 Arc::clone(&master),
                 stream_name.clone(),
-                descriptor_generation,
+                DescriptorWatchCursor {
+                    descriptor_generation,
+                    segment_identity: initial_segment_identity,
+                },
                 segment_schema.clone(),
                 Arc::clone(&descriptor_updates),
                 Arc::clone(&descriptor_refresh_error),
@@ -5829,6 +5906,7 @@ struct CrossSectionalEngine {
 #[pyclass]
 struct StreamTableMaterializer {
     name: String,
+    frame_per_batch: bool,
     input_schema: Arc<Schema>,
     output_schema: Arc<Schema>,
     target: Vec<TargetConfig>,
@@ -6224,7 +6302,7 @@ impl ReactiveLatestEngine {
 impl StreamTableMaterializer {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false, shard_key=None, shard_nums=None, shard_version=None, shard_stream_names=None, shard_writer_epochs=None))]
+    #[pyo3(signature = (name, input_schema, target, *, source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false, descriptor_publisher=None, row_capacity=None, writer_epoch=None, retention_segments=None, retention_guard=None, dt_column=None, id_column=None, dt_part=None, persist_path=None, persist_publisher=None, descriptor_forwarding=false, frame_per_batch=false, shard_key=None, shard_nums=None, shard_version=None, shard_stream_names=None, shard_writer_epochs=None))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -6246,6 +6324,7 @@ impl StreamTableMaterializer {
         persist_path: Option<String>,
         persist_publisher: Option<Py<PyAny>>,
         descriptor_forwarding: bool,
+        frame_per_batch: bool,
         shard_key: Option<Vec<String>>,
         shard_nums: Option<usize>,
         shard_version: Option<u32>,
@@ -6257,6 +6336,16 @@ impl StreamTableMaterializer {
                 .map_err(|error| py_value_error(error.to_string()))?,
         );
         let row_capacity = row_capacity.unwrap_or(DEFAULT_STREAM_TABLE_ROW_CAPACITY);
+        if frame_per_batch && descriptor_forwarding {
+            return Err(py_value_error(
+                "frame_per_batch is incompatible with descriptor_forwarding",
+            ));
+        }
+        if frame_per_batch && retention_segments == Some(0) {
+            return Err(py_value_error(
+                "frame_per_batch requires retention_segments >= 1",
+            ));
+        }
         let (engine, output_schema, shard_metadata, shard_failures) = match (shard_key, shard_nums)
         {
             (None, None) => {
@@ -6306,6 +6395,9 @@ impl StreamTableMaterializer {
                 if descriptor_forwarding {
                     engine = engine.with_descriptor_forwarding(true);
                 }
+                if frame_per_batch {
+                    engine = engine.with_frame_per_batch(true);
+                }
                 let persist_path_provided = persist_path.is_some();
                 if let Some(path) = persist_path {
                     let mut config = StreamTablePersistConfig::new(PathBuf::from(path));
@@ -6351,6 +6443,7 @@ impl StreamTableMaterializer {
                     "descriptor_publisher",
                 )?;
                 reject_sharded_stream_table_option(descriptor_forwarding, "descriptor_forwarding")?;
+                reject_sharded_stream_table_option(frame_per_batch, "frame_per_batch")?;
                 reject_sharded_stream_table_option(persist_path.is_some(), "persist_path")?;
                 reject_sharded_stream_table_option(
                     persist_publisher.is_some(),
@@ -6425,6 +6518,7 @@ impl StreamTableMaterializer {
 
         Ok(Self {
             name,
+            frame_per_batch,
             input_schema: schema,
             output_schema,
             target,
@@ -6518,6 +6612,7 @@ impl StreamTableMaterializer {
             dict.set_item("shard_version", shard_metadata.shard_version)?;
             dict.set_item("shard_names", shard_metadata.shard_names.clone())?;
         }
+        dict.set_item("frame_per_batch", self.frame_per_batch)?;
         Ok(dict.into_any().unbind())
     }
 
@@ -10361,6 +10456,28 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_update_sequence_restores_intermediate_sealed_segments() {
+        let current = serde_json::json!({"segment_id": 1, "generation": 0});
+        let intermediate = serde_json::json!({"segment_id": 2, "generation": 1});
+        let latest = serde_json::json!({
+            "segment_id": 3,
+            "generation": 2,
+            "sealed_segments": [current, intermediate],
+        });
+
+        let updates = descriptor_update_sequence_from_value(9, (1, 0), latest).unwrap();
+        let identities = updates
+            .iter()
+            .map(|update| descriptor_segment_identity(&update.descriptor).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(identities, vec![(2, 1), (3, 2)]);
+        assert!(updates
+            .iter()
+            .all(|update| update.descriptor_generation == 9));
+    }
+
+    #[test]
     fn descriptor_watcher_uses_long_poll_timeout_instead_of_hot_polling() {
         assert!(SEGMENT_DESCRIPTOR_WATCH_TIMEOUT >= Duration::from_millis(100));
     }
@@ -11097,7 +11214,13 @@ mod tests {
             Arc::clone(&running),
             Arc::clone(&reader_master),
             "ticks".to_string(),
-            current_stream.descriptor_generation,
+            DescriptorWatchCursor {
+                descriptor_generation: current_stream.descriptor_generation,
+                segment_identity: descriptor_segment_identity(
+                    current_stream.active_segment_descriptor.as_ref().unwrap(),
+                )
+                .unwrap(),
+            },
             schema.clone(),
             Arc::clone(&descriptor_updates),
             Arc::clone(&descriptor_refresh_error),

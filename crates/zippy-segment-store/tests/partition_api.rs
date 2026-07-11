@@ -264,6 +264,57 @@ fn partition_writer_writes_columnar_rows_in_one_committed_prefix() {
 }
 
 #[test]
+fn partition_writer_atomic_columnar_rows_rolls_back_failure_and_requires_empty_segment() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::new("last_price", ColumnType::Float64),
+    ])
+    .unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig {
+        default_row_capacity: 4,
+    })
+    .unwrap();
+    let handle = store
+        .open_partition_with_schema("frames", "atomic-columnar", schema)
+        .unwrap();
+    let writer = handle.writer();
+
+    let error = writer
+        .write_atomic_columnar_rows(2, |columns, _| {
+            columns.write_i64_values("dt", &[1, 1])?;
+            columns.write_utf8_values("instrument_id", &["IF2606", "IH2606"])?;
+            Err(ZippySegmentStoreError::Writer("injected frame failure"))
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("injected frame failure"));
+    assert_eq!(writer.committed_row_count(), 0);
+    assert_eq!(writer.debug_snapshot_record_batch().unwrap().num_rows(), 0);
+
+    let written = writer
+        .write_atomic_columnar_rows(2, |columns, _| {
+            columns.write_i64_values("dt", &[2, 2])?;
+            columns.write_utf8_values("instrument_id", &["IF2606", "IH2606"])?;
+            columns.write_f64_values("last_price", &[4102.5, 2711.0])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(written, 2);
+    assert_eq!(writer.committed_row_count(), 2);
+
+    let error = writer
+        .write_atomic_columnar_rows(1, |columns, _| {
+            columns.write_i64_values("dt", &[3])?;
+            columns.write_utf8_values("instrument_id", &["IC2606"])?;
+            columns.write_f64_values("last_price", &[6201.5])?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("requires empty segment"));
+    assert_eq!(writer.committed_row_count(), 2);
+}
+
+#[test]
 fn active_row_span_exposes_borrowed_utf8_cell_values_for_hot_filters() {
     let schema = compile_schema(&[
         ColumnSpec::new("dt", ColumnType::TimestampNsTz("Asia/Shanghai")),

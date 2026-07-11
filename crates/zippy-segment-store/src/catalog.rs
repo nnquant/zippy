@@ -517,8 +517,8 @@ pub struct PartitionRowWriter<'a> {
 
 /// 批量列式写入器。
 ///
-/// 该类型只在 `PartitionWriterHandle::write_columnar_rows` 的闭包内有效，所有列都写入
-/// 同一个预留 row range，最后统一发布 committed prefix。
+/// 该类型只在 `PartitionWriterHandle` 的列式写入闭包内有效，所有列都写入同一个预留
+/// row range，最后统一发布 committed prefix。
 pub struct PartitionColumnWriter<'a> {
     writer: &'a mut ActiveSegmentWriter,
     start_row: usize,
@@ -1050,6 +1050,80 @@ impl PartitionWriterHandle {
                 .notify_all()
                 .map_err(ZippySegmentStoreError::Io)?;
         }
+        Ok(written)
+    }
+
+    /// 原子地向空 active segment 写入一个完整列式批次。
+    ///
+    /// 写入期间 payload version 保持为 mutation 状态，读端只能在所有列完成后观察到
+    /// committed prefix。发生错误时 active segment 会恢复为空，不暴露半批数据。
+    pub fn write_atomic_columnar_rows<F>(
+        &self,
+        row_count: usize,
+        write: F,
+    ) -> Result<usize, ZippySegmentStoreError>
+    where
+        F: FnOnce(&mut PartitionColumnWriter<'_>, usize) -> Result<(), ZippySegmentStoreError>,
+    {
+        let written = {
+            let mut state = self.handle.inner.state.lock().unwrap();
+            if state.writer.has_open_row() {
+                return Err(ZippySegmentStoreError::Writer("row already open"));
+            }
+            if state.writer.committed_row_count() != 0
+                || state.writer.remaining_row_capacity() != state.row_capacity
+            {
+                return Err(ZippySegmentStoreError::Writer(
+                    "atomic columnar write requires empty segment",
+                ));
+            }
+            if row_count > state.row_capacity {
+                return Err(ZippySegmentStoreError::Writer("segment is full"));
+            }
+
+            state
+                .writer
+                .begin_payload_mutation()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            let write_result = {
+                let mut column_writer = PartitionColumnWriter {
+                    writer: &mut state.writer,
+                    start_row: 0,
+                    row_count,
+                };
+                write(&mut column_writer, row_count)
+            }
+            .and_then(|_| {
+                state
+                    .writer
+                    .finish_columnar_rows_without_publish(row_count)
+                    .map_err(ZippySegmentStoreError::Writer)
+            });
+            if let Err(error) = write_result {
+                let reset_result = state
+                    .writer
+                    .reset_rows_without_publish()
+                    .map_err(ZippySegmentStoreError::Writer);
+                let abort_result = state
+                    .writer
+                    .abort_payload_mutation()
+                    .map_err(ZippySegmentStoreError::Writer);
+                reset_result?;
+                abort_result?;
+                return Err(error);
+            }
+            state
+                .writer
+                .finish_payload_mutation()
+                .map_err(ZippySegmentStoreError::Writer)?;
+            row_count
+        };
+
+        self.handle
+            .inner
+            .broadcaster
+            .notify_all()
+            .map_err(ZippySegmentStoreError::Io)?;
         Ok(written)
     }
 

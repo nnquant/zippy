@@ -3,9 +3,9 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use zippy_core::{Engine, LateDataPolicy, SegmentTableView};
-use zippy_engines::CrossSectionalEngine;
+use zippy_engines::{CrossSectionalEngine, StreamTableMaterializer};
 use zippy_operators::{CSDemeanSpec, CSRankSpec, CSZscoreSpec};
 
 fn bench_crosssectional_pipeline(c: &mut Criterion) {
@@ -123,9 +123,63 @@ fn bench_crosssectional_large_bucket_small_updates(c: &mut Criterion) {
     });
 }
 
+fn bench_crosssectional_frame_materialization(c: &mut Criterion) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("ret_1m", DataType::Float64, false),
+    ]));
+    let batch = crosssectional_batch(Arc::clone(&schema), 5_000, 0);
+    let mut group = c.benchmark_group("crosssectional_frame_materialization_5000_rows");
+
+    group.bench_function("append", |b| {
+        b.iter_batched(
+            || {
+                StreamTableMaterializer::new_with_row_capacity(
+                    "append_bench",
+                    Arc::clone(&schema),
+                    8_192,
+                )
+                .unwrap()
+            },
+            |mut materializer| {
+                materializer
+                    .on_data(SegmentTableView::from_record_batch(batch.clone()))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("complete_frame", |b| {
+        b.iter_batched(
+            || {
+                StreamTableMaterializer::new_with_row_capacity(
+                    "frame_bench",
+                    Arc::clone(&schema),
+                    8_192,
+                )
+                .unwrap()
+                .with_frame_per_batch(true)
+            },
+            |mut materializer| {
+                materializer
+                    .on_data(SegmentTableView::from_record_batch(batch.clone()))
+                    .unwrap()
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_crosssectional_pipeline,
-    bench_crosssectional_large_bucket_small_updates
+    bench_crosssectional_large_bucket_small_updates,
+    bench_crosssectional_frame_materialization,
 );
 criterion_main!(benches);

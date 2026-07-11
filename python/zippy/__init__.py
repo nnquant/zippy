@@ -30,6 +30,12 @@ _APPEND_TABLE_KIND = "append_table"
 _KEY_VALUE_TABLE_KIND = "key_value_table"
 _TABLE_SEMANTICS_FIELD = "zippy_table_semantics"
 _KEY_VALUE_SNAPSHOT_SEMANTICS = "key_value_snapshot"
+_FRAME_MODE_FIELD = "zippy_frame_mode"
+_FRAME_BY_FIELD = "zippy_frame_by"
+_FRAME_PROTOCOL_VERSION_FIELD = "zippy_frame_protocol_version"
+_SEGMENT_PER_BATCH_FRAME_MODE = "segment_per_batch"
+_FRAME_PROTOCOL_VERSION = 1
+_FRAME_SUBSCRIBER_READY_TIMEOUT_SEC = 5.0
 _LATEST_BY_FIELD = "zippy_latest_by"
 _KEY_VALUE_CHANGELOG_SUFFIX = ".__kv_changelog"
 _STREAM_TABLE_SHARD_SUFFIX_RE = re.compile(r"\.__shard_\d{4}$")
@@ -5886,8 +5892,17 @@ def _normalize_key_value_by(by: object, *, parameter: str = "by") -> list[str]:
     return fields
 
 
-def _append_table_descriptor_metadata() -> dict[str, object]:
-    return {_TABLE_KIND_FIELD: _APPEND_TABLE_KIND}
+def _append_table_descriptor_metadata(*, frame_by: str | None = None) -> dict[str, object]:
+    metadata: dict[str, object] = {_TABLE_KIND_FIELD: _APPEND_TABLE_KIND}
+    if frame_by is not None:
+        metadata.update(
+            {
+                _FRAME_MODE_FIELD: _SEGMENT_PER_BATCH_FRAME_MODE,
+                _FRAME_BY_FIELD: frame_by,
+                _FRAME_PROTOCOL_VERSION_FIELD: _FRAME_PROTOCOL_VERSION,
+            }
+        )
+    return metadata
 
 
 def _key_value_table_descriptor_metadata(
@@ -6875,6 +6890,98 @@ def subscribe_table(
     return subscriber.start()
 
 
+def subscribe_frames(
+    source: str,
+    callback,
+    master: MasterClient | None = None,
+    *,
+    poll_interval_ms: int = 1,
+    xfast: bool = False,
+    idle_spin_checks: int = 64,
+    wait: bool = False,
+    timeout: float | str | None = None,
+) -> StreamSubscriber:
+    """
+    Subscribe to complete cross-sectional frames using one Arrow callback per upstream bucket.
+
+    The source must be published with ``append_table(..., frame_by=...).publish()``. Each input
+    batch is committed atomically into one segment, so callback boundaries are semantic frame
+    boundaries rather than throughput batches. The subscription starts at the live tail; frames
+    produced while the subscriber is disconnected are not replayed automatically.
+
+    :param source: Named frame stream to subscribe to.
+    :type source: str
+    :param callback: Function called once with each complete ``pyarrow.Table`` frame.
+    :type callback: callable
+    :param master: Optional explicit master client. When omitted, ``zippy.connect()`` is used.
+    :type master: MasterClient | None
+    :param poll_interval_ms: Sleep interval when no complete frame is available.
+    :type poll_interval_ms: int
+    :param xfast: Spin instead of sleeping when no frame is available.
+    :type xfast: bool
+    :param idle_spin_checks: Short spin checks before entering mmap futex wait.
+    :type idle_spin_checks: int
+    :param wait: When true, wait until the frame stream is ready.
+    :type wait: bool
+    :param timeout: Optional maximum wait duration in seconds or a duration string.
+    :type timeout: float | str | None
+    :returns: Started subscriber handle.
+    :rtype: StreamSubscriber
+    :raises ValueError: If the stream does not declare the complete-frame protocol.
+    :raises NotImplementedError: If the selected data path is remote.
+    :raises TimeoutError: If the local segment reader does not become ready in time.
+    """
+    selected_master = master or _default_master()
+    if _remote_gateway_endpoint_for_data(selected_master) is not None:
+        raise NotImplementedError("subscribe_frames currently requires a local segment data path")
+    if wait:
+        _wait_for_table_ready(source, selected_master, timeout)
+    stream = _get_stream_status_or_full(selected_master, source)
+    frame_mode = _descriptor_metadata_value(stream, _FRAME_MODE_FIELD)
+    frame_version = _descriptor_metadata_value(stream, _FRAME_PROTOCOL_VERSION_FIELD)
+    frame_by = _descriptor_metadata_value(stream, _FRAME_BY_FIELD)
+    if frame_mode != _SEGMENT_PER_BATCH_FRAME_MODE:
+        raise ValueError(
+            "subscribe_frames requires append_table(..., frame_by=...).publish() "
+            f"source=[{source}]"
+        )
+    if frame_version != _FRAME_PROTOCOL_VERSION:
+        raise ValueError(
+            "unsupported frame protocol version " f"source=[{source}] version=[{frame_version}]"
+        )
+    if not isinstance(frame_by, str) or not frame_by:
+        raise ValueError(f"frame stream is missing frame_by metadata source=[{source}]")
+    _reject_logical_sharded_subscribe(
+        source,
+        selected_master,
+        wait=False,
+        timeout=timeout,
+    )
+    subscriber = subscribe_table(
+        source,
+        callback,
+        master=selected_master,
+        poll_interval_ms=poll_interval_ms,
+        xfast=xfast,
+        idle_spin_checks=idle_spin_checks,
+        wait=False,
+        timeout=timeout,
+        start_from=-1,
+    )
+    deadline = time.monotonic() + _FRAME_SUBSCRIBER_READY_TIMEOUT_SEC
+    while True:
+        metrics = subscriber.metrics()
+        if metrics.get("ready") is True:
+            return subscriber
+        if metrics.get("running") is not True:
+            subscriber.stop()
+            raise RuntimeError(f"frame subscriber stopped before ready source=[{source}]")
+        if time.monotonic() >= deadline:
+            subscriber.stop()
+            raise TimeoutError(f"frame subscriber did not become ready source=[{source}]")
+        time.sleep(0.001)
+
+
 class ParquetPersist:
     """
     Configure parquet persistence output for a stream table.
@@ -7811,6 +7918,19 @@ def _engine_latest_by(engine: object) -> list[str] | None:
     return [str(item) for item in by]
 
 
+def _validate_cross_section_frame_by(engine: object, frame_by: str) -> None:
+    config_fn = getattr(engine, "config", None)
+    config = config_fn() if callable(config_fn) else None
+    if not isinstance(config, dict) or config.get("engine_type") != "cross_sectional":
+        raise ValueError("frame_by is only supported for CrossSectionalEngine output")
+    dt_column = config.get("dt_column")
+    if frame_by != dt_column:
+        raise ValueError(
+            "frame_by must match CrossSectionalEngine dt_column "
+            f"frame_by=[{frame_by}] dt_column=[{dt_column}]"
+        )
+
+
 class _SessionSourceBinding:
     """
     Fluent binding for materializing an existing named table source.
@@ -7895,6 +8015,8 @@ class _SessionTablePublishBinding:
     :type name: str
     :param by: Optional key columns for key-value tables.
     :type by: list[str] | tuple[str, ...] | str | None
+    :param frame_by: Optional complete-frame bucket column for append tables.
+    :type frame_by: str | None
     :param source: Optional existing source table name.
     :type source: str | None
     """
@@ -7906,12 +8028,14 @@ class _SessionTablePublishBinding:
         table_kind: str,
         name: str,
         by: str | list[str] | tuple[str, ...] | None = None,
+        frame_by: str | None = None,
         source: str | None = None,
     ) -> None:
         self._session = session
         self._table_kind = table_kind
         self._name = name
         self._by = by
+        self._frame_by = frame_by
         self._source = source
 
     def publish(
@@ -7949,6 +8073,7 @@ class _SessionTablePublishBinding:
             return self._session._publish_append_table(
                 self._name,
                 persist=persist,
+                frame_by=self._frame_by,
                 method="append_table(...).publish()",
             )
         if self._table_kind == _KEY_VALUE_TABLE_KIND:
@@ -8290,7 +8415,13 @@ class Session:
             self._pending_output_tables[id(engine_obj)] = pending_output
         return self
 
-    def stream_table(self, name: str, *, persist: bool = False) -> "Session":
+    def stream_table(
+        self,
+        name: str,
+        *,
+        persist: bool = False,
+        frame_by: str | None = None,
+    ) -> "Session":
         """
         Materialize the latest engine output into a named table.
 
@@ -8301,6 +8432,8 @@ class Session:
         :type name: str
         :param persist: Whether to persist the stream table as parquet.
         :type persist: bool
+        :param frame_by: Cross-sectional bucket column preserved as one callback frame.
+        :type frame_by: str | None
         :returns: This session for fluent ``.stream_table(...).run()`` usage.
         :rtype: Session
         :raises RuntimeError: If no engine has been added.
@@ -8312,23 +8445,35 @@ class Session:
         engine = self._engines[-1]
         latest_by = _engine_latest_by(engine)
         if latest_by is not None:
+            if frame_by is not None:
+                raise ValueError("ReactiveLatestEngine output does not support frame_by")
             return self.key_value_table(name, by=latest_by).publish(persist=persist)
-        return self.append_table(name).publish(persist=persist)
+        return self.append_table(name, frame_by=frame_by).publish(persist=persist)
 
-    def append_table(self, name: str) -> _SessionTablePublishBinding:
+    def append_table(
+        self,
+        name: str,
+        *,
+        frame_by: str | None = None,
+    ) -> _SessionTablePublishBinding:
         """
         Configure the latest engine output as an append stream table.
 
         :param name: Output append stream table name.
         :type name: str
+        :param frame_by: Cross-sectional bucket column preserved as one callback frame.
+        :type frame_by: str | None
         :returns: Publish binding. Call ``.publish(persist=True|False)`` to materialize it.
         :rtype: _SessionTablePublishBinding
         """
         self._validate_publish_table_name(name, method="append_table")
+        if frame_by is not None and (not isinstance(frame_by, str) or not frame_by):
+            raise ValueError("append_table frame_by must be a non-empty string")
         return _SessionTablePublishBinding(
             self,
             table_kind=_APPEND_TABLE_KIND,
             name=name,
+            frame_by=frame_by,
         )
 
     def key_value_table(
@@ -8382,6 +8527,7 @@ class Session:
         name: str,
         *,
         persist: bool = False,
+        frame_by: str | None = None,
         method: str = "publish_append_table()",
     ) -> "Session":
         """
@@ -8391,6 +8537,8 @@ class Session:
         :type name: str
         :param persist: Whether to persist the append table as parquet.
         :type persist: bool
+        :param frame_by: Cross-sectional bucket column preserved as one callback frame.
+        :type frame_by: str | None
         :returns: This session for fluent ``.publish_append_table(...).run()`` usage.
         :rtype: Session
         :raises RuntimeError: If no engine has been added.
@@ -8405,6 +8553,8 @@ class Session:
         engine = self._engines[-1]
         if _engine_latest_by(engine) is not None:
             raise ValueError("ReactiveLatestEngine output cannot publish append_table")
+        if frame_by is not None:
+            _validate_cross_section_frame_by(engine, frame_by)
         engine_id = id(engine)
         if engine_id in self._materialized_engine_ids:
             raise ValueError("latest engine output is already materialized")
@@ -8415,6 +8565,7 @@ class Session:
             name,
             persist=persist,
             table_kind=_APPEND_TABLE_KIND,
+            frame_by=frame_by,
         )
         return self
 
@@ -8959,6 +9110,7 @@ class Session:
         persist: bool,
         table_kind: str | None = None,
         key_fields: list[str] | None = None,
+        frame_by: str | None = None,
     ) -> None:
         materializers = self._materialize_engine_output(
             engine,
@@ -8966,6 +9118,7 @@ class Session:
             persist=persist,
             table_kind=table_kind,
             key_fields=key_fields,
+            frame_by=frame_by,
         )
         engine_index = self._runtime_engines.index(engine)
         for offset, materializer in enumerate(materializers):
@@ -8980,6 +9133,7 @@ class Session:
         persist: bool,
         table_kind: str | None = None,
         key_fields: list[str] | None = None,
+        frame_by: str | None = None,
     ) -> list[object]:
         output_schema = engine.output_schema()
         table_options = _resolve_stream_table_options(
@@ -9001,6 +9155,10 @@ class Session:
             raise ValueError(f"unsupported table kind table_kind=[{table_kind}]")
         if table_kind == _APPEND_TABLE_KIND and latest_by is not None:
             raise ValueError("ReactiveLatestEngine output cannot publish append_table")
+        if frame_by is not None:
+            if table_kind != _APPEND_TABLE_KIND:
+                raise ValueError("frame_by is only supported by append_table")
+            _validate_cross_section_frame_by(engine, frame_by)
         if table_kind == _KEY_VALUE_TABLE_KIND:
             key_fields = _normalize_key_value_by(
                 key_fields if key_fields is not None else latest_by
@@ -9008,7 +9166,9 @@ class Session:
         if table_kind == _KEY_VALUE_TABLE_KIND and table_options["persist_path"] is not None:
             raise ValueError("key_value_table does not support persist=True")
 
-        descriptor_metadata: dict[str, object] = _append_table_descriptor_metadata()
+        descriptor_metadata: dict[str, object] = _append_table_descriptor_metadata(
+            frame_by=frame_by
+        )
         changelog_stream_name = None
         if table_kind == _KEY_VALUE_TABLE_KIND:
             assert key_fields is not None
@@ -9085,7 +9245,7 @@ class Session:
                     ),
                 )
             else:
-                materializer = _StreamTableMaterializer(
+                materializer_kwargs = dict(
                     name=table_name,
                     input_schema=output_schema,
                     source=engine,
@@ -9108,6 +9268,9 @@ class Session:
                         else None
                     ),
                 )
+                if frame_by is not None:
+                    materializer_kwargs["frame_per_batch"] = True
+                materializer = _StreamTableMaterializer(**materializer_kwargs)
             self.master.publish_segment_descriptor(
                 table_name,
                 _annotate_table_descriptor(
@@ -10718,6 +10881,7 @@ __all__ = [
     "replay",
     "raise_if_failed",
     "subscribe",
+    "subscribe_frames",
     "subscribe_table",
     "wait_healthy",
     "version",

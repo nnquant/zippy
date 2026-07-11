@@ -3,7 +3,7 @@ import inspect
 import json
 import importlib.util
 import tomllib
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import os
 from pathlib import Path
 import signal
@@ -986,6 +986,117 @@ def test_session_append_table_publish_sets_append_table_kind(monkeypatch) -> Non
         "factor_events",
         {"zippy_table_kind": "append_table"},
     )
+
+
+def test_session_cross_section_append_table_publish_sets_complete_frame_protocol(
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_rank", pa.float64()),
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self.source_config: dict[str, object] = {}
+            self.descriptor: dict[str, object] = {}
+
+        def process_id(self) -> str:
+            return "proc_test"
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "table": {
+                    "row_capacity": 16,
+                    "retention_segments": None,
+                    "persist": {"enabled": False, "partition": {}},
+                }
+            }
+
+        def register_stream(self, *args) -> None:
+            return None
+
+        def register_source(self, source_name, source_type, output_stream, config) -> None:
+            self.source_config = config
+
+        def publish_segment_descriptor(self, stream_name, descriptor) -> None:
+            self.descriptor = descriptor
+
+        def get_stream_status(self, stream_name: str) -> dict[str, object]:
+            return {"writer_epoch": 1}
+
+        def get_stream(self, stream_name: str) -> dict[str, object]:
+            return {"segment_reader_leases": []}
+
+    class FakeCrossSectionalEngine:
+        def output_schema(self) -> pa.Schema:
+            return schema
+
+        def config(self) -> dict[str, object]:
+            return {"engine_type": "cross_sectional", "dt_column": "dt"}
+
+        def status(self) -> str:
+            return "created"
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    class CapturingStreamTableMaterializer:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def active_descriptor(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_StreamTableMaterializer", CapturingStreamTableMaterializer)
+    master = FakeMaster()
+
+    zippy.Session(name="cross_section_session", master=master).engine(
+        FakeCrossSectionalEngine()
+    ).append_table("cross_section_frames", frame_by="dt").publish()
+
+    expected_metadata = {
+        "zippy_table_kind": "append_table",
+        "zippy_frame_mode": "segment_per_batch",
+        "zippy_frame_by": "dt",
+        "zippy_frame_protocol_version": 1,
+    }
+    assert captured["frame_per_batch"] is True
+    assert all(master.source_config[key] == value for key, value in expected_metadata.items())
+    assert master.descriptor == expected_metadata
+
+
+def test_session_cross_section_frame_by_must_match_engine_dt_column() -> None:
+    schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+    engine = zippy.CrossSectionalEngine(
+        name="cs_frame_validation",
+        input_schema=schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        target=zippy.NullPublisher(),
+    )
+    session = zippy.Session(name="cross_section_session", master=zippy.MasterClient()).engine(
+        engine
+    )
+
+    with pytest.raises(ValueError, match="frame_by must match"):
+        session.append_table("cross_section_frames", frame_by="wrong_dt").publish()
 
 
 def test_session_append_table_publish_uses_stream_status_for_writer_epoch(
@@ -5207,6 +5318,101 @@ def test_cross_sectional_engine_emits_bucketed_output_over_zmq() -> None:
     subscriber.close()
 
 
+def test_cross_sectional_frame_subscription_delivers_rapid_buckets_without_fragmentation(
+    tmp_path: Path,
+) -> None:
+    server, control_endpoint = start_master_server(tmp_path)
+    master = zippy.MasterClient(control_endpoint=control_endpoint)
+    input_schema = pa.schema(
+        [
+            ("symbol", pa.string()),
+            ("dt", pa.timestamp("ns", tz="UTC")),
+            ("ret_1m", pa.float64()),
+        ]
+    )
+    engine = zippy.CrossSectionalEngine(
+        name="cs_frame_e2e",
+        input_schema=input_schema,
+        id_column="symbol",
+        dt_column="dt",
+        trigger_interval=zippy.Duration.minutes(1),
+        late_data_policy=zippy.LateDataPolicy.REJECT,
+        factors=[zippy.CS_RANK(column="ret_1m", output="ret_rank")],
+        target=zippy.NullPublisher(),
+    )
+    session = (
+        zippy.Session(name="cs_frame_e2e_session", master=master)
+        .engine(engine)
+        .append_table("cs_frame_e2e_output", frame_by="dt")
+        .publish()
+        .start()
+    )
+    frames: list[pa.Table] = []
+    received = threading.Event()
+
+    def on_frame(table: pa.Table) -> None:
+        frames.append(table)
+        if len(frames) >= 5:
+            received.set()
+        time.sleep(0.03)
+
+    subscriber = None
+    try:
+        subscriber = zippy.subscribe_frames(
+            "cs_frame_e2e_output",
+            on_frame,
+            master=master,
+            poll_interval_ms=1,
+        )
+        assert subscriber.metrics()["ready"] is True
+        assert subscriber.metrics()["current_segment_id"] != 0
+        initial_descriptor_generation = master.get_stream_status("cs_frame_e2e_output")[
+            "descriptor_generation"
+        ]
+
+        bucket_start = datetime(2026, 4, 2, 9, 30, tzinfo=timezone.utc)
+        for bucket_index in range(5):
+            timestamp = bucket_start + timedelta(minutes=bucket_index, seconds=1)
+            engine.write(
+                {
+                    "symbol": ["C", "A", "B"],
+                    "dt": [timestamp, timestamp, timestamp],
+                    "ret_1m": [3.0, 1.0, 2.0],
+                }
+            )
+            engine.flush()
+
+        descriptor_deadline = time.time() + 5.0
+        descriptor_generation = initial_descriptor_generation
+        while descriptor_generation < initial_descriptor_generation + 5:
+            if time.time() >= descriptor_deadline:
+                break
+            descriptor_generation = master.get_stream_status("cs_frame_e2e_output")[
+                "descriptor_generation"
+            ]
+            time.sleep(0.01)
+        assert descriptor_generation >= initial_descriptor_generation + 5
+        assert received.wait(timeout=5.0), {
+            "frames_received": len(frames),
+            "frame_dts": [frame.column("dt")[0].as_py() for frame in frames],
+            "subscriber_metrics": json.dumps(subscriber.metrics(), sort_keys=True),
+            "descriptor_generation": descriptor_generation,
+            "initial_descriptor_generation": initial_descriptor_generation,
+        }
+        assert len(frames) == 5
+        for bucket_index, frame in enumerate(frames):
+            expected_dt = bucket_start + timedelta(minutes=bucket_index)
+            assert frame.num_rows == 3
+            assert frame.column("symbol").to_pylist() == ["A", "B", "C"]
+            assert frame.column("dt").to_pylist() == [expected_dt] * 3
+            assert frame.column("ret_rank").to_pylist() == pytest.approx([1.0, 2.0, 3.0])
+    finally:
+        if subscriber is not None:
+            subscriber.stop()
+        session.stop()
+        server.stop()
+
+
 def test_cross_sectional_engine_config_exposes_runtime_xfast() -> None:
     input_schema = pa.schema(
         [
@@ -7001,6 +7207,72 @@ def test_subscribe_table_waits_for_late_producer_stream(tmp_path: Path) -> None:
         if pipeline is not None:
             pipeline.stop()
         server.stop()
+
+
+def test_subscribe_frames_requires_protocol_metadata_and_delegates_to_tail_table_subscribe(
+    monkeypatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeMaster:
+        def get_stream_status(self, source: str) -> dict[str, object]:
+            return {
+                "stream_name": source,
+                "zippy_table_kind": "append_table",
+                "zippy_frame_mode": "segment_per_batch",
+                "zippy_frame_by": "dt",
+                "zippy_frame_protocol_version": 1,
+            }
+
+    class FakeSubscriber:
+        def metrics(self) -> dict[str, object]:
+            return {"ready": True, "running": True}
+
+    expected_subscriber = FakeSubscriber()
+
+    def fake_subscribe_table(source, callback, master=None, **kwargs):
+        seen.update(
+            {
+                "source": source,
+                "callback": callback,
+                "master": master,
+                **kwargs,
+            }
+        )
+        return expected_subscriber
+
+    def callback(table) -> None:
+        return None
+
+    monkeypatch.setattr(zippy, "subscribe_table", fake_subscribe_table)
+    master = FakeMaster()
+
+    subscriber = zippy.subscribe_frames(
+        "cross_section_frames",
+        callback,
+        master=master,
+        poll_interval_ms=2,
+    )
+
+    assert subscriber is expected_subscriber
+    assert seen["source"] == "cross_section_frames"
+    assert seen["callback"] is callback
+    assert seen["master"] is master
+    assert seen["poll_interval_ms"] == 2
+    assert seen["start_from"] == -1
+
+
+def test_subscribe_frames_rejects_plain_append_stream() -> None:
+    class FakeMaster:
+        def get_stream_status(self, source: str) -> dict[str, object]:
+            return {"stream_name": source, "zippy_table_kind": "append_table"}
+
+    with pytest.raises(ValueError, match=r"append_table\(\.\.\., frame_by="):
+        zippy.subscribe_frames(
+            "factor_events",
+            lambda table: None,
+            master=FakeMaster(),
+        )
 
 
 @pytest.mark.parametrize("table_callback", [False, True])

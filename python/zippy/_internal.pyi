@@ -483,6 +483,7 @@ class StreamTableMaterializer:
         persist_path: str | None = None,
         persist_publisher: object | None = None,
         descriptor_forwarding: bool = False,
+        frame_per_batch: bool = False,
         shard_key: list[str] | None = None,
         shard_nums: int | None = None,
         shard_version: int | None = None,
