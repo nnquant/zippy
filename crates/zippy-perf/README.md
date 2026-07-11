@@ -197,6 +197,12 @@ cargo run -p zippy-perf --release -- stream-table-segment-copy \
 - remote profile 的 source metrics
 - pass/fail
 
+`actual_peak_rows_per_sec` 取以 `steady_start` 为 origin 的绝对半开 1 秒桶
+`[steady_start + n s, steady_start + (n + 1) s)` 中的最大行数，不是滑动窗口。观测跨桶时，
+先结算旧桶，再把当前观测计入其所属桶。
+
+`metadata.started_at_unix_ms` 在 config 校验成功后、profile dispatch 和耗时工作开始前捕获。
+
 定时/手动 workflow 使用 `if: always()` 上传已经生成的 JSON。尾延迟等阈值不通过时，CLI
 会先写报告再以 exit code `2` 退出，因此对应 JSON 可以保留；consumer timeout、计数不一致等
 profile 执行错误会在报告构造前以 exit code `1` 退出，只能从 workflow log 排查，不会产生可上传的
