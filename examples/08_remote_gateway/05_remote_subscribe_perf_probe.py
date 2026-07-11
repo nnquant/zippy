@@ -19,7 +19,12 @@ from __future__ import annotations
 import argparse
 import json
 
-from zippy.remote_gateway_perf import run_remote_subscribe_perf_probe
+from zippy.remote_gateway_perf import (
+    build_subscribe_perf_report,
+    run_remote_subscribe_perf_probe,
+)
+
+build_probe_report = build_subscribe_perf_report
 
 
 def run_probe(args: argparse.Namespace) -> dict[str, object]:
