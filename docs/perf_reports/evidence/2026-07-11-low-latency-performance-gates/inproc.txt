@@ -1,8 +1,8 @@
-2026-07-11T03:34:09.010381637Z  INFO performance profile started component=[perf] event=[profile_start] profile=[InprocTimeseries]
-2026-07-11T03:34:09.011077961Z  INFO engine started component=[runtime] engine=[InprocTimeseries] event=[start] status=[running]
-2026-07-11T03:34:12.985898142Z  INFO engine stopped component=[runtime] engine=[InprocTimeseries] event=[stop] batch_rows=[0]
+2026-07-11T04:20:37.156553216Z  INFO performance profile started component=[perf] event=[profile_start] profile=[InprocTimeseries]
+2026-07-11T04:20:37.158137375Z  INFO engine started component=[runtime] engine=[InprocTimeseries] event=[start] status=[running]
+2026-07-11T04:20:41.133075101Z  INFO engine stopped component=[runtime] engine=[InprocTimeseries] event=[stop] batch_rows=[0]
 profile=InprocTimeseries
-git_sha=e7da98ad1374
+git_sha=586722652977
 target=linux-x86_64
 pass=true
 engine_status=stopped
@@ -11,5 +11,5 @@ output_rows_total=401408
 actual_average_rows_per_sec=99669.33
 actual_peak_rows_per_sec=102400.00
 batches_per_sec=24.33
-latency_micros[count=73, p50=26.00, p95=32.00, p99=39.00, max=39.00]
-2026-07-11T03:34:12.987602886Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[InprocTimeseries] pass=[true]
+latency_micros[count=73, p50=27.00, p95=36.00, p99=42.00, max=45.00]
+2026-07-11T04:20:41.133960695Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[InprocTimeseries] pass=[true]

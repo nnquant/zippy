@@ -1,6 +1,6 @@
-2026-07-11T03:33:35.750617751Z  INFO performance profile started component=[perf] event=[profile_start] profile=[WriteToSubscribeE2e]
+2026-07-11T04:19:28.692546343Z  INFO performance profile started component=[perf] event=[profile_start] profile=[WriteToSubscribeE2e]
 profile=WriteToSubscribeE2e
-git_sha=e7da98ad1374
+git_sha=586722652977
 target=linux-x86_64
 pass=true
 engine_status=stopped
@@ -9,5 +9,5 @@ output_rows_total=2400
 actual_average_rows_per_sec=200.00
 actual_peak_rows_per_sec=200.00
 batches_per_sec=200.00
-latency_micros[count=2000, p50=46.00, p95=70.00, p99=88.00, max=165.00]
-2026-07-11T03:33:47.747018998Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[WriteToSubscribeE2e] pass=[true]
+latency_micros[count=2000, p50=46.00, p95=76.00, p99=96.00, max=202.00]
+2026-07-11T04:19:40.689110302Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[WriteToSubscribeE2e] pass=[true]

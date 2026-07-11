@@ -9,9 +9,13 @@ drain-inclusive throughput 的新发布基线。
 
 - Phase 2 基础代码 commit：`3ff850ade14dcbfbe9b636db94a9832aded20a87`
 - 实施计划与 Task0 证据 commit：`ae25e1f4a6cdf14bc9f00f03be794dbbd2b7b4d3`
-- 最终性能代码与说明 HEAD：`e7da98ad1374761193e76b14f595f41e60e163bf`
+- benchmarked 最终代码与 README HEAD：`586722652977dfba0e3970287db6c9c9c83ff4b2`
 - half-open engine window commit：`ff3fce43b7632d22c3f84a2dfc073fbc2f52df2a`
 - full-window throughput denominator commit：`a015bf43fa650cc00ac64cd3c8915fdfeb4f719d`
+- absolute peak bucket fix commit：`b9657f61afd4545615987d05ffb87c6b6bf647c1`
+- profile-start metadata fix commit：`d6fe40f121161e3bf688b01c9b05141bee702095`
+- metadata validation tests commit：`f201bb1e252dea78b5bdc8c12d49c6952c446736`
+- final metric semantics docs commit：`586722652977dfba0e3970287db6c9c9c83ff4b2`
 - target：`linux-x86_64`
 
 版本化审计来源：
@@ -33,10 +37,10 @@ drain-inclusive throughput 的新发布基线。
 | --- | --- |
 | `before.json` | `11b2b06647c889bec614586b58760742d9d1d9a561df1bd51fa4be39cccd2f19` |
 | `before.txt` | `50fd10ac31b4681dcaea75e1a072e1c9ec32290affe11be3591db4e12596deaf` |
-| `consumer-after.json` | `ca36fcd4fda114190f9fff00125a3df3eba7f102f65fd80f97a06ff6eb4c62f2` |
-| `consumer-after.txt` | `7636b4d04a99b8c9d001827c681e869d1a6ec9769661c6c452f7de3f7970e1d4` |
-| `inproc.json` | `e4a103ee50a4713e6decc05b738c14d8d8ff33b30ed61249f2ff71819cc12c3f` |
-| `inproc.txt` | `7dbc99b104b88dc3f0ec0910405c51b0978ee042a20a28d410e8e6600f93b978` |
+| `consumer-after.json` | `3eca3e6667165dff15b342a6d228141efd2c043a02603f6b078834e19ac516a2` |
+| `consumer-after.txt` | `26587adefb59b39d7ec90d514b4165ba823a89185dbe0f2eee8534b0bd24203b` |
+| `inproc.json` | `21b7c5f35985d0c9d9310d906418162326de86acc783787108b9a7c7a15348d7` |
+| `inproc.txt` | `551391bdcd45c89cfbe6730806a61c83e9d974b714601617244feb3dd76e25b5` |
 | `environment.md` | `0390fa94080b0d5c663b43409ebac7e81a11f1dcf832eed29c41004adb449836` |
 
 ## 旧同步基线
@@ -117,9 +121,9 @@ TMPDIR=/dev/shm cargo run -p zippy-perf --release -- \
 保存的完整 stdout（版本化副本 [consumer-after.txt](evidence/2026-07-11-low-latency-performance-gates/consumer-after.txt)）：
 
 ```text
-2026-07-11T03:33:35.750617751Z  INFO performance profile started component=[perf] event=[profile_start] profile=[WriteToSubscribeE2e]
+2026-07-11T04:19:28.692546343Z  INFO performance profile started component=[perf] event=[profile_start] profile=[WriteToSubscribeE2e]
 profile=WriteToSubscribeE2e
-git_sha=e7da98ad1374
+git_sha=586722652977
 target=linux-x86_64
 pass=true
 engine_status=stopped
@@ -128,8 +132,8 @@ output_rows_total=2400
 actual_average_rows_per_sec=200.00
 actual_peak_rows_per_sec=200.00
 batches_per_sec=200.00
-latency_micros[count=2000, p50=46.00, p95=70.00, p99=88.00, max=165.00]
-2026-07-11T03:33:47.747018998Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[WriteToSubscribeE2e] pass=[true]
+latency_micros[count=2000, p50=46.00, p95=76.00, p99=96.00, max=202.00]
+2026-07-11T04:19:40.689110302Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[WriteToSubscribeE2e] pass=[true]
 ```
 
 新 JSON 精确值（版本化副本 [consumer-after.json](evidence/2026-07-11-low-latency-performance-gates/consumer-after.json)）：
@@ -137,6 +141,7 @@ latency_micros[count=2000, p50=46.00, p95=70.00, p99=88.00, max=165.00]
 | 字段 | 值 |
 | --- | ---: |
 | `pass` | `true` |
+| `metadata.started_at_unix_ms` | `1783743568693` |
 | `input_rows_total` | `2400` |
 | `output_rows_total` | `2400` |
 | `engine_metrics.processed_rows_total` | `2400` |
@@ -145,9 +150,9 @@ latency_micros[count=2000, p50=46.00, p95=70.00, p99=88.00, max=165.00]
 | `batches_per_sec` | `200.0` |
 | `latency.sample_count` | `2000` |
 | `latency.p50_micros` | `46.0` |
-| `latency.p95_micros` | `70.0` |
-| `latency.p99_micros` | `88.0` |
-| `latency.max_micros` | `165.0` |
+| `latency.p95_micros` | `76.0` |
+| `latency.p99_micros` | `96.0` |
+| `latency.max_micros` | `202.0` |
 
 由于系统没有 `jq`，本轮使用 Python 标准库对 JSON 做同等严格断言：
 
@@ -156,7 +161,9 @@ python3 -c "import json; d=json.load(open('docs/perf_reports/evidence/2026-07-11
 ```
 
 结果：退出码为 0，`input == output == processed == 2400`，样本数为 `2000`，
-并且 `max 165.0us >= p99 88.0us`。
+并且 `max 202.0us >= p99 96.0us`。`metadata.started_at_unix_ms` 对应
+`2026-07-11T04:19:28.693Z`，与 stdout profile start 相差约 `0.454ms`；profile
+finish 在其后约 `11.996s`，因此该字段记录启动点而非结束点。
 
 ## In-Process Drain 检查
 
@@ -177,11 +184,11 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
 保存的完整 stdout（版本化副本 [inproc.txt](evidence/2026-07-11-low-latency-performance-gates/inproc.txt)）：
 
 ```text
-2026-07-11T03:34:09.010381637Z  INFO performance profile started component=[perf] event=[profile_start] profile=[InprocTimeseries]
-2026-07-11T03:34:09.011077961Z  INFO engine started component=[runtime] engine=[InprocTimeseries] event=[start] status=[running]
-2026-07-11T03:34:12.985898142Z  INFO engine stopped component=[runtime] engine=[InprocTimeseries] event=[stop] batch_rows=[0]
+2026-07-11T04:20:37.156553216Z  INFO performance profile started component=[perf] event=[profile_start] profile=[InprocTimeseries]
+2026-07-11T04:20:37.158137375Z  INFO engine started component=[runtime] engine=[InprocTimeseries] event=[start] status=[running]
+2026-07-11T04:20:41.133075101Z  INFO engine stopped component=[runtime] engine=[InprocTimeseries] event=[stop] batch_rows=[0]
 profile=InprocTimeseries
-git_sha=e7da98ad1374
+git_sha=586722652977
 target=linux-x86_64
 pass=true
 engine_status=stopped
@@ -190,8 +197,8 @@ output_rows_total=401408
 actual_average_rows_per_sec=99669.33
 actual_peak_rows_per_sec=102400.00
 batches_per_sec=24.33
-latency_micros[count=73, p50=26.00, p95=32.00, p99=39.00, max=39.00]
-2026-07-11T03:34:12.987602886Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[InprocTimeseries] pass=[true]
+latency_micros[count=73, p50=27.00, p95=36.00, p99=42.00, max=45.00]
+2026-07-11T04:20:41.133960695Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[InprocTimeseries] pass=[true]
 ```
 
 in-process JSON 精确值（版本化副本 [inproc.json](evidence/2026-07-11-low-latency-performance-gates/inproc.json)）：
@@ -199,6 +206,7 @@ in-process JSON 精确值（版本化副本 [inproc.json](evidence/2026-07-11-lo
 | 字段 | 值 |
 | --- | ---: |
 | `pass` | `true` |
+| `metadata.started_at_unix_ms` | `1783743637157` |
 | accepted rows (`input_rows_total`) | `401408` |
 | processed rows (`engine_metrics.processed_rows_total`) | `401408` |
 | steady accepted rows | `299008` |
@@ -211,6 +219,11 @@ in-process JSON 精确值（版本化副本 [inproc.json](evidence/2026-07-11-lo
 | `engine_metrics.processed_batches_total` | `98` |
 | `engine_metrics.output_batches_total` | `99` |
 | `batches_per_sec` | `24.333333333333332` |
+| `latency.sample_count` | `73` |
+| `latency.p50_micros` | `27.0` |
+| `latency.p95_micros` | `36.0` |
+| `latency.p99_micros` | `42.0` |
+| `latency.max_micros` | `45.0` |
 
 本 profile 的 rational deadline 为 `batch_index * 4096 / 100000` 秒，总窗口是
 `warmup 1s + steady 3s = 4s`，接收区间为严格半开 `[0s, 4s)`。index 97 的
@@ -227,6 +240,11 @@ elapsed = 299008 / 99669.33333333333 = 3.0s
 batches_per_sec = 73 / 3.0 = 24.333333333333332
 ```
 
+`actual_peak_rows_per_sec=102400.0` 是以 `steady_start` 为 origin 的绝对半开
+1 秒桶最大行数，不是滑动窗口。跨桶时先结算旧桶，再把当前 batch 计入其所属桶，
+避免把边界后的 batch 错算进前一个桶。consumer profile 同样使用该定义，本轮 peak
+为 `200.0 rows/s`。
+
 这里的 `engine_metrics.processed_batches_total=98` 是 warmup 加 steady 全窗口输入批，
 而 `engine_metrics.output_batches_total=99` 包含 flush 输出。两者都不是 steady 批数，
 不能直接用来推导上述 steady `batches_per_sec`。
@@ -237,13 +255,18 @@ effective elapsed 为 `3.0s`，不小于配置 steady `3s`，
 `handle.write()` 返回后读取一次队列快照；它可能漏掉两次快照之间的瞬时峰值。
 因此 `max >= final` 只是结构不变量，不证明真实运行峰值只有 `1`。
 
+inproc `metadata.started_at_unix_ms=1783743637157` 对应
+`2026-07-11T04:20:37.157Z`，与 stdout profile start 相差约 `0.447ms`；profile
+finish 在其后约 `3.977s`。corrected metadata 在 config 验证成功后、profile dispatch
+和耗时工作开始前捕获；历史同步 before 证据保留原始实现与原始字段值，不做回填。
+
 ## 验证结果
 
-在最终 HEAD `e7da98ad1374761193e76b14f595f41e60e163bf` 上运行：
+在 benchmarked HEAD `586722652977dfba0e3970287db6c9c9c83ff4b2` 上运行：
 
 | 命令 | 结果 |
 | --- | --- |
-| `cargo test -p zippy-perf --lib` | 通过，42 passed，0 failed |
+| `cargo test -p zippy-perf --lib` | 通过，50 passed，0 failed |
 | `cargo fmt --check` | 通过，退出码 0 |
 | `cargo clippy -p zippy-perf --all-targets -- -D warnings` | 通过，退出码 0 |
 | `git diff --check` | 通过，退出码 0 |
@@ -257,7 +280,7 @@ effective elapsed 为 `3.0s`，不小于配置 steady `3s`，
 旧 profile 在 producer 线程内同步执行 `commit -> read_available()`，不包含 futex
 阻塞 consumer 的唤醒与调度路径。新 profile 使用独立阻塞 consumer，并在 consumer
 真实观察到 row 后记录延迟。因此旧同步分布 `11/17/24us` 与新 consumer-boundary
-分布 `46/70/88us` 不能做数值横向比较；它们共同证明测量边界已改变。新
+分布 `46/76/96us` 不能做数值横向比较；它们共同证明测量边界已改变。新
 consumer-boundary 序列从本报告开始成为后续回归的新 baseline。
 
 workflow 使用的 `p95 <= 1000us`、`p99 <= 5000us` 是 shared-runner 回归阈值，

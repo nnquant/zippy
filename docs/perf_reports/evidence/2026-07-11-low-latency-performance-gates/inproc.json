@@ -15,9 +15,9 @@
     "max_queue_depth": null
   },
   "metadata": {
-    "git_sha": "e7da98ad1374",
+    "git_sha": "586722652977",
     "target": "linux-x86_64",
-    "started_at_unix_ms": 1783740852987
+    "started_at_unix_ms": 1783743637157
   },
   "input_rows_total": 401408,
   "output_rows_total": 401408,
@@ -26,10 +26,10 @@
   "batches_per_sec": 24.333333333333332,
   "latency": {
     "sample_count": 73,
-    "p50_micros": 26.0,
-    "p95_micros": 32.0,
-    "p99_micros": 39.0,
-    "max_micros": 39.0
+    "p50_micros": 27.0,
+    "p95_micros": 36.0,
+    "p99_micros": 42.0,
+    "max_micros": 45.0
   },
   "secondary_latency": null,
   "engine_status": "stopped",
