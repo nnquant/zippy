@@ -1298,6 +1298,51 @@ struct DriveStats {
     secondary_latencies_micros: Vec<u64>,
 }
 
+struct RowPeakTracker {
+    origin: Instant,
+    current_bucket_index: u64,
+    current_bucket_rows: u64,
+    peak_rows: u64,
+}
+
+impl RowPeakTracker {
+    fn new(origin: Instant) -> Self {
+        Self {
+            origin,
+            current_bucket_index: 0,
+            current_bucket_rows: 0,
+            peak_rows: 0,
+        }
+    }
+
+    fn record(&mut self, observed_at: Instant, rows: u64) -> PerfResult<()> {
+        let observed_bucket = observed_at
+            .checked_duration_since(self.origin)
+            .ok_or_else(|| "row peak observation predates origin".to_string())?
+            .as_secs();
+        if observed_bucket < self.current_bucket_index {
+            return Err(format!(
+                "row peak tracker received out-of-order bucket current=[{}] observed=[{}]",
+                self.current_bucket_index, observed_bucket
+            ));
+        }
+        if observed_bucket > self.current_bucket_index {
+            self.peak_rows = self.peak_rows.max(self.current_bucket_rows);
+            self.current_bucket_index = observed_bucket;
+            self.current_bucket_rows = 0;
+        }
+        self.current_bucket_rows = self
+            .current_bucket_rows
+            .checked_add(rows)
+            .ok_or_else(|| "row peak bucket row count overflowed".to_string())?;
+        Ok(())
+    }
+
+    fn finish(self) -> u64 {
+        self.peak_rows.max(self.current_bucket_rows)
+    }
+}
+
 struct EngineDriveStats {
     input_rows_total: u64,
     steady_rows_total: u64,
@@ -1446,10 +1491,8 @@ where
     let mut input_rows_total = 0_u64;
     let mut steady_rows_total = 0_u64;
     let mut steady_batches_total = 0_u64;
-    let mut peak_rows_per_sec = 0_f64;
+    let mut peak_tracker = RowPeakTracker::new(steady_started_at);
     let mut batch_latencies_micros = Vec::new();
-    let mut second_window_start = steady_started_at;
-    let mut second_window_rows = 0_u64;
     let mut max_observed_queue_depth = 0;
     let mut write_completion_clock = Instant::now;
 
@@ -1488,19 +1531,14 @@ where
         if measured {
             steady_rows_total += config.rows_per_batch as u64;
             steady_batches_total += 1;
-            second_window_rows += config.rows_per_batch as u64;
-            while batch_start >= second_window_start + Duration::from_secs(1) {
-                peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
-                second_window_rows = 0;
-                second_window_start += Duration::from_secs(1);
-            }
+            peak_tracker.record(batch_start, config.rows_per_batch as u64)?;
         }
         batch_index = batch_index
             .checked_add(1)
             .ok_or_else(|| "engine drive batch index overflowed".to_string())?;
     }
 
-    peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+    let peak_rows_per_sec = peak_tracker.finish() as f64;
 
     Ok(EngineDriveStats {
         input_rows_total,
@@ -1535,10 +1573,8 @@ where
     let mut next_tick = start;
     let mut input_rows_total = 0_u64;
     let mut steady_rows_total = 0_u64;
-    let mut peak_rows_per_sec = 0_f64;
+    let mut peak_tracker = RowPeakTracker::new(warmup_end);
     let mut batch_latencies_micros = Vec::new();
-    let mut second_window_start = warmup_end;
-    let mut second_window_rows = 0_u64;
 
     while Instant::now() < end {
         let now = Instant::now();
@@ -1552,12 +1588,7 @@ where
         if batch_start >= warmup_end {
             steady_rows_total += config.rows_per_batch as u64;
             batch_latencies_micros.push(send_elapsed.as_micros() as u64);
-            second_window_rows += config.rows_per_batch as u64;
-            while batch_start >= second_window_start + Duration::from_secs(1) {
-                peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
-                second_window_rows = 0;
-                second_window_start += Duration::from_secs(1);
-            }
+            peak_tracker.record(batch_start, config.rows_per_batch as u64)?;
         }
         next_tick += batch_interval;
         if Instant::now() - start >= total_duration {
@@ -1565,7 +1596,7 @@ where
         }
     }
 
-    peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+    let peak_rows_per_sec = peak_tracker.finish() as f64;
     let actual_average_rows_per_sec = steady_rows_total as f64 / steady_duration.as_secs_f64();
 
     Ok(DriveStats {
@@ -2247,11 +2278,9 @@ fn drive_stream_table_to_reader(
     let mut next_tick = start;
     let mut input_rows_total = 0_u64;
     let mut steady_rows_total = 0_u64;
-    let mut peak_rows_per_sec = 0_f64;
+    let mut peak_tracker = RowPeakTracker::new(warmup_end);
     let mut batch_latencies_micros = Vec::new();
     let mut secondary_latencies_micros = Vec::new();
-    let mut second_window_start = warmup_end;
-    let mut second_window_rows = 0_u64;
 
     while Instant::now() < end {
         let now = Instant::now();
@@ -2275,12 +2304,7 @@ fn drive_stream_table_to_reader(
             steady_rows_total += observed_rows;
             batch_latencies_micros.push(full_elapsed.as_micros() as u64);
             secondary_latencies_micros.push(on_data_elapsed.as_micros() as u64);
-            second_window_rows += observed_rows;
-            while sample_start >= second_window_start + Duration::from_secs(1) {
-                peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
-                second_window_rows = 0;
-                second_window_start += Duration::from_secs(1);
-            }
+            peak_tracker.record(sample_start, observed_rows)?;
         }
         next_tick += row_interval;
         if Instant::now() - start >= total_duration {
@@ -2288,7 +2312,7 @@ fn drive_stream_table_to_reader(
         }
     }
 
-    peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
+    let peak_rows_per_sec = peak_tracker.finish() as f64;
     let actual_average_rows_per_sec = steady_rows_total as f64 / steady_duration.as_secs_f64();
 
     Ok(DriveStats {
@@ -2647,7 +2671,8 @@ mod tests {
         write_report_json, write_to_subscribe_consumer_complete,
         write_to_subscribe_deadline_offset, ConsumerJoinGuard, ConsumerStats, EngineMetricsReport,
         LatencySummary, OverflowPolicyConfig, PerfConfig, PerfProfile, ProducerOutcome,
-        ProducerState, SteadyPeakTracker, WriteToSubscribeTiming, REMOTE_IDLE_GRACE_SEC,
+        ProducerState, RowPeakTracker, SteadyPeakTracker, WriteToSubscribeTiming,
+        REMOTE_IDLE_GRACE_SEC,
     };
     use zippy_core::{EngineMetricsSnapshot, EngineStatus};
     use zippy_segment_store::{
@@ -2842,6 +2867,32 @@ mod tests {
             end + Duration::from_nanos(1),
             end,
         ));
+    }
+
+    #[test]
+    fn row_peak_tracker_accumulates_rows_within_absolute_second_bucket() {
+        let origin = Instant::now();
+        let mut tracker = RowPeakTracker::new(origin);
+
+        tracker.record(origin, 4_096).unwrap();
+        tracker
+            .record(origin + Duration::from_millis(900), 4_096)
+            .unwrap();
+
+        assert_eq!(tracker.finish(), 8_192);
+    }
+
+    #[test]
+    fn row_peak_tracker_rolls_before_counting_current_batch() {
+        let origin = Instant::now();
+        let mut tracker = RowPeakTracker::new(origin);
+
+        tracker.record(origin, 4_096).unwrap();
+        tracker
+            .record(origin + Duration::from_millis(1_100), 4_096)
+            .unwrap();
+
+        assert_eq!(tracker.finish(), 4_096);
     }
 
     #[test]
