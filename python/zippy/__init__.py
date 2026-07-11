@@ -27,6 +27,7 @@ _NATIVE_AVAILABLE = os.environ.get("ZIPPY_FORCE_PURE_PYTHON") != "1"
 _DEFAULT_REMOTE_GATEWAY_TIMEOUT_SEC = 60.0
 _TABLE_KIND_FIELD = "zippy_table_kind"
 _APPEND_TABLE_KIND = "append_table"
+_FRAME_TABLE_KIND = "frame_table"
 _KEY_VALUE_TABLE_KIND = "key_value_table"
 _TABLE_SEMANTICS_FIELD = "zippy_table_semantics"
 _KEY_VALUE_SNAPSHOT_SEMANTICS = "key_value_snapshot"
@@ -5892,17 +5893,17 @@ def _normalize_key_value_by(by: object, *, parameter: str = "by") -> list[str]:
     return fields
 
 
-def _append_table_descriptor_metadata(*, frame_by: str | None = None) -> dict[str, object]:
-    metadata: dict[str, object] = {_TABLE_KIND_FIELD: _APPEND_TABLE_KIND}
-    if frame_by is not None:
-        metadata.update(
-            {
-                _FRAME_MODE_FIELD: _SEGMENT_PER_BATCH_FRAME_MODE,
-                _FRAME_BY_FIELD: frame_by,
-                _FRAME_PROTOCOL_VERSION_FIELD: _FRAME_PROTOCOL_VERSION,
-            }
-        )
-    return metadata
+def _append_table_descriptor_metadata() -> dict[str, object]:
+    return {_TABLE_KIND_FIELD: _APPEND_TABLE_KIND}
+
+
+def _frame_table_descriptor_metadata(*, by: str) -> dict[str, object]:
+    return {
+        _TABLE_KIND_FIELD: _FRAME_TABLE_KIND,
+        _FRAME_MODE_FIELD: _SEGMENT_PER_BATCH_FRAME_MODE,
+        _FRAME_BY_FIELD: by,
+        _FRAME_PROTOCOL_VERSION_FIELD: _FRAME_PROTOCOL_VERSION,
+    }
 
 
 def _key_value_table_descriptor_metadata(
@@ -6149,9 +6150,8 @@ class StreamSubscriber:
     restarted writer and continue receiving new rows, but rows missed while the
     writer or reader is unavailable are not automatically backfilled.
     Use this event-oriented path when every committed factor row must trigger one
-    ordered callback, such as CTA strategies. For cross-sectional strategies,
-    prefer :func:`subscribe_table` so the callback receives Arrow data without
-    per-row Python object creation.
+    ordered callback, such as CTA strategies. For cross-sectional strategies that
+    require one complete bucket per callback, use :func:`subscribe_frames`.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6574,8 +6574,8 @@ def subscribe(
     downtime.
     This is the event-oriented callback path. It preserves one ordered callback per
     committed row and is appropriate for CTA strategies that react to every factor
-    event. Cross-sectional strategies should use :func:`subscribe_table` and keep
-    the cross-section key as an explicit business boundary.
+    event. Cross-sectional strategies should publish a ``frame_table`` and use
+    :func:`subscribe_frames` so the cross-section boundary remains explicit.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6779,9 +6779,8 @@ def subscribe_table(
     This is the preferred high-frequency subscription path because it keeps data
     in Arrow batches instead of allocating one Python ``Row`` object per row.
     ``batch_size`` controls delivery throughput only; it does not define a complete
-    cross-section. Consumers that require one full cross-section must use an explicit
-    bucket key from the upstream cross-sectional engine and must not infer frame
-    completeness from callback batch size.
+    cross-section. Consumers that require one full cross-section must publish with
+    ``frame_table(..., by=...)`` and consume with :func:`subscribe_frames`.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6904,10 +6903,10 @@ def subscribe_frames(
     """
     Subscribe to complete cross-sectional frames using one Arrow callback per upstream bucket.
 
-    The source must be published with ``append_table(..., frame_by=...).publish()``. Each input
-    batch is committed atomically into one segment, so callback boundaries are semantic frame
-    boundaries rather than throughput batches. The subscription starts at the live tail; frames
-    produced while the subscriber is disconnected are not replayed automatically.
+    The source must be published with ``frame_table(..., by=...).publish()``. Each input batch is
+    committed atomically into one segment, so callback boundaries are semantic frame boundaries
+    rather than throughput batches. The subscription starts at the live tail; frames produced
+    while the subscriber is disconnected are not replayed automatically.
 
     :param source: Named frame stream to subscribe to.
     :type source: str
@@ -6937,20 +6936,20 @@ def subscribe_frames(
     if wait:
         _wait_for_table_ready(source, selected_master, timeout)
     stream = _get_stream_status_or_full(selected_master, source)
+    table_kind = _descriptor_table_kind(stream)
     frame_mode = _descriptor_metadata_value(stream, _FRAME_MODE_FIELD)
     frame_version = _descriptor_metadata_value(stream, _FRAME_PROTOCOL_VERSION_FIELD)
     frame_by = _descriptor_metadata_value(stream, _FRAME_BY_FIELD)
-    if frame_mode != _SEGMENT_PER_BATCH_FRAME_MODE:
+    if table_kind != _FRAME_TABLE_KIND or frame_mode != _SEGMENT_PER_BATCH_FRAME_MODE:
         raise ValueError(
-            "subscribe_frames requires append_table(..., frame_by=...).publish() "
-            f"source=[{source}]"
+            "subscribe_frames requires frame_table(..., by=...).publish() " f"source=[{source}]"
         )
     if frame_version != _FRAME_PROTOCOL_VERSION:
         raise ValueError(
             "unsupported frame protocol version " f"source=[{source}] version=[{frame_version}]"
         )
     if not isinstance(frame_by, str) or not frame_by:
-        raise ValueError(f"frame stream is missing frame_by metadata source=[{source}]")
+        raise ValueError(f"frame table is missing by metadata source=[{source}]")
     _reject_logical_sharded_subscribe(
         source,
         selected_master,
@@ -7918,16 +7917,24 @@ def _engine_latest_by(engine: object) -> list[str] | None:
     return [str(item) for item in by]
 
 
-def _validate_cross_section_frame_by(engine: object, frame_by: str) -> None:
+def _normalize_frame_table_by(by: object) -> str:
+    if not isinstance(by, str):
+        raise TypeError("frame_table by must be a string")
+    if not by:
+        raise ValueError("frame_table by must not be empty")
+    return by
+
+
+def _validate_frame_table_by(engine: object, by: str) -> None:
     config_fn = getattr(engine, "config", None)
     config = config_fn() if callable(config_fn) else None
     if not isinstance(config, dict) or config.get("engine_type") != "cross_sectional":
-        raise ValueError("frame_by is only supported for CrossSectionalEngine output")
+        raise ValueError("frame_table is only supported for CrossSectionalEngine output")
     dt_column = config.get("dt_column")
-    if frame_by != dt_column:
+    if by != dt_column:
         raise ValueError(
-            "frame_by must match CrossSectionalEngine dt_column "
-            f"frame_by=[{frame_by}] dt_column=[{dt_column}]"
+            "frame_table by must match CrossSectionalEngine dt_column "
+            f"by=[{by}] dt_column=[{dt_column}]"
         )
 
 
@@ -8009,14 +8016,12 @@ class _SessionTablePublishBinding:
 
     :param session: Owning session.
     :type session: Session
-    :param table_kind: Internal table storage kind.
+    :param table_kind: Public table semantic kind.
     :type table_kind: str
     :param name: Output stream table name.
     :type name: str
-    :param by: Optional key columns for key-value tables.
+    :param by: Optional frame boundary column or key-value key columns.
     :type by: list[str] | tuple[str, ...] | str | None
-    :param frame_by: Optional complete-frame bucket column for append tables.
-    :type frame_by: str | None
     :param source: Optional existing source table name.
     :type source: str | None
     """
@@ -8028,14 +8033,12 @@ class _SessionTablePublishBinding:
         table_kind: str,
         name: str,
         by: str | list[str] | tuple[str, ...] | None = None,
-        frame_by: str | None = None,
         source: str | None = None,
     ) -> None:
         self._session = session
         self._table_kind = table_kind
         self._name = name
         self._by = by
-        self._frame_by = frame_by
         self._source = source
 
     def publish(
@@ -8073,8 +8076,14 @@ class _SessionTablePublishBinding:
             return self._session._publish_append_table(
                 self._name,
                 persist=persist,
-                frame_by=self._frame_by,
                 method="append_table(...).publish()",
+            )
+        if self._table_kind == _FRAME_TABLE_KIND:
+            return self._session._publish_frame_table(
+                self._name,
+                by=self._by,
+                persist=persist,
+                method="frame_table(...).publish()",
             )
         if self._table_kind == _KEY_VALUE_TABLE_KIND:
             return self._session._publish_key_value_table(
@@ -8382,8 +8391,9 @@ class Session:
         :type engine: object
         :param kwargs: Constructor arguments when ``engine`` is a class.
             ``output_stream="name"`` remains a shortcut for automatic table materialization.
-            Prefer explicit ``.append_table(...).publish(...)`` or
-            ``.key_value_table(...).publish(...)`` for new code.
+            Prefer explicit ``.append_table(...).publish(...)``,
+            ``.frame_table(...).publish(...)``, or ``.key_value_table(...).publish(...)``
+            for new code.
         :type kwargs: object
         :returns: This session for fluent ``.engine(...).run()`` usage.
         :rtype: Session
@@ -8420,20 +8430,18 @@ class Session:
         name: str,
         *,
         persist: bool = False,
-        frame_by: str | None = None,
     ) -> "Session":
         """
         Materialize the latest engine output into a named table.
 
         Normal engine outputs become append stream tables. ``ReactiveLatestEngine`` outputs become
-        key-value stream tables.
+        key-value stream tables. Complete-frame semantics are never inferred; use
+        ``frame_table(name, by=...).publish()`` explicitly.
 
         :param name: Output stream table name.
         :type name: str
         :param persist: Whether to persist the stream table as parquet.
         :type persist: bool
-        :param frame_by: Cross-sectional bucket column preserved as one callback frame.
-        :type frame_by: str | None
         :returns: This session for fluent ``.stream_table(...).run()`` usage.
         :rtype: Session
         :raises RuntimeError: If no engine has been added.
@@ -8445,35 +8453,55 @@ class Session:
         engine = self._engines[-1]
         latest_by = _engine_latest_by(engine)
         if latest_by is not None:
-            if frame_by is not None:
-                raise ValueError("ReactiveLatestEngine output does not support frame_by")
             return self.key_value_table(name, by=latest_by).publish(persist=persist)
-        return self.append_table(name, frame_by=frame_by).publish(persist=persist)
+        return self.append_table(name).publish(persist=persist)
 
-    def append_table(
-        self,
-        name: str,
-        *,
-        frame_by: str | None = None,
-    ) -> _SessionTablePublishBinding:
+    def append_table(self, name: str) -> _SessionTablePublishBinding:
         """
         Configure the latest engine output as an append stream table.
 
         :param name: Output append stream table name.
         :type name: str
-        :param frame_by: Cross-sectional bucket column preserved as one callback frame.
-        :type frame_by: str | None
         :returns: Publish binding. Call ``.publish(persist=True|False)`` to materialize it.
         :rtype: _SessionTablePublishBinding
         """
         self._validate_publish_table_name(name, method="append_table")
-        if frame_by is not None and (not isinstance(frame_by, str) or not frame_by):
-            raise ValueError("append_table frame_by must be a non-empty string")
         return _SessionTablePublishBinding(
             self,
             table_kind=_APPEND_TABLE_KIND,
             name=name,
-            frame_by=frame_by,
+        )
+
+    def frame_table(
+        self,
+        name: str,
+        *,
+        by: str,
+    ) -> _SessionTablePublishBinding:
+        """
+        Configure the latest cross-sectional engine output as an ordered frame table.
+
+        Each upstream bucket is committed atomically and remains one callback unit for
+        ``subscribe_frames()``. Use this for cross-sectional strategies that require every
+        instrument in a time bucket before evaluating the portfolio. Use ``append_table()``
+        for independent events and ``key_value_table()`` for replaceable latest state.
+
+        :param name: Output frame table name.
+        :type name: str
+        :param by: Cross-sectional boundary column. It must match the engine ``dt_column``.
+        :type by: str
+        :returns: Publish binding. Call ``.publish(persist=True|False)`` to materialize it.
+        :rtype: _SessionTablePublishBinding
+        :raises TypeError: If ``by`` is not a string.
+        :raises ValueError: If ``by`` is empty.
+        """
+        self._validate_publish_table_name(name, method="frame_table")
+        frame_by = _normalize_frame_table_by(by)
+        return _SessionTablePublishBinding(
+            self,
+            table_kind=_FRAME_TABLE_KIND,
+            name=name,
+            by=frame_by,
         )
 
     def key_value_table(
@@ -8527,7 +8555,6 @@ class Session:
         name: str,
         *,
         persist: bool = False,
-        frame_by: str | None = None,
         method: str = "publish_append_table()",
     ) -> "Session":
         """
@@ -8537,8 +8564,6 @@ class Session:
         :type name: str
         :param persist: Whether to persist the append table as parquet.
         :type persist: bool
-        :param frame_by: Cross-sectional bucket column preserved as one callback frame.
-        :type frame_by: str | None
         :returns: This session for fluent ``.publish_append_table(...).run()`` usage.
         :rtype: Session
         :raises RuntimeError: If no engine has been added.
@@ -8553,8 +8578,6 @@ class Session:
         engine = self._engines[-1]
         if _engine_latest_by(engine) is not None:
             raise ValueError("ReactiveLatestEngine output cannot publish append_table")
-        if frame_by is not None:
-            _validate_cross_section_frame_by(engine, frame_by)
         engine_id = id(engine)
         if engine_id in self._materialized_engine_ids:
             raise ValueError("latest engine output is already materialized")
@@ -8565,6 +8588,50 @@ class Session:
             name,
             persist=persist,
             table_kind=_APPEND_TABLE_KIND,
+        )
+        return self
+
+    def _publish_frame_table(
+        self,
+        name: str,
+        *,
+        by: object,
+        persist: bool = False,
+        method: str = "frame_table(...).publish()",
+    ) -> "Session":
+        """
+        Publish the latest cross-sectional engine output as an ordered frame table.
+
+        :param name: Output frame table name.
+        :type name: str
+        :param by: Cross-sectional boundary column matching the engine ``dt_column``.
+        :type by: object
+        :param persist: Whether to persist the append-only frame history as parquet.
+        :type persist: bool
+        :returns: This session for fluent ``.run()`` usage.
+        :rtype: Session
+        :raises RuntimeError: If no engine has been added.
+        :raises ValueError: If the engine or boundary column cannot provide frame semantics.
+        """
+        self._validate_publish_table_name(name, method=method)
+        frame_by = _normalize_frame_table_by(by)
+        if not isinstance(persist, bool):
+            raise TypeError("persist must be True or False")
+        if not self._engines:
+            raise RuntimeError(f"{method} requires an engine() before it")
+
+        engine = self._engines[-1]
+        _validate_frame_table_by(engine, frame_by)
+        engine_id = id(engine)
+        if engine_id in self._materialized_engine_ids:
+            raise ValueError("latest engine output is already materialized")
+
+        self._pending_output_tables.pop(engine_id, None)
+        self._attach_engine_output_table(
+            engine,
+            name,
+            persist=persist,
+            table_kind=_FRAME_TABLE_KIND,
             frame_by=frame_by,
         )
         return self
@@ -9043,7 +9110,8 @@ class Session:
         if explicit_target:
             raise TypeError(
                 "target is not supported in Session.engine(); publish engine output with "
-                "append_table(...).publish(...) or key_value_table(...).publish(...)"
+                "append_table(...).publish(...), frame_table(...).publish(...), or "
+                "key_value_table(...).publish(...)"
             )
         if "output" in kwargs:
             raise TypeError(
@@ -9151,14 +9219,19 @@ class Session:
         latest_by = _engine_latest_by(engine)
         if table_kind is None:
             table_kind = _KEY_VALUE_TABLE_KIND if latest_by is not None else _APPEND_TABLE_KIND
-        if table_kind not in {_APPEND_TABLE_KIND, _KEY_VALUE_TABLE_KIND}:
+        if table_kind not in {
+            _APPEND_TABLE_KIND,
+            _FRAME_TABLE_KIND,
+            _KEY_VALUE_TABLE_KIND,
+        }:
             raise ValueError(f"unsupported table kind table_kind=[{table_kind}]")
-        if table_kind == _APPEND_TABLE_KIND and latest_by is not None:
-            raise ValueError("ReactiveLatestEngine output cannot publish append_table")
-        if frame_by is not None:
-            if table_kind != _APPEND_TABLE_KIND:
-                raise ValueError("frame_by is only supported by append_table")
-            _validate_cross_section_frame_by(engine, frame_by)
+        if table_kind in {_APPEND_TABLE_KIND, _FRAME_TABLE_KIND} and latest_by is not None:
+            raise ValueError(f"ReactiveLatestEngine output cannot publish {table_kind}")
+        if table_kind == _FRAME_TABLE_KIND:
+            frame_by = _normalize_frame_table_by(frame_by)
+            _validate_frame_table_by(engine, frame_by)
+        elif frame_by is not None:
+            raise ValueError("frame boundary metadata is only supported by frame_table")
         if table_kind == _KEY_VALUE_TABLE_KIND:
             key_fields = _normalize_key_value_by(
                 key_fields if key_fields is not None else latest_by
@@ -9166,11 +9239,12 @@ class Session:
         if table_kind == _KEY_VALUE_TABLE_KIND and table_options["persist_path"] is not None:
             raise ValueError("key_value_table does not support persist=True")
 
-        descriptor_metadata: dict[str, object] = _append_table_descriptor_metadata(
-            frame_by=frame_by
-        )
+        descriptor_metadata: dict[str, object] = _append_table_descriptor_metadata()
         changelog_stream_name = None
-        if table_kind == _KEY_VALUE_TABLE_KIND:
+        if table_kind == _FRAME_TABLE_KIND:
+            assert frame_by is not None
+            descriptor_metadata = _frame_table_descriptor_metadata(by=frame_by)
+        elif table_kind == _KEY_VALUE_TABLE_KIND:
             assert key_fields is not None
             changelog_stream_name = _key_value_changelog_stream_name(table_name)
             descriptor_metadata = _key_value_table_descriptor_metadata(
@@ -9268,7 +9342,7 @@ class Session:
                         else None
                     ),
                 )
-                if frame_by is not None:
+                if table_kind == _FRAME_TABLE_KIND:
                     materializer_kwargs["frame_per_batch"] = True
                 materializer = _StreamTableMaterializer(**materializer_kwargs)
             self.master.publish_segment_descriptor(

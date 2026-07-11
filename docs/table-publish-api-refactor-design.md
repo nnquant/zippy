@@ -22,10 +22,11 @@ existing users.
 
 ## Decision
 
-Zippy exposes two table kinds:
+Zippy exposes three table kinds:
 
 ```text
 append_table
+frame_table
 key_value_table
 ```
 
@@ -33,6 +34,11 @@ key_value_table
 at the logical row level, row offsets are monotonic, and new data is represented by
 appending rows. Storage-layer compaction, retention, parquet rewrite, or segment
 cleanup does not violate this contract as long as the logical table remains append-only.
+
+`frame_table` is an append-only logical table with an explicit business-batch boundary. Each
+upstream frame is committed atomically, sealed as one segment, and delivered as one ordered
+`subscribe_frames()` callback. It reuses append-table storage and query behavior; it is not a
+second storage engine.
 
 `key_value_table` is a key-value materialized table. It represents the latest value for
 each configured key. Its storage model is:
@@ -50,6 +56,11 @@ The public API should make this split visible:
 ```python
 session.append_table("factor_events").publish(persist=True)
 
+session.frame_table(
+    "stock_factor_frames",
+    by="dt",
+).publish()
+
 session.key_value_table(
     "latest_factors",
     by=["instrument_id"],
@@ -61,10 +72,11 @@ Do not add `kv_table` or `keyvalue_table` aliases. The canonical public name is
 
 ## Table Kind Semantics
 
-| Table kind | Meaning | `subscribe()` | `subscribe_table()` | `read_table()` |
-| --- | --- | --- | --- | --- |
-| `append_table` | Append-only history/event table | Newly appended rows | Existing compatible table callback behavior | Point-in-time query over append history |
-| `key_value_table` | `key -> latest value` current table | Key-value changelog events | Full latest snapshot callback | Current consistent snapshot |
+| Table kind | Meaning | `subscribe()` | `subscribe_table()` | `subscribe_frames()` | `read_table()` |
+| --- | --- | --- | --- | --- | --- |
+| `append_table` | Append-only history/event table | Newly appended rows | Incremental Arrow batches | Rejected | Point-in-time query over append history |
+| `frame_table` | Ordered immutable business frames | Not recommended | Generic incremental Arrow batches | One complete ordered frame per callback | Point-in-time query over append history |
+| `key_value_table` | `key -> latest value` current table | Key-value changelog events | Full latest snapshot callback | Rejected | Current consistent snapshot |
 
 All tables can be subscribed to. The callback semantic is selected by table kind, not
 by a user remembering which engine produced the table.
@@ -98,6 +110,26 @@ key-value table:
 )
 ```
 
+`Session.frame_table(...).publish(...)` materializes each closed cross-sectional bucket as one
+ordered frame while reusing append-table storage:
+
+```python
+(
+    session
+    .engine(cross_sectional_engine)
+    .frame_table(
+        "stock_factor_frames",
+        by="dt",
+    )
+    .publish()
+)
+```
+
+`by` is required and must match `CrossSectionalEngine.dt_column`. The corresponding consumer API
+is `subscribe_frames()`, not a callback batch-size convention. See
+[`frame-table.md`](frame-table.md) for selection guidance, runtime guarantees, and operational
+limits.
+
 The method can also derive a key-value table from an existing append table:
 
 ```python
@@ -130,21 +162,24 @@ ReactiveLatestEngine + stream_table(name)
   -> key_value_table(name, by=engine.by).publish(...)
 ```
 
-New documentation should prefer `append_table(...).publish(...)` and
-`key_value_table(...).publish(...)`. `publish_append_table(...)` and
-`publish_key_value_table(...)` remain deprecated aliases for compatibility.
-`output_stream=...` remains a legacy shortcut and should follow the same compatibility mapping.
+New documentation should prefer the explicit semantic API: `append_table(...)` for independent
+events, `frame_table(..., by=...)` for complete ordered cross-sections, and
+`key_value_table(..., by=...)` for current state. `publish_append_table(...)` and
+`publish_key_value_table(...)` remain deprecated aliases for compatibility. `stream_table()` and
+`output_stream=...` never infer frame semantics because doing so would make strategy correctness
+depend on the engine class rather than an explicit publish contract.
 
 ## Engine Support Matrix
 
-| Engine/source | `publish_append_table` | `publish_key_value_table` |
-| --- | --- | --- |
-| Normal event/factor engine | Supported | Supported when `by` is explicit |
-| `ReactiveStateEngine` | Supported | Supported when `by` is explicit |
-| `ReactiveLatestEngine` | Not supported | Supported and preferred |
-| `TimeSeriesEngine` | Supported | Allowed only with explicit `by` and clear latest-view semantics |
-| `BarGeneratorEngine` | Supported | Allowed only with explicit `by` and clear latest-view semantics |
-| Existing append table source | Not applicable | Supported |
+| Engine/source | `append_table` | `frame_table` | `key_value_table` |
+| --- | --- | --- | --- |
+| Normal event/factor engine | Supported | Not supported unless it declares complete-frame output | Supported when `by` is explicit |
+| `CrossSectionalEngine` | Supported, but frame boundaries are not preserved | Supported and preferred | Supported only with explicit latest-state intent |
+| `ReactiveStateEngine` | Supported | Not supported | Supported when `by` is explicit |
+| `ReactiveLatestEngine` | Not supported | Not supported | Supported and preferred |
+| `TimeSeriesEngine` | Supported | Not supported | Allowed only with explicit `by` and clear latest-view semantics |
+| `BarGeneratorEngine` | Supported | Not supported | Allowed only with explicit `by` and clear latest-view semantics |
+| Existing append or frame table source | Not applicable | Not applicable | Supported |
 
 `ReactiveLatestEngine` must not publish as an append table. Its output does not
 represent complete historical events; treating it as append history would create a
@@ -158,7 +193,15 @@ stateful factor computation, not key-value table materialization.
 Every registered table descriptor should include:
 
 ```text
-zippy_table_kind = append_table | key_value_table
+zippy_table_kind = append_table | frame_table | key_value_table
+```
+
+`frame_table` descriptors should also include:
+
+```text
+zippy_frame_mode = segment_per_batch
+zippy_frame_by = <boundary column>
+zippy_frame_protocol_version = 1
 ```
 
 `key_value_table` descriptors should also include:
@@ -190,14 +233,26 @@ The suffix is an internal storage detail. Public API and documentation should us
 `subscribe(source, callback)` is event-oriented:
 
 - For `append_table`, it follows append row offsets and emits newly appended rows.
+- For `frame_table`, it is not the recommended consumer because row callbacks discard the frame
+  boundary at the Python API.
 - For `key_value_table`, it follows the internal changelog stream and emits key-value
   changes. Internal `_zippy_*` fields are hidden from normal callbacks.
 
 `subscribe_table(source, callback)` is table-oriented:
 
 - For `append_table`, it preserves existing compatible table callback behavior.
+- For `frame_table`, it remains a generic Arrow subscription. Consumers whose correctness depends
+  on callback boundaries must use `subscribe_frames()`.
 - For `key_value_table`, it emits full latest snapshots when the snapshot descriptor
   advances.
+
+`subscribe_frames(source, callback)` is frame-oriented:
+
+- It accepts only a descriptor declaring `zippy_table_kind=frame_table` and the supported frame
+  protocol version.
+- It starts at the live tail and waits until the local segment reader is ready before returning.
+- It emits one complete retained frame per callback and restores intermediate sealed descriptor
+  generations in order.
 
 Do not add a separate `watch_table()` API in this refactor. `subscribe_table()` remains
 the public snapshot-watch entry point.
@@ -232,6 +287,7 @@ not silently present a live-only table as a complete replay-backed table.
 ### Phase 1: API and metadata
 
 - Add `Session.append_table(...).publish(...)`.
+- Add `Session.frame_table(..., by=...).publish(...)`.
 - Add `Session.key_value_table(...).publish(...)`.
 - Add `Session.source(...)` for source-table-derived materialization.
 - Write `zippy_table_kind` for newly materialized tables.
@@ -244,6 +300,7 @@ not silently present a live-only table as a complete replay-backed table.
 - Keep snapshot, changelog, and watermark metadata in one semantic boundary.
 - Hide internal changelog streams from default list APIs.
 - Preserve `subscribe()` and `subscribe_table()` behavior for existing key-value users.
+- Add `subscribe_frames()` without changing generic `subscribe_table()` batching controls.
 
 ### Phase 3: Append-table-derived key-value views
 
@@ -255,21 +312,26 @@ not silently present a live-only table as a complete replay-backed table.
 ### Phase 4: Cleanup and documentation
 
 - Move examples from `stream_table()` to the new publish methods.
-- Document `append_table` and `key_value_table` as the only public table kinds.
+- Document `append_table`, `frame_table`, and `key_value_table` as the public table kinds.
 - Deprecate ambiguous examples that imply `ReactiveLatestEngine` can produce append
   history.
 
 ## Test Matrix
 
 - `append_table(...).publish(...)` creates `zippy_table_kind=append_table`.
+- `frame_table(..., by="dt").publish(...)` creates `zippy_table_kind=frame_table` and
+  complete-frame protocol metadata.
 - `key_value_table(...).publish(...)` creates `zippy_table_kind=key_value_table`.
 - `stream_table()` remains compatible for normal engines.
 - `ReactiveLatestEngine.stream_table()` maps to `key_value_table`.
 - `ReactiveLatestEngine.append_table(...).publish(...)` raises a clear error.
+- `frame_table()` requires a `CrossSectionalEngine` and `by=engine.dt_column`.
 - `ReactiveStateEngine.append_table(...).publish(...)` remains supported.
 - `subscribe()` on append tables emits appended rows.
 - `subscribe()` on key-value tables emits changelog events and hides internal fields.
 - `subscribe_table()` on key-value tables emits full snapshots.
+- `subscribe_frames()` rejects plain append and key-value tables.
+- `subscribe_frames()` preserves ordered frame boundaries while callbacks lag.
 - `read_table()` on key-value tables returns a consistent snapshot.
 - `list_streams()` hides internal changelog streams by default.
 - `list_streams(include_internal=True)` shows internal changelog streams.

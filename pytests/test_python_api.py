@@ -988,7 +988,7 @@ def test_session_append_table_publish_sets_append_table_kind(monkeypatch) -> Non
     )
 
 
-def test_session_cross_section_append_table_publish_sets_complete_frame_protocol(
+def test_session_cross_section_frame_table_publish_sets_complete_frame_protocol(
     monkeypatch,
 ) -> None:
     schema = pa.schema(
@@ -1060,10 +1060,10 @@ def test_session_cross_section_append_table_publish_sets_complete_frame_protocol
 
     zippy.Session(name="cross_section_session", master=master).engine(
         FakeCrossSectionalEngine()
-    ).append_table("cross_section_frames", frame_by="dt").publish()
+    ).frame_table("cross_section_frames", by="dt").publish()
 
     expected_metadata = {
-        "zippy_table_kind": "append_table",
+        "zippy_table_kind": "frame_table",
         "zippy_frame_mode": "segment_per_batch",
         "zippy_frame_by": "dt",
         "zippy_frame_protocol_version": 1,
@@ -1073,7 +1073,31 @@ def test_session_cross_section_append_table_publish_sets_complete_frame_protocol
     assert master.descriptor == expected_metadata
 
 
-def test_session_cross_section_frame_by_must_match_engine_dt_column() -> None:
+def test_session_frame_table_signature_keeps_boundary_explicit() -> None:
+    frame_signature = inspect.signature(zippy.Session.frame_table)
+    frame_by = frame_signature.parameters["by"]
+
+    assert frame_by.kind is inspect.Parameter.KEYWORD_ONLY
+    assert frame_by.default is inspect.Parameter.empty
+    assert "frame_by" not in inspect.signature(zippy.Session.append_table).parameters
+    assert "frame_by" not in inspect.signature(zippy.Session.stream_table).parameters
+
+
+@pytest.mark.parametrize(
+    ("by", "error_type", "message"),
+    [
+        (["dt"], TypeError, "frame_table by must be a string"),
+        ("", ValueError, "frame_table by must not be empty"),
+    ],
+)
+def test_session_frame_table_rejects_invalid_by(by, error_type, message) -> None:
+    session = zippy.Session(name="cross_section_session", master=zippy.MasterClient())
+
+    with pytest.raises(error_type, match=message):
+        session.frame_table("cross_section_frames", by=by)
+
+
+def test_session_frame_table_by_must_match_engine_dt_column() -> None:
     schema = pa.schema(
         [
             ("symbol", pa.string()),
@@ -1095,8 +1119,30 @@ def test_session_cross_section_frame_by_must_match_engine_dt_column() -> None:
         engine
     )
 
-    with pytest.raises(ValueError, match="frame_by must match"):
-        session.append_table("cross_section_frames", frame_by="wrong_dt").publish()
+    with pytest.raises(ValueError, match="frame_table by must match"):
+        session.frame_table("cross_section_frames", by="wrong_dt").publish()
+
+
+def test_session_frame_table_rejects_non_cross_sectional_engine() -> None:
+    class FakeEventEngine:
+        def config(self) -> dict[str, object]:
+            return {"engine_type": "reactive_state"}
+
+        def status(self) -> str:
+            return "created"
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    session = zippy.Session(name="event_session", master=zippy.MasterClient()).engine(
+        FakeEventEngine()
+    )
+
+    with pytest.raises(ValueError, match="only supported for CrossSectionalEngine"):
+        session.frame_table("event_frames", by="dt").publish()
 
 
 def test_session_append_table_publish_uses_stream_status_for_writer_epoch(
@@ -5343,7 +5389,7 @@ def test_cross_sectional_frame_subscription_delivers_rapid_buckets_without_fragm
     session = (
         zippy.Session(name="cs_frame_e2e_session", master=master)
         .engine(engine)
-        .append_table("cs_frame_e2e_output", frame_by="dt")
+        .frame_table("cs_frame_e2e_output", by="dt")
         .publish()
         .start()
     )
@@ -7218,7 +7264,7 @@ def test_subscribe_frames_requires_protocol_metadata_and_delegates_to_tail_table
         def get_stream_status(self, source: str) -> dict[str, object]:
             return {
                 "stream_name": source,
-                "zippy_table_kind": "append_table",
+                "zippy_table_kind": "frame_table",
                 "zippy_frame_mode": "segment_per_batch",
                 "zippy_frame_by": "dt",
                 "zippy_frame_protocol_version": 1,
@@ -7267,9 +7313,28 @@ def test_subscribe_frames_rejects_plain_append_stream() -> None:
         def get_stream_status(self, source: str) -> dict[str, object]:
             return {"stream_name": source, "zippy_table_kind": "append_table"}
 
-    with pytest.raises(ValueError, match=r"append_table\(\.\.\., frame_by="):
+    with pytest.raises(ValueError, match=r"frame_table\(\.\.\., by="):
         zippy.subscribe_frames(
             "factor_events",
+            lambda table: None,
+            master=FakeMaster(),
+        )
+
+
+def test_subscribe_frames_rejects_append_kind_with_frame_protocol_metadata() -> None:
+    class FakeMaster:
+        def get_stream_status(self, source: str) -> dict[str, object]:
+            return {
+                "stream_name": source,
+                "zippy_table_kind": "append_table",
+                "zippy_frame_mode": "segment_per_batch",
+                "zippy_frame_by": "dt",
+                "zippy_frame_protocol_version": 1,
+            }
+
+    with pytest.raises(ValueError, match=r"frame_table\(\.\.\., by="):
+        zippy.subscribe_frames(
+            "legacy_factor_frames",
             lambda table: None,
             master=FakeMaster(),
         )
