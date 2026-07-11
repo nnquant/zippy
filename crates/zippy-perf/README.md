@@ -39,8 +39,9 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
 
 `inproc-timeseries` 的 `latency_micros` 只测量 `EngineHandle::write()` 的 queue-admission
 返回耗时，不是 engine 完成处理或发布的端到端延迟。`actual_average_rows_per_sec` 和
-`batches_per_sec` 都以稳态窗口内成功接收的 rows/batches 为分子，以稳态开始到最终
-`flush()` 完成（包含 drain）的时间为分母。
+`batches_per_sec` 都以稳态窗口内成功接收的 rows/batches 为分子。分母从 `steady_start`
+计算到 `max(configured steady end, final flush completion)`：提前完成排空时仍至少覆盖完整的
+配置稳态窗口，排空延迟时则把超出的 drain 时间计入。
 
 `engine_metrics.max_observed_queue_depth` 是每次成功 `write()` 后读取 `queue_depth`
 快照所得的最大值，不是 runtime 原子维护的 high-water mark，采样间的瞬时峰值可能不会被
