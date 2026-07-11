@@ -565,7 +565,7 @@ fn run_write_to_subscribe_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
         input_rows_total: drive_stats.produced,
         output_rows_total: drive_stats.consumed,
         actual_average_rows_per_sec,
-        actual_peak_rows_per_sec: actual_average_rows_per_sec,
+        actual_peak_rows_per_sec: drive_stats.actual_peak_rows_per_sec,
         batches_per_sec: compute_batches_per_sec(
             drive_stats.measured_consumed,
             profile_config.duration_sec as f64,
@@ -1416,6 +1416,7 @@ struct ProducerState {
 struct ProducerStats {
     produced: u64,
     measured_produced: u64,
+    actual_peak_rows_per_sec: f64,
 }
 
 enum ProducerOutcome {
@@ -1435,7 +1436,68 @@ struct WriteToSubscribeStats {
     consumed: u64,
     measured_produced: u64,
     measured_consumed: u64,
+    actual_peak_rows_per_sec: f64,
     latency_samples_micros: Vec<u64>,
+}
+
+struct SteadyPeakTracker {
+    warmup_end_elapsed_ns: u128,
+    steady_end_elapsed_ns: u128,
+    current_window_index: Option<u128>,
+    current_window_rows: u64,
+    peak_rows: u64,
+}
+
+impl SteadyPeakTracker {
+    fn new(warmup_end_elapsed_ns: u128, steady_end_elapsed_ns: u128) -> Self {
+        Self {
+            warmup_end_elapsed_ns,
+            steady_end_elapsed_ns,
+            current_window_index: None,
+            current_window_rows: 0,
+            peak_rows: 0,
+        }
+    }
+
+    fn record(&mut self, sent_elapsed_ns: u128) -> PerfResult<()> {
+        const SECOND_NS: u128 = 1_000_000_000;
+
+        if !is_write_to_subscribe_measured(
+            sent_elapsed_ns,
+            self.warmup_end_elapsed_ns,
+            self.steady_end_elapsed_ns,
+        ) {
+            return Ok(());
+        }
+        let window_index = (sent_elapsed_ns - self.warmup_end_elapsed_ns) / SECOND_NS;
+        match self.current_window_index {
+            Some(current_window_index) if current_window_index == window_index => {
+                self.current_window_rows =
+                    self.current_window_rows.checked_add(1).ok_or_else(|| {
+                        "write-to-subscribe peak window row count overflowed".to_string()
+                    })?;
+            }
+            Some(current_window_index) if current_window_index < window_index => {
+                self.peak_rows = self.peak_rows.max(self.current_window_rows);
+                self.current_window_index = Some(window_index);
+                self.current_window_rows = 1;
+            }
+            Some(_) => {
+                return Err(
+                    "write-to-subscribe peak tracker received out-of-order timestamp".to_string(),
+                );
+            }
+            None => {
+                self.current_window_index = Some(window_index);
+                self.current_window_rows = 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> u64 {
+        self.peak_rows.max(self.current_window_rows)
+    }
 }
 
 struct ConsumerJoinGuard {
@@ -1569,31 +1631,41 @@ fn drive_segment_write_to_consumer(
     };
     let consumer_result = consumer.join();
 
+    let (producer, consumer) = merge_write_to_subscribe_results(producer_result, consumer_result)?;
+    let latency_sample_count = u64::try_from(consumer.latency_samples_micros.len())
+        .map_err(|_| "write-to-subscribe latency sample count overflowed".to_string())?;
+    validate_write_to_subscribe_counts(
+        producer.produced,
+        consumer.consumed,
+        producer.measured_produced,
+        consumer.measured_consumed,
+        latency_sample_count,
+    )?;
+    Ok(WriteToSubscribeStats {
+        produced: producer.produced,
+        consumed: consumer.consumed,
+        measured_produced: producer.measured_produced,
+        measured_consumed: consumer.measured_consumed,
+        actual_peak_rows_per_sec: producer.actual_peak_rows_per_sec,
+        latency_samples_micros: consumer.latency_samples_micros,
+    })
+}
+
+fn merge_write_to_subscribe_results(
+    producer_result: PerfResult<ProducerOutcome>,
+    consumer_result: PerfResult<ConsumerStats>,
+) -> PerfResult<(ProducerStats, ConsumerStats)> {
     match (producer_result, consumer_result) {
-        (Err(producer_error), _) => Err(producer_error),
+        (Err(producer_error), Err(consumer_error)) => Err(format!(
+            "write-to-subscribe consumer error: {consumer_error}; producer error: {producer_error}"
+        )),
+        (Err(producer_error), Ok(_)) => Err(producer_error),
         (Ok(ProducerOutcome::CancelledByConsumer), Err(consumer_error)) => Err(consumer_error),
         (Ok(ProducerOutcome::CancelledByConsumer), Ok(_)) => {
             Err("write-to-subscribe producer was cancelled without a consumer error".to_string())
         }
         (Ok(ProducerOutcome::Completed(_)), Err(consumer_error)) => Err(consumer_error),
-        (Ok(ProducerOutcome::Completed(producer)), Ok(consumer)) => {
-            let latency_sample_count = u64::try_from(consumer.latency_samples_micros.len())
-                .map_err(|_| "write-to-subscribe latency sample count overflowed".to_string())?;
-            validate_write_to_subscribe_counts(
-                producer.produced,
-                consumer.consumed,
-                producer.measured_produced,
-                consumer.measured_consumed,
-                latency_sample_count,
-            )?;
-            Ok(WriteToSubscribeStats {
-                produced: producer.produced,
-                consumed: consumer.consumed,
-                measured_produced: producer.measured_produced,
-                measured_consumed: consumer.measured_consumed,
-                latency_samples_micros: consumer.latency_samples_micros,
-            })
-        }
+        (Ok(ProducerOutcome::Completed(producer)), Ok(consumer)) => Ok((producer, consumer)),
     }
 }
 
@@ -1641,6 +1713,9 @@ fn produce_write_to_subscribe_rows(
         steady_end_elapsed_ns,
         &state,
     );
+    if result.is_err() {
+        state.cancelled.store(true, Ordering::Release);
+    }
     state.done.store(true, Ordering::Release);
     result
 }
@@ -1661,6 +1736,7 @@ fn produce_write_to_subscribe_rows_inner(
     let mut next_tick = origin;
     let mut row_index = 0_u64;
     let mut measured_produced = 0_u64;
+    let mut peak_tracker = SteadyPeakTracker::new(warmup_end_elapsed_ns, steady_end_elapsed_ns);
 
     loop {
         if state.cancelled.load(Ordering::Acquire) {
@@ -1688,6 +1764,8 @@ fn produce_write_to_subscribe_rows_inner(
 
         let row_offset = usize::try_from(row_index)
             .map_err(|_| "write-to-subscribe row index overflowed usize".to_string())?;
+        let sent_elapsed_ns_u128 = origin.elapsed().as_nanos();
+        let sent_elapsed_ns = checked_write_to_subscribe_elapsed_ns(sent_elapsed_ns_u128)?;
         writer.begin_row().map_err(str::to_string)?;
         writer
             .write_utf8("symbol", &format!("S{:04}", row_offset % config.symbols))
@@ -1698,9 +1776,6 @@ fn produce_write_to_subscribe_rows_inner(
         writer
             .write_f64("volume", 100.0 + (row_offset % 17) as f64)
             .map_err(str::to_string)?;
-        let sent_elapsed_ns_u128 = origin.elapsed().as_nanos();
-        let sent_elapsed_ns = i64::try_from(sent_elapsed_ns_u128)
-            .map_err(|_| "write-to-subscribe sent_elapsed_ns overflowed i64".to_string())?;
         writer
             .write_i64("sent_elapsed_ns", sent_elapsed_ns)
             .map_err(str::to_string)?;
@@ -1720,12 +1795,14 @@ fn produce_write_to_subscribe_rows_inner(
             })?;
             state.measured_produced.fetch_add(1, Ordering::Release);
         }
+        peak_tracker.record(sent_elapsed_ns_u128)?;
         next_tick += row_interval;
     }
 
     Ok(ProducerOutcome::Completed(ProducerStats {
         produced: row_index,
         measured_produced,
+        actual_peak_rows_per_sec: peak_tracker.finish() as f64,
     }))
 }
 
@@ -1812,7 +1889,7 @@ fn consume_write_to_subscribe_rows_inner(
             }
             continue;
         }
-        if state.done.load(Ordering::Acquire) {
+        if write_to_subscribe_consumer_complete(state, consumed) {
             return Ok(ConsumerStats {
                 consumed,
                 measured_consumed,
@@ -1868,6 +1945,15 @@ fn is_write_to_subscribe_measured(
     steady_end_elapsed_ns: u128,
 ) -> bool {
     sent_elapsed_ns >= warmup_end_elapsed_ns && sent_elapsed_ns < steady_end_elapsed_ns
+}
+
+fn checked_write_to_subscribe_elapsed_ns(elapsed_ns: u128) -> PerfResult<i64> {
+    i64::try_from(elapsed_ns)
+        .map_err(|_| "write-to-subscribe sent_elapsed_ns overflowed i64".to_string())
+}
+
+fn write_to_subscribe_consumer_complete(state: &ProducerState, consumed: u64) -> bool {
+    state.done.load(Ordering::Acquire) && consumed >= state.produced.load(Ordering::Acquire)
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -2245,14 +2331,17 @@ fn evaluate_pass(
 mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
-    use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        compute_remote_downstream_deadline, consume_write_to_subscribe_rows,
-        is_write_to_subscribe_measured, remote_downstream_should_stop_for_idle, run_profile,
-        validate_write_to_subscribe_counts, write_report_json, EngineMetricsReport, LatencySummary,
-        OverflowPolicyConfig, PerfConfig, PerfProfile, ProducerState, REMOTE_IDLE_GRACE_SEC,
+        checked_write_to_subscribe_elapsed_ns, compute_remote_downstream_deadline,
+        consume_write_to_subscribe_rows, drive_segment_write_to_consumer,
+        is_write_to_subscribe_measured, merge_write_to_subscribe_results,
+        produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
+        validate_write_to_subscribe_counts, write_report_json,
+        write_to_subscribe_consumer_complete, ConsumerStats, EngineMetricsReport, LatencySummary,
+        OverflowPolicyConfig, PerfConfig, PerfProfile, ProducerOutcome, ProducerState,
+        SteadyPeakTracker, REMOTE_IDLE_GRACE_SEC,
     };
     use zippy_core::EngineStatus;
     use zippy_segment_store::{
@@ -2283,6 +2372,26 @@ mod tests {
             max_p99_micros: None,
             max_queue_depth: None,
         }
+    }
+
+    fn write_to_subscribe_test_segment(
+        row_capacity: usize,
+    ) -> (ActiveSegmentWriter, ActiveSegmentReader) {
+        let schema = compile_schema(&[
+            ColumnSpec::new("symbol", ColumnType::Utf8),
+            ColumnSpec::new("sent_elapsed_ns", ColumnType::Int64),
+            ColumnSpec::new("price", ColumnType::Float64),
+            ColumnSpec::new("volume", ColumnType::Float64),
+        ])
+        .unwrap();
+        let layout = LayoutPlan::for_schema(&schema, row_capacity).unwrap();
+        let writer =
+            ActiveSegmentWriter::new_for_runtime(schema.clone(), layout.clone(), 90_001, 0)
+                .unwrap();
+        let envelope = writer.active_descriptor().to_envelope_bytes().unwrap();
+        let reader =
+            ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout).unwrap();
+        (writer, reader)
     }
 
     #[test]
@@ -2337,6 +2446,7 @@ mod tests {
         assert!(report.input_rows_total > 0);
         assert_eq!(report.input_rows_total, report.output_rows_total);
         assert_eq!(report.output_rows_total, report.latency.sample_count);
+        assert!(report.actual_peak_rows_per_sec >= report.actual_average_rows_per_sec);
         assert!(report.latency.p99_micros >= report.latency.p50_micros);
         assert!(report.latency.max_micros >= report.latency.p99_micros);
         assert!(report.pass);
@@ -2381,37 +2491,151 @@ mod tests {
     }
 
     #[test]
-    fn write_to_subscribe_empty_real_segment_consumer_times_out() {
-        let schema =
-            compile_schema(&[ColumnSpec::new("sent_elapsed_ns", ColumnType::Int64)]).unwrap();
-        let layout = LayoutPlan::for_schema(&schema, 1).unwrap();
-        let writer =
-            ActiveSegmentWriter::new_for_runtime(schema.clone(), layout.clone(), 90_001, 0)
-                .unwrap();
-        let envelope = writer.active_descriptor().to_envelope_bytes().unwrap();
-        let reader =
-            ActiveSegmentReader::from_descriptor_envelope(&envelope, schema, layout).unwrap();
-        let state = Arc::new(ProducerState::default());
-        let consumer_state = Arc::clone(&state);
+    fn write_to_subscribe_done_waits_until_all_produced_rows_are_consumed() {
+        let state = ProducerState::default();
+        state.produced.store(2, Ordering::Release);
 
-        let consumer = thread::spawn(move || {
-            let origin = Instant::now();
-            consume_write_to_subscribe_rows(
-                reader,
-                origin,
-                0,
-                0,
-                origin + Duration::from_millis(20),
-                consumer_state,
-            )
-        });
-        let error = consumer.join().unwrap().unwrap_err();
+        assert!(!write_to_subscribe_consumer_complete(&state, 2));
+        state.done.store(true, Ordering::Release);
+
+        assert!(!write_to_subscribe_consumer_complete(&state, 1));
+        assert!(write_to_subscribe_consumer_complete(&state, 2));
+    }
+
+    #[test]
+    fn write_to_subscribe_elapsed_ns_conversion_checks_i64_boundary() {
+        assert_eq!(
+            checked_write_to_subscribe_elapsed_ns(i64::MAX as u128).unwrap(),
+            i64::MAX
+        );
+
+        let error = checked_write_to_subscribe_elapsed_ns(i64::MAX as u128 + 1).unwrap_err();
+        assert_eq!(error, "write-to-subscribe sent_elapsed_ns overflowed i64");
+    }
+
+    #[test]
+    fn write_to_subscribe_peak_tracker_reports_burst_window_not_average() {
+        const SECOND_NS: u128 = 1_000_000_000;
+        let mut tracker = SteadyPeakTracker::new(SECOND_NS, SECOND_NS * 3);
+
+        for sent_elapsed_ns in [
+            SECOND_NS - 1,
+            SECOND_NS,
+            SECOND_NS + 1,
+            SECOND_NS * 2 - 1,
+            SECOND_NS * 2,
+            SECOND_NS * 3,
+        ] {
+            tracker.record(sent_elapsed_ns).unwrap();
+        }
+
+        let peak_rows_per_sec = tracker.finish();
+        let average_rows_per_sec = 4.0 / 2.0;
+        assert_eq!(peak_rows_per_sec, 3);
+        assert_ne!(peak_rows_per_sec as f64, average_rows_per_sec);
+    }
+
+    #[test]
+    fn write_to_subscribe_producer_error_sets_done_and_cancelled() {
+        let mut config = test_config(PerfProfile::WriteToSubscribeE2e, test_endpoint());
+        config.target_rows_per_sec = 1_000_000_000;
+        config.symbols = 1;
+        let (mut writer, _reader) = write_to_subscribe_test_segment(1);
+        let origin = Instant::now();
+        let end = origin + Duration::from_millis(20);
+        let state = Arc::new(ProducerState::default());
+
+        let result = produce_write_to_subscribe_rows(
+            &config,
+            &mut writer,
+            origin,
+            end,
+            0,
+            Duration::from_millis(20).as_nanos(),
+            Arc::clone(&state),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("small writer must fail before producer deadline"),
+        };
+
+        assert_eq!(error, "segment is full");
+        assert_eq!(state.produced.load(Ordering::Acquire), 1);
+        assert!(state.cancelled.load(Ordering::Acquire));
+        assert!(state.done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn write_to_subscribe_producer_error_joins_consumer_and_clears_waiter() {
+        let mut config = test_config(PerfProfile::WriteToSubscribeE2e, test_endpoint());
+        config.target_rows_per_sec = 1_000_000_000;
+        config.symbols = 1;
+        let (mut writer, reader) = write_to_subscribe_test_segment(1);
+        let observer = reader.clone();
+
+        let result = drive_segment_write_to_consumer(&config, &mut writer, reader);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("small writer must fail before producer deadline"),
+        };
+
+        assert_eq!(error, "segment is full");
+        assert_eq!(observer.control_snapshot().unwrap().waiter_count, 0);
+    }
+
+    #[test]
+    fn write_to_subscribe_combines_consumer_and_producer_errors_consumer_first() {
+        let producer_result = Err("producer-original".to_string());
+        let consumer_result = Err("consumer-original".to_string());
+
+        let result = merge_write_to_subscribe_results(producer_result, consumer_result);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("double error must remain an error"),
+        };
+
+        assert_eq!(
+            error,
+            "write-to-subscribe consumer error: consumer-original; producer error: producer-original"
+        );
+    }
+
+    #[test]
+    fn write_to_subscribe_cancelled_producer_preserves_consumer_error() {
+        let producer_result = Ok(ProducerOutcome::CancelledByConsumer);
+        let consumer_result: Result<ConsumerStats, String> = Err("consumer-original".to_string());
+
+        let result = merge_write_to_subscribe_results(producer_result, consumer_result);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("consumer error must remain an error"),
+        };
+
+        assert_eq!(error, "consumer-original");
+    }
+
+    #[test]
+    fn write_to_subscribe_empty_real_segment_consumer_times_out() {
+        let (writer, reader) = write_to_subscribe_test_segment(1);
+        let observer = reader.clone();
+        let state = Arc::new(ProducerState::default());
+        let origin = Instant::now();
+        let error = consume_write_to_subscribe_rows(
+            reader,
+            origin,
+            0,
+            0,
+            origin + Duration::from_millis(20),
+            Arc::clone(&state),
+        )
+        .unwrap_err();
 
         assert!(
             error.contains("consumer timed out"),
             "unexpected error: {error}"
         );
         assert!(state.cancelled.load(Ordering::Acquire));
+        assert_eq!(observer.control_snapshot().unwrap().waiter_count, 0);
         drop(writer);
     }
 
