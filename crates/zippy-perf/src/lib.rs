@@ -2458,11 +2458,11 @@ fn count_per_sec_over_elapsed(count: u64, elapsed: Duration) -> f64 {
     count as f64 / elapsed.as_secs_f64().max(1e-9)
 }
 
-fn validate_inproc_completion(input_rows_total: u64, processed_rows_total: u64) -> PerfResult<()> {
-    if input_rows_total != processed_rows_total {
+fn validate_inproc_completion(accepted_rows: u64, processed_rows: u64) -> PerfResult<()> {
+    if accepted_rows != processed_rows {
         return Err(format!(
-            "in-process row count mismatch input_rows_total=[{input_rows_total}] \
-             processed_rows_total=[{processed_rows_total}]"
+            "in-process row count mismatch accepted_rows=[{accepted_rows}] \
+             processed_rows=[{processed_rows}]"
         ));
     }
     Ok(())
@@ -2636,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn count_per_sec_uses_supplied_elapsed_time() {
+    fn drain_inclusive_throughput_uses_total_processing_elapsed_time() {
         assert_eq!(
             count_per_sec_over_elapsed(100, Duration::from_secs(2)),
             50.0
@@ -2644,12 +2644,12 @@ mod tests {
     }
 
     #[test]
-    fn inproc_completion_validation_reports_accepted_and_processed_counts() {
+    fn inproc_completeness_rejects_unprocessed_accepted_rows() {
         let error = validate_inproc_completion(100, 99).unwrap_err();
 
         assert_eq!(
             error,
-            "in-process row count mismatch input_rows_total=[100] processed_rows_total=[99]"
+            "in-process row count mismatch accepted_rows=[100] processed_rows=[99]"
         );
     }
 
@@ -3155,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_pass_rejects_observed_queue_depth_above_configured_threshold() {
+    fn evaluate_pass_rejects_queue_depth_above_configured_threshold() {
         let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
         config.max_queue_depth = Some(2);
         let engine_metrics = EngineMetricsReport {
