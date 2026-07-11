@@ -1381,6 +1381,42 @@ where
     Ok(())
 }
 
+fn engine_batch_deadline_offset(
+    batch_index: u64,
+    rows_per_batch: usize,
+    target_rows_per_sec: u64,
+) -> PerfResult<Duration> {
+    if target_rows_per_sec == 0 {
+        return Err("engine drive target_rows_per_sec must be positive".to_string());
+    }
+    let deadline_ns = u128::from(batch_index)
+        .checked_mul(rows_per_batch as u128)
+        .and_then(|rows| rows.checked_mul(1_000_000_000))
+        .ok_or_else(|| {
+            format!(
+                "engine drive deadline overflowed batch_index=[{batch_index}] \
+                 rows_per_batch=[{rows_per_batch}]"
+            )
+        })?
+        / u128::from(target_rows_per_sec);
+    let deadline_ns = u64::try_from(deadline_ns).map_err(|_| {
+        format!("engine drive deadline nanoseconds overflowed u64 deadline_ns=[{deadline_ns}]")
+    })?;
+    Ok(Duration::from_nanos(deadline_ns))
+}
+
+fn should_admit_engine_batch(batch_start: Instant, end: Instant) -> bool {
+    batch_start < end
+}
+
+fn is_engine_drive_measured(
+    batch_start: Instant,
+    steady_started_at: Instant,
+    end: Instant,
+) -> bool {
+    batch_start >= steady_started_at && should_admit_engine_batch(batch_start, end)
+}
+
 fn drive_engine_generator<A>(
     config: &PerfConfig,
     factory: &mut TickBatchFactory,
@@ -1391,15 +1427,17 @@ where
 {
     let warmup_duration = Duration::from_secs(config.warmup_sec);
     let steady_duration = Duration::from_secs(config.duration_sec);
-    let total_duration = warmup_duration + steady_duration;
-    let batch_interval_ns = ((1_000_000_000_u128 * config.rows_per_batch as u128)
-        / config.target_rows_per_sec as u128)
-        .max(1) as u64;
-    let batch_interval = Duration::from_nanos(batch_interval_ns);
+    let total_duration = warmup_duration
+        .checked_add(steady_duration)
+        .ok_or_else(|| "engine drive total duration overflowed".to_string())?;
     let start = Instant::now();
-    let steady_started_at = start + warmup_duration;
-    let end = steady_started_at + steady_duration;
-    let mut next_tick = start;
+    let steady_started_at = start
+        .checked_add(warmup_duration)
+        .ok_or_else(|| "engine drive steady start overflowed Instant".to_string())?;
+    let end = start
+        .checked_add(total_duration)
+        .ok_or_else(|| "engine drive end overflowed Instant".to_string())?;
+    let mut batch_index = 0_u64;
     let mut input_rows_total = 0_u64;
     let mut steady_rows_total = 0_u64;
     let mut steady_batches_total = 0_u64;
@@ -1410,14 +1448,28 @@ where
     let mut max_observed_queue_depth = 0;
     let mut write_completion_clock = Instant::now;
 
-    while Instant::now() < end {
+    loop {
+        let deadline_offset = engine_batch_deadline_offset(
+            batch_index,
+            config.rows_per_batch,
+            config.target_rows_per_sec,
+        )?;
+        if deadline_offset >= total_duration {
+            break;
+        }
+        let deadline = start
+            .checked_add(deadline_offset)
+            .ok_or_else(|| "engine drive deadline overflowed Instant".to_string())?;
         let now = Instant::now();
-        if next_tick > now {
-            thread::sleep(next_tick - now);
+        if deadline > now {
+            thread::sleep(deadline - now);
         }
         let batch = factory.next_batch()?;
         let batch_start = Instant::now();
-        let measured = batch_start >= steady_started_at;
+        if !should_admit_engine_batch(batch_start, end) {
+            break;
+        }
+        let measured = is_engine_drive_measured(batch_start, steady_started_at, end);
         drive_engine_batch_admission(
             admission,
             batch,
@@ -1438,10 +1490,9 @@ where
                 second_window_start += Duration::from_secs(1);
             }
         }
-        next_tick += batch_interval;
-        if Instant::now() - start >= total_duration {
-            break;
-        }
+        batch_index = batch_index
+            .checked_add(1)
+            .ok_or_else(|| "engine drive batch index overflowed".to_string())?;
     }
 
     peak_rows_per_sec = peak_rows_per_sec.max(second_window_rows as f64);
@@ -2572,9 +2623,10 @@ mod tests {
         checked_write_to_subscribe_elapsed_ns, compute_remote_downstream_deadline,
         consume_write_to_subscribe_rows, consume_write_to_subscribe_span,
         count_per_sec_over_elapsed, drive_engine_batch_admission, drive_segment_write_to_consumer,
-        engine_metrics_report_with_observed_queue_depth, is_write_to_subscribe_measured,
-        merge_write_to_subscribe_results, merge_write_to_subscribe_startup_error,
-        produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
+        engine_batch_deadline_offset, engine_metrics_report_with_observed_queue_depth,
+        is_engine_drive_measured, is_write_to_subscribe_measured, merge_write_to_subscribe_results,
+        merge_write_to_subscribe_startup_error, produce_write_to_subscribe_rows,
+        remote_downstream_should_stop_for_idle, run_profile, should_admit_engine_batch,
         validate_inproc_completion, validate_write_to_subscribe_counts, write_report_json,
         write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset,
         ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
@@ -2704,6 +2756,52 @@ mod tests {
             error,
             "in-process row count mismatch accepted_rows=[100] processed_rows=[99]"
         );
+    }
+
+    #[test]
+    fn engine_drive_rational_deadline_excludes_first_batch_after_total_window() {
+        let total_duration = Duration::from_secs(4);
+
+        let last_inside = engine_batch_deadline_offset(97, 4_096, 100_000).unwrap();
+        let first_outside = engine_batch_deadline_offset(98, 4_096, 100_000).unwrap();
+
+        assert_eq!(last_inside, Duration::from_nanos(3_973_120_000));
+        assert_eq!(first_outside, Duration::from_nanos(4_014_080_000));
+        assert!(last_inside < total_duration);
+        assert!(first_outside >= total_duration);
+    }
+
+    #[test]
+    fn engine_drive_measurement_window_is_half_open() {
+        let steady_started_at = Instant::now();
+        let end = steady_started_at + Duration::from_secs(3);
+
+        assert!(is_engine_drive_measured(
+            steady_started_at,
+            steady_started_at,
+            end,
+        ));
+        assert!(is_engine_drive_measured(
+            end - Duration::from_nanos(1),
+            steady_started_at,
+            end,
+        ));
+        assert!(!is_engine_drive_measured(end, steady_started_at, end,));
+    }
+
+    #[test]
+    fn engine_drive_does_not_admit_after_sleep_crosses_end() {
+        let end = Instant::now() + Duration::from_secs(1);
+
+        assert!(should_admit_engine_batch(
+            end - Duration::from_nanos(1),
+            end,
+        ));
+        assert!(!should_admit_engine_batch(end, end));
+        assert!(!should_admit_engine_batch(
+            end + Duration::from_nanos(1),
+            end,
+        ));
     }
 
     #[test]
