@@ -279,7 +279,11 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
         drive_stats.input_rows_total,
         engine_metrics.processed_rows_total,
     )?;
-    let steady_elapsed = drain_completed_at.duration_since(drive_stats.steady_started_at);
+    let steady_elapsed = inproc_processing_elapsed(
+        drive_stats.steady_started_at,
+        drive_stats.steady_ends_at,
+        drain_completed_at,
+    );
     let actual_average_rows_per_sec =
         count_per_sec_over_elapsed(drive_stats.steady_rows_total, steady_elapsed);
     let batches_per_sec =
@@ -1299,6 +1303,7 @@ struct EngineDriveStats {
     steady_rows_total: u64,
     steady_batches_total: u64,
     steady_started_at: Instant,
+    steady_ends_at: Instant,
     actual_peak_rows_per_sec: f64,
     batch_latencies_micros: Vec<u64>,
     max_observed_queue_depth: usize,
@@ -1502,6 +1507,7 @@ where
         steady_rows_total,
         steady_batches_total,
         steady_started_at,
+        steady_ends_at: end,
         actual_peak_rows_per_sec: peak_rows_per_sec,
         batch_latencies_micros,
         max_observed_queue_depth,
@@ -2542,6 +2548,16 @@ fn count_per_sec_over_elapsed(count: u64, elapsed: Duration) -> f64 {
     count as f64 / elapsed.as_secs_f64().max(1e-9)
 }
 
+fn inproc_processing_elapsed(
+    steady_started_at: Instant,
+    steady_ends_at: Instant,
+    drain_completed_at: Instant,
+) -> Duration {
+    steady_ends_at
+        .max(drain_completed_at)
+        .duration_since(steady_started_at)
+}
+
 fn validate_inproc_completion(accepted_rows: u64, processed_rows: u64) -> PerfResult<()> {
     if accepted_rows != processed_rows {
         return Err(format!(
@@ -2624,14 +2640,14 @@ mod tests {
         consume_write_to_subscribe_rows, consume_write_to_subscribe_span,
         count_per_sec_over_elapsed, drive_engine_batch_admission, drive_segment_write_to_consumer,
         engine_batch_deadline_offset, engine_metrics_report_with_observed_queue_depth,
-        is_engine_drive_measured, is_write_to_subscribe_measured, merge_write_to_subscribe_results,
-        merge_write_to_subscribe_startup_error, produce_write_to_subscribe_rows,
-        remote_downstream_should_stop_for_idle, run_profile, should_admit_engine_batch,
-        validate_inproc_completion, validate_write_to_subscribe_counts, write_report_json,
-        write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset,
-        ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
-        OverflowPolicyConfig, PerfConfig, PerfProfile, ProducerOutcome, ProducerState,
-        SteadyPeakTracker, WriteToSubscribeTiming, REMOTE_IDLE_GRACE_SEC,
+        inproc_processing_elapsed, is_engine_drive_measured, is_write_to_subscribe_measured,
+        merge_write_to_subscribe_results, merge_write_to_subscribe_startup_error,
+        produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
+        should_admit_engine_batch, validate_inproc_completion, validate_write_to_subscribe_counts,
+        write_report_json, write_to_subscribe_consumer_complete,
+        write_to_subscribe_deadline_offset, ConsumerJoinGuard, ConsumerStats, EngineMetricsReport,
+        LatencySummary, OverflowPolicyConfig, PerfConfig, PerfProfile, ProducerOutcome,
+        ProducerState, SteadyPeakTracker, WriteToSubscribeTiming, REMOTE_IDLE_GRACE_SEC,
     };
     use zippy_core::{EngineMetricsSnapshot, EngineStatus};
     use zippy_segment_store::{
@@ -2745,6 +2761,30 @@ mod tests {
         assert_eq!(
             count_per_sec_over_elapsed(100, Duration::from_secs(2)),
             50.0
+        );
+    }
+
+    #[test]
+    fn inproc_processing_elapsed_preserves_full_steady_window_before_drain() {
+        let steady_started_at = Instant::now();
+        let steady_ends_at = steady_started_at + Duration::from_secs(3);
+        let drain_completed_at = steady_started_at + Duration::from_secs(2);
+
+        assert_eq!(
+            inproc_processing_elapsed(steady_started_at, steady_ends_at, drain_completed_at),
+            Duration::from_secs(3),
+        );
+    }
+
+    #[test]
+    fn inproc_processing_elapsed_extends_through_late_drain() {
+        let steady_started_at = Instant::now();
+        let steady_ends_at = steady_started_at + Duration::from_secs(3);
+        let drain_completed_at = steady_started_at + Duration::from_secs(4);
+
+        assert_eq!(
+            inproc_processing_elapsed(steady_started_at, steady_ends_at, drain_completed_at),
+            Duration::from_secs(4),
         );
     }
 
