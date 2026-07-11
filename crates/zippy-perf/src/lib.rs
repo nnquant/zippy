@@ -2792,6 +2792,35 @@ mod tests {
         assert_eq!(report.metadata.target, "sentinel-target");
     }
 
+    #[test]
+    fn invalid_profile_config_skips_metadata_capture_and_dispatch() {
+        let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        config.rows_per_batch = 0;
+        let capture_called = Cell::new(false);
+        let dispatch_called = Cell::new(false);
+
+        let error = run_profile_with_hooks(
+            &config,
+            || {
+                capture_called.set(true);
+                PerfReportMetadata {
+                    git_sha: "unused-sha".to_string(),
+                    target: "unused-target".to_string(),
+                    started_at_unix_ms: 0,
+                }
+            },
+            |config, metadata| {
+                dispatch_called.set(true);
+                Ok(empty_report(config, metadata))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "rows_per_batch must be greater than zero");
+        assert!(!capture_called.get());
+        assert!(!dispatch_called.get());
+    }
+
     fn write_to_subscribe_test_segment(
         row_capacity: usize,
     ) -> (ActiveSegmentWriter, ActiveSegmentReader) {
