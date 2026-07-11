@@ -83,9 +83,13 @@ pub struct PerfConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencySummary {
+    #[serde(default)]
+    pub sample_count: u64,
     pub p50_micros: f64,
     pub p95_micros: f64,
     pub p99_micros: f64,
+    #[serde(default)]
+    pub max_micros: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,17 +209,23 @@ pub fn format_report(report: &PerfReport) -> String {
         ),
         format!("batches_per_sec={:.2}", report.batches_per_sec),
         format!(
-            "latency_micros[p50={:.2}, p95={:.2}, p99={:.2}]",
-            report.latency.p50_micros, report.latency.p95_micros, report.latency.p99_micros
+            "latency_micros[count={}, p50={:.2}, p95={:.2}, p99={:.2}, max={:.2}]",
+            report.latency.sample_count,
+            report.latency.p50_micros,
+            report.latency.p95_micros,
+            report.latency.p99_micros,
+            report.latency.max_micros
         ),
     ];
 
     if let Some(secondary_latency) = report.secondary_latency.as_ref() {
         lines.push(format!(
-            "secondary_latency_micros[p50={:.2}, p95={:.2}, p99={:.2}]",
+            "secondary_latency_micros[count={}, p50={:.2}, p95={:.2}, p99={:.2}, max={:.2}]",
+            secondary_latency.sample_count,
             secondary_latency.p50_micros,
             secondary_latency.p95_micros,
-            secondary_latency.p99_micros
+            secondary_latency.p99_micros,
+            secondary_latency.max_micros
         ));
     }
 
@@ -1728,9 +1738,11 @@ fn build_latency_summary(samples_micros: &[u64]) -> LatencySummary {
     let mut sorted = samples_micros.to_vec();
     sorted.sort_unstable();
     LatencySummary {
+        sample_count: u64::try_from(sorted.len()).unwrap_or(u64::MAX),
         p50_micros: percentile(&sorted, 0.50),
         p95_micros: percentile(&sorted, 0.95),
         p99_micros: percentile(&sorted, 0.99),
+        max_micros: sorted.last().copied().unwrap_or_default() as f64,
     }
 }
 
@@ -2009,7 +2021,43 @@ mod tests {
         assert!(content.contains("git_sha"));
         assert!(content.contains("target"));
         assert!(content.contains("started_at_unix_ms"));
+        let formatted = super::format_report(&report);
+        assert!(formatted.contains("latency_micros[count="));
+        assert!(formatted.contains("max="));
+        assert!(content.contains("sample_count"));
+        assert!(content.contains("max_micros"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn latency_summary_reports_sample_count_and_maximum() {
+        let summary = super::build_latency_summary(&[9, 1, 4]);
+
+        assert_eq!(summary.sample_count, 3);
+        assert_eq!(summary.max_micros, 9.0);
+        assert_eq!(summary.p50_micros, 4.0);
+        assert_eq!(summary.p95_micros, 9.0);
+        assert_eq!(summary.p99_micros, 9.0);
+
+        let empty = super::build_latency_summary(&[]);
+        assert_eq!(empty.sample_count, 0);
+        assert_eq!(empty.max_micros, 0.0);
+        assert_eq!(empty.p50_micros, 0.0);
+        assert_eq!(empty.p95_micros, 0.0);
+        assert_eq!(empty.p99_micros, 0.0);
+    }
+
+    #[test]
+    fn latency_summary_deserializes_legacy_json_without_additive_fields() {
+        let summary: LatencySummary =
+            serde_json::from_str(r#"{"p50_micros": 4.0, "p95_micros": 9.0, "p99_micros": 9.0}"#)
+                .unwrap();
+
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.max_micros, 0.0);
+        assert_eq!(summary.p50_micros, 4.0);
+        assert_eq!(summary.p95_micros, 9.0);
+        assert_eq!(summary.p99_micros, 9.0);
     }
 
     #[test]
@@ -2017,9 +2065,11 @@ mod tests {
         let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
         config.max_p99_micros = Some(100.0);
         let latency = LatencySummary {
+            sample_count: 1,
             p50_micros: 10.0,
             p95_micros: 50.0,
             p99_micros: 101.0,
+            max_micros: 101.0,
         };
 
         let pass = super::evaluate_pass(
@@ -2039,9 +2089,11 @@ mod tests {
         let mut config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
         config.max_p95_micros = Some(50.0);
         let latency = LatencySummary {
+            sample_count: 1,
             p50_micros: 10.0,
             p95_micros: 50.1,
             p99_micros: 80.0,
+            max_micros: 80.0,
         };
 
         let pass = super::evaluate_pass(
