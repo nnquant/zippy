@@ -378,6 +378,7 @@ struct DownstreamLink {
 #[derive(Clone)]
 struct RuntimeOptions {
     buffer_capacity: usize,
+    archive_buffer_capacity: Option<usize>,
     overflow_policy: OverflowPolicy,
     xfast: bool,
 }
@@ -5866,7 +5867,7 @@ struct KeyValueTableMaterializer {
 impl ReactiveStateEngine {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", invalid_value_policy="reject", source=None, master=None, buffer_capacity=1024, overflow_policy=None, xfast=false))]
+    #[pyo3(signature = (name, input_schema, id_column, factors, target, *, id_filter=None, state_failure_policy="fail_fast", invalid_value_policy="reject", source=None, master=None, buffer_capacity=1024, overflow_policy=None, archive_buffer_capacity=None, xfast=false))]
     fn new(
         py: Python<'_>,
         name: String,
@@ -5881,6 +5882,7 @@ impl ReactiveStateEngine {
         master: Option<&Bound<'_, PyAny>>,
         buffer_capacity: usize,
         overflow_policy: Option<&Bound<'_, PyAny>>,
+        archive_buffer_capacity: Option<usize>,
         xfast: bool,
     ) -> PyResult<Self> {
         let schema = Arc::new(
@@ -5904,7 +5906,12 @@ impl ReactiveStateEngine {
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(
+            buffer_capacity,
+            overflow_policy,
+            archive_buffer_capacity,
+            xfast,
+        )?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -6051,7 +6058,7 @@ impl ReactiveLatestEngine {
         let target = target.ok_or_else(|| py_value_error("target is required"))?;
         let by = parse_by_columns(by)?;
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, None, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -6399,7 +6406,7 @@ impl StreamTableMaterializer {
             }
         };
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, None, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -6680,7 +6687,7 @@ impl KeyValueTableMaterializer {
         }
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, None, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -6886,7 +6893,7 @@ impl TimeSeriesEngine {
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, None, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -7039,7 +7046,7 @@ impl BarGeneratorEngine {
             .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, None, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -7209,7 +7216,7 @@ impl CrossSectionalEngine {
         .map_err(|error| py_value_error(error.to_string()))?;
         let output_schema = engine.output_schema();
         let target = parse_targets(target)?;
-        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, xfast)?;
+        let runtime_options = parse_runtime_options(buffer_capacity, overflow_policy, None, xfast)?;
         let handle = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(EngineStatus::Created));
         let metrics = Arc::new(Mutex::new(EngineMetricsSnapshot::default()));
@@ -8697,14 +8704,21 @@ fn map_python_source_error(error: PyErr) -> ZippyError {
 fn parse_runtime_options(
     buffer_capacity: usize,
     overflow_policy: Option<&Bound<'_, PyAny>>,
+    archive_buffer_capacity: Option<usize>,
     xfast: bool,
 ) -> PyResult<RuntimeOptions> {
     if buffer_capacity == 0 {
         return Err(py_value_error("buffer_capacity must be greater than zero"));
     }
+    if archive_buffer_capacity == Some(0) {
+        return Err(py_value_error(
+            "archive_buffer_capacity must be greater than zero",
+        ));
+    }
 
     Ok(RuntimeOptions {
         buffer_capacity,
+        archive_buffer_capacity,
         overflow_policy: parse_overflow_policy(overflow_policy)?,
         xfast,
     })
@@ -8813,6 +8827,9 @@ fn engine_base_config_dict<'py>(
     dict.set_item("engine_type", engine_type)?;
     dict.set_item("name", name)?;
     dict.set_item("buffer_capacity", runtime_options.buffer_capacity)?;
+    if let Some(archive_buffer_capacity) = runtime_options.archive_buffer_capacity {
+        dict.set_item("archive_buffer_capacity", archive_buffer_capacity)?;
+    }
     dict.set_item(
         "overflow_policy",
         overflow_policy_as_str(runtime_options.overflow_policy),

@@ -404,6 +404,7 @@ class ReactiveStateEngine:
         master: MasterClient | None = None,
         buffer_capacity: int = 1024,
         overflow_policy: _OverflowPolicyValue | None = None,
+        archive_buffer_capacity: int | None = None,
         xfast: bool = False,
         descriptor_publisher: object | None = None,
     ) -> None: ...

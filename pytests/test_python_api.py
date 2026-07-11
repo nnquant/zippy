@@ -4102,7 +4102,7 @@ def test_zippy_io_does_not_export_removed_parquet_sink_api() -> None:
 @pytest.mark.parametrize(
     "engine_type,legacy_parameters",
     [
-        (zippy.ReactiveStateEngine, {"parquet_sink", "archive_buffer_capacity"}),
+        (zippy.ReactiveStateEngine, {"parquet_sink"}),
         (zippy.ReactiveLatestEngine, {"parquet_sink", "archive_buffer_capacity"}),
         (zippy._internal.StreamTableMaterializer, {"sink", "archive_buffer_capacity"}),
         (zippy._internal.KeyValueTableMaterializer, {"sink", "archive_buffer_capacity"}),
@@ -4206,14 +4206,14 @@ def test_engine_rejects_invalid_runtime_config_keywords(tmp_path: Path) -> None:
             overflow_policy="block",
         )
 
-    with pytest.raises(TypeError, match="unexpected keyword argument 'archive_buffer_capacity'"):
+    with pytest.raises(ValueError, match="archive_buffer_capacity"):
         zippy.ReactiveStateEngine(
             name="tick_factors",
             input_schema=schema,
             id_column="symbol",
             factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
             target=zippy.NullPublisher(),
-            archive_buffer_capacity=8,
+            archive_buffer_capacity=0,
         )
 
 
@@ -4232,6 +4232,7 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle() -> None:
         factors=[zippy.TS_EMA(column="price", span=2, output="ema_2")],
         target=zippy.NullPublisher(),
         buffer_capacity=32,
+        archive_buffer_capacity=64,
         overflow_policy=zippy.OverflowPolicy.REJECT,
     )
 
@@ -4252,12 +4253,12 @@ def test_reactive_engine_exposes_status_metrics_and_config_lifecycle() -> None:
     config = engine.config()
     assert config["engine_type"] == "reactive"
     assert config["buffer_capacity"] == 32
+    assert config["archive_buffer_capacity"] == 64
     assert config["overflow_policy"] == "reject"
     assert config["targets"] == [{"type": "null"}]
     assert config["source_linked"] is False
     assert config["state_failure_policy"] == "fail_fast"
     assert config["invalid_value_policy"] == "reject"
-    assert "archive_buffer_capacity" not in config
     assert "has_sink" not in config
     assert "parquet_sink" not in config
 
