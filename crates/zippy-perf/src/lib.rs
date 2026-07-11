@@ -158,18 +158,34 @@ pub struct PerfReport {
 }
 
 pub fn run_profile(config: &PerfConfig) -> PerfResult<PerfReport> {
-    validate_config(config)?;
+    run_profile_with_hooks(config, PerfReportMetadata::capture, dispatch_profile)
+}
 
+fn run_profile_with_hooks<CaptureMetadata, Dispatch>(
+    config: &PerfConfig,
+    capture_metadata: CaptureMetadata,
+    dispatch: Dispatch,
+) -> PerfResult<PerfReport>
+where
+    CaptureMetadata: FnOnce() -> PerfReportMetadata,
+    Dispatch: FnOnce(&PerfConfig, PerfReportMetadata) -> PerfResult<PerfReport>,
+{
+    validate_config(config)?;
+    let metadata = capture_metadata();
+    dispatch(config, metadata)
+}
+
+fn dispatch_profile(config: &PerfConfig, metadata: PerfReportMetadata) -> PerfResult<PerfReport> {
     match config.profile {
-        PerfProfile::InprocTimeseries => run_inproc_timeseries(config),
-        PerfProfile::RemotePipelineUpstream => run_remote_pipeline_upstream(config),
-        PerfProfile::RemotePipelineDownstream => run_remote_pipeline_downstream(config),
-        PerfProfile::StreamTableSegmentCopy => run_stream_table_segment(config, false),
-        PerfProfile::StreamTableSegmentForward => run_stream_table_segment(config, true),
-        PerfProfile::SingleRowLowRate => run_single_row_low_rate(config),
-        PerfProfile::WriteToSubscribeE2e => run_write_to_subscribe_e2e(config),
-        PerfProfile::RuntimeStreamTableE2e => run_runtime_stream_table_e2e(config),
-        PerfProfile::StreamTableSubscriberE2e => run_stream_table_subscriber_e2e(config),
+        PerfProfile::InprocTimeseries => run_inproc_timeseries(config, metadata),
+        PerfProfile::RemotePipelineUpstream => run_remote_pipeline_upstream(config, metadata),
+        PerfProfile::RemotePipelineDownstream => run_remote_pipeline_downstream(config, metadata),
+        PerfProfile::StreamTableSegmentCopy => run_stream_table_segment(config, false, metadata),
+        PerfProfile::StreamTableSegmentForward => run_stream_table_segment(config, true, metadata),
+        PerfProfile::SingleRowLowRate => run_single_row_low_rate(config, metadata),
+        PerfProfile::WriteToSubscribeE2e => run_write_to_subscribe_e2e(config, metadata),
+        PerfProfile::RuntimeStreamTableE2e => run_runtime_stream_table_e2e(config, metadata),
+        PerfProfile::StreamTableSubscriberE2e => run_stream_table_subscriber_e2e(config, metadata),
     }
 }
 
@@ -250,7 +266,10 @@ pub fn format_report(report: &PerfReport) -> String {
     lines.join("\n")
 }
 
-fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_inproc_timeseries(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let tick_schema = build_tick_schema();
     let mut factory = TickBatchFactory::new(
         Arc::clone(&tick_schema),
@@ -302,7 +321,7 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total,
         actual_average_rows_per_sec,
@@ -317,7 +336,10 @@ fn run_inproc_timeseries(config: &PerfConfig) -> PerfResult<PerfReport> {
     })
 }
 
-fn run_remote_pipeline_upstream(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_remote_pipeline_upstream(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let tick_schema = build_tick_schema();
     let bar_schema = build_bar_schema(&tick_schema).map_err(|error| error.to_string())?;
     let stream_publisher =
@@ -365,7 +387,7 @@ fn run_remote_pipeline_upstream(config: &PerfConfig) -> PerfResult<PerfReport> {
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total,
         actual_average_rows_per_sec,
@@ -380,7 +402,10 @@ fn run_remote_pipeline_upstream(config: &PerfConfig) -> PerfResult<PerfReport> {
     })
 }
 
-fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_remote_pipeline_downstream(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let tick_schema = build_tick_schema();
     let bar_schema = build_bar_schema(&tick_schema).map_err(|error| error.to_string())?;
     let source = ZmqSource::connect(
@@ -430,7 +455,7 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: engine_metrics.processed_rows_total,
         output_rows_total,
         actual_average_rows_per_sec: average_rows_per_sec,
@@ -445,25 +470,33 @@ fn run_remote_pipeline_downstream(config: &PerfConfig) -> PerfResult<PerfReport>
     })
 }
 
-fn run_stream_table_segment(config: &PerfConfig, forwarding: bool) -> PerfResult<PerfReport> {
+fn run_stream_table_segment(
+    config: &PerfConfig,
+    forwarding: bool,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let row_capacity = config
         .rows_per_batch
         .saturating_mul(64)
         .max(config.rows_per_batch)
         .min(1_048_576);
-    run_stream_table_segment_with_row_capacity(config, forwarding, row_capacity)
+    run_stream_table_segment_with_row_capacity(config, forwarding, row_capacity, metadata)
 }
 
-fn run_single_row_low_rate(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_single_row_low_rate(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let profile_config = single_row_profile_config(config);
     let row_capacity = expected_single_row_capacity(&profile_config)?;
-    run_stream_table_segment_with_row_capacity(&profile_config, false, row_capacity)
+    run_stream_table_segment_with_row_capacity(&profile_config, false, row_capacity, metadata)
 }
 
 fn run_stream_table_segment_with_row_capacity(
     config: &PerfConfig,
     forwarding: bool,
     row_capacity: usize,
+    metadata: PerfReportMetadata,
 ) -> PerfResult<PerfReport> {
     let tick_schema = build_tick_schema();
     let table = build_tick_segment_table(
@@ -516,7 +549,7 @@ fn run_stream_table_segment_with_row_capacity(
     Ok(PerfReport {
         profile: config.profile,
         config: config.clone(),
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total: drive_stats.input_rows_total,
         actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
@@ -534,7 +567,10 @@ fn run_stream_table_segment_with_row_capacity(
     })
 }
 
-fn run_write_to_subscribe_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_write_to_subscribe_e2e(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let profile_config = single_row_profile_config(config);
     let row_capacity = expected_single_row_capacity(&profile_config)?;
     let schema = compile_schema(&[
@@ -583,7 +619,7 @@ fn run_write_to_subscribe_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
     Ok(PerfReport {
         profile: profile_config.profile,
         config: profile_config.clone(),
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: drive_stats.produced,
         output_rows_total: drive_stats.consumed,
         actual_average_rows_per_sec,
@@ -601,7 +637,10 @@ fn run_write_to_subscribe_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
     })
 }
 
-fn run_runtime_stream_table_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_runtime_stream_table_e2e(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let profile_config = single_row_profile_config(config);
     let row_capacity = expected_single_row_capacity(&profile_config)?;
     let tick_schema = build_tick_schema();
@@ -651,7 +690,7 @@ fn run_runtime_stream_table_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
     Ok(PerfReport {
         profile: profile_config.profile,
         config: profile_config.clone(),
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: engine_metrics.processed_rows_total,
         output_rows_total,
         actual_average_rows_per_sec: steady_rows_per_sec,
@@ -669,7 +708,10 @@ fn run_runtime_stream_table_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
     })
 }
 
-fn run_stream_table_subscriber_e2e(config: &PerfConfig) -> PerfResult<PerfReport> {
+fn run_stream_table_subscriber_e2e(
+    config: &PerfConfig,
+    metadata: PerfReportMetadata,
+) -> PerfResult<PerfReport> {
     let profile_config = single_row_profile_config(config);
     let row_capacity = expected_single_row_capacity(&profile_config)?;
     let tick_schema = build_tick_schema();
@@ -732,7 +774,7 @@ fn run_stream_table_subscriber_e2e(config: &PerfConfig) -> PerfResult<PerfReport
     Ok(PerfReport {
         profile: profile_config.profile,
         config: profile_config,
-        metadata: PerfReportMetadata::capture(),
+        metadata,
         input_rows_total: drive_stats.input_rows_total,
         output_rows_total: drive_stats.input_rows_total,
         actual_average_rows_per_sec: drive_stats.actual_average_rows_per_sec,
@@ -2667,11 +2709,12 @@ mod tests {
         inproc_processing_elapsed, is_engine_drive_measured, is_write_to_subscribe_measured,
         merge_write_to_subscribe_results, merge_write_to_subscribe_startup_error,
         produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
-        should_admit_engine_batch, validate_inproc_completion, validate_write_to_subscribe_counts,
-        write_report_json, write_to_subscribe_consumer_complete,
-        write_to_subscribe_deadline_offset, ConsumerJoinGuard, ConsumerStats, EngineMetricsReport,
-        LatencySummary, OverflowPolicyConfig, PerfConfig, PerfProfile, ProducerOutcome,
-        ProducerState, RowPeakTracker, SteadyPeakTracker, WriteToSubscribeTiming,
+        run_profile_with_hooks, should_admit_engine_batch, validate_inproc_completion,
+        validate_write_to_subscribe_counts, write_report_json,
+        write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset,
+        ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
+        OverflowPolicyConfig, PerfConfig, PerfProfile, PerfReport, PerfReportMetadata,
+        ProducerOutcome, ProducerState, RowPeakTracker, SteadyPeakTracker, WriteToSubscribeTiming,
         REMOTE_IDLE_GRACE_SEC,
     };
     use zippy_core::{EngineMetricsSnapshot, EngineStatus};
@@ -2703,6 +2746,50 @@ mod tests {
             max_p99_micros: None,
             max_queue_depth: None,
         }
+    }
+
+    fn empty_report(config: &PerfConfig, metadata: PerfReportMetadata) -> PerfReport {
+        PerfReport {
+            profile: config.profile,
+            config: config.clone(),
+            metadata,
+            input_rows_total: 0,
+            output_rows_total: 0,
+            actual_average_rows_per_sec: 0.0,
+            actual_peak_rows_per_sec: 0.0,
+            batches_per_sec: 0.0,
+            latency: LatencySummary::default(),
+            secondary_latency: None,
+            engine_status: EngineStatus::Stopped.as_str().to_string(),
+            engine_metrics: EngineMetricsReport::default(),
+            source_metrics: None,
+            pass: true,
+        }
+    }
+
+    #[test]
+    fn profile_report_uses_metadata_captured_before_dispatch() {
+        let config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let logical_time = Cell::new(1_000_u128);
+
+        let report = run_profile_with_hooks(
+            &config,
+            || PerfReportMetadata {
+                git_sha: "sentinel-sha".to_string(),
+                target: "sentinel-target".to_string(),
+                started_at_unix_ms: logical_time.get(),
+            },
+            |config, metadata| {
+                logical_time.set(9_000);
+                Ok(empty_report(config, metadata))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(logical_time.get(), 9_000);
+        assert_eq!(report.metadata.started_at_unix_ms, 1_000);
+        assert_eq!(report.metadata.git_sha, "sentinel-sha");
+        assert_eq!(report.metadata.target, "sentinel-target");
     }
 
     fn write_to_subscribe_test_segment(
