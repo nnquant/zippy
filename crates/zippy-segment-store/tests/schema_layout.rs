@@ -28,6 +28,10 @@ fn compile_schema_assigns_content_based_schema_id_and_layout() {
     assert_eq!(layout.row_capacity(), 64);
     assert!(layout.column("instrument_id").unwrap().offsets_len > 0);
     assert!(layout.column("bid_price_1").unwrap().validity_len > 0);
+    assert_eq!(layout.column_at(0).unwrap().name.as_ref(), "dt");
+    assert_eq!(layout.column_at(1).unwrap().name.as_ref(), "instrument_id");
+    assert_eq!(layout.column_at(2).unwrap().name.as_ref(), "bid_price_1");
+    assert!(layout.column_at(3).is_none());
 }
 
 #[test]

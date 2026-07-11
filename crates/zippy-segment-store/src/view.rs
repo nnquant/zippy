@@ -208,6 +208,16 @@ impl RowSpanView {
         row_offset: usize,
         field_name: &str,
     ) -> Result<SegmentCellValue, ZippySegmentStoreError> {
+        let column_index = self.column_index(field_name)?;
+        self.cell_value_at(row_offset, column_index)
+    }
+
+    /// 按列序号直接读取 span 内某行某列的标量值。
+    pub fn cell_value_at(
+        &self,
+        row_offset: usize,
+        column_index: usize,
+    ) -> Result<SegmentCellValue, ZippySegmentStoreError> {
         if row_offset >= self.row_count() {
             return Err(ZippySegmentStoreError::Lifecycle(
                 "row offset out of bounds",
@@ -217,15 +227,67 @@ impl RowSpanView {
         let spec = self
             .schema()
             .columns()
-            .iter()
-            .find(|spec| spec.name() == field_name)
+            .get(column_index)
             .ok_or(ZippySegmentStoreError::Schema("missing column"))?;
 
         match &self.backing {
             RowSpanBacking::Sealed(handle) => self.sealed_cell_value(handle, spec, absolute_row),
+            RowSpanBacking::Active(attachment) => {
+                let layout = attachment
+                    .descriptor
+                    .layout()
+                    .column_at(column_index)
+                    .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
+                read_active_payload_consistent(
+                    attachment,
+                    || self.active_cell_value(attachment, spec, layout, absolute_row),
+                    |error| error,
+                )
+            }
+        }
+    }
+
+    /// 一次读取 span 内某行的全部标量值，并复用调用方提供的缓冲区。
+    pub fn read_row_values_at(
+        &self,
+        row_offset: usize,
+        values: &mut Vec<SegmentCellValue>,
+    ) -> Result<(), ZippySegmentStoreError> {
+        if row_offset >= self.row_count() {
+            return Err(ZippySegmentStoreError::Lifecycle(
+                "row offset out of bounds",
+            ));
+        }
+
+        let absolute_row = self.start_row + row_offset;
+        values.clear();
+        values.reserve(self.schema().columns().len());
+        match &self.backing {
+            RowSpanBacking::Sealed(handle) => {
+                for spec in self.schema().columns() {
+                    values.push(self.sealed_cell_value(handle, spec, absolute_row)?);
+                }
+                Ok(())
+            }
             RowSpanBacking::Active(attachment) => read_active_payload_consistent(
                 attachment,
-                || self.active_cell_value(attachment, spec, absolute_row),
+                || {
+                    values.clear();
+                    for (column_index, spec) in self.schema().columns().iter().enumerate() {
+                        let layout = attachment
+                            .descriptor
+                            .layout()
+                            .column_at(column_index)
+                            .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
+                        values.push(self.active_cell_value(
+                            attachment,
+                            spec,
+                            layout,
+                            absolute_row,
+                        )?);
+                    }
+                    Ok(())
+                },
                 |error| error,
             ),
         }
@@ -266,9 +328,14 @@ impl RowSpanView {
             RowSpanBacking::Sealed(handle) => {
                 self.sealed_utf8_cell_value(handle, spec, absolute_row)
             }
-            RowSpanBacking::Active(attachment) => {
-                self.active_utf8_cell_value(attachment, spec, absolute_row)
-            }
+            RowSpanBacking::Active(attachment) => attachment
+                .descriptor
+                .layout()
+                .column_at(column_index)
+                .ok_or(ZippySegmentStoreError::Schema("missing column layout"))
+                .and_then(|layout| {
+                    self.active_utf8_cell_value(attachment, spec, layout, absolute_row)
+                }),
         }
     }
 
@@ -365,14 +432,9 @@ impl RowSpanView {
         &self,
         attachment: &ActiveSegmentAttachment,
         spec: &ColumnSpec,
+        layout: &ColumnLayout,
         row: usize,
     ) -> Result<SegmentCellValue, ZippySegmentStoreError> {
-        let layout = attachment
-            .descriptor
-            .layout()
-            .column(spec.name())
-            .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
-
         if spec.nullable && !read_active_validity(attachment, layout, row)? {
             return Ok(SegmentCellValue::Null);
         }
@@ -397,14 +459,9 @@ impl RowSpanView {
         &self,
         attachment: &'a ActiveSegmentAttachment,
         spec: &ColumnSpec,
+        layout: &ColumnLayout,
         row: usize,
     ) -> Result<Option<&'a str>, ZippySegmentStoreError> {
-        let layout = attachment
-            .descriptor
-            .layout()
-            .column(spec.name())
-            .ok_or(ZippySegmentStoreError::Schema("missing column layout"))?;
-
         if spec.nullable && !read_active_validity(attachment, layout, row)? {
             return Ok(None);
         }

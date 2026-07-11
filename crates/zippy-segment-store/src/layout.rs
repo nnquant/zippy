@@ -123,6 +123,11 @@ impl LayoutPlan {
         self.columns.iter().find(|col| col.name.as_ref() == name)
     }
 
+    /// 按 schema 序号查找布局。
+    pub fn column_at(&self, index: usize) -> Option<&ColumnLayout> {
+        self.columns.get(index)
+    }
+
     /// 返回 payload 需要的最小总字节数。
     pub fn total_bytes(&self) -> usize {
         self.columns

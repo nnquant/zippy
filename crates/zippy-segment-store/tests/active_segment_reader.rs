@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use zippy_segment_store::{
     compile_schema, ActiveSegmentReader, ActiveSegmentWriter, ColumnSpec, ColumnType,
     CompiledSchema, LayoutPlan, SegmentCellValue, SegmentStore, SegmentStoreConfig,
+    ZippySegmentStoreError,
 };
 
 fn tick_schema() -> CompiledSchema {
@@ -405,6 +406,37 @@ fn active_row_span_reads_cells_without_record_batch_materialization() {
         span.cell_value(0, "last_price").unwrap(),
         SegmentCellValue::Float64(4112.5)
     );
+    assert_eq!(
+        span.cell_value_at(0, 0).unwrap(),
+        SegmentCellValue::TimestampNs(101)
+    );
+    assert_eq!(
+        span.cell_value_at(0, 1).unwrap(),
+        SegmentCellValue::Utf8("IF2606".to_string())
+    );
+    assert_eq!(
+        span.cell_value_at(0, 2).unwrap(),
+        SegmentCellValue::Float64(4112.5)
+    );
+
+    let mut row_values = vec![SegmentCellValue::Int64(-1)];
+    span.read_row_values_at(0, &mut row_values).unwrap();
+    assert_eq!(
+        row_values,
+        vec![
+            SegmentCellValue::TimestampNs(101),
+            SegmentCellValue::Utf8("IF2606".to_string()),
+            SegmentCellValue::Float64(4112.5),
+        ]
+    );
+    assert!(matches!(
+        span.cell_value_at(0, 3).unwrap_err(),
+        ZippySegmentStoreError::Schema("missing column")
+    ));
+    assert!(matches!(
+        span.read_row_values_at(1, &mut row_values).unwrap_err(),
+        ZippySegmentStoreError::Lifecycle("row offset out of bounds")
+    ));
 }
 
 #[test]

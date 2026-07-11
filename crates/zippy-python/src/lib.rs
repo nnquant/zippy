@@ -5079,9 +5079,10 @@ fn invoke_stream_row_callbacks(
             filter_us += instant_delta_us(filter_started_at, Instant::now());
         }
         return Python::with_gil(|py| -> PyResult<usize> {
+            let mut row_values = Vec::with_capacity(span.schema().columns().len());
             for row_index in matching_rows.iter().copied() {
                 let row_dict_started_at = trace_enabled.then(Instant::now);
-                let values = row_span_row_to_pydict(py, &span, row_index)?;
+                let values = row_span_row_to_pydict(py, &span, row_index, &mut row_values)?;
                 if let Some(row_dict_started_at) = row_dict_started_at {
                     row_dict_us += instant_delta_us(row_dict_started_at, Instant::now());
                 }
@@ -5113,9 +5114,10 @@ fn invoke_stream_row_callbacks(
     }
 
     Python::with_gil(|py| -> PyResult<usize> {
+        let mut row_values = Vec::with_capacity(span.schema().columns().len());
         for row_index in 0..span.row_count() {
             let row_dict_started_at = trace_enabled.then(Instant::now);
-            let values = row_span_row_to_pydict(py, &span, row_index)?;
+            let values = row_span_row_to_pydict(py, &span, row_index, &mut row_values)?;
             if let Some(row_dict_started_at) = row_dict_started_at {
                 row_dict_us += instant_delta_us(row_dict_started_at, Instant::now());
             }
@@ -5220,13 +5222,13 @@ fn row_span_row_to_pydict<'py>(
     py: Python<'py>,
     span: &RowSpanView,
     row_offset: usize,
+    row_values: &mut Vec<SegmentCellValue>,
 ) -> PyResult<Bound<'py, PyDict>> {
+    span.read_row_values_at(row_offset, row_values)
+        .map_err(|error| py_runtime_error(error.to_string()))?;
     let values = PyDict::new_bound(py);
-    for column in span.schema().columns() {
+    for (column, value) in span.schema().columns().iter().zip(row_values.drain(..)) {
         let name = column.name();
-        let value = span
-            .cell_value(row_offset, name)
-            .map_err(|error| py_runtime_error(error.to_string()))?;
         values.set_item(name, segment_cell_value_to_py(py, value)?)?;
     }
     Ok(values)
@@ -11936,9 +11938,7 @@ mod tests {
         });
     }
 
-    fn stream_table_class<'py>(
-        py: Python<'py>,
-    ) -> (Bound<'py, PyModule>, Bound<'py, PyAny>, Py<PyAny>) {
+    fn stream_table_class(py: Python<'_>) -> (Bound<'_, PyModule>, Bound<'_, PyAny>, Py<PyAny>) {
         ensure_python_site_packages_on_sys_path(py).unwrap();
         let module = PyModule::new_bound(py, "zippy._internal").unwrap();
         _internal(py, &module).unwrap();

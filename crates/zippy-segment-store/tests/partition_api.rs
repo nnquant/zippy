@@ -1,7 +1,7 @@
 use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
 use zippy_segment_store::{
     compile_schema, ActiveSegmentDescriptor, ColumnSpec, ColumnType, LayoutPlan, RowSpanView,
-    SegmentStore, SegmentStoreConfig, ShmRegion, ZippySegmentStoreError,
+    SegmentCellValue, SegmentStore, SegmentStoreConfig, ShmRegion, ZippySegmentStoreError,
 };
 
 const SHM_SEALED_OFFSET: usize = 48;
@@ -307,6 +307,38 @@ fn active_row_span_exposes_borrowed_utf8_cell_values_for_hot_filters() {
         span.utf8_cell_value(0, "missing").unwrap_err(),
         ZippySegmentStoreError::Schema("missing column")
     ));
+}
+
+#[test]
+fn active_row_span_reads_nullable_factor_values_without_defaults() {
+    let schema = compile_schema(&[
+        ColumnSpec::new("instrument_id", ColumnType::Utf8),
+        ColumnSpec::nullable("factor_value", ColumnType::Float64),
+    ])
+    .unwrap();
+    let store = SegmentStore::new(SegmentStoreConfig::for_test()).unwrap();
+    let handle = store
+        .open_partition_with_schema("factors", "cta", schema)
+        .unwrap();
+    handle
+        .writer()
+        .write_row(|row| {
+            row.write_utf8("instrument_id", "IF2606")?;
+            Ok(())
+        })
+        .unwrap();
+    let span = handle.active_row_span(0, 1).unwrap();
+    let mut values = Vec::new();
+
+    span.read_row_values_at(0, &mut values).unwrap();
+
+    assert_eq!(
+        values,
+        vec![
+            SegmentCellValue::Utf8("IF2606".to_string()),
+            SegmentCellValue::Null,
+        ]
+    );
 }
 
 #[test]

@@ -4530,10 +4530,7 @@ class Table:
         except ValueError as error:
             raise RuntimeError(str(error)) from error
 
-        if (
-            not shard_names
-            and _descriptor_metadata_value(stream_info, "zippy_sharded") is True
-        ):
+        if not shard_names and _descriptor_metadata_value(stream_info, "zippy_sharded") is True:
             raise RuntimeError(f"zippy_shards missing for sharded table table_name=[{self.source}]")
 
         self._shard_names = list(shard_names)
@@ -6136,8 +6133,10 @@ class StreamSubscriber:
     Live subscriptions are best-effort: a running subscriber can attach to a
     restarted writer and continue receiving new rows, but rows missed while the
     writer or reader is unavailable are not automatically backfilled.
-    For high-frequency subscriptions, prefer :func:`subscribe_table`, which
-    delivers Arrow tables in batches and avoids per-row Python object creation.
+    Use this event-oriented path when every committed factor row must trigger one
+    ordered callback, such as CTA strategies. For cross-sectional strategies,
+    prefer :func:`subscribe_table` so the callback receives Arrow data without
+    per-row Python object creation.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6558,8 +6557,10 @@ def subscribe(
     This is a best-effort live subscription. It can resume on new writer
     descriptors, but does not automatically backfill rows missed during writer
     downtime.
-    This row-callback API is a low-frequency compatibility path. For high-frequency
-    live data, use :func:`subscribe_table` so callbacks receive Arrow table batches.
+    This is the event-oriented callback path. It preserves one ordered callback per
+    committed row and is appropriate for CTA strategies that react to every factor
+    event. Cross-sectional strategies should use :func:`subscribe_table` and keep
+    the cross-section key as an explicit business boundary.
 
     :param source: Named stream to subscribe to.
     :type source: str
@@ -6762,6 +6763,10 @@ def subscribe_table(
     callbacks on each descriptor generation change.
     This is the preferred high-frequency subscription path because it keeps data
     in Arrow batches instead of allocating one Python ``Row`` object per row.
+    ``batch_size`` controls delivery throughput only; it does not define a complete
+    cross-section. Consumers that require one full cross-section must use an explicit
+    bucket key from the upstream cross-sectional engine and must not infer frame
+    completeness from callback batch size.
 
     :param source: Named stream to subscribe to.
     :type source: str

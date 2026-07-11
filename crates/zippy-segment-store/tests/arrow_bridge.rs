@@ -5,7 +5,7 @@ use arrow::{
 use zippy_segment_store::{
     compile_schema, debug_snapshot_record_batch_for_test, ActiveSegmentDescriptor,
     ActiveSegmentWriter, ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanView,
-    ShmRegion,
+    SegmentCellValue, ShmRegion,
 };
 
 const SHM_SCHEMA_ID_OFFSET: usize = 0;
@@ -71,6 +71,31 @@ fn row_span_converts_to_record_batch_for_debug_export() {
         .downcast_ref::<Float64Array>()
         .unwrap();
     assert_eq!(last_price.value(0), 4125.0);
+}
+
+#[test]
+fn sealed_row_span_reads_all_values_in_schema_order() {
+    let (schema, layout) = tick_schema_and_layout();
+    let mut writer = ActiveSegmentWriter::new_for_test(schema, layout).unwrap();
+    writer.append_tick_for_test(1, "rb2501", 4123.5).unwrap();
+    writer.append_tick_for_test(2, "rb2505", 4125.0).unwrap();
+    let span = RowSpanView::new(writer.sealed_handle_for_test().unwrap(), 1, 2).unwrap();
+    let mut values = Vec::new();
+
+    span.read_row_values_at(0, &mut values).unwrap();
+
+    assert_eq!(
+        values,
+        vec![
+            SegmentCellValue::TimestampNs(2),
+            SegmentCellValue::Utf8("rb2505".to_string()),
+            SegmentCellValue::Float64(4125.0),
+        ]
+    );
+    assert_eq!(
+        span.cell_value_at(0, 1).unwrap(),
+        SegmentCellValue::Utf8("rb2505".to_string())
+    );
 }
 
 #[test]
