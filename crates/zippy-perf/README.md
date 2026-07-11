@@ -197,9 +197,13 @@ cargo run -p zippy-perf --release -- stream-table-segment-copy \
 - remote profile 的 source metrics
 - pass/fail
 
+除 `remote-pipeline-downstream` 和 `runtime-stream-table-e2e` 外，
 `actual_peak_rows_per_sec` 取以 `steady_start` 为 origin 的绝对半开 1 秒桶
 `[steady_start + n s, steady_start + (n + 1) s)` 中的最大行数，不是滑动窗口。观测跨桶时，
 先结算旧桶，再把当前观测计入其所属桶。
+
+这两个例外 profile 未做逐秒峰值采样；其 `actual_peak_rows_per_sec` 当前等于各自的 steady
+average（`actual_average_rows_per_sec`），不能解释为真实峰值。
 
 `metadata.started_at_unix_ms` 在 config 校验成功后、profile dispatch 和耗时工作开始前捕获。
 
