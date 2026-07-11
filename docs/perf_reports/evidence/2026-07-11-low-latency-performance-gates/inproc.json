@@ -1,0 +1,48 @@
+{
+  "profile": "InprocTimeseries",
+  "config": {
+    "profile": "InprocTimeseries",
+    "rows_per_batch": 4096,
+    "target_rows_per_sec": 100000,
+    "duration_sec": 3,
+    "warmup_sec": 1,
+    "symbols": 128,
+    "endpoint": "tcp://127.0.0.1:5560",
+    "buffer_capacity": 4096,
+    "overflow_policy": "Block",
+    "max_p95_micros": null,
+    "max_p99_micros": null,
+    "max_queue_depth": null
+  },
+  "metadata": {
+    "git_sha": "9f31e7fd7d84",
+    "target": "linux-x86_64",
+    "started_at_unix_ms": 1783737599924
+  },
+  "input_rows_total": 405504,
+  "output_rows_total": 405504,
+  "actual_average_rows_per_sec": 100504.54332534889,
+  "actual_peak_rows_per_sec": 102400.0,
+  "batches_per_sec": 24.537242022790256,
+  "latency": {
+    "sample_count": 74,
+    "p50_micros": 26.0,
+    "p95_micros": 33.0,
+    "p99_micros": 44.0,
+    "max_micros": 152.0
+  },
+  "secondary_latency": null,
+  "engine_status": "stopped",
+  "engine_metrics": {
+    "processed_batches_total": 99,
+    "processed_rows_total": 405504,
+    "output_batches_total": 100,
+    "dropped_batches_total": 0,
+    "late_rows_total": 0,
+    "publish_errors_total": 0,
+    "queue_depth": 0,
+    "max_observed_queue_depth": 1
+  },
+  "source_metrics": null,
+  "pass": true
+}

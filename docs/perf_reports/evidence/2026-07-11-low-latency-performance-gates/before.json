@@ -1,0 +1,45 @@
+{
+  "profile": "WriteToSubscribeE2e",
+  "config": {
+    "profile": "WriteToSubscribeE2e",
+    "rows_per_batch": 1,
+    "target_rows_per_sec": 200,
+    "duration_sec": 10,
+    "warmup_sec": 2,
+    "symbols": 32,
+    "endpoint": "tcp://127.0.0.1:5560",
+    "buffer_capacity": 4096,
+    "overflow_policy": "Block",
+    "max_p95_micros": null,
+    "max_p99_micros": null,
+    "max_queue_depth": null
+  },
+  "metadata": {
+    "git_sha": "ae25e1f4a6cd",
+    "target": "linux-x86_64",
+    "started_at_unix_ms": 1783729008238
+  },
+  "input_rows_total": 2401,
+  "output_rows_total": 2401,
+  "actual_average_rows_per_sec": 200.1,
+  "actual_peak_rows_per_sec": 201.0,
+  "batches_per_sec": 240.1,
+  "latency": {
+    "p50_micros": 11.0,
+    "p95_micros": 17.0,
+    "p99_micros": 24.0
+  },
+  "secondary_latency": null,
+  "engine_status": "stopped",
+  "engine_metrics": {
+    "processed_batches_total": 2401,
+    "processed_rows_total": 2401,
+    "output_batches_total": 2401,
+    "dropped_batches_total": 0,
+    "late_rows_total": 0,
+    "publish_errors_total": 0,
+    "queue_depth": 0
+  },
+  "source_metrics": null,
+  "pass": true
+}

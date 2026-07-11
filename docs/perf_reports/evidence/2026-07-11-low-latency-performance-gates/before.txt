@@ -1,0 +1,13 @@
+2026-07-11T00:16:36.235396565Z  INFO performance profile started component=[perf] event=[profile_start] profile=[WriteToSubscribeE2e]
+profile=WriteToSubscribeE2e
+git_sha=ae25e1f4a6cd
+target=linux-x86_64
+pass=true
+engine_status=stopped
+input_rows_total=2401
+output_rows_total=2401
+actual_average_rows_per_sec=200.10
+actual_peak_rows_per_sec=201.00
+batches_per_sec=240.10
+latency_micros[p50=11.00, p95=17.00, p99=24.00]
+2026-07-11T00:16:48.238165497Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[WriteToSubscribeE2e] pass=[true]

@@ -1,0 +1,15 @@
+2026-07-11T02:39:55.906324152Z  INFO performance profile started component=[perf] event=[profile_start] profile=[InprocTimeseries]
+2026-07-11T02:39:55.906858398Z  INFO engine started component=[runtime] engine=[InprocTimeseries] event=[start] status=[running]
+2026-07-11T02:39:59.922773824Z  INFO engine stopped component=[runtime] engine=[InprocTimeseries] event=[stop] batch_rows=[0]
+profile=InprocTimeseries
+git_sha=9f31e7fd7d84
+target=linux-x86_64
+pass=true
+engine_status=stopped
+input_rows_total=405504
+output_rows_total=405504
+actual_average_rows_per_sec=100504.54
+actual_peak_rows_per_sec=102400.00
+batches_per_sec=24.54
+latency_micros[count=74, p50=26.00, p95=33.00, p99=44.00, max=152.00]
+2026-07-11T02:39:59.924698521Z  INFO performance profile finished component=[perf] event=[profile_finish] profile=[InprocTimeseries] pass=[true]
