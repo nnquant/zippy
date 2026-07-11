@@ -31,10 +31,21 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
   --duration-sec 60 \
   --warmup-sec 10 \
   --symbols 1024 \
+  --buffer-capacity 4096 \
   --max-p95-micros 1000 \
   --max-p99-micros 5000 \
-  --max-queue-depth 0
+  --max-queue-depth 64
 ```
+
+`inproc-timeseries` 的 `latency_micros` 只测量 `EngineHandle::write()` 的 queue-admission
+返回耗时，不是 engine 完成处理或发布的端到端延迟。`actual_average_rows_per_sec` 和
+`batches_per_sec` 都以稳态窗口内成功接收的 rows/batches 为分子，以稳态开始到最终
+`flush()` 完成（包含 drain）的时间为分母。
+
+`engine_metrics.max_observed_queue_depth` 是每次成功 `write()` 后读取 `queue_depth`
+快照所得的最大值，不是 runtime 原子维护的 high-water mark，采样间的瞬时峰值可能不会被
+捕获。定时/手动 workflow 在 `buffer_capacity=4096` 时使用 `max_queue_depth=64`，这是共享
+runner 上的宽松回归门禁，用来避免把一次正常 admission 误判为队列失败，不是生产 SLA。
 
 跨进程压测需要先启动 downstream，再启动 upstream：
 
@@ -90,6 +101,7 @@ TMPDIR=/dev/shm cargo run -p zippy-perf --release -- single-row-low-rate \
 
 ```bash
 TMPDIR=/dev/shm cargo run -p zippy-perf --release -- write-to-subscribe-e2e \
+  --rows-per-batch 1 \
   --target-rows-per-sec 200 \
   --duration-sec 60 \
   --warmup-sec 5 \
@@ -97,7 +109,21 @@ TMPDIR=/dev/shm cargo run -p zippy-perf --release -- write-to-subscribe-e2e \
   --max-p99-micros 300
 ```
 
-`write-to-subscribe-e2e` 同样强制 `rows_per_batch=1`。它直接在 segment-store 内执行 `write row -> commit prefix -> ActiveSegmentReader::read_available()`，测量 committed prefix 对同机 reader 可见的延迟。这个 profile 不包含 runtime queue、worker 调度、Python callback、watcher 打印或真实 CTP 回调，因此适合和 LDC watcher 结果拆口径对比。
+`write-to-subscribe-e2e` 强制 `rows_per_batch=1`，使用独立 producer/consumer 线程。consumer
+先进入 waiter/futex notification wait；producer 按节奏写入行并 commit，consumer 被唤醒后调用
+`ActiveSegmentReader::read_available()`，再逐行读取共享 monotonic origin 下的
+`sent_elapsed_ns` 并记录延迟。这个边界覆盖 commit、notify、consumer 线程调度、mmap
+可见性、阻塞唤醒和 read availability，不包含 Python conversion 或 callback 执行，也不经过
+Zippy runtime queue/worker。
+
+报告的 `latency.sample_count` 和 `latency.max_micros` 分别给出稳态样本数与最大值。只有
+produced/consumed 总数相等，且稳态 produced/consumed/sample count 全部相等时才会构造报告，
+因此该边界把零丢失作为硬门禁。旧同步实现的 `p50/p95/p99=11/17/24 us` 基线与新的独立
+consumer 分布测量边界不同，不能横向比较。
+
+定时/手动 workflow 在共享 `ubuntu-latest` runner 上使用 `p95 <= 1000 us`、
+`p99 <= 5000 us`，只用于阻挡粗粒度回归。原生 Linux 固定主机的目标仍是
+`p99 <= 300 us`；落门禁前应在目标主机重复运行 10-20 次完成基线校准。
 
 runtime fast data path 基准：
 
@@ -164,11 +190,16 @@ cargo run -p zippy-perf --release -- stream-table-segment-copy \
 - actual average rows/s
 - actual peak rows/s
 - batches/s
-- batch write latency p50/p95/p99
+- latency sample count 和 p50/p95/p99/max
 - final engine status
 - engine metrics
 - remote profile 的 source metrics
 - pass/fail
+
+定时/手动 workflow 使用 `if: always()` 上传已经生成的 JSON。尾延迟等阈值不通过时，CLI
+会先写报告再以 exit code `2` 退出，因此对应 JSON 可以保留；consumer timeout、计数不一致等
+profile 执行错误会在报告构造前以 exit code `1` 退出，只能从 workflow log 排查，不会产生可上传的
+JSON。
 
 ## 当前边界
 

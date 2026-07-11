@@ -8,6 +8,7 @@ on:
 jobs:
   zippy-perf-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: checkout
@@ -24,9 +25,10 @@ jobs:
             --duration-sec 10 \
             --warmup-sec 2 \
             --symbols 1024 \
+            --buffer-capacity 4096 \
             --max-p95-micros 1000 \
             --max-p99-micros 5000 \
-            --max-queue-depth 0 \
+            --max-queue-depth 64 \
             --report-json target/zippy-perf-inproc-timeseries.json
 
       - name: run stream table copy profile
@@ -53,7 +55,22 @@ jobs:
             --max-p99-micros 5000 \
             --report-json target/zippy-perf-stream-table-forward.json
 
+      - name: run write-to-subscribe profile
+        env:
+          TMPDIR: /dev/shm
+        run: |
+          cargo run -p zippy-perf --release -- write-to-subscribe-e2e \
+            --rows-per-batch 1 \
+            --target-rows-per-sec 200 \
+            --duration-sec 10 \
+            --warmup-sec 2 \
+            --symbols 32 \
+            --max-p95-micros 1000 \
+            --max-p99-micros 5000 \
+            --report-json target/zippy-perf-write-to-subscribe-e2e.json
+
       - name: upload performance reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zippy-perf-reports
