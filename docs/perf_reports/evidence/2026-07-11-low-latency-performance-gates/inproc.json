@@ -15,28 +15,28 @@
     "max_queue_depth": null
   },
   "metadata": {
-    "git_sha": "9f31e7fd7d84",
+    "git_sha": "e7da98ad1374",
     "target": "linux-x86_64",
-    "started_at_unix_ms": 1783737599924
+    "started_at_unix_ms": 1783740852987
   },
-  "input_rows_total": 405504,
-  "output_rows_total": 405504,
-  "actual_average_rows_per_sec": 100504.54332534889,
+  "input_rows_total": 401408,
+  "output_rows_total": 401408,
+  "actual_average_rows_per_sec": 99669.33333333333,
   "actual_peak_rows_per_sec": 102400.0,
-  "batches_per_sec": 24.537242022790256,
+  "batches_per_sec": 24.333333333333332,
   "latency": {
-    "sample_count": 74,
+    "sample_count": 73,
     "p50_micros": 26.0,
-    "p95_micros": 33.0,
-    "p99_micros": 44.0,
-    "max_micros": 152.0
+    "p95_micros": 32.0,
+    "p99_micros": 39.0,
+    "max_micros": 39.0
   },
   "secondary_latency": null,
   "engine_status": "stopped",
   "engine_metrics": {
-    "processed_batches_total": 99,
-    "processed_rows_total": 405504,
-    "output_batches_total": 100,
+    "processed_batches_total": 98,
+    "processed_rows_total": 401408,
+    "output_batches_total": 99,
     "dropped_batches_total": 0,
     "late_rows_total": 0,
     "publish_errors_total": 0,
