@@ -62,6 +62,9 @@ _LIVE_SNAPSHOT_RETRY_ATTEMPTS = 20
 _LIVE_SNAPSHOT_RETRY_SLEEP_SEC = 0.002
 _DEFAULT_MAX_PARALLELISM = 4
 _MAX_PARALLELISM = 256
+_DEFAULT_MAX_QUERY_BUFFER_BYTES = 512 * 1024 * 1024
+_DEFAULT_QUERY_MAX_BUFFERED_BYTES = 128 * 1024 * 1024
+_MAX_QUERY_BUFFER_BYTES = (1 << 32) - 1
 _TEMPORAL_LITERAL_RE = re.compile(
     r"^(?P<year>\d{4})"
     r"(?:(?P<dash_month>-?)(?P<month>\d{2})"
@@ -367,6 +370,7 @@ _USE_MASTER_CONFIG = object()
 _BUILTIN_CONFIG: dict[str, object] = {
     "runtime": {
         "max_parallelism": _DEFAULT_MAX_PARALLELISM,
+        "max_query_buffer_bytes": _DEFAULT_MAX_QUERY_BUFFER_BYTES,
     },
     "master": {
         "host": None,
@@ -377,6 +381,7 @@ _BUILTIN_CONFIG: dict[str, object] = {
     },
     "query": {
         "parallelism": None,
+        "max_buffered_bytes": None,
     },
     "table": {
         "row_capacity": 65_536,
@@ -3816,6 +3821,11 @@ class GatewayServer:
             master,
             max_parallelism=self.max_parallelism,
         )
+        self.max_query_buffer_bytes = _resolve_max_query_buffer_bytes(master)
+        self.query_max_buffered_bytes = _resolve_query_max_buffered_bytes(
+            master,
+            max_query_buffer_bytes=self.max_query_buffer_bytes,
+        )
         self._native = _NativeGatewayServer(
             endpoint=self.endpoint,
             master=master,
@@ -3827,6 +3837,8 @@ class GatewayServer:
             write_timeout_ms=self.write_timeout_ms,
             max_parallelism=self.max_parallelism,
             query_parallelism=self.query_parallelism,
+            max_query_buffer_bytes=self.max_query_buffer_bytes,
+            query_max_buffered_bytes=self.query_max_buffered_bytes,
         )
 
     def start(self) -> "GatewayServer":
@@ -10653,6 +10665,71 @@ def _resolve_query_parallelism(
             f"parallelism=[{parallelism}] max_parallelism=[{resolved_max}]"
         )
     return parallelism
+
+
+def _parse_query_buffer_bytes(value: object, source: str) -> int:
+    try:
+        buffer_bytes = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{source} must be an integer") from error
+    if buffer_bytes <= 0:
+        raise ValueError(f"{source} must be greater than zero")
+    if buffer_bytes > _MAX_QUERY_BUFFER_BYTES:
+        raise ValueError(f"{source} must not exceed {_MAX_QUERY_BUFFER_BYTES}")
+    return buffer_bytes
+
+
+def _resolve_max_query_buffer_bytes(master: object | None) -> int:
+    env_value = os.environ.get("ZIPPY_MAX_QUERY_BUFFER_BYTES")
+    if env_value is not None:
+        return _parse_query_buffer_bytes(env_value, "ZIPPY_MAX_QUERY_BUFFER_BYTES")
+    if master is None:
+        return _DEFAULT_MAX_QUERY_BUFFER_BYTES
+    master_config = _master_config(master)
+    runtime_config = master_config.get("runtime", {})
+    if not isinstance(runtime_config, dict):
+        return _DEFAULT_MAX_QUERY_BUFFER_BYTES
+    return _parse_query_buffer_bytes(
+        runtime_config.get("max_query_buffer_bytes", _DEFAULT_MAX_QUERY_BUFFER_BYTES),
+        "runtime.max_query_buffer_bytes",
+    )
+
+
+def _resolve_query_max_buffered_bytes(
+    master: object | None,
+    *,
+    max_query_buffer_bytes: int | None = None,
+) -> int:
+    resolved_max = (
+        _resolve_max_query_buffer_bytes(master)
+        if max_query_buffer_bytes is None
+        else max_query_buffer_bytes
+    )
+    env_value = os.environ.get("ZIPPY_QUERY_MAX_BUFFERED_BYTES")
+    if env_value is not None:
+        buffer_bytes = _parse_query_buffer_bytes(
+            env_value,
+            "ZIPPY_QUERY_MAX_BUFFERED_BYTES",
+        )
+    elif master is None:
+        buffer_bytes = min(_DEFAULT_QUERY_MAX_BUFFERED_BYTES, resolved_max)
+    else:
+        master_config = _master_config(master)
+        query_config = master_config.get("query", {})
+        configured = (
+            query_config.get("max_buffered_bytes") if isinstance(query_config, dict) else None
+        )
+        buffer_bytes = (
+            min(_DEFAULT_QUERY_MAX_BUFFERED_BYTES, resolved_max)
+            if configured is None
+            else _parse_query_buffer_bytes(configured, "query.max_buffered_bytes")
+        )
+    if buffer_bytes > resolved_max:
+        raise ValueError(
+            "query max_buffered_bytes must not exceed runtime max_query_buffer_bytes "
+            f"max_buffered_bytes=[{buffer_bytes}] max_query_buffer_bytes=[{resolved_max}]"
+        )
+    return buffer_bytes
 
 
 def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:

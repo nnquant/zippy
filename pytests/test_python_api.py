@@ -12465,6 +12465,8 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
     assert captured["write_timeout_ms"] == 14
     assert captured["max_parallelism"] == 4
     assert captured["query_parallelism"] == 4
+    assert captured["max_query_buffer_bytes"] == 512 * 1024 * 1024
+    assert captured["query_max_buffered_bytes"] == 128 * 1024 * 1024
 
 
 def test_gateway_server_uses_query_parallelism_from_config_and_env(monkeypatch) -> None:
@@ -12505,7 +12507,13 @@ def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> 
 
     class FakeMaster:
         def get_config(self) -> dict[str, object]:
-            return {"runtime": {"max_parallelism": 6}, "query": {"parallelism": None}}
+            return {
+                "runtime": {
+                    "max_parallelism": 6,
+                    "max_query_buffer_bytes": 64 * 1024 * 1024,
+                },
+                "query": {"parallelism": None, "max_buffered_bytes": None},
+            }
 
     class FakeNativeGatewayServer:
         def __init__(self, **kwargs) -> None:
@@ -12518,13 +12526,80 @@ def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> 
     monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
     monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
     monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_QUERY_BUFFER_BYTES", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_MAX_BUFFERED_BYTES", raising=False)
 
     gateway = zippy.GatewayServer(master=FakeMaster())
 
     assert gateway.max_parallelism == 6
     assert gateway.query_parallelism == 6
+    assert gateway.max_query_buffer_bytes == 64 * 1024 * 1024
+    assert gateway.query_max_buffered_bytes == 64 * 1024 * 1024
     assert captured["max_parallelism"] == 6
     assert captured["query_parallelism"] == 6
+
+
+def test_gateway_server_uses_query_buffer_budgets_from_config_and_env(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "runtime": {"max_query_buffer_bytes": 256 * 1024 * 1024},
+                "query": {"max_buffered_bytes": 64 * 1024 * 1024},
+            }
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            captured.append(kwargs)
+            self.endpoint = kwargs["endpoint"]
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_QUERY_BUFFER_BYTES", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_MAX_BUFFERED_BYTES", raising=False)
+
+    configured = zippy.GatewayServer(master=FakeMaster())
+    monkeypatch.setenv("ZIPPY_MAX_QUERY_BUFFER_BYTES", str(768 * 1024 * 1024))
+    monkeypatch.setenv("ZIPPY_QUERY_MAX_BUFFERED_BYTES", str(96 * 1024 * 1024))
+    overridden = zippy.GatewayServer(master=FakeMaster())
+
+    assert configured.max_query_buffer_bytes == 256 * 1024 * 1024
+    assert configured.query_max_buffered_bytes == 64 * 1024 * 1024
+    assert overridden.max_query_buffer_bytes == 768 * 1024 * 1024
+    assert overridden.query_max_buffered_bytes == 96 * 1024 * 1024
+    assert [item["query_max_buffered_bytes"] for item in captured] == [
+        64 * 1024 * 1024,
+        96 * 1024 * 1024,
+    ]
+
+
+def test_gateway_server_rejects_query_buffer_budget_above_global_limit(monkeypatch) -> None:
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "runtime": {"max_query_buffer_bytes": 64 * 1024 * 1024},
+                "query": {"max_buffered_bytes": 128 * 1024 * 1024},
+            }
+
+    monkeypatch.delenv("ZIPPY_MAX_QUERY_BUFFER_BYTES", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_MAX_BUFFERED_BYTES", raising=False)
+
+    with pytest.raises(ValueError, match="must not exceed runtime max_query_buffer_bytes"):
+        zippy.GatewayServer(master=FakeMaster())
+
+
+@pytest.mark.parametrize("value", ["0", str(1 << 32), "not-an-integer"])
+def test_gateway_server_rejects_invalid_query_buffer_budget_env(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("ZIPPY_QUERY_MAX_BUFFERED_BYTES", value)
+
+    with pytest.raises(ValueError, match="ZIPPY_QUERY_MAX_BUFFERED_BYTES"):
+        zippy.GatewayServer()
 
 
 def test_gateway_server_rejects_query_parallelism_above_global_limit(monkeypatch) -> None:

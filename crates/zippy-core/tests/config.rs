@@ -1,12 +1,14 @@
 use std::fs;
 use std::sync::{Mutex, OnceLock};
 
-use zippy_core::ZippyConfig;
+use zippy_core::{ZippyConfig, ZippyRuntimeConfig};
 
 const CONFIG_ENV_KEYS: &[&str] = &[
     "HOME",
     "ZIPPY_LOG_LEVEL",
     "ZIPPY_MAX_PARALLELISM",
+    "ZIPPY_MAX_QUERY_BUFFER_BYTES",
+    "ZIPPY_QUERY_MAX_BUFFERED_BYTES",
     "ZIPPY_QUERY_PARALLELISM",
     "ZIPPY_TABLE_ROW_CAPACITY",
     "ZIPPY_TABLE_RETENTION_SEGMENTS",
@@ -45,9 +47,11 @@ level = "debug"
 
 [runtime]
 max_parallelism = 10
+max_query_buffer_bytes = 268435456
 
 [query]
 parallelism = 6
+max_buffered_bytes = 67108864
 
 [table]
 row_capacity = 1024
@@ -87,6 +91,8 @@ shutdown_timeout_ms = 3000
         &[
             ("ZIPPY_LOG_LEVEL", "warn"),
             ("ZIPPY_MAX_PARALLELISM", "9"),
+            ("ZIPPY_MAX_QUERY_BUFFER_BYTES", "805306368"),
+            ("ZIPPY_QUERY_MAX_BUFFERED_BYTES", "100663296"),
             ("ZIPPY_QUERY_PARALLELISM", "8"),
             ("ZIPPY_TABLE_ROW_CAPACITY", "2048"),
             ("ZIPPY_TABLE_RETENTION_SEGMENTS", "5"),
@@ -116,8 +122,11 @@ shutdown_timeout_ms = 3000
             assert_eq!(config.master.shutdown_timeout_ms, 7000);
             assert_eq!(config.log.level, "warn");
             assert_eq!(config.runtime.max_parallelism, 9);
+            assert_eq!(config.runtime.max_query_buffer_bytes, 805306368);
             assert_eq!(config.query.parallelism, Some(8));
+            assert_eq!(config.query.max_buffered_bytes, Some(100663296));
             assert_eq!(config.query_parallelism(), 8);
+            assert_eq!(config.query_max_buffered_bytes(), 100663296);
             assert_eq!(config.table.row_capacity, 2048);
             assert_eq!(config.table.retention_segments, Some(5));
             assert!(config.table.persist.enabled);
@@ -159,8 +168,21 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     .unwrap();
 
     assert_eq!(config.runtime.max_parallelism, 4);
+    assert_eq!(config.runtime.max_query_buffer_bytes, 536870912);
     assert_eq!(config.query.parallelism, None);
+    assert_eq!(config.query.max_buffered_bytes, None);
     assert_eq!(config.query_parallelism(), 4);
+    assert_eq!(config.query_max_buffered_bytes(), 134217728);
+}
+
+#[test]
+fn zippy_runtime_config_deserializes_legacy_value_without_buffer_budget() {
+    let runtime = serde_json::from_value::<ZippyRuntimeConfig>(serde_json::json!({
+        "max_parallelism": 4
+    }))
+    .unwrap();
+
+    assert_eq!(runtime.max_query_buffer_bytes, 512 * 1024 * 1024);
 }
 
 #[test]
@@ -172,6 +194,7 @@ fn zippy_config_query_parallelism_inherits_runtime_limit() {
         r#"
 [runtime]
 max_parallelism = 7
+max_query_buffer_bytes = 67108864
 "#,
     )
     .unwrap();
@@ -180,6 +203,8 @@ max_parallelism = 7
 
     assert_eq!(config.query.parallelism, None);
     assert_eq!(config.query_parallelism(), 7);
+    assert_eq!(config.query.max_buffered_bytes, None);
+    assert_eq!(config.query_max_buffered_bytes(), 67108864);
 }
 
 #[test]
@@ -220,6 +245,29 @@ max_parallelism = 0
     assert!(error
         .to_string()
         .contains("runtime max_parallelism must be between 1 and 256"));
+}
+
+#[test]
+fn zippy_config_rejects_query_buffer_budget_above_runtime_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_query_buffer_bytes = 67108864
+
+[query]
+max_buffered_bytes = 134217728
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("query max_buffered_bytes must not exceed runtime max_query_buffer_bytes"));
 }
 
 #[test]

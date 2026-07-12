@@ -28,7 +28,8 @@ use zippy_core::{
     LogConfig, MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
     SegmentTableView, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode, SourceSink,
     StreamHello, StreamInfo, ZippyConfig, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
-    DEFAULT_MAX_PARALLELISM, MAX_PARALLELISM,
+    DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES, DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+    MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
 use zippy_engines::{
     AuctionPolicy as RustAuctionPolicy, BarGeneratorEngine as RustBarGeneratorEngine,
@@ -2021,12 +2022,14 @@ struct GatewayServer {
     endpoint: Mutex<String>,
     max_parallelism: usize,
     query_parallelism: usize,
+    max_query_buffer_bytes: usize,
+    query_max_buffered_bytes: usize,
 }
 
 #[pymethods]
 impl GatewayServer {
     #[new]
-    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None, max_connections=None, max_subscribers=None, max_blocking_requests=None, write_timeout_ms=None, max_parallelism=DEFAULT_MAX_PARALLELISM, query_parallelism=DEFAULT_MAX_PARALLELISM))]
+    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None, max_connections=None, max_subscribers=None, max_blocking_requests=None, write_timeout_ms=None, max_parallelism=DEFAULT_MAX_PARALLELISM, query_parallelism=DEFAULT_MAX_PARALLELISM, max_query_buffer_bytes=DEFAULT_MAX_QUERY_BUFFER_BYTES, query_max_buffered_bytes=DEFAULT_QUERY_MAX_BUFFERED_BYTES))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: String,
@@ -2039,6 +2042,8 @@ impl GatewayServer {
         write_timeout_ms: Option<u64>,
         max_parallelism: usize,
         query_parallelism: usize,
+        max_query_buffer_bytes: usize,
+        query_max_buffered_bytes: usize,
     ) -> PyResult<Self> {
         if max_parallelism == 0 || max_parallelism > MAX_PARALLELISM {
             return Err(py_value_error(format!(
@@ -2050,6 +2055,18 @@ impl GatewayServer {
             return Err(py_value_error(format!(
                 "query parallelism must be between 1 and max_parallelism value=[{}] max_parallelism=[{}]",
                 query_parallelism, max_parallelism
+            )));
+        }
+        if max_query_buffer_bytes == 0 || max_query_buffer_bytes > MAX_QUERY_BUFFER_BYTES {
+            return Err(py_value_error(format!(
+                "max_query_buffer_bytes must be between 1 and {} value=[{}]",
+                MAX_QUERY_BUFFER_BYTES, max_query_buffer_bytes
+            )));
+        }
+        if query_max_buffered_bytes == 0 || query_max_buffered_bytes > max_query_buffer_bytes {
+            return Err(py_value_error(format!(
+                "query max_buffered_bytes must be between 1 and max_query_buffer_bytes value=[{}] max_query_buffer_bytes=[{}]",
+                query_max_buffered_bytes, max_query_buffer_bytes
             )));
         }
         let master_endpoint = match master {
@@ -2072,6 +2089,8 @@ impl GatewayServer {
             endpoint: Mutex::new(endpoint),
             max_parallelism,
             query_parallelism,
+            max_query_buffer_bytes,
+            query_max_buffered_bytes,
         })
     }
 
@@ -2087,10 +2106,12 @@ impl GatewayServer {
             .ok_or_else(|| py_runtime_error("gateway server cannot be restarted after stop"))?;
         let server = py
             .allow_threads(|| {
-                RustGatewayServer::new_with_parallelism(
+                RustGatewayServer::new_with_query_limits(
                     config,
                     self.max_parallelism,
                     self.query_parallelism,
+                    self.max_query_buffer_bytes,
+                    self.query_max_buffered_bytes,
                 )
                 .and_then(RustGatewayServer::start)
             })
@@ -2119,6 +2140,8 @@ impl GatewayServer {
                     "running": false,
                     "max_parallelism": self.max_parallelism,
                     "query_parallelism": self.query_parallelism,
+                    "max_query_buffer_bytes": self.max_query_buffer_bytes,
+                    "query_max_buffered_bytes": self.query_max_buffered_bytes,
                 })
             });
         serde_json_value_to_py(py, &metrics)

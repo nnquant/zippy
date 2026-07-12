@@ -2,7 +2,7 @@
 
 日期：2026-05-12
 
-最近更新：2026-07-12
+最近更新：2026-07-13
 
 依据：`docs/performance_audit_findings_2026-05-12.md`
 
@@ -21,7 +21,7 @@
 | P006 Latest/KeyValue 更新触发大状态重建 | 部分修复，剩余继续处理 | `ReactiveLatestEngine` 不再每批 clone 全量 latest map；KeyValue 在容量允许时原地 rewrite active snapshot；slot-level 增量更新留待专项。 |
 | P007 ReactiveState 多因子中间 batch 与 O(window) rolling | 部分修复，剩余继续处理 | rolling mean/std 改为 per-id running sum/sumsq；factor 中间 batch 重建留待专项。 |
 | P008 Arrow bridge 物化 segment 行范围 | 部分修复，剩余继续处理 | `RowSpanView` 支持 projection batch 和 chunked reader；Gateway live `collect(stream=True)` 接入 segment chunked producer；zero-copy 留待专项。 |
-| P009 persisted parquet scan 串行与 filter 读后执行 | 已修复 streaming persisted scan 基础路径，row-group pruning 留待后续 | persisted streaming collect 支持按文件有界并行扫描、确定性输出顺序和逐 batch filter/project。 |
+| P009 persisted parquet scan 串行与 filter 读后执行 | 已修复默认 streaming persisted scan；row-range budget 留待后续 | persisted streaming collect 支持 row-group pruning、有界并行、逐 batch channel、确定性顺序和 byte budget。 |
 | P010 Gateway write 全局 writers mutex 包住 flush | 已修复核心锁耦合，writer actor 留待真实指标决策 | writer map 改为 per-stream writer handle；已有 writer 的 `on_data/on_flush` 不再持有全局 map 锁；metrics 已覆盖 writer lock/on_data/flush/descriptor publish 分段耗时。 |
 | P011 subscribe 固定 sleep 轮询 | 已修复核心轮询路径 | subscribe 空闲等待接入 active segment mmap notification；gateway 内部写入 notifier 仅作为 descriptor 未就绪等启动路径兜底。 |
 | P012 benchmark 场景不能代表目标容量 | 部分修复，剩余跳过 | performance workflow 覆盖 3 个核心 profile；JSON 报告补充 git sha、target 和启动时间；完整容量矩阵仍需专项。 |
@@ -222,17 +222,24 @@
 - tail persisted scan 保留从新到旧读取文件和最终正序输出语义，同时按 chunk 过滤。
 - `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，并发由
   `[runtime].max_parallelism` 约束；`[query].parallelism` 可进一步收紧，默认窗口最多 4 个文件。
-- Gateway 复用固定大小 persisted scan worker pool；worker 数和有界待执行队列容量都由
-  `[runtime].max_parallelism` 控制，不再为每个 streaming collect 创建一组临时线程。
+- Gateway 复用固定大小 persisted scan worker pool；worker 数由 `[runtime].max_parallelism`
+  控制，不再为每个 streaming collect 创建一组临时线程。每个 cursor 一次只推进一个 reader
+  batch 后重新排队，慢客户端不会长期占用 worker。
 - 默认 pure persisted producer 构造阶段只解析 schema、筛选 catalog 条目并校验路径，不打开或读取
   parquet；Gateway 先发送 `collect_start`，第一次请求 batch 时才提交第一波 scan jobs。
 - 每条查询使用滑动 in-flight 文件窗口。结果按 file index 缓冲并严格按 catalog 顺序输出；每消费
   完一个文件才释放一个槽位并补充一个新任务，使 worker 持续工作，同时保证运行中、乱序完成和
   待发送的文件总数不超过查询并行度。慢客户端的 socket write backpressure 会限制后续文件预取。
+- 单文件结果改为容量为 1 的 batch channel；worker 不再收集完整文件的 filtered batches。channel
+  已持有 batch 时 cursor 让出 worker 并短暂 backoff，当前 catalog 文件按 batch 消费。
+- `[runtime].max_query_buffer_bytes` 默认 `512 MiB`，为所有 persisted streaming 查询提供全局
+  admission；`[query].max_buffered_bytes` 默认 `128 MiB`，并均分给当前查询的活跃文件槽位。
+- 每个 buffered batch 按 Arrow `get_array_memory_size()` 申请槽位额度，生命周期随 batch 发送和
+  释放；单 batch 超过槽位额度时明确报错，不允许静默突破预算。
 - duplicate/stale/index mismatch 和 worker panic 都映射为 `ZippyError`；客户端中断时 producer
   取消标志会让尚未执行的 jobs 直接跳过，并丢弃已取消查询的完成结果。
 - `collect_end.metrics` 新增 `file_scan_parallelism`、`max_in_flight_file_scans`，并保留
-  `max_pending_file_results`，可核对配置预算和实际峰值是否满足边界。
+  `max_pending_file_results`；同时记录 query/file budget、当前/峰值 buffered bytes 及额度等待时间。
 - head/tail/slice streaming 路径继续使用面向行范围的专用最小读取 helper，避免为了统一实现而扫描
   明知不需要的文件；默认无行范围路径使用消费驱动扫描器。
 - tail helper 修复了单文件跨多个 parquet reader batch 时的 batch 顺序反转问题。
@@ -242,8 +249,11 @@
 - 支持的数值比较和 `is_in` 会先使用 parquet row-group min/max statistics 做保守 pruning；不支持的
   表达式或统计类型会保守读取，并在 Arrow batch 上执行精确 filter。
 - `scanned_rows` 仍表示 projection 后、filter 前的实际扫描行数，指标语义保持不变。
-- 当前内存边界按“文件数”而不是“字节数”定义：单个 worker 仍会收集一个 parquet 文件的 filtered
-  reader batches 后再交给 ordered producer。超大单文件需要后续改成 batch channel + byte budget。
+- byte budget 覆盖已经生成并保留的 Arrow batches；Parquet decoder 必须先构造一个 batch 才能得知
+  精确大小，因此每个运行 worker 仍可能额外短暂持有一个尚未入账的 decoder batch。
+- Arrow IPC 编码期间 batch 与 payload 会短暂并存，payload 不计入本轮 Arrow buffer budget。
+- head/tail/slice 仍使用按行范围最小化读取的 materialized helper，不走默认 pure persisted batch
+  channel；超大 row-range 请求需要后续统一到 byte-budget producer。
 - parquet reader batch size 固定为 1024 行；读取 parallelism 已统一到 zippy query 配置。
 
 ### P010 Gateway per-stream writer lock
@@ -320,7 +330,8 @@
 
 这些项目不适合在本轮直接改代码，因为它们会改变架构边界或核心状态模型：
 
-- Gateway 查询协议：P002/P009 的单文件 batch/byte budget 和 mixed persisted + live streaming。
+- Gateway 查询协议：P002/P009 的 row-range/IPC payload byte budget 和 mixed persisted + live
+  streaming。
 - engine 状态存储模型：P004/P005/P006/P007 剩余项。
 - segment/Arrow 读侧内存模型：P008 剩余项。
 - Gateway 写入调度：P010 的 writer actor 是否值得引入需要基于分段 metrics 评估。
@@ -329,7 +340,7 @@
 
 建议后续拆成六个专项：
 
-1. Gateway persisted 单文件 batch channel + byte budget。
+1. Gateway persisted row-range producer + IPC payload byte budget。
 2. Engine columnar state model。
 3. Segment Arrow zero-copy/chunked reader。
 4. Gateway writer metrics 采样 + per-stream writer actor 决策。

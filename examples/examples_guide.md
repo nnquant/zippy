@@ -30,16 +30,22 @@ uv run zippy stream ls --uri default
 ```toml
 [runtime]
 max_parallelism = 4
+max_query_buffer_bytes = 536870912
 
 # 可选：查询预算默认继承 runtime.max_parallelism
 [query]
 parallelism = 2
+max_buffered_bytes = 134217728
 ```
 
 也可以用环境变量临时覆盖：
 
 ```bash
-ZIPPY_MAX_PARALLELISM=8 ZIPPY_QUERY_PARALLELISM=4 uv run zippy master run default
+ZIPPY_MAX_PARALLELISM=8 \
+ZIPPY_QUERY_PARALLELISM=4 \
+ZIPPY_MAX_QUERY_BUFFER_BYTES=536870912 \
+ZIPPY_QUERY_MAX_BUFFERED_BYTES=134217728 \
+uv run zippy master run default
 ```
 
 `ZIPPY_MAX_PARALLELISM` 覆盖 `[runtime].max_parallelism`；`ZIPPY_QUERY_PARALLELISM`
@@ -48,7 +54,13 @@ ZIPPY_MAX_PARALLELISM=8 ZIPPY_QUERY_PARALLELISM=4 uv run zippy master run defaul
 `shard_nums="auto"`；查询预算限制本地 persisted Parquet 文件读取、逻辑分片查询
 fan-out 和 native Gateway persisted 文件扫描。
 
-这是单次查询上限；多个进程或多个并发查询仍各自拥有预算，需要结合 Gateway 的
+persisted streaming 的进程级 Arrow 缓冲预算默认是 `512 MiB`，单查询默认是 `128 MiB`。
+单查询额度从全局额度中 admission，随后均分给活跃文件扫描槽位；默认并行度 4 时每槽约
+`32 MiB`。这两个值限制 buffered Arrow batches，不包括 Parquet decoder 正在构造的一个临时
+batch，也不包括已经编码的网络 payload。
+
+`query.max_buffered_bytes` 是单次查询上限；同一 Gateway 进程内的并发查询共享
+`runtime.max_query_buffer_bytes`，不同进程各自拥有一份全局预算。仍需结合 Gateway 的
 `max_blocking_requests` 和实际磁盘能力控制总负载。
 
 多文件历史查询和逻辑分片查询通常能从更高并行度获益；单文件的 `head()`、`tail()`、

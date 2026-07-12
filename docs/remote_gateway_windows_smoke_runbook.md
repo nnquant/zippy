@@ -40,6 +40,10 @@ port = 17690
 
 [runtime]
 max_parallelism = 4
+max_query_buffer_bytes = 536870912
+
+[query]
+max_buffered_bytes = 134217728
 
 [gateway]
 enabled = true
@@ -54,6 +58,9 @@ protocol_version = 1
 - `runtime.max_parallelism = 4`：限制进程级并行度和 Gateway worker 数；查询默认继承该值；
   如需单独收紧查询，可配置 `[query].parallelism` 或 `ZIPPY_QUERY_PARALLELISM`，但不得
   超过全局上限；
+- `runtime.max_query_buffer_bytes = 536870912`：所有 persisted streaming 查询合计最多 admission
+  `512 MiB` Arrow 缓冲；单查询默认 `128 MiB`，可通过 `[query].max_buffered_bytes` 或
+  `ZIPPY_QUERY_MAX_BUFFERED_BYTES` 收紧；
 - gateway 默认监听地址从 master TCP 配置推导，端口为 `master.port + 1`；
 - `token`：GatewayServer 的轻量访问令牌，Windows client 会从 master config 自动发现；
 - `protocol_version`：当前协议版本，第一版固定为 `1`。

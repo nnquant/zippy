@@ -108,9 +108,11 @@ port = 17690
 
 [runtime]
 max_parallelism = 4
+max_query_buffer_bytes = 536870912
 
 [query]
 parallelism = 2
+max_buffered_bytes = 134217728
 
 [gateway]
 enabled = true
@@ -126,18 +128,30 @@ worker 数和 persisted file scan 共享 worker pool 大小。`[query].paralleli
 多个并发 collect 请求各自拥有这个预算，进程总负载还受 Gateway
 `max_blocking_requests` 限制。
 
+`[runtime].max_query_buffer_bytes` 是 Gateway persisted streaming 查询的进程级 Arrow
+缓冲 admission 上限，默认 `512 MiB`；`[query].max_buffered_bytes` 是单查询上限，默认
+`128 MiB`，且不得超过全局值。对应环境变量是 `ZIPPY_MAX_QUERY_BUFFER_BYTES` 和
+`ZIPPY_QUERY_MAX_BUFFERED_BYTES`。单查询开始读取前从全局额度中保留自己的上限，结束、错误或
+客户端断开时归还，因此默认最多同时容纳 4 条达到上限的重查询。
+
 pure persisted `collect(stream=True)` 在完成 schema 和 catalog 路径校验后先发送
 `collect_start`，第一次拉取 batch 时才提交文件读取。每条查询最多提交
 `query.parallelism` 个文件进入滑动 in-flight 窗口；结果即使乱序完成，也严格按 catalog
-顺序输出。每消费完一个文件才释放一个窗口槽位并补充一个新任务，使 worker 持续工作，同时
-保证运行中、乱序完成和待发送的文件总数不超过查询并行度；因此 socket 写背压会直接限制
-后续文件预取。共享 scan pool 的待执行队列容量等于 `runtime.max_parallelism`，不会随查询数或
-匹配文件数无界增长。
+顺序输出。每个文件通过容量为 1 的 batch channel 逐批交付；非当前文件最多预留一个待消费
+batch，channel 满后 scan cursor 让出共享 worker 并重新排队。单查询字节额度均分给活跃文件
+槽位，batch 的 Arrow memory size 超过槽位额度时查询明确失败，不会突破 retained-batch
+上限。每消费完一个文件才释放窗口槽位并补充新任务，因此 socket 写背压会直接限制后续文件
+预取。共享 pool 每次只让 cursor 推进一个 reader batch，运行 worker 数受
+`runtime.max_parallelism` 限制；排队 cursor 数受已 admission 的查询数和各查询文件窗口共同
+约束，不随匹配文件总数增长。
 
 `collect_end.metrics` 中的 `file_scan_parallelism`、`max_in_flight_file_scans` 和
 `max_pending_file_results` 分别表示单查询配置预算、实际峰值 in-flight 文件数和乱序结果
-缓冲峰值。`head`、`tail`、`slice` 继续使用面向行范围的专用最小读取路径；默认无行范围的
-pure persisted 查询使用上述消费驱动流式路径。
+缓冲峰值。`query_buffer_budget_bytes`、`file_buffer_budget_bytes`、`buffered_bytes`、
+`max_buffered_bytes`、`buffer_wait_elapsed_ms` 和 `global_buffer_wait_elapsed_ms` 用于核对字节
+额度；`first_chunk_elapsed_ms` 用于观察 admission、首文件扫描、编码和首次写出的合计延迟。
+`head`、`tail`、`slice` 继续使用面向行范围的专用最小读取路径；默认无行范围的 pure persisted
+查询使用上述消费驱动流式路径。
 
 默认不需要配置 gateway 的 `host` / `port`：当 master 是 TCP endpoint 时，
 GatewayServer endpoint 从 master endpoint 推导，端口为 `master.port + 1`。高级场景

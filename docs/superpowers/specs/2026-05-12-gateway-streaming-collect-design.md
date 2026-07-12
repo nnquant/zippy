@@ -115,9 +115,11 @@ GatewayPersistedScanTask {
 
 实现使用两级配置和一个共享池：
 
-- `[runtime].max_parallelism`：Gateway persisted scan 共享 worker pool 大小，同时也是有界 job
-  queue 的容量，默认 `4`。
+- `[runtime].max_parallelism`：Gateway persisted scan 共享 worker pool 大小，默认 `4`。
 - `[query].parallelism`：单条查询滑动 in-flight 窗口的最大文件数；省略时继承 runtime 上限。
+- `[runtime].max_query_buffer_bytes`：所有 persisted streaming 查询的 Arrow buffer admission，默认
+  `512 MiB`。
+- `[query].max_buffered_bytes`：单查询 Arrow buffer 上限，默认 `128 MiB`，均分给活跃文件槽位。
 - `max_blocking_requests`：限制同时运行的 blocking producer steps；stream 已经开始后等待 permit，
   不因瞬时资源竞争返回半途错误。
 
@@ -131,10 +133,14 @@ producer 构造阶段会筛选 catalog 条目并校验路径，但不打开 parq
 - `next_file_index`
 - `pending_file_results`
 
-当 worker 完成某个文件：
+每个文件拥有容量为 1 的 batch channel 和独立 byte budget。scan cursor 每次最多读取、过滤并
+发送一个 batch，随后回到共享 work queue；channel 已占用时 cursor 短暂 backoff 并让出 worker，
+不再聚合完整文件结果，也不会让慢客户端固定占住扫描线程。
 
-- 如果 `file_index == next_file_index`，立即输出该文件 batches。
-- 如果不是下一个 index，暂存到当前波次的 bounded pending buffer。
+输出端：
+
+- 只消费 `next_file_index` 对应 channel，保持 catalog order。
+- 后续文件最多各保留一个 channel batch，不能绕过当前文件输出。
 - 每消费完一个文件才释放一个窗口槽位并补充一个新任务。运行中、乱序完成和待发送的文件总数
   始终不超过 `query.parallelism`；慢客户端不会触发窗口之外的文件读取。
 
@@ -172,7 +178,7 @@ producer 构造阶段会筛选 catalog 条目并校验路径，但不打开 parq
 - parquet scan/filter/encode 的 blocking 工作通过 bounded producer 执行。
 - 写 socket 时不持有全局 `blocking_limit` permit。
 - 慢客户端通过 socket write backpressure 限速 producer。
-- pending result buffer 有上限，达到上限后 scan worker 等待消费。
+- pending result buffer 有上限；达到上限后 scan cursor 让出 worker，等待后续公平调度。
 - 客户端断开后停止调度新文件，并丢弃尚未发送的结果。
 
 初版增加或复用以下限额：
@@ -210,6 +216,13 @@ producer 构造阶段会筛选 catalog 条目并校验路径，但不打开 parq
 - `file_scan_parallelism`
 - `max_in_flight_file_scans`
 - `max_pending_file_results`
+- `query_buffer_budget_bytes`
+- `file_buffer_budget_bytes`
+- `buffered_bytes`
+- `max_buffered_bytes`
+- `buffer_wait_elapsed_ms`
+- `global_buffer_wait_elapsed_ms`
+- `first_chunk_elapsed_ms`
 - `materialized_live_batches`
 
 普通 `collect()` metrics 不需要在本专项中改名或改变语义。

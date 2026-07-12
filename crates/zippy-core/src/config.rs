@@ -14,6 +14,9 @@ pub const DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES: usize = 8;
 pub const DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_MAX_PARALLELISM: usize = 4;
 pub const MAX_PARALLELISM: usize = 256;
+pub const DEFAULT_MAX_QUERY_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+pub const DEFAULT_QUERY_MAX_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
+pub const MAX_QUERY_BUFFER_BYTES: usize = u32::MAX as usize;
 const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%m%d%H"];
 
 /// Process-wide Zippy runtime configuration.
@@ -35,20 +38,28 @@ pub struct ZippyConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyRuntimeConfig {
     pub max_parallelism: usize,
+    #[serde(default = "default_max_query_buffer_bytes")]
+    pub max_query_buffer_bytes: usize,
 }
 
 impl Default for ZippyRuntimeConfig {
     fn default() -> Self {
         Self {
             max_parallelism: DEFAULT_MAX_PARALLELISM,
+            max_query_buffer_bytes: DEFAULT_MAX_QUERY_BUFFER_BYTES,
         }
     }
+}
+
+fn default_max_query_buffer_bytes() -> usize {
+    DEFAULT_MAX_QUERY_BUFFER_BYTES
 }
 
 /// Optional query-specific override of the process-wide parallelism limit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyQueryConfig {
     pub parallelism: Option<usize>,
+    pub max_buffered_bytes: Option<usize>,
 }
 
 /// Master control endpoint defaults.
@@ -164,11 +175,13 @@ struct PartialZippyConfig {
 #[derive(Debug, Deserialize)]
 struct PartialRuntimeConfig {
     max_parallelism: Option<usize>,
+    max_query_buffer_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PartialQueryConfig {
     parallelism: Option<usize>,
+    max_buffered_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +305,9 @@ impl ZippyConfig {
             if let Some(max_parallelism) = runtime.max_parallelism {
                 self.runtime.max_parallelism = max_parallelism;
             }
+            if let Some(max_query_buffer_bytes) = runtime.max_query_buffer_bytes {
+                self.runtime.max_query_buffer_bytes = max_query_buffer_bytes;
+            }
         }
         if let Some(master) = partial.master {
             if let Some(host) = master.host {
@@ -389,6 +405,9 @@ impl ZippyConfig {
             if let Some(parallelism) = query.parallelism {
                 self.query.parallelism = Some(parallelism);
             }
+            if let Some(max_buffered_bytes) = query.max_buffered_bytes {
+                self.query.max_buffered_bytes = Some(max_buffered_bytes);
+            }
         }
         Ok(())
     }
@@ -396,6 +415,10 @@ impl ZippyConfig {
     fn apply_env(&mut self) -> Result<()> {
         if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
             self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_MAX_QUERY_BUFFER_BYTES") {
+            self.runtime.max_query_buffer_bytes =
+                parse_usize_env("ZIPPY_MAX_QUERY_BUFFER_BYTES", &value)?;
         }
         if let Some(host) = env_string("ZIPPY_MASTER_HOST") {
             self.master.host = Some(non_empty(host, "ZIPPY_MASTER_HOST")?);
@@ -432,6 +455,10 @@ impl ZippyConfig {
         }
         if let Some(value) = env_string("ZIPPY_QUERY_PARALLELISM") {
             self.query.parallelism = Some(parse_usize_env("ZIPPY_QUERY_PARALLELISM", &value)?);
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_MAX_BUFFERED_BYTES") {
+            self.query.max_buffered_bytes =
+                Some(parse_usize_env("ZIPPY_QUERY_MAX_BUFFERED_BYTES", &value)?);
         }
         if let Some(value) = env_string("ZIPPY_TABLE_ROW_CAPACITY") {
             self.table.row_capacity =
@@ -575,6 +602,31 @@ impl ZippyConfig {
                 });
             }
         }
+        if self.runtime.max_query_buffer_bytes == 0
+            || self.runtime.max_query_buffer_bytes > MAX_QUERY_BUFFER_BYTES
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "runtime max_query_buffer_bytes must be between 1 and {} value=[{}]",
+                    MAX_QUERY_BUFFER_BYTES, self.runtime.max_query_buffer_bytes
+                ),
+            });
+        }
+        if let Some(max_buffered_bytes) = self.query.max_buffered_bytes {
+            if max_buffered_bytes == 0 {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "query max_buffered_bytes must be greater than zero".to_string(),
+                });
+            }
+            if max_buffered_bytes > self.runtime.max_query_buffer_bytes {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "query max_buffered_bytes must not exceed runtime max_query_buffer_bytes value=[{}] max_query_buffer_bytes=[{}]",
+                        max_buffered_bytes, self.runtime.max_query_buffer_bytes
+                    ),
+                });
+            }
+        }
         if self.table.row_capacity == 0 {
             return Err(ZippyError::InvalidConfig {
                 reason: "table row_capacity must be greater than zero".to_string(),
@@ -640,6 +692,14 @@ impl ZippyConfig {
         self.query
             .parallelism
             .unwrap_or(self.runtime.max_parallelism)
+    }
+
+    /// Return the effective per-query buffered Arrow byte limit.
+    pub fn query_max_buffered_bytes(&self) -> usize {
+        self.query
+            .max_buffered_bytes
+            .unwrap_or(DEFAULT_QUERY_MAX_BUFFERED_BYTES)
+            .min(self.runtime.max_query_buffer_bytes)
     }
 }
 

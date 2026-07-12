@@ -205,7 +205,7 @@ fn start_gateway_if_enabled(
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "gateway endpoint is required when gateway is enabled".to_string(),
             })?;
-    let gateway = GatewayServer::new_with_parallelism(
+    let gateway = GatewayServer::new_with_query_limits(
         GatewayServerConfig {
             endpoint,
             master_endpoint: control_endpoint.clone(),
@@ -218,6 +218,8 @@ fn start_gateway_if_enabled(
         },
         runtime_config.runtime.max_parallelism,
         runtime_config.query_parallelism(),
+        runtime_config.runtime.max_query_buffer_bytes,
+        runtime_config.query_max_buffered_bytes(),
     )?
     .start()?;
     let (host, port) = gateway_endpoint_host_port(gateway.endpoint());
@@ -230,6 +232,8 @@ fn start_gateway_if_enabled(
         port = port.as_str(),
         max_parallelism = runtime_config.runtime.max_parallelism,
         query_parallelism = runtime_config.query_parallelism(),
+        max_query_buffer_bytes = runtime_config.runtime.max_query_buffer_bytes,
+        query_max_buffered_bytes = runtime_config.query_max_buffered_bytes(),
         "started zippy gateway"
     );
     Ok(Some(gateway))

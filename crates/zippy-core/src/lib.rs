@@ -31,8 +31,9 @@ pub use config::{
     default_config_path, ZippyConfig, ZippyGatewayConfig, ZippyLogConfig, ZippyQueryConfig,
     ZippyRuntimeConfig, ZippyTableConfig, ZippyTablePersistConfig,
     ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL,
-    DEFAULT_MAX_PARALLELISM, DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD,
-    DEFAULT_TABLE_ROW_CAPACITY, MAX_PARALLELISM,
+    DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES, DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+    DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
+    MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
 pub use control_transport::{connect_control_endpoint, send_control_line_request, ControlStream};
 pub use endpoint::{

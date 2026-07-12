@@ -261,9 +261,11 @@ port = {}
 
 [query]
 parallelism = 7
+max_buffered_bytes = 67108864
 
 [runtime]
 max_parallelism = 8
+max_query_buffer_bytes = 268435456
 
 [gateway]
 enabled = true
@@ -296,6 +298,9 @@ token = "dev-token"
     assert_eq!(response["metrics"]["requests_total"], 1);
     assert_eq!(response["metrics"]["max_parallelism"], 8);
     assert_eq!(response["metrics"]["query_parallelism"], 7);
+    assert_eq!(response["metrics"]["max_query_buffer_bytes"], 268435456);
+    assert_eq!(response["metrics"]["query_max_buffered_bytes"], 67108864);
+    assert_eq!(response["metrics"]["query_buffer_reserved_bytes"], 0);
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);

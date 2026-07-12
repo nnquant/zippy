@@ -1119,7 +1119,7 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
     let (master, master_thread) =
         spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
     let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
-    let gateway = GatewayServer::new_with_parallelism(
+    let gateway = GatewayServer::new_with_query_limits(
         GatewayServerConfig {
             endpoint: gateway_endpoint.clone(),
             master_endpoint: master_endpoint.clone(),
@@ -1132,6 +1132,8 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
         },
         4,
         1,
+        4096,
+        1024,
     )
     .unwrap()
     .start()
@@ -1272,7 +1274,93 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
             .unwrap()
             <= 1
     );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["query_buffer_budget_bytes"],
+        json!(1024)
+    );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["file_buffer_budget_bytes"],
+        json!(1024)
+    );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["buffered_bytes"],
+        json!(0)
+    );
+    assert!(
+        frames.last().unwrap().0["metrics"]["max_buffered_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        frames.last().unwrap().0["metrics"]["first_chunk_elapsed_ms"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(
+        frames.last().unwrap().0["metrics"]["max_buffered_bytes"]
+            .as_u64()
+            .unwrap()
+            <= 1024
+    );
     assert_eq!(gateway.metrics()["collect_requests_total"], json!(2));
+    assert_eq!(gateway.metrics()["max_query_buffer_bytes"], json!(4096));
+    assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
+
+    let oversized_path = temp.path().join("oversized.parquet");
+    let oversized_schema =
+        std::sync::Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+    let oversized_batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&oversized_schema),
+        vec![std::sync::Arc::new(Int64Array::from_iter_values(
+            0_i64..1024,
+        ))],
+    )
+    .unwrap();
+    write_parquet_batch(&oversized_path, &oversized_batch);
+    client
+        .register_stream("stream_budget_error_ticks", oversized_schema, 64, 4096)
+        .unwrap();
+    client
+        .register_source(
+            "stream_budget_error_source",
+            "test",
+            "stream_budget_error_ticks",
+            json!({}),
+        )
+        .unwrap();
+    client
+        .publish_persisted_file(
+            "stream_budget_error_ticks",
+            json!({
+                "file_path": oversized_path.to_string_lossy(),
+                "row_count": oversized_batch.num_rows(),
+                "source_segment_id": 1,
+                "source_generation": 0
+            }),
+        )
+        .unwrap();
+
+    let error_frames = send_gateway_stream_frames(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect_stream",
+            "source": "stream_budget_error_ticks",
+            "token": "dev-token",
+            "chunk_rows": 1024,
+            "plan": []
+        }),
+        vec![],
+    );
+
+    assert_eq!(error_frames.first().unwrap().0["kind"], "collect_start");
+    assert_eq!(error_frames.last().unwrap().0["kind"], "collect_error");
+    assert!(error_frames.last().unwrap().0["reason"]
+        .as_str()
+        .unwrap()
+        .contains("persisted scan batch exceeds file buffer budget"));
+    assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
 
     gateway.stop();
     master.shutdown();

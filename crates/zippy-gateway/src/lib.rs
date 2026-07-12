@@ -5,7 +5,7 @@ use std::net::{TcpListener as StdTcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -25,7 +25,9 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::{
-    arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+    arrow_reader::{
+        ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+    },
     ProjectionMask,
 };
 use parquet::file::statistics::Statistics;
@@ -40,7 +42,8 @@ use zippy_core::{
     ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
     ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
     RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
-    UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM, MAX_PARALLELISM,
+    UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES,
+    DEFAULT_QUERY_MAX_BUFFERED_BYTES, MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
@@ -102,7 +105,10 @@ struct GatewayState {
     max_blocking_requests: usize,
     max_parallelism: usize,
     query_parallelism: usize,
+    max_query_buffer_bytes: usize,
+    query_max_buffered_bytes: usize,
     persisted_scan_pool: Arc<GatewayPersistedScanPool>,
+    persisted_buffer_limit: Arc<tokio::sync::Semaphore>,
     write_timeout: Duration,
 }
 
@@ -175,6 +181,13 @@ struct GatewayCollectStreamMetrics {
     file_scan_parallelism: usize,
     max_in_flight_file_scans: usize,
     max_pending_file_results: usize,
+    query_buffer_budget_bytes: usize,
+    file_buffer_budget_bytes: usize,
+    buffered_bytes: usize,
+    max_buffered_bytes: usize,
+    buffer_wait_elapsed_ms: f64,
+    global_buffer_wait_elapsed_ms: f64,
+    first_chunk_elapsed_ms: f64,
     materialized_live_batches: usize,
     segment_streamed_batches: usize,
     segment_streamed_rows: usize,
@@ -268,15 +281,209 @@ struct GatewayPersistedScanThreadResult {
     result: Result<GatewayPersistedScanResult>,
 }
 
+#[derive(Default)]
+struct GatewayBufferedBytesTracker {
+    current_bytes: AtomicUsize,
+    max_bytes: AtomicUsize,
+    wait_nanos: AtomicU64,
+}
+
+impl GatewayBufferedBytesTracker {
+    fn reserve(&self, bytes: usize) {
+        let current = self.current_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.max_bytes.fetch_max(current, Ordering::AcqRel);
+    }
+
+    fn add_wait(&self, waited: Duration) {
+        let wait_nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        self.wait_nanos.fetch_add(wait_nanos, Ordering::Relaxed);
+    }
+
+    fn release(&self, bytes: usize) {
+        let previous = self.current_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        assert!(previous >= bytes, "gateway buffered byte tracker underflow");
+    }
+
+    fn update_metrics(&self, metrics: &mut GatewayCollectStreamMetrics) {
+        metrics.buffered_bytes = self.current_bytes.load(Ordering::Acquire);
+        metrics.max_buffered_bytes = metrics
+            .max_buffered_bytes
+            .max(self.max_bytes.load(Ordering::Acquire));
+        metrics.buffer_wait_elapsed_ms =
+            self.wait_nanos.load(Ordering::Acquire) as f64 / 1_000_000.0;
+    }
+}
+
+struct GatewayFileByteBudget {
+    limit_bytes: usize,
+    occupied: AtomicBool,
+    tracker: Arc<GatewayBufferedBytesTracker>,
+}
+
+impl GatewayFileByteBudget {
+    fn new(limit_bytes: usize, tracker: Arc<GatewayBufferedBytesTracker>) -> Result<Self> {
+        if limit_bytes == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "gateway persisted file buffer budget must be positive".to_string(),
+            });
+        }
+        Ok(Self {
+            limit_bytes,
+            occupied: AtomicBool::new(false),
+            tracker,
+        })
+    }
+
+    fn try_acquire_slot(self: &Arc<Self>) -> Option<GatewayFileSlotPermit> {
+        self.occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| GatewayFileSlotPermit {
+                budget: Arc::clone(self),
+            })
+    }
+
+    fn buffered_permit(
+        self: &Arc<Self>,
+        slot: GatewayFileSlotPermit,
+        bytes: usize,
+        file_index: usize,
+    ) -> Result<GatewayFileBytePermit> {
+        if bytes > self.limit_bytes {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "persisted scan batch exceeds file buffer budget file_index=[{}] batch_bytes=[{}] file_buffer_budget_bytes=[{}]",
+                    file_index, bytes, self.limit_bytes
+                ),
+            });
+        }
+        self.tracker.reserve(bytes);
+        Ok(GatewayFileBytePermit {
+            _slot: slot,
+            tracker: Arc::clone(&self.tracker),
+            bytes,
+        })
+    }
+}
+
+struct GatewayFileSlotPermit {
+    budget: Arc<GatewayFileByteBudget>,
+}
+
+impl Drop for GatewayFileSlotPermit {
+    fn drop(&mut self) {
+        let was_occupied = self.budget.occupied.swap(false, Ordering::AcqRel);
+        assert!(was_occupied, "gateway persisted file slot released twice");
+    }
+}
+
+struct GatewayFileBytePermit {
+    _slot: GatewayFileSlotPermit,
+    tracker: Arc<GatewayBufferedBytesTracker>,
+    bytes: usize,
+}
+
+impl Drop for GatewayFileBytePermit {
+    fn drop(&mut self) {
+        self.tracker.release(self.bytes);
+    }
+}
+
+struct GatewayPersistedBufferedBatch {
+    batch: RecordBatch,
+    _permit: Option<GatewayFileBytePermit>,
+}
+
+impl GatewayPersistedBufferedBatch {
+    fn materialized(batch: RecordBatch) -> Self {
+        Self {
+            batch,
+            _permit: None,
+        }
+    }
+}
+
+enum GatewayPersistedScanEvent {
+    Batch(GatewayPersistedBufferedBatch),
+    End {
+        file_index: usize,
+        scanned_rows: usize,
+    },
+    Error {
+        file_index: usize,
+        error: ZippyError,
+    },
+}
+
 struct GatewayPersistedScanJob {
     task: GatewayPersistedScanTask,
-    result_sender: mpsc::Sender<GatewayPersistedScanThreadResult>,
+    output_projection_columns: Option<Vec<String>>,
+    event_sender: mpsc::SyncSender<GatewayPersistedScanEvent>,
+    buffer_budget: Arc<GatewayFileByteBudget>,
     cancelled: Arc<AtomicBool>,
 }
 
+struct GatewayPersistedScanCursor {
+    task: GatewayPersistedScanTask,
+    output_projection_columns: Option<Vec<String>>,
+    event_sender: mpsc::SyncSender<GatewayPersistedScanEvent>,
+    buffer_budget: Arc<GatewayFileByteBudget>,
+    cancelled: Arc<AtomicBool>,
+    reader: ParquetRecordBatchReader,
+    scanned_rows: usize,
+    budget_wait_started: Option<Instant>,
+}
+
+enum GatewayPersistedScanWork {
+    Start(GatewayPersistedScanJob),
+    Continue(GatewayPersistedScanCursor),
+}
+
+impl GatewayPersistedScanWork {
+    fn identity(
+        &self,
+    ) -> (
+        usize,
+        mpsc::SyncSender<GatewayPersistedScanEvent>,
+        Arc<AtomicBool>,
+    ) {
+        match self {
+            Self::Start(job) => (
+                job.task.file_index,
+                job.event_sender.clone(),
+                Arc::clone(&job.cancelled),
+            ),
+            Self::Continue(cursor) => (
+                cursor.task.file_index,
+                cursor.event_sender.clone(),
+                Arc::clone(&cursor.cancelled),
+            ),
+        }
+    }
+}
+
+enum GatewayPersistedScanPoolMessage {
+    Work(GatewayPersistedScanWork),
+    Stop,
+}
+
+enum GatewayPersistedScanStep {
+    Complete,
+    Continue {
+        cursor: GatewayPersistedScanCursor,
+        backoff: bool,
+    },
+}
+
 struct GatewayPersistedScanPool {
-    sender: Mutex<Option<mpsc::SyncSender<GatewayPersistedScanJob>>>,
+    sender: Mutex<Option<mpsc::Sender<GatewayPersistedScanPoolMessage>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+struct GatewayPersistedScanResources {
+    pool: Arc<GatewayPersistedScanPool>,
+    parallelism: usize,
+    query_buffer_budget_bytes: usize,
 }
 
 impl GatewayPersistedScanPool {
@@ -286,36 +493,59 @@ impl GatewayPersistedScanPool {
                 reason: "gateway persisted scan worker count must be positive".to_string(),
             });
         }
-        let (sender, receiver) = mpsc::sync_channel::<GatewayPersistedScanJob>(worker_count);
+        let (sender, receiver) = mpsc::channel::<GatewayPersistedScanPoolMessage>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
+            let requeue_sender = sender.clone();
             let worker = thread::Builder::new()
                 .name(format!("zippy-query-{worker_index}"))
                 .spawn(move || loop {
-                    let job = {
+                    let message = {
                         let receiver = receiver.lock().unwrap();
                         receiver.recv()
                     };
-                    let Ok(job) = job else {
+                    let Ok(message) = message else {
                         break;
                     };
-                    if job.cancelled.load(Ordering::Acquire) {
+                    let GatewayPersistedScanPoolMessage::Work(work) = message else {
+                        break;
+                    };
+                    let (file_index, event_sender, cancelled) = work.identity();
+                    if cancelled.load(Ordering::Acquire) {
                         continue;
                     }
-                    let file_index = job.task.file_index;
                     let result =
-                        catch_unwind(AssertUnwindSafe(|| scan_persisted_file_task(job.task)))
+                        catch_unwind(AssertUnwindSafe(|| advance_persisted_scan_work(work)))
                             .unwrap_or_else(|_| {
                                 Err(ZippyError::Io {
                                     reason: "gateway persisted scan worker panicked".to_string(),
                                 })
                             });
-                    if !job.cancelled.load(Ordering::Acquire) {
-                        let _ = job
-                            .result_sender
-                            .send(GatewayPersistedScanThreadResult { file_index, result });
+                    match result {
+                        Ok(GatewayPersistedScanStep::Complete) => {}
+                        Ok(GatewayPersistedScanStep::Continue { cursor, backoff }) => {
+                            if backoff {
+                                thread::sleep(Duration::from_micros(100));
+                            }
+                            if requeue_sender
+                                .send(GatewayPersistedScanPoolMessage::Work(
+                                    GatewayPersistedScanWork::Continue(cursor),
+                                ))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            if !cancelled.load(Ordering::Acquire) {
+                                let _ = event_sender.try_send(GatewayPersistedScanEvent::Error {
+                                    file_index,
+                                    error,
+                                });
+                            }
+                        }
                     }
                 })
                 .map_err(|error| ZippyError::Io {
@@ -340,7 +570,9 @@ impl GatewayPersistedScanPool {
             .ok_or_else(|| ZippyError::Io {
                 reason: "gateway persisted scan pool is stopped".to_string(),
             })?
-            .send(job)
+            .send(GatewayPersistedScanPoolMessage::Work(
+                GatewayPersistedScanWork::Start(job),
+            ))
             .map_err(|_| ZippyError::Io {
                 reason: "gateway persisted scan pool disconnected".to_string(),
             })
@@ -349,7 +581,12 @@ impl GatewayPersistedScanPool {
 
 impl Drop for GatewayPersistedScanPool {
     fn drop(&mut self) {
-        self.sender.lock().unwrap().take();
+        let worker_count = self.workers.lock().unwrap().len();
+        if let Some(sender) = self.sender.lock().unwrap().take() {
+            for _ in 0..worker_count {
+                let _ = sender.send(GatewayPersistedScanPoolMessage::Stop);
+            }
+        }
         for worker in self.workers.lock().unwrap().drain(..) {
             let _ = worker.join();
         }
@@ -428,6 +665,38 @@ impl GatewayCollectStreamMetrics {
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or_default();
+            metrics.query_buffer_budget_bytes = object
+                .get("query_buffer_budget_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.file_buffer_budget_bytes = object
+                .get("file_buffer_budget_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.buffered_bytes = object
+                .get("buffered_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.max_buffered_bytes = object
+                .get("max_buffered_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_default();
+            metrics.buffer_wait_elapsed_ms = object
+                .get("buffer_wait_elapsed_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            metrics.global_buffer_wait_elapsed_ms = object
+                .get("global_buffer_wait_elapsed_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            metrics.first_chunk_elapsed_ms = object
+                .get("first_chunk_elapsed_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
         }
         metrics
     }
@@ -447,6 +716,13 @@ impl GatewayCollectStreamMetrics {
             "file_scan_parallelism": self.file_scan_parallelism,
             "max_in_flight_file_scans": self.max_in_flight_file_scans,
             "max_pending_file_results": self.max_pending_file_results,
+            "query_buffer_budget_bytes": self.query_buffer_budget_bytes,
+            "file_buffer_budget_bytes": self.file_buffer_budget_bytes,
+            "buffered_bytes": self.buffered_bytes,
+            "max_buffered_bytes": self.max_buffered_bytes,
+            "buffer_wait_elapsed_ms": self.buffer_wait_elapsed_ms,
+            "global_buffer_wait_elapsed_ms": self.global_buffer_wait_elapsed_ms,
+            "first_chunk_elapsed_ms": self.first_chunk_elapsed_ms,
             "materialized_live_batches": self.materialized_live_batches,
             "segment_streamed_batches": self.segment_streamed_batches,
             "segment_streamed_rows": self.segment_streamed_rows,
@@ -463,34 +739,35 @@ impl GatewayPersistedBatchSource {
     fn next_batch(
         &mut self,
         metrics: &mut GatewayCollectStreamMetrics,
-    ) -> Result<Option<RecordBatch>> {
+    ) -> Result<Option<GatewayPersistedBufferedBatch>> {
         match self {
-            Self::Materialized(batches) => Ok(batches.pop_front()),
+            Self::Materialized(batches) => Ok(batches
+                .pop_front()
+                .map(GatewayPersistedBufferedBatch::materialized)),
             Self::Streaming(scanner) => scanner.next_batch(metrics),
         }
     }
 }
 
-enum GatewayPersistedReadyItem {
-    Batch(RecordBatch),
-    FileEnd,
+struct GatewayPersistedFileStream {
+    file_index: usize,
+    file_path: String,
+    event_receiver: mpsc::Receiver<GatewayPersistedScanEvent>,
 }
 
 struct GatewayPersistedStreamScanner {
     pool: Arc<GatewayPersistedScanPool>,
     tasks: VecDeque<GatewayPersistedScanTask>,
-    file_paths: Vec<String>,
-    result_sender: mpsc::Sender<GatewayPersistedScanThreadResult>,
-    result_receiver: mpsc::Receiver<GatewayPersistedScanThreadResult>,
+    file_streams: VecDeque<GatewayPersistedFileStream>,
     cancelled: Arc<AtomicBool>,
     parallelism: usize,
-    in_flight: usize,
-    active_file_slots: usize,
     total_files: usize,
     next_file_index: usize,
-    pending: BTreeMap<usize, Result<GatewayPersistedScanResult>>,
-    ready_items: VecDeque<GatewayPersistedReadyItem>,
     output_projection_columns: Option<Vec<String>>,
+    query_buffer_budget_bytes: usize,
+    file_buffer_budget_bytes: usize,
+    buffered_bytes_tracker: Arc<GatewayBufferedBytesTracker>,
+    _global_buffer_reservation: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl GatewayPersistedStreamScanner {
@@ -500,6 +777,7 @@ impl GatewayPersistedStreamScanner {
         output_projection_columns: Option<&[String]>,
         pool: Arc<GatewayPersistedScanPool>,
         parallelism: usize,
+        query_buffer_budget_bytes: usize,
     ) -> Result<Self> {
         if parallelism == 0 {
             return Err(ZippyError::InvalidConfig {
@@ -520,129 +798,153 @@ impl GatewayPersistedStreamScanner {
                 scan_pushdown: scan_pushdown.clone(),
             })
             .collect::<VecDeque<_>>();
-        let (result_sender, result_receiver) = mpsc::channel();
+        if query_buffer_budget_bytes == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "gateway query buffer budget must be positive".to_string(),
+            });
+        }
+        let active_file_limit = parallelism.min(file_paths.len()).max(1);
+        let file_buffer_budget_bytes = query_buffer_budget_bytes / active_file_limit;
+        if file_buffer_budget_bytes == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "gateway query buffer budget is smaller than active file slots query_buffer_budget_bytes=[{}] active_file_slots=[{}]",
+                    query_buffer_budget_bytes, active_file_limit
+                ),
+            });
+        }
         Ok(Self {
             pool,
             tasks,
             total_files: file_paths.len(),
-            file_paths,
-            result_sender,
-            result_receiver,
+            file_streams: VecDeque::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
             parallelism,
-            in_flight: 0,
-            active_file_slots: 0,
             next_file_index: 0,
-            pending: BTreeMap::new(),
-            ready_items: VecDeque::new(),
             output_projection_columns: output_projection_columns.map(<[String]>::to_vec),
+            query_buffer_budget_bytes,
+            file_buffer_budget_bytes,
+            buffered_bytes_tracker: Arc::new(GatewayBufferedBytesTracker::default()),
+            _global_buffer_reservation: None,
         })
+    }
+
+    fn global_buffer_reservation_bytes(&self) -> usize {
+        if self.total_files == 0 {
+            0
+        } else {
+            self.query_buffer_budget_bytes
+        }
+    }
+
+    fn attach_global_buffer_reservation(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self._global_buffer_reservation = Some(permit);
     }
 
     fn next_batch(
         &mut self,
         metrics: &mut GatewayCollectStreamMetrics,
-    ) -> Result<Option<RecordBatch>> {
+    ) -> Result<Option<GatewayPersistedBufferedBatch>> {
         loop {
-            match self.ready_items.pop_front() {
-                Some(GatewayPersistedReadyItem::Batch(batch)) => return Ok(Some(batch)),
-                Some(GatewayPersistedReadyItem::FileEnd) => {
-                    self.active_file_slots =
-                        self.active_file_slots
-                            .checked_sub(1)
-                            .ok_or_else(|| ZippyError::Io {
-                                reason: "gateway persisted scan file slot underflow".to_string(),
-                            })?;
-                    self.schedule_available(metrics)?;
-                    continue;
-                }
-                None => {}
-            }
+            self.buffered_bytes_tracker.update_metrics(metrics);
             self.schedule_available(metrics)?;
-            self.move_ready_results(metrics)?;
-            if !self.ready_items.is_empty() {
-                continue;
-            }
-            if self.next_file_index == self.total_files
-                && self.in_flight == 0
-                && self.active_file_slots == 0
-            {
+            let Some(file_stream) = self.file_streams.front() else {
+                debug_assert_eq!(self.next_file_index, self.total_files);
+                self._global_buffer_reservation.take();
+                self.buffered_bytes_tracker.update_metrics(metrics);
                 return Ok(None);
-            }
-
-            let wait_started = Instant::now();
-            let thread_result = self.result_receiver.recv().map_err(|_| ZippyError::Io {
-                reason: "gateway persisted scan result channel disconnected".to_string(),
-            })?;
-            metrics.scan_elapsed_ms += wait_started.elapsed().as_secs_f64() * 1000.0;
-            self.in_flight = self
-                .in_flight
-                .checked_sub(1)
-                .ok_or_else(|| ZippyError::Io {
-                    reason: "gateway persisted scan in-flight counter underflow".to_string(),
-                })?;
-            if thread_result.file_index < self.next_file_index
-                || self.pending.contains_key(&thread_result.file_index)
-            {
+            };
+            if file_stream.file_index != self.next_file_index {
                 return Err(ZippyError::Io {
                     reason: format!(
-                        "streaming collect received duplicate or stale file result file_index=[{}] next_file_index=[{}]",
-                        thread_result.file_index, self.next_file_index
+                        "streaming collect file stream order mismatch expected=[{}] actual=[{}]",
+                        self.next_file_index, file_stream.file_index
                     ),
                 });
             }
-            self.pending
-                .insert(thread_result.file_index, thread_result.result);
-            metrics.max_pending_file_results =
-                metrics.max_pending_file_results.max(self.pending.len());
+
+            let wait_started = Instant::now();
+            let event = file_stream
+                .event_receiver
+                .recv()
+                .map_err(|_| ZippyError::Io {
+                    reason: format!(
+                        "gateway persisted scan event channel disconnected file_index=[{}]",
+                        self.next_file_index
+                    ),
+                })?;
+            metrics.scan_elapsed_ms += wait_started.elapsed().as_secs_f64() * 1000.0;
+            match event {
+                GatewayPersistedScanEvent::Batch(batch) => {
+                    self.buffered_bytes_tracker.update_metrics(metrics);
+                    return Ok(Some(batch));
+                }
+                GatewayPersistedScanEvent::End {
+                    file_index,
+                    scanned_rows,
+                } => {
+                    if file_index != self.next_file_index {
+                        return Err(ZippyError::Io {
+                            reason: format!(
+                                "streaming collect file end index mismatch expected=[{}] actual=[{}]",
+                                self.next_file_index, file_index
+                            ),
+                        });
+                    }
+                    let completed = self.file_streams.pop_front().unwrap();
+                    metrics.scanned_rows = metrics.scanned_rows.saturating_add(scanned_rows);
+                    metrics.scanned_file_paths.push(completed.file_path);
+                    metrics.scanned_files = metrics.scanned_file_paths.len();
+                    self.next_file_index += 1;
+                }
+                GatewayPersistedScanEvent::Error { file_index, error } => {
+                    if file_index != self.next_file_index {
+                        return Err(ZippyError::Io {
+                            reason: format!(
+                                "streaming collect file error index mismatch expected=[{}] actual=[{}]",
+                                self.next_file_index, file_index
+                            ),
+                        });
+                    }
+                    return Err(error);
+                }
+            }
         }
     }
 
     fn schedule_available(&mut self, metrics: &mut GatewayCollectStreamMetrics) -> Result<()> {
-        while self.active_file_slots < self.parallelism {
+        while self.file_streams.len() < self.parallelism {
             let Some(task) = self.tasks.pop_front() else {
                 break;
             };
+            let file_index = task.file_index;
+            let file_path = task.file_path.clone();
+            let (event_sender, event_receiver) = mpsc::sync_channel(1);
+            let buffer_budget = Arc::new(GatewayFileByteBudget::new(
+                self.file_buffer_budget_bytes,
+                Arc::clone(&self.buffered_bytes_tracker),
+            )?);
             self.pool.submit(GatewayPersistedScanJob {
                 task,
-                result_sender: self.result_sender.clone(),
+                output_projection_columns: self.output_projection_columns.clone(),
+                event_sender,
+                buffer_budget,
                 cancelled: Arc::clone(&self.cancelled),
             })?;
-            self.in_flight += 1;
-            self.active_file_slots += 1;
+            self.file_streams.push_back(GatewayPersistedFileStream {
+                file_index,
+                file_path,
+                event_receiver,
+            });
         }
-        metrics.max_in_flight_file_scans = metrics.max_in_flight_file_scans.max(self.in_flight);
-        Ok(())
-    }
-
-    fn move_ready_results(&mut self, metrics: &mut GatewayCollectStreamMetrics) -> Result<()> {
-        while let Some(result) = self.pending.remove(&self.next_file_index) {
-            let result = result?;
-            if result.file_index != self.next_file_index {
-                return Err(ZippyError::Io {
-                    reason: format!(
-                        "streaming collect file result index mismatch expected=[{}] actual=[{}]",
-                        self.next_file_index, result.file_index
-                    ),
-                });
-            }
-            metrics.scanned_rows = metrics.scanned_rows.saturating_add(result.scanned_rows);
-            metrics
-                .scanned_file_paths
-                .push(self.file_paths[self.next_file_index].clone());
-            metrics.scanned_files = metrics.scanned_file_paths.len();
-            for batch in result.batches {
-                let batch =
-                    project_record_batch(&batch, self.output_projection_columns.as_deref())?;
-                if batch.num_rows() > 0 {
-                    self.ready_items
-                        .push_back(GatewayPersistedReadyItem::Batch(batch));
-                }
-            }
-            self.ready_items
-                .push_back(GatewayPersistedReadyItem::FileEnd);
-            self.next_file_index += 1;
-        }
+        metrics.max_in_flight_file_scans = metrics
+            .max_in_flight_file_scans
+            .max(self.file_streams.len());
+        metrics.max_pending_file_results = metrics
+            .max_pending_file_results
+            .max(self.file_streams.len().saturating_sub(1));
+        metrics.query_buffer_budget_bytes = self.query_buffer_budget_bytes;
+        metrics.file_buffer_budget_bytes = self.file_buffer_budget_bytes;
         Ok(())
     }
 }
@@ -664,7 +966,7 @@ enum GatewayCollectStreamProducer {
         schema: SchemaRef,
         source: GatewayPersistedBatchSource,
         chunk_rows: usize,
-        current_batch: Option<RecordBatch>,
+        current_batch: Option<GatewayPersistedBufferedBatch>,
         current_offset: usize,
         skip_rows: usize,
         remaining_rows: Option<usize>,
@@ -711,9 +1013,13 @@ impl GatewayCollectStreamProducer {
         output_projection_columns: Option<&[String]>,
         row_range_pushdown: Option<GatewayRowRangePushdown>,
         chunk_rows: usize,
-        scan_pool: Arc<GatewayPersistedScanPool>,
-        query_parallelism: usize,
+        scan_resources: GatewayPersistedScanResources,
     ) -> Result<Self> {
+        let GatewayPersistedScanResources {
+            pool,
+            parallelism,
+            query_buffer_budget_bytes,
+        } = scan_resources;
         let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
         let scan_schema = schema_for_scan_pushdown(&schema, scan_pushdown)?;
         let output_schema = schema_for_projection_columns(&scan_schema, output_projection_columns)?;
@@ -722,8 +1028,9 @@ impl GatewayCollectStreamProducer {
                 stream,
                 scan_pushdown,
                 output_projection_columns,
-                scan_pool,
-                query_parallelism,
+                pool,
+                parallelism,
+                query_buffer_budget_bytes,
             )?;
             return Ok(Self::Persisted {
                 schema: output_schema,
@@ -735,7 +1042,7 @@ impl GatewayCollectStreamProducer {
                 remaining_rows: None,
                 metrics: GatewayCollectStreamMetrics {
                     streaming: true,
-                    file_scan_parallelism: query_parallelism,
+                    file_scan_parallelism: parallelism,
                     ..GatewayCollectStreamMetrics::default()
                 },
             });
@@ -845,6 +1152,35 @@ impl GatewayCollectStreamProducer {
         }
     }
 
+    fn global_buffer_reservation_bytes(&self) -> usize {
+        match self {
+            Self::Persisted {
+                source: GatewayPersistedBatchSource::Streaming(scanner),
+                ..
+            } => scanner.global_buffer_reservation_bytes(),
+            _ => 0,
+        }
+    }
+
+    fn attach_global_buffer_reservation(
+        &mut self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        match self {
+            Self::Persisted {
+                source: GatewayPersistedBatchSource::Streaming(scanner),
+                ..
+            } => {
+                scanner.attach_global_buffer_reservation(permit);
+                Ok(())
+            }
+            _ => Err(ZippyError::InvalidConfig {
+                reason: "gateway buffer reservation requires a persisted streaming producer"
+                    .to_string(),
+            }),
+        }
+    }
+
     fn metrics(&self) -> Value {
         match self {
             Self::Materialized { metrics, .. } => metrics.value(),
@@ -892,26 +1228,27 @@ impl GatewayCollectStreamProducer {
                 }
                 if current_batch
                     .as_ref()
-                    .is_none_or(|batch| *current_offset >= batch.num_rows())
+                    .is_none_or(|batch| *current_offset >= batch.batch.num_rows())
                 {
+                    current_batch.take();
                     *current_batch = source.next_batch(metrics)?;
                     *current_offset = 0;
                 }
                 let Some(batch) = current_batch.as_ref() else {
                     return Ok(None);
                 };
-                if batch.num_rows() == 0 {
+                if batch.batch.num_rows() == 0 {
                     *current_batch = None;
                     continue;
                 }
-                let available_rows = batch.num_rows() - *current_offset;
+                let available_rows = batch.batch.num_rows() - *current_offset;
                 if *skip_rows >= available_rows {
                     *skip_rows -= available_rows;
-                    *current_offset = batch.num_rows();
+                    *current_offset = batch.batch.num_rows();
                     continue;
                 }
                 let start = *current_offset + *skip_rows;
-                let available_rows = batch.num_rows() - start;
+                let available_rows = batch.batch.num_rows() - start;
                 *skip_rows = 0;
                 let mut rows = (*chunk_rows).min(available_rows);
                 if let Some(remaining) = remaining_rows.as_mut() {
@@ -921,7 +1258,7 @@ impl GatewayCollectStreamProducer {
                 if rows == 0 {
                     return Ok(None);
                 }
-                let chunk = batch.slice(start, rows);
+                let chunk = batch.batch.slice(start, rows);
                 *current_offset = start + rows;
                 metrics.returned_rows = metrics.returned_rows.saturating_add(rows);
                 return Ok(Some(chunk));
@@ -1154,7 +1491,13 @@ struct MasterDescriptorPublisher {
 impl GatewayServer {
     /// Create a native GatewayServer.
     pub fn new(config: GatewayServerConfig) -> Result<Self> {
-        Self::new_with_parallelism(config, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_PARALLELISM)
+        Self::new_with_query_limits(
+            config,
+            DEFAULT_MAX_PARALLELISM,
+            DEFAULT_MAX_PARALLELISM,
+            DEFAULT_MAX_QUERY_BUFFER_BYTES,
+            DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+        )
     }
 
     /// Create a native GatewayServer with one shared query and runtime limit.
@@ -1162,7 +1505,13 @@ impl GatewayServer {
         config: GatewayServerConfig,
         query_parallelism: usize,
     ) -> Result<Self> {
-        Self::new_with_parallelism(config, query_parallelism, query_parallelism)
+        Self::new_with_query_limits(
+            config,
+            query_parallelism,
+            query_parallelism,
+            DEFAULT_MAX_QUERY_BUFFER_BYTES,
+            DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+        )
     }
 
     /// Create a native GatewayServer with process-wide and query-specific limits.
@@ -1170,6 +1519,23 @@ impl GatewayServer {
         config: GatewayServerConfig,
         max_parallelism: usize,
         query_parallelism: usize,
+    ) -> Result<Self> {
+        Self::new_with_query_limits(
+            config,
+            max_parallelism,
+            query_parallelism,
+            DEFAULT_MAX_QUERY_BUFFER_BYTES,
+            DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+        )
+    }
+
+    /// Create a native GatewayServer with CPU and buffered-query limits.
+    pub fn new_with_query_limits(
+        config: GatewayServerConfig,
+        max_parallelism: usize,
+        query_parallelism: usize,
+        max_query_buffer_bytes: usize,
+        query_max_buffered_bytes: usize,
     ) -> Result<Self> {
         if max_parallelism == 0 || max_parallelism > MAX_PARALLELISM {
             return Err(ZippyError::InvalidConfig {
@@ -1184,6 +1550,25 @@ impl GatewayServer {
                 reason: format!(
                     "query parallelism must be between 1 and max_parallelism value=[{}] max_parallelism=[{}]",
                     query_parallelism, max_parallelism
+                ),
+            });
+        }
+        let max_supported_query_buffer_bytes =
+            MAX_QUERY_BUFFER_BYTES.min(tokio::sync::Semaphore::MAX_PERMITS);
+        if max_query_buffer_bytes == 0 || max_query_buffer_bytes > max_supported_query_buffer_bytes
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "max_query_buffer_bytes must be between 1 and {} value=[{}]",
+                    max_supported_query_buffer_bytes, max_query_buffer_bytes
+                ),
+            });
+        }
+        if query_max_buffered_bytes == 0 || query_max_buffered_bytes > max_query_buffer_bytes {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query max_buffered_bytes must be between 1 and max_query_buffer_bytes value=[{}] max_query_buffer_bytes=[{}]",
+                    query_max_buffered_bytes, max_query_buffer_bytes
                 ),
             });
         }
@@ -1216,6 +1601,7 @@ impl GatewayServer {
         )?;
         let metrics = Arc::new(Mutex::new(GatewayMetrics::default()));
         let persisted_scan_pool = Arc::new(GatewayPersistedScanPool::new(max_parallelism)?);
+        let persisted_buffer_limit = Arc::new(tokio::sync::Semaphore::new(max_query_buffer_bytes));
         let master = Arc::new(GatewayAsyncMasterClient::new(
             config.master_endpoint.clone(),
             Arc::clone(&metrics),
@@ -1240,7 +1626,10 @@ impl GatewayServer {
                 max_blocking_requests,
                 max_parallelism,
                 query_parallelism,
+                max_query_buffer_bytes,
+                query_max_buffered_bytes,
                 persisted_scan_pool,
+                persisted_buffer_limit,
                 write_timeout,
             }),
             runtime: None,
@@ -1327,6 +1716,22 @@ impl GatewayServer {
         insert_json_metric(fields, "max_subscribers", self.state.max_subscribers);
         insert_json_metric(fields, "max_parallelism", self.state.max_parallelism);
         insert_json_metric(fields, "query_parallelism", self.state.query_parallelism);
+        insert_json_metric(
+            fields,
+            "max_query_buffer_bytes",
+            self.state.max_query_buffer_bytes,
+        );
+        insert_json_metric(
+            fields,
+            "query_max_buffered_bytes",
+            self.state.query_max_buffered_bytes,
+        );
+        insert_json_metric(
+            fields,
+            "query_buffer_reserved_bytes",
+            self.state.max_query_buffer_bytes
+                - self.state.persisted_buffer_limit.available_permits(),
+        );
         insert_json_metric(
             fields,
             "write_timeout_ms",
@@ -1910,8 +2315,11 @@ impl GatewayState {
                         stream_plan.output_projection_columns.as_deref(),
                         stream_plan.row_range_pushdown.map(|(pushdown, _)| pushdown),
                         stream_plan.chunk_rows,
-                        Arc::clone(&self.persisted_scan_pool),
-                        self.query_parallelism,
+                        GatewayPersistedScanResources {
+                            pool: Arc::clone(&self.persisted_scan_pool),
+                            parallelism: self.query_parallelism,
+                            query_buffer_budget_bytes: self.query_max_buffered_bytes,
+                        },
                     );
                 }
             }
@@ -2653,6 +3061,21 @@ impl GatewayState {
         );
         insert_json_metric(fields, "query_parallelism", self.query_parallelism);
         insert_json_metric(fields, "max_parallelism", self.max_parallelism);
+        insert_json_metric(
+            fields,
+            "max_query_buffer_bytes",
+            self.max_query_buffer_bytes,
+        );
+        insert_json_metric(
+            fields,
+            "query_max_buffered_bytes",
+            self.query_max_buffered_bytes,
+        );
+        insert_json_metric(
+            fields,
+            "query_buffer_reserved_bytes",
+            self.max_query_buffer_bytes - self.persisted_buffer_limit.available_permits(),
+        );
         insert_json_metric(
             fields,
             "snapshots_active",
@@ -3579,6 +4002,50 @@ async fn handle_collect_stream_async(
         &schema_payload,
     )
     .await?;
+    let collect_started = Instant::now();
+
+    let buffer_reservation_bytes = producer.global_buffer_reservation_bytes();
+    if buffer_reservation_bytes > 0 {
+        let reservation_started = Instant::now();
+        let reservation_result = async {
+            let permits =
+                u32::try_from(buffer_reservation_bytes).map_err(|_| ZippyError::InvalidConfig {
+                    reason: format!(
+                        "gateway query buffer reservation exceeds supported range bytes=[{}]",
+                        buffer_reservation_bytes
+                    ),
+                })?;
+            tokio::time::timeout(
+                state.write_timeout,
+                Arc::clone(&state.persisted_buffer_limit).acquire_many_owned(permits),
+            )
+            .await
+            .map_err(|_| ZippyError::Io {
+                reason: format!(
+                    "gateway query buffer reservation timed out bytes=[{}] timeout_ms=[{}]",
+                    buffer_reservation_bytes,
+                    state.write_timeout.as_millis()
+                ),
+            })?
+            .map_err(|_| ZippyError::Io {
+                reason: "gateway query buffer limit is closed".to_string(),
+            })
+        }
+        .await;
+        let reservation = match reservation_result {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                write_collect_stream_error_async(stream, &error).await?;
+                return Ok(());
+            }
+        };
+        if let Err(error) = producer.attach_global_buffer_reservation(reservation) {
+            write_collect_stream_error_async(stream, &error).await?;
+            return Ok(());
+        }
+        producer.metrics_mut().global_buffer_wait_elapsed_ms +=
+            reservation_started.elapsed().as_secs_f64() * 1000.0;
+    }
 
     let mut chunk_index = 0usize;
     loop {
@@ -3600,16 +4067,7 @@ async fn handle_collect_stream_async(
         let (next_producer, encoded_batch) = match producer_step {
             Ok(step) => step,
             Err(error) => {
-                write_frame_async(
-                    stream,
-                    &json!({
-                        "status": "error",
-                        "kind": "collect_error",
-                        "reason": error.to_string(),
-                    }),
-                    &[],
-                )
-                .await?;
+                write_collect_stream_error_async(stream, &error).await?;
                 return Ok(());
             }
         };
@@ -3630,6 +4088,10 @@ async fn handle_collect_stream_async(
         )
         .await?;
         producer.metrics_mut().write_elapsed_ms += write_started.elapsed().as_secs_f64() * 1000.0;
+        if chunk_index == 0 {
+            producer.metrics_mut().first_chunk_elapsed_ms =
+                collect_started.elapsed().as_secs_f64() * 1000.0;
+        }
         chunk_index += 1;
     }
 
@@ -3641,6 +4103,22 @@ async fn handle_collect_stream_async(
             "kind": "collect_end",
             "chunks": chunk_index,
             "metrics": metrics,
+        }),
+        &[],
+    )
+    .await
+}
+
+async fn write_collect_stream_error_async(
+    stream: &mut tokio::net::TcpStream,
+    error: &ZippyError,
+) -> Result<()> {
+    write_frame_async(
+        stream,
+        &json!({
+            "status": "error",
+            "kind": "collect_error",
+            "reason": error.to_string(),
         }),
         &[],
     )
@@ -4289,6 +4767,121 @@ fn scan_persisted_file_task(task: GatewayPersistedScanTask) -> Result<GatewayPer
     })
 }
 
+fn start_persisted_scan_cursor(job: GatewayPersistedScanJob) -> Result<GatewayPersistedScanCursor> {
+    let GatewayPersistedScanJob {
+        task,
+        output_projection_columns,
+        event_sender,
+        buffer_budget,
+        cancelled,
+    } = job;
+    let file_path = task.file_path.clone();
+    let (_, reader) = build_parquet_record_batch_reader(
+        Path::new(&file_path),
+        task.projection_columns.as_deref(),
+        &task.scan_pushdown.filters,
+        None,
+    )?;
+    Ok(GatewayPersistedScanCursor {
+        task,
+        output_projection_columns,
+        event_sender,
+        buffer_budget,
+        cancelled,
+        reader,
+        scanned_rows: 0,
+        budget_wait_started: None,
+    })
+}
+
+fn advance_persisted_scan_work(work: GatewayPersistedScanWork) -> Result<GatewayPersistedScanStep> {
+    let cursor = match work {
+        GatewayPersistedScanWork::Start(job) => start_persisted_scan_cursor(job)?,
+        GatewayPersistedScanWork::Continue(cursor) => cursor,
+    };
+    advance_persisted_scan_cursor(cursor)
+}
+
+fn advance_persisted_scan_cursor(
+    mut cursor: GatewayPersistedScanCursor,
+) -> Result<GatewayPersistedScanStep> {
+    if cursor.cancelled.load(Ordering::Acquire) {
+        return Ok(GatewayPersistedScanStep::Complete);
+    }
+    let Some(slot) = cursor.buffer_budget.try_acquire_slot() else {
+        cursor.budget_wait_started.get_or_insert_with(Instant::now);
+        return Ok(GatewayPersistedScanStep::Continue {
+            cursor,
+            backoff: true,
+        });
+    };
+    if let Some(wait_started) = cursor.budget_wait_started.take() {
+        cursor
+            .buffer_budget
+            .tracker
+            .add_wait(wait_started.elapsed());
+    }
+    let Some(batch) = cursor.reader.next() else {
+        drop(slot);
+        let event = GatewayPersistedScanEvent::End {
+            file_index: cursor.task.file_index,
+            scanned_rows: cursor.scanned_rows,
+        };
+        return match cursor.event_sender.try_send(event) {
+            Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                Ok(GatewayPersistedScanStep::Complete)
+            }
+            Err(mpsc::TrySendError::Full(_)) => Err(ZippyError::Io {
+                reason: format!(
+                    "gateway persisted scan end channel unexpectedly full file_index=[{}]",
+                    cursor.task.file_index
+                ),
+            }),
+        };
+    };
+    let batch = batch.map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to read persisted parquet batch path=[{}] error=[{}]",
+            cursor.task.file_path, error
+        ),
+    })?;
+    let batch = apply_scan_pushdown_to_record_batch(
+        batch,
+        &cursor.task.scan_pushdown,
+        &mut cursor.scanned_rows,
+    )?;
+    if batch.num_rows() == 0 {
+        drop(slot);
+        return Ok(GatewayPersistedScanStep::Continue {
+            cursor,
+            backoff: false,
+        });
+    }
+    let batch = project_record_batch(&batch, cursor.output_projection_columns.as_deref())?;
+    let buffered_bytes = batch.get_array_memory_size();
+    let permit =
+        cursor
+            .buffer_budget
+            .buffered_permit(slot, buffered_bytes, cursor.task.file_index)?;
+    let event = GatewayPersistedScanEvent::Batch(GatewayPersistedBufferedBatch {
+        batch,
+        _permit: Some(permit),
+    });
+    match cursor.event_sender.try_send(event) {
+        Ok(()) => Ok(GatewayPersistedScanStep::Continue {
+            cursor,
+            backoff: false,
+        }),
+        Err(mpsc::TrySendError::Disconnected(_)) => Ok(GatewayPersistedScanStep::Complete),
+        Err(mpsc::TrySendError::Full(_)) => Err(ZippyError::Io {
+            reason: format!(
+                "gateway persisted scan batch channel unexpectedly full file_index=[{}]",
+                cursor.task.file_index
+            ),
+        }),
+    }
+}
+
 fn tail_persisted_file_record_batches(
     stream: &StreamInfo,
     n: usize,
@@ -4524,6 +5117,28 @@ fn read_parquet_record_batch_chunks(
     filters: &[Value],
     row_range: Option<PersistedParquetRowRange>,
 ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+    let (schema, reader) =
+        build_parquet_record_batch_reader(path, projection_columns, filters, row_range)?;
+    let batches = reader
+        .map(|batch| {
+            batch.map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to read persisted parquet batch path=[{}] error=[{}]",
+                    path.display(),
+                    error
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((schema, batches))
+}
+
+fn build_parquet_record_batch_reader(
+    path: &Path,
+    projection_columns: Option<&[String]>,
+    filters: &[Value],
+    row_range: Option<PersistedParquetRowRange>,
+) -> Result<(SchemaRef, ParquetRecordBatchReader)> {
     let file = File::open(path).map_err(|error| ZippyError::Io {
         reason: format!(
             "failed to open persisted parquet file path=[{}] error=[{}]",
@@ -4618,18 +5233,7 @@ fn read_parquet_record_batch_chunks(
                 error
             ),
         })?;
-    let batches = reader
-        .map(|batch| {
-            batch.map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to read persisted parquet batch path=[{}] error=[{}]",
-                    path.display(),
-                    error
-                ),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((schema, batches))
+    Ok((schema, reader))
 }
 
 fn parquet_row_group_may_match_filter(
@@ -6991,10 +7595,35 @@ mod tests {
 
     #[test]
     fn gateway_query_parallelism_is_validated_and_reported() {
-        let gateway = GatewayServer::new_with_parallelism(test_gateway_config(), 8, 7).unwrap();
+        let gateway = GatewayServer::new_with_query_limits(
+            test_gateway_config(),
+            8,
+            7,
+            256 * 1024 * 1024,
+            64 * 1024 * 1024,
+        )
+        .unwrap();
 
         assert_eq!(gateway.metrics()["max_parallelism"], json!(8));
         assert_eq!(gateway.metrics()["query_parallelism"], json!(7));
+        assert_eq!(
+            gateway.metrics()["max_query_buffer_bytes"],
+            json!(256 * 1024 * 1024)
+        );
+        assert_eq!(
+            gateway.metrics()["query_max_buffered_bytes"],
+            json!(64 * 1024 * 1024)
+        );
+        assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
+        let reservation = Arc::clone(&gateway.state.persisted_buffer_limit)
+            .try_acquire_many_owned(64 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            gateway.metrics()["query_buffer_reserved_bytes"],
+            json!(64 * 1024 * 1024)
+        );
+        drop(reservation);
+        assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
 
         let error = GatewayServer::new_with_parallelism(test_gateway_config(), 4, 5)
             .err()
@@ -7002,6 +7631,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("query parallelism must be between 1 and max_parallelism"));
+
+        let error = GatewayServer::new_with_query_limits(
+            test_gateway_config(),
+            4,
+            4,
+            64 * 1024 * 1024,
+            128 * 1024 * 1024,
+        )
+        .err()
+        .expect("query buffer budget above max must fail");
+        assert!(error
+            .to_string()
+            .contains("query max_buffered_bytes must be between 1 and max_query_buffer_bytes"));
     }
 
     #[test]
@@ -7183,8 +7825,11 @@ mod tests {
             None,
             None,
             1,
-            Arc::new(GatewayPersistedScanPool::new(1).unwrap()),
-            1,
+            GatewayPersistedScanResources {
+                pool: Arc::new(GatewayPersistedScanPool::new(1).unwrap()),
+                parallelism: 1,
+                query_buffer_budget_bytes: 32 * 1024 * 1024,
+            },
         )
         .unwrap();
         std::fs::remove_file(&parquet_path).unwrap();
@@ -7237,8 +7882,11 @@ mod tests {
             None,
             None,
             1,
-            Arc::new(GatewayPersistedScanPool::new(2).unwrap()),
-            2,
+            GatewayPersistedScanResources {
+                pool: Arc::new(GatewayPersistedScanPool::new(2).unwrap()),
+                parallelism: 2,
+                query_buffer_budget_bytes: 32 * 1024 * 1024,
+            },
         )
         .unwrap();
 
@@ -7253,7 +7901,7 @@ mod tests {
             panic!("expected streaming persisted producer");
         };
         assert!(scanner.tasks.is_empty());
-        assert_eq!(scanner.active_file_slots, 2);
+        assert_eq!(scanner.file_streams.len(), 2);
         let error = producer.next_batch().unwrap_err();
 
         let first_values = first
@@ -7273,12 +7921,220 @@ mod tests {
             .contains("failed to open persisted parquet file"));
         assert_eq!(producer.metrics()["file_scan_parallelism"], json!(2));
         assert_eq!(producer.metrics()["max_in_flight_file_scans"], json!(2));
+        assert_eq!(
+            producer.metrics()["file_buffer_budget_bytes"],
+            json!(16 * 1024 * 1024)
+        );
+        assert!(producer.metrics()["max_buffered_bytes"].as_u64().unwrap() <= 32 * 1024 * 1024);
         assert!(
             producer.metrics()["max_pending_file_results"]
                 .as_u64()
                 .unwrap()
                 <= 2
         );
+    }
+
+    #[test]
+    fn persisted_stream_producer_bounds_buffered_batches_by_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("byte-budget.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let row_count = PERSISTED_PARQUET_SCAN_BATCH_SIZE * 4 + 3;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..row_count).map(|value| value as i64),
+            )) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut stream = stream_info_for_gateway_status_test("byte_budget_ticks", schema, 1);
+        stream.persisted_files = vec![json!({
+            "file_path": parquet_path.to_string_lossy(),
+            "row_count": row_count,
+            "source_segment_id": 1,
+            "source_generation": 0
+        })];
+        stream.status = "stale".to_string();
+        stream.writer_process_id = None;
+        let query_buffer_budget = 32 * 1024;
+        let mut producer = GatewayCollectStreamProducer::persisted_serial(
+            &stream,
+            &GatewayScanPushdown::default(),
+            None,
+            None,
+            PERSISTED_PARQUET_SCAN_BATCH_SIZE,
+            GatewayPersistedScanResources {
+                pool: Arc::new(GatewayPersistedScanPool::new(1).unwrap()),
+                parallelism: 1,
+                query_buffer_budget_bytes: query_buffer_budget,
+            },
+        )
+        .unwrap();
+
+        let mut returned_rows = 0usize;
+        while let Some(batch) = producer.next_batch().unwrap() {
+            returned_rows += batch.num_rows();
+        }
+        let metrics = producer.metrics();
+
+        assert_eq!(returned_rows, row_count);
+        assert_eq!(
+            metrics["query_buffer_budget_bytes"],
+            json!(query_buffer_budget)
+        );
+        assert_eq!(
+            metrics["file_buffer_budget_bytes"],
+            json!(query_buffer_budget)
+        );
+        assert!(metrics["max_buffered_bytes"].as_u64().unwrap() > 0);
+        assert!(
+            metrics["max_buffered_bytes"].as_u64().unwrap()
+                <= u64::try_from(query_buffer_budget).unwrap()
+        );
+        assert_eq!(metrics["buffered_bytes"], json!(0));
+    }
+
+    #[test]
+    fn persisted_stream_producer_rejects_batch_larger_than_file_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("oversized-batch.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0_i64..1024)) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut stream = stream_info_for_gateway_status_test("oversized_batch_ticks", schema, 1);
+        stream.persisted_files = vec![json!({
+            "file_path": parquet_path.to_string_lossy(),
+            "row_count": batch.num_rows(),
+            "source_segment_id": 1,
+            "source_generation": 0
+        })];
+        stream.status = "stale".to_string();
+        stream.writer_process_id = None;
+        let mut producer = GatewayCollectStreamProducer::persisted_serial(
+            &stream,
+            &GatewayScanPushdown::default(),
+            None,
+            None,
+            PERSISTED_PARQUET_SCAN_BATCH_SIZE,
+            GatewayPersistedScanResources {
+                pool: Arc::new(GatewayPersistedScanPool::new(1).unwrap()),
+                parallelism: 1,
+                query_buffer_budget_bytes: 1024,
+            },
+        )
+        .unwrap();
+
+        let error = producer.next_batch().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("persisted scan batch exceeds file buffer budget"));
+    }
+
+    #[test]
+    fn persisted_stream_backpressure_does_not_pin_shared_scan_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let blocked_path = temp.path().join("blocked.parquet");
+        let blocked_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0_i64..2048)) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&blocked_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&blocked_batch).unwrap();
+        writer.close().unwrap();
+        let ready_path = temp.path().join("ready.parquet");
+        let ready_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![99_i64])) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(&ready_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&ready_batch).unwrap();
+        writer.close().unwrap();
+        let mut blocked_stream =
+            stream_info_for_gateway_status_test("blocked_budget_ticks", Arc::clone(&schema), 1);
+        blocked_stream.persisted_files = vec![json!({
+            "file_path": blocked_path.to_string_lossy(),
+            "row_count": blocked_batch.num_rows(),
+            "source_segment_id": 1,
+            "source_generation": 0
+        })];
+        blocked_stream.status = "stale".to_string();
+        blocked_stream.writer_process_id = None;
+        let mut ready_stream = stream_info_for_gateway_status_test("ready_budget_ticks", schema, 1);
+        ready_stream.persisted_files = vec![json!({
+            "file_path": ready_path.to_string_lossy(),
+            "row_count": ready_batch.num_rows(),
+            "source_segment_id": 1,
+            "source_generation": 0
+        })];
+        ready_stream.status = "stale".to_string();
+        ready_stream.writer_process_id = None;
+        let pool = Arc::new(GatewayPersistedScanPool::new(1).unwrap());
+        let mut blocked_producer = GatewayCollectStreamProducer::persisted_serial(
+            &blocked_stream,
+            &GatewayScanPushdown::default(),
+            None,
+            None,
+            PERSISTED_PARQUET_SCAN_BATCH_SIZE,
+            GatewayPersistedScanResources {
+                pool: Arc::clone(&pool),
+                parallelism: 1,
+                query_buffer_budget_bytes: 32 * 1024,
+            },
+        )
+        .unwrap();
+        let mut ready_producer = GatewayCollectStreamProducer::persisted_serial(
+            &ready_stream,
+            &GatewayScanPushdown::default(),
+            None,
+            None,
+            1,
+            GatewayPersistedScanResources {
+                pool,
+                parallelism: 1,
+                query_buffer_budget_bytes: 32 * 1024,
+            },
+        )
+        .unwrap();
+
+        let first = blocked_producer.next_batch().unwrap().unwrap();
+        assert_eq!(first.num_rows(), PERSISTED_PARQUET_SCAN_BATCH_SIZE);
+        let (sender, receiver) = mpsc::channel();
+        let ready_join = thread::spawn(move || {
+            let result = ready_producer.next_batch().map(|batch| {
+                batch.map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                })
+            });
+            let _ = sender.send(result);
+        });
+
+        let ready_result = receiver.recv_timeout(Duration::from_secs(1));
+        drop(blocked_producer);
+        ready_join.join().unwrap();
+
+        assert_eq!(ready_result.unwrap().unwrap(), Some(99));
     }
 
     #[test]
