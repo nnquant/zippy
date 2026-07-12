@@ -2868,15 +2868,17 @@ impl MasterServer {
         source_files: &[serde_json::Value],
         compacted_file: serde_json::Value,
     ) -> Result<()> {
+        if self.config.table.persist.compaction.delete_sources {
+            return Err(ZippyError::InvalidConfig {
+                reason:
+                    "table persist compaction delete_sources requires persisted snapshot leases"
+                        .to_string(),
+            });
+        }
         let source_keys = source_files
             .iter()
             .map(persisted_file_compaction_key)
             .collect::<HashSet<_>>();
-        let source_paths = source_files
-            .iter()
-            .filter_map(|item| item.get("file_path").and_then(serde_json::Value::as_str))
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
         let _snapshot_guard = self.snapshot_lock.lock().unwrap();
         let mut registry = self.registry.lock().unwrap();
         let previous_persisted_files = registry
@@ -2901,20 +2903,6 @@ impl MasterServer {
         self.control_changed.notify_all();
         drop(registry);
 
-        if self.config.table.persist.compaction.delete_sources {
-            for path in source_paths {
-                if let Err(error) = fs::remove_file(&path) {
-                    tracing::warn!(
-                        component = "master",
-                        event = "compaction_delete_source",
-                        status = "error",
-                        file_path = path.display().to_string(),
-                        error = %error,
-                        "failed to delete compacted source parquet"
-                    );
-                }
-            }
-        }
         Ok(())
     }
 
@@ -3580,6 +3568,9 @@ fn compacted_persisted_file_metadata(
         metadata["source_segments"] = serde_json::Value::Array(source_segments.clone());
         metadata["source_segment_id"] = source_segments[0]["source_segment_id"].clone();
         metadata["source_generation"] = source_segments[0]["source_generation"].clone();
+        if let Some(writer_epoch) = source_segments[0].get("writer_epoch") {
+            metadata["writer_epoch"] = writer_epoch.clone();
+        }
     }
     if !sort_columns.is_empty() {
         metadata["sort_columns"] = serde_json::json!(sort_columns);
@@ -3795,8 +3786,11 @@ fn persisted_file_compaction_key(item: &serde_json::Value) -> (String, String) {
         })
 }
 
-fn persisted_file_order_key(item: &serde_json::Value) -> (u64, u64, u64, String) {
+fn persisted_file_order_key(item: &serde_json::Value) -> (u64, u64, u64, u64, String) {
     (
+        item.get("writer_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
         item.get("source_segment_id")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default(),
@@ -4293,6 +4287,39 @@ mod tests {
         let groups = compaction_groups(&persisted_files, &stream);
 
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn persisted_file_order_keeps_writer_epochs_contiguous() {
+        let mut files = [
+            serde_json::json!({
+                "writer_epoch": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 3,
+                "file_path": "epoch-2-segment-1.parquet"
+            }),
+            serde_json::json!({
+                "writer_epoch": 1,
+                "source_segment_id": 2,
+                "source_generation": 1,
+                "created_at": 2,
+                "file_path": "epoch-1-segment-2.parquet"
+            }),
+            serde_json::json!({
+                "writer_epoch": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 1,
+                "file_path": "epoch-1-segment-1.parquet"
+            }),
+        ];
+
+        files.sort_by_key(persisted_file_order_key);
+
+        assert_eq!(files[0]["file_path"], "epoch-1-segment-1.parquet");
+        assert_eq!(files[1]["file_path"], "epoch-1-segment-2.parquet");
+        assert_eq!(files[2]["file_path"], "epoch-2-segment-1.parquet");
     }
 
     fn stream_record_for_segment_identity_test(

@@ -101,7 +101,8 @@ uv run zippy stream ls --uri default
 - `zp.compare_replay(...)`：把 live persisted 数据和 replay 输出按 key 对齐比较。
 - `zp.ops.drop_table(...)`：删除表元数据，并可同步删除持久化数据。
 - `zp.ops.compact_table(...)`：低频合并 persisted parquet 小文件，按 partition 分组
-  生成 compacted parquet，并替换 master 中的 persisted metadata。
+  生成 compacted parquet，并替换 master 中的 persisted metadata。源文件默认保留；
+  当前不支持 `delete_sources=True`，物理清理由后续 snapshot-aware GC 负责。
 - `zp.ops.compact_tables(...)`：批量执行低频 compaction；周期 compaction 由 master
   根据 `[table.persist.compaction]` 配置统一调度，不在 Python 侧单独启动后台 worker。
 - `zp.GatewayServer(...)`：native Rust 跨平台数据面服务。日常由 master 根据

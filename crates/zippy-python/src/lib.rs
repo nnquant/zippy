@@ -84,6 +84,17 @@ fn write_latency_trace_line(mut line: String) {
     let _ = stderr.write_all(line.as_bytes());
 }
 
+fn subscriber_descriptor_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ZIPPY_DESCRIPTOR_TRACE") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    })
+}
+
 fn py_value_error(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
@@ -3033,6 +3044,28 @@ impl DescriptorUpdateSlot {
         self.changed.notify_all();
     }
 
+    fn refresh_pending_descriptor(
+        &self,
+        segment_identity: (u64, u64),
+        descriptor_generation: u64,
+        descriptor: serde_json::Value,
+    ) -> std::result::Result<bool, String> {
+        let replacement = descriptor_update_from_value(descriptor_generation, descriptor)?;
+        let mut guard = self.updates.lock().unwrap();
+        let mut refreshed = false;
+        for pending in guard.iter_mut() {
+            if descriptor_segment_identity(&pending.descriptor).ok() == Some(segment_identity) {
+                *pending = replacement.clone();
+                refreshed = true;
+            }
+        }
+        drop(guard);
+        if refreshed {
+            self.changed.notify_all();
+        }
+        Ok(refreshed)
+    }
+
     fn restore_front(&self, update: DescriptorUpdate) {
         self.updates.lock().unwrap().push_front(update);
         self.changed.notify_all();
@@ -3283,6 +3316,26 @@ fn descriptor_update_sequence_from_value(
         descriptor,
     )?);
     Ok(updates)
+}
+
+fn descriptor_retry_candidate(
+    pending: &DescriptorUpdate,
+    descriptor_generation: u64,
+    active_descriptor: Option<serde_json::Value>,
+    sealed_segments: &[serde_json::Value],
+) -> std::result::Result<Option<DescriptorUpdate>, String> {
+    let pending_identity =
+        descriptor_segment_identity(&pending.descriptor).map_err(|error| error.to_string())?;
+    if let Some(sealed_descriptor) = sealed_segments
+        .iter()
+        .find(|descriptor| descriptor_segment_identity(descriptor).ok() == Some(pending_identity))
+    {
+        return descriptor_update_from_value(descriptor_generation, sealed_descriptor.clone())
+            .map(Some);
+    }
+    active_descriptor
+        .map(|descriptor| descriptor_update_from_value(descriptor_generation, descriptor))
+        .transpose()
 }
 
 fn take_descriptor_update_after_poll(
@@ -3869,6 +3922,11 @@ impl SegmentReaderDriver {
                             descriptor_generation,
                         ));
                     }
+                    if self.pending_descriptor_retry.is_some()
+                        && self.reader_handle.reader_lease.is_some()
+                    {
+                        return Ok(SegmentReaderDriverEvent::Idle);
+                    }
 
                     let update = if self.xfast {
                         spin_loop();
@@ -3961,6 +4019,9 @@ impl SegmentReaderDriver {
     }
 
     fn refresh_latest_descriptor_update(&mut self) -> std::result::Result<Option<u64>, String> {
+        if self.pending_descriptor_retry.is_some() && self.reader_handle.reader_lease.is_some() {
+            return self.retry_pending_descriptor_update();
+        }
         if Instant::now() < self.next_descriptor_refresh_at {
             return Ok(None);
         }
@@ -3994,6 +4055,11 @@ impl SegmentReaderDriver {
         &mut self,
         observed_notification_seq: u32,
     ) -> std::result::Result<DescriptorPollOutcome, String> {
+        if self.pending_descriptor_retry.is_some() && self.reader_handle.reader_lease.is_some() {
+            return self.retry_pending_descriptor_update_after_notification_check(
+                observed_notification_seq,
+            );
+        }
         if Instant::now() < self.next_descriptor_refresh_at {
             return Ok(DescriptorPollOutcome::NoUpdate);
         }
@@ -4073,18 +4139,48 @@ impl SegmentReaderDriver {
         descriptor_update_from_value(stream.descriptor_generation, descriptor).map(Some)
     }
 
+    fn latest_descriptor_update_for_retry(
+        &self,
+        pending: &DescriptorUpdate,
+    ) -> std::result::Result<Option<DescriptorUpdate>, String> {
+        let Some(reader_lease) = self.reader_handle.reader_lease.as_ref() else {
+            return Ok(None);
+        };
+        let stream = reader_lease
+            .master
+            .lock()
+            .unwrap()
+            .get_stream(&reader_lease.source)
+            .map_err(|error| error.to_string())?;
+        descriptor_retry_candidate(
+            pending,
+            stream.descriptor_generation,
+            stream.active_segment_descriptor,
+            &stream.sealed_segments,
+        )
+    }
+
     fn descriptor_refresh_interval(&self) -> Duration {
         self.idle_wait.max(SEGMENT_DESCRIPTOR_RETRY_COOLDOWN)
     }
 
     fn apply_ready_descriptor_updates(&mut self) -> std::result::Result<Option<u64>, String> {
+        if self.pending_descriptor_retry.is_some() && self.reader_handle.reader_lease.is_some() {
+            if let Some(descriptor_generation) = self.retry_pending_descriptor_update_now()? {
+                return Ok(Some(descriptor_generation));
+            }
+        }
         while let Some(update) = take_descriptor_update_after_poll(
             SubscriberReadOutcome::Empty,
             self.descriptor_updates.as_ref(),
             &self.descriptor_text,
         ) {
-            if let Some(descriptor_generation) = self.apply_descriptor_update_or_retry(update)? {
-                return Ok(Some(descriptor_generation));
+            match self.apply_descriptor_update_or_retry(update)? {
+                Some(descriptor_generation) => return Ok(Some(descriptor_generation)),
+                None if self.reader_handle.reader_lease.is_some() => {
+                    return self.retry_pending_descriptor_update();
+                }
+                None => {}
             }
         }
         self.retry_pending_descriptor_update()
@@ -4094,6 +4190,14 @@ impl SegmentReaderDriver {
         &mut self,
         observed_notification_seq: u32,
     ) -> std::result::Result<DescriptorPollOutcome, String> {
+        if self.pending_descriptor_retry.is_some() && self.reader_handle.reader_lease.is_some() {
+            match self.retry_pending_descriptor_update_now_after_notification_check(
+                observed_notification_seq,
+            )? {
+                DescriptorPollOutcome::NoUpdate => {}
+                outcome => return Ok(outcome),
+            }
+        }
         loop {
             if self.reader_notification_changed(observed_notification_seq)? {
                 return Ok(DescriptorPollOutcome::ReaderNotified);
@@ -4121,6 +4225,11 @@ impl SegmentReaderDriver {
                     self.descriptor_updates.restore_front(update);
                     self.record_pending_descriptor_updates();
                     return Ok(DescriptorPollOutcome::ReaderNotified);
+                }
+                DescriptorPollOutcome::NoUpdate if self.reader_handle.reader_lease.is_some() => {
+                    return self.retry_pending_descriptor_update_after_notification_check(
+                        observed_notification_seq,
+                    );
                 }
                 DescriptorPollOutcome::NoUpdate => {}
             }
@@ -4191,6 +4300,13 @@ impl SegmentReaderDriver {
     }
 
     fn defer_descriptor_retry(&mut self, update: DescriptorUpdate) {
+        if subscriber_descriptor_trace_enabled() {
+            let identity = descriptor_segment_identity(&update.descriptor).ok();
+            write_latency_trace_line(format!(
+                "zippy_descriptor_trace event=[retry_deferred] identity=[{:?}] descriptor_generation=[{}]",
+                identity, update.descriptor_generation,
+            ));
+        }
         let should_replace = self
             .pending_descriptor_retry
             .as_ref()
@@ -4208,7 +4324,7 @@ impl SegmentReaderDriver {
         }
 
         let pending = self.pending_descriptor_retry.clone().unwrap();
-        let update = match self.latest_descriptor_update()? {
+        let update = match self.latest_descriptor_update_for_retry(&pending)? {
             Some(latest) if latest.text == self.descriptor_text => {
                 self.pending_descriptor_retry = None;
                 return Ok(None);
@@ -4235,6 +4351,11 @@ impl SegmentReaderDriver {
         }
     }
 
+    fn retry_pending_descriptor_update_now(&mut self) -> std::result::Result<Option<u64>, String> {
+        self.next_descriptor_retry_at = Instant::now();
+        self.retry_pending_descriptor_update()
+    }
+
     fn retry_pending_descriptor_update_after_notification_check(
         &mut self,
         observed_notification_seq: u32,
@@ -4248,7 +4369,7 @@ impl SegmentReaderDriver {
         }
 
         let pending = self.pending_descriptor_retry.clone().unwrap();
-        let latest = self.latest_descriptor_update()?;
+        let latest = self.latest_descriptor_update_for_retry(&pending)?;
         if self.reader_notification_changed(observed_notification_seq)? {
             return Ok(DescriptorPollOutcome::ReaderNotified);
         }
@@ -4264,6 +4385,14 @@ impl SegmentReaderDriver {
             update,
             observed_notification_seq,
         )
+    }
+
+    fn retry_pending_descriptor_update_now_after_notification_check(
+        &mut self,
+        observed_notification_seq: u32,
+    ) -> std::result::Result<DescriptorPollOutcome, String> {
+        self.next_descriptor_retry_at = Instant::now();
+        self.retry_pending_descriptor_update_after_notification_check(observed_notification_seq)
     }
 
     fn apply_descriptor_update(
@@ -4301,6 +4430,13 @@ impl SegmentReaderDriver {
         } = prepared;
         let previous_handle = std::mem::replace(&mut self.reader_handle, next_handle);
         self.descriptor_text = descriptor_text;
+        if subscriber_descriptor_trace_enabled() {
+            let identity = descriptor_segment_identity(&descriptor).ok();
+            write_latency_trace_line(format!(
+                "zippy_descriptor_trace event=[descriptor_committed] identity=[{:?}] descriptor_generation=[{}]",
+                identity, descriptor_generation,
+            ));
+        }
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.record_descriptor_rebind(descriptor_generation, &descriptor);
         }
@@ -4385,7 +4521,7 @@ fn spawn_segment_descriptor_watcher(
     thread::spawn(move || {
         while running.load(Ordering::SeqCst) {
             let client = master.lock().unwrap().clone();
-            let update = match client.wait_segment_descriptor(
+            let mut update = match client.wait_segment_descriptor(
                 &stream_name,
                 cursor.descriptor_generation,
                 SEGMENT_DESCRIPTOR_WATCH_TIMEOUT,
@@ -4412,13 +4548,90 @@ fn spawn_segment_descriptor_watcher(
                 }
             };
 
+            if update.descriptor_generation > cursor.descriptor_generation.saturating_add(1) {
+                let stream = match client.get_stream(&stream_name) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        *descriptor_refresh_error.lock().unwrap() = Some(error.to_string());
+                        descriptor_updates.notify();
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                };
+                if stream.descriptor_generation >= update.descriptor_generation {
+                    let Some(mut descriptor) = stream.active_segment_descriptor else {
+                        *descriptor_refresh_error.lock().unwrap() = Some(format!(
+                            "segment descriptor missing while recovering generation gap stream_name=[{}] descriptor_generation=[{}]",
+                            stream_name, stream.descriptor_generation,
+                        ));
+                        descriptor_updates.notify();
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    };
+                    let Some(object) = descriptor.as_object_mut() else {
+                        *descriptor_refresh_error.lock().unwrap() = Some(format!(
+                            "segment descriptor must be an object while recovering generation gap stream_name=[{}] descriptor_generation=[{}]",
+                            stream_name, stream.descriptor_generation,
+                        ));
+                        descriptor_updates.notify();
+                        running.store(false, Ordering::SeqCst);
+                        break;
+                    };
+                    object.insert(
+                        "sealed_segments".to_string(),
+                        serde_json::Value::Array(stream.sealed_segments),
+                    );
+                    update.descriptor_generation = stream.descriptor_generation;
+                    update.descriptor = descriptor;
+                }
+            }
+
             cursor.descriptor_generation = update.descriptor_generation;
+            let pending_refresh = update
+                .descriptor
+                .get("sealed_segments")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|sealed_segments| {
+                    sealed_segments.iter().find(|descriptor| {
+                        descriptor_segment_identity(descriptor).ok()
+                            == Some(cursor.segment_identity)
+                    })
+                })
+                .cloned()
+                .map(|descriptor| {
+                    descriptor_updates.refresh_pending_descriptor(
+                        cursor.segment_identity,
+                        update.descriptor_generation,
+                        descriptor,
+                    )
+                })
+                .transpose();
+            if let Err(error) = pending_refresh {
+                *descriptor_refresh_error.lock().unwrap() = Some(error);
+                descriptor_updates.notify();
+                running.store(false, Ordering::SeqCst);
+                break;
+            }
             match descriptor_update_sequence_from_value(
                 update.descriptor_generation,
                 cursor.segment_identity,
                 update.descriptor,
             ) {
                 Ok(updates) => {
+                    if subscriber_descriptor_trace_enabled() {
+                        let identities = updates
+                            .iter()
+                            .filter_map(|update| {
+                                descriptor_segment_identity(&update.descriptor).ok()
+                            })
+                            .collect::<Vec<_>>();
+                        write_latency_trace_line(format!(
+                            "zippy_descriptor_trace event=[watch_update] cursor_identity=[{:?}] descriptor_generation=[{}] queued_identities=[{:?}]",
+                            cursor.segment_identity,
+                            update.descriptor_generation,
+                            identities,
+                        ));
+                    }
                     let next_identity = updates
                         .last()
                         .and_then(|update| descriptor_segment_identity(&update.descriptor).ok());
@@ -10475,6 +10688,74 @@ mod tests {
         assert!(updates
             .iter()
             .all(|update| update.descriptor_generation == 9));
+    }
+
+    #[test]
+    fn descriptor_update_slot_refreshes_pending_active_descriptor_when_it_seals() {
+        let updates = DescriptorUpdateSlot::default();
+        let active = serde_json::json!({
+            "segment_id": 2,
+            "generation": 1,
+            "committed_row_count": 0,
+            "sealed": false,
+        });
+        updates.set(descriptor_update_from_value(2, active).unwrap());
+        let sealed = serde_json::json!({
+            "segment_id": 2,
+            "generation": 1,
+            "committed_row_count": 3,
+            "sealed": true,
+        });
+
+        let refreshed = updates
+            .refresh_pending_descriptor((2, 1), 3, sealed)
+            .unwrap();
+        let update = updates
+            .take_after_poll(SubscriberReadOutcome::Empty, "current")
+            .unwrap();
+
+        assert!(refreshed);
+        assert_eq!(update.descriptor_generation, 3);
+        assert_eq!(update.descriptor["committed_row_count"], 3);
+        assert_eq!(update.descriptor["sealed"], true);
+        assert_eq!(updates.pending_update_count(), 0);
+    }
+
+    #[test]
+    fn descriptor_retry_keeps_retained_sealed_segment_before_latest_active() {
+        let pending = descriptor_update_from_value(
+            2,
+            serde_json::json!({
+                "segment_id": 2,
+                "generation": 1,
+                "committed_row_count": 0,
+                "sealed": false,
+            }),
+        )
+        .unwrap();
+        let sealed = serde_json::json!({
+            "segment_id": 2,
+            "generation": 1,
+            "committed_row_count": 3,
+            "sealed": true,
+        });
+        let latest = serde_json::json!({
+            "segment_id": 3,
+            "generation": 2,
+            "committed_row_count": 0,
+            "sealed": false,
+        });
+
+        let candidate = descriptor_retry_candidate(&pending, 3, Some(latest), &[sealed])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            descriptor_segment_identity(&candidate.descriptor).unwrap(),
+            (2, 1)
+        );
+        assert_eq!(candidate.descriptor["committed_row_count"], 3);
+        assert_eq!(candidate.descriptor["sealed"], true);
     }
 
     #[test]

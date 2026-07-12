@@ -27,6 +27,7 @@ use parquet::arrow::{
     arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
     ProjectionMask,
 };
+use parquet::file::statistics::Statistics;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -60,6 +61,8 @@ const DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT: Duration = Duration::from_m
 const DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM: usize = 4;
 const DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS: usize = 8;
 const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
+const MAX_GATEWAY_SNAPSHOTS: usize = 1024;
+const GATEWAY_SNAPSHOT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Native Rust GatewayServer configuration.
 #[derive(Debug, Clone)]
@@ -420,26 +423,26 @@ impl GatewayCollectStreamProducer {
             ),
             Some(GatewayRowRangePushdown::Head(n)) => (
                 0,
-                Some(n),
-                parallel_persisted_file_record_batches(
+                None,
+                head_persisted_file_record_batches(
                     stream,
+                    n,
                     scan_pushdown,
                     &mut scanned_rows,
                     &mut scanned_files,
-                    &mut max_pending_file_results,
                 )?,
             ),
-            Some(GatewayRowRangePushdown::Slice { offset, length }) => (
-                offset,
-                length,
-                parallel_persisted_file_record_batches(
+            Some(GatewayRowRangePushdown::Slice { offset, length }) => {
+                let (batches, _, _) = slice_persisted_file_record_batches(
                     stream,
+                    offset,
+                    length,
                     scan_pushdown,
                     &mut scanned_rows,
                     &mut scanned_files,
-                    &mut max_pending_file_results,
-                )?,
-            ),
+                )?;
+                (0, None, batches)
+            }
             None => (
                 0,
                 None,
@@ -645,18 +648,32 @@ struct GatewayScannedBatch {
 
 struct GatewaySnapshot {
     source: String,
-    stream: StreamInfo,
+    stream: Arc<StreamInfo>,
     active_descriptor: Option<Value>,
     active_committed_row_high_watermark: Option<usize>,
+    last_accessed_at: Instant,
     _leases: Vec<SegmentReaderLeaseGuard>,
 }
 
 #[derive(Clone)]
 struct GatewaySnapshotView {
     source: String,
-    stream: StreamInfo,
+    stream: Arc<StreamInfo>,
     active_descriptor: Option<Value>,
     active_committed_row_high_watermark: Option<usize>,
+}
+
+fn expire_gateway_snapshots(
+    snapshots: &mut HashMap<String, GatewaySnapshot>,
+    now: Instant,
+) -> usize {
+    let before = snapshots.len();
+    snapshots.retain(|_, snapshot| {
+        now.checked_duration_since(snapshot.last_accessed_at)
+            .unwrap_or_default()
+            < GATEWAY_SNAPSHOT_IDLE_TIMEOUT
+    });
+    before.saturating_sub(snapshots.len())
 }
 
 #[derive(Clone)]
@@ -800,6 +817,8 @@ struct GatewayMetrics {
     subscribe_clients_rejected_total: u64,
     request_timeouts_total: u64,
     payload_timeouts_total: u64,
+    snapshots_expired_total: u64,
+    snapshots_evicted_total: u64,
 }
 
 struct MasterDescriptorPublisher {
@@ -949,6 +968,11 @@ impl GatewayServer {
             "write_timeout_ms",
             self.state.write_timeout.as_millis() as u64,
         );
+        insert_json_metric(
+            fields,
+            "snapshots_active",
+            self.state.snapshots.lock().unwrap().len(),
+        );
         value
     }
 
@@ -967,6 +991,7 @@ impl GatewayServer {
             let _ = runtime.join_handle.join();
         }
         self.state.close_all_writers();
+        self.state.snapshots.lock().unwrap().clear();
     }
 }
 
@@ -1048,6 +1073,8 @@ fn gateway_metrics_json(metrics: &GatewayMetrics) -> Value {
         subscribe_clients_rejected_total,
         request_timeouts_total,
         payload_timeouts_total,
+        snapshots_expired_total,
+        snapshots_evicted_total,
     );
     Value::Object(value)
 }
@@ -1611,15 +1638,13 @@ impl GatewayState {
         );
         let snapshot = GatewaySnapshot {
             source: source.to_string(),
-            stream: stream.clone(),
+            stream: Arc::new(stream.clone()),
             active_descriptor,
             active_committed_row_high_watermark: pinned_active_high_watermark,
+            last_accessed_at: Instant::now(),
             _leases: leases,
         };
-        self.snapshots
-            .lock()
-            .unwrap()
-            .insert(snapshot_id.clone(), snapshot);
+        self.insert_snapshot(snapshot_id.clone(), snapshot);
 
         Ok((
             json!({
@@ -1691,14 +1716,17 @@ impl GatewayState {
         let mut scan_pushdown_applied = false;
         let scanned = if let Some(snapshot_id) = snapshot_id {
             scan_pushdown_applied = true;
-            let mut scanned =
-                self.collect_snapshot_source(source, snapshot_id, &requested_scan_pushdown)?;
             if let Some((pushdown, _)) = row_range_pushdown {
                 row_range_pushed = true;
-                let row_range_op = pushdown.to_plan_op();
-                scanned.batch = apply_collect_plan(scanned.batch, &[row_range_op])?;
+                self.collect_snapshot_source_row_range(
+                    source,
+                    snapshot_id,
+                    pushdown,
+                    &requested_scan_pushdown,
+                )?
+            } else {
+                self.collect_snapshot_source(source, snapshot_id, &requested_scan_pushdown)?
             }
-            scanned
         } else {
             match batch {
                 Some(batch) => GatewayScannedBatch {
@@ -1788,38 +1816,19 @@ impl GatewayState {
         snapshot_id: &str,
         scan_pushdown: &GatewayScanPushdown,
     ) -> Result<GatewayScannedBatch> {
-        let snapshot = {
-            let snapshots = self.snapshots.lock().unwrap();
-            let snapshot = snapshots
-                .get(snapshot_id)
-                .ok_or_else(|| ZippyError::InvalidConfig {
-                    reason: format!("remote snapshot not found snapshot_id=[{}]", snapshot_id),
-                })?;
-            GatewaySnapshotView {
-                source: snapshot.source.clone(),
-                stream: snapshot.stream.clone(),
-                active_descriptor: snapshot.active_descriptor.clone(),
-                active_committed_row_high_watermark: snapshot.active_committed_row_high_watermark,
-            }
-        };
-        if snapshot.source != source {
-            return Err(ZippyError::InvalidConfig {
-                reason: format!(
-                    "remote snapshot source mismatch snapshot_id=[{}] expected=[{}] got=[{}]",
-                    snapshot_id, snapshot.source, source
-                ),
-            });
-        }
+        let snapshot = self.snapshot_view(source, snapshot_id)?;
 
         let schema = Arc::new(arrow_schema_from_stream_metadata(&snapshot.stream.schema)?);
         let mut scanned_rows = 0usize;
         let mut scanned_live_rows = 0usize;
         let mut scanned_files = Vec::new();
-        let mut batches = persisted_file_record_batches(
+        let mut _max_pending_file_results = 0usize;
+        let mut batches = parallel_persisted_file_record_batches(
             &snapshot.stream,
             scan_pushdown,
             &mut scanned_rows,
             &mut scanned_files,
+            &mut _max_pending_file_results,
         )?;
         if let Some(descriptor) = &snapshot.active_descriptor {
             let Some(active_committed_row_high_watermark) =
@@ -1855,6 +1864,216 @@ impl GatewayState {
             scanned_live_rows,
             scanned_files,
         })
+    }
+
+    fn collect_snapshot_source_row_range(
+        &self,
+        source: &str,
+        snapshot_id: &str,
+        pushdown: GatewayRowRangePushdown,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
+        let snapshot = self.snapshot_view(source, snapshot_id)?;
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&snapshot.stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_live_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let mut leases = Vec::new();
+        let segment_schema = snapshot
+            .active_descriptor
+            .as_ref()
+            .map(|_| compile_segment_schema_from_stream_metadata(&snapshot.stream.schema))
+            .transpose()?;
+
+        let batches = match pushdown {
+            GatewayRowRangePushdown::Tail(n) => {
+                let mut live_batches = Vec::new();
+                if let (Some(descriptor), Some(segment_schema)) =
+                    (snapshot.active_descriptor.as_ref(), segment_schema.clone())
+                {
+                    let high_watermark =
+                        snapshot
+                            .active_committed_row_high_watermark
+                            .ok_or_else(|| ZippyError::Io {
+                                reason: format!(
+                                "remote snapshot missing active high watermark snapshot_id=[{}]",
+                                snapshot_id
+                            ),
+                            })?;
+                    live_batches = tail_live_segment_record_batches_with_leases(
+                        self,
+                        source,
+                        descriptor,
+                        &snapshot.stream.sealed_segments,
+                        segment_schema,
+                        high_watermark,
+                        n,
+                        false,
+                        &mut leases,
+                        scan_pushdown,
+                        &mut scanned_live_rows,
+                    )?;
+                }
+                let persisted_remaining = n.saturating_sub(scanned_live_rows);
+                let mut persisted_batches = if persisted_remaining > 0 {
+                    tail_persisted_file_record_batches(
+                        &snapshot.stream,
+                        persisted_remaining,
+                        scan_pushdown,
+                        &mut scanned_rows,
+                        &mut scanned_files,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                persisted_batches.append(&mut live_batches);
+                persisted_batches
+            }
+            GatewayRowRangePushdown::Head(n) => {
+                let mut batches = head_persisted_file_record_batches(
+                    &snapshot.stream,
+                    n,
+                    scan_pushdown,
+                    &mut scanned_rows,
+                    &mut scanned_files,
+                )?;
+                let remaining = n.saturating_sub(scanned_rows);
+                if remaining > 0 {
+                    if let (Some(descriptor), Some(segment_schema)) =
+                        (snapshot.active_descriptor.as_ref(), segment_schema.clone())
+                    {
+                        let mut live_batches = head_live_segment_record_batches_with_leases(
+                            self,
+                            source,
+                            descriptor,
+                            &snapshot.stream.sealed_segments,
+                            segment_schema,
+                            remaining,
+                            false,
+                            &mut leases,
+                            scan_pushdown,
+                            &mut scanned_live_rows,
+                        )?;
+                        batches.append(&mut live_batches);
+                    }
+                }
+                batches
+            }
+            GatewayRowRangePushdown::Slice { offset, length } => {
+                let (mut batches, persisted_rows, selected_persisted_rows) =
+                    slice_persisted_file_record_batches(
+                        &snapshot.stream,
+                        offset,
+                        length,
+                        scan_pushdown,
+                        &mut scanned_rows,
+                        &mut scanned_files,
+                    )?;
+                let remaining_length =
+                    length.map(|value| value.saturating_sub(selected_persisted_rows));
+                if remaining_length.is_none_or(|value| value > 0) {
+                    if let (Some(descriptor), Some(segment_schema)) =
+                        (snapshot.active_descriptor.as_ref(), segment_schema)
+                    {
+                        let mut live_batches = slice_live_segment_record_batches_with_leases(
+                            self,
+                            source,
+                            descriptor,
+                            &snapshot.stream.sealed_segments,
+                            segment_schema,
+                            offset.saturating_sub(persisted_rows),
+                            remaining_length,
+                            false,
+                            &mut leases,
+                            scan_pushdown,
+                            &mut scanned_live_rows,
+                        )?;
+                        batches.append(&mut live_batches);
+                    }
+                }
+                batches
+            }
+        };
+        scanned_rows = scanned_rows.saturating_add(scanned_live_rows);
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(
+                schema_for_scan_pushdown(&schema, scan_pushdown)?,
+                batches,
+            )?,
+            scanned_rows,
+            scanned_live_rows,
+            scanned_files,
+        })
+    }
+
+    fn snapshot_view(&self, source: &str, snapshot_id: &str) -> Result<GatewaySnapshotView> {
+        let snapshot = {
+            let mut snapshots = self.snapshots.lock().unwrap();
+            let snapshot =
+                snapshots
+                    .get_mut(snapshot_id)
+                    .ok_or_else(|| ZippyError::InvalidConfig {
+                        reason: format!("remote snapshot not found snapshot_id=[{}]", snapshot_id),
+                    })?;
+            snapshot.last_accessed_at = Instant::now();
+            GatewaySnapshotView {
+                source: snapshot.source.clone(),
+                stream: snapshot.stream.clone(),
+                active_descriptor: snapshot.active_descriptor.clone(),
+                active_committed_row_high_watermark: snapshot.active_committed_row_high_watermark,
+            }
+        };
+        if snapshot.source != source {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "remote snapshot source mismatch snapshot_id=[{}] expected=[{}] got=[{}]",
+                    snapshot_id, snapshot.source, source
+                ),
+            });
+        }
+        Ok(snapshot)
+    }
+
+    fn insert_snapshot(&self, snapshot_id: String, snapshot: GatewaySnapshot) {
+        self.expire_idle_snapshots();
+        let evicted = {
+            let mut snapshots = self.snapshots.lock().unwrap();
+            let mut evicted = 0usize;
+            while snapshots.len() >= MAX_GATEWAY_SNAPSHOTS {
+                let Some(oldest_id) = snapshots
+                    .iter()
+                    .min_by_key(|(_, snapshot)| snapshot.last_accessed_at)
+                    .map(|(snapshot_id, _)| snapshot_id.clone())
+                else {
+                    break;
+                };
+                snapshots.remove(&oldest_id);
+                evicted += 1;
+            }
+            snapshots.insert(snapshot_id, snapshot);
+            evicted
+        };
+        if evicted > 0 {
+            self.increment_metric(|metrics| {
+                metrics.snapshots_evicted_total = metrics
+                    .snapshots_evicted_total
+                    .saturating_add(evicted as u64);
+            });
+        }
+    }
+
+    fn expire_idle_snapshots(&self) {
+        let expired = {
+            let mut snapshots = self.snapshots.lock().unwrap();
+            expire_gateway_snapshots(&mut snapshots, Instant::now())
+        };
+        if expired > 0 {
+            self.increment_metric(|metrics| {
+                metrics.snapshots_expired_total = metrics
+                    .snapshots_expired_total
+                    .saturating_add(expired as u64);
+            });
+        }
     }
 
     fn write_batch(&self, stream_name: &str, batch: RecordBatch) -> Result<()> {
@@ -2059,10 +2278,16 @@ impl GatewayState {
     fn metrics_value(&self) -> Value {
         let metrics = self.metrics.lock().unwrap().clone();
         let mut value = gateway_metrics_json(&metrics);
+        let fields = value.as_object_mut().unwrap();
         insert_json_metric(
-            value.as_object_mut().unwrap(),
+            fields,
             "write_timeout_ms",
             self.write_timeout.as_millis() as u64,
+        );
+        insert_json_metric(
+            fields,
+            "snapshots_active",
+            self.snapshots.lock().unwrap().len(),
         );
         value
     }
@@ -2185,11 +2410,13 @@ impl GatewayState {
         let mut scanned_rows = 0usize;
         let mut scanned_live_rows = 0usize;
         let mut scanned_files = Vec::new();
-        let mut batches = persisted_file_record_batches(
+        let mut _max_pending_file_results = 0usize;
+        let mut batches = parallel_persisted_file_record_batches(
             &stream,
             scan_pushdown,
             &mut scanned_rows,
             &mut scanned_files,
+            &mut _max_pending_file_results,
         )?;
         if let Some(mut live_batches) = self.try_collect_live_segment_batches(
             source,
@@ -2260,13 +2487,17 @@ impl GatewayState {
     ) -> Result<GatewayScannedBatch> {
         let stream = self.master.get_stream_blocking(source)?;
         if stream_has_persisted_files(&stream) {
-            if let GatewayRowRangePushdown::Tail(n) = pushdown {
-                return self.collect_stream_source_tail(source, &stream, n, scan_pushdown);
-            }
-            let mut scanned = self.collect_stream_source(source, scan_pushdown)?;
-            let row_range_op = pushdown.to_plan_op();
-            scanned.batch = apply_collect_plan(scanned.batch, &[row_range_op])?;
-            return Ok(scanned);
+            return match pushdown {
+                GatewayRowRangePushdown::Tail(n) => {
+                    self.collect_stream_source_tail(source, &stream, n, scan_pushdown)
+                }
+                GatewayRowRangePushdown::Head(n) => {
+                    self.collect_stream_source_head(source, &stream, n, scan_pushdown)
+                }
+                GatewayRowRangePushdown::Slice { offset, length } => {
+                    self.collect_stream_source_slice(source, &stream, offset, length, scan_pushdown)
+                }
+            };
         }
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
@@ -2306,6 +2537,7 @@ impl GatewayState {
                     segment_schema,
                     active_committed_row_high_watermark,
                     n,
+                    true,
                     &mut _leases,
                     scan_pushdown,
                     &mut scanned_rows,
@@ -2318,6 +2550,7 @@ impl GatewayState {
                 &stream.sealed_segments,
                 segment_schema,
                 n,
+                true,
                 &mut _leases,
                 scan_pushdown,
                 &mut scanned_rows,
@@ -2331,6 +2564,7 @@ impl GatewayState {
                     segment_schema,
                     offset,
                     length,
+                    true,
                     &mut _leases,
                     scan_pushdown,
                     &mut scanned_rows,
@@ -2394,6 +2628,112 @@ impl GatewayState {
         })
     }
 
+    fn collect_stream_source_head(
+        &self,
+        source: &str,
+        stream: &StreamInfo,
+        n: usize,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_live_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let mut batches = head_persisted_file_record_batches(
+            stream,
+            n,
+            scan_pushdown,
+            &mut scanned_rows,
+            &mut scanned_files,
+        )?;
+        let persisted_raw_rows = scanned_rows;
+        let remaining = n.saturating_sub(persisted_raw_rows);
+        if remaining > 0 && stream.status != "stale" {
+            if let Some(descriptor) = stream.active_segment_descriptor.as_ref() {
+                let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+                let mut leases = Vec::new();
+                let mut live_batches = head_live_segment_record_batches_with_leases(
+                    self,
+                    source,
+                    descriptor,
+                    &stream.sealed_segments,
+                    segment_schema,
+                    remaining,
+                    true,
+                    &mut leases,
+                    scan_pushdown,
+                    &mut scanned_live_rows,
+                )?;
+                batches.append(&mut live_batches);
+            }
+        }
+        scanned_rows = scanned_rows.saturating_add(scanned_live_rows);
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(
+                schema_for_scan_pushdown(&schema, scan_pushdown)?,
+                batches,
+            )?,
+            scanned_rows,
+            scanned_live_rows,
+            scanned_files,
+        })
+    }
+
+    fn collect_stream_source_slice(
+        &self,
+        source: &str,
+        stream: &StreamInfo,
+        offset: usize,
+        length: Option<usize>,
+        scan_pushdown: &GatewayScanPushdown,
+    ) -> Result<GatewayScannedBatch> {
+        let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
+        let mut scanned_rows = 0usize;
+        let mut scanned_live_rows = 0usize;
+        let mut scanned_files = Vec::new();
+        let (mut batches, persisted_rows, selected_persisted_rows) =
+            slice_persisted_file_record_batches(
+                stream,
+                offset,
+                length,
+                scan_pushdown,
+                &mut scanned_rows,
+                &mut scanned_files,
+            )?;
+        let remaining_length = length.map(|value| value.saturating_sub(selected_persisted_rows));
+        let should_scan_live = remaining_length.is_none_or(|value| value > 0);
+        if should_scan_live && stream.status != "stale" {
+            if let Some(descriptor) = stream.active_segment_descriptor.as_ref() {
+                let segment_schema = compile_segment_schema_from_stream_metadata(&stream.schema)?;
+                let mut leases = Vec::new();
+                let mut live_batches = slice_live_segment_record_batches_with_leases(
+                    self,
+                    source,
+                    descriptor,
+                    &stream.sealed_segments,
+                    segment_schema,
+                    offset.saturating_sub(persisted_rows),
+                    remaining_length,
+                    true,
+                    &mut leases,
+                    scan_pushdown,
+                    &mut scanned_live_rows,
+                )?;
+                batches.append(&mut live_batches);
+            }
+        }
+        scanned_rows = scanned_rows.saturating_add(scanned_live_rows);
+        Ok(GatewayScannedBatch {
+            batch: concat_record_batches(
+                schema_for_scan_pushdown(&schema, scan_pushdown)?,
+                batches,
+            )?,
+            scanned_rows,
+            scanned_live_rows,
+            scanned_files,
+        })
+    }
+
     fn try_collect_live_segment_tail_batches(
         &self,
         source: &str,
@@ -2422,6 +2762,7 @@ impl GatewayState {
             segment_schema,
             active_committed_row_high_watermark,
             n,
+            true,
             &mut leases,
             scan_pushdown,
             &mut scanned_rows,
@@ -2740,6 +3081,7 @@ async fn heartbeat_loop_async(
                     break;
                 }
                 let _ = state.master.heartbeat().await;
+                state.expire_idle_snapshots();
             }
         }
     }
@@ -3427,30 +3769,6 @@ fn concat_record_batches(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result
     })
 }
 
-fn persisted_file_record_batches(
-    stream: &StreamInfo,
-    scan_pushdown: &GatewayScanPushdown,
-    scanned_rows: &mut usize,
-    scanned_files: &mut Vec<String>,
-) -> Result<Vec<RecordBatch>> {
-    let mut batches = Vec::new();
-    for persisted_file in non_overlapping_persisted_files(stream) {
-        let file_path = persisted_file_path(persisted_file)?;
-        let file_batches = read_parquet_record_batches(
-            Path::new(&file_path),
-            scan_pushdown.projection_columns.as_deref(),
-        )?;
-        scanned_files.push(file_path);
-        for batch in file_batches {
-            let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
-            if batch.num_rows() > 0 {
-                batches.push(batch);
-            }
-        }
-    }
-    Ok(batches)
-}
-
 fn parallel_persisted_file_record_batches(
     stream: &StreamInfo,
     scan_pushdown: &GatewayScanPushdown,
@@ -3458,7 +3776,7 @@ fn parallel_persisted_file_record_batches(
     scanned_files: &mut Vec<String>,
     max_pending_file_results: &mut usize,
 ) -> Result<Vec<RecordBatch>> {
-    let files = non_overlapping_persisted_files(stream)
+    let files = matching_non_overlapping_persisted_files(stream, scan_pushdown)
         .into_iter()
         .map(persisted_file_path)
         .collect::<Result<Vec<_>>>()?;
@@ -3472,6 +3790,16 @@ fn parallel_persisted_file_record_batches(
             scan_pushdown: scan_pushdown.clone(),
         })
         .collect::<Vec<_>>();
+    if tasks.len() <= 1 {
+        let mut batches = Vec::new();
+        if let Some(task) = tasks.into_iter().next() {
+            let result = scan_persisted_file_task(task)?;
+            *scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
+            batches.extend(result.batches);
+        }
+        scanned_files.extend(files);
+        return Ok(batches);
+    }
     let mut batches = Vec::new();
     let mut ordered =
         OrderedGatewayFileResults::new(DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS);
@@ -3501,7 +3829,7 @@ fn parallel_persisted_file_record_batches(
             for handle in handles {
                 if handle.join().is_err() && join_error.is_none() {
                     join_error = Some(ZippyError::Io {
-                        reason: "streaming collect persisted scan worker panicked".to_string(),
+                        reason: "gateway persisted scan worker panicked".to_string(),
                     });
                 }
             }
@@ -3539,6 +3867,7 @@ fn scan_persisted_file_task(task: GatewayPersistedScanTask) -> Result<GatewayPer
     let file_batches = read_parquet_record_batches(
         Path::new(&task.file_path),
         task.projection_columns.as_deref(),
+        &task.scan_pushdown.filters,
     )?;
     let mut batches = Vec::new();
     for batch in file_batches {
@@ -3594,11 +3923,115 @@ fn tail_persisted_file_record_batches(
     Ok(file_groups_reversed.into_iter().flatten().collect())
 }
 
+fn head_persisted_file_record_batches(
+    stream: &StreamInfo,
+    n: usize,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+    scanned_files: &mut Vec<String>,
+) -> Result<Vec<RecordBatch>> {
+    let mut remaining = n;
+    let mut batches = Vec::new();
+    for persisted_file in non_overlapping_persisted_files(stream) {
+        if remaining == 0 {
+            break;
+        }
+        let file_path = persisted_file_path(persisted_file)?;
+        let file_batches = read_parquet_record_batches_head(
+            Path::new(&file_path),
+            scan_pushdown.projection_columns.as_deref(),
+            remaining,
+        )?;
+        let raw_rows = file_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        scanned_files.push(file_path);
+        remaining = remaining.saturating_sub(raw_rows);
+        for batch in file_batches {
+            let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+    }
+    Ok(batches)
+}
+
+fn slice_persisted_file_record_batches(
+    stream: &StreamInfo,
+    offset: usize,
+    length: Option<usize>,
+    scan_pushdown: &GatewayScanPushdown,
+    scanned_rows: &mut usize,
+    scanned_files: &mut Vec<String>,
+) -> Result<(Vec<RecordBatch>, usize, usize)> {
+    let files = non_overlapping_persisted_files(stream);
+    let mut file_rows = Vec::with_capacity(files.len());
+    let mut persisted_rows = 0usize;
+    for persisted_file in &files {
+        let file_path = persisted_file_path(persisted_file)?;
+        let rows = persisted_file
+            .get("row_count")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .map(Ok)
+            .unwrap_or_else(|| persisted_parquet_row_count(Path::new(&file_path)))?;
+        persisted_rows = persisted_rows.saturating_add(rows);
+        file_rows.push((persisted_file, file_path, rows));
+    }
+
+    let requested_end = length.map(|value| offset.saturating_add(value));
+    let mut absolute_position = 0usize;
+    let mut selected_raw_rows = 0usize;
+    let mut batches = Vec::new();
+    for (_, file_path, rows) in file_rows {
+        let file_start = absolute_position;
+        let file_end = file_start.saturating_add(rows);
+        absolute_position = file_end;
+        if file_end <= offset {
+            continue;
+        }
+        if requested_end.is_some_and(|end| file_start >= end) {
+            break;
+        }
+        let start_in_file = offset.saturating_sub(file_start);
+        let take_length = requested_end.map(|end| {
+            end.saturating_sub(file_start)
+                .min(rows)
+                .saturating_sub(start_in_file)
+        });
+        if take_length == Some(0) {
+            continue;
+        }
+        let file_batches = read_parquet_record_batches_slice(
+            Path::new(&file_path),
+            scan_pushdown.projection_columns.as_deref(),
+            start_in_file,
+            take_length,
+        )?;
+        let raw_rows = file_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        selected_raw_rows = selected_raw_rows.saturating_add(raw_rows);
+        scanned_files.push(file_path);
+        for batch in file_batches {
+            let batch = apply_scan_pushdown_to_record_batch(batch, scan_pushdown, scanned_rows)?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
+        }
+    }
+    Ok((batches, persisted_rows, selected_raw_rows))
+}
+
 fn read_parquet_record_batches(
     path: &Path,
     projection_columns: Option<&[String]>,
+    filters: &[Value],
 ) -> Result<Vec<RecordBatch>> {
-    Ok(read_parquet_record_batch_chunks_with_tail(path, projection_columns, None)?.1)
+    Ok(read_parquet_record_batch_chunks(path, projection_columns, filters, None)?.1)
 }
 
 fn read_parquet_record_batches_tail(
@@ -3606,13 +4039,85 @@ fn read_parquet_record_batches_tail(
     projection_columns: Option<&[String]>,
     n: usize,
 ) -> Result<Vec<RecordBatch>> {
-    Ok(read_parquet_record_batch_chunks_with_tail(path, projection_columns, Some(n))?.1)
+    Ok(read_parquet_record_batch_chunks(
+        path,
+        projection_columns,
+        &[],
+        Some(PersistedParquetRowRange::Tail(n)),
+    )?
+    .1)
 }
 
-fn read_parquet_record_batch_chunks_with_tail(
+fn read_parquet_record_batches_head(
     path: &Path,
     projection_columns: Option<&[String]>,
-    tail_rows: Option<usize>,
+    n: usize,
+) -> Result<Vec<RecordBatch>> {
+    Ok(read_parquet_record_batch_chunks(
+        path,
+        projection_columns,
+        &[],
+        Some(PersistedParquetRowRange::Head(n)),
+    )?
+    .1)
+}
+
+fn read_parquet_record_batches_slice(
+    path: &Path,
+    projection_columns: Option<&[String]>,
+    offset: usize,
+    length: Option<usize>,
+) -> Result<Vec<RecordBatch>> {
+    Ok(read_parquet_record_batch_chunks(
+        path,
+        projection_columns,
+        &[],
+        Some(PersistedParquetRowRange::Slice { offset, length }),
+    )?
+    .1)
+}
+
+fn persisted_parquet_row_count(path: &Path) -> Result<usize> {
+    let file = File::open(path).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "failed to open persisted parquet file path=[{}] error=[{}]",
+            path.display(),
+            error
+        ),
+    })?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to read persisted parquet metadata path=[{}] error=[{}]",
+                path.display(),
+                error
+            ),
+        })?;
+    usize::try_from(builder.metadata().file_metadata().num_rows()).map_err(|_| {
+        ZippyError::InvalidConfig {
+            reason: format!(
+                "persisted parquet row count overflows usize path=[{}]",
+                path.display()
+            ),
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PersistedParquetRowRange {
+    Head(usize),
+    Tail(usize),
+    Slice {
+        offset: usize,
+        length: Option<usize>,
+    },
+}
+
+fn read_parquet_record_batch_chunks(
+    path: &Path,
+    projection_columns: Option<&[String]>,
+    filters: &[Value],
+    row_range: Option<PersistedParquetRowRange>,
 ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let file = File::open(path).map_err(|error| ZippyError::Io {
         reason: format!(
@@ -3649,7 +4154,24 @@ fn read_parquet_record_batch_chunks_with_tail(
         let projection = ProjectionMask::roots(builder.parquet_schema(), indices);
         builder = builder.with_projection(projection);
     }
-    if let Some(tail_rows) = tail_rows {
+    if row_range.is_none() && !filters.is_empty() {
+        let row_groups = builder
+            .metadata()
+            .row_groups()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row_group)| {
+                filters
+                    .iter()
+                    .all(|filter| {
+                        parquet_row_group_may_match_filter(builder.schema(), row_group, filter)
+                    })
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        builder = builder.with_row_groups(row_groups);
+    }
+    if let Some(row_range) = row_range {
         let total_rows =
             usize::try_from(builder.metadata().file_metadata().num_rows()).map_err(|_| {
                 ZippyError::InvalidConfig {
@@ -3659,8 +4181,18 @@ fn read_parquet_record_batch_chunks_with_tail(
                     ),
                 }
             })?;
-        let selected_rows = tail_rows.min(total_rows);
-        let skipped_rows = total_rows.saturating_sub(selected_rows);
+        let (skipped_rows, selected_rows) = match row_range {
+            PersistedParquetRowRange::Head(rows) => (0, rows.min(total_rows)),
+            PersistedParquetRowRange::Tail(rows) => {
+                let selected = rows.min(total_rows);
+                (total_rows.saturating_sub(selected), selected)
+            }
+            PersistedParquetRowRange::Slice { offset, length } => {
+                let skipped = offset.min(total_rows);
+                let available = total_rows.saturating_sub(skipped);
+                (skipped, length.unwrap_or(available).min(available))
+            }
+        };
         let mut selectors = Vec::new();
         if skipped_rows > 0 {
             selectors.push(RowSelector::skip(skipped_rows));
@@ -3693,6 +4225,102 @@ fn read_parquet_record_batch_chunks_with_tail(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok((schema, batches))
+}
+
+fn parquet_row_group_may_match_filter(
+    schema: &SchemaRef,
+    row_group: &parquet::file::metadata::RowGroupMetaData,
+    filter: &Value,
+) -> bool {
+    let Some(expr) = filter.get("expr") else {
+        return true;
+    };
+    parquet_row_group_may_match_expr(schema, row_group, expr)
+}
+
+fn parquet_row_group_may_match_expr(
+    schema: &SchemaRef,
+    row_group: &parquet::file::metadata::RowGroupMetaData,
+    expr: &Value,
+) -> bool {
+    if query_expr_kind(expr) == Some("is_in") {
+        let Some(args) = expr
+            .get("args")
+            .and_then(Value::as_array)
+            .filter(|args| args.len() == 2)
+        else {
+            return true;
+        };
+        let Ok(Some(column)) = query_expr_column_name(&args[0]) else {
+            return true;
+        };
+        let Some(values) = literal_value(&args[1]).as_array() else {
+            return true;
+        };
+        let Some((minimum, maximum)) = parquet_row_group_min_max(schema, row_group, column) else {
+            return true;
+        };
+        return values
+            .iter()
+            .any(|value| numeric_range_may_match(&minimum, &maximum, "eq", value).unwrap_or(true));
+    }
+    if query_expr_kind(expr) != Some("binary") {
+        return true;
+    }
+    let Some(op) = expr.get("op").and_then(Value::as_str) else {
+        return true;
+    };
+    let Some(args) = expr
+        .get("args")
+        .and_then(Value::as_array)
+        .filter(|args| args.len() == 2)
+    else {
+        return true;
+    };
+    if op == "and" {
+        return parquet_row_group_may_match_expr(schema, row_group, &args[0])
+            && parquet_row_group_may_match_expr(schema, row_group, &args[1]);
+    }
+    if op == "or" {
+        return parquet_row_group_may_match_expr(schema, row_group, &args[0])
+            || parquet_row_group_may_match_expr(schema, row_group, &args[1]);
+    }
+    let Ok(Some((column, literal, reverse))) = column_literal_filter_pair(&args[0], &args[1])
+    else {
+        return true;
+    };
+    let Some((minimum, maximum)) = parquet_row_group_min_max(schema, row_group, column) else {
+        return true;
+    };
+    let normalized_op = if reverse {
+        let Ok(reversed) = reverse_filter_op(op) else {
+            return true;
+        };
+        reversed
+    } else {
+        op.to_string()
+    };
+    numeric_range_may_match(&minimum, &maximum, &normalized_op, literal_value(literal))
+        .unwrap_or(true)
+}
+
+fn parquet_row_group_min_max(
+    schema: &SchemaRef,
+    row_group: &parquet::file::metadata::RowGroupMetaData,
+    column: &str,
+) -> Option<(Value, Value)> {
+    let column_index = schema.index_of(column).ok()?;
+    let statistics = row_group.column(column_index).statistics()?;
+    if !statistics.min_is_exact() || !statistics.max_is_exact() {
+        return None;
+    }
+    match statistics {
+        Statistics::Int32(values) => Some((json!(*values.min_opt()?), json!(*values.max_opt()?))),
+        Statistics::Int64(values) => Some((json!(*values.min_opt()?), json!(*values.max_opt()?))),
+        Statistics::Float(values) => Some((json!(*values.min_opt()?), json!(*values.max_opt()?))),
+        Statistics::Double(values) => Some((json!(*values.min_opt()?), json!(*values.max_opt()?))),
+        _ => None,
+    }
 }
 
 fn apply_scan_pushdown_to_record_batch(
@@ -3769,10 +4397,11 @@ fn schema_for_projection_columns(
 }
 
 fn stream_has_persisted_files(stream: &StreamInfo) -> bool {
-    stream
-        .persisted_files
-        .iter()
-        .any(|item| persisted_file_path(item).is_ok())
+    stream.persisted_files.iter().any(|item| {
+        item.get("file_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.is_empty())
+    })
 }
 
 fn stream_is_persisted_only(stream: &StreamInfo) -> bool {
@@ -3786,11 +4415,243 @@ fn non_overlapping_persisted_files(stream: &StreamInfo) -> Vec<&Value> {
     let mut files = stream
         .persisted_files
         .iter()
-        .filter(|item| persisted_file_path(item).is_ok())
-        .filter(|item| persisted_segment_identities(item).is_disjoint(&live_identities))
+        .filter(|item| {
+            item.get("file_path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.is_empty())
+        })
+        .filter(|item| {
+            !segment_identities_overlap(&persisted_segment_identities(item), &live_identities)
+        })
         .collect::<Vec<_>>();
     files.sort_by_key(|item| persisted_file_order_key(item));
     files
+}
+
+fn matching_non_overlapping_persisted_files<'a>(
+    stream: &'a StreamInfo,
+    scan_pushdown: &GatewayScanPushdown,
+) -> Vec<&'a Value> {
+    non_overlapping_persisted_files(stream)
+        .into_iter()
+        .filter(|item| {
+            scan_pushdown
+                .filters
+                .iter()
+                .all(|filter| persisted_file_may_match_filter(item, filter))
+        })
+        .collect()
+}
+
+fn persisted_file_may_match_filter(item: &Value, filter: &Value) -> bool {
+    let Some(expr) = filter.get("expr") else {
+        return true;
+    };
+    persisted_file_may_match_expr(item, expr)
+}
+
+fn persisted_file_may_match_expr(item: &Value, expr: &Value) -> bool {
+    if query_expr_kind(expr) == Some("is_in") {
+        return persisted_file_may_match_is_in(item, expr);
+    }
+    if query_expr_kind(expr) != Some("binary") {
+        return true;
+    }
+    let Some(op) = expr.get("op").and_then(Value::as_str) else {
+        return true;
+    };
+    let Some(args) = expr
+        .get("args")
+        .and_then(Value::as_array)
+        .filter(|args| args.len() == 2)
+    else {
+        return true;
+    };
+    if op == "and" {
+        return persisted_file_may_match_expr(item, &args[0])
+            && persisted_file_may_match_expr(item, &args[1]);
+    }
+    if op == "or" {
+        return persisted_file_may_match_expr(item, &args[0])
+            || persisted_file_may_match_expr(item, &args[1]);
+    }
+    let Ok(Some((column, literal, reverse))) = column_literal_filter_pair(&args[0], &args[1])
+    else {
+        return true;
+    };
+    let normalized_op = if reverse {
+        let Ok(reversed) = reverse_filter_op(op) else {
+            return true;
+        };
+        reversed
+    } else {
+        op.to_string()
+    };
+    let literal = literal_value(literal);
+    if let Some(partition_value) = item.get("partition").and_then(|value| value.get(column)) {
+        if !partition_value_may_match(partition_value, &normalized_op, literal) {
+            return false;
+        }
+    }
+    let Some((min_value, max_value)) = persisted_file_min_max(item, column) else {
+        return true;
+    };
+    numeric_range_may_match(min_value, max_value, &normalized_op, literal).unwrap_or(true)
+}
+
+fn persisted_file_may_match_is_in(item: &Value, expr: &Value) -> bool {
+    let Some(args) = expr
+        .get("args")
+        .and_then(Value::as_array)
+        .filter(|args| args.len() == 2)
+    else {
+        return true;
+    };
+    let Ok(Some(column)) = query_expr_column_name(&args[0]) else {
+        return true;
+    };
+    let Some(values) = literal_value(&args[1]).as_array() else {
+        return true;
+    };
+    if let Some(partition_value) = item.get("partition").and_then(|value| value.get(column)) {
+        return values
+            .iter()
+            .any(|value| partition_scalar_equality(partition_value, value).unwrap_or(true));
+    }
+    let Some((min_value, max_value)) = persisted_file_min_max(item, column) else {
+        return true;
+    };
+    values
+        .iter()
+        .any(|value| numeric_range_may_match(min_value, max_value, "eq", value).unwrap_or(true))
+}
+
+fn persisted_file_min_max<'a>(item: &'a Value, column: &str) -> Option<(&'a Value, &'a Value)> {
+    if let Some(stats) = item.get("stats").and_then(|stats| stats.get(column)) {
+        return Some((stats.get("min")?, stats.get("max")?));
+    }
+    match column {
+        "dt" | "event_ts" => Some((item.get("min_event_ts")?, item.get("max_event_ts")?)),
+        "seq" => Some((item.get("min_seq")?, item.get("max_seq")?)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExactNumericValue {
+    Integer(i128),
+    Float(f64),
+}
+
+fn exact_numeric_value(value: &Value) -> Option<ExactNumericValue> {
+    if let Some(value) = value.as_i64() {
+        return Some(ExactNumericValue::Integer(i128::from(value)));
+    }
+    if let Some(value) = value.as_u64() {
+        return Some(ExactNumericValue::Integer(i128::from(value)));
+    }
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .map(ExactNumericValue::Float)
+}
+
+fn numeric_range_may_match(
+    min_value: &Value,
+    max_value: &Value,
+    op: &str,
+    literal: &Value,
+) -> Option<bool> {
+    match (
+        exact_numeric_value(min_value)?,
+        exact_numeric_value(max_value)?,
+        exact_numeric_value(literal)?,
+    ) {
+        (
+            ExactNumericValue::Integer(minimum),
+            ExactNumericValue::Integer(maximum),
+            ExactNumericValue::Integer(value),
+        ) => Some(range_values_may_match(minimum, maximum, op, value)),
+        (
+            ExactNumericValue::Float(minimum),
+            ExactNumericValue::Float(maximum),
+            ExactNumericValue::Float(value),
+        ) => Some(range_values_may_match(minimum, maximum, op, value)),
+        _ => None,
+    }
+}
+
+fn range_values_may_match<T: Copy + PartialEq + PartialOrd>(
+    minimum: T,
+    maximum: T,
+    op: &str,
+    value: T,
+) -> bool {
+    match op {
+        "eq" => minimum <= value && value <= maximum,
+        "ne" => !(minimum == maximum && maximum == value),
+        "gt" => maximum > value,
+        "ge" => maximum >= value,
+        "lt" => minimum < value,
+        "le" => minimum <= value,
+        _ => true,
+    }
+}
+
+fn partition_value_may_match(partition_value: &Value, op: &str, literal: &Value) -> bool {
+    match op {
+        "eq" => partition_scalar_equality(partition_value, literal).unwrap_or(true),
+        "ne" => partition_scalar_equality(partition_value, literal) != Some(true),
+        _ => numeric_range_may_match(partition_value, partition_value, op, literal).unwrap_or(true),
+    }
+}
+
+fn partition_scalar_equality(left: &Value, right: &Value) -> Option<bool> {
+    match (exact_numeric_value(left), exact_numeric_value(right)) {
+        (Some(ExactNumericValue::Integer(left)), Some(ExactNumericValue::Integer(right))) => {
+            return Some(left == right);
+        }
+        (Some(ExactNumericValue::Float(left)), Some(ExactNumericValue::Float(right))) => {
+            return Some(left == right);
+        }
+        (Some(_), Some(_)) => return None,
+        (Some(number), None) => {
+            return numeric_string_value(right.as_str()?)
+                .and_then(|string_number| same_kind_numeric_equality(number, string_number));
+        }
+        (None, Some(number)) => {
+            return numeric_string_value(left.as_str()?)
+                .and_then(|string_number| same_kind_numeric_equality(string_number, number));
+        }
+        (None, None) => {}
+    }
+    match (left, right) {
+        (Value::String(left), Value::String(right)) => Some(left == right),
+        (Value::Bool(left), Value::Bool(right)) => Some(left == right),
+        (Value::Null, Value::Null) => Some(true),
+        _ => None,
+    }
+}
+
+fn numeric_string_value(value: &str) -> Option<ExactNumericValue> {
+    if let Ok(value) = value.parse::<i128>() {
+        return Some(ExactNumericValue::Integer(value));
+    }
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .map(ExactNumericValue::Float)
+}
+
+fn same_kind_numeric_equality(left: ExactNumericValue, right: ExactNumericValue) -> Option<bool> {
+    match (left, right) {
+        (ExactNumericValue::Integer(left), ExactNumericValue::Integer(right)) => {
+            Some(left == right)
+        }
+        (ExactNumericValue::Float(left), ExactNumericValue::Float(right)) => Some(left == right),
+        _ => None,
+    }
 }
 
 fn persisted_file_path(value: &Value) -> Result<String> {
@@ -3838,12 +4699,19 @@ fn persisted_file_path(value: &Value) -> Result<String> {
     Ok(canonical_path.to_string_lossy().to_string())
 }
 
-fn live_segment_identities(stream: &StreamInfo) -> std::collections::BTreeSet<(u64, u64)> {
-    let mut identities = std::collections::BTreeSet::new();
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GatewaySegmentIdentity {
+    segment_id: u64,
+    generation: u64,
+    writer_epoch: Option<u64>,
+}
+
+fn live_segment_identities(stream: &StreamInfo) -> Vec<GatewaySegmentIdentity> {
+    let mut identities = Vec::new();
     if let Some(descriptor) = stream.active_segment_descriptor.as_ref() {
         if let Some(identity) = segment_identity_from_value(descriptor, "segment_id", "generation")
         {
-            identities.insert(identity);
+            identities.push(identity);
         }
     } else {
         return identities;
@@ -3851,14 +4719,16 @@ fn live_segment_identities(stream: &StreamInfo) -> std::collections::BTreeSet<(u
     for descriptor in &stream.sealed_segments {
         if let Some(identity) = segment_identity_from_value(descriptor, "segment_id", "generation")
         {
-            identities.insert(identity);
+            identities.push(identity);
         }
     }
+    identities.sort_unstable();
+    identities.dedup();
     identities
 }
 
-fn persisted_segment_identities(value: &Value) -> std::collections::BTreeSet<(u64, u64)> {
-    let mut identities = std::collections::BTreeSet::new();
+fn persisted_segment_identities(value: &Value) -> Vec<GatewaySegmentIdentity> {
+    let mut identities = Vec::new();
     if let Some(source_segments) = value.get("source_segments").and_then(Value::as_array) {
         for source_segment in source_segments {
             if let Some(identity) = segment_identity_from_value(
@@ -3866,7 +4736,7 @@ fn persisted_segment_identities(value: &Value) -> std::collections::BTreeSet<(u6
                 "source_segment_id",
                 "source_generation",
             ) {
-                identities.insert(identity);
+                identities.push(identity);
             }
         }
     }
@@ -3874,9 +4744,11 @@ fn persisted_segment_identities(value: &Value) -> std::collections::BTreeSet<(u6
         if let Some(identity) =
             segment_identity_from_value(value, "source_segment_id", "source_generation")
         {
-            identities.insert(identity);
+            identities.push(identity);
         }
     }
+    identities.sort_unstable();
+    identities.dedup();
     identities
 }
 
@@ -3884,15 +4756,37 @@ fn segment_identity_from_value(
     value: &Value,
     segment_id_key: &str,
     generation_key: &str,
-) -> Option<(u64, u64)> {
-    Some((
-        value.get(segment_id_key)?.as_u64()?,
-        value.get(generation_key)?.as_u64()?,
-    ))
+) -> Option<GatewaySegmentIdentity> {
+    Some(GatewaySegmentIdentity {
+        segment_id: value.get(segment_id_key)?.as_u64()?,
+        generation: value.get(generation_key)?.as_u64()?,
+        writer_epoch: value.get("writer_epoch").and_then(Value::as_u64),
+    })
 }
 
-fn persisted_file_order_key(value: &Value) -> (u64, u64, u64, String) {
+fn segment_identities_overlap(
+    persisted: &[GatewaySegmentIdentity],
+    live: &[GatewaySegmentIdentity],
+) -> bool {
+    persisted.iter().any(|persisted_identity| {
+        live.iter()
+            .any(|live_identity| segment_identity_matches(*persisted_identity, *live_identity))
+    })
+}
+
+fn segment_identity_matches(left: GatewaySegmentIdentity, right: GatewaySegmentIdentity) -> bool {
+    if left.segment_id != right.segment_id || left.generation != right.generation {
+        return false;
+    }
+    match (left.writer_epoch, right.writer_epoch) {
+        (Some(left_epoch), Some(right_epoch)) => left_epoch == right_epoch,
+        _ => true,
+    }
+}
+
+fn persisted_file_order_key(value: &Value) -> (u64, u64, u64, u64, String) {
     (
+        json_u64_order_value(value.get("writer_epoch")),
         json_u64_order_value(value.get("source_segment_id")),
         json_u64_order_value(value.get("source_generation")),
         json_u64_order_value(value.get("created_at")),
@@ -3905,7 +4799,7 @@ fn persisted_file_order_key(value: &Value) -> (u64, u64, u64, String) {
 }
 
 fn json_u64_order_value(value: Option<&Value>) -> u64 {
-    value.and_then(Value::as_u64).unwrap_or(u64::MAX)
+    value.and_then(Value::as_u64).unwrap_or_default()
 }
 
 fn live_segment_record_batches(
@@ -3952,6 +4846,7 @@ fn tail_live_segment_record_batches_with_leases(
     segment_schema: CompiledSchema,
     active_committed_row_high_watermark: usize,
     n: usize,
+    acquire_leases: bool,
     leases: &mut Vec<SegmentReaderLeaseGuard>,
     scan_pushdown: &GatewayScanPushdown,
     scanned_rows: &mut usize,
@@ -3976,7 +4871,9 @@ fn tail_live_segment_record_batches_with_leases(
         if remaining == 0 {
             break;
         }
-        leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        if acquire_leases {
+            leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        }
         let batch = descriptor_tail_record_batch_until(
             sealed_descriptor,
             segment_schema.clone(),
@@ -4003,6 +4900,7 @@ fn head_live_segment_record_batches_with_leases(
     sealed_descriptors: &[Value],
     segment_schema: CompiledSchema,
     n: usize,
+    acquire_leases: bool,
     leases: &mut Vec<SegmentReaderLeaseGuard>,
     scan_pushdown: &GatewayScanPushdown,
     scanned_rows: &mut usize,
@@ -4014,7 +4912,9 @@ fn head_live_segment_record_batches_with_leases(
         if remaining == 0 {
             break;
         }
-        leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        if acquire_leases {
+            leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        }
         let (batch, _) = descriptor_slice_record_batch_until(
             sealed_descriptor,
             segment_schema.clone(),
@@ -4031,7 +4931,9 @@ fn head_live_segment_record_batches_with_leases(
     }
 
     if remaining > 0 {
-        leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
+        if acquire_leases {
+            leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
+        }
         let active_committed_row_high_watermark =
             active_committed_row_high_watermark(descriptor, segment_schema.clone())?;
         let (active_batch, _) = descriptor_slice_record_batch_until(
@@ -4060,6 +4962,7 @@ fn slice_live_segment_record_batches_with_leases(
     segment_schema: CompiledSchema,
     offset: usize,
     length: Option<usize>,
+    acquire_leases: bool,
     leases: &mut Vec<SegmentReaderLeaseGuard>,
     scan_pushdown: &GatewayScanPushdown,
     scanned_rows: &mut usize,
@@ -4072,7 +4975,9 @@ fn slice_live_segment_record_batches_with_leases(
         if length.is_some_and(|value| collected_rows >= value) {
             break;
         }
-        leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        if acquire_leases {
+            leases.push(state.acquire_segment_reader_lease(source, sealed_descriptor)?);
+        }
         let remaining_length = length.map(|value| value.saturating_sub(collected_rows));
         let start_row = offset.saturating_sub(absolute_position);
         let (batch, committed_rows) = descriptor_slice_record_batch_until(
@@ -4092,7 +4997,9 @@ fn slice_live_segment_record_batches_with_leases(
     }
 
     if length.is_none_or(|value| collected_rows < value) {
-        leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
+        if acquire_leases {
+            leases.push(state.acquire_segment_reader_lease(source, descriptor)?);
+        }
         let active_committed_row_high_watermark =
             active_committed_row_high_watermark(descriptor, segment_schema.clone())?;
         let remaining_length = length.map(|value| value.saturating_sub(collected_rows));
@@ -5777,6 +6684,7 @@ mod tests {
             data_path: "segment".to_string(),
             descriptor_generation: 0,
             active_segment_descriptor: None,
+            source_configs: Vec::new(),
             active_segment_preflight: None,
             segment_row_capacity: Some(DEFAULT_STREAM_TABLE_ROW_CAPACITY),
             sealed_segments: Vec::new(),
@@ -5835,6 +6743,7 @@ mod tests {
             data_path: "segment".to_string(),
             descriptor_generation: 0,
             active_segment_descriptor: None,
+            source_configs: Vec::new(),
             active_segment_preflight: None,
             segment_row_capacity: Some(4096),
             sealed_segments: Vec::new(),
@@ -6083,13 +6992,83 @@ mod tests {
             writer.close().unwrap();
         }
 
-        let batches = read_parquet_record_batches(&path, None).unwrap();
+        let batches = read_parquet_record_batches(&path, None, &[]).unwrap();
 
         assert_eq!(batches.len(), 2);
         assert_eq!(
             batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
             row_count
         );
+    }
+
+    #[test]
+    fn persisted_parquet_reader_prunes_non_matching_row_groups() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![0_i64, 1, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("row-groups.parquet");
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_size(2)
+            .build();
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, Some(properties)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let filters = vec![json!({
+            "op": "filter",
+            "expr": {
+                "kind": "binary",
+                "op": "ge",
+                "args": [
+                    {"kind": "col", "value": "seq"},
+                    {"kind": "literal", "value": 2}
+                ]
+            }
+        })];
+
+        let batches = read_parquet_record_batches(&path, None, &filters).unwrap();
+        let table = concat_record_batches(batch.schema(), batches).unwrap();
+        let values = table
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+
+        assert_eq!(values, vec![2, 3]);
+    }
+
+    #[test]
+    fn persisted_parquet_row_range_returns_no_rows_for_zero_length() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![0_i64, 1])) as ArrayRef],
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("zero-length.parquet");
+        {
+            let file = File::create(&path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let head = read_parquet_record_batches_head(&path, None, 0).unwrap();
+        let tail = read_parquet_record_batches_tail(&path, None, 0).unwrap();
+        let slice = read_parquet_record_batches_slice(&path, None, 1, Some(0)).unwrap();
+
+        assert!(head.is_empty());
+        assert!(tail.is_empty());
+        assert!(slice.is_empty());
     }
 
     #[test]
@@ -6109,6 +7088,7 @@ mod tests {
             data_path: "segment".to_string(),
             descriptor_generation: 0,
             active_segment_descriptor: None,
+            source_configs: Vec::new(),
             active_segment_preflight: None,
             segment_row_capacity: Some(4096),
             sealed_segments: vec![json!({
@@ -6137,5 +7117,257 @@ mod tests {
         let files = non_overlapping_persisted_files(&stream);
 
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn persisted_overlap_distinguishes_writer_epochs() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let stream = StreamInfo {
+            stream_name: "writer_restart_ticks".to_string(),
+            schema: schema_metadata(&schema),
+            schema_hash: canonical_schema_hash(&schema),
+            data_path: "segment".to_string(),
+            descriptor_generation: 1,
+            active_segment_descriptor: Some(json!({
+                "segment_id": 1,
+                "generation": 0,
+                "writer_epoch": 2
+            })),
+            source_configs: Vec::new(),
+            active_segment_preflight: None,
+            segment_row_capacity: Some(4096),
+            sealed_segments: Vec::new(),
+            persisted_files: vec![json!({
+                "file_path": "/tmp/epoch-1-segment-1.parquet",
+                "row_count": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "writer_epoch": 1
+            })],
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: Some("writer-2".to_string()),
+            writer_epoch: 2,
+            reader_count: 0,
+            status: "writer_attached".to_string(),
+        };
+
+        let files = non_overlapping_persisted_files(&stream);
+
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn persisted_file_order_keeps_writer_epochs_contiguous() {
+        let mut files = [
+            json!({
+                "writer_epoch": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 3,
+                "file_path": "epoch-2-segment-1.parquet"
+            }),
+            json!({
+                "writer_epoch": 1,
+                "source_segment_id": 2,
+                "source_generation": 1,
+                "created_at": 2,
+                "file_path": "epoch-1-segment-2.parquet"
+            }),
+            json!({
+                "writer_epoch": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 1,
+                "file_path": "epoch-1-segment-1.parquet"
+            }),
+        ];
+
+        files.sort_by_key(persisted_file_order_key);
+
+        assert_eq!(files[0]["file_path"], "epoch-1-segment-1.parquet");
+        assert_eq!(files[1]["file_path"], "epoch-1-segment-2.parquet");
+        assert_eq!(files[2]["file_path"], "epoch-2-segment-1.parquet");
+    }
+
+    #[test]
+    fn persisted_file_filter_pruning_preserves_nanosecond_precision() {
+        let boundary = 1_700_000_000_000_000_000_i64;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dt",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let stream = StreamInfo {
+            stream_name: "filtered_ticks".to_string(),
+            schema: schema_metadata(&schema),
+            schema_hash: canonical_schema_hash(&schema),
+            data_path: "segment".to_string(),
+            descriptor_generation: 0,
+            active_segment_descriptor: None,
+            source_configs: Vec::new(),
+            active_segment_preflight: None,
+            segment_row_capacity: Some(4096),
+            sealed_segments: Vec::new(),
+            persisted_files: vec![
+                json!({
+                    "file_path": "/tmp/boundary.parquet",
+                    "source_segment_id": 1,
+                    "source_generation": 0,
+                    "stats": {"dt": {"min": boundary, "max": boundary}}
+                }),
+                json!({
+                    "file_path": "/tmp/after-boundary.parquet",
+                    "source_segment_id": 2,
+                    "source_generation": 1,
+                    "stats": {"dt": {"min": boundary + 1, "max": boundary + 1}}
+                }),
+            ],
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: None,
+            writer_epoch: 1,
+            reader_count: 0,
+            status: "registered".to_string(),
+        };
+        let scan_pushdown = GatewayScanPushdown {
+            filters: vec![json!({
+                "op": "filter",
+                "expr": {
+                    "kind": "binary",
+                    "op": "gt",
+                    "args": [
+                        {"kind": "col", "value": "dt"},
+                        {
+                            "kind": "literal",
+                            "literal_type": "timestamp_ns",
+                            "value": boundary,
+                            "unit": "ns"
+                        }
+                    ]
+                }
+            })],
+            projection_columns: None,
+        };
+
+        let files = matching_non_overlapping_persisted_files(&stream, &scan_pushdown);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["file_path"], "/tmp/after-boundary.parquet");
+    }
+
+    #[test]
+    fn persisted_partition_filter_handles_mixed_scalar_encodings_conservatively() {
+        let item = json!({"partition": {"bucket": "1"}});
+        let equality = json!({
+            "kind": "binary",
+            "op": "eq",
+            "args": [
+                {"kind": "col", "value": "bucket"},
+                {"kind": "literal", "value": 1}
+            ]
+        });
+        let mismatch = json!({
+            "kind": "binary",
+            "op": "eq",
+            "args": [
+                {"kind": "col", "value": "bucket"},
+                {"kind": "literal", "value": 2}
+            ]
+        });
+
+        assert!(persisted_file_may_match_expr(&item, &equality));
+        assert!(!persisted_file_may_match_expr(&item, &mismatch));
+    }
+
+    #[test]
+    fn persisted_scan_fails_closed_for_missing_catalog_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let stream = StreamInfo {
+            stream_name: "missing_ticks".to_string(),
+            schema: schema_metadata(&schema),
+            schema_hash: canonical_schema_hash(&schema),
+            data_path: "segment".to_string(),
+            descriptor_generation: 0,
+            active_segment_descriptor: None,
+            source_configs: Vec::new(),
+            active_segment_preflight: None,
+            segment_row_capacity: Some(4096),
+            sealed_segments: Vec::new(),
+            persisted_files: vec![json!({
+                "file_path": temp.path().join("missing.parquet").to_string_lossy(),
+                "persist_data_root": temp.path().to_string_lossy(),
+                "source_segment_id": 1,
+                "source_generation": 0
+            })],
+            persist_events: Vec::new(),
+            segment_reader_leases: Vec::new(),
+            buffer_size: 64,
+            frame_size: 4096,
+            write_seq: 0,
+            writer_process_id: None,
+            writer_epoch: 1,
+            reader_count: 0,
+            status: "registered".to_string(),
+        };
+        let mut scanned_rows = 0;
+        let mut scanned_files = Vec::new();
+        let mut max_pending_file_results = 0;
+
+        let error = parallel_persisted_file_record_batches(
+            &stream,
+            &GatewayScanPushdown::default(),
+            &mut scanned_rows,
+            &mut scanned_files,
+            &mut max_pending_file_results,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to canonicalize persisted file path"));
+    }
+
+    #[test]
+    fn gateway_snapshot_expiry_removes_only_idle_snapshots() {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let stream = stream_info_for_gateway_status_test("snapshot_ticks", schema, 1);
+        let now = Instant::now();
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            "active".to_string(),
+            GatewaySnapshot {
+                source: "snapshot_ticks".to_string(),
+                stream: Arc::new(stream.clone()),
+                active_descriptor: None,
+                active_committed_row_high_watermark: None,
+                last_accessed_at: now,
+                _leases: Vec::new(),
+            },
+        );
+        snapshots.insert(
+            "expired".to_string(),
+            GatewaySnapshot {
+                source: "snapshot_ticks".to_string(),
+                stream: Arc::new(stream),
+                active_descriptor: None,
+                active_committed_row_high_watermark: None,
+                last_accessed_at: now - GATEWAY_SNAPSHOT_IDLE_TIMEOUT - Duration::from_secs(1),
+                _leases: Vec::new(),
+            },
+        );
+
+        let expired = expire_gateway_snapshots(&mut snapshots, now);
+
+        assert_eq!(expired, 1);
+        assert!(snapshots.contains_key("active"));
+        assert!(!snapshots.contains_key("expired"));
     }
 }

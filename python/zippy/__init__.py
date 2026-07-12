@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import atexit
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from dataclasses import dataclass
+from decimal import Decimal
+from decimal import InvalidOperation
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -56,6 +60,7 @@ _KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD = "zippy_key_value_last_changelog_seq"
 _KEY_VALUE_SCHEMA_VERSION_FIELD = "zippy_key_value_schema_version"
 _LIVE_SNAPSHOT_RETRY_ATTEMPTS = 20
 _LIVE_SNAPSHOT_RETRY_SLEEP_SEC = 0.002
+_DEFAULT_SHARD_QUERY_PARALLELISM = 4
 _TEMPORAL_LITERAL_RE = re.compile(
     r"^(?P<year>\d{4})"
     r"(?:(?P<dash_month>-?)(?P<month>\d{2})"
@@ -383,7 +388,7 @@ _BUILTIN_CONFIG: dict[str, object] = {
                 "enabled": False,
                 "interval_sec": 300.0,
                 "min_files": 8,
-                "delete_sources": True,
+                "delete_sources": False,
                 "sort_column": None,
             },
         },
@@ -874,6 +879,16 @@ def _expr_columns(expr: object) -> set[str]:
     return columns
 
 
+def _query_expr_output_name(expr: object) -> str | None:
+    if isinstance(expr, str):
+        return expr
+    if not isinstance(expr, _QueryExpr):
+        return None
+    if expr._kind in {"col", "alias"}:
+        return str(expr._value)
+    return None
+
+
 def _normalize_query_exprs(
     exprs: tuple[object, ...],
     named_exprs: dict[str, object],
@@ -1236,6 +1251,18 @@ def _remote_gateway_plan_split(
             return remote_ops, plan_ops[index + 1 :]
         return remote_ops, plan_ops[index:]
     return remote_ops, []
+
+
+def _shard_fanout_plan_split(
+    plan_ops: list[tuple[str, object]],
+) -> tuple[list[tuple[str, object]], list[tuple[str, object]]]:
+    shard_ops: list[tuple[str, object]] = []
+    shard_safe_ops = {"filter", "select", "with_columns", "drop", "rename"}
+    for index, (kind, value) in enumerate(plan_ops):
+        if kind not in shard_safe_ops:
+            return shard_ops, plan_ops[index:]
+        shard_ops.append((kind, value))
+    return shard_ops, []
 
 
 def _remote_gateway_capability_summary(
@@ -1881,7 +1908,7 @@ def _compact_table(
     table_name: str,
     *,
     min_files: int = 2,
-    delete_sources: bool = True,
+    delete_sources: bool = False,
     sort_column: str | None = None,
     master: MasterClient | None = None,
 ) -> dict[str, object]:
@@ -1892,7 +1919,8 @@ def _compact_table(
     :type table_name: str
     :param min_files: Minimum files in one partition group before compaction.
     :type min_files: int
-    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :param delete_sources: Reserved for snapshot-aware garbage collection. Passing true is
+        rejected because persisted snapshot leases are not implemented yet.
     :type delete_sources: bool
     :param sort_column: Optional column used to sort compacted parquet rows.
     :type sort_column: str | None
@@ -1900,13 +1928,16 @@ def _compact_table(
     :type master: MasterClient | None
     :returns: Compaction summary.
     :rtype: dict[str, object]
-    :raises ValueError: If ``table_name`` is empty or ``min_files`` is smaller than two.
+    :raises ValueError: If ``table_name`` is empty, ``min_files`` is smaller than two, or
+        ``delete_sources`` is true.
     :raises RuntimeError: If master does not support persisted metadata replacement.
     """
     if not table_name:
         raise ValueError("table_name must not be empty")
     if min_files < 2:
         raise ValueError("min_files must be at least 2")
+    if delete_sources:
+        raise ValueError("delete_sources requires persisted snapshot leases and is not supported")
 
     master_client = master or _default_master()
     replace_persisted_files = getattr(master_client, "replace_persisted_files", None)
@@ -1922,7 +1953,6 @@ def _compact_table(
     groups = _persisted_compaction_groups(stream, persisted_files)
     compacted_files: list[dict[str, object]] = []
     compacted_source_keys: set[tuple[str, str]] = set()
-    source_paths: list[Path] = []
 
     for group_files in groups.values():
         if len(group_files) < min_files:
@@ -1936,7 +1966,6 @@ def _compact_table(
         compacted_files.append(compacted_file)
         for item in group_files:
             compacted_source_keys.add(_persisted_file_compaction_key(item))
-            source_paths.append(_validated_persisted_file_local_path(item))
 
     if not compacted_files:
         return {
@@ -1958,24 +1987,14 @@ def _compact_table(
     next_files.sort(key=_persisted_file_order_key)
     replace_persisted_files(table_name, next_files)
 
-    deleted = 0
-    delete_errors: list[dict[str, str]] = []
-    if delete_sources:
-        for path in source_paths:
-            try:
-                path.unlink(missing_ok=True)
-                deleted += 1
-            except OSError as error:
-                delete_errors.append({"file_path": str(path), "error": str(error)})
-
     return {
         "table_name": table_name,
         "groups_compacted": len(compacted_files),
         "files_compacted": len(compacted_source_keys),
         "rows_compacted": sum(int(item.get("row_count", 0)) for item in compacted_files),
         "compacted_files": compacted_files,
-        "source_files_deleted": deleted,
-        "source_file_delete_errors": delete_errors,
+        "source_files_deleted": 0,
+        "source_file_delete_errors": [],
     }
 
 
@@ -1983,7 +2002,7 @@ def _compact_tables(
     table_names: object = None,
     *,
     min_files: int = 2,
-    delete_sources: bool = True,
+    delete_sources: bool = False,
     sort_column: str | None = None,
     continue_on_error: bool = False,
     master: MasterClient | None = None,
@@ -1996,7 +2015,8 @@ def _compact_tables(
     :type table_names: object
     :param min_files: Minimum files in one partition group before compaction.
     :type min_files: int
-    :param delete_sources: Whether to delete source parquet files after metadata replacement.
+    :param delete_sources: Reserved for snapshot-aware garbage collection. Passing true is
+        rejected because persisted snapshot leases are not implemented yet.
     :type delete_sources: bool
     :param sort_column: Optional column used to sort compacted parquet rows.
     :type sort_column: str | None
@@ -2006,9 +2026,12 @@ def _compact_tables(
     :type master: MasterClient | None
     :returns: Multi-table compaction summary.
     :rtype: dict[str, object]
+    :raises ValueError: If ``min_files`` is smaller than two or ``delete_sources`` is true.
     """
     if min_files < 2:
         raise ValueError("min_files must be at least 2")
+    if delete_sources:
+        raise ValueError("delete_sources requires persisted snapshot leases and is not supported")
 
     master_client = master or _default_master()
     resolved_table_names = _resolve_compaction_table_names(table_names, master_client)
@@ -2301,6 +2324,8 @@ def _compacted_persisted_file_metadata(
         metadata["source_segments"] = source_segments
         metadata["source_segment_id"] = source_segments[0]["source_segment_id"]
         metadata["source_generation"] = source_segments[0]["source_generation"]
+        if "writer_epoch" in source_segments[0]:
+            metadata["writer_epoch"] = source_segments[0]["writer_epoch"]
     for key in ("partition", "partition_path", "partition_spec", "persist_data_root"):
         if key in first_file:
             metadata[key] = first_file[key]
@@ -2417,7 +2442,7 @@ class Ops:
         table_name: str,
         *,
         min_files: int = 2,
-        delete_sources: bool = True,
+        delete_sources: bool = False,
         sort_column: str | None = None,
         master: MasterClient | None = None,
     ) -> dict[str, object]:
@@ -2428,7 +2453,8 @@ class Ops:
         :type table_name: str
         :param min_files: Minimum files in one partition group before compaction.
         :type min_files: int
-        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :param delete_sources: Reserved for snapshot-aware garbage collection. Passing true is
+            rejected because persisted snapshot leases are not implemented yet.
         :type delete_sources: bool
         :param sort_column: Optional column used to sort compacted parquet rows.
         :type sort_column: str | None
@@ -2436,6 +2462,7 @@ class Ops:
         :type master: MasterClient | None
         :returns: Compaction summary.
         :rtype: dict[str, object]
+        :raises ValueError: If ``min_files`` is smaller than two or ``delete_sources`` is true.
         """
         return _compact_table(
             table_name,
@@ -2450,7 +2477,7 @@ class Ops:
         table_names: object = None,
         *,
         min_files: int = 2,
-        delete_sources: bool = True,
+        delete_sources: bool = False,
         sort_column: str | None = None,
         continue_on_error: bool = False,
         master: MasterClient | None = None,
@@ -2463,7 +2490,8 @@ class Ops:
         :type table_names: object
         :param min_files: Minimum files in one partition group before compaction.
         :type min_files: int
-        :param delete_sources: Whether to delete source parquet files after metadata replacement.
+        :param delete_sources: Reserved for snapshot-aware garbage collection. Passing true is
+            rejected because persisted snapshot leases are not implemented yet.
         :type delete_sources: bool
         :param sort_column: Optional column used to sort compacted parquet rows.
         :type sort_column: str | None
@@ -2473,6 +2501,7 @@ class Ops:
         :type master: MasterClient | None
         :returns: Multi-table compaction summary.
         :rtype: dict[str, object]
+        :raises ValueError: If ``min_files`` is smaller than two or ``delete_sources`` is true.
         """
         return _compact_tables(
             table_names,
@@ -4271,7 +4300,8 @@ class Table:
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         shard_names = self._logical_shard_names_for_collect()
         if shard_names:
-            no_pushdown_plan = {"row_range": None, "columns": None, "filters": None}
+            shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
+            pushdown_plan = self._pushdown_plan_summary(schema, shard_plan)
             return {
                 "source": self.source,
                 "snapshot": self._snapshot_enabled,
@@ -4284,15 +4314,23 @@ class Table:
                     "tail": None,
                     "head": None,
                     "slice": None,
-                    "columns": None,
-                    "filters": None,
+                    "columns": pushdown_plan["columns"],
+                    "filters": pushdown_plan["filters"],
                 },
-                "pushdown_plan": no_pushdown_plan,
+                "pushdown_plan": pushdown_plan,
                 "global_plan": _query_plan_to_json(optimized_plan),
-                "residual_plan": _query_plan_to_json(optimized_plan),
+                "shard_plan": _query_plan_to_json(shard_plan),
+                "residual_plan": _query_plan_to_json(residual_plan),
+                "fanout_parallelism": min(
+                    len(shard_names),
+                    _DEFAULT_SHARD_QUERY_PARALLELISM,
+                ),
                 "capability": {
                     "executor": "sharded_fanout",
                     "fanout": "physical_shards",
+                    "shard_plan_mode": "safe_prefix",
+                    "shard_plan_ops": [kind for kind, _ in shard_plan],
+                    "residual_plan_ops": [kind for kind, _ in residual_plan],
                     "residual_execution": "local_after_concat",
                     "unsupported_gateway_ops": [],
                 },
@@ -4484,7 +4522,7 @@ class Table:
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         shard_names = self._logical_shard_names_for_collect()
         if shard_names:
-            no_pushdown_plan = {"row_range": None, "columns": None, "filters": None}
+            shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
             return {
                 "executor": "sharded_fanout",
                 "sharded": True,
@@ -4492,12 +4530,18 @@ class Table:
                 "shard_names": list(shard_names),
                 "original_plan": _query_plan_to_json(self._plan_ops),
                 "optimized_plan": _query_plan_to_json(optimized_plan),
-                "pushdown_plan": no_pushdown_plan,
+                "pushdown_plan": self._pushdown_plan_summary(schema, shard_plan),
                 "global_plan": _query_plan_to_json(optimized_plan),
-                "residual_plan": _query_plan_to_json(optimized_plan),
+                "shard_plan": _query_plan_to_json(shard_plan),
+                "residual_plan": _query_plan_to_json(residual_plan),
+                "fanout_parallelism": min(
+                    len(shard_names),
+                    _DEFAULT_SHARD_QUERY_PARALLELISM,
+                ),
                 "scanned_files": [],
                 "scanned_rows": 0,
                 "scanned_live_rows": 0,
+                "shard_metrics": [],
                 "returned_rows": None,
                 "elapsed_ms": None,
             }
@@ -4552,37 +4596,80 @@ class Table:
     ):
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
+        shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
+        fanout_parallelism = min(len(shard_names), _DEFAULT_SHARD_QUERY_PARALLELISM)
         if metrics is not None:
             metrics["executor"] = "sharded_fanout"
             metrics["sharded"] = True
             metrics["shards_scanned"] = len(shard_names)
             metrics["shard_names"] = list(shard_names)
             metrics["global_plan"] = _query_plan_to_json(optimized_plan)
-            metrics["residual_plan"] = _query_plan_to_json(optimized_plan)
+            metrics["shard_plan"] = _query_plan_to_json(shard_plan)
+            metrics["residual_plan"] = _query_plan_to_json(residual_plan)
+            metrics["pushdown_plan"] = self._pushdown_plan_summary(schema, shard_plan)
+            metrics["fanout_parallelism"] = fanout_parallelism
 
-        shard_tables = []
         fixed_shard_snapshots = None
         if self._snapshot_enabled:
             fixed_shard_snapshots = getattr(self, "_fixed_shard_snapshots", None)
             if fixed_shard_snapshots is None:
                 fixed_shard_snapshots = {}
                 self._fixed_shard_snapshots = fixed_shard_snapshots
+        existing_snapshots = dict(fixed_shard_snapshots or {})
 
-        for shard_name in shard_names:
+        def collect_shard(shard_name: str):
             shard_reader = Table(
                 shard_name,
                 master=getattr(self, "_master", None),
                 snapshot=self._snapshot_enabled,
                 _force_local=bool(getattr(self, "_force_local", False)),
             )
-            if fixed_shard_snapshots is not None and shard_name in fixed_shard_snapshots:
-                shard_reader._fixed_snapshot = fixed_shard_snapshots[shard_name]
-            shard_tables.append(shard_reader._collect_query(metrics=None, stream=stream))
-            if fixed_shard_snapshots is not None and shard_reader._fixed_snapshot is not None:
-                fixed_shard_snapshots[shard_name] = shard_reader._fixed_snapshot
+            if shard_name in existing_snapshots:
+                shard_reader._fixed_snapshot = existing_snapshots[shard_name]
+            shard_reader._plan_ops = list(shard_plan)
+            shard_metrics = shard_reader._new_query_metrics() if metrics is not None else None
+            shard_table = shard_reader._collect_query(metrics=shard_metrics, stream=stream)
+            if shard_metrics is not None:
+                shard_metrics["returned_rows"] = shard_table.num_rows
+                shard_metrics["source"] = shard_name
+            return shard_name, shard_table, shard_reader._fixed_snapshot, shard_metrics
 
-        combined = _concat_query_tables(shard_tables, schema)
-        return self._apply_query_plan(combined, optimized_plan)
+        if fanout_parallelism <= 1:
+            shard_results = [collect_shard(shard_name) for shard_name in shard_names]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=fanout_parallelism,
+                thread_name_prefix="zippy-shard-query",
+            ) as executor:
+                shard_results = list(executor.map(collect_shard, shard_names))
+
+        shard_tables = []
+        for shard_name, shard_table, fixed_snapshot, shard_metrics in shard_results:
+            shard_tables.append(shard_table)
+            if fixed_shard_snapshots is not None and fixed_snapshot is not None:
+                fixed_shard_snapshots[shard_name] = fixed_snapshot
+            if metrics is not None and shard_metrics is not None:
+                aggregate_scanned_rows = metrics.get("scanned_rows")
+                shard_scanned_rows = shard_metrics.get("scanned_rows")
+                metrics["scanned_rows"] = (
+                    aggregate_scanned_rows if isinstance(aggregate_scanned_rows, int) else 0
+                ) + (shard_scanned_rows if isinstance(shard_scanned_rows, int) else 0)
+                aggregate_live_rows = metrics.get("scanned_live_rows")
+                shard_live_rows = shard_metrics.get("scanned_live_rows")
+                metrics["scanned_live_rows"] = (
+                    aggregate_live_rows if isinstance(aggregate_live_rows, int) else 0
+                ) + (shard_live_rows if isinstance(shard_live_rows, int) else 0)
+                scanned_files = shard_metrics.get("scanned_files", [])
+                aggregate_scanned_files = metrics.get("scanned_files")
+                if isinstance(scanned_files, list) and isinstance(aggregate_scanned_files, list):
+                    aggregate_scanned_files.extend(scanned_files)
+                aggregate_shard_metrics = metrics.get("shard_metrics")
+                if isinstance(aggregate_shard_metrics, list):
+                    aggregate_shard_metrics.append(shard_metrics)
+
+        combined_schema = shard_tables[0].schema if shard_tables else schema
+        combined = _concat_query_tables(shard_tables, combined_schema)
+        return self._apply_query_plan(combined, residual_plan)
 
     def _pushdown_plan_summary(
         self,
@@ -4814,13 +4901,42 @@ class Table:
             return None
         if not any(kind == "select" for kind, _ in plan_ops):
             return None
+        schema_names = list(getattr(schema, "names", []) or [])
+        lineage: dict[str, set[str]] = {name: {name} for name in schema_names}
         required: set[str] = set()
+
+        def resolve(columns: set[str]) -> set[str]:
+            resolved: set[str] = set()
+            for column in columns:
+                resolved.update(lineage.get(column, {column}))
+            return resolved
+
         for kind, value in plan_ops:
             if kind == "filter":
-                required.update(_expr_columns(value))
+                required.update(resolve(_expr_columns(value)))
             elif kind in {"select", "with_columns"}:
+                next_lineage = {} if kind == "select" else dict(lineage)
                 for expr in value:
-                    required.update(_expr_columns(expr))
+                    dependencies = resolve(_expr_columns(expr))
+                    required.update(dependencies)
+                    output_name = _query_expr_output_name(expr)
+                    if output_name is None:
+                        return None
+                    next_lineage[output_name] = dependencies
+                lineage = next_lineage
+            elif kind == "rename":
+                for source_name, target_name in value.items():
+                    if source_name in lineage:
+                        lineage[str(target_name)] = lineage.pop(str(source_name))
+            elif kind == "drop":
+                for column in value:
+                    lineage.pop(str(column), None)
+            elif kind == "sort":
+                required.update(
+                    resolve(
+                        {column for expr in value.get("by", []) for column in _expr_columns(expr)}
+                    )
+                )
         if not required:
             return None
         return _ordered_subset(required, schema)
@@ -5015,8 +5131,13 @@ def _tail_persisted_rows(
     tables = []
     row_count = 0
     for item in reversed(sorted(files, key=_persisted_file_order_key)):
-        table = _read_persisted_parquet_file(_validated_persisted_file_path(item))
-        _record_persisted_file_scan(metrics, item, table)
+        table, scanned_rows, _ = _read_persisted_parquet_row_range(
+            _validated_persisted_file_path(item),
+            offset=0,
+            length=n - row_count,
+            from_end=True,
+        )
+        _record_persisted_file_scan(metrics, item, table, scanned_rows=scanned_rows)
         if table.num_rows == 0:
             continue
         tables.append(table)
@@ -5049,8 +5170,12 @@ def _head_persisted_rows(
     tables = []
     remaining = n
     for item in sorted(files, key=_persisted_file_order_key):
-        table = _read_persisted_parquet_file(_validated_persisted_file_path(item))
-        _record_persisted_file_scan(metrics, item, table)
+        table, scanned_rows, _ = _read_persisted_parquet_row_range(
+            _validated_persisted_file_path(item),
+            offset=0,
+            length=remaining,
+        )
+        _record_persisted_file_scan(metrics, item, table, scanned_rows=scanned_rows)
         if table.num_rows == 0:
             continue
         if table.num_rows > remaining:
@@ -5088,26 +5213,26 @@ def _slice_persisted_rows(
         if requested_end is not None and absolute_position >= requested_end:
             break
 
-        table = _read_persisted_parquet_file(_validated_persisted_file_path(item))
-        _record_persisted_file_scan(metrics, item, table)
-        file_row_count = table.num_rows
         file_start = absolute_position
-        file_end = file_start + file_row_count
-        absolute_position = file_end
-        if file_row_count == 0 or file_end <= offset:
-            continue
-
         start_in_file = max(0, offset - file_start)
         if requested_end is None:
-            take_length = file_row_count - start_in_file
+            take_length = None
         else:
-            take_until = min(file_row_count, requested_end - file_start)
-            take_length = max(0, take_until - start_in_file)
-        if take_length <= 0:
+            take_length = max(0, requested_end - file_start - start_in_file)
+        if take_length == 0:
             continue
-        sliced = table.slice(start_in_file, take_length)
-        tables.append(sliced)
-        collected_rows += sliced.num_rows
+
+        table, scanned_rows, file_row_count = _read_persisted_parquet_row_range(
+            _validated_persisted_file_path(item),
+            offset=start_in_file,
+            length=take_length,
+        )
+        _record_persisted_file_scan(metrics, item, table, scanned_rows=scanned_rows)
+        absolute_position = file_start + file_row_count
+        if table.num_rows == 0:
+            continue
+        tables.append(table)
+        collected_rows += table.num_rows
         if length is not None and collected_rows >= length:
             break
 
@@ -5163,6 +5288,58 @@ def _read_persisted_parquet_file(
     return pq.read_table(str(file_path), columns=columns, filters=filters, partitioning=None)
 
 
+def _read_persisted_parquet_row_range(
+    file_path: object,
+    *,
+    offset: int,
+    length: int | None,
+    from_end: bool = False,
+):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parquet_file = pq.ParquetFile(str(file_path))
+    total_rows = int(parquet_file.metadata.num_rows)
+    normalized_length = None if length is None else max(0, int(length))
+    if from_end:
+        selected_rows = (
+            total_rows if normalized_length is None else min(total_rows, normalized_length)
+        )
+        start = total_rows - selected_rows
+        end = total_rows
+    else:
+        start = min(max(0, int(offset)), total_rows)
+        end = (
+            total_rows if normalized_length is None else min(total_rows, start + normalized_length)
+        )
+
+    if start >= end:
+        return pa.Table.from_batches([], schema=parquet_file.schema_arrow), 0, total_rows
+
+    row_groups: list[int] = []
+    group_start = 0
+    first_group_start = 0
+    scanned_rows = 0
+    for group_index in range(parquet_file.metadata.num_row_groups):
+        group_rows = int(parquet_file.metadata.row_group(group_index).num_rows)
+        group_end = group_start + group_rows
+        if group_end > start and group_start < end:
+            if not row_groups:
+                first_group_start = group_start
+            row_groups.append(group_index)
+            scanned_rows += group_rows
+        if group_start >= end:
+            break
+        group_start = group_end
+
+    if not row_groups:
+        return pa.Table.from_batches([], schema=parquet_file.schema_arrow), 0, total_rows
+
+    table = parquet_file.read_row_groups(row_groups)
+    table = table.slice(start - first_group_start, end - start)
+    return table, scanned_rows, total_rows
+
+
 def _validated_persisted_file_path(item: dict[str, object]) -> str:
     file_path = str(item["file_path"])
     persist_root = item.get("persist_data_root")
@@ -5189,13 +5366,16 @@ def _record_persisted_file_scan(
     metrics: dict[str, object] | None,
     item: dict[str, object],
     table: object,
+    *,
+    scanned_rows: int | None = None,
 ) -> None:
     if metrics is None:
         return
     scanned_files = metrics.setdefault("scanned_files", [])
     if isinstance(scanned_files, list):
         scanned_files.append(str(item.get("file_path", "")))
-    metrics["scanned_rows"] = int(metrics.get("scanned_rows", 0)) + table.num_rows
+    physical_rows = table.num_rows if scanned_rows is None else int(scanned_rows)
+    metrics["scanned_rows"] = int(metrics.get("scanned_rows", 0)) + physical_rows
 
 
 def _record_live_scan(metrics: dict[str, object] | None, table: object) -> None:
@@ -5331,11 +5511,20 @@ def _range_may_match_filter(
     op: str,
     value: object,
 ) -> bool:
-    try:
-        left_min = float(min_value)
-        left_max = float(max_value)
-        right = float(_filter_value_for_range(value))
-    except (TypeError, ValueError):
+    left_min = _exact_numeric_filter_value(min_value)
+    left_max = _exact_numeric_filter_value(max_value)
+    if left_min is None or left_max is None:
+        return True
+    if op == "in" and isinstance(value, (list, tuple, set)):
+        candidates: list[Decimal] = []
+        for item in value:
+            candidate = _exact_numeric_filter_value(_filter_value_for_range(item))
+            if candidate is None:
+                return True
+            candidates.append(candidate)
+        return any(left_min <= candidate <= left_max for candidate in candidates)
+    right = _exact_numeric_filter_value(_filter_value_for_range(value))
+    if right is None:
         return True
     if op == "==":
         return left_min <= right <= left_max
@@ -5349,8 +5538,6 @@ def _range_may_match_filter(
         return left_min < right
     if op == "<=":
         return left_min <= right
-    if op == "in" and isinstance(value, (list, tuple, set)):
-        return any(left_min <= float(item) <= left_max for item in value)
     return True
 
 
@@ -5360,19 +5547,45 @@ def _filter_value_for_range(value: object) -> object:
     return value
 
 
+def _exact_numeric_filter_value(value: object) -> Decimal | None:
+    if isinstance(value, bool):
+        return Decimal(int(value))
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return Decimal(str(value))
+    if isinstance(value, str):
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation:
+            return None
+        return parsed if parsed.is_finite() else None
+    return None
+
+
 def _partition_value_matches_filter(partition_value: object, op: str, value: object) -> bool:
+    normalized_value = _filter_value_for_range(value)
     if op == "==":
-        return str(partition_value) == str(value)
+        equality = _partition_scalar_equality(partition_value, normalized_value)
+        return equality is not False
     if op == "!=":
-        return str(partition_value) != str(value)
+        equality = _partition_scalar_equality(partition_value, normalized_value)
+        return equality is not True
     if op == "in":
         if not isinstance(value, (list, tuple, set)):
             return True
-        return str(partition_value) in {str(item) for item in value}
-    try:
-        left = float(partition_value)
-        right = float(value)
-    except (TypeError, ValueError):
+        equalities = [
+            _partition_scalar_equality(partition_value, _filter_value_for_range(item))
+            for item in value
+        ]
+        return any(equality is not False for equality in equalities)
+    left = _exact_numeric_filter_value(partition_value)
+    right = _exact_numeric_filter_value(normalized_value)
+    if left is None or right is None:
         return True
     if op == ">":
         return left > right
@@ -5383,6 +5596,29 @@ def _partition_value_matches_filter(partition_value: object, op: str, value: obj
     if op == "<=":
         return left <= right
     return True
+
+
+def _partition_scalar_equality(left: object, right: object) -> bool | None:
+    left_numeric = _exact_numeric_filter_value(left)
+    right_numeric = _exact_numeric_filter_value(right)
+    if left_numeric is not None and right_numeric is not None:
+        return left_numeric == right_numeric
+    if (left_numeric is None) != (right_numeric is None):
+        return None
+    if isinstance(left, str) and isinstance(right, str):
+        return str(left) == str(right)
+    if isinstance(left, datetime) and isinstance(right, datetime):
+        return left == right
+    if (
+        isinstance(left, date)
+        and not isinstance(left, datetime)
+        and isinstance(right, date)
+        and not isinstance(right, datetime)
+    ):
+        return left == right
+    if type(left) is type(right) and isinstance(left, (bool, type(None))):
+        return left == right
+    return None
 
 
 def _non_overlapping_persisted_files(
@@ -5608,11 +5844,12 @@ def _segment_identity_matches(
 
 
 def _segment_identity_order_key(value: tuple[int, int, int | None]) -> tuple[int, int, int]:
-    return (value[0], value[1], -1 if value[2] is None else value[2])
+    return (-1 if value[2] is None else value[2], value[0], value[1])
 
 
-def _persisted_file_order_key(value: dict[str, object]) -> tuple[int, int, int, str]:
+def _persisted_file_order_key(value: dict[str, object]) -> tuple[int, int, int, int, str]:
     return (
+        _int_order_value(value.get("writer_epoch")),
         _int_order_value(value.get("source_segment_id")),
         _int_order_value(value.get("source_generation")),
         _int_order_value(value.get("created_at")),
@@ -5624,7 +5861,7 @@ def _int_order_value(value: object) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return -1
+        return 0
 
 
 class Row:

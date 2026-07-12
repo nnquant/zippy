@@ -223,6 +223,27 @@ enabled = true
 }
 
 #[test]
+fn zippy_config_rejects_compaction_source_deletion_without_snapshot_leases() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[table.persist.compaction]
+enabled = true
+delete_sources = true
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("delete_sources requires persisted snapshot leases"));
+}
+
+#[test]
 fn zippy_config_rejects_legacy_partition_dt_part_format() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");

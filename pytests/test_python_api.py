@@ -5364,8 +5364,10 @@ def test_cross_sectional_engine_emits_bucketed_output_over_zmq() -> None:
     subscriber.close()
 
 
+@pytest.mark.parametrize("callback_delay_sec", [0.03, 0.1])
 def test_cross_sectional_frame_subscription_delivers_rapid_buckets_without_fragmentation(
     tmp_path: Path,
+    callback_delay_sec: float,
 ) -> None:
     server, control_endpoint = start_master_server(tmp_path)
     master = zippy.MasterClient(control_endpoint=control_endpoint)
@@ -5400,7 +5402,7 @@ def test_cross_sectional_frame_subscription_delivers_rapid_buckets_without_fragm
         frames.append(table)
         if len(frames) >= 5:
             received.set()
-        time.sleep(0.03)
+        time.sleep(callback_delay_sec)
 
     subscriber = None
     try:
@@ -5438,13 +5440,34 @@ def test_cross_sectional_frame_subscription_delivers_rapid_buckets_without_fragm
             ]
             time.sleep(0.01)
         assert descriptor_generation >= initial_descriptor_generation + 5
-        assert received.wait(timeout=5.0), {
-            "frames_received": len(frames),
-            "frame_dts": [frame.column("dt")[0].as_py() for frame in frames],
-            "subscriber_metrics": json.dumps(subscriber.metrics(), sort_keys=True),
-            "descriptor_generation": descriptor_generation,
-            "initial_descriptor_generation": initial_descriptor_generation,
-        }
+        if not received.wait(timeout=5.0):
+            frame_dts = [frame.column("dt")[0].as_py() for frame in frames]
+            subscriber_metrics = json.dumps(subscriber.metrics(), sort_keys=True)
+            stream = master.get_stream("cs_frame_e2e_output")
+            active_descriptor = stream.get("active_segment_descriptor") or {}
+            descriptor_state = {
+                "active": {
+                    "segment_id": active_descriptor.get("segment_id"),
+                    "generation": active_descriptor.get("generation"),
+                    "committed_row_count": active_descriptor.get("committed_row_count"),
+                },
+                "sealed": [
+                    {
+                        "segment_id": descriptor.get("segment_id"),
+                        "generation": descriptor.get("generation"),
+                        "committed_row_count": descriptor.get("committed_row_count"),
+                    }
+                    for descriptor in stream.get("sealed_segments", [])
+                ],
+            }
+            raise AssertionError(
+                "frame subscriber did not deliver every rapid bucket "
+                f"frames_received=[{len(frames)}] frame_dts=[{frame_dts}] "
+                f"subscriber_metrics=[{subscriber_metrics}] "
+                f"descriptor_state=[{descriptor_state}] "
+                f"descriptor_generation=[{descriptor_generation}] "
+                f"initial_descriptor_generation=[{initial_descriptor_generation}]"
+            )
         assert len(frames) == 5
         for bucket_index, frame in enumerate(frames):
             expected_dt = bucket_start + timedelta(minutes=bucket_index)
@@ -6841,7 +6864,6 @@ def test_ops_compact_table_sorts_compacted_partition_by_dt(
             self.replaced_files = files
 
     master = FakeMaster()
-
     result = zippy.ops.compact_table("ctp_ticks", master=master)
 
     assert result["groups_compacted"] == 1
@@ -9089,15 +9111,20 @@ def test_ops_compact_table_replaces_small_partition_files(
             self.replaced_files = files
 
     master = FakeMaster()
+    old_snapshot = {
+        "active_segment_descriptor": None,
+        "sealed_segments": [],
+        "persisted_files": [dict(item) for item in persisted_files[:2]],
+    }
 
     result = zippy.ops.compact_table("ctp_ticks", master=master)
 
     assert result["groups_compacted"] == 1
     assert result["files_compacted"] == 2
     assert result["rows_compacted"] == 3
-    assert result["source_files_deleted"] == 2
-    assert not first_file.exists()
-    assert not second_file.exists()
+    assert result["source_files_deleted"] == 0
+    assert first_file.exists()
+    assert second_file.exists()
     assert other_file.exists()
     assert master.replaced_files is not None
     assert len(master.replaced_files) == 2
@@ -9105,6 +9132,28 @@ def test_ops_compact_table_replaces_small_partition_files(
     assert compacted["row_count"] == 3
     assert compacted["partition_path"] == "dt_part=202604/instrument_id=IF2606"
     assert pq.read_table(compacted["file_path"], partitioning=None).num_rows == 3
+    assert zippy._collect_persisted_rows(old_snapshot).num_rows == 3
+
+
+def test_ops_compact_table_rejects_unsafe_source_deletion() -> None:
+    class FakeMaster:
+        def get_stream(self, table_name: str) -> dict[str, object]:
+            raise AssertionError("unsafe source deletion must fail before reading metadata")
+
+        def list_streams(self) -> list[dict[str, object]]:
+            raise AssertionError("unsafe source deletion must fail before discovering tables")
+
+    with pytest.raises(ValueError, match="persisted snapshot leases"):
+        zippy.ops.compact_table(
+            "ctp_ticks",
+            delete_sources=True,
+            master=FakeMaster(),
+        )
+    with pytest.raises(ValueError, match="persisted snapshot leases"):
+        zippy.ops.compact_tables(
+            delete_sources=True,
+            master=FakeMaster(),
+        )
 
 
 def test_master_client_replace_persisted_files_updates_stream_metadata(
@@ -12550,6 +12599,7 @@ def _install_fake_sharded_native_query(
     rows_by_source: dict[str, pa.Table] | None = None,
     logical_descriptor: dict[str, object] | None = None,
     logical_source_configs: list[dict[str, object]] | None = None,
+    scan_delay_sec: float = 0.0,
 ) -> object:
     schema = pa.schema(
         [
@@ -12576,6 +12626,9 @@ def _install_fake_sharded_native_query(
         def __init__(self) -> None:
             self.stream_info_calls: list[str] = []
             self.scanned_sources: list[str] = []
+            self.active_scans = 0
+            self.max_active_scans = 0
+            self.scan_lock = threading.Lock()
 
         def get_stream(self, source: str) -> dict[str, object]:
             self.stream_info_calls.append(source)
@@ -12622,9 +12675,21 @@ def _install_fake_sharded_native_query(
             del snapshot
             if self.source == logical_name:
                 raise AssertionError("logical sharded table must fan out to physical shards")
-            self.master.scanned_sources.append(self.source)
-            table = rows_by_source[self.source]
-            return pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+            with self.master.scan_lock:
+                self.master.scanned_sources.append(self.source)
+                self.master.active_scans += 1
+                self.master.max_active_scans = max(
+                    self.master.max_active_scans,
+                    self.master.active_scans,
+                )
+            try:
+                if scan_delay_sec:
+                    time.sleep(scan_delay_sec)
+                table = rows_by_source[self.source]
+                return pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+            finally:
+                with self.master.scan_lock:
+                    self.master.active_scans -= 1
 
     monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
     return FakeMaster()
@@ -12639,7 +12704,7 @@ def test_read_table_and_shard_collect_fans_out_in_shard_order(monkeypatch) -> No
         "instrument_id": ["IF2606", "IH2606", "IF2606", "AU2606"],
         "seq": [1, 2, 3, 4],
     }
-    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert sorted(master.scanned_sources) == ["ticks.__shard_0000", "ticks.__shard_0001"]
 
 
 def test_stream_table_and_shard_table_constructor_collect_fans_out(monkeypatch) -> None:
@@ -12648,7 +12713,7 @@ def test_stream_table_and_shard_table_constructor_collect_fans_out(monkeypatch) 
     result = zippy.Table("ticks", master=master, snapshot=False).collect()
 
     assert result.column("seq").to_pylist() == [1, 2, 3, 4]
-    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert sorted(master.scanned_sources) == ["ticks.__shard_0000", "ticks.__shard_0001"]
 
 
 def test_read_table_and_shard_head_applies_after_concat(monkeypatch) -> None:
@@ -12660,21 +12725,51 @@ def test_read_table_and_shard_head_applies_after_concat(monkeypatch) -> None:
         "instrument_id": ["IF2606", "IH2606"],
         "seq": [1, 2],
     }
-    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert sorted(master.scanned_sources) == ["ticks.__shard_0000", "ticks.__shard_0001"]
 
 
-def test_read_table_and_shard_filter_select_applies_after_concat(monkeypatch) -> None:
+def test_read_table_and_shard_filter_select_pushes_safe_prefix_to_each_shard(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch)
+
+    profile = (
+        zippy.read_table("ticks", master=master, snapshot=False)
+        .filter(zippy.col("instrument_id") == "IF2606")
+        .select("seq")
+        .profile()
+    )
+
+    result = profile["result"]
+    assert result.to_pydict() == {"seq": [1, 3]}
+    assert sorted(master.scanned_sources) == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert [item["op"] for item in profile["metrics"]["shard_plan"]] == [
+        "filter",
+        "select",
+    ]
+    assert profile["metrics"]["residual_plan"] == []
+    assert [item["returned_rows"] for item in profile["metrics"]["shard_metrics"]] == [1, 1]
+
+
+def test_read_table_and_shard_safe_prefix_keeps_projected_schema_when_empty(monkeypatch) -> None:
     master = _install_fake_sharded_native_query(monkeypatch)
 
     result = (
         zippy.read_table("ticks", master=master, snapshot=False)
-        .filter(zippy.col("instrument_id") == "IF2606")
+        .filter(zippy.col("instrument_id") == "missing")
         .select("seq")
         .collect()
     )
 
-    assert result.to_pydict() == {"seq": [1, 3]}
-    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert result.num_rows == 0
+    assert result.column_names == ["seq"]
+
+
+def test_read_table_and_shard_collects_physical_shards_concurrently(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(monkeypatch, scan_delay_sec=0.05)
+
+    result = zippy.read_table("ticks", master=master, snapshot=False).collect()
+
+    assert result.column("seq").to_pylist() == [1, 2, 3, 4]
+    assert master.max_active_scans == 2
 
 
 def test_read_table_and_shard_uses_source_config_metadata_fallback(monkeypatch) -> None:
@@ -12689,7 +12784,7 @@ def test_read_table_and_shard_uses_source_config_metadata_fallback(monkeypatch) 
     result = zippy.read_table("ticks", master=master, snapshot=False).collect()
 
     assert result.column("seq").to_pylist() == [1, 2, 3, 4]
-    assert master.scanned_sources == ["ticks.__shard_0000", "ticks.__shard_0001"]
+    assert sorted(master.scanned_sources) == ["ticks.__shard_0000", "ticks.__shard_0001"]
 
 
 def test_read_table_and_shard_profile_marks_sharded(monkeypatch) -> None:
@@ -12708,6 +12803,9 @@ def test_read_table_and_shard_profile_marks_sharded(monkeypatch) -> None:
         "columns": None,
         "filters": None,
     }
+    assert profile["metrics"]["shard_plan"] == []
+    assert [item["op"] for item in profile["metrics"]["residual_plan"]] == ["head"]
+    assert profile["metrics"]["fanout_parallelism"] == 2
 
 
 def test_read_table_and_shard_explain_marks_global_execution(monkeypatch) -> None:
@@ -12726,10 +12824,14 @@ def test_read_table_and_shard_explain_marks_global_execution(monkeypatch) -> Non
         "filters": None,
     }
     assert explain["pushdown_plan"] == {"row_range": None, "columns": None, "filters": None}
+    assert explain["shard_plan"] == []
     assert explain["global_plan"] == explain["residual_plan"]
     assert explain["capability"] == {
         "executor": "sharded_fanout",
         "fanout": "physical_shards",
+        "shard_plan_mode": "safe_prefix",
+        "shard_plan_ops": [],
+        "residual_plan_ops": ["head"],
         "residual_execution": "local_after_concat",
         "unsupported_gateway_ops": [],
     }
@@ -13024,6 +13126,44 @@ def test_table_plan_pushes_projection_and_simple_predicate_to_persisted_reader(
             "filters": [("instrument_id", "==", "IF2606")],
         }
     ]
+
+
+def test_table_plan_projection_tracks_renamed_source_column(monkeypatch) -> None:
+    schema = pa.schema([("source_price", pa.float64())])
+    source_table = pa.table({"source_price": [4102.5]}, schema=schema)
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            self.source = source
+            self.master = master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return {
+                "stream_name": self.source,
+                "schema_hash": "abc",
+                "active_segment_descriptor": {"segment_id": 1, "generation": 0},
+                "active_committed_row_high_watermark": 1,
+                "sealed_segments": [],
+                "persisted_files": [],
+                "descriptor_generation": 1,
+            }
+
+        def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
+            return pa.RecordBatchReader.from_batches(schema, source_table.to_batches())
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    result = (
+        zippy.read_table("ctp_ticks", master=object(), snapshot=False)
+        .rename({"source_price": "price"})
+        .select("price")
+        .collect()
+    )
+
+    assert result.to_pydict() == {"price": [4102.5]}
 
 
 def test_validated_persisted_file_path_accepts_file_inside_root(tmp_path: Path) -> None:
@@ -13401,6 +13541,70 @@ def test_table_plan_prunes_persisted_files_by_event_time_metadata(
     assert read_files == ["/tmp/new.parquet"]
 
 
+def test_persisted_range_pruning_preserves_nanosecond_integer_precision() -> None:
+    boundary = 1_700_000_000_000_000_000
+
+    assert zippy._range_may_match_filter(boundary + 1, boundary + 1, ">", boundary)
+    assert zippy._range_may_match_filter(boundary - 1, boundary - 1, "<", boundary)
+    assert not zippy._range_may_match_filter(boundary, boundary, ">", boundary)
+
+
+def test_persisted_partition_pruning_handles_mixed_scalar_encodings_conservatively() -> None:
+    assert zippy._partition_value_matches_filter("1", "==", 1)
+    assert not zippy._partition_value_matches_filter("1", "!=", 1)
+    assert zippy._partition_value_matches_filter("1", "in", [1, 2])
+
+    timestamp = zippy._TemporalInstantLiteral(
+        1_700_000_000_000_000_000,
+        timezone=None,
+        unit="ns",
+    )
+    assert zippy._partition_value_matches_filter("2023-11-14", "==", timestamp)
+    assert zippy._partition_value_matches_filter("2023-11-14", "!=", timestamp)
+
+
+def test_persisted_file_order_keeps_writer_epochs_contiguous() -> None:
+    files = [
+        {
+            "writer_epoch": 1,
+            "source_segment_id": 1,
+            "source_generation": 0,
+            "created_at": 1,
+            "file_path": "epoch-1-segment-1.parquet",
+        },
+        {
+            "writer_epoch": 1,
+            "source_segment_id": 2,
+            "source_generation": 1,
+            "created_at": 2,
+            "file_path": "epoch-1-segment-2.parquet",
+        },
+        {
+            "writer_epoch": 2,
+            "source_segment_id": 1,
+            "source_generation": 0,
+            "created_at": 3,
+            "file_path": "epoch-2-segment-1.parquet",
+        },
+        {
+            "writer_epoch": 2,
+            "source_segment_id": 2,
+            "source_generation": 1,
+            "created_at": 4,
+            "file_path": "epoch-2-segment-2.parquet",
+        },
+    ]
+
+    ordered = sorted(files, key=zippy._persisted_file_order_key)
+
+    assert [item["file_path"] for item in ordered] == [
+        "epoch-1-segment-1.parquet",
+        "epoch-1-segment-2.parquet",
+        "epoch-2-segment-1.parquet",
+        "epoch-2-segment-2.parquet",
+    ]
+
+
 def test_table_head_pushdown_skips_later_persisted_files(
     monkeypatch,
 ) -> None:
@@ -13465,21 +13669,25 @@ def test_table_head_pushdown_skips_later_persisted_files(
                 "head pushdown should not scan live rows when persisted has enough"
             )
 
-    def fake_read_persisted_parquet_file(
+    def fake_read_persisted_parquet_row_range(
         file_path: object,
         *,
-        columns: list[str] | None = None,
-        filters: object | None = None,
-    ) -> pa.Table:
+        offset: int,
+        length: int | None,
+        from_end: bool = False,
+    ) -> tuple[pa.Table, int, int]:
         read_files.append(str(file_path))
-        return persisted_rows[str(file_path)].select(columns or schema.names)
+        table = persisted_rows[str(file_path)]
+        start = max(0, table.num_rows - int(length or 0)) if from_end else offset
+        selected = table.slice(start, length)
+        return selected, table.num_rows, table.num_rows
 
     explicit_master = object()
     monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
     monkeypatch.setattr(
         zippy,
-        "_read_persisted_parquet_file",
-        fake_read_persisted_parquet_file,
+        "_read_persisted_parquet_row_range",
+        fake_read_persisted_parquet_row_range,
     )
     _allow_fake_persisted_paths(monkeypatch)
 
@@ -13550,20 +13758,24 @@ def test_table_profile_reports_scan_metrics_for_head_pushdown(
         def scan_snapshot(self, snapshot: dict[str, object]) -> pa.RecordBatchReader:
             raise AssertionError("head profile should not scan live rows when persisted has enough")
 
-    def fake_read_persisted_parquet_file(
+    def fake_read_persisted_parquet_row_range(
         file_path: object,
         *,
-        columns: list[str] | None = None,
-        filters: object | None = None,
-    ) -> pa.Table:
-        return persisted_rows[str(file_path)].select(columns or schema.names)
+        offset: int,
+        length: int | None,
+        from_end: bool = False,
+    ) -> tuple[pa.Table, int, int]:
+        table = persisted_rows[str(file_path)]
+        start = max(0, table.num_rows - int(length or 0)) if from_end else offset
+        selected = table.slice(start, length)
+        return selected, table.num_rows, table.num_rows
 
     explicit_master = object()
     monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
     monkeypatch.setattr(
         zippy,
-        "_read_persisted_parquet_file",
-        fake_read_persisted_parquet_file,
+        "_read_persisted_parquet_row_range",
+        fake_read_persisted_parquet_row_range,
     )
     _allow_fake_persisted_paths(monkeypatch)
 
@@ -13576,6 +13788,26 @@ def test_table_profile_reports_scan_metrics_for_head_pushdown(
     assert profile["metrics"]["scanned_files"] == ["/tmp/segment-1.parquet"]
     assert profile["metrics"]["scanned_rows"] == 2
     assert profile["metrics"]["pushdown_plan"]["row_range"] == {"op": "head", "n": 1}
+
+
+def test_persisted_row_range_reads_only_overlapping_row_group(tmp_path: Path) -> None:
+    parquet_file = tmp_path / "row-groups.parquet"
+    pq.write_table(
+        pa.table({"seq": list(range(8))}),
+        parquet_file,
+        row_group_size=2,
+    )
+
+    table, scanned_rows, total_rows = zippy._read_persisted_parquet_row_range(
+        parquet_file,
+        offset=0,
+        length=1,
+        from_end=True,
+    )
+
+    assert table["seq"].to_pylist() == [7]
+    assert scanned_rows == 2
+    assert total_rows == 8
 
 
 def test_table_slice_pushdown_skips_non_overlapping_persisted_files(
@@ -13655,21 +13887,25 @@ def test_table_slice_pushdown_skips_non_overlapping_persisted_files(
                 "slice pushdown should not scan live rows when persisted has enough"
             )
 
-    def fake_read_persisted_parquet_file(
+    def fake_read_persisted_parquet_row_range(
         file_path: object,
         *,
-        columns: list[str] | None = None,
-        filters: object | None = None,
-    ) -> pa.Table:
+        offset: int,
+        length: int | None,
+        from_end: bool = False,
+    ) -> tuple[pa.Table, int, int]:
         read_files.append(str(file_path))
-        return persisted_rows[str(file_path)].select(columns or schema.names)
+        table = persisted_rows[str(file_path)]
+        start = max(0, table.num_rows - int(length or 0)) if from_end else offset
+        selected = table.slice(start, length)
+        return selected, table.num_rows, table.num_rows
 
     explicit_master = object()
     monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
     monkeypatch.setattr(
         zippy,
-        "_read_persisted_parquet_file",
-        fake_read_persisted_parquet_file,
+        "_read_persisted_parquet_row_range",
+        fake_read_persisted_parquet_row_range,
     )
     _allow_fake_persisted_paths(monkeypatch)
 
@@ -16936,23 +17172,25 @@ def test_pipeline_source_sharded_stream_table_e2e(tmp_path: Path) -> None:
         assert logical_descriptor["zippy_shard_nums"] == 4
         assert logical_descriptor["zippy_shards"] == shard_names
 
-        assert {stream["stream_name"] for stream in client.list_streams()} == {
-            "sharded_ticks"
-        }
+        assert {stream["stream_name"] for stream in client.list_streams()} == {"sharded_ticks"}
         assert {stream["stream_name"] for stream in client.list_streams(include_internal=True)} == {
             "sharded_ticks",
             *shard_names,
         }
 
         deadline = time.time() + 2.0
-        latest = zippy.read_table("sharded_ticks", master=client, snapshot=False).sort(
-            "row_id"
-        ).collect()
+        latest = (
+            zippy.read_table("sharded_ticks", master=client, snapshot=False)
+            .sort("row_id")
+            .collect()
+        )
         while latest.num_rows != 4 and time.time() < deadline:
             time.sleep(0.01)
-            latest = zippy.read_table("sharded_ticks", master=client, snapshot=False).sort(
-                "row_id"
-            ).collect()
+            latest = (
+                zippy.read_table("sharded_ticks", master=client, snapshot=False)
+                .sort("row_id")
+                .collect()
+            )
 
         assert latest.to_pydict() == rows
 
@@ -17498,7 +17736,7 @@ def test_pipeline_stream_table_shard_unregisters_source_after_late_failure(
             persist=None,
             shard_key="instrument_id",
             shard_nums=2,
-    )
+        )
 
     assert master.source_records[0][0] == "test_ingest.openctp_ticks"
     assert master.unregistered_sources == [

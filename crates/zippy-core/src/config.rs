@@ -95,7 +95,7 @@ impl Default for ZippyTablePersistCompactionConfig {
             enabled: false,
             interval_sec: DEFAULT_TABLE_PERSIST_COMPACTION_INTERVAL_SEC,
             min_files: DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES,
-            delete_sources: true,
+            delete_sources: false,
             sort_column: None,
         }
     }
@@ -636,6 +636,12 @@ fn validate_persist_compaction(compaction: &ZippyTablePersistCompactionConfig) -
     if compaction.min_files < 2 {
         return Err(ZippyError::InvalidConfig {
             reason: "table persist compaction min_files must be at least 2".to_string(),
+        });
+    }
+    if compaction.enabled && compaction.delete_sources {
+        return Err(ZippyError::InvalidConfig {
+            reason: "table persist compaction delete_sources requires persisted snapshot leases"
+                .to_string(),
         });
     }
     Ok(())

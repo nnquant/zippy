@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1205,7 +1206,6 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
         vec![],
     );
     assert_eq!(default_response["status"], "ok");
-
     let frames = send_gateway_stream_frames(
         gateway.endpoint(),
         json!({
@@ -1485,6 +1485,14 @@ fn native_gateway_collect_stream_head_matches_default_collect() {
 #[test]
 fn native_gateway_collect_stream_tail_matches_default_collect() {
     assert_streaming_row_range_matches_default("tail", json!({"op": "tail", "n": 1}));
+}
+
+#[test]
+fn native_gateway_collect_stream_slice_matches_default_collect() {
+    assert_streaming_row_range_matches_default(
+        "slice",
+        json!({"op": "slice", "offset": 1, "length": 1}),
+    );
 }
 
 #[test]
@@ -4160,6 +4168,37 @@ fn assert_streaming_row_range_matches_default(label: &str, row_range_op: serde_j
         vec![],
     );
     assert_eq!(default_response["status"], "ok");
+    let (snapshot_response, _) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "create_snapshot",
+            "source": stream_name,
+            "token": "dev-token"
+        }),
+        vec![],
+    );
+    assert_eq!(snapshot_response["status"], "ok");
+    let snapshot_id = snapshot_response["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap();
+    let (metrics_response, _) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({"kind": "metrics", "token": "dev-token"}),
+        vec![],
+    );
+    assert_eq!(metrics_response["metrics"]["snapshots_active"], json!(1));
+    let (snapshot_collect_response, snapshot_payload) = send_gateway_frame_with_payload(
+        gateway.endpoint(),
+        json!({
+            "kind": "collect",
+            "source": stream_name,
+            "snapshot_id": snapshot_id,
+            "token": "dev-token",
+            "plan": plan
+        }),
+        vec![],
+    );
+    assert_eq!(snapshot_collect_response["status"], "ok");
 
     let frames = send_gateway_stream_frames(
         gateway.endpoint(),
@@ -4180,15 +4219,33 @@ fn assert_streaming_row_range_matches_default(label: &str, row_range_op: serde_j
         .unwrap()
         .values()
         .to_vec();
+    let snapshot_values = decode_ipc_batch(&snapshot_payload)
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
     assert_eq!(streamed_i64_values(&frames), default_values);
+    assert_eq!(snapshot_values, default_values);
     assert_eq!(
         frames.last().unwrap().0["metrics"]["row_range_pushdown"],
         json!(label)
     );
-    let expected_scanned_files = if label == "tail" { 1 } else { 2 };
+    let expected_scanned_files = if matches!(label, "head" | "tail" | "slice") {
+        1
+    } else {
+        2
+    };
     assert_eq!(
         frames.last().unwrap().0["metrics"]["scanned_files"],
         json!(expected_scanned_files)
+    );
+    assert_eq!(
+        snapshot_collect_response["metrics"]["scanned_files"]
+            .as_array()
+            .map(Vec::len),
+        Some(expected_scanned_files as usize)
     );
 
     gateway.stop();
@@ -4197,8 +4254,20 @@ fn assert_streaming_row_range_matches_default(label: &str, row_range_op: serde_j
 }
 
 fn reserve_tcp_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    static RESERVED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if RESERVED_PORTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(port)
+        {
+            return port;
+        }
+    }
 }
 
 fn loopback_control_endpoint() -> ControlEndpoint {
