@@ -6,6 +6,7 @@ use zippy_core::ZippyConfig;
 const CONFIG_ENV_KEYS: &[&str] = &[
     "HOME",
     "ZIPPY_LOG_LEVEL",
+    "ZIPPY_MAX_PARALLELISM",
     "ZIPPY_QUERY_PARALLELISM",
     "ZIPPY_TABLE_ROW_CAPACITY",
     "ZIPPY_TABLE_RETENTION_SEGMENTS",
@@ -41,6 +42,9 @@ fn zippy_config_loads_toml_and_env_overrides() {
         r#"
 [log]
 level = "debug"
+
+[runtime]
+max_parallelism = 10
 
 [query]
 parallelism = 6
@@ -82,6 +86,7 @@ shutdown_timeout_ms = 3000
     with_env(
         &[
             ("ZIPPY_LOG_LEVEL", "warn"),
+            ("ZIPPY_MAX_PARALLELISM", "9"),
             ("ZIPPY_QUERY_PARALLELISM", "8"),
             ("ZIPPY_TABLE_ROW_CAPACITY", "2048"),
             ("ZIPPY_TABLE_RETENTION_SEGMENTS", "5"),
@@ -110,7 +115,9 @@ shutdown_timeout_ms = 3000
             assert_eq!(config.master.port, Some(27690));
             assert_eq!(config.master.shutdown_timeout_ms, 7000);
             assert_eq!(config.log.level, "warn");
-            assert_eq!(config.query.parallelism, 8);
+            assert_eq!(config.runtime.max_parallelism, 9);
+            assert_eq!(config.query.parallelism, Some(8));
+            assert_eq!(config.query_parallelism(), 8);
             assert_eq!(config.table.row_capacity, 2048);
             assert_eq!(config.table.retention_segments, Some(5));
             assert!(config.table.persist.enabled);
@@ -151,18 +158,39 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     })
     .unwrap();
 
-    assert_eq!(config.query.parallelism, 4);
+    assert_eq!(config.runtime.max_parallelism, 4);
+    assert_eq!(config.query.parallelism, None);
+    assert_eq!(config.query_parallelism(), 4);
 }
 
 #[test]
-fn zippy_config_rejects_invalid_query_parallelism() {
+fn zippy_config_query_parallelism_inherits_runtime_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_parallelism = 7
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.query.parallelism, None);
+    assert_eq!(config.query_parallelism(), 7);
+}
+
+#[test]
+fn zippy_config_rejects_query_parallelism_above_runtime_limit() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     fs::write(
         &config_path,
         r#"
 [query]
-parallelism = 0
+parallelism = 5
 "#,
     )
     .unwrap();
@@ -171,7 +199,27 @@ parallelism = 0
 
     assert!(error
         .to_string()
-        .contains("query parallelism must be between 1 and 256"));
+        .contains("query parallelism must be between 1 and runtime max_parallelism"));
+}
+
+#[test]
+fn zippy_config_rejects_invalid_runtime_max_parallelism() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_parallelism = 0
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("runtime max_parallelism must be between 1 and 256"));
 }
 
 #[test]

@@ -29,10 +29,10 @@ pub use bus_protocol::{
 };
 pub use config::{
     default_config_path, ZippyConfig, ZippyGatewayConfig, ZippyLogConfig, ZippyQueryConfig,
-    ZippyTableConfig, ZippyTablePersistConfig, ZippyTablePersistPartitionConfig,
-    DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL, DEFAULT_QUERY_PARALLELISM,
-    DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
-    MAX_QUERY_PARALLELISM,
+    ZippyRuntimeConfig, ZippyTableConfig, ZippyTablePersistConfig,
+    ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL,
+    DEFAULT_MAX_PARALLELISM, DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD,
+    DEFAULT_TABLE_ROW_CAPACITY, MAX_PARALLELISM,
 };
 pub use control_transport::{connect_control_endpoint, send_control_line_request, ControlStream};
 pub use endpoint::{

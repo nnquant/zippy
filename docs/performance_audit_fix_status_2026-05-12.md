@@ -219,7 +219,7 @@
   执行 projection/filter，再把非空结果交给上层统一 concat。
 - tail persisted scan 保留从新到旧读取文件和最终正序输出语义，同时按 chunk 过滤。
 - `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，并发由
-  `[query].parallelism` 或 `ZIPPY_QUERY_PARALLELISM` 控制，默认每批最多 4 个文件。
+  `[runtime].max_parallelism` 约束；`[query].parallelism` 可进一步收紧，默认每批最多 4 个文件。
 - `OrderedGatewayFileResults` 按 file index 缓冲完成结果，保证并发扫描后输出仍按 catalog 顺序确定。
 - ordered result buffer 拒绝 duplicate/stale/gap，worker panic 映射为 `ZippyError`。
 - head/slice streaming 路径复用有界并行扫描后在 producer 层 skip/take；tail streaming 路径继续使用

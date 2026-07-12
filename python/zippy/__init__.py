@@ -60,8 +60,8 @@ _KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD = "zippy_key_value_last_changelog_seq"
 _KEY_VALUE_SCHEMA_VERSION_FIELD = "zippy_key_value_schema_version"
 _LIVE_SNAPSHOT_RETRY_ATTEMPTS = 20
 _LIVE_SNAPSHOT_RETRY_SLEEP_SEC = 0.002
-_DEFAULT_QUERY_PARALLELISM = 4
-_MAX_QUERY_PARALLELISM = 256
+_DEFAULT_MAX_PARALLELISM = 4
+_MAX_PARALLELISM = 256
 _TEMPORAL_LITERAL_RE = re.compile(
     r"^(?P<year>\d{4})"
     r"(?:(?P<dash_month>-?)(?P<month>\d{2})"
@@ -365,6 +365,9 @@ _SHUTDOWN_HOOKS_LOCK = threading.RLock()
 _MASTER_LOCAL_DATA_PATH: dict[int, bool] = {}
 _USE_MASTER_CONFIG = object()
 _BUILTIN_CONFIG: dict[str, object] = {
+    "runtime": {
+        "max_parallelism": _DEFAULT_MAX_PARALLELISM,
+    },
     "master": {
         "host": None,
         "port": None,
@@ -373,7 +376,7 @@ _BUILTIN_CONFIG: dict[str, object] = {
         "level": "info",
     },
     "query": {
-        "parallelism": _DEFAULT_QUERY_PARALLELISM,
+        "parallelism": None,
     },
     "table": {
         "row_capacity": 65_536,
@@ -3808,7 +3811,11 @@ class GatewayServer:
             int(max_blocking_requests) if max_blocking_requests is not None else None
         )
         self.write_timeout_ms = int(write_timeout_ms) if write_timeout_ms is not None else None
-        self.query_parallelism = _resolve_query_parallelism(master)
+        self.max_parallelism = _resolve_max_parallelism(master)
+        self.query_parallelism = _resolve_query_parallelism(
+            master,
+            max_parallelism=self.max_parallelism,
+        )
         self._native = _NativeGatewayServer(
             endpoint=self.endpoint,
             master=master,
@@ -3818,6 +3825,7 @@ class GatewayServer:
             max_subscribers=self.max_subscribers,
             max_blocking_requests=self.max_blocking_requests,
             write_timeout_ms=self.write_timeout_ms,
+            max_parallelism=self.max_parallelism,
             query_parallelism=self.query_parallelism,
         )
 
@@ -3924,7 +3932,11 @@ class Table:
                 self._inner = _NativeQuery(source=source, master=selected_master)
             self._master = selected_master
             self._force_local = bool(_force_local)
-            self._query_parallelism = _resolve_query_parallelism(selected_master)
+            self._max_parallelism = _resolve_max_parallelism(selected_master)
+            self._query_parallelism = _resolve_query_parallelism(
+                selected_master,
+                max_parallelism=self._max_parallelism,
+            )
             self._logical_stream_info: dict[str, object] | None = None
             self._shard_names: list[str] | None = None
             self._fixed_shard_snapshots: dict[str, dict[str, object]] | None = None
@@ -4371,6 +4383,7 @@ class Table:
                     self._query_parallelism // min(len(shard_names), self._query_parallelism),
                 ),
                 "query_parallelism": self._query_parallelism,
+                "max_parallelism": self._max_parallelism,
                 "capability": {
                     "executor": "sharded_fanout",
                     "fanout": "physical_shards",
@@ -4519,6 +4532,7 @@ class Table:
         table._inner = self._inner
         table._master = getattr(self, "_master", None)
         table._force_local = bool(getattr(self, "_force_local", False))
+        table._max_parallelism = self._max_parallelism
         table._query_parallelism = self._query_parallelism
         table._logical_stream_info = getattr(self, "_logical_stream_info", None)
         table._shard_names = getattr(self, "_shard_names", None)
@@ -4590,6 +4604,7 @@ class Table:
                     self._query_parallelism // min(len(shard_names), self._query_parallelism),
                 ),
                 "query_parallelism": self._query_parallelism,
+                "max_parallelism": self._max_parallelism,
                 "scanned_files": [],
                 "scanned_rows": 0,
                 "scanned_live_rows": 0,
@@ -4610,6 +4625,7 @@ class Table:
             "returned_rows": None,
             "elapsed_ms": None,
             "query_parallelism": self._query_parallelism,
+            "max_parallelism": self._max_parallelism,
         }
 
     def _logical_shard_names_for_collect(self) -> list[str]:
@@ -5372,7 +5388,7 @@ def _collect_persisted_rows(
     columns: list[str] | None = None,
     filters: object | None = None,
     metrics: dict[str, object] | None = None,
-    parallelism: int = _DEFAULT_QUERY_PARALLELISM,
+    parallelism: int = _DEFAULT_MAX_PARALLELISM,
 ):
     files = [
         item
@@ -5385,7 +5401,7 @@ def _collect_persisted_rows(
     ordered_files = sorted(files, key=_persisted_file_order_key)
     worker_count = min(
         len(ordered_files),
-        _parse_query_parallelism(parallelism, "query parallelism"),
+        _parse_parallelism(parallelism, "query parallelism"),
     )
 
     def read_file(item: dict[str, object]):
@@ -10204,9 +10220,10 @@ class Pipeline:
         :param shard_key: Column name or ordered column names used to shard rows. Omit together
             with ``shard_nums`` to keep the default single-materializer path.
         :type shard_key: str | list[str] | tuple[str, ...] | None
-        :param shard_nums: Number of shards, or ``"auto"`` to use up to 16 CPU-backed shards.
-            When provided with ``shard_key``, stream_table creates a logical stream plus internal
-            physical shard streams backed by a sharded native materializer.
+        :param shard_nums: Number of shards, or ``"auto"`` to use up to 16 CPU-backed shards
+            without exceeding ``runtime.max_parallelism``. When provided with ``shard_key``,
+            stream_table creates a logical stream plus internal physical shard streams backed by
+            a sharded native materializer.
         :type shard_nums: int | str | None
         :returns: This pipeline.
         :rtype: Pipeline
@@ -10217,6 +10234,7 @@ class Pipeline:
             schema=schema,
             shard_key=shard_key,
             shard_nums=shard_nums,
+            max_parallelism=_resolve_max_parallelism(self.master),
         )
         table_options = _resolve_stream_table_options(
             name=name,
@@ -10581,32 +10599,60 @@ def _master_config(master: object) -> dict[str, object]:
     return get_config()
 
 
-def _parse_query_parallelism(value: object, source: str) -> int:
+def _parse_parallelism(value: object, source: str) -> int:
     try:
         parallelism = int(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{source} must be an integer") from error
     if parallelism <= 0:
         raise ValueError(f"{source} must be greater than zero")
-    if parallelism > _MAX_QUERY_PARALLELISM:
-        raise ValueError(f"{source} must not exceed {_MAX_QUERY_PARALLELISM}")
+    if parallelism > _MAX_PARALLELISM:
+        raise ValueError(f"{source} must not exceed {_MAX_PARALLELISM}")
     return parallelism
 
 
-def _resolve_query_parallelism(master: object | None) -> int:
+def _resolve_max_parallelism(master: object | None) -> int:
+    env_value = os.environ.get("ZIPPY_MAX_PARALLELISM")
+    if env_value is not None:
+        return _parse_parallelism(env_value, "ZIPPY_MAX_PARALLELISM")
+    if master is None:
+        return _DEFAULT_MAX_PARALLELISM
+    master_config = _master_config(master)
+    runtime_config = master_config.get("runtime", {})
+    if not isinstance(runtime_config, dict):
+        return _DEFAULT_MAX_PARALLELISM
+    return _parse_parallelism(
+        runtime_config.get("max_parallelism", _DEFAULT_MAX_PARALLELISM),
+        "runtime.max_parallelism",
+    )
+
+
+def _resolve_query_parallelism(
+    master: object | None,
+    *,
+    max_parallelism: int | None = None,
+) -> int:
+    resolved_max = _resolve_max_parallelism(master) if max_parallelism is None else max_parallelism
     env_value = os.environ.get("ZIPPY_QUERY_PARALLELISM")
     if env_value is not None:
-        return _parse_query_parallelism(env_value, "ZIPPY_QUERY_PARALLELISM")
-    if master is None:
-        return _DEFAULT_QUERY_PARALLELISM
-    master_config = _master_config(master)
-    query_config = master_config.get("query", {})
-    if not isinstance(query_config, dict):
-        return _DEFAULT_QUERY_PARALLELISM
-    return _parse_query_parallelism(
-        query_config.get("parallelism", _DEFAULT_QUERY_PARALLELISM),
-        "query.parallelism",
-    )
+        parallelism = _parse_parallelism(env_value, "ZIPPY_QUERY_PARALLELISM")
+    elif master is None:
+        parallelism = resolved_max
+    else:
+        master_config = _master_config(master)
+        query_config = master_config.get("query", {})
+        configured = query_config.get("parallelism") if isinstance(query_config, dict) else None
+        parallelism = (
+            resolved_max
+            if configured is None
+            else _parse_parallelism(configured, "query.parallelism")
+        )
+    if parallelism > resolved_max:
+        raise ValueError(
+            "query parallelism must not exceed runtime max_parallelism "
+            f"parallelism=[{parallelism}] max_parallelism=[{resolved_max}]"
+        )
+    return parallelism
 
 
 def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:
@@ -10822,6 +10868,7 @@ def _resolve_stream_table_sharding(
     schema,
     shard_key,
     shard_nums,
+    max_parallelism: int = _DEFAULT_MAX_PARALLELISM,
 ) -> _StreamTableSharding | None:
     if shard_key is None and shard_nums is None:
         return None
@@ -10830,7 +10877,7 @@ def _resolve_stream_table_sharding(
     if shard_nums is not None and shard_key is None:
         raise ValueError("shard_nums requires shard_key")
 
-    parsed_shard_nums = _resolve_stream_table_shard_nums(shard_nums)
+    parsed_shard_nums = _resolve_stream_table_shard_nums(shard_nums, max_parallelism)
     if parsed_shard_nums == 1 and shard_nums != "auto":
         raise ValueError("shard_nums=1 disables sharding; omit shard_key")
 
@@ -10843,9 +10890,12 @@ def _resolve_stream_table_sharding(
     return _StreamTableSharding(shard_key=parsed_shard_key, shard_nums=parsed_shard_nums)
 
 
-def _resolve_stream_table_shard_nums(shard_nums) -> int:
+def _resolve_stream_table_shard_nums(
+    shard_nums,
+    max_parallelism: int = _DEFAULT_MAX_PARALLELISM,
+) -> int:
     if shard_nums == "auto":
-        return min(os.cpu_count() or 1, 16)
+        return min(os.cpu_count() or 1, max_parallelism, 16)
     if isinstance(shard_nums, bool) or not isinstance(shard_nums, int):
         raise ValueError("shard_nums must be a positive integer or 'auto'")
     if shard_nums <= 0:

@@ -39,7 +39,7 @@ use zippy_core::{
     ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
     ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
     RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
-    UnregisterSourceRequest, ZippyError, DEFAULT_QUERY_PARALLELISM, MAX_QUERY_PARALLELISM,
+    UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM, MAX_PARALLELISM,
 };
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
@@ -99,6 +99,7 @@ struct GatewayState {
     max_connections: usize,
     max_subscribers: usize,
     max_blocking_requests: usize,
+    max_parallelism: usize,
     query_parallelism: usize,
     write_timeout: Duration,
 }
@@ -832,19 +833,36 @@ struct MasterDescriptorPublisher {
 impl GatewayServer {
     /// Create a native GatewayServer.
     pub fn new(config: GatewayServerConfig) -> Result<Self> {
-        Self::new_with_query_parallelism(config, DEFAULT_QUERY_PARALLELISM)
+        Self::new_with_parallelism(config, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_PARALLELISM)
     }
 
-    /// Create a native GatewayServer with an explicit persisted-query worker limit.
+    /// Create a native GatewayServer with one shared query and runtime limit.
     pub fn new_with_query_parallelism(
         config: GatewayServerConfig,
         query_parallelism: usize,
     ) -> Result<Self> {
-        if query_parallelism == 0 || query_parallelism > MAX_QUERY_PARALLELISM {
+        Self::new_with_parallelism(config, query_parallelism, query_parallelism)
+    }
+
+    /// Create a native GatewayServer with process-wide and query-specific limits.
+    pub fn new_with_parallelism(
+        config: GatewayServerConfig,
+        max_parallelism: usize,
+        query_parallelism: usize,
+    ) -> Result<Self> {
+        if max_parallelism == 0 || max_parallelism > MAX_PARALLELISM {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
-                    "query parallelism must be between 1 and {} value=[{}]",
-                    MAX_QUERY_PARALLELISM, query_parallelism
+                    "max_parallelism must be between 1 and {} value=[{}]",
+                    MAX_PARALLELISM, max_parallelism
+                ),
+            });
+        }
+        if query_parallelism == 0 || query_parallelism > max_parallelism {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query parallelism must be between 1 and max_parallelism value=[{}] max_parallelism=[{}]",
+                    query_parallelism, max_parallelism
                 ),
             });
         }
@@ -898,6 +916,7 @@ impl GatewayServer {
                 max_connections,
                 max_subscribers,
                 max_blocking_requests,
+                max_parallelism,
                 query_parallelism,
                 write_timeout,
             }),
@@ -929,6 +948,7 @@ impl GatewayServer {
             .to_string();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(self.state.max_parallelism)
             .enable_io()
             .enable_time()
             .thread_name("zippy-gateway")
@@ -982,6 +1002,7 @@ impl GatewayServer {
             self.state.max_blocking_requests,
         );
         insert_json_metric(fields, "max_subscribers", self.state.max_subscribers);
+        insert_json_metric(fields, "max_parallelism", self.state.max_parallelism);
         insert_json_metric(fields, "query_parallelism", self.state.query_parallelism);
         insert_json_metric(
             fields,
@@ -2307,6 +2328,7 @@ impl GatewayState {
             self.write_timeout.as_millis() as u64,
         );
         insert_json_metric(fields, "query_parallelism", self.query_parallelism);
+        insert_json_metric(fields, "max_parallelism", self.max_parallelism);
         insert_json_metric(
             fields,
             "snapshots_active",
@@ -6611,16 +6633,17 @@ mod tests {
 
     #[test]
     fn gateway_query_parallelism_is_validated_and_reported() {
-        let gateway = GatewayServer::new_with_query_parallelism(test_gateway_config(), 7).unwrap();
+        let gateway = GatewayServer::new_with_parallelism(test_gateway_config(), 8, 7).unwrap();
 
+        assert_eq!(gateway.metrics()["max_parallelism"], json!(8));
         assert_eq!(gateway.metrics()["query_parallelism"], json!(7));
 
-        let error = GatewayServer::new_with_query_parallelism(test_gateway_config(), 0)
+        let error = GatewayServer::new_with_parallelism(test_gateway_config(), 4, 5)
             .err()
-            .expect("zero query parallelism must fail");
+            .expect("query parallelism above max must fail");
         assert!(error
             .to_string()
-            .contains("query parallelism must be between 1 and 256"));
+            .contains("query parallelism must be between 1 and max_parallelism"));
     }
 
     #[test]
@@ -7376,7 +7399,7 @@ mod tests {
         let error = parallel_persisted_file_record_batches(
             &stream,
             &GatewayScanPushdown::default(),
-            DEFAULT_QUERY_PARALLELISM,
+            DEFAULT_MAX_PARALLELISM,
             &mut scanned_rows,
             &mut scanned_files,
             &mut max_pending_file_results,

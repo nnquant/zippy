@@ -38,8 +38,8 @@ Windows Python client
 host = "0.0.0.0"
 port = 17690
 
-[query]
-parallelism = 4
+[runtime]
+max_parallelism = 4
 
 [gateway]
 enabled = true
@@ -51,8 +51,9 @@ protocol_version = 1
 
 - `enabled = true`：master 会启动 native GatewayServer，并向远端 client 发布 Gateway
   capability；
-- `query.parallelism = 4`：限制单次 Gateway persisted 文件扫描并发，默认值也是 `4`；可用
-  `ZIPPY_QUERY_PARALLELISM` 覆盖，有效范围为 `1..=256`；
+- `runtime.max_parallelism = 4`：限制进程级并行度和 Gateway worker 数；查询默认继承该值；
+  如需单独收紧查询，可配置 `[query].parallelism` 或 `ZIPPY_QUERY_PARALLELISM`，但不得
+  超过全局上限；
 - gateway 默认监听地址从 master TCP 配置推导，端口为 `master.port + 1`；
 - `token`：GatewayServer 的轻量访问令牌，Windows client 会从 master config 自动发现；
 - `protocol_version`：当前协议版本，第一版固定为 `1`。

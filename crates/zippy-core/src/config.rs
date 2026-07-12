@@ -12,13 +12,15 @@ pub const DEFAULT_TABLE_PERSIST_DATA_DIR: &str = "data";
 pub const DEFAULT_TABLE_PERSIST_COMPACTION_INTERVAL_SEC: f64 = 300.0;
 pub const DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES: usize = 8;
 pub const DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
-pub const DEFAULT_QUERY_PARALLELISM: usize = 4;
-pub const MAX_QUERY_PARALLELISM: usize = 256;
+pub const DEFAULT_MAX_PARALLELISM: usize = 4;
+pub const MAX_PARALLELISM: usize = 256;
 const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%m%d%H"];
 
 /// Process-wide Zippy runtime configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZippyConfig {
+    #[serde(default)]
+    pub runtime: ZippyRuntimeConfig,
     #[serde(default)]
     pub master: ZippyMasterConfig,
     pub log: ZippyLogConfig,
@@ -29,17 +31,29 @@ pub struct ZippyConfig {
     pub query: ZippyQueryConfig,
 }
 
-/// Query execution resource limits shared by local and remote readers.
+/// Process-wide execution resource limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyRuntimeConfig {
+    pub max_parallelism: usize,
+}
+
+impl Default for ZippyRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_parallelism: DEFAULT_MAX_PARALLELISM,
+        }
+    }
+}
+
+/// Optional query-specific override of the process-wide parallelism limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyQueryConfig {
-    pub parallelism: usize,
+    pub parallelism: Option<usize>,
 }
 
 impl Default for ZippyQueryConfig {
     fn default() -> Self {
-        Self {
-            parallelism: DEFAULT_QUERY_PARALLELISM,
-        }
+        Self { parallelism: None }
     }
 }
 
@@ -145,11 +159,17 @@ impl Default for ZippyGatewayConfig {
 
 #[derive(Debug, Deserialize)]
 struct PartialZippyConfig {
+    runtime: Option<PartialRuntimeConfig>,
     master: Option<PartialMasterConfig>,
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
     gateway: Option<PartialGatewayConfig>,
     query: Option<PartialQueryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialRuntimeConfig {
+    max_parallelism: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +235,7 @@ struct PartialGatewayConfig {
 impl Default for ZippyConfig {
     fn default() -> Self {
         Self {
+            runtime: ZippyRuntimeConfig::default(),
             master: ZippyMasterConfig::default(),
             log: ZippyLogConfig {
                 level: DEFAULT_LOG_LEVEL.to_string(),
@@ -273,6 +294,11 @@ impl ZippyConfig {
     }
 
     fn apply_partial(&mut self, partial: PartialZippyConfig) -> Result<()> {
+        if let Some(runtime) = partial.runtime {
+            if let Some(max_parallelism) = runtime.max_parallelism {
+                self.runtime.max_parallelism = max_parallelism;
+            }
+        }
         if let Some(master) = partial.master {
             if let Some(host) = master.host {
                 self.master.host = Some(non_empty(host, "master.host")?);
@@ -367,13 +393,16 @@ impl ZippyConfig {
         }
         if let Some(query) = partial.query {
             if let Some(parallelism) = query.parallelism {
-                self.query.parallelism = parallelism;
+                self.query.parallelism = Some(parallelism);
             }
         }
         Ok(())
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
+            self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;
+        }
         if let Some(host) = env_string("ZIPPY_MASTER_HOST") {
             self.master.host = Some(non_empty(host, "ZIPPY_MASTER_HOST")?);
         }
@@ -408,15 +437,7 @@ impl ZippyConfig {
             self.log.level = non_empty(level, "ZIPPY_LOG_LEVEL")?;
         }
         if let Some(value) = env_string("ZIPPY_QUERY_PARALLELISM") {
-            self.query.parallelism =
-                value
-                    .parse::<usize>()
-                    .map_err(|error| ZippyError::InvalidConfig {
-                        reason: format!(
-                            "env var must parse as usize name=[ZIPPY_QUERY_PARALLELISM] error=[{}]",
-                            error
-                        ),
-                    })?;
+            self.query.parallelism = Some(parse_usize_env("ZIPPY_QUERY_PARALLELISM", &value)?);
         }
         if let Some(value) = env_string("ZIPPY_TABLE_ROW_CAPACITY") {
             self.table.row_capacity =
@@ -542,13 +563,23 @@ impl ZippyConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.query.parallelism == 0 || self.query.parallelism > MAX_QUERY_PARALLELISM {
+        if self.runtime.max_parallelism == 0 || self.runtime.max_parallelism > MAX_PARALLELISM {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
-                    "query parallelism must be between 1 and {} value=[{}]",
-                    MAX_QUERY_PARALLELISM, self.query.parallelism
+                    "runtime max_parallelism must be between 1 and {} value=[{}]",
+                    MAX_PARALLELISM, self.runtime.max_parallelism
                 ),
             });
+        }
+        if let Some(parallelism) = self.query.parallelism {
+            if parallelism == 0 || parallelism > self.runtime.max_parallelism {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "query parallelism must be between 1 and runtime max_parallelism value=[{}] max_parallelism=[{}]",
+                        parallelism, self.runtime.max_parallelism
+                    ),
+                });
+            }
         }
         if self.table.row_capacity == 0 {
             return Err(ZippyError::InvalidConfig {
@@ -609,6 +640,13 @@ impl ZippyConfig {
             Some(format!("{host}:{port}"))
         })
     }
+
+    /// Return the effective query limit after applying runtime inheritance.
+    pub fn query_parallelism(&self) -> usize {
+        self.query
+            .parallelism
+            .unwrap_or(self.runtime.max_parallelism)
+    }
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -640,6 +678,17 @@ fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
             ),
         }),
     }
+}
+
+fn parse_usize_env(key: &str, value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|error| ZippyError::InvalidConfig {
+            reason: format!(
+                "env var must parse as usize name=[{}] error=[{}]",
+                key, error
+            ),
+        })
 }
 
 fn non_empty(value: String, name: &str) -> Result<String> {

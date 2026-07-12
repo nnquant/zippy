@@ -23,25 +23,30 @@ uv run python examples/01_quickstart/01_connect_and_read_table.py --uri default
 uv run zippy stream ls --uri default
 ```
 
-### 查询并行度
+### 运行时并行度
 
-单次历史查询的并发读取预算由 zippy 配置统一管理，默认是 `4`：
+进程级并行度上限由 zippy 配置统一管理，默认是 `4`：
 
 ```toml
+[runtime]
+max_parallelism = 4
+
+# 可选：查询预算默认继承 runtime.max_parallelism
 [query]
-parallelism = 4
+parallelism = 2
 ```
 
 也可以用环境变量临时覆盖：
 
 ```bash
-ZIPPY_QUERY_PARALLELISM=8 uv run zippy master run default
+ZIPPY_MAX_PARALLELISM=8 ZIPPY_QUERY_PARALLELISM=4 uv run zippy master run default
 ```
 
-`ZIPPY_QUERY_PARALLELISM` 的优先级高于 `[query].parallelism`，有效范围是 `1..=256`。
-该预算同时限制单次本地 persisted Parquet 文件读取、逻辑分片查询 fan-out 和 native
-Gateway 的 persisted 文件扫描。逻辑分片会在活跃分片之间分配预算，避免“分片并行 x
-文件并行”造成线程数平方级放大。
+`ZIPPY_MAX_PARALLELISM` 覆盖 `[runtime].max_parallelism`；`ZIPPY_QUERY_PARALLELISM`
+覆盖 `[query].parallelism`。两者有效范围都是 `1..=256`，查询覆盖值不得超过全局上限。
+未配置查询覆盖时，查询预算继承全局值。全局上限还约束 Gateway Tokio worker 和
+`shard_nums="auto"`；查询预算限制本地 persisted Parquet 文件读取、逻辑分片查询
+fan-out 和 native Gateway persisted 文件扫描。
 
 这是单次查询上限；多个进程或多个并发查询仍各自拥有预算，需要结合 Gateway 的
 `max_blocking_requests` 和实际磁盘能力控制总负载。

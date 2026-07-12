@@ -12463,6 +12463,7 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
     assert captured["max_subscribers"] == 12
     assert captured["max_blocking_requests"] == 13
     assert captured["write_timeout_ms"] == 14
+    assert captured["max_parallelism"] == 4
     assert captured["query_parallelism"] == 4
 
 
@@ -12471,7 +12472,10 @@ def test_gateway_server_uses_query_parallelism_from_config_and_env(monkeypatch) 
 
     class FakeMaster:
         def get_config(self) -> dict[str, object]:
-            return {"query": {"parallelism": 7}}
+            return {
+                "runtime": {"max_parallelism": 8},
+                "query": {"parallelism": 7},
+            }
 
     class FakeNativeGatewayServer:
         def __init__(self, **kwargs) -> None:
@@ -12485,12 +12489,57 @@ def test_gateway_server_uses_query_parallelism_from_config_and_env(monkeypatch) 
     monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
 
     configured = zippy.GatewayServer(master=FakeMaster())
+    monkeypatch.setenv("ZIPPY_MAX_PARALLELISM", "6")
     monkeypatch.setenv("ZIPPY_QUERY_PARALLELISM", "3")
     overridden = zippy.GatewayServer(master=FakeMaster())
 
+    assert configured.max_parallelism == 8
     assert configured.query_parallelism == 7
+    assert overridden.max_parallelism == 6
     assert overridden.query_parallelism == 3
     assert [item["query_parallelism"] for item in captured] == [7, 3]
+
+
+def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {"runtime": {"max_parallelism": 6}, "query": {"parallelism": None}}
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.endpoint = kwargs["endpoint"]
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+
+    gateway = zippy.GatewayServer(master=FakeMaster())
+
+    assert gateway.max_parallelism == 6
+    assert gateway.query_parallelism == 6
+    assert captured["max_parallelism"] == 6
+    assert captured["query_parallelism"] == 6
+
+
+def test_gateway_server_rejects_query_parallelism_above_global_limit(monkeypatch) -> None:
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {
+                "runtime": {"max_parallelism": 4},
+                "query": {"parallelism": 5},
+            }
+
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+
+    with pytest.raises(ValueError, match="must not exceed runtime max_parallelism"):
+        zippy.GatewayServer(master=FakeMaster())
 
 
 @pytest.mark.parametrize("value", ["0", "257", "not-an-integer"])
@@ -17942,6 +17991,12 @@ def test_pipeline_stream_table_shard_auto_registers_logical_and_physical_streams
         assert descriptor["zippy_shard_mode"] == "hash"
         assert descriptor["zippy_shard_version"] == 1
         assert "writer_epoch" not in descriptor
+
+
+def test_stream_table_shard_auto_honors_runtime_max_parallelism(monkeypatch) -> None:
+    monkeypatch.setattr(zippy.os, "cpu_count", lambda: 32)
+
+    assert zippy._resolve_stream_table_shard_nums("auto", max_parallelism=3) == 3
 
 
 @pytest.mark.parametrize(

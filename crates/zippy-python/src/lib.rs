@@ -28,7 +28,7 @@ use zippy_core::{
     LogConfig, MasterClient as CoreMasterClient, OverflowPolicy, Publisher as CorePublisher,
     SegmentTableView, Source, SourceEvent, SourceHandle, SourceMode as RustSourceMode, SourceSink,
     StreamHello, StreamInfo, ZippyConfig, ZippyError, DEFAULT_CONTROL_ENDPOINT_URI,
-    DEFAULT_QUERY_PARALLELISM, MAX_QUERY_PARALLELISM,
+    DEFAULT_MAX_PARALLELISM, MAX_PARALLELISM,
 };
 use zippy_engines::{
     AuctionPolicy as RustAuctionPolicy, BarGeneratorEngine as RustBarGeneratorEngine,
@@ -2019,13 +2019,14 @@ struct GatewayServer {
     config: Mutex<Option<GatewayServerConfig>>,
     server: Mutex<Option<RustGatewayServer>>,
     endpoint: Mutex<String>,
+    max_parallelism: usize,
     query_parallelism: usize,
 }
 
 #[pymethods]
 impl GatewayServer {
     #[new]
-    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None, max_connections=None, max_subscribers=None, max_blocking_requests=None, write_timeout_ms=None, query_parallelism=DEFAULT_QUERY_PARALLELISM))]
+    #[pyo3(signature = (endpoint="127.0.0.1:17666".to_string(), *, master=None, token=None, max_write_rows=None, max_connections=None, max_subscribers=None, max_blocking_requests=None, write_timeout_ms=None, max_parallelism=DEFAULT_MAX_PARALLELISM, query_parallelism=DEFAULT_MAX_PARALLELISM))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         endpoint: String,
@@ -2036,12 +2037,19 @@ impl GatewayServer {
         max_subscribers: Option<usize>,
         max_blocking_requests: Option<usize>,
         write_timeout_ms: Option<u64>,
+        max_parallelism: usize,
         query_parallelism: usize,
     ) -> PyResult<Self> {
-        if query_parallelism == 0 || query_parallelism > MAX_QUERY_PARALLELISM {
+        if max_parallelism == 0 || max_parallelism > MAX_PARALLELISM {
             return Err(py_value_error(format!(
-                "query parallelism must be between 1 and {} value=[{}]",
-                MAX_QUERY_PARALLELISM, query_parallelism
+                "max_parallelism must be between 1 and {} value=[{}]",
+                MAX_PARALLELISM, max_parallelism
+            )));
+        }
+        if query_parallelism == 0 || query_parallelism > max_parallelism {
+            return Err(py_value_error(format!(
+                "query parallelism must be between 1 and max_parallelism value=[{}] max_parallelism=[{}]",
+                query_parallelism, max_parallelism
             )));
         }
         let master_endpoint = match master {
@@ -2062,6 +2070,7 @@ impl GatewayServer {
             })),
             server: Mutex::new(None),
             endpoint: Mutex::new(endpoint),
+            max_parallelism,
             query_parallelism,
         })
     }
@@ -2078,8 +2087,12 @@ impl GatewayServer {
             .ok_or_else(|| py_runtime_error("gateway server cannot be restarted after stop"))?;
         let server = py
             .allow_threads(|| {
-                RustGatewayServer::new_with_query_parallelism(config, self.query_parallelism)
-                    .and_then(RustGatewayServer::start)
+                RustGatewayServer::new_with_parallelism(
+                    config,
+                    self.max_parallelism,
+                    self.query_parallelism,
+                )
+                .and_then(RustGatewayServer::start)
             })
             .map_err(|error| py_runtime_error(error.to_string()))?;
         *self.endpoint.lock().unwrap() = server.endpoint().to_string();
@@ -2104,6 +2117,7 @@ impl GatewayServer {
                 serde_json::json!({
                     "endpoint": self.endpoint.lock().unwrap().clone(),
                     "running": false,
+                    "max_parallelism": self.max_parallelism,
                     "query_parallelism": self.query_parallelism,
                 })
             });

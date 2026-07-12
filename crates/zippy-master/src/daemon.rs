@@ -107,7 +107,8 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
         table_persist_enabled = runtime_config.table.persist.enabled,
         table_persist_method = runtime_config.table.persist.method.as_str(),
         table_persist_data_dir = runtime_config.table.persist.data_dir.as_str(),
-        query_parallelism = runtime_config.query.parallelism,
+        max_parallelism = runtime_config.runtime.max_parallelism,
+        query_parallelism = runtime_config.query_parallelism(),
         log_file = snapshot
             .file_path
             .as_ref()
@@ -204,7 +205,7 @@ fn start_gateway_if_enabled(
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "gateway endpoint is required when gateway is enabled".to_string(),
             })?;
-    let gateway = GatewayServer::new_with_query_parallelism(
+    let gateway = GatewayServer::new_with_parallelism(
         GatewayServerConfig {
             endpoint,
             master_endpoint: control_endpoint.clone(),
@@ -215,7 +216,8 @@ fn start_gateway_if_enabled(
             max_blocking_requests: None,
             write_timeout_ms: None,
         },
-        runtime_config.query.parallelism,
+        runtime_config.runtime.max_parallelism,
+        runtime_config.query_parallelism(),
     )?
     .start()?;
     let (host, port) = gateway_endpoint_host_port(gateway.endpoint());
@@ -226,7 +228,8 @@ fn start_gateway_if_enabled(
         endpoint = gateway.endpoint(),
         host = host.as_str(),
         port = port.as_str(),
-        query_parallelism = runtime_config.query.parallelism,
+        max_parallelism = runtime_config.runtime.max_parallelism,
+        query_parallelism = runtime_config.query_parallelism(),
         "started zippy gateway"
     );
     Ok(Some(gateway))

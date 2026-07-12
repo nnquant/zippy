@@ -262,6 +262,9 @@ port = {}
 [query]
 parallelism = 7
 
+[runtime]
+max_parallelism = 8
+
 [gateway]
 enabled = true
 token = "dev-token"
@@ -291,6 +294,7 @@ token = "dev-token"
 
     assert_eq!(response["status"], "ok");
     assert_eq!(response["metrics"]["requests_total"], 1);
+    assert_eq!(response["metrics"]["max_parallelism"], 8);
     assert_eq!(response["metrics"]["query_parallelism"], 7);
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
