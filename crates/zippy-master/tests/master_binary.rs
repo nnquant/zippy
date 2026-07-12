@@ -259,6 +259,9 @@ fn master_binary_starts_native_gateway_when_enabled() {
 host = "127.0.0.1"
 port = {}
 
+[query]
+parallelism = 7
+
 [gateway]
 enabled = true
 token = "dev-token"
@@ -288,6 +291,7 @@ token = "dev-token"
 
     assert_eq!(response["status"], "ok");
     assert_eq!(response["metrics"]["requests_total"], 1);
+    assert_eq!(response["metrics"]["query_parallelism"], 7);
 
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);

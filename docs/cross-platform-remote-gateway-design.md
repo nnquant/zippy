@@ -106,11 +106,21 @@ master config/capability 中需要暴露：
 host = "127.0.0.1"
 port = 17690
 
+[query]
+parallelism = 4
+
 [gateway]
 enabled = true
 token = "..."
 protocol_version = 1
 ```
+
+`[query].parallelism` 是单次查询的并发读取预算，默认值为 `4`；
+`ZIPPY_QUERY_PARALLELISM` 可在进程启动时覆盖配置。Gateway persisted 文件扫描、本地
+Parquet 文件扫描和逻辑分片 fan-out 使用同一预算，避免不同执行层各自并行导致过量线程。
+有效范围为 `1..=256`。
+多个并发 collect 请求各自拥有这个预算，进程总负载还受 Gateway
+`max_blocking_requests` 限制。
 
 默认不需要配置 gateway 的 `host` / `port`：当 master 是 TCP endpoint 时，
 GatewayServer endpoint 从 master endpoint 推导，端口为 `master.port + 1`。高级场景

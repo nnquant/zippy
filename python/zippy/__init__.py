@@ -60,7 +60,8 @@ _KEY_VALUE_LAST_CHANGELOG_SEQ_FIELD = "zippy_key_value_last_changelog_seq"
 _KEY_VALUE_SCHEMA_VERSION_FIELD = "zippy_key_value_schema_version"
 _LIVE_SNAPSHOT_RETRY_ATTEMPTS = 20
 _LIVE_SNAPSHOT_RETRY_SLEEP_SEC = 0.002
-_DEFAULT_SHARD_QUERY_PARALLELISM = 4
+_DEFAULT_QUERY_PARALLELISM = 4
+_MAX_QUERY_PARALLELISM = 256
 _TEMPORAL_LITERAL_RE = re.compile(
     r"^(?P<year>\d{4})"
     r"(?:(?P<dash_month>-?)(?P<month>\d{2})"
@@ -370,6 +371,9 @@ _BUILTIN_CONFIG: dict[str, object] = {
     },
     "log": {
         "level": "info",
+    },
+    "query": {
+        "parallelism": _DEFAULT_QUERY_PARALLELISM,
     },
     "table": {
         "row_capacity": 65_536,
@@ -1223,8 +1227,25 @@ def _remote_gateway_op_supported(kind: str, value: object) -> bool:
 def _remote_gateway_plan_split(
     plan_ops: list[tuple[str, object]],
 ) -> tuple[list[tuple[str, object]], list[tuple[str, object]]]:
+    row_range_op, row_range_residual = _row_range_plan_split(plan_ops)
+    if row_range_op is not None:
+        plan_ops = [row_range_op, *row_range_residual]
+
     remote_ops: list[tuple[str, object]] = []
+    row_range_seen = False
     for index, (kind, value) in enumerate(plan_ops):
+        if kind in {"head", "tail", "slice"}:
+            remote_ops.append((kind, value))
+            row_range_seen = True
+            continue
+        if row_range_seen:
+            if kind == "select" and _remote_select_exprs_supported(value):
+                remote_ops.append((kind, value))
+                continue
+            if kind in {"drop", "rename"}:
+                remote_ops.append((kind, value))
+                continue
+            return remote_ops, plan_ops[index:]
         if kind == "filter" and _remote_filter_expr_supported(value):
             remote_ops.append((kind, value))
             continue
@@ -1240,17 +1261,24 @@ def _remote_gateway_plan_split(
         if kind == "rename":
             remote_ops.append((kind, value))
             continue
-        if kind == "head":
-            remote_ops.append((kind, value))
-            return remote_ops, plan_ops[index + 1 :]
-        if kind == "tail":
-            remote_ops.append((kind, value))
-            return remote_ops, plan_ops[index + 1 :]
-        if kind == "slice":
-            remote_ops.append((kind, value))
-            return remote_ops, plan_ops[index + 1 :]
         return remote_ops, plan_ops[index:]
     return remote_ops, []
+
+
+def _row_range_plan_split(
+    plan_ops: list[tuple[str, object]],
+) -> tuple[tuple[str, object] | None, list[tuple[str, object]]]:
+    commutable_prefix_ops = {"select", "with_columns", "drop", "rename"}
+    for index, (kind, value) in enumerate(plan_ops):
+        if kind in {"head", "tail", "slice"}:
+            if any(prefix_kind not in commutable_prefix_ops for prefix_kind, _ in plan_ops[:index]):
+                break
+            if kind == "slice" and isinstance(value, dict) and int(value.get("offset", 0)) < 0:
+                break
+            return (kind, value), [*plan_ops[:index], *plan_ops[index + 1 :]]
+        if kind not in commutable_prefix_ops:
+            break
+    return None, list(plan_ops)
 
 
 def _shard_fanout_plan_split(
@@ -3780,6 +3808,7 @@ class GatewayServer:
             int(max_blocking_requests) if max_blocking_requests is not None else None
         )
         self.write_timeout_ms = int(write_timeout_ms) if write_timeout_ms is not None else None
+        self.query_parallelism = _resolve_query_parallelism(master)
         self._native = _NativeGatewayServer(
             endpoint=self.endpoint,
             master=master,
@@ -3789,6 +3818,7 @@ class GatewayServer:
             max_subscribers=self.max_subscribers,
             max_blocking_requests=self.max_blocking_requests,
             write_timeout_ms=self.write_timeout_ms,
+            query_parallelism=self.query_parallelism,
         )
 
     def start(self) -> "GatewayServer":
@@ -3894,6 +3924,7 @@ class Table:
                 self._inner = _NativeQuery(source=source, master=selected_master)
             self._master = selected_master
             self._force_local = bool(_force_local)
+            self._query_parallelism = _resolve_query_parallelism(selected_master)
             self._logical_stream_info: dict[str, object] | None = None
             self._shard_names: list[str] | None = None
             self._fixed_shard_snapshots: dict[str, dict[str, object]] | None = None
@@ -4251,17 +4282,26 @@ class Table:
 
         tail_n = self._tail_pushdown_count()
         if tail_n is not None:
-            return self._collect_tail_pushdown(tail_n, metrics=metrics)
+            return self._collect_tail_pushdown(
+                tail_n,
+                residual_plan=self._residual_plan_ops(optimized_plan),
+                metrics=metrics,
+            )
 
         head_n = self._head_pushdown_count()
         if head_n is not None:
-            return self._collect_head_pushdown(head_n, metrics=metrics)
+            return self._collect_head_pushdown(
+                head_n,
+                residual_plan=self._residual_plan_ops(optimized_plan),
+                metrics=metrics,
+            )
 
         slice_spec = self._slice_pushdown_spec()
         if slice_spec is not None:
             return self._collect_slice_pushdown(
                 int(slice_spec["offset"]),
                 slice_spec["length"],
+                residual_plan=self._residual_plan_ops(optimized_plan),
                 metrics=metrics,
             )
 
@@ -4273,6 +4313,7 @@ class Table:
             columns=read_columns,
             filters=pushdown_filters,
             metrics=metrics,
+            parallelism=self._query_parallelism,
         )
         live = None
         if _snapshot_has_active_descriptor(snapshot):
@@ -4323,8 +4364,13 @@ class Table:
                 "residual_plan": _query_plan_to_json(residual_plan),
                 "fanout_parallelism": min(
                     len(shard_names),
-                    _DEFAULT_SHARD_QUERY_PARALLELISM,
+                    self._query_parallelism,
                 ),
+                "per_shard_parallelism": max(
+                    1,
+                    self._query_parallelism // min(len(shard_names), self._query_parallelism),
+                ),
+                "query_parallelism": self._query_parallelism,
                 "capability": {
                     "executor": "sharded_fanout",
                     "fanout": "physical_shards",
@@ -4473,6 +4519,7 @@ class Table:
         table._inner = self._inner
         table._master = getattr(self, "_master", None)
         table._force_local = bool(getattr(self, "_force_local", False))
+        table._query_parallelism = self._query_parallelism
         table._logical_stream_info = getattr(self, "_logical_stream_info", None)
         table._shard_names = getattr(self, "_shard_names", None)
         table._fixed_shard_snapshots = getattr(self, "_fixed_shard_snapshots", None)
@@ -4536,8 +4583,13 @@ class Table:
                 "residual_plan": _query_plan_to_json(residual_plan),
                 "fanout_parallelism": min(
                     len(shard_names),
-                    _DEFAULT_SHARD_QUERY_PARALLELISM,
+                    self._query_parallelism,
                 ),
+                "per_shard_parallelism": max(
+                    1,
+                    self._query_parallelism // min(len(shard_names), self._query_parallelism),
+                ),
+                "query_parallelism": self._query_parallelism,
                 "scanned_files": [],
                 "scanned_rows": 0,
                 "scanned_live_rows": 0,
@@ -4557,6 +4609,7 @@ class Table:
             "scanned_live_rows": 0,
             "returned_rows": None,
             "elapsed_ms": None,
+            "query_parallelism": self._query_parallelism,
         }
 
     def _logical_shard_names_for_collect(self) -> list[str]:
@@ -4597,7 +4650,8 @@ class Table:
         schema = self.schema()
         optimized_plan = _normalize_temporal_plan_ops(self._optimized_plan_ops(), schema)
         shard_plan, residual_plan = _shard_fanout_plan_split(optimized_plan)
-        fanout_parallelism = min(len(shard_names), _DEFAULT_SHARD_QUERY_PARALLELISM)
+        fanout_parallelism = min(len(shard_names), self._query_parallelism)
+        per_shard_parallelism = max(1, self._query_parallelism // fanout_parallelism)
         if metrics is not None:
             metrics["executor"] = "sharded_fanout"
             metrics["sharded"] = True
@@ -4608,6 +4662,7 @@ class Table:
             metrics["residual_plan"] = _query_plan_to_json(residual_plan)
             metrics["pushdown_plan"] = self._pushdown_plan_summary(schema, shard_plan)
             metrics["fanout_parallelism"] = fanout_parallelism
+            metrics["per_shard_parallelism"] = per_shard_parallelism
 
         fixed_shard_snapshots = None
         if self._snapshot_enabled:
@@ -4624,6 +4679,7 @@ class Table:
                 snapshot=self._snapshot_enabled,
                 _force_local=bool(getattr(self, "_force_local", False)),
             )
+            shard_reader._query_parallelism = per_shard_parallelism
             if shard_name in existing_snapshots:
                 shard_reader._fixed_snapshot = existing_snapshots[shard_name]
             shard_reader._plan_ops = list(shard_plan)
@@ -4676,10 +4732,16 @@ class Table:
         schema: object | None,
         plan_ops: list[tuple[str, object]],
     ) -> dict[str, object]:
+        row_range_op, residual_plan = _row_range_plan_split(plan_ops)
         return {
             "row_range": self._row_range_pushdown_summary(plan_ops),
-            "columns": self._source_read_columns(schema, plan_ops),
-            "filters": self._pushdown_filters(schema, plan_ops),
+            "columns": self._source_read_columns(
+                schema,
+                residual_plan if row_range_op is not None else plan_ops,
+            ),
+            "filters": (
+                None if row_range_op is not None else self._pushdown_filters(schema, plan_ops)
+            ),
         }
 
     def _row_range_pushdown_summary(
@@ -4705,24 +4767,25 @@ class Table:
         self,
         plan_ops: list[tuple[str, object]],
     ) -> list[tuple[str, object]]:
-        if self._row_range_pushdown_summary(plan_ops) is not None:
-            return []
-        return list(plan_ops)
+        row_range_op, residual_plan = _row_range_plan_split(plan_ops)
+        return residual_plan if row_range_op is not None else list(plan_ops)
 
     def _tail_pushdown_count(self, plan_ops: list[tuple[str, object]] | None = None) -> int | None:
         plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
-        if len(plan_ops) != 1:
+        row_range_op, _ = _row_range_plan_split(plan_ops)
+        if row_range_op is None:
             return None
-        kind, value = plan_ops[0]
+        kind, value = row_range_op
         if kind != "tail":
             return None
         return int(value)
 
     def _head_pushdown_count(self, plan_ops: list[tuple[str, object]] | None = None) -> int | None:
         plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
-        if len(plan_ops) != 1:
+        row_range_op, _ = _row_range_plan_split(plan_ops)
+        if row_range_op is None:
             return None
-        kind, value = plan_ops[0]
+        kind, value = row_range_op
         if kind != "head":
             return None
         return int(value)
@@ -4732,9 +4795,10 @@ class Table:
         plan_ops: list[tuple[str, object]] | None = None,
     ) -> dict[str, int | None] | None:
         plan_ops = self._optimized_plan_ops() if plan_ops is None else plan_ops
-        if len(plan_ops) != 1:
+        row_range_op, _ = _row_range_plan_split(plan_ops)
+        if row_range_op is None:
             return None
-        kind, value = plan_ops[0]
+        kind, value = row_range_op
         if kind != "slice" or not isinstance(value, dict):
             return None
         offset = int(value["offset"])
@@ -4745,9 +4809,23 @@ class Table:
             return None
         return {"offset": offset, "length": None if length is None else int(length)}
 
-    def _collect_tail_pushdown(self, n: int, metrics: dict[str, object] | None = None):
+    def _collect_tail_pushdown(
+        self,
+        n: int,
+        *,
+        residual_plan: list[tuple[str, object]] | None = None,
+        metrics: dict[str, object] | None = None,
+    ):
+        residual_plan = [] if residual_plan is None else residual_plan
+        schema = self.schema()
+        read_columns = self._source_read_columns(schema, residual_plan)
+        read_schema = _schema_for_query_columns(schema, read_columns)
         for attempt in range(_LIVE_SNAPSHOT_RETRY_ATTEMPTS):
             snapshot = self.snapshot()
+            if n <= 0:
+                table = _concat_query_tables([], read_schema)
+                return self._apply_query_plan(table, residual_plan)
+
             live = None
             if _snapshot_has_active_descriptor(snapshot):
                 try:
@@ -4758,29 +4836,48 @@ class Table:
                         continue
                     raise
             _record_live_scan(metrics, live)
+            live = _select_query_columns(live, read_columns) if live is not None else None
             live_rows = 0 if live is None else live.num_rows
-            if n <= 0:
-                return _concat_query_tables([], self.schema())
             if live_rows >= n:
-                return live
+                return self._apply_query_plan(live, residual_plan)
 
-            persisted = _tail_persisted_rows(snapshot, n - live_rows, metrics=metrics)
-            table = _concat_query_tables([persisted, live], self.schema())
+            persisted = _tail_persisted_rows(
+                snapshot,
+                n - live_rows,
+                columns=read_columns,
+                metrics=metrics,
+            )
+            table = _concat_query_tables([persisted, live], read_schema)
             if table.num_rows > n:
-                return table.slice(table.num_rows - n)
-            return table
+                table = table.slice(table.num_rows - n)
+            return self._apply_query_plan(table, residual_plan)
         raise RuntimeError("snapshot retry exhausted")
 
-    def _collect_head_pushdown(self, n: int, metrics: dict[str, object] | None = None):
+    def _collect_head_pushdown(
+        self,
+        n: int,
+        *,
+        residual_plan: list[tuple[str, object]] | None = None,
+        metrics: dict[str, object] | None = None,
+    ):
+        residual_plan = [] if residual_plan is None else residual_plan
+        schema = self.schema()
+        read_columns = self._source_read_columns(schema, residual_plan)
+        read_schema = _schema_for_query_columns(schema, read_columns)
         for attempt in range(_LIVE_SNAPSHOT_RETRY_ATTEMPTS):
             snapshot = self.snapshot()
-            schema = self.schema()
             if n <= 0:
-                return _concat_query_tables([], schema)
+                table = _concat_query_tables([], read_schema)
+                return self._apply_query_plan(table, residual_plan)
 
-            persisted = _head_persisted_rows(snapshot, n, metrics=metrics)
+            persisted = _head_persisted_rows(
+                snapshot,
+                n,
+                columns=read_columns,
+                metrics=metrics,
+            )
             if persisted is not None and persisted.num_rows >= n:
-                return persisted.slice(0, n)
+                return self._apply_query_plan(persisted.slice(0, n), residual_plan)
 
             remaining = n - (0 if persisted is None else persisted.num_rows)
             live = None
@@ -4792,34 +4889,43 @@ class Table:
                         time.sleep(_LIVE_SNAPSHOT_RETRY_SLEEP_SEC)
                         continue
                     raise
-            table = _concat_query_tables([persisted, live], schema)
+            live = _select_query_columns(live, read_columns) if live is not None else None
+            table = _concat_query_tables([persisted, live], read_schema)
             if table.num_rows > n:
-                return table.slice(0, n)
-            return table
+                table = table.slice(0, n)
+            return self._apply_query_plan(table, residual_plan)
         raise RuntimeError("snapshot retry exhausted")
 
     def _collect_slice_pushdown(
         self,
         offset: int,
         length: int | None,
+        *,
+        residual_plan: list[tuple[str, object]] | None = None,
         metrics: dict[str, object] | None = None,
     ):
+        residual_plan = [] if residual_plan is None else residual_plan
+        schema = self.schema()
+        read_columns = self._source_read_columns(schema, residual_plan)
+        read_schema = _schema_for_query_columns(schema, read_columns)
         for attempt in range(_LIVE_SNAPSHOT_RETRY_ATTEMPTS):
             snapshot = self.snapshot()
-            schema = self.schema()
             if length == 0:
-                return _concat_query_tables([], schema)
+                table = _concat_query_tables([], read_schema)
+                return self._apply_query_plan(table, residual_plan)
 
             persisted, persisted_row_count, collected_rows = _slice_persisted_rows(
                 snapshot,
                 offset,
                 length,
+                columns=read_columns,
                 metrics=metrics,
             )
             if length is not None and collected_rows >= length:
                 if persisted is not None:
-                    return persisted.slice(0, length)
-                return _concat_query_tables([], schema)
+                    return self._apply_query_plan(persisted.slice(0, length), residual_plan)
+                table = _concat_query_tables([], read_schema)
+                return self._apply_query_plan(table, residual_plan)
 
             live_offset = max(0, offset - persisted_row_count)
             live_length = None if length is None else length - collected_rows
@@ -4837,10 +4943,11 @@ class Table:
                         time.sleep(_LIVE_SNAPSHOT_RETRY_SLEEP_SEC)
                         continue
                     raise
-            table = _concat_query_tables([persisted, live], schema)
+            live = _select_query_columns(live, read_columns) if live is not None else None
+            table = _concat_query_tables([persisted, live], read_schema)
             if length is not None and table.num_rows > length:
-                return table.slice(0, length)
-            return table
+                table = table.slice(0, length)
+            return self._apply_query_plan(table, residual_plan)
         raise RuntimeError("snapshot retry exhausted")
 
     def _apply_query_plan(self, table, plan_ops: list[tuple[str, object]] | None = None):
@@ -5119,6 +5226,8 @@ def _arrow_row_bytes(table, row_index: int) -> bytes:
 def _tail_persisted_rows(
     snapshot: dict[str, object],
     n: int,
+    *,
+    columns: list[str] | None = None,
     metrics: dict[str, object] | None = None,
 ):
     if n <= 0:
@@ -5136,6 +5245,7 @@ def _tail_persisted_rows(
             offset=0,
             length=n - row_count,
             from_end=True,
+            columns=columns,
         )
         _record_persisted_file_scan(metrics, item, table, scanned_rows=scanned_rows)
         if table.num_rows == 0:
@@ -5158,6 +5268,8 @@ def _tail_persisted_rows(
 def _head_persisted_rows(
     snapshot: dict[str, object],
     n: int,
+    *,
+    columns: list[str] | None = None,
     metrics: dict[str, object] | None = None,
 ):
     if n <= 0:
@@ -5174,6 +5286,7 @@ def _head_persisted_rows(
             _validated_persisted_file_path(item),
             offset=0,
             length=remaining,
+            columns=columns,
         )
         _record_persisted_file_scan(metrics, item, table, scanned_rows=scanned_rows)
         if table.num_rows == 0:
@@ -5194,6 +5307,8 @@ def _slice_persisted_rows(
     snapshot: dict[str, object],
     offset: int,
     length: int | None,
+    *,
+    columns: list[str] | None = None,
     metrics: dict[str, object] | None = None,
 ):
     files = sorted(_non_overlapping_persisted_files(snapshot), key=_persisted_file_order_key)
@@ -5226,6 +5341,7 @@ def _slice_persisted_rows(
             _validated_persisted_file_path(item),
             offset=start_in_file,
             length=take_length,
+            columns=columns,
         )
         _record_persisted_file_scan(metrics, item, table, scanned_rows=scanned_rows)
         absolute_position = file_start + file_row_count
@@ -5256,6 +5372,7 @@ def _collect_persisted_rows(
     columns: list[str] | None = None,
     filters: object | None = None,
     metrics: dict[str, object] | None = None,
+    parallelism: int = _DEFAULT_QUERY_PARALLELISM,
 ):
     files = [
         item
@@ -5265,15 +5382,25 @@ def _collect_persisted_rows(
     if not files:
         return None
 
-    tables = []
-    for item in sorted(files, key=_persisted_file_order_key):
-        table = _read_persisted_parquet_file(
-            _validated_persisted_file_path(item),
-            columns=columns,
-            filters=filters,
+    ordered_files = sorted(files, key=_persisted_file_order_key)
+    worker_count = min(
+        len(ordered_files),
+        _parse_query_parallelism(parallelism, "query parallelism"),
+    )
+
+    def read_file(item: dict[str, object]):
+        return _read_persisted_parquet_file(
+            _validated_persisted_file_path(item), columns=columns, filters=filters
         )
+
+    if worker_count == 1:
+        tables = [read_file(item) for item in ordered_files]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            tables = list(executor.map(read_file, ordered_files))
+
+    for item, table in zip(ordered_files, tables, strict=True):
         _record_persisted_file_scan(metrics, item, table)
-        tables.append(table)
     return _concat_query_tables(tables, None)
 
 
@@ -5285,7 +5412,13 @@ def _read_persisted_parquet_file(
 ):
     import pyarrow.parquet as pq
 
-    return pq.read_table(str(file_path), columns=columns, filters=filters, partitioning=None)
+    return pq.read_table(
+        str(file_path),
+        columns=columns,
+        filters=filters,
+        partitioning=None,
+        use_threads=False,
+    )
 
 
 def _read_persisted_parquet_row_range(
@@ -5294,6 +5427,7 @@ def _read_persisted_parquet_row_range(
     offset: int,
     length: int | None,
     from_end: bool = False,
+    columns: list[str] | None = None,
 ):
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -5313,8 +5447,9 @@ def _read_persisted_parquet_row_range(
             total_rows if normalized_length is None else min(total_rows, start + normalized_length)
         )
 
+    output_schema = _schema_for_query_columns(parquet_file.schema_arrow, columns)
     if start >= end:
-        return pa.Table.from_batches([], schema=parquet_file.schema_arrow), 0, total_rows
+        return pa.Table.from_batches([], schema=output_schema), 0, total_rows
 
     row_groups: list[int] = []
     group_start = 0
@@ -5333,9 +5468,9 @@ def _read_persisted_parquet_row_range(
         group_start = group_end
 
     if not row_groups:
-        return pa.Table.from_batches([], schema=parquet_file.schema_arrow), 0, total_rows
+        return pa.Table.from_batches([], schema=output_schema), 0, total_rows
 
-    table = parquet_file.read_row_groups(row_groups)
+    table = parquet_file.read_row_groups(row_groups, columns=columns, use_threads=False)
     table = table.slice(start - first_group_start, end - start)
     return table, scanned_rows, total_rows
 
@@ -10439,11 +10574,39 @@ def _persist_path(value: ParquetPersist | str | os.PathLike[str] | None) -> str 
     raise TypeError("persist_path must be zippy.ParquetPersist or a path-like value")
 
 
-def _master_config(master: MasterClient) -> dict[str, object]:
+def _master_config(master: object) -> dict[str, object]:
     get_config = getattr(master, "get_config", None)
     if get_config is None:
         return dict(_BUILTIN_CONFIG)
     return get_config()
+
+
+def _parse_query_parallelism(value: object, source: str) -> int:
+    try:
+        parallelism = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{source} must be an integer") from error
+    if parallelism <= 0:
+        raise ValueError(f"{source} must be greater than zero")
+    if parallelism > _MAX_QUERY_PARALLELISM:
+        raise ValueError(f"{source} must not exceed {_MAX_QUERY_PARALLELISM}")
+    return parallelism
+
+
+def _resolve_query_parallelism(master: object | None) -> int:
+    env_value = os.environ.get("ZIPPY_QUERY_PARALLELISM")
+    if env_value is not None:
+        return _parse_query_parallelism(env_value, "ZIPPY_QUERY_PARALLELISM")
+    if master is None:
+        return _DEFAULT_QUERY_PARALLELISM
+    master_config = _master_config(master)
+    query_config = master_config.get("query", {})
+    if not isinstance(query_config, dict):
+        return _DEFAULT_QUERY_PARALLELISM
+    return _parse_query_parallelism(
+        query_config.get("parallelism", _DEFAULT_QUERY_PARALLELISM),
+        "query.parallelism",
+    )
 
 
 def _stream_writer_epoch(master: MasterClient, table_name: str) -> int | None:

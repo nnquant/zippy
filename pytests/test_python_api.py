@@ -12463,6 +12463,45 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
     assert captured["max_subscribers"] == 12
     assert captured["max_blocking_requests"] == 13
     assert captured["write_timeout_ms"] == 14
+    assert captured["query_parallelism"] == 4
+
+
+def test_gateway_server_uses_query_parallelism_from_config_and_env(monkeypatch) -> None:
+    captured: list[dict[str, object]] = []
+
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {"query": {"parallelism": 7}}
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            captured.append(kwargs)
+            self.endpoint = kwargs["endpoint"]
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+
+    configured = zippy.GatewayServer(master=FakeMaster())
+    monkeypatch.setenv("ZIPPY_QUERY_PARALLELISM", "3")
+    overridden = zippy.GatewayServer(master=FakeMaster())
+
+    assert configured.query_parallelism == 7
+    assert overridden.query_parallelism == 3
+    assert [item["query_parallelism"] for item in captured] == [7, 3]
+
+
+@pytest.mark.parametrize("value", ["0", "257", "not-an-integer"])
+def test_gateway_server_rejects_invalid_query_parallelism_env(
+    monkeypatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("ZIPPY_QUERY_PARALLELISM", value)
+
+    with pytest.raises(ValueError, match="ZIPPY_QUERY_PARALLELISM"):
+        zippy.GatewayServer()
 
 
 @pytest.mark.parametrize(
@@ -12600,6 +12639,7 @@ def _install_fake_sharded_native_query(
     logical_descriptor: dict[str, object] | None = None,
     logical_source_configs: list[dict[str, object]] | None = None,
     scan_delay_sec: float = 0.0,
+    query_parallelism: int | None = None,
 ) -> object:
     schema = pa.schema(
         [
@@ -12629,6 +12669,11 @@ def _install_fake_sharded_native_query(
             self.active_scans = 0
             self.max_active_scans = 0
             self.scan_lock = threading.Lock()
+
+        def get_config(self) -> dict[str, object]:
+            if query_parallelism is None:
+                return {}
+            return {"query": {"parallelism": query_parallelism}}
 
         def get_stream(self, source: str) -> dict[str, object]:
             self.stream_info_calls.append(source)
@@ -12770,6 +12815,76 @@ def test_read_table_and_shard_collects_physical_shards_concurrently(monkeypatch)
 
     assert result.column("seq").to_pylist() == [1, 2, 3, 4]
     assert master.max_active_scans == 2
+
+
+def test_read_table_and_shard_collect_honors_configured_parallelism(monkeypatch) -> None:
+    master = _install_fake_sharded_native_query(
+        monkeypatch,
+        scan_delay_sec=0.03,
+        query_parallelism=1,
+    )
+
+    profile = zippy.read_table("ticks", master=master, snapshot=False).profile()
+
+    assert profile["result"].column("seq").to_pylist() == [1, 2, 3, 4]
+    assert master.max_active_scans == 1
+    assert profile["metrics"]["query_parallelism"] == 1
+    assert profile["metrics"]["fanout_parallelism"] == 1
+    assert profile["metrics"]["per_shard_parallelism"] == 1
+
+
+def test_collect_persisted_rows_uses_configured_parallelism_and_preserves_order(
+    monkeypatch,
+) -> None:
+    active_scans = 0
+    max_active_scans = 0
+    scan_lock = threading.Lock()
+
+    def fake_read_persisted_parquet_file(
+        file_path: object,
+        *,
+        columns: list[str] | None = None,
+        filters: object | None = None,
+    ) -> pa.Table:
+        del columns, filters
+        nonlocal active_scans, max_active_scans
+        with scan_lock:
+            active_scans += 1
+            max_active_scans = max(max_active_scans, active_scans)
+        try:
+            time.sleep(0.03)
+            return pa.table({"seq": [int(str(file_path).rsplit("-", 1)[1])]})
+        finally:
+            with scan_lock:
+                active_scans -= 1
+
+    monkeypatch.setattr(
+        zippy,
+        "_read_persisted_parquet_file",
+        fake_read_persisted_parquet_file,
+    )
+    monkeypatch.setattr(
+        zippy,
+        "_validated_persisted_file_path",
+        lambda item: str(item["file_path"]),
+    )
+    snapshot = {
+        "active_segment_descriptor": None,
+        "sealed_segments": [],
+        "persisted_files": [
+            {
+                "file_path": f"segment-{index}",
+                "source_segment_id": index + 1,
+                "source_generation": 0,
+            }
+            for index in range(4)
+        ],
+    }
+
+    result = zippy._collect_persisted_rows(snapshot, parallelism=2)
+
+    assert result.column("seq").to_pylist() == [0, 1, 2, 3]
+    assert max_active_scans == 2
 
 
 def test_read_table_and_shard_uses_source_config_metadata_fallback(monkeypatch) -> None:
@@ -13675,9 +13790,12 @@ def test_table_head_pushdown_skips_later_persisted_files(
         offset: int,
         length: int | None,
         from_end: bool = False,
+        columns: list[str] | None = None,
     ) -> tuple[pa.Table, int, int]:
         read_files.append(str(file_path))
         table = persisted_rows[str(file_path)]
+        if columns is not None:
+            table = table.select(columns)
         start = max(0, table.num_rows - int(length or 0)) if from_end else offset
         selected = table.slice(start, length)
         return selected, table.num_rows, table.num_rows
@@ -13764,8 +13882,11 @@ def test_table_profile_reports_scan_metrics_for_head_pushdown(
         offset: int,
         length: int | None,
         from_end: bool = False,
+        columns: list[str] | None = None,
     ) -> tuple[pa.Table, int, int]:
         table = persisted_rows[str(file_path)]
+        if columns is not None:
+            table = table.select(columns)
         start = max(0, table.num_rows - int(length or 0)) if from_end else offset
         selected = table.slice(start, length)
         return selected, table.num_rows, table.num_rows
@@ -13808,6 +13929,80 @@ def test_persisted_row_range_reads_only_overlapping_row_group(tmp_path: Path) ->
     assert table["seq"].to_pylist() == [7]
     assert scanned_rows == 2
     assert total_rows == 8
+
+
+def test_table_select_tail_pushdown_reads_only_required_last_row_group(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    schema = pa.schema(
+        [
+            ("seq", pa.int64()),
+            ("price", pa.float64()),
+            ("unused", pa.string()),
+        ]
+    )
+    parquet_file = tmp_path / "projected-tail.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "seq": list(range(8)),
+                "price": [float(value) for value in range(8)],
+                "unused": [f"value-{value}" for value in range(8)],
+            },
+            schema=schema,
+        ),
+        parquet_file,
+        row_group_size=2,
+    )
+    snapshot = {
+        "stream_name": "projected_tail",
+        "schema_hash": "projected-tail",
+        "active_segment_descriptor": None,
+        "sealed_segments": [],
+        "persisted_files": [
+            {
+                "file_path": str(parquet_file),
+                "persist_data_root": str(tmp_path),
+                "row_count": 8,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "writer_epoch": 1,
+            }
+        ],
+        "descriptor_generation": 1,
+    }
+
+    class FakeNativeQuery:
+        def __init__(self, source: str, master: object) -> None:
+            del source, master
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def snapshot(self) -> dict[str, object]:
+            return snapshot
+
+        def stream_info(self) -> dict[str, object]:
+            return snapshot
+
+    monkeypatch.setattr(zippy, "_NativeQuery", FakeNativeQuery)
+
+    profile = (
+        zippy.read_table("projected_tail", master=object(), snapshot=False)
+        .select("seq", "price")
+        .tail(1)
+        .profile()
+    )
+
+    assert profile["result"].to_pydict() == {"seq": [7], "price": [7.0]}
+    assert profile["metrics"]["scanned_rows"] == 2
+    assert profile["metrics"]["pushdown_plan"] == {
+        "row_range": {"op": "tail", "n": 1},
+        "columns": ["seq", "price"],
+        "filters": None,
+    }
+    assert [item["op"] for item in profile["metrics"]["residual_plan"]] == ["select"]
 
 
 def test_table_slice_pushdown_skips_non_overlapping_persisted_files(
@@ -13893,9 +14088,12 @@ def test_table_slice_pushdown_skips_non_overlapping_persisted_files(
         offset: int,
         length: int | None,
         from_end: bool = False,
+        columns: list[str] | None = None,
     ) -> tuple[pa.Table, int, int]:
         read_files.append(str(file_path))
         table = persisted_rows[str(file_path)]
+        if columns is not None:
+            table = table.select(columns)
         start = max(0, table.num_rows - int(length or 0)) if from_end else offset
         selected = table.slice(start, length)
         return selected, table.num_rows, table.num_rows
@@ -14037,6 +14235,58 @@ def test_remote_explain_reports_gateway_residual_plan(monkeypatch) -> None:
     assert explain["capability"]["gateway_plan_ops"] == ["head"]
     assert explain["capability"]["gateway_residual_ops"] == ["filter"]
     assert explain["capability"]["unsupported_gateway_ops"] == []
+
+
+def test_remote_explain_reorders_projection_before_tail_for_gateway_pushdown(monkeypatch) -> None:
+    schema = pa.schema(
+        [
+            ("instrument_id", pa.string()),
+            ("seq", pa.int64()),
+        ]
+    )
+
+    class FakeRemoteQuery:
+        def __init__(self, source: str, master: object, endpoint: str, token: str | None) -> None:
+            del source, master, endpoint, token
+
+        def schema(self) -> pa.Schema:
+            return schema
+
+        def collect_plan(self, plan: list[dict[str, object]], *, snapshot: bool) -> pa.Table:
+            del plan, snapshot
+            return pa.table({"instrument_id": [], "seq": []}, schema=schema)
+
+    class FakeMaster:
+        def __init__(self) -> None:
+            self._process_id = None
+
+        def process_id(self) -> str | None:
+            return self._process_id
+
+        def register_process(self, app: str) -> str:
+            self._process_id = f"proc.{app}"
+            return self._process_id
+
+        def get_config(self) -> dict[str, object]:
+            return {
+                "gateway": {
+                    "enabled": True,
+                    "endpoint": "127.0.0.1:17691",
+                    "token": None,
+                }
+            }
+
+    monkeypatch.setattr(zippy, "_RemoteQuery", FakeRemoteQuery)
+
+    explain = (
+        zippy.read_table("ctp_ticks", master=FakeMaster(), snapshot=False)
+        .select("seq")
+        .tail(2)
+        .explain()
+    )
+
+    assert [item["op"] for item in explain["gateway_plan"]] == ["tail", "select"]
+    assert explain["gateway_residual_plan"] == []
 
 
 def test_remote_explain_reports_join_as_gateway_residual_plan(monkeypatch) -> None:

@@ -39,7 +39,7 @@ use zippy_core::{
     ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
     ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
     RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
-    UnregisterSourceRequest, ZippyError,
+    UnregisterSourceRequest, ZippyError, DEFAULT_QUERY_PARALLELISM, MAX_QUERY_PARALLELISM,
 };
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
@@ -58,7 +58,6 @@ const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM: usize = 4;
 const DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS: usize = 8;
 const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
 const MAX_GATEWAY_SNAPSHOTS: usize = 1024;
@@ -100,6 +99,7 @@ struct GatewayState {
     max_connections: usize,
     max_subscribers: usize,
     max_blocking_requests: usize,
+    query_parallelism: usize,
     write_timeout: Duration,
 }
 
@@ -402,6 +402,7 @@ impl GatewayCollectStreamProducer {
         output_projection_columns: Option<&[String]>,
         row_range_pushdown: Option<GatewayRowRangePushdown>,
         chunk_rows: usize,
+        query_parallelism: usize,
     ) -> Result<Self> {
         let scan_started = Instant::now();
         let schema = Arc::new(arrow_schema_from_stream_metadata(&stream.schema)?);
@@ -449,6 +450,7 @@ impl GatewayCollectStreamProducer {
                 parallel_persisted_file_record_batches(
                     stream,
                     scan_pushdown,
+                    query_parallelism,
                     &mut scanned_rows,
                     &mut scanned_files,
                     &mut max_pending_file_results,
@@ -830,6 +832,22 @@ struct MasterDescriptorPublisher {
 impl GatewayServer {
     /// Create a native GatewayServer.
     pub fn new(config: GatewayServerConfig) -> Result<Self> {
+        Self::new_with_query_parallelism(config, DEFAULT_QUERY_PARALLELISM)
+    }
+
+    /// Create a native GatewayServer with an explicit persisted-query worker limit.
+    pub fn new_with_query_parallelism(
+        config: GatewayServerConfig,
+        query_parallelism: usize,
+    ) -> Result<Self> {
+        if query_parallelism == 0 || query_parallelism > MAX_QUERY_PARALLELISM {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query parallelism must be between 1 and {} value=[{}]",
+                    MAX_QUERY_PARALLELISM, query_parallelism
+                ),
+            });
+        }
         if let Some(max_write_rows) = config.max_write_rows {
             if max_write_rows == 0 {
                 return Err(ZippyError::InvalidConfig {
@@ -880,6 +898,7 @@ impl GatewayServer {
                 max_connections,
                 max_subscribers,
                 max_blocking_requests,
+                query_parallelism,
                 write_timeout,
             }),
             runtime: None,
@@ -963,6 +982,7 @@ impl GatewayServer {
             self.state.max_blocking_requests,
         );
         insert_json_metric(fields, "max_subscribers", self.state.max_subscribers);
+        insert_json_metric(fields, "query_parallelism", self.state.query_parallelism);
         insert_json_metric(
             fields,
             "write_timeout_ms",
@@ -1546,6 +1566,7 @@ impl GatewayState {
                         stream_plan.output_projection_columns.as_deref(),
                         stream_plan.row_range_pushdown.map(|(pushdown, _)| pushdown),
                         stream_plan.chunk_rows,
+                        self.query_parallelism,
                     );
                 }
             }
@@ -1826,6 +1847,7 @@ impl GatewayState {
         let mut batches = parallel_persisted_file_record_batches(
             &snapshot.stream,
             scan_pushdown,
+            self.query_parallelism,
             &mut scanned_rows,
             &mut scanned_files,
             &mut _max_pending_file_results,
@@ -2284,6 +2306,7 @@ impl GatewayState {
             "write_timeout_ms",
             self.write_timeout.as_millis() as u64,
         );
+        insert_json_metric(fields, "query_parallelism", self.query_parallelism);
         insert_json_metric(
             fields,
             "snapshots_active",
@@ -2414,6 +2437,7 @@ impl GatewayState {
         let mut batches = parallel_persisted_file_record_batches(
             &stream,
             scan_pushdown,
+            self.query_parallelism,
             &mut scanned_rows,
             &mut scanned_files,
             &mut _max_pending_file_results,
@@ -3772,6 +3796,7 @@ fn concat_record_batches(schema: SchemaRef, batches: Vec<RecordBatch>) -> Result
 fn parallel_persisted_file_record_batches(
     stream: &StreamInfo,
     scan_pushdown: &GatewayScanPushdown,
+    query_parallelism: usize,
     scanned_rows: &mut usize,
     scanned_files: &mut Vec<String>,
     max_pending_file_results: &mut usize,
@@ -3790,9 +3815,9 @@ fn parallel_persisted_file_record_batches(
             scan_pushdown: scan_pushdown.clone(),
         })
         .collect::<Vec<_>>();
-    if tasks.len() <= 1 {
+    if tasks.len() <= 1 || query_parallelism == 1 {
         let mut batches = Vec::new();
-        if let Some(task) = tasks.into_iter().next() {
+        for task in tasks {
             let result = scan_persisted_file_task(task)?;
             *scanned_rows = scanned_rows.saturating_add(result.scanned_rows);
             batches.extend(result.batches);
@@ -3801,12 +3826,12 @@ fn parallel_persisted_file_record_batches(
         return Ok(batches);
     }
     let mut batches = Vec::new();
-    let mut ordered =
-        OrderedGatewayFileResults::new(DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS);
+    let mut ordered = OrderedGatewayFileResults::new(
+        DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS.max(query_parallelism),
+    );
     let mut next_task_index = 0usize;
     while next_task_index < tasks.len() {
-        let end_index =
-            (next_task_index + DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM).min(tasks.len());
+        let end_index = (next_task_index + query_parallelism).min(tasks.len());
         let chunk = &tasks[next_task_index..end_index];
         let results = std::sync::mpsc::channel::<GatewayPersistedScanThreadResult>();
         let receiver = thread::scope(|scope| {
@@ -6571,6 +6596,33 @@ mod tests {
     use parquet::arrow::ArrowWriter;
     use std::io::{BufRead, BufReader, Write};
 
+    fn test_gateway_config() -> GatewayServerConfig {
+        GatewayServerConfig {
+            endpoint: "127.0.0.1:0".to_string(),
+            master_endpoint: ControlEndpoint::Tcp("127.0.0.1:1".parse().unwrap()),
+            token: None,
+            max_write_rows: None,
+            max_connections: None,
+            max_subscribers: None,
+            max_blocking_requests: None,
+            write_timeout_ms: None,
+        }
+    }
+
+    #[test]
+    fn gateway_query_parallelism_is_validated_and_reported() {
+        let gateway = GatewayServer::new_with_query_parallelism(test_gateway_config(), 7).unwrap();
+
+        assert_eq!(gateway.metrics()["query_parallelism"], json!(7));
+
+        let error = GatewayServer::new_with_query_parallelism(test_gateway_config(), 0)
+            .err()
+            .expect("zero query parallelism must fail");
+        assert!(error
+            .to_string()
+            .contains("query parallelism must be between 1 and 256"));
+    }
+
     #[test]
     fn gateway_writer_creation_fetches_writer_epoch_with_stream_status_request() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7324,6 +7376,7 @@ mod tests {
         let error = parallel_persisted_file_record_batches(
             &stream,
             &GatewayScanPushdown::default(),
+            DEFAULT_QUERY_PARALLELISM,
             &mut scanned_rows,
             &mut scanned_files,
             &mut max_pending_file_results,

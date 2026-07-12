@@ -23,6 +23,33 @@ uv run python examples/01_quickstart/01_connect_and_read_table.py --uri default
 uv run zippy stream ls --uri default
 ```
 
+### 查询并行度
+
+单次历史查询的并发读取预算由 zippy 配置统一管理，默认是 `4`：
+
+```toml
+[query]
+parallelism = 4
+```
+
+也可以用环境变量临时覆盖：
+
+```bash
+ZIPPY_QUERY_PARALLELISM=8 uv run zippy master run default
+```
+
+`ZIPPY_QUERY_PARALLELISM` 的优先级高于 `[query].parallelism`，有效范围是 `1..=256`。
+该预算同时限制单次本地 persisted Parquet 文件读取、逻辑分片查询 fan-out 和 native
+Gateway 的 persisted 文件扫描。逻辑分片会在活跃分片之间分配预算，避免“分片并行 x
+文件并行”造成线程数平方级放大。
+
+这是单次查询上限；多个进程或多个并发查询仍各自拥有预算，需要结合 Gateway 的
+`max_blocking_requests` 和实际磁盘能力控制总负载。
+
+多文件历史查询和逻辑分片查询通常能从更高并行度获益；单文件的 `head()`、`tail()`、
+`slice()` 主要依赖 row-group 和列裁剪，通常保留默认值即可。修改配置后需要重启 master；
+仅修改客户端环境变量时，需要重新创建 `Table` 或 `GatewayServer` 对象。
+
 ## 目录结构
 
 - `01_quickstart/`：连接 master、创建最小 StreamTable、读取最新数据。
@@ -87,6 +114,8 @@ uv run zippy stream ls --uri default
 - `zp.read_table("table_name")`：读取表，底层会拼接 persisted、sealed 和 active segment。
   若监控或策略进程需要先于 producer 启动，可用
   `zp.read_table("table_name", wait=True, timeout="30s")` 等待表注册。
+  对 `select()` / `drop()` / `rename()` / `with_columns()` 后紧接的 `head()`、`tail()`、
+  非负 `slice()`，执行器会先做安全的行范围读取，再执行投影，避免为少量结果全表扫描。
 - `zp.read_table("table_name").info()` / `.health()` / `.alerts()`：查看单张表的低频诊断信息。
 - `zp.ops.list_tables()` / `zp.ops.table_info("table_name")`：查看 master 中的表状态和元数据。
 - `zp.ops.table_health("table_name")` / `zp.ops.table_alerts("table_name")`：基于 master

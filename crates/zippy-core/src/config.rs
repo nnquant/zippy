@@ -12,6 +12,8 @@ pub const DEFAULT_TABLE_PERSIST_DATA_DIR: &str = "data";
 pub const DEFAULT_TABLE_PERSIST_COMPACTION_INTERVAL_SEC: f64 = 300.0;
 pub const DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES: usize = 8;
 pub const DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_QUERY_PARALLELISM: usize = 4;
+pub const MAX_QUERY_PARALLELISM: usize = 256;
 const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%m%d%H"];
 
 /// Process-wide Zippy runtime configuration.
@@ -23,6 +25,22 @@ pub struct ZippyConfig {
     pub table: ZippyTableConfig,
     #[serde(default)]
     pub gateway: ZippyGatewayConfig,
+    #[serde(default)]
+    pub query: ZippyQueryConfig,
+}
+
+/// Query execution resource limits shared by local and remote readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyQueryConfig {
+    pub parallelism: usize,
+}
+
+impl Default for ZippyQueryConfig {
+    fn default() -> Self {
+        Self {
+            parallelism: DEFAULT_QUERY_PARALLELISM,
+        }
+    }
 }
 
 /// Master control endpoint defaults.
@@ -131,6 +149,12 @@ struct PartialZippyConfig {
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
     gateway: Option<PartialGatewayConfig>,
+    query: Option<PartialQueryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialQueryConfig {
+    parallelism: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +235,7 @@ impl Default for ZippyConfig {
                 },
             },
             gateway: ZippyGatewayConfig::default(),
+            query: ZippyQueryConfig::default(),
         }
     }
 }
@@ -340,6 +365,11 @@ impl ZippyConfig {
                 self.gateway.protocol_version = protocol_version;
             }
         }
+        if let Some(query) = partial.query {
+            if let Some(parallelism) = query.parallelism {
+                self.query.parallelism = parallelism;
+            }
+        }
         Ok(())
     }
 
@@ -376,6 +406,17 @@ impl ZippyConfig {
         }
         if let Some(level) = env_string("ZIPPY_LOG_LEVEL") {
             self.log.level = non_empty(level, "ZIPPY_LOG_LEVEL")?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_PARALLELISM") {
+            self.query.parallelism =
+                value
+                    .parse::<usize>()
+                    .map_err(|error| ZippyError::InvalidConfig {
+                        reason: format!(
+                            "env var must parse as usize name=[ZIPPY_QUERY_PARALLELISM] error=[{}]",
+                            error
+                        ),
+                    })?;
         }
         if let Some(value) = env_string("ZIPPY_TABLE_ROW_CAPACITY") {
             self.table.row_capacity =
@@ -501,6 +542,14 @@ impl ZippyConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.query.parallelism == 0 || self.query.parallelism > MAX_QUERY_PARALLELISM {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query parallelism must be between 1 and {} value=[{}]",
+                    MAX_QUERY_PARALLELISM, self.query.parallelism
+                ),
+            });
+        }
         if self.table.row_capacity == 0 {
             return Err(ZippyError::InvalidConfig {
                 reason: "table row_capacity must be greater than zero".to_string(),

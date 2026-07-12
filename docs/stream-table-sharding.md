@@ -89,13 +89,27 @@ Physical shard metadata includes `zippy_internal=true`,
 physical shard in shard-name order, concatenates the tables, and then applies the
 query plan globally.
 
+Safe row-preserving prefixes such as filters, projections, computed columns,
+drops, and renames run on each physical shard before concat. Global row-range,
+sort, and join operations remain after concat so their semantics do not depend on
+fan-out scheduling.
+
 This first version does not guarantee global time ordering. Use an explicit
 `sort(...)` in the query when the result needs deterministic global order.
 
-`Table.explain()` and `Table.profile()` mark this path as `sharded_fanout`.
-Row-range and gateway pushdown are not reported for logical sharded reads,
-because `head`, `tail`, `slice`, filters, projections, joins, and computed
-columns run after concat.
+`Table.explain()` and `Table.profile()` mark this path as `sharded_fanout` and
+report `query_parallelism`, `fanout_parallelism`, and `per_shard_parallelism`.
+Configure the per-query read budget with:
+
+```toml
+[query]
+parallelism = 4
+```
+
+`ZIPPY_QUERY_PARALLELISM` overrides this value. Zippy divides the budget across
+active shards, so shard fan-out and each shard's local persisted-file reads do
+not multiply into unbounded nested parallelism. The default is `4`, and the
+valid range is `1..=256`.
 
 ## Subscribe Boundary
 

@@ -218,7 +218,8 @@
 - 普通 persisted scan 不再把每个 parquet 文件先 concat 成单个 batch 后过滤，而是逐 reader batch
   执行 projection/filter，再把非空结果交给上层统一 concat。
 - tail persisted scan 保留从新到旧读取文件和最终正序输出语义，同时按 chunk 过滤。
-- `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，每批最多 4 个文件并行。
+- `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，并发由
+  `[query].parallelism` 或 `ZIPPY_QUERY_PARALLELISM` 控制，默认每批最多 4 个文件。
 - `OrderedGatewayFileResults` 按 file index 缓冲完成结果，保证并发扫描后输出仍按 catalog 顺序确定。
 - ordered result buffer 拒绝 duplicate/stale/gap，worker panic 映射为 `ZippyError`。
 - head/slice streaming 路径复用有界并行扫描后在 producer 层 skip/take；tail streaming 路径继续使用
@@ -230,7 +231,8 @@
 - filter 仍是 Arrow batch 读后执行，还没有使用 parquet row-group statistics pruning。
 - `scanned_rows` 仍表示 projection 后、filter 前的实际扫描行数，指标语义保持不变。
 - 当前 bounded parallel 仍在 producer 构造阶段完成文件扫描，尚不是端到端背压式逐文件流式拉取。
-- parallelism、pending file results 和 parquet reader batch size 仍需后续配置化。
+- pending file results 和 parquet reader batch size 仍需后续配置化；读取 parallelism 已统一到
+  zippy query 配置。
 
 ### P010 Gateway per-stream writer lock
 
