@@ -2,6 +2,8 @@
 
 日期：2026-05-12
 
+最近更新：2026-07-12
+
 依据：`docs/performance_audit_findings_2026-05-12.md`
 
 范围：本轮按审计文档修复低风险、边界清楚的问题。涉及协议、存储状态模型、查询执行器、
@@ -219,20 +221,30 @@
   执行 projection/filter，再把非空结果交给上层统一 concat。
 - tail persisted scan 保留从新到旧读取文件和最终正序输出语义，同时按 chunk 过滤。
 - `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，并发由
-  `[runtime].max_parallelism` 约束；`[query].parallelism` 可进一步收紧，默认每批最多 4 个文件。
-- `OrderedGatewayFileResults` 按 file index 缓冲完成结果，保证并发扫描后输出仍按 catalog 顺序确定。
-- ordered result buffer 拒绝 duplicate/stale/gap，worker panic 映射为 `ZippyError`。
-- head/slice streaming 路径复用有界并行扫描后在 producer 层 skip/take；tail streaming 路径继续使用
-  tail helper 避免全量扫描。
+  `[runtime].max_parallelism` 约束；`[query].parallelism` 可进一步收紧，默认窗口最多 4 个文件。
+- Gateway 复用固定大小 persisted scan worker pool；worker 数和有界待执行队列容量都由
+  `[runtime].max_parallelism` 控制，不再为每个 streaming collect 创建一组临时线程。
+- 默认 pure persisted producer 构造阶段只解析 schema、筛选 catalog 条目并校验路径，不打开或读取
+  parquet；Gateway 先发送 `collect_start`，第一次请求 batch 时才提交第一波 scan jobs。
+- 每条查询使用滑动 in-flight 文件窗口。结果按 file index 缓冲并严格按 catalog 顺序输出；每消费
+  完一个文件才释放一个槽位并补充一个新任务，使 worker 持续工作，同时保证运行中、乱序完成和
+  待发送的文件总数不超过查询并行度。慢客户端的 socket write backpressure 会限制后续文件预取。
+- duplicate/stale/index mismatch 和 worker panic 都映射为 `ZippyError`；客户端中断时 producer
+  取消标志会让尚未执行的 jobs 直接跳过，并丢弃已取消查询的完成结果。
+- `collect_end.metrics` 新增 `file_scan_parallelism`、`max_in_flight_file_scans`，并保留
+  `max_pending_file_results`，可核对配置预算和实际峰值是否满足边界。
+- head/tail/slice streaming 路径继续使用面向行范围的专用最小读取 helper，避免为了统一实现而扫描
+  明知不需要的文件；默认无行范围路径使用消费驱动扫描器。
 - tail helper 修复了单文件跨多个 parquet reader batch 时的 batch 顺序反转问题。
 
 边界：
 
-- filter 仍是 Arrow batch 读后执行，还没有使用 parquet row-group statistics pruning。
+- 支持的数值比较和 `is_in` 会先使用 parquet row-group min/max statistics 做保守 pruning；不支持的
+  表达式或统计类型会保守读取，并在 Arrow batch 上执行精确 filter。
 - `scanned_rows` 仍表示 projection 后、filter 前的实际扫描行数，指标语义保持不变。
-- 当前 bounded parallel 仍在 producer 构造阶段完成文件扫描，尚不是端到端背压式逐文件流式拉取。
-- pending file results 和 parquet reader batch size 仍需后续配置化；读取 parallelism 已统一到
-  zippy query 配置。
+- 当前内存边界按“文件数”而不是“字节数”定义：单个 worker 仍会收集一个 parquet 文件的 filtered
+  reader batches 后再交给 ordered producer。超大单文件需要后续改成 batch channel + byte budget。
+- parquet reader batch size 固定为 1024 行；读取 parallelism 已统一到 zippy query 配置。
 
 ### P010 Gateway per-stream writer lock
 
@@ -308,7 +320,7 @@
 
 这些项目不适合在本轮直接改代码，因为它们会改变架构边界或核心状态模型：
 
-- Gateway 查询协议：P002/P009 的限流配置化、背压式逐文件拉取和 row-group pruning。
+- Gateway 查询协议：P002/P009 的单文件 batch/byte budget 和 mixed persisted + live streaming。
 - engine 状态存储模型：P004/P005/P006/P007 剩余项。
 - segment/Arrow 读侧内存模型：P008 剩余项。
 - Gateway 写入调度：P010 的 writer actor 是否值得引入需要基于分段 metrics 评估。
@@ -317,7 +329,7 @@
 
 建议后续拆成六个专项：
 
-1. Gateway streaming collect 配置化 + parquet row-group pruning。
+1. Gateway persisted 单文件 batch channel + byte budget。
 2. Engine columnar state model。
 3. Segment Arrow zero-copy/chunked reader。
 4. Gateway writer metrics 采样 + per-stream writer actor 决策。

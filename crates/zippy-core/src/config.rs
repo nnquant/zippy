@@ -46,15 +46,9 @@ impl Default for ZippyRuntimeConfig {
 }
 
 /// Optional query-specific override of the process-wide parallelism limit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyQueryConfig {
     pub parallelism: Option<usize>,
-}
-
-impl Default for ZippyQueryConfig {
-    fn default() -> Self {
-        Self { parallelism: None }
-    }
 }
 
 /// Master control endpoint defaults.

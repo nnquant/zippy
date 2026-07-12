@@ -1119,16 +1119,20 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
     let (master, master_thread) =
         spawn_master_with_persist_root(master_endpoint.clone(), temp.path());
     let gateway_endpoint = format!("127.0.0.1:{}", reserve_tcp_port());
-    let gateway = GatewayServer::new(GatewayServerConfig {
-        endpoint: gateway_endpoint.clone(),
-        master_endpoint: master_endpoint.clone(),
-        token: Some("dev-token".to_string()),
-        max_write_rows: Some(1024),
-        max_connections: None,
-        max_subscribers: None,
-        max_blocking_requests: None,
-        write_timeout_ms: None,
-    })
+    let gateway = GatewayServer::new_with_parallelism(
+        GatewayServerConfig {
+            endpoint: gateway_endpoint.clone(),
+            master_endpoint: master_endpoint.clone(),
+            token: Some("dev-token".to_string()),
+            max_write_rows: Some(1024),
+            max_connections: None,
+            max_subscribers: None,
+            max_blocking_requests: None,
+            write_timeout_ms: None,
+        },
+        4,
+        1,
+    )
     .unwrap()
     .start()
     .unwrap();
@@ -1253,6 +1257,20 @@ fn native_gateway_collect_streams_persisted_files_in_default_order() {
     assert_eq!(
         frames.last().unwrap().0["metrics"]["scanned_files"],
         json!(2)
+    );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["file_scan_parallelism"],
+        json!(1)
+    );
+    assert_eq!(
+        frames.last().unwrap().0["metrics"]["max_in_flight_file_scans"],
+        json!(1)
+    );
+    assert!(
+        frames.last().unwrap().0["metrics"]["max_pending_file_results"]
+            .as_u64()
+            .unwrap()
+            <= 1
     );
     assert_eq!(gateway.metrics()["collect_requests_total"], json!(2));
 

@@ -119,11 +119,25 @@ protocol_version = 1
 ```
 
 `[runtime].max_parallelism` 是进程级并行度上限，默认值为 `4`，并约束 Gateway Tokio
-worker 数。`[query].parallelism` 是可选的单次查询预算；省略时继承全局上限，配置时不得
-超过全局上限。对应环境变量是 `ZIPPY_MAX_PARALLELISM` 和
+worker 数和 persisted file scan 共享 worker pool 大小。`[query].parallelism` 是可选的单次
+查询预算；省略时继承全局上限，配置时不得超过全局上限。对应环境变量是
+`ZIPPY_MAX_PARALLELISM` 和
 `ZIPPY_QUERY_PARALLELISM`，有效范围为 `1..=256`。
 多个并发 collect 请求各自拥有这个预算，进程总负载还受 Gateway
 `max_blocking_requests` 限制。
+
+pure persisted `collect(stream=True)` 在完成 schema 和 catalog 路径校验后先发送
+`collect_start`，第一次拉取 batch 时才提交文件读取。每条查询最多提交
+`query.parallelism` 个文件进入滑动 in-flight 窗口；结果即使乱序完成，也严格按 catalog
+顺序输出。每消费完一个文件才释放一个窗口槽位并补充一个新任务，使 worker 持续工作，同时
+保证运行中、乱序完成和待发送的文件总数不超过查询并行度；因此 socket 写背压会直接限制
+后续文件预取。共享 scan pool 的待执行队列容量等于 `runtime.max_parallelism`，不会随查询数或
+匹配文件数无界增长。
+
+`collect_end.metrics` 中的 `file_scan_parallelism`、`max_in_flight_file_scans` 和
+`max_pending_file_results` 分别表示单查询配置预算、实际峰值 in-flight 文件数和乱序结果
+缓冲峰值。`head`、`tail`、`slice` 继续使用面向行范围的专用最小读取路径；默认无行范围的
+pure persisted 查询使用上述消费驱动流式路径。
 
 默认不需要配置 gateway 的 `host` / `port`：当 master 是 TCP endpoint 时，
 GatewayServer endpoint 从 master endpoint 推导，端口为 `master.port + 1`。高级场景

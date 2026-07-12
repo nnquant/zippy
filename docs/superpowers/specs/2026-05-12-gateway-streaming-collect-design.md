@@ -113,13 +113,16 @@ GatewayPersistedScanTask {
 
 ### Bounded Parallelism
 
-初版使用内部常量：
+实现使用两级配置和一个共享池：
 
-- `DEFAULT_GATEWAY_STREAMING_COLLECTS = 8`
-- `DEFAULT_GATEWAY_PERSISTED_SCAN_PARALLELISM = 4`
-- `DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS = 8`
+- `[runtime].max_parallelism`：Gateway persisted scan 共享 worker pool 大小，同时也是有界 job
+  queue 的容量，默认 `4`。
+- `[query].parallelism`：单条查询滑动 in-flight 窗口的最大文件数；省略时继承 runtime 上限。
+- `max_blocking_requests`：限制同时运行的 blocking producer steps；stream 已经开始后等待 permit，
+  不因瞬时资源竞争返回半途错误。
 
-后续可把这些常量暴露为 Gateway config。
+producer 构造阶段会筛选 catalog 条目并校验路径，但不打开 parquet。Gateway 发送
+`collect_start` 后，第一次拉取 batch 才提交第一波 scan jobs。
 
 ### Ordered Output
 
@@ -131,8 +134,9 @@ GatewayPersistedScanTask {
 当 worker 完成某个文件：
 
 - 如果 `file_index == next_file_index`，立即输出该文件 batches。
-- 如果不是下一个 index，暂存到 bounded pending buffer。
-- pending buffer 达到上限时，worker/collector 侧阻塞，避免慢客户端导致内存无限增长。
+- 如果不是下一个 index，暂存到当前波次的 bounded pending buffer。
+- 每消费完一个文件才释放一个窗口槽位并补充一个新任务。运行中、乱序完成和待发送的文件总数
+  始终不超过 `query.parallelism`；慢客户端不会触发窗口之外的文件读取。
 
 ### Head/Tail
 
@@ -203,6 +207,8 @@ GatewayPersistedScanTask {
 - `filter_elapsed_ms`
 - `encode_elapsed_ms`
 - `write_elapsed_ms`
+- `file_scan_parallelism`
+- `max_in_flight_file_scans`
 - `max_pending_file_results`
 - `materialized_live_batches`
 
