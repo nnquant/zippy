@@ -5,6 +5,12 @@ import pyarrow as pa
 
 __version__: str
 
+def run_server_daemon(
+    uri: str | None = None,
+    *,
+    control_endpoint: str | None = None,
+    config: str | None = None,
+) -> None: ...
 def run_master_daemon(
     uri: str | None = None,
     *,

@@ -559,7 +559,11 @@ impl MasterServer {
                     timed_out_processes: alive,
                 };
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10)),
+            );
         }
     }
 

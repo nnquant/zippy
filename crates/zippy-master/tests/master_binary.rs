@@ -258,6 +258,7 @@ fn master_binary_starts_native_gateway_when_enabled() {
 [master]
 host = "127.0.0.1"
 port = {}
+shutdown_timeout_ms = 1500
 
 [query]
 parallelism = 7
@@ -292,20 +293,30 @@ token = "dev-token"
         .unwrap();
 
     wait_for_log_contains(&log_dir, "\"event\":\"master_listening\"");
-    let response = wait_for_gateway_metrics(gateway_addr, "dev-token");
+    let response = wait_for_gateway_process_registration(gateway_addr, "dev-token");
 
     assert_eq!(response["status"], "ok");
-    assert_eq!(response["metrics"]["requests_total"], 1);
+    assert!(response["metrics"]["requests_total"]
+        .as_u64()
+        .is_some_and(|count| count >= 1));
     assert_eq!(response["metrics"]["max_parallelism"], 8);
     assert_eq!(response["metrics"]["query_parallelism"], 7);
     assert_eq!(response["metrics"]["max_query_buffer_bytes"], 268435456);
     assert_eq!(response["metrics"]["query_max_buffered_bytes"], 67108864);
     assert_eq!(response["metrics"]["query_buffer_reserved_bytes"], 0);
+    assert!(response["metrics"]["master_process_reregistrations_total"]
+        .as_u64()
+        .is_some_and(|count| count >= 1));
 
+    let shutdown_started = Instant::now();
     let status = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
     assert_eq!(status, 0);
     let exit = child.wait().unwrap();
     assert!(exit.success());
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(1),
+        "legacy master signal shutdown waited for the full master timeout"
+    );
 }
 
 #[test]
@@ -558,15 +569,23 @@ fn read_stderr(child: &mut std::process::Child) -> String {
     output
 }
 
-fn wait_for_gateway_metrics(addr: SocketAddr, token: &str) -> serde_json::Value {
+fn wait_for_gateway_process_registration(addr: SocketAddr, token: &str) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(response) = send_gateway_metrics(addr, token) {
-            return response;
+            let registrations = response["metrics"]["master_process_reregistrations_total"]
+                .as_u64()
+                .unwrap_or_default();
+            if registrations >= 1 {
+                return response;
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("gateway metrics endpoint was not reachable addr=[{}]", addr);
+    panic!(
+        "gateway did not register its master process addr=[{}]",
+        addr
+    );
 }
 
 fn send_gateway_metrics(addr: SocketAddr, token: &str) -> std::io::Result<serde_json::Value> {

@@ -266,7 +266,7 @@ if _NATIVE_AVAILABLE:
         from ._internal import LogSpec
         from ._internal import MasterClient
         from ._internal import MasterServer
-        from ._internal import run_master_daemon
+        from ._internal import run_server_daemon
         from ._internal import KeyValueTableMaterializer as _KeyValueTableMaterializer
         from ._internal import SegmentStreamSource
         from ._internal import NullPublisher
@@ -338,10 +338,10 @@ if not _NATIVE_AVAILABLE:
     ZmqSubscriber = _native_unavailable("ZmqSubscriber")
     __version__ = "0.5.0+pure"
 
-    def run_master_daemon(*args, **kwargs) -> None:
+    def run_server_daemon(*args, **kwargs) -> None:
         del args, kwargs
         raise RuntimeError(
-            "zippy native extension is unavailable; run_master_daemon requires "
+            "zippy native extension is unavailable; run_server_daemon requires "
             "the platform-specific zippy wheel"
         ) from _NATIVE_IMPORT_ERROR
 
@@ -353,6 +353,10 @@ if not _NATIVE_AVAILABLE:
 
     def version() -> str:
         return __version__
+
+
+# The old product name is a Python-level alias as well as an extension-module compatibility symbol.
+run_master_daemon = run_server_daemon
 
 
 DEFAULT_MASTER_URI = "zippy://default"
@@ -11414,6 +11418,7 @@ __all__ = [
     "MasterClient",
     "MasterServer",
     "run_master_daemon",
+    "run_server_daemon",
     "NullPublisher",
     "OverflowPolicy",
     "ParquetPersist",

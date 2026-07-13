@@ -64,11 +64,33 @@ def test_master_run_help() -> None:
     assert "URI" in result.output
 
 
+def test_server_run_help() -> None:
+    runner = CliRunner()
+    result = runner.invoke(main, ["server", "run", "--help"])
+    assert result.exit_code == 0
+    assert "Run the local single-node zippy server." in result.output
+    assert DEFAULT_CONTROL_ENDPOINT in result.output
+    assert "URI" in result.output
+
+
+def test_public_master_daemon_is_server_daemon_compatibility_alias() -> None:
+    assert zippy.run_master_daemon is zippy.run_server_daemon
+
+
+def test_native_master_daemon_symbol_is_server_daemon_compatibility_alias() -> None:
+    if not getattr(zippy, "_NATIVE_AVAILABLE", False):
+        pytest.skip("native extension is unavailable")
+    from zippy import _internal
+
+    assert _internal.run_master_daemon is _internal.run_server_daemon
+
+
 def test_cli_root_help() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
     assert "master" in result.output
+    assert "server" in result.output
     assert "gateway" in result.output
     assert "stream" in result.output
     assert "table" in result.output
@@ -87,6 +109,7 @@ def test_python_module_entrypoint_shows_root_help() -> None:
     assert result.returncode == 0
     assert "zippy management CLI." in result.stdout
     assert "master" in result.stdout
+    assert "server" in result.stdout
     assert "gateway" in result.stdout
     assert "stream" in result.stdout
     assert "table" in result.stdout
@@ -1455,6 +1478,22 @@ def test_master_run_returns_click_error_when_server_start_fails(
     assert "failed to bind control socket" in result.output
 
 
+def test_server_run_returns_click_error_when_runtime_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_run_server_daemon(control_endpoint: str) -> None:
+        assert control_endpoint
+        raise RuntimeError("failed to compose server runtime")
+
+    monkeypatch.setattr(zippy, "run_server_daemon", failing_run_server_daemon, raising=False)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["server", "run", "/tmp/zippy-server-fail.sock"])
+
+    assert result.exit_code != 0
+    assert "failed to compose server runtime" in result.output
+
+
 def test_master_run_wraps_control_parent_creation_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1500,6 +1539,38 @@ def test_master_run_uses_default_tcp_control_endpoint(monkeypatch: pytest.Monkey
     assert events == [("run_master_daemon", "tcp://127.0.0.1:17690")]
     assert "master starting host=[127.0.0.1] port=[17690]" in result.output
     assert "keyboard interrupt" not in result.output.lower()
+
+
+def test_server_run_uses_default_tcp_control_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, str]] = []
+
+    def recording_run_server_daemon(control_endpoint: str) -> None:
+        events.append(("run_server_daemon", control_endpoint))
+
+    def unexpected_run_master_daemon(control_endpoint: str) -> None:
+        raise AssertionError(
+            f"server run must not dispatch through Python master alias endpoint=[{control_endpoint}]"
+        )
+
+    monkeypatch.setattr(
+        zippy,
+        "run_server_daemon",
+        recording_run_server_daemon,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        zippy,
+        "run_master_daemon",
+        unexpected_run_master_daemon,
+        raising=False,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["server", "run"])
+
+    assert result.exit_code == 0
+    assert events == [("run_server_daemon", "tcp://127.0.0.1:17690")]
+    assert "server starting host=[127.0.0.1] port=[17690]" in result.output
 
 
 def test_master_run_accepts_named_logical_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1616,6 +1687,48 @@ port = 27690
     )
 
 
+def test_server_run_forwards_config_path_and_configured_master_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[tuple[str, str]] = []
+    config_path = tmp_path / "zippy-config.toml"
+    config_path.write_text(
+        """
+[master]
+host = "127.0.0.1"
+port = 28690
+
+[gateway]
+enabled = false
+""",
+        encoding="utf-8",
+    )
+
+    def recording_run_server_daemon(
+        control_endpoint: str,
+        *,
+        config: str | None = None,
+    ) -> None:
+        events.append((control_endpoint, config or ""))
+
+    monkeypatch.setattr(
+        zippy,
+        "run_server_daemon",
+        recording_run_server_daemon,
+        raising=False,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["server", "run", "--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert events == [("tcp://127.0.0.1:28690", str(config_path))]
+    assert (
+        "server starting host=[127.0.0.1] port=[28690] endpoint=[tcp://127.0.0.1:28690]"
+        in result.output
+    )
+
+
 def test_master_run_exits_cleanly_on_sigint(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("SIGINT subprocess semantics are Unix-specific in this test")
@@ -1654,7 +1767,7 @@ def test_master_run_exits_cleanly_on_sigint(tmp_path: Path) -> None:
         assert process.returncode == 0
         assert not control_endpoint.exists()
         assert not owner_path.exists()
-        assert "master_shutdown_requested" in stdout
+        assert "server_shutdown_requested" in stdout
         assert "master_stopped" in stdout
         assert "Aborted!" not in stderr
     finally:

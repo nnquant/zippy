@@ -11,10 +11,15 @@
 mod composition;
 mod health;
 mod legacy_query;
+mod runtime;
 
 pub use composition::LegacyServerServices;
 pub use health::{LegacyServerCapabilities, LegacyServerHealth, ServiceHealth};
 pub use legacy_query::{
     LegacyGatewayPlan, LegacyQueryEngineAdapter, LegacyQueryEngineConfig,
     LEGACY_GATEWAY_PLAN_FORMAT_VERSION,
+};
+pub use runtime::{
+    run_server_daemon, LegacyServerMode, LegacyServerReadiness, LegacyServerRuntime,
+    LegacyServerRuntimeConfig, LegacyServerRuntimeHealth, LegacyServerShutdownOutcome,
 };

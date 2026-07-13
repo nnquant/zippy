@@ -4,8 +4,10 @@ Master management commands for the zippy CLI.
 
 from __future__ import annotations
 
-import click
+from collections.abc import Callable
 import tomllib
+
+import click
 
 import zippy
 
@@ -33,12 +35,21 @@ def master_group() -> None:
     type=click.Path(dir_okay=False, path_type=str),
     help="Path to zippy config TOML file.",
 )
-def run_master(uri: str, config_path: str | None) -> None:
+def run_master(uri: str | None, config_path: str | None) -> None:
     """
     Run the local zippy-master daemon.
 
     Default URI: tcp://127.0.0.1:17690
     """
+    _run_daemon("master", zippy.run_master_daemon, uri, config_path)
+
+
+def _run_daemon(
+    service_name: str,
+    native_runner: Callable[..., None],
+    uri: str | None,
+    config_path: str | None,
+) -> None:
     try:
         config = _load_config(config_path)
         effective_uri = uri or _master_uri_from_config(config) or DEFAULT_CONTROL_ENDPOINT
@@ -47,13 +58,13 @@ def run_master(uri: str, config_path: str | None) -> None:
         host, port = _endpoint_host_port(resolved_control_endpoint)
         if port:
             click.echo(
-                f"master starting host=[{host}] port=[{port}] "
+                f"{service_name} starting host=[{host}] port=[{port}] "
                 f"endpoint=[{resolved_control_endpoint}]"
             )
         if config_path is None:
-            zippy.run_master_daemon(resolved_control_endpoint)
+            native_runner(resolved_control_endpoint)
         else:
-            zippy.run_master_daemon(resolved_control_endpoint, config=config_path)
+            native_runner(resolved_control_endpoint, config=config_path)
     except KeyboardInterrupt:
         return
     except (OSError, RuntimeError, ValueError) as error:

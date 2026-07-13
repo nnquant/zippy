@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(unix)]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -25,6 +26,47 @@ pub struct MasterDaemonConfig {
     pub log_dir: PathBuf,
     pub log_level: Option<String>,
     pub console_log: bool,
+}
+
+/// Validated legacy master components prepared without starting any listener.
+#[derive(Debug)]
+pub struct PreparedMasterRuntime {
+    control_endpoint: ControlEndpoint,
+    runtime_config: ZippyConfig,
+    server: MasterServer,
+    shutdown_timeout: Duration,
+}
+
+impl PreparedMasterRuntime {
+    /// Returns the effective master control endpoint.
+    pub fn control_endpoint(&self) -> &ControlEndpoint {
+        &self.control_endpoint
+    }
+
+    /// Returns the merged and validated runtime configuration.
+    pub fn runtime_config(&self) -> &ZippyConfig {
+        &self.runtime_config
+    }
+
+    /// Returns the prepared master service.
+    pub fn server(&self) -> &MasterServer {
+        &self.server
+    }
+
+    /// Returns the configured graceful shutdown timeout.
+    pub fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
+    }
+
+    /// Consumes the prepared runtime into its owning components.
+    pub fn into_parts(self) -> (ControlEndpoint, ZippyConfig, MasterServer, Duration) {
+        (
+            self.control_endpoint,
+            self.runtime_config,
+            self.server,
+            self.shutdown_timeout,
+        )
+    }
 }
 
 impl MasterDaemonConfig {
@@ -57,6 +99,80 @@ impl MasterDaemonConfig {
 }
 
 pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
+    let prepared = prepare_master_runtime(config)?;
+    let gateway = Arc::new(Mutex::new(start_legacy_gateway_if_enabled(
+        prepared.runtime_config(),
+        prepared.control_endpoint(),
+    )?));
+    let control_endpoint = prepared.control_endpoint().clone();
+    let control_endpoint_display = control_endpoint.display_string();
+    let server = prepared.server().clone();
+    install_shutdown_handlers(
+        &control_endpoint,
+        server.clone(),
+        Arc::clone(&gateway),
+        prepared.shutdown_timeout(),
+    )?;
+
+    if std::env::var_os("ZIPPY_MASTER_TEST_PAUSE_BEFORE_SERVE").is_some() {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    if !server.is_running() {
+        stop_legacy_gateway_after_master_exit(&gateway, prepared.shutdown_timeout());
+        tracing::info!(
+            component = "master",
+            event = "master_stopped",
+            status = "stopped",
+            control_endpoint = control_endpoint_display.as_str(),
+            "master stopped"
+        );
+        return Ok(());
+    }
+
+    let result = server.serve_endpoint_with_ready(&control_endpoint, None);
+    stop_legacy_gateway_after_master_exit(&gateway, prepared.shutdown_timeout());
+    result
+}
+
+fn stop_legacy_gateway_after_master_exit(
+    gateway: &Arc<Mutex<Option<GatewayServer>>>,
+    timeout: Duration,
+) {
+    let Some(gateway) = gateway
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    match gateway.stop_gracefully_with_timeout(timeout) {
+        Ok(outcome) if outcome.is_clean() => {}
+        Ok(outcome) => {
+            tracing::error!(
+                component = "master",
+                event = "legacy_gateway_cleanup_after_master_incomplete",
+                status = "incomplete",
+                outcome = ?outcome,
+                "legacy Gateway cleanup after master exit was incomplete"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                component = "master",
+                event = "legacy_gateway_cleanup_after_master_error",
+                status = "error",
+                error = %error,
+                "legacy Gateway cleanup after master exit failed"
+            );
+        }
+    }
+}
+
+/// Loads configuration, logging, snapshot state, and master service without binding listeners.
+pub fn prepare_master_runtime(
+    config: MasterDaemonConfig,
+) -> zippy_core::Result<PreparedMasterRuntime> {
     let MasterDaemonConfig {
         mut control_endpoint,
         config_path,
@@ -82,7 +198,6 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
             })?;
         }
     }
-    let _gateway = start_gateway_if_enabled(&runtime_config, &control_endpoint)?;
     let control_endpoint_display = control_endpoint.display_string();
     let (control_host, control_port) = control_endpoint_host_port(&control_endpoint);
 
@@ -163,24 +278,12 @@ pub fn run_master_daemon(config: MasterDaemonConfig) -> zippy_core::Result<()> {
             runtime_config,
         )
     };
-    install_shutdown_handlers(&control_endpoint, server.clone(), shutdown_timeout)?;
-
-    if std::env::var_os("ZIPPY_MASTER_TEST_PAUSE_BEFORE_SERVE").is_some() {
-        std::thread::sleep(Duration::from_millis(150));
-    }
-
-    if !server.is_running() {
-        tracing::info!(
-            component = "master",
-            event = "master_stopped",
-            status = "stopped",
-            control_endpoint = control_endpoint_display.as_str(),
-            "master stopped"
-        );
-        return Ok(());
-    }
-
-    server.serve_endpoint_with_ready(&control_endpoint, None)
+    Ok(PreparedMasterRuntime {
+        control_endpoint,
+        runtime_config: server.runtime_config().clone(),
+        server,
+        shutdown_timeout,
+    })
 }
 
 fn control_endpoint_host_port(endpoint: &ControlEndpoint) -> (String, String) {
@@ -190,7 +293,8 @@ fn control_endpoint_host_port(endpoint: &ControlEndpoint) -> (String, String) {
     }
 }
 
-fn start_gateway_if_enabled(
+/// Starts the compatibility Gateway when enabled in the validated runtime configuration.
+pub fn start_legacy_gateway_if_enabled(
     runtime_config: &ZippyConfig,
     control_endpoint: &ControlEndpoint,
 ) -> zippy_core::Result<Option<GatewayServer>> {
@@ -261,6 +365,7 @@ fn load_runtime_config(config_path: Option<&Path>) -> zippy_core::Result<ZippyCo
 fn install_shutdown_handlers(
     control_endpoint: &ControlEndpoint,
     server: MasterServer,
+    gateway: Arc<Mutex<Option<GatewayServer>>>,
     shutdown_timeout: Duration,
 ) -> zippy_core::Result<()> {
     #[cfg(unix)]
@@ -285,7 +390,40 @@ fn install_shutdown_handlers(
                         "received shutdown signal"
                     );
                 }
-                let outcome = server.request_graceful_shutdown(shutdown_timeout);
+                let deadline = Instant::now()
+                    .checked_add(shutdown_timeout)
+                    .unwrap_or_else(Instant::now);
+                if let Some(gateway) = gateway
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    match gateway.stop_gracefully_with_timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                    ) {
+                        Ok(outcome) if outcome.is_clean() => {}
+                        Ok(outcome) => {
+                            tracing::error!(
+                                component = "master",
+                                event = "legacy_gateway_shutdown_incomplete",
+                                status = "incomplete",
+                                outcome = ?outcome,
+                                "legacy master Gateway cleanup was incomplete"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                component = "master",
+                                event = "legacy_gateway_shutdown_error",
+                                status = "error",
+                                error = %error,
+                                "legacy master failed to stop Gateway"
+                            );
+                        }
+                    }
+                }
+                let outcome = server
+                    .request_graceful_shutdown(deadline.saturating_duration_since(Instant::now()));
                 if !outcome.timed_out_processes.is_empty() {
                     tracing::error!(
                         component = "master",
@@ -303,6 +441,7 @@ fn install_shutdown_handlers(
     {
         let _ = control_endpoint;
         let _ = server;
+        let _ = gateway;
         let _ = shutdown_timeout;
     }
 

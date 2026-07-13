@@ -2340,6 +2340,7 @@ dependencies = [
  "zippy-master",
  "zippy-operators",
  "zippy-segment-store",
+ "zippy-server",
 ]
 
 [[package]]
@@ -2365,8 +2366,10 @@ dependencies = [
  "parquet",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "tokio",
+ "tracing",
  "zippy-core",
  "zippy-gateway",
  "zippy-master",

@@ -22,6 +22,7 @@ zippy-io = { path = "../zippy-io", features = ["zmq-publisher"] }
 zippy-master = { path = "../zippy-master" }
 zippy-operators = { path = "../zippy-operators" }
 zippy-segment-store = { path = "../zippy-segment-store" }
+zippy-server = { path = "../zippy-server" }
 
 [build-dependencies]
 pyo3-build-config = "0.22"

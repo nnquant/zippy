@@ -164,12 +164,20 @@ liveness. Catalog and query health are evaluated independently:
 - a stopped gateway therefore makes query unavailable without hiding catalog availability;
 - `begin_shutdown()` closes adapter admission irreversibly, so a later `activate()` is rejected.
 
-The master lifecycle flag and gateway facade validation are local observations. They do not prove
-that TCP or Unix listeners are reachable, or that the master endpoint configured in the gateway is
-healthy. Phase 1 reports `end_to_end_liveness: null` rather than deriving it from those flags. The
-legacy CLI/runtime orchestrator must complete its existing listener and dependency probes before it
-calls `activate()`. A later server phase should own those listeners and publish a real end-to-end
-probe before using this structure as an external load-balancer readiness response.
+The master lifecycle flag and gateway facade validation are local observations. Direct users of
+`LegacyServerServices` therefore receive `end_to_end_liveness: null`; that value must not be used as
+an external readiness probe. `LegacyServerRuntime` owns the stronger boundary: it waits for the
+master listener bind barrier, starts the configured Gateway, performs a real Gateway-to-master
+control request, and only then calls `activate()`. Its health view publishes
+`end_to_end_liveness: true` after those checks and changes it to `false` before shutdown. The
+recommended product entry point is `zippy server run`; `zippy master run` is a compatibility alias
+to the same server-owned runtime.
+
+Catalog-only mode uses the same closed-then-activated `RuntimeRegistry` admission gate as full
+mode. Shutdown caches its first structured result and gives Gateway, master process draining, and
+the master listener one absolute deadline; repeated calls neither retry blocking cleanup nor turn a
+previous timeout into a clean result. The standalone Rust `zippy-master` binary remains a Phase 1
+rollback path and is not this composition root.
 
 The query adapter enforces the composition admission gate. Phase 1 still returns the raw catalog
 adapter for compatibility, so a previously cloned catalog handle remains callable after

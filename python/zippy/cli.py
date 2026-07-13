@@ -9,6 +9,7 @@ import click
 from .cli_gateway import gateway_group
 from .cli_master import master_group
 from .cli_pm import pm_group
+from .cli_server import server_group
 from .cli_stream import stream_group
 from .cli_table import table_group
 from .cli_webui import webui_command
@@ -22,6 +23,7 @@ def main() -> None:
 
 
 main.add_command(master_group)
+main.add_command(server_group)
 main.add_command(gateway_group)
 main.add_command(stream_group)
 main.add_command(table_group)

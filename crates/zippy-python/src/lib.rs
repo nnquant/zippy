@@ -57,7 +57,7 @@ use zippy_io::{
     ZmqPublisher as RustZmqPublisher, ZmqSource as RustZmqSource,
     ZmqStreamPublisher as RustZmqStreamPublisher, ZmqSubscriber as RustZmqSubscriber,
 };
-use zippy_master::daemon::{run_master_daemon as run_rust_master_daemon, MasterDaemonConfig};
+use zippy_master::daemon::MasterDaemonConfig;
 use zippy_master::server::MasterServer as RustMasterServer;
 use zippy_operators::{
     AbsSpec as RustAbsSpec, AggCountSpec as RustAggCountSpec, AggFirstSpec as RustAggFirstSpec,
@@ -75,6 +75,7 @@ use zippy_segment_store::{
     SegmentCellValue, SegmentControlSnapshot, SegmentStore, SegmentStoreConfig,
     ZippySegmentStoreError,
 };
+use zippy_server::{run_server_daemon as run_rust_server_daemon, LegacyServerRuntimeConfig};
 
 use native_source_bridge::create_native_source_sink_capsule;
 
@@ -7702,7 +7703,8 @@ impl CrossSectionalEngine {
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", python_dev_version())?;
     module.add_function(wrap_pyfunction!(version, module)?)?;
-    module.add_function(wrap_pyfunction!(run_master_daemon, module)?)?;
+    module.add_function(wrap_pyfunction!(run_server_daemon, module)?)?;
+    module.add("run_master_daemon", module.getattr("run_server_daemon")?)?;
     module.add_function(wrap_pyfunction!(setup_log, module)?)?;
     module.add_function(wrap_pyfunction!(log_info, module)?)?;
     module.add_class::<TsEmaSpec>()?;
@@ -7756,7 +7758,16 @@ fn version() -> String {
 
 #[pyfunction]
 #[pyo3(signature = (uri=None, *, control_endpoint=None, config=None))]
-fn run_master_daemon(
+fn run_server_daemon(
+    py: Python<'_>,
+    uri: Option<String>,
+    control_endpoint: Option<String>,
+    config: Option<String>,
+) -> PyResult<()> {
+    run_server_daemon_impl(py, uri, control_endpoint, config)
+}
+
+fn run_server_daemon_impl(
     py: Python<'_>,
     uri: Option<String>,
     control_endpoint: Option<String>,
@@ -7768,7 +7779,7 @@ fn run_master_daemon(
     if let Some(config) = config {
         daemon_config = daemon_config.with_config_path(PathBuf::from(config));
     }
-    py.allow_threads(move || run_rust_master_daemon(daemon_config))
+    py.allow_threads(move || run_rust_server_daemon(LegacyServerRuntimeConfig::new(daemon_config)))
         .map_err(|error| py_runtime_error(error.to_string()))
 }
 
