@@ -1,15 +1,15 @@
-//! SQLite Catalog migration foundation for the single-node Zippy server.
+//! SQLite Catalog physical migration foundation for the single-node Zippy server.
 //!
-//! This crate deliberately exposes only a non-authoritative foundation state.
-//! It does not implement [`zippy_types::Catalog`] and cannot become metadata
-//! authority until typed commands, shadow comparison, and read snapshots land in
-//! later migration slices. Physical SQLite schema versions are independent of
-//! CatalogCommand wire versions. The SQLite connection is created, used, and
-//! dropped exclusively on one dedicated OS actor thread.
+//! Physical schema v2 stores the complete first domain layout with lossless
+//! unsigned encodings, but this foundation handle remains non-authoritative and
+//! does not implement [`zippy_types::Catalog`]. Physical SQLite schema versions
+//! are independent of CatalogCommand wire versions. The SQLite connection is
+//! created, used, and dropped exclusively on one dedicated OS actor thread.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod encoding;
 mod migration;
 
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ use zippy_core::{DataDirectory, ManagedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;
@@ -38,10 +38,10 @@ const MAX_BUSY_TIMEOUT_MILLIS: u128 = i32::MAX as u128;
 const ACTOR_THREAD_NAME: &str = "zippy-catalog-actor";
 const QUICK_CHECK_PROGRESS_INTERVAL: i32 = 1_000;
 
-/// The only authority state supported by this migration foundation.
+/// The authority state exposed by the inspection-only migration handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogAuthorityState {
-    /// The database contains only migration metadata and cannot serve Catalog APIs.
+    /// The handle may migrate and inspect the database but cannot serve Catalog APIs.
     FoundationOnly,
 }
 
@@ -160,8 +160,8 @@ pub struct SqliteCatalogFoundationStatus {
 
 /// A versioned SQLite Catalog foundation whose connection is actor-thread confined.
 ///
-/// This handle only initializes, validates, and inspects the future Catalog. It
-/// neither implements catalog commands nor takes authority from the legacy
+/// This handle only initializes, validates, and inspects the physical Catalog.
+/// It neither implements catalog commands nor takes authority from the legacy
 /// Registry.
 ///
 /// ```compile_fail
@@ -473,17 +473,54 @@ fn run_quick_check_inner(connection: &Connection) -> Result<CatalogIntegrity> {
         diagnostics
             .push(row.map_err(|error| map_sqlite_error("read catalog quick check result", error))?);
     }
-    if diagnostics == ["ok"] {
-        Ok(CatalogIntegrity::Ok)
-    } else {
-        Err(ServerError::new(
+    if diagnostics != ["ok"] {
+        return Err(ServerError::new(
             ErrorCode::DataCorruption,
             format!(
                 "catalog quick check failed diagnostics=[{}]",
                 diagnostics.join("; ")
             ),
-        ))
+        ));
     }
+    run_foreign_key_check(connection)?;
+    Ok(CatalogIntegrity::Ok)
+}
+
+fn run_foreign_key_check(connection: &Connection) -> Result<()> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|error| map_sqlite_error("prepare catalog foreign key check", error))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| map_sqlite_error("run catalog foreign key check", error))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|error| map_sqlite_error("read catalog foreign key check result", error))?
+    else {
+        return Ok(());
+    };
+    let table: String = row
+        .get(0)
+        .map_err(|error| map_sqlite_error("decode catalog foreign key table", error))?;
+    let row_id: Option<i64> = row
+        .get(1)
+        .map_err(|error| map_sqlite_error("decode catalog foreign key row id", error))?;
+    let parent: String = row
+        .get(2)
+        .map_err(|error| map_sqlite_error("decode catalog foreign key parent", error))?;
+    let constraint: i64 = row
+        .get(3)
+        .map_err(|error| map_sqlite_error("decode catalog foreign key constraint", error))?;
+    Err(ServerError::new(
+        ErrorCode::DataCorruption,
+        format!(
+            concat!(
+                "catalog foreign key check failed table=[{}] row_id=[{:?}] ",
+                "parent=[{}] constraint=[{}]"
+            ),
+            table, row_id, parent, constraint
+        ),
+    ))
 }
 
 fn validate_managed_catalog_path(config: &SqliteCatalogConfig) -> Result<()> {
