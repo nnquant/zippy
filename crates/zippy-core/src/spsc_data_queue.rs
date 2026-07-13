@@ -38,7 +38,7 @@ impl<T> SpscDataQueue<T> {
     /// :param capacity: 队列容量，必须大于零。
     /// :type capacity: usize
     /// :returns: 成功时返回可共享的队列实例。
-    /// :rtype: crate::Result<Self>
+    /// :rtype: `crate::Result<Self>`
     /// :raises ZippyError::InvalidConfig: 当容量为零时返回错误。
     pub fn new(capacity: usize) -> Result<Self> {
         if capacity == 0 {
@@ -98,7 +98,7 @@ impl<T> SpscDataQueue<T> {
     /// 尝试弹出一个元素。
     ///
     /// :returns: 队列非空时返回首个元素，否则返回 `None`。
-    /// :rtype: Option<T>
+    /// :rtype: `Option<T>`
     pub fn try_pop(&self) -> Option<T> {
         let value = self.inner.try_pop();
         if value.is_some() {

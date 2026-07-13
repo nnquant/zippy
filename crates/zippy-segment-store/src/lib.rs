@@ -1,3 +1,6 @@
+#[cfg(all(feature = "test-failpoints", not(debug_assertions)))]
+compile_error!("test-failpoints must not be enabled when debug assertions are disabled");
+
 mod active_reader;
 mod arrow_bridge;
 mod builder;
@@ -12,6 +15,8 @@ mod persistence;
 mod schema;
 mod segment;
 mod shm;
+#[cfg(feature = "test-failpoints")]
+pub mod test_failpoints;
 mod view;
 
 pub use active_reader::ActiveSegmentReader;

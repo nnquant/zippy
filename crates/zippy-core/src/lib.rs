@@ -1,6 +1,7 @@
 pub mod bus_protocol;
 pub mod config;
 pub mod control_transport;
+pub mod data_directory;
 pub mod endpoint;
 pub mod engine;
 pub mod error;
@@ -36,6 +37,10 @@ pub use config::{
     MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
 pub use control_transport::{connect_control_endpoint, send_control_line_request, ControlStream};
+pub use data_directory::{
+    DataDirectory, DataDirectoryError, ManagedDataDirectory, DATA_FORMAT_VERSION,
+    DATA_FORMAT_VERSION_FILE,
+};
 pub use endpoint::{
     default_control_endpoint, default_control_endpoint_path, resolve_control_endpoint,
     resolve_control_endpoint_uri, resolve_control_endpoint_with_home, ControlEndpoint,

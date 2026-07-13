@@ -85,6 +85,33 @@ cargo run -p zippy-perf --release -- inproc-timeseries \
   --report-json /tmp/zippy-perf-report.json
 ```
 
+## 单机重构基线清单
+
+`--baseline-manifest-json` 在运行 benchmark 前写入 `planned` 清单，运行成功后覆写为
+`completed`，执行失败时覆写为 `failed`。每次状态更新都通过同目录临时文件和原子 rename
+完成。清单包含完整 Git SHA、工作树 dirty 状态、实际可执行文件路径/大小/SHA-256、包版本、
+debug/release 构建身份、完整 `PerfConfig`、数据集 ID、输入契约和数据生成参数。
+完成后的清单还会内嵌原始 `PerfReport`，便于单文件归档和自动比较。
+
+先用 dry-run 审计将要执行的基线，不会启动 benchmark：
+
+```bash
+cargo run -p zippy-perf --release -- inproc-timeseries \
+  --duration-sec 60 \
+  --warmup-sec 10 \
+  --dataset-id zippy-perf.synthetic-ticks.v1 \
+  --baseline-manifest-json /tmp/zippy-single-node-baseline.json \
+  --dry-run
+```
+
+正式采集仍复用同一个 profile 驱动，只需去掉 `--dry-run`。如需保留独立原始报告，可以同时
+传入 `--report-json`；manifest 不依赖该选项。`remote-pipeline-upstream` 和
+`remote-pipeline-downstream` 无法自行证明对端数据身份，因此使用 baseline manifest 时必须显式
+传入 `--dataset-id`；本地 profile 未指定时使用版本化 synthetic 默认值。
+
+Git SHA 和 dirty 状态在构建 `zippy-perf` 时嵌入，因此复制二进制后不依赖原源码目录。无 `.git`
+的可复现构建必须显式设置 `ZIPPY_BUILD_GIT_SHA` 和 `ZIPPY_BUILD_GIT_DIRTY=true|false`。
+
 低频单行写入基准：
 
 ```bash

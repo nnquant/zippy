@@ -1,0 +1,48 @@
+{
+  "persist_file_id": "factor_events:7:41-42:compact-1",
+  "stream_name": "factor_events",
+  "schema_hash": "factor-events-schema-v1",
+  "file_path": "/var/lib/zippy/tables/factor_events/compact-000001.parquet",
+  "row_count": 4,
+  "created_at": 1776038400123,
+  "writer_epoch": 7,
+  "source_segment_id": 41,
+  "source_generation": 0,
+  "source_segments": [
+    {
+      "source_segment_id": 41,
+      "source_generation": 0,
+      "writer_epoch": 7
+    },
+    {
+      "source_segment_id": 42,
+      "source_generation": 0,
+      "writer_epoch": 7
+    }
+  ],
+  "compacted": true,
+  "compacted_file_count": 2,
+  "compacted_source_file_ids": [
+    "factor_events:7:41:0",
+    "factor_events:7:42:0"
+  ],
+  "partition_spec": {
+    "dt_column": "dt",
+    "columns": [
+      "trading_day"
+    ]
+  },
+  "partition_values": {
+    "trading_day": "2026-04-13"
+  },
+  "stats": {
+    "dt": {
+      "min": 1776038400000000000,
+      "max": 1776038403000000000
+    }
+  },
+  "sort_columns": [
+    "dt",
+    "seq"
+  ]
+}

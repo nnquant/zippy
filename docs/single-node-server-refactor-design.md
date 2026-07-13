@@ -2,12 +2,13 @@
 
 日期：2026-07-13
 
-状态：设计提案，待实施
+状态：实施中（Phase 0/1）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
 关联文档：
 
+- [`adr/README.md`](adr/README.md)
 - [`control_plane_lifecycle_runbook.md`](control_plane_lifecycle_runbook.md)
 - [`cross-platform-remote-gateway-design.md`](cross-platform-remote-gateway-design.md)
 - [`keyvalue-table-changelog-refactor-design.md`](keyvalue-table-changelog-refactor-design.md)

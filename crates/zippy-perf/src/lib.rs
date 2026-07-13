@@ -1,7 +1,7 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -11,6 +11,7 @@ use arrow::array::{ArrayRef, Float64Array, StringArray, TimestampNanosecondArray
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zippy_core::{
     spawn_engine_with_publisher, spawn_source_engine_with_publisher, Engine, EngineConfig,
     EngineMetricsSnapshot, EngineStatus, LateDataPolicy, OverflowPolicy, Publisher, Result,
@@ -36,6 +37,9 @@ const MIN_PASS_RATIO: f64 = 0.90;
 const WRITE_TO_SUBSCRIBE_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TO_SUBSCRIBE_WAIT_SLICE: Duration = Duration::from_millis(10);
 const WRITE_TO_SUBSCRIBE_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const BASELINE_MANIFEST_FORMAT_VERSION: u32 = 1;
+const SINGLE_NODE_REFACTOR_SUITE: &str = "single-node-refactor";
+const DEFAULT_SYNTHETIC_DATASET_ID: &str = "zippy-perf.synthetic.v1";
 
 type PerfResult<T> = std::result::Result<T, String>;
 
@@ -69,7 +73,7 @@ impl OverflowPolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerfConfig {
     pub profile: PerfProfile,
     pub rows_per_batch: usize,
@@ -128,8 +132,12 @@ pub struct PerfReportMetadata {
 
 impl PerfReportMetadata {
     fn capture() -> Self {
+        Self::capture_with_git_sha(current_git_sha())
+    }
+
+    fn capture_with_git_sha(git_sha: String) -> Self {
         Self {
-            git_sha: current_git_sha(),
+            git_sha,
             target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             started_at_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -155,6 +163,232 @@ pub struct PerfReport {
     pub engine_metrics: EngineMetricsReport,
     pub source_metrics: Option<SourceMetricsReport>,
     pub pass: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Lifecycle state of a single-node refactor baseline run.
+pub enum BaselineRunState {
+    /// The manifest was captured before benchmark dispatch.
+    Planned,
+    /// The benchmark completed and its report is embedded.
+    Completed,
+    /// The benchmark failed before it could produce a report.
+    Failed,
+}
+
+/// Identity of the exact executable used to run a baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfBinaryIdentity {
+    /// File name of the running executable.
+    pub binary_name: String,
+    /// Cargo package version compiled into the executable.
+    pub package_version: String,
+    /// Coarse Cargo build profile, either `debug` or `release`.
+    pub build_profile: String,
+    /// Runtime operating system and architecture.
+    pub target: String,
+    /// Canonical path of the running executable.
+    pub executable_path: PathBuf,
+    /// Size of the running executable in bytes.
+    pub executable_size_bytes: u64,
+    /// Lowercase SHA-256 digest of the running executable.
+    pub executable_sha256: String,
+}
+
+impl PerfBinaryIdentity {
+    fn capture() -> PerfResult<Self> {
+        let executable_path = std::env::current_exe().map_err(|error| error.to_string())?;
+        let executable_path = fs::canonicalize(&executable_path).unwrap_or(executable_path);
+        let executable_file = open_running_executable(&executable_path)?;
+        let executable_metadata = executable_file
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        let binary_name = executable_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "current executable has no valid UTF-8 file name".to_string())?
+            .to_string();
+        let executable_sha256 =
+            sha256_reader(executable_file).map_err(|error| error.to_string())?;
+
+        Ok(Self {
+            binary_name,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_profile: if cfg!(debug_assertions) {
+                "debug".to_string()
+            } else {
+                "release".to_string()
+            },
+            target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            executable_path,
+            executable_size_bytes: executable_metadata.len(),
+            executable_sha256,
+        })
+    }
+}
+
+/// Git source tree identity embedded when the benchmark binary was built.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfSourceIdentity {
+    /// Full Git object ID for `HEAD`.
+    pub git_sha: String,
+    /// Whether tracked or untracked changes were present at build time.
+    pub git_dirty: bool,
+}
+
+impl PerfSourceIdentity {
+    fn capture() -> PerfResult<Self> {
+        let git_sha = option_env!("ZIPPY_PERF_GIT_SHA")
+            .ok_or_else(|| "build did not embed a full git object id".to_string())?;
+        let git_dirty = option_env!("ZIPPY_PERF_GIT_DIRTY")
+            .ok_or_else(|| "build did not embed git dirty state".to_string())?;
+        parse_git_source_identity(git_sha.to_string(), git_dirty)
+    }
+}
+
+/// Data-generation parameters that determine the benchmark input shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfDatasetParameters {
+    /// Number of rows produced in each input batch.
+    pub rows_per_batch: usize,
+    /// Configured input rate.
+    pub target_rows_per_sec: u64,
+    /// Measured benchmark duration.
+    pub duration_sec: u64,
+    /// Warm-up duration excluded from steady-state results.
+    pub warmup_sec: u64,
+    /// Symbol cardinality generated or expected by the profile.
+    pub symbols: usize,
+}
+
+/// Identity and generation contract for a benchmark dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfDatasetManifest {
+    /// Stable operator-supplied or derived dataset identifier.
+    pub dataset_id: String,
+    /// Input source category, such as `synthetic` or `remote_stream`.
+    pub source_kind: String,
+    /// Versioned logical input schema used by the profile.
+    pub input_contract: String,
+    /// Parameters affecting generated or expected input data.
+    pub parameters: PerfDatasetParameters,
+}
+
+impl PerfDatasetManifest {
+    fn from_config(dataset_id: String, config: &PerfConfig) -> Self {
+        let source_kind = match config.profile {
+            PerfProfile::RemotePipelineUpstream | PerfProfile::RemotePipelineDownstream => {
+                "remote_stream"
+            }
+            _ => "synthetic",
+        };
+        let input_contract = match config.profile {
+            PerfProfile::WriteToSubscribeE2e
+            | PerfProfile::RuntimeStreamTableE2e
+            | PerfProfile::StreamTableSubscriberE2e => "zippy-perf.timestamped-tick.v1",
+            _ => "zippy-perf.tick.v1",
+        };
+
+        Self {
+            dataset_id,
+            source_kind: source_kind.to_string(),
+            input_contract: input_contract.to_string(),
+            parameters: PerfDatasetParameters {
+                rows_per_batch: config.rows_per_batch,
+                target_rows_per_sec: config.target_rows_per_sec,
+                duration_sec: config.duration_sec,
+                warmup_sec: config.warmup_sec,
+                symbols: config.symbols,
+            },
+        }
+    }
+}
+
+/// Machine-readable evidence envelope for a single-node refactor baseline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaselineManifest {
+    /// Manifest schema version.
+    pub format_version: u32,
+    /// Stable benchmark suite identifier.
+    pub suite: String,
+    /// Current lifecycle state.
+    pub state: BaselineRunState,
+    /// Start time, 12-character Git SHA, and runtime target used by the report.
+    pub metadata: PerfReportMetadata,
+    /// Full Git SHA and working-tree state embedded at build time.
+    pub source: PerfSourceIdentity,
+    /// Identity of the exact executable used for the run.
+    pub binary: PerfBinaryIdentity,
+    /// Complete benchmark configuration.
+    pub config: PerfConfig,
+    /// Dataset identity, contract, and generation parameters.
+    pub dataset: PerfDatasetManifest,
+    /// Completed report, absent for planned and failed runs.
+    pub report: Option<PerfReport>,
+    /// Failure reason, present only for failed runs.
+    pub error: Option<String>,
+}
+
+impl BaselineManifest {
+    /// Transition a planned manifest to completed using the resulting report.
+    pub fn completed(mut self, report: &PerfReport) -> PerfResult<Self> {
+        if report.config != self.config {
+            return Err("baseline report config does not match planned config".to_string());
+        }
+        let expected_report_sha = short_git_sha(&self.source.git_sha);
+        if report.metadata.git_sha != expected_report_sha {
+            return Err("baseline report git sha does not match planned source".to_string());
+        }
+        self.state = BaselineRunState::Completed;
+        self.metadata = report.metadata.clone();
+        self.report = Some(report.clone());
+        self.error = None;
+        Ok(self)
+    }
+
+    /// Transition a planned manifest to failed and retain its evidence identity.
+    pub fn failed(mut self, error: impl Into<String>) -> Self {
+        self.state = BaselineRunState::Failed;
+        self.report = None;
+        self.error = Some(error.into());
+        self
+    }
+}
+
+/// Capture a planned manifest without dispatching the benchmark profile.
+///
+/// Remote profiles require an explicit dataset ID because their peer process is
+/// outside this process's authority. Local profiles default to the versioned
+/// synthetic dataset ID when `dataset_id` is `None`.
+pub fn plan_baseline_manifest(
+    config: &PerfConfig,
+    dataset_id: Option<&str>,
+) -> PerfResult<BaselineManifest> {
+    validate_config(config)?;
+    let dataset_id = resolve_dataset_id(config.profile, dataset_id)?;
+    let source = PerfSourceIdentity::capture()?;
+
+    Ok(BaselineManifest {
+        format_version: BASELINE_MANIFEST_FORMAT_VERSION,
+        suite: SINGLE_NODE_REFACTOR_SUITE.to_string(),
+        state: BaselineRunState::Planned,
+        metadata: PerfReportMetadata::capture_with_git_sha(short_git_sha(&source.git_sha)),
+        source,
+        binary: PerfBinaryIdentity::capture()?,
+        config: config.clone(),
+        dataset: PerfDatasetManifest::from_config(dataset_id, config),
+        report: None,
+        error: None,
+    })
+}
+
+/// Atomically write a baseline manifest as formatted JSON.
+///
+/// The temporary file is created in the destination directory and renamed over
+/// the prior state, so readers never observe a partially written manifest.
+pub fn write_baseline_manifest_json(path: &Path, manifest: &BaselineManifest) -> PerfResult<()> {
+    write_pretty_json(path, manifest)
 }
 
 pub fn run_profile(config: &PerfConfig) -> PerfResult<PerfReport> {
@@ -190,26 +424,101 @@ fn dispatch_profile(config: &PerfConfig, metadata: PerfReportMetadata) -> PerfRe
 }
 
 pub fn write_report_json(path: &Path, report: &PerfReport) -> PerfResult<()> {
-    let json = serde_json::to_string_pretty(report).map_err(|error| error.to_string())?;
-    if let Some(parent) = path
+    write_pretty_json(path, report)
+}
+
+fn write_pretty_json(path: &Path, value: &impl Serialize) -> PerfResult<()> {
+    let mut json = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    json.push(b'\n');
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".zippy-json-")
+        .tempfile_in(parent)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(&json)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error.to_string())?;
+    sync_json_parent(parent).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_json_parent(parent: &Path) -> std::io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_json_parent(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_running_executable(_reported_path: &Path) -> PerfResult<fs::File> {
+    fs::File::open("/proc/self/exe").map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_running_executable(reported_path: &Path) -> PerfResult<fs::File> {
+    fs::File::open(reported_path).map_err(|error| error.to_string())
+}
+
+fn sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
     }
-    fs::write(path, json).map_err(|error| error.to_string())
+}
+
+fn resolve_dataset_id(profile: PerfProfile, dataset_id: Option<&str>) -> PerfResult<String> {
+    if let Some(dataset_id) = dataset_id {
+        let dataset_id = dataset_id.trim();
+        if dataset_id.is_empty() {
+            return Err("dataset_id must not be empty".to_string());
+        }
+        return Ok(dataset_id.to_string());
+    }
+    if matches!(
+        profile,
+        PerfProfile::RemotePipelineUpstream | PerfProfile::RemotePipelineDownstream
+    ) {
+        return Err("remote pipeline profiles require an explicit dataset_id".to_string());
+    }
+    Ok(DEFAULT_SYNTHETIC_DATASET_ID.to_string())
+}
+
+fn parse_git_source_identity(git_sha: String, git_dirty: &str) -> PerfResult<PerfSourceIdentity> {
+    if git_sha.len() < 40 || !git_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("git rev-parse returned an invalid full object id".to_string());
+    }
+    let git_dirty = match git_dirty {
+        "true" => true,
+        "false" => false,
+        value => return Err(format!("invalid embedded git dirty state value=[{value}]")),
+    };
+    Ok(PerfSourceIdentity { git_sha, git_dirty })
 }
 
 fn current_git_sha() -> String {
-    Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|sha| sha.trim().to_string())
-        .filter(|sha| !sha.is_empty())
+    option_env!("ZIPPY_PERF_GIT_SHA")
+        .map(short_git_sha)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn short_git_sha(full_sha: &str) -> String {
+    full_sha.chars().take(12).collect()
 }
 
 pub fn format_report(report: &PerfReport) -> String {
@@ -2696,6 +3005,8 @@ fn evaluate_pass(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::io::Cursor;
+    use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, OnceLock};
     use std::thread;
@@ -2711,11 +3022,12 @@ mod tests {
         produce_write_to_subscribe_rows, remote_downstream_should_stop_for_idle, run_profile,
         run_profile_with_hooks, should_admit_engine_batch, validate_inproc_completion,
         validate_write_to_subscribe_counts, write_report_json,
-        write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset,
-        ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
-        OverflowPolicyConfig, PerfConfig, PerfProfile, PerfReport, PerfReportMetadata,
+        write_to_subscribe_consumer_complete, write_to_subscribe_deadline_offset, BaselineManifest,
+        BaselineRunState, ConsumerJoinGuard, ConsumerStats, EngineMetricsReport, LatencySummary,
+        OverflowPolicyConfig, PerfBinaryIdentity, PerfConfig, PerfDatasetManifest,
+        PerfDatasetParameters, PerfProfile, PerfReport, PerfReportMetadata, PerfSourceIdentity,
         ProducerOutcome, ProducerState, RowPeakTracker, SteadyPeakTracker, WriteToSubscribeTiming,
-        REMOTE_IDLE_GRACE_SEC,
+        BASELINE_MANIFEST_FORMAT_VERSION, REMOTE_IDLE_GRACE_SEC, SINGLE_NODE_REFACTOR_SUITE,
     };
     use zippy_core::{EngineMetricsSnapshot, EngineStatus};
     use zippy_segment_store::{
@@ -2819,6 +3131,134 @@ mod tests {
         assert_eq!(error, "rows_per_batch must be greater than zero");
         assert!(!capture_called.get());
         assert!(!dispatch_called.get());
+    }
+
+    #[test]
+    fn baseline_manifest_serializes_build_config_dataset_and_completed_report() {
+        let config = test_config(PerfProfile::InprocTimeseries, test_endpoint());
+        let metadata = PerfReportMetadata {
+            git_sha: "0123456789ab".to_string(),
+            target: "linux-x86_64".to_string(),
+            started_at_unix_ms: 1_000,
+        };
+        let manifest = BaselineManifest {
+            format_version: BASELINE_MANIFEST_FORMAT_VERSION,
+            suite: SINGLE_NODE_REFACTOR_SUITE.to_string(),
+            state: BaselineRunState::Planned,
+            metadata: metadata.clone(),
+            source: PerfSourceIdentity {
+                git_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                git_dirty: true,
+            },
+            binary: PerfBinaryIdentity {
+                binary_name: "zippy-perf".to_string(),
+                package_version: "0.5.0".to_string(),
+                build_profile: "release".to_string(),
+                target: "linux-x86_64".to_string(),
+                executable_path: PathBuf::from("/opt/zippy/bin/zippy-perf"),
+                executable_size_bytes: 42,
+                executable_sha256:
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            },
+            config: config.clone(),
+            dataset: PerfDatasetManifest {
+                dataset_id: "fixture.tick.v1".to_string(),
+                source_kind: "synthetic".to_string(),
+                input_contract: "zippy-perf.tick.v1".to_string(),
+                parameters: PerfDatasetParameters {
+                    rows_per_batch: config.rows_per_batch,
+                    target_rows_per_sec: config.target_rows_per_sec,
+                    duration_sec: config.duration_sec,
+                    warmup_sec: config.warmup_sec,
+                    symbols: config.symbols,
+                },
+            },
+            report: None,
+            error: None,
+        };
+        let completed = manifest
+            .completed(&empty_report(&config, metadata))
+            .unwrap();
+        let json = serde_json::to_value(completed).unwrap();
+
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["suite"], "single-node-refactor");
+        assert_eq!(json["state"], "completed");
+        assert_eq!(json["metadata"]["git_sha"], "0123456789ab");
+        assert_eq!(json["source"]["git_dirty"], true);
+        assert_eq!(json["binary"]["binary_name"], "zippy-perf");
+        assert_eq!(json["binary"]["build_profile"], "release");
+        assert_eq!(json["binary"]["executable_size_bytes"], 42);
+        assert_eq!(json["config"]["rows_per_batch"], config.rows_per_batch);
+        assert_eq!(json["dataset"]["dataset_id"], "fixture.tick.v1");
+        assert_eq!(json["dataset"]["parameters"]["symbols"], config.symbols);
+        assert!(json["report"].is_object());
+        assert!(json["error"].is_null());
+    }
+
+    #[test]
+    fn executable_sha256_matches_standard_known_vector() {
+        assert_eq!(
+            super::sha256_reader(Cursor::new(b"a")).unwrap(),
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        );
+    }
+
+    #[test]
+    fn remote_profile_requires_explicit_dataset_identity() {
+        let error =
+            super::resolve_dataset_id(PerfProfile::RemotePipelineDownstream, None).unwrap_err();
+        assert_eq!(
+            error,
+            "remote pipeline profiles require an explicit dataset_id"
+        );
+        assert_eq!(
+            super::resolve_dataset_id(
+                PerfProfile::RemotePipelineDownstream,
+                Some("fixture.remote-bars.v1")
+            )
+            .unwrap(),
+            "fixture.remote-bars.v1"
+        );
+    }
+
+    #[test]
+    fn source_identity_preserves_full_git_sha_and_dirty_state() {
+        let git_sha = "0123456789abcdef0123456789abcdef01234567";
+        let clean = super::parse_git_source_identity(git_sha.to_string(), "false").unwrap();
+        let dirty = super::parse_git_source_identity(git_sha.to_string(), "true").unwrap();
+
+        assert_eq!(clean.git_sha, git_sha);
+        assert!(!clean.git_dirty);
+        assert_eq!(dirty.git_sha, git_sha);
+        assert!(dirty.git_dirty);
+    }
+
+    #[test]
+    fn pretty_json_replacement_is_atomic_and_removes_temporary_file() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "zippy-perf-atomic-json-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = output_dir.join("manifest.json");
+
+        super::write_pretty_json(&path, &serde_json::json!({"state": "planned"})).unwrap();
+        super::write_pretty_json(&path, &serde_json::json!({"state": "completed"})).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["state"], "completed");
+        let entries = std::fs::read_dir(&output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("manifest.json")]);
+
+        std::fs::remove_dir_all(output_dir).unwrap();
     }
 
     fn write_to_subscribe_test_segment(

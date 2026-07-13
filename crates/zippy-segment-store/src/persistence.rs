@@ -391,6 +391,8 @@ fn flush_sealed_to_dir(sealed: SealedSegmentHandle, output_dir: &Path) -> Persis
     writer
         .close()
         .map_err(|_| failure_for_segment(&sealed, target_path.clone(), "close parquet failed"))?;
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::hit(crate::test_failpoints::PERSISTENCE_AFTER_PARQUET_CLOSE);
     if std::fs::rename(&temp_path, &target_path).is_err() {
         let _ = std::fs::remove_file(&temp_path);
         return Err(failure_for_segment(

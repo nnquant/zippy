@@ -4,7 +4,8 @@ use clap::{Parser, ValueEnum};
 use tracing::{error, info};
 use zippy_core::{setup_log, LogConfig};
 use zippy_perf::{
-    format_report, run_profile, write_report_json, OverflowPolicyConfig, PerfConfig, PerfProfile,
+    format_report, plan_baseline_manifest, run_profile, write_baseline_manifest_json,
+    write_report_json, BaselineManifest, OverflowPolicyConfig, PerfConfig, PerfProfile,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -57,6 +58,12 @@ struct Cli {
     endpoint: String,
     #[arg(long)]
     report_json: Option<PathBuf>,
+    #[arg(long)]
+    baseline_manifest_json: Option<PathBuf>,
+    #[arg(long)]
+    dataset_id: Option<String>,
+    #[arg(long, requires = "baseline_manifest_json")]
+    dry_run: bool,
 }
 
 fn main() {
@@ -97,6 +104,43 @@ fn main() {
         max_queue_depth: cli.max_queue_depth,
     };
 
+    let planned_manifest = match cli.baseline_manifest_json.as_ref() {
+        Some(path) => {
+            let manifest = match plan_baseline_manifest(&config, cli.dataset_id.as_deref()) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    error!(
+                        component = "perf",
+                        event = "baseline_manifest_plan_error",
+                        error = %error,
+                        "baseline manifest planning failed"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            if let Err(error) = write_baseline_manifest_json(path, &manifest) {
+                error!(
+                    component = "perf",
+                    event = "baseline_manifest_write_error",
+                    error = %error,
+                    path = %path.display(),
+                    "baseline manifest write failed"
+                );
+                std::process::exit(1);
+            }
+            Some(manifest)
+        }
+        None => None,
+    };
+
+    if cli.dry_run {
+        println!(
+            "baseline_manifest={}",
+            cli.baseline_manifest_json.as_ref().unwrap().display()
+        );
+        return;
+    }
+
     info!(
         component = "perf",
         event = "profile_start",
@@ -106,6 +150,11 @@ fn main() {
     let report = match run_profile(&config) {
         Ok(report) => report,
         Err(error) => {
+            write_failed_baseline_manifest(
+                cli.baseline_manifest_json.as_deref(),
+                planned_manifest.as_ref(),
+                &error,
+            );
             error!(
                 component = "perf",
                 event = "profile_error",
@@ -120,12 +169,45 @@ fn main() {
 
     if let Some(path) = cli.report_json.as_ref() {
         if let Err(error) = write_report_json(path, &report) {
+            write_failed_baseline_manifest(
+                cli.baseline_manifest_json.as_deref(),
+                planned_manifest.as_ref(),
+                &format!("performance report write failed: {error}"),
+            );
             error!(
                 component = "perf",
                 event = "report_write_error",
                 error = %error,
                 path = %path.display(),
                 "performance report write failed"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    if let (Some(path), Some(manifest)) = (
+        cli.baseline_manifest_json.as_ref(),
+        planned_manifest.as_ref(),
+    ) {
+        let manifest = match manifest.clone().completed(&report) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                error!(
+                    component = "perf",
+                    event = "baseline_manifest_complete_error",
+                    error = %error,
+                    "baseline manifest completion failed"
+                );
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = write_baseline_manifest_json(path, &manifest) {
+            error!(
+                component = "perf",
+                event = "baseline_manifest_write_error",
+                error = %error,
+                path = %path.display(),
+                "completed baseline manifest write failed"
             );
             std::process::exit(1);
         }
@@ -141,5 +223,25 @@ fn main() {
 
     if !report.pass {
         std::process::exit(2);
+    }
+}
+
+fn write_failed_baseline_manifest(
+    path: Option<&std::path::Path>,
+    manifest: Option<&BaselineManifest>,
+    profile_error: &str,
+) {
+    let (Some(path), Some(manifest)) = (path, manifest) else {
+        return;
+    };
+    let failed = manifest.clone().failed(profile_error);
+    if let Err(error) = write_baseline_manifest_json(path, &failed) {
+        error!(
+            component = "perf",
+            event = "baseline_manifest_write_error",
+            error = %error,
+            path = %path.display(),
+            "failed baseline manifest write failed"
+        );
     }
 }

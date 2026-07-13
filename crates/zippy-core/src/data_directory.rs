@@ -1,0 +1,388 @@
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use thiserror::Error;
+
+/// Current on-disk format understood by this Zippy binary.
+pub const DATA_FORMAT_VERSION: u32 = 1;
+
+/// Name of the marker checked before any managed data is opened.
+pub const DATA_FORMAT_VERSION_FILE: &str = "FORMAT_VERSION";
+
+const DATA_FORMAT_VERSION_TEMP_PREFIX: &str = ".FORMAT_VERSION.tmp-";
+
+/// Directories owned and managed by a single Zippy server data root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedDataDirectory {
+    Catalog,
+    Wal,
+    Segments,
+    Parquet,
+    Spill,
+    Temporary,
+    Backup,
+    Logs,
+    Run,
+}
+
+impl ManagedDataDirectory {
+    /// Return the stable relative directory name used on disk.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Catalog => "catalog",
+            Self::Wal => "wal",
+            Self::Segments => "segments",
+            Self::Parquet => "parquet",
+            Self::Spill => "spill",
+            Self::Temporary => "tmp",
+            Self::Backup => "backup",
+            Self::Logs => "logs",
+            Self::Run => "run",
+        }
+    }
+}
+
+const MANAGED_DIRECTORIES: [ManagedDataDirectory; 9] = [
+    ManagedDataDirectory::Catalog,
+    ManagedDataDirectory::Wal,
+    ManagedDataDirectory::Segments,
+    ManagedDataDirectory::Parquet,
+    ManagedDataDirectory::Spill,
+    ManagedDataDirectory::Temporary,
+    ManagedDataDirectory::Backup,
+    ManagedDataDirectory::Logs,
+    ManagedDataDirectory::Run,
+];
+
+/// Failure returned while establishing ownership of a server data directory.
+#[derive(Debug, Error)]
+pub enum DataDirectoryError {
+    #[error("data directory IO failed path=[{path}] reason=[{reason}]")]
+    Io { path: PathBuf, reason: String },
+    #[error("data root must be a directory path=[{path}]")]
+    NotDirectory { path: PathBuf },
+    #[error("data format marker must be a regular file path=[{path}]")]
+    NotRegularFile { path: PathBuf },
+    #[error("data root must not be a symbolic link path=[{path}]")]
+    SymbolicLink { path: PathBuf },
+    #[error("unversioned data root is not empty path=[{path}]")]
+    UnversionedNonEmpty { path: PathBuf },
+    #[error("invalid data format version path=[{path}] value=[{value}]")]
+    InvalidFormatVersion { path: PathBuf, value: String },
+    #[error("unsupported data format version found=[{found}] supported=[{supported}]")]
+    UnsupportedFormatVersion { found: u32, supported: u32 },
+    #[cfg(unix)]
+    #[error("data path permissions must be owner-only path=[{path}] mode=[{mode:o}]")]
+    InsecurePermissions { path: PathBuf, mode: u32 },
+    #[cfg(not(unix))]
+    #[error("managed data directory security is unsupported on this platform")]
+    UnsupportedPlatformSecurity,
+}
+
+/// Validated ownership boundary for all files managed by one Zippy server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataDirectory {
+    root: PathBuf,
+}
+
+impl DataDirectory {
+    /// Initialize an empty data root or reopen an already initialized one.
+    ///
+    /// An existing non-empty directory without `FORMAT_VERSION` is rejected so
+    /// legacy or unrelated files cannot be silently claimed by the new server.
+    pub fn initialize(path: impl AsRef<Path>) -> Result<Self, DataDirectoryError> {
+        require_supported_platform()?;
+        let requested = path.as_ref();
+        reject_root_symlink(requested)?;
+
+        if requested.exists() {
+            require_directory(requested)?;
+        } else {
+            create_owner_directory(requested)?;
+        }
+
+        let root = canonicalize(requested)?;
+        let version_path = root.join(DATA_FORMAT_VERSION_FILE);
+        if version_path.exists() {
+            return Self::open(root);
+        }
+
+        if directory_has_unowned_entries(&root)? {
+            return Err(DataDirectoryError::UnversionedNonEmpty { path: root });
+        }
+
+        restrict_owner_permissions(&root)?;
+        write_format_version(&root, &version_path, DATA_FORMAT_VERSION)?;
+        ensure_managed_directories(&root)?;
+        Ok(Self { root })
+    }
+
+    /// Open a previously initialized data root after validating its format.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DataDirectoryError> {
+        require_supported_platform()?;
+        let requested = path.as_ref();
+        reject_root_symlink(requested)?;
+        require_directory(requested)?;
+        require_owner_permissions(requested)?;
+
+        let root = canonicalize(requested)?;
+        let version_path = root.join(DATA_FORMAT_VERSION_FILE);
+        require_regular_file(&version_path)?;
+        require_owner_permissions(&version_path)?;
+        let found = read_format_version(&version_path)?;
+        if found != DATA_FORMAT_VERSION {
+            return Err(DataDirectoryError::UnsupportedFormatVersion {
+                found,
+                supported: DATA_FORMAT_VERSION,
+            });
+        }
+
+        ensure_managed_directories(&root)?;
+        Ok(Self { root })
+    }
+
+    /// Return the canonical data root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Return a managed child path after initialization has validated it.
+    pub fn path(&self, directory: ManagedDataDirectory) -> PathBuf {
+        self.root.join(directory.as_str())
+    }
+}
+
+fn reject_root_symlink(path: &Path) -> Result<(), DataDirectoryError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(DataDirectoryError::SymbolicLink {
+                path: path.to_path_buf(),
+            })
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(path, error)),
+    }
+}
+
+fn require_directory(path: &Path) -> Result<(), DataDirectoryError> {
+    let metadata = fs::metadata(path).map_err(|error| io_error(path, error))?;
+    if metadata.is_dir() {
+        Ok(())
+    } else {
+        Err(DataDirectoryError::NotDirectory {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn require_regular_file(path: &Path) -> Result<(), DataDirectoryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
+    if metadata.file_type().is_symlink() {
+        return Err(DataDirectoryError::SymbolicLink {
+            path: path.to_path_buf(),
+        });
+    }
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(DataDirectoryError::NotRegularFile {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn canonicalize(path: &Path) -> Result<PathBuf, DataDirectoryError> {
+    path.canonicalize().map_err(|error| io_error(path, error))
+}
+
+fn directory_has_unowned_entries(path: &Path) -> Result<bool, DataDirectoryError> {
+    for entry in fs::read_dir(path).map_err(|error| io_error(path, error))? {
+        let entry = entry.map_err(|error| io_error(path, error))?;
+        let file_name = entry.file_name();
+        let is_stale_version_temp = file_name
+            .to_str()
+            .is_some_and(|name| name.starts_with(DATA_FORMAT_VERSION_TEMP_PREFIX));
+        if !is_stale_version_temp {
+            return Ok(true);
+        }
+
+        let file_type = entry
+            .file_type()
+            .map_err(|error| io_error(&entry.path(), error))?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn read_format_version(path: &Path) -> Result<u32, DataDirectoryError> {
+    let mut value = String::new();
+    File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut value))
+        .map_err(|error| io_error(path, error))?;
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| DataDirectoryError::InvalidFormatVersion {
+            path: path.to_path_buf(),
+            value: value.trim().to_string(),
+        })
+}
+
+fn write_format_version(
+    root: &Path,
+    path: &Path,
+    expected_version: u32,
+) -> Result<(), DataDirectoryError> {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(DATA_FORMAT_VERSION_TEMP_PREFIX)
+        .tempfile_in(root)
+        .map_err(|error| io_error(path, error))?;
+    writeln!(temporary, "{expected_version}").map_err(|error| io_error(path, error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| io_error(path, error))?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            drop(error.file);
+            require_regular_file(path)?;
+            require_owner_permissions(path)?;
+            let found = read_format_version(path)?;
+            if found != expected_version {
+                return Err(DataDirectoryError::UnsupportedFormatVersion {
+                    found,
+                    supported: expected_version,
+                });
+            }
+        }
+        Err(error) => return Err(io_error(path, error.error)),
+    }
+    sync_directory_io(root).map_err(|error| io_error(root, error))?;
+    Ok(())
+}
+
+fn ensure_managed_directories(root: &Path) -> Result<(), DataDirectoryError> {
+    for directory in MANAGED_DIRECTORIES {
+        let path = root.join(directory.as_str());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DataDirectoryError::SymbolicLink { path });
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(DataDirectoryError::NotDirectory { path });
+            }
+            Ok(_) => require_owner_permissions(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_owner_directory(&path)?;
+            }
+            Err(error) => return Err(io_error(&path, error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path).map_err(|error| io_error(path, error))
+}
+
+#[cfg(not(unix))]
+fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
+    fs::create_dir(path).map_err(|error| io_error(path, error))
+}
+
+#[cfg(unix)]
+fn restrict_owner_permissions(path: &Path) -> Result<(), DataDirectoryError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| io_error(path, error))
+}
+
+#[cfg(not(unix))]
+fn restrict_owner_permissions(_path: &Path) -> Result<(), DataDirectoryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_owner_permissions(path: &Path) -> Result<(), DataDirectoryError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(path)
+        .map_err(|error| io_error(path, error))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 == 0 {
+        Ok(())
+    } else {
+        Err(DataDirectoryError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+fn require_owner_permissions(_path: &Path) -> Result<(), DataDirectoryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory_io(path: &Path) -> std::io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
+}
+
+#[cfg(not(unix))]
+fn sync_directory_io(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_supported_platform() -> Result<(), DataDirectoryError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_supported_platform() -> Result<(), DataDirectoryError> {
+    Err(DataDirectoryError::UnsupportedPlatformSecurity)
+}
+
+fn io_error(path: &Path, error: std::io::Error) -> DataDirectoryError {
+    DataDirectoryError::Io {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{read_format_version, write_format_version, DataDirectoryError};
+
+    #[test]
+    fn format_publish_never_overwrites_a_competing_version() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("FORMAT_VERSION");
+        write_format_version(root.path(), &marker, 2).unwrap();
+
+        let error = write_format_version(root.path(), &marker, 1).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DataDirectoryError::UnsupportedFormatVersion {
+                found: 2,
+                supported: 1
+            }
+        ));
+        assert_eq!(read_format_version(&marker).unwrap(), 2);
+    }
+}

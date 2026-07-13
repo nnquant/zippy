@@ -1,0 +1,96 @@
+{
+  "format_version": 1,
+  "tables": [
+    {
+      "name": "factor_events",
+      "kind": "append_table",
+      "by": null,
+      "descriptor": {
+        "zippy_table_kind": "append_table"
+      },
+      "write": {
+        "api": "append_table",
+        "operation": "append",
+        "commit_boundary": "committed_rows"
+      },
+      "query": {
+        "api": "read_table",
+        "result": "ordered_append_log"
+      },
+      "subscribe": {
+        "api": "subscribe",
+        "source": "factor_events",
+        "delivery": "ordered_incremental_rows",
+        "start_from": "tail_or_non_negative_row_offset"
+      }
+    },
+    {
+      "name": "cross_section_frames",
+      "kind": "frame_table",
+      "by": "dt",
+      "descriptor": {
+        "zippy_table_kind": "frame_table",
+        "zippy_frame_mode": "segment_per_batch",
+        "zippy_frame_by": "dt",
+        "zippy_frame_protocol_version": 1
+      },
+      "write": {
+        "api": "frame_table",
+        "operation": "append_complete_frame",
+        "commit_boundary": "input_batch"
+      },
+      "query": {
+        "api": "read_table",
+        "result": "ordered_complete_frame_log"
+      },
+      "subscribe": {
+        "api": "subscribe_frames",
+        "source": "cross_section_frames",
+        "delivery": "one_complete_frame_per_callback",
+        "start_from": "live_tail"
+      }
+    },
+    {
+      "name": "latest_factors",
+      "kind": "key_value_table",
+      "by": [
+        "instrument_id"
+      ],
+      "descriptor": {
+        "zippy_table_kind": "key_value_table",
+        "zippy_table_semantics": "key_value_snapshot",
+        "zippy_latest_by": [
+          "instrument_id"
+        ],
+        "zippy_key_value_keys": [
+          "instrument_id"
+        ],
+        "zippy_key_value_changelog_stream": "latest_factors.__kv_changelog",
+        "zippy_kv_changelog_stream": "latest_factors.__kv_changelog"
+      },
+      "write": {
+        "api": "key_value_table",
+        "operation": "upsert_latest_snapshot_and_append_changelog",
+        "commit_boundary": "snapshot_version"
+      },
+      "query": {
+        "api": "read_table",
+        "result": "latest_snapshot_by_key"
+      },
+      "subscribe": {
+        "api": "subscribe",
+        "source": "latest_factors.__kv_changelog",
+        "delivery": "ordered_upsert_rows_without_internal_columns",
+        "start_from": "live_tail_only",
+        "table_api": "subscribe_table",
+        "table_delivery": "full_latest_snapshot"
+      }
+    }
+  ],
+  "legacy_kind_fallback": {
+    "descriptor": {
+      "zippy_table_semantics": "key_value_snapshot"
+    },
+    "kind": "key_value_table"
+  }
+}
