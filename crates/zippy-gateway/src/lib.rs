@@ -39,13 +39,13 @@ use zippy_core::bus_protocol::{
 };
 use zippy_core::{
     canonical_schema_hash, control_response_result, schema_metadata, send_control_line_request,
-    send_control_line_request_cancellable_with_deadline, ControlEndpoint, ControlRequest,
-    ControlResponse, Engine, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
-    PublishSegmentDescriptorRequest, RegisterProcessRequest, RegisterSourceRequest,
-    RegisterStreamRequest, Result, SegmentTableView, StreamInfo, UnregisterSourceRequest,
-    ZippyError, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES,
-    DEFAULT_QUERY_MAX_BUFFERED_BYTES, MAX_CONTROL_RESPONSE_LINE_BYTES, MAX_PARALLELISM,
-    MAX_QUERY_BUFFER_BYTES,
+    send_control_line_request_cancellable_with_deadline, send_control_line_request_with_timeout,
+    ControlEndpoint, ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
+    ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
+    RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
+    UnregisterProcessRequest, UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM,
+    DEFAULT_MAX_QUERY_BUFFER_BYTES, DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+    MAX_CONTROL_RESPONSE_LINE_BYTES, MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
@@ -67,6 +67,7 @@ const DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS: usize = 64;
 const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const GATEWAY_SHUTDOWN_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS: usize = 8;
 const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
@@ -1782,10 +1783,21 @@ impl GatewayServer {
 
     /// Stop the background gateway listener and flush table writers.
     pub fn stop(mut self) {
-        self.shutdown();
+        if let Err(error) = self.shutdown() {
+            tracing::warn!(
+                event = "gateway_shutdown_incomplete",
+                error = %error,
+                "gateway stopped with incomplete master cleanup"
+            );
+        }
     }
 
-    fn shutdown(&mut self) {
+    /// Stop the Gateway and report whether its Master process lease was released.
+    pub fn stop_gracefully(mut self) -> Result<()> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
         self.state.stopped.store(true, Ordering::SeqCst);
         if let Some(runtime) = self.runtime.as_ref() {
             let _ = runtime.shutdown.send(true);
@@ -1796,12 +1808,19 @@ impl GatewayServer {
         }
         self.state.close_all_writers();
         self.state.snapshots.lock().unwrap().clear();
+        self.state.master.unregister_process_blocking()
     }
 }
 
 impl Drop for GatewayServer {
     fn drop(&mut self) {
-        self.shutdown();
+        if let Err(error) = self.shutdown() {
+            tracing::warn!(
+                event = "gateway_shutdown_incomplete",
+                error = %error,
+                "gateway dropped with incomplete master cleanup"
+            );
+        }
     }
 }
 
@@ -2258,6 +2277,26 @@ impl GatewayAsyncMasterClient {
 
     fn clear_process(&self) {
         *self.process.lock().unwrap() = None;
+    }
+
+    fn unregister_process_blocking(&self) -> Result<()> {
+        let Some(process) = self.process.lock().unwrap().take() else {
+            return Ok(());
+        };
+        self.metrics.lock().unwrap().master_async_requests_total += 1;
+        let response = send_control_line_request_with_timeout(
+            &self.endpoint,
+            ControlRequest::UnregisterProcess(UnregisterProcessRequest {
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+            }),
+            self.request_timeout
+                .min(GATEWAY_SHUTDOWN_UNREGISTER_TIMEOUT),
+        )?;
+        match response {
+            ControlResponse::ProcessUnregistered { .. } => Ok(()),
+            other => Err(unexpected_response("ProcessUnregistered", other)),
+        }
     }
 
     async fn send_request_async(&self, request: ControlRequest) -> Result<ControlResponse> {
@@ -3999,7 +4038,6 @@ async fn async_serve_loop(
             }
         }
     }
-    heartbeat.abort();
     let _ = heartbeat.await;
 }
 
@@ -4010,6 +4048,7 @@ async fn heartbeat_loop_async(
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
