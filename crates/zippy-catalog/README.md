@@ -1,11 +1,13 @@
-# SQLite Catalog Foundation
+# SQLite Catalog
 
-Phase P2.1 establishes a non-authoritative SQLite migration foundation at the
-managed path `<data_root>/catalog/catalog.db`.
+Phase P2.1 established the non-authoritative migration foundation at
+`<data_root>/catalog/catalog.db`. Phase P2.2 now adds the physical domain schema
+and the first typed command slice, while legacy metadata remains authoritative.
 
 Implemented:
 
-- one dedicated OS actor thread owns the only SQLite connection;
+- each Catalog handle confines its own SQLite connection to one dedicated OS
+  actor thread;
 - the actor revalidates managed directories and opens `catalog.db` with
   `SQLITE_OPEN_NOFOLLOW`;
 - a bounded actor command queue rejects excess inspection work;
@@ -14,24 +16,53 @@ Implemented:
   catalog metadata;
 - per-version normalized `sqlite_schema` inventory fingerprints, including
   implicit auto-indexes, validated before each migration commits and on reopen;
-- VM-step-interruptible startup and explicit `quick_check(1)` through SQLite's
-  progress handler; ordinary inspection returns the cached integrity result;
-- future physical schema versions fail closed.
+- VM-step-interruptible startup and explicit `quick_check(1)` plus
+  `foreign_key_check`; ordinary inspection returns the cached integrity result;
+- future physical schema versions fail closed;
+- physical v2 domain tables for namespaces, tables, schemas, snapshots, files,
+  source lineage, producer checkpoints, durable consumer offsets, long-lived
+  leases, maintenance jobs, and idempotent responses;
+- lossless big-endian BLOB encodings for stable IDs, every `u64`, optional
+  values, and explicit empty/known/legacy-unknown watermarks;
+- a second single-connection actor implementing `CreateNamespace`, revision,
+  namespace get/list, exact idempotent replay, and revision CAS through the
+  stable `Catalog` traits.
 
 Physical SQLite schema versions and `CatalogCommand` wire versions are separate
-version spaces. Physical v1 creates only `catalog_meta` and
-`catalog_migrations`. It intentionally has no namespace, table, snapshot, file,
-idempotency, or maintenance-job domain tables and does not implement the
-`Catalog` trait.
+version spaces. Physical v1 remains the immutable migration foundation.
+Physical v2 is the complete first domain layout; it does not imply that every
+V1 command is executable.
 
-Before server integration, P2.2 must freeze the complete typed physical schema,
-including lossless unsigned encoding and all table, watermark, provenance,
-lineage, and idempotency invariants. It must also add server-lock ownership,
-network-filesystem rejection, directory-handle pinning against parent-path
-replacement races, process-kill crash failpoints, and an absolute shutdown
-deadline. The current reliable `close` may wait indefinitely for an actor
-already executing work; dropping the handle invokes the same shutdown path.
+Current-manifest reads filter `data_files` by table, committed state, and the
+canonical empty removed-snapshot tag, then order by `file_id`. Both the partial
+`data_files_active_manifest` index and the composite `data_files_by_gc_state`
+index cover that access pattern; SQLite may select either from collected
+statistics without scanning the table or creating a temporary sort.
+
+Current typed capability matrix:
+
+| Capability | Status |
+| --- | --- |
+| `CreateNamespace` and namespace discovery | implemented |
+| empty table resolution/query snapshot | implemented transactionally |
+| table/schema/manifest/producer/consumer/job commands | `UnsupportedPlan` |
+| non-empty historical snapshot reads | `UnsupportedPlan` |
+| legacy primary + SQLite shadow fan-out | not connected |
+| SQLite read or write authority | disabled |
+
+The physical schema reserves `legacy_discovery_order`, but frozen V1 snapshot
+DTOs cannot return that order without violating their wire contract. Non-empty
+snapshot reads therefore remain disabled until a V2 typed read contract carries
+explicit scan order.
+
+Before server integration, the Catalog must still add table and manifest command
+execution, exact non-empty read snapshots, process-level ownership, network
+filesystem rejection, directory-handle pinning against parent replacement races,
+process-kill crash failpoints, and an absolute shutdown deadline. The current
+reliable `close` may wait indefinitely for an actor already executing work;
+dropping the handle invokes the same shutdown path.
 
 The integrity timeout bounds SQLite VM progress-handler checks, not all wall
 time spent opening files, waiting in filesystem I/O, or running migrations.
-P2.1 therefore does not claim an absolute startup deadline.
+The current implementation therefore does not claim an absolute startup or
+shutdown deadline and must not be selected by `zippy server run` yet.

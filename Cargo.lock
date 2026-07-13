@@ -2278,6 +2278,7 @@ dependencies = [
  "rusqlite",
  "sha2",
  "tempfile",
+ "tokio",
  "tracing",
  "zippy-core",
  "zippy-types",

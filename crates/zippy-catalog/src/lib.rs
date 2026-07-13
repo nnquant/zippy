@@ -1,16 +1,21 @@
-//! SQLite Catalog physical migration foundation for the single-node Zippy server.
+//! SQLite Catalog migration and typed command foundation for the single-node server.
 //!
 //! Physical schema v2 stores the complete first domain layout with lossless
-//! unsigned encodings, but this foundation handle remains non-authoritative and
-//! does not implement [`zippy_types::Catalog`]. Physical SQLite schema versions
-//! are independent of CatalogCommand wire versions. The SQLite connection is
-//! created, used, and dropped exclusively on one dedicated OS actor thread.
+//! unsigned encodings. [`SqliteCatalog`] implements the first namespace command
+//! slice, but legacy metadata remains authoritative and non-empty table snapshot
+//! reads remain disabled. Physical SQLite schema versions are independent of
+//! CatalogCommand wire versions. Each handle creates, uses, and drops its SQLite
+//! connection exclusively on one dedicated OS actor thread.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod domain;
 mod encoding;
 mod migration;
+mod service;
+
+pub use service::SqliteCatalog;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -114,7 +119,7 @@ impl SqliteCatalogConfig {
     }
 }
 
-/// Result of SQLite's full catalog `quick_check` pass.
+/// Result of SQLite's catalog `quick_check` and foreign-key validation pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogIntegrity {
     /// SQLite reported `ok` and no additional diagnostics.
@@ -160,9 +165,9 @@ pub struct SqliteCatalogFoundationStatus {
 
 /// A versioned SQLite Catalog foundation whose connection is actor-thread confined.
 ///
-/// This handle only initializes, validates, and inspects the physical Catalog.
-/// It neither implements catalog commands nor takes authority from the legacy
-/// Registry.
+/// This handle only initializes, validates, and inspects the physical Catalog;
+/// [`SqliteCatalog`] is the separate typed command handle. Neither handle takes
+/// authority from the legacy Registry in this migration slice.
 ///
 /// ```compile_fail
 /// fn require_catalog<T: zippy_types::Catalog>() {}

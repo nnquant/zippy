@@ -2,7 +2,7 @@
 
 日期：2026-07-13
 
-状态：实施中（Phase 0/1）
+状态：实施中（Phase 0/1 已完成，Phase 2 P2.2 进行中）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
@@ -287,7 +287,10 @@ Checkpoint 由 CatalogService 在低负载或 WAL 达到阈值时显式执行。
 
 ### 5.2 Catalog 数据模型
 
-第一版 schema 至少包括：
+第一版逻辑 schema 至少包括以下实体。下列 SQL 是字段关系草图，不是当前 migration 的逐字 DDL；
+physical v2 已将稳定 ID 编码为非零 BLOB16、`u64`/UTC 纳秒编码为 big-endian BLOB8，并将
+`Option<u64>` 与 watermark 编码为带显式状态 tag 的 canonical BLOB9，避免 SQLite signed INTEGER
+和通用 JSON number 丢失 `u64::MAX` 或混淆 empty/legacy-unknown。
 
 ```sql
 CREATE TABLE catalog_meta (
@@ -1719,6 +1722,13 @@ frontend 依赖 QueryService 的 query lifecycle，不应先用 Flight 包装 le
 - P2.2 冻结完整类型化 domain schema 后再增加 namespace/table/schema/snapshot/file、producer、
   subscription、lease、job 和 idempotency 表。所有 `u64`、watermark、writer epoch、lineage 与
   provenance 必须先定义无损编码和 golden migration test，之后才允许接入 server。
+
+当前实施状态（2026-07-13）：physical v2 domain schema、无损 BLOB 编码、v1 -> v2 migration、
+schema inventory、`CreateNamespace` 单写者事务和跨重启幂等回放已经实现。其余 V1 command、
+非空 `CatalogQuerySnapshot`、legacy importer/shadow/diff、绝对 shutdown deadline 尚未实现，因此
+SQLite 仍不能成为 `zippy server run` 的 read/write authority。physical schema 中已经保留 legacy
+discovery order，但 frozen V1 snapshot DTO 无法无损携带该顺序；在 V2 typed read contract 冻结前，
+非空 snapshot read 必须返回 `UnsupportedPlan`。
 
 SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立版本空间，不能用同一个
 “v1/v2”标签推断彼此已实现。
