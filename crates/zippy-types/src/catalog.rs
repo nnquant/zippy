@@ -4,6 +4,7 @@ mod wire_v1;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Write;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
@@ -24,6 +25,8 @@ use crate::{
 pub const CURRENT_CATALOG_COMMAND_FORMAT_VERSION: u32 = 1;
 /// The permanently assigned wire version for frozen V1 catalog records.
 pub const CATALOG_COMMAND_FORMAT_VERSION_V1: u32 = 1;
+/// Maximum UTF-8 byte length of an audited catalog actor principal.
+pub const MAX_CATALOG_ACTOR_PRINCIPAL_BYTES: usize = 4 * 1024;
 
 /// The canonical encoding version used to validate an idempotent catalog command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -168,7 +171,8 @@ pub enum CatalogActorKind {
 pub struct CatalogActor {
     /// The class of actor.
     pub kind: CatalogActorKind,
-    /// A stable principal, service, or migration name.
+    /// A stable principal, service, or migration name, bounded by
+    /// [`MAX_CATALOG_ACTOR_PRINCIPAL_BYTES`] when fingerprinted or admitted.
     pub principal: String,
 }
 
@@ -193,21 +197,19 @@ pub struct CatalogCommandFingerprintInputV1 {
 impl CatalogCommandFingerprintInputV1 {
     /// Encodes the canonical versioned bytes used by the fingerprint.
     pub fn canonical_bytes(&self) -> std::result::Result<Vec<u8>, CatalogFingerprintError> {
-        if self.format_version != CatalogCommandFormatVersion::v1() {
-            return Err(CatalogFingerprintError::UnsupportedFormatVersion {
-                actual: self.format_version.get(),
-            });
-        }
+        validate_fingerprint_fields(self.format_version, &self.actor)?;
         serde_json::to_vec(&wire_v1::FingerprintInputV1::from(self))
             .map_err(CatalogFingerprintError::Encode)
     }
 
     /// Computes the canonical SHA-256 fingerprint.
     pub fn fingerprint(&self) -> std::result::Result<CommandFingerprint, CatalogFingerprintError> {
-        let digest = Sha256::digest(self.canonical_bytes()?);
-        let mut bytes = [0_u8; 32];
-        bytes.copy_from_slice(&digest);
-        Ok(CommandFingerprint::from_bytes(bytes))
+        fingerprint_fields(
+            self.format_version,
+            self.expected_revision,
+            &self.actor,
+            &self.command,
+        )
     }
 }
 
@@ -219,6 +221,14 @@ pub enum CatalogFingerprintError {
     UnsupportedFormatVersion {
         /// The unsupported version value.
         actual: u32,
+    },
+    /// The audited actor principal exceeds the protocol resource bound.
+    #[error("catalog actor principal exceeds byte limit actual=[{actual}] maximum=[{maximum}]")]
+    ActorPrincipalTooLarge {
+        /// The actual UTF-8 byte length.
+        actual: usize,
+        /// The maximum accepted UTF-8 byte length.
+        maximum: usize,
     },
     /// Canonical JSON encoding failed.
     #[error("failed to encode canonical catalog command error=[{0}]")]
@@ -292,17 +302,79 @@ impl CatalogCommandEnvelopeV1 {
 
     /// Recomputes and validates the canonical fingerprint before idempotency lookup.
     pub fn verify_fingerprint(&self) -> std::result::Result<(), CatalogFingerprintError> {
-        let input = CatalogCommandFingerprintInputV1 {
-            format_version: self.format_version,
-            expected_revision: self.expected_revision,
-            actor: self.actor.clone(),
-            command: self.command.clone(),
-        };
-        if input.fingerprint()? == self.canonical_fingerprint {
+        if fingerprint_fields(
+            self.format_version,
+            self.expected_revision,
+            &self.actor,
+            &self.command,
+        )? == self.canonical_fingerprint
+        {
             Ok(())
         } else {
             Err(CatalogFingerprintError::Mismatch)
         }
+    }
+}
+
+fn fingerprint_fields(
+    format_version: CatalogCommandFormatVersion,
+    expected_revision: Option<u64>,
+    actor: &CatalogActor,
+    command: &CatalogCommandV1,
+) -> std::result::Result<CommandFingerprint, CatalogFingerprintError> {
+    validate_fingerprint_fields(format_version, actor)?;
+    let mut writer = FingerprintWriter(Sha256::new());
+    if let Some(wire) = wire_v1::ManifestFingerprintInputRefV1::from_parts(
+        format_version,
+        expected_revision,
+        actor,
+        command,
+    ) {
+        serde_json::to_writer(&mut writer, &wire).map_err(CatalogFingerprintError::Encode)?;
+    } else {
+        let wire = wire_v1::FingerprintInputV1::from_parts(
+            format_version,
+            expected_revision,
+            actor,
+            command,
+        );
+        serde_json::to_writer(&mut writer, &wire).map_err(CatalogFingerprintError::Encode)?;
+    }
+    let digest = writer.0.finalize();
+    let mut bytes = [0_u8; 32];
+    bytes.copy_from_slice(&digest);
+    Ok(CommandFingerprint::from_bytes(bytes))
+}
+
+fn validate_fingerprint_fields(
+    format_version: CatalogCommandFormatVersion,
+    actor: &CatalogActor,
+) -> std::result::Result<(), CatalogFingerprintError> {
+    if format_version != CatalogCommandFormatVersion::v1() {
+        return Err(CatalogFingerprintError::UnsupportedFormatVersion {
+            actual: format_version.get(),
+        });
+    }
+    let actual = actor.principal.len();
+    if actual > MAX_CATALOG_ACTOR_PRINCIPAL_BYTES {
+        return Err(CatalogFingerprintError::ActorPrincipalTooLarge {
+            actual,
+            maximum: MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+        });
+    }
+    Ok(())
+}
+
+struct FingerprintWriter(Sha256);
+
+impl Write for FingerprintWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -483,31 +555,64 @@ pub struct AcquireProducerCommand {
     pub expected_writer_epoch: Option<u64>,
 }
 
-/// A command that exposes one persisted file set as a new snapshot.
+/// Exposes one server-internal native append file set as a new snapshot.
+///
+/// Frozen V1 is intentionally narrower than the general persistence domain. It
+/// accepts only a non-empty, strictly file-id-ordered set of native files for an
+/// append table. File row counts, offset ranges, and source lineage must agree;
+/// their aggregate coverage must start immediately after the parent snapshot's
+/// watermark and end at `committed_log_offset`.
+///
+/// This is not a producer-fenced public ingest request: it carries no producer
+/// identity, epoch, or batch sequence. The server must complete producer
+/// fencing and file/directory durability before submitting it. Legacy import,
+/// frame-aware persistence, and key-value materialization require a later
+/// command version.
+///
+/// The SQLite V1 executor admits at most 4,096 files, 4,096 lineage rows per
+/// file, 65,536 lineage rows in total, 64 MiB of encoded metadata, and 1 MiB per
+/// typed metadata BLOB.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitDataFilesCommand {
     /// The table receiving the files.
     pub table_id: TableId,
     /// The snapshot version that must still be current.
     pub expected_snapshot_version: u64,
-    /// Complete files not yet visible in any catalog snapshot.
+    /// Complete native files in strict file-id order, not yet catalog-visible.
     pub files: Vec<PendingDataFile>,
-    /// The durable logical boundary represented by the new snapshot.
+    /// The exact contiguous durable boundary reached by the new files.
     pub committed_log_offset: OffsetWatermark,
 }
 
-/// A command that replaces compacted source files atomically.
+/// Atomically replaces one append manifest set with row-preserving outputs.
+///
+/// Frozen V1 accepts only non-empty input and output sets in strict file-id
+/// order. Every input must be visible at `expected_snapshot_version`; aggregate
+/// output row count, logical offsets, schema-version coverage, and source
+/// lineage must exactly equal the inputs. Compaction cannot advance or regress
+/// the parent snapshot's committed log watermark.
+///
+/// This is a server-internal Catalog primitive, not a maintenance worker
+/// protocol. It carries no maintenance job, lease generation, or lease-bound
+/// worker identity, so the coordinator must fence the worker before submission.
+/// The command envelope actor remains audit metadata rather than a lease token.
+/// V1 does not represent preserve-order legacy discovery, frame-aware rewrite,
+/// or key-value materialization; those require a later command version.
+///
+/// The SQLite V1 executor admits at most 4,096 input files, 4,096 output files,
+/// 4,096 lineage rows per output, 65,536 lineage rows in total, 64 MiB of encoded
+/// metadata, and 1 MiB per typed metadata BLOB.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitCompactionCommand {
     /// The table being compacted.
     pub table_id: TableId,
     /// The snapshot version used to plan the compaction.
     pub expected_snapshot_version: u64,
-    /// The currently visible source files to remove.
+    /// The exact currently visible source set in strict file-id order.
     pub input_file_ids: Vec<FileId>,
-    /// Complete immutable replacement files not yet catalog-visible.
+    /// Complete native row-preserving outputs in strict file-id order.
     pub output_files: Vec<PendingDataFile>,
-    /// The durable logical boundary retained in the output.
+    /// The parent snapshot's unchanged durable logical boundary.
     pub committed_log_offset: OffsetWatermark,
 }
 
@@ -1183,17 +1288,19 @@ mod tests {
 
     use sha2::{Digest, Sha256};
 
+    use super::wire_v1;
+
     use super::{
         AcquireProducerCommand, AcquireSnapshotLeaseCommand, AlterTableSchemaCommand, Catalog,
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCodecError, CatalogCommandEnvelopeV1,
         CatalogCommandFingerprintInputV1, CatalogCommandFormatVersion, CatalogCommandV1,
-        CatalogOutcomeV1, CatalogQuerySnapshot, CatalogRead, CatalogResponseV1,
-        CatalogSnapshotSelector, CatalogTableSnapshot, CatalogWrite, CommitCompactionCommand,
-        CommitConsumerOffsetCommand, CommitDataFilesCommand, CreateMaintenanceJobCommand,
-        CreateNamespaceCommand, CreateTableCommand, DropTableCommand, MaintenanceJobDescriptor,
-        MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor, ReleaseSnapshotLeaseCommand,
-        SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand, VersionedCatalogCommand,
-        VersionedCatalogResponse,
+        CatalogFingerprintError, CatalogOutcomeV1, CatalogQuerySnapshot, CatalogRead,
+        CatalogResponseV1, CatalogSnapshotSelector, CatalogTableSnapshot, CatalogWrite,
+        CommitCompactionCommand, CommitConsumerOffsetCommand, CommitDataFilesCommand,
+        CreateMaintenanceJobCommand, CreateNamespaceCommand, CreateTableCommand, DropTableCommand,
+        MaintenanceJobDescriptor, MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor,
+        ReleaseSnapshotLeaseCommand, SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand,
+        VersionedCatalogCommand, VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
     };
     use crate::table::{
         AppendTableDefinition, CatalogName, ColumnName, ColumnSet, DataFileDescriptor,
@@ -1638,6 +1745,69 @@ mod tests {
             envelope.canonical_fingerprint.to_string(),
             "d148e59fcc48fc11c53e25dd64683db613ea64c2562905dab4214828d982c5e0"
         );
+    }
+
+    #[test]
+    fn borrowed_manifest_fingerprint_wire_matches_owned_v1_wire() {
+        let mut manifest_commands = 0;
+        for command in nested_wire_commands() {
+            if !matches!(
+                &command,
+                CatalogCommandV1::CommitDataFiles(_) | CatalogCommandV1::CommitCompaction(_)
+            ) {
+                continue;
+            }
+            manifest_commands += 1;
+            let input = CatalogCommandFingerprintInputV1 {
+                format_version: CatalogCommandFormatVersion::v1(),
+                expected_revision: Some(17),
+                actor: actor(),
+                command,
+            };
+            let owned = serde_json::to_vec(&wire_v1::FingerprintInputV1::from(&input)).unwrap();
+            let borrowed = wire_v1::ManifestFingerprintInputRefV1::from_parts(
+                input.format_version,
+                input.expected_revision,
+                &input.actor,
+                &input.command,
+            )
+            .unwrap();
+
+            assert_eq!(serde_json::to_vec(&borrowed).unwrap(), owned);
+        }
+        assert_eq!(manifest_commands, 2);
+    }
+
+    #[test]
+    fn actor_principal_is_bounded_before_canonical_fingerprint_encoding() {
+        let at_limit = CatalogCommandFingerprintInputV1 {
+            format_version: CatalogCommandFormatVersion::v1(),
+            expected_revision: None,
+            actor: CatalogActor {
+                kind: CatalogActorKind::Server,
+                principal: "p".repeat(MAX_CATALOG_ACTOR_PRINCIPAL_BYTES),
+            },
+            command: command(),
+        };
+        assert!(at_limit.fingerprint().is_ok());
+
+        let oversized = CatalogCommandFingerprintInputV1 {
+            format_version: CatalogCommandFormatVersion::v1(),
+            expected_revision: None,
+            actor: CatalogActor {
+                kind: CatalogActorKind::Server,
+                principal: "p".repeat(MAX_CATALOG_ACTOR_PRINCIPAL_BYTES + 1),
+            },
+            command: command(),
+        };
+        assert!(matches!(
+            oversized.canonical_bytes(),
+            Err(CatalogFingerprintError::ActorPrincipalTooLarge { .. })
+        ));
+        assert!(matches!(
+            oversized.fingerprint(),
+            Err(CatalogFingerprintError::ActorPrincipalTooLarge { .. })
+        ));
     }
 
     #[test]

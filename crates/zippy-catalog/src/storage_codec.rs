@@ -1,7 +1,7 @@
 //! Versioned durable BLOB codecs and canonical Arrow schema validation.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use arrow::datatypes::{
@@ -9,6 +9,7 @@ use arrow::datatypes::{
 };
 use arrow::ipc::reader::StreamReader;
 use serde::de::DeserializeOwned;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -27,6 +28,7 @@ const MAX_SCHEMA_NESTING_DEPTH: usize = 32;
 const MAX_SCHEMA_METADATA_ENTRIES: usize = 4_096;
 const MAX_SCHEMA_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_TYPED_JSON_BYTES: usize = 1024 * 1024;
+const TYPED_JSON_CHUNK_BYTES: usize = 64 * 1024;
 const TYPED_JSON_MAGIC: &[u8; 3] = b"ZCJ";
 const TYPED_JSON_V1: u8 = 1;
 const TYPED_JSON_PREFIX: &[u8; 4] = b"ZCJ\x01";
@@ -736,10 +738,6 @@ pub(crate) fn decode_snapshot_summary_blob(encoded: &[u8]) -> Result<MetadataMap
 }
 
 /// Encodes data-file partition metadata through the frozen V1 storage DTO.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "manifest writers land after snapshot readers")
-)]
 pub(crate) fn encode_data_file_partition_blob(value: &MetadataMap) -> Result<Vec<u8>> {
     encode_metadata_map_blob(DATA_FILE_PARTITION_BLOB_KIND, value)
 }
@@ -750,10 +748,6 @@ pub(crate) fn decode_data_file_partition_blob(encoded: &[u8]) -> Result<Metadata
 }
 
 /// Encodes data-file statistics through the frozen V1 storage DTO.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "manifest writers land after snapshot readers")
-)]
 pub(crate) fn encode_data_file_statistics_blob(value: &MetadataMap) -> Result<Vec<u8>> {
     encode_metadata_map_blob(DATA_FILE_STATISTICS_BLOB_KIND, value)
 }
@@ -764,10 +758,6 @@ pub(crate) fn decode_data_file_statistics_blob(encoded: &[u8]) -> Result<Metadat
 }
 
 /// Encodes data-file metadata through the frozen V1 storage DTO.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "manifest writers land after snapshot readers")
-)]
 pub(crate) fn encode_data_file_metadata_blob(value: &MetadataMap) -> Result<Vec<u8>> {
     encode_metadata_map_blob(DATA_FILE_METADATA_BLOB_KIND, value)
 }
@@ -778,7 +768,7 @@ pub(crate) fn decode_data_file_metadata_blob(encoded: &[u8]) -> Result<MetadataM
 }
 
 fn encode_metadata_map_blob(kind: &str, value: &MetadataMap) -> Result<Vec<u8>> {
-    encode_versioned_json(kind, &StoredSnapshotSummaryV1::from(value))
+    encode_bounded_metadata_json(kind, &StoredSnapshotSummaryRefV1(value))
 }
 
 fn decode_metadata_map_blob(kind: &str, encoded: &[u8]) -> Result<MetadataMap> {
@@ -897,14 +887,18 @@ struct StoredTableConfigV1(BTreeMap<String, String>);
 #[serde(transparent)]
 struct StoredSnapshotSummaryV1(BTreeMap<String, StoredMetadataScalarV1>);
 
-impl From<&MetadataMap> for StoredSnapshotSummaryV1 {
-    fn from(value: &MetadataMap) -> Self {
-        Self(
-            value
-                .iter()
-                .map(|(key, scalar)| (key.clone(), StoredMetadataScalarV1::from(scalar)))
-                .collect(),
-        )
+struct StoredSnapshotSummaryRefV1<'a>(&'a MetadataMap);
+
+impl Serialize for StoredSnapshotSummaryRefV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0 {
+            map.serialize_entry(key, &StoredMetadataScalarRefV1::from(value))?;
+        }
+        map.end()
     }
 }
 
@@ -931,18 +925,31 @@ enum StoredMetadataScalarV1 {
     Bytes(Vec<u8>),
 }
 
-impl From<&MetadataScalar> for StoredMetadataScalarV1 {
-    fn from(value: &MetadataScalar) -> Self {
+#[derive(Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum StoredMetadataScalarRefV1<'a> {
+    Null,
+    Boolean(&'a bool),
+    Int64(&'a i64),
+    #[serde(rename = "uint64")]
+    UInt64(&'a u64),
+    Float64(StoredFiniteMetadataFloatV1),
+    String(&'a str),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> From<&'a MetadataScalar> for StoredMetadataScalarRefV1<'a> {
+    fn from(value: &'a MetadataScalar) -> Self {
         match value {
             MetadataScalar::Null => Self::Null,
-            MetadataScalar::Boolean(value) => Self::Boolean(*value),
-            MetadataScalar::Int64(value) => Self::Int64(*value),
-            MetadataScalar::UInt64(value) => Self::UInt64(*value),
+            MetadataScalar::Boolean(value) => Self::Boolean(value),
+            MetadataScalar::Int64(value) => Self::Int64(value),
+            MetadataScalar::UInt64(value) => Self::UInt64(value),
             MetadataScalar::Float64(value) => {
                 Self::Float64(StoredFiniteMetadataFloatV1::new(value.get()))
             }
-            MetadataScalar::String(value) => Self::String(value.clone()),
-            MetadataScalar::Bytes(value) => Self::Bytes(value.clone()),
+            MetadataScalar::String(value) => Self::String(value),
+            MetadataScalar::Bytes(value) => Self::Bytes(value),
         }
     }
 }
@@ -963,6 +970,7 @@ impl From<StoredMetadataScalarV1> for MetadataScalar {
     }
 }
 
+#[derive(Clone, Copy)]
 struct StoredFiniteMetadataFloatV1(u64);
 
 impl StoredFiniteMetadataFloatV1 {
@@ -1027,6 +1035,99 @@ where
     encoded.extend_from_slice(&checksum);
     encoded.extend_from_slice(&payload);
     Ok(encoded)
+}
+
+fn encode_bounded_metadata_json<T>(kind: &str, value: &T) -> Result<Vec<u8>>
+where
+    T: Serialize,
+{
+    let mut writer = BoundedJsonWriter::new(MAX_TYPED_JSON_BYTES);
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if let Some(actual) = writer.limit_exceeded_at {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "catalog typed BLOB exceeds limit kind=[{kind}] actual_bytes_at_least=[{actual}] maximum_bytes=[{MAX_TYPED_JSON_BYTES}]"
+                ),
+            ));
+        }
+        return Err(ServerError::new(
+            ErrorCode::Internal,
+            format!("encode catalog typed BLOB kind=[{kind}] error=[{error}]"),
+        ));
+    }
+    Ok(writer.into_typed_blob(kind))
+}
+
+struct BoundedJsonWriter {
+    chunks: Vec<Vec<u8>>,
+    length: usize,
+    maximum: usize,
+    limit_exceeded_at: Option<usize>,
+}
+
+impl BoundedJsonWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            chunks: Vec::new(),
+            length: 0,
+            maximum,
+            limit_exceeded_at: None,
+        }
+    }
+
+    fn into_typed_blob(self, kind: &str) -> Vec<u8> {
+        let checksum =
+            typed_json_checksum_parts(kind, self.chunks.iter().map(|chunk| chunk.as_slice()));
+        let mut encoded = Vec::with_capacity(TYPED_JSON_HEADER_BYTES + self.length);
+        encoded.extend_from_slice(TYPED_JSON_PREFIX);
+        encoded.extend_from_slice(&checksum);
+        for chunk in self.chunks {
+            encoded.extend_from_slice(&chunk);
+        }
+        encoded
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, mut input: &[u8]) -> std::io::Result<usize> {
+        let input_len = input.len();
+        let next = self.length.checked_add(input_len).ok_or_else(|| {
+            self.limit_exceeded_at = Some(usize::MAX);
+            std::io::Error::other("catalog typed JSON byte count overflow")
+        })?;
+        if next > self.maximum {
+            self.limit_exceeded_at = Some(next);
+            return Err(std::io::Error::other(
+                "catalog typed JSON byte limit exceeded",
+            ));
+        }
+        while !input.is_empty() {
+            let needs_chunk = self
+                .chunks
+                .last()
+                .is_none_or(|chunk| chunk.len() == TYPED_JSON_CHUNK_BYTES);
+            if needs_chunk {
+                let remaining = self.maximum - self.length;
+                self.chunks
+                    .push(Vec::with_capacity(TYPED_JSON_CHUNK_BYTES.min(remaining)));
+            }
+            let chunk = self
+                .chunks
+                .last_mut()
+                .expect("nonempty input creates a JSON chunk");
+            let available = TYPED_JSON_CHUNK_BYTES - chunk.len();
+            let copied = available.min(input.len());
+            chunk.extend_from_slice(&input[..copied]);
+            input = &input[copied..];
+            self.length += copied;
+        }
+        Ok(input_len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn decode_versioned_json<T>(kind: &str, encoded: &[u8]) -> Result<T>
@@ -1114,11 +1215,20 @@ fn sort_json_value(value: Value) -> Value {
 }
 
 fn typed_json_checksum(kind: &str, payload: &[u8]) -> [u8; SHA256_BYTES] {
+    typed_json_checksum_parts(kind, std::iter::once(payload))
+}
+
+fn typed_json_checksum_parts<'a>(
+    kind: &str,
+    payload: impl IntoIterator<Item = &'a [u8]>,
+) -> [u8; SHA256_BYTES] {
     let mut digest = Sha256::new();
     digest.update(TYPED_JSON_HASH_DOMAIN);
     digest.update(kind.as_bytes());
     digest.update([0]);
-    digest.update(payload);
+    for part in payload {
+        digest.update(part);
+    }
     digest.finalize().into()
 }
 
@@ -1402,6 +1512,15 @@ mod tests {
             encode_data_file_metadata_blob(&oversized)
                 .unwrap_err()
                 .code(),
+            ErrorCode::ResourceExhausted
+        );
+
+        let escaped = MetadataMap::from([(
+            "escaped".to_owned(),
+            MetadataScalar::String("\0".repeat(MAX_TYPED_JSON_BYTES / 2)),
+        )]);
+        assert_eq!(
+            encode_data_file_metadata_blob(&escaped).unwrap_err().code(),
             ErrorCode::ResourceExhausted
         );
 

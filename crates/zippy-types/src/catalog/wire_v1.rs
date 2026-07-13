@@ -5,7 +5,8 @@ use std::fmt::Display;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::*;
 use crate::table::{
@@ -83,11 +84,376 @@ impl From<&CatalogCommandFingerprintInputV1> for FingerprintInputV1 {
             actor,
             command,
         } = input;
+        Self::from_parts(*format_version, *expected_revision, actor, command)
+    }
+}
+
+impl FingerprintInputV1 {
+    pub(super) fn from_parts(
+        format_version: CatalogCommandFormatVersion,
+        expected_revision: Option<u64>,
+        actor: &CatalogActor,
+        command: &CatalogCommandV1,
+    ) -> Self {
         Self {
             format_version: format_version.get(),
-            expected_revision: *expected_revision,
+            expected_revision,
             actor: actor.into(),
             command: command.into(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct ManifestFingerprintInputRefV1<'a> {
+    format_version: u32,
+    expected_revision: Option<u64>,
+    actor: ActorRefV1<'a>,
+    command: ManifestCommandRefV1<'a>,
+}
+
+impl<'a> ManifestFingerprintInputRefV1<'a> {
+    pub(super) fn from_parts(
+        format_version: CatalogCommandFormatVersion,
+        expected_revision: Option<u64>,
+        actor: &'a CatalogActor,
+        command: &'a CatalogCommandV1,
+    ) -> Option<Self> {
+        let command = match command {
+            CatalogCommandV1::CommitDataFiles(command) => {
+                ManifestCommandRefV1::CommitDataFiles(CommitDataFilesRefV1::from(command))
+            }
+            CatalogCommandV1::CommitCompaction(command) => {
+                ManifestCommandRefV1::CommitCompaction(CommitCompactionRefV1::from(command))
+            }
+            _ => return None,
+        };
+        Some(Self {
+            format_version: format_version.get(),
+            expected_revision,
+            actor: ActorRefV1::from(actor),
+            command,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ActorRefV1<'a> {
+    kind: &'static str,
+    principal: &'a str,
+}
+
+impl<'a> From<&'a CatalogActor> for ActorRefV1<'a> {
+    fn from(actor: &'a CatalogActor) -> Self {
+        Self {
+            kind: match actor.kind {
+                CatalogActorKind::User => "user",
+                CatalogActorKind::Server => "server",
+                CatalogActorKind::Maintenance => "maintenance",
+                CatalogActorKind::Migration => "migration",
+            },
+            principal: actor.principal.as_str(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "command", rename_all = "snake_case")]
+enum ManifestCommandRefV1<'a> {
+    CommitDataFiles(CommitDataFilesRefV1<'a>),
+    CommitCompaction(CommitCompactionRefV1<'a>),
+}
+
+#[derive(Serialize)]
+struct CommitDataFilesRefV1<'a> {
+    table_id: DisplayRef<'a, TableId>,
+    expected_snapshot_version: u64,
+    files: PendingDataFilesRefV1<'a>,
+    committed_log_offset: OffsetWatermarkRefV1,
+}
+
+impl<'a> From<&'a CommitDataFilesCommand> for CommitDataFilesRefV1<'a> {
+    fn from(command: &'a CommitDataFilesCommand) -> Self {
+        Self {
+            table_id: DisplayRef(&command.table_id),
+            expected_snapshot_version: command.expected_snapshot_version,
+            files: PendingDataFilesRefV1(&command.files),
+            committed_log_offset: command.committed_log_offset.into(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CommitCompactionRefV1<'a> {
+    table_id: DisplayRef<'a, TableId>,
+    expected_snapshot_version: u64,
+    input_file_ids: DisplaySliceRefV1<'a, FileId>,
+    output_files: PendingDataFilesRefV1<'a>,
+    committed_log_offset: OffsetWatermarkRefV1,
+}
+
+impl<'a> From<&'a CommitCompactionCommand> for CommitCompactionRefV1<'a> {
+    fn from(command: &'a CommitCompactionCommand) -> Self {
+        Self {
+            table_id: DisplayRef(&command.table_id),
+            expected_snapshot_version: command.expected_snapshot_version,
+            input_file_ids: DisplaySliceRefV1(&command.input_file_ids),
+            output_files: PendingDataFilesRefV1(&command.output_files),
+            committed_log_offset: command.committed_log_offset.into(),
+        }
+    }
+}
+
+struct DisplayRef<'a, T>(&'a T);
+
+impl<T> Serialize for DisplayRef<'_, T>
+where
+    T: Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self.0)
+    }
+}
+
+struct DisplaySliceRefV1<'a, T>(&'a [T]);
+
+impl<T> Serialize for DisplaySliceRefV1<'_, T>
+where
+    T: Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for value in self.0 {
+            sequence.serialize_element(&DisplayRef(value))?;
+        }
+        sequence.end()
+    }
+}
+
+struct PendingDataFilesRefV1<'a>(&'a [PendingDataFile]);
+
+impl Serialize for PendingDataFilesRefV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for file in self.0 {
+            sequence.serialize_element(&PendingDataFileRefV1::from(file))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct PendingDataFileRefV1<'a> {
+    file_id: DisplayRef<'a, FileId>,
+    table_id: DisplayRef<'a, TableId>,
+    schema_version: u64,
+    location: DataFileLocationRefV1<'a>,
+    file_size_bytes: u64,
+    row_count: u64,
+    provenance: DataFileProvenanceRefV1<'a>,
+    partition: MetadataMapRefV1<'a>,
+    statistics: MetadataMapRefV1<'a>,
+    metadata: MetadataMapRefV1<'a>,
+    checksum: &'a str,
+    created_at_ns: u64,
+}
+
+impl<'a> From<&'a PendingDataFile> for PendingDataFileRefV1<'a> {
+    fn from(file: &'a PendingDataFile) -> Self {
+        Self {
+            file_id: DisplayRef(&file.file_id),
+            table_id: DisplayRef(&file.table_id),
+            schema_version: file.schema_version,
+            location: DataFileLocationRefV1::from(&file.location),
+            file_size_bytes: file.file_size_bytes,
+            row_count: file.row_count.get(),
+            provenance: DataFileProvenanceRefV1::from(&file.provenance),
+            partition: MetadataMapRefV1(&file.partition),
+            statistics: MetadataMapRefV1(&file.statistics),
+            metadata: MetadataMapRefV1(&file.metadata),
+            checksum: file.checksum.as_str(),
+            created_at_ns: file.created_at_ns,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "path", rename_all = "snake_case")]
+enum DataFileLocationRefV1<'a> {
+    Managed(&'a str),
+    ExternalLegacy(&'a str),
+}
+
+impl<'a> From<&'a DataFileLocation> for DataFileLocationRefV1<'a> {
+    fn from(location: &'a DataFileLocation) -> Self {
+        match location {
+            DataFileLocation::Managed(path) => Self::Managed(path.as_str()),
+            DataFileLocation::ExternalLegacy(path) => Self::ExternalLegacy(path.as_str()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DataFileProvenanceRefV1<'a> {
+    Native(NativeDataFileProvenanceRefV1<'a>),
+    Legacy {
+        offsets: Option<OffsetRangeRefV1>,
+        preserve_discovery_order: bool,
+    },
+}
+
+impl<'a> From<&'a DataFileProvenance> for DataFileProvenanceRefV1<'a> {
+    fn from(provenance: &'a DataFileProvenance) -> Self {
+        match provenance {
+            DataFileProvenance::Native(native) => Self::Native(NativeDataFileProvenanceRefV1 {
+                offsets: native.offsets().into(),
+                source_lineage: SourceLineagesRefV1(native.source_lineage().as_slice()),
+            }),
+            DataFileProvenance::Legacy {
+                offsets,
+                preserve_discovery_order,
+            } => Self::Legacy {
+                offsets: offsets.map(Into::into),
+                preserve_discovery_order: *preserve_discovery_order,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NativeDataFileProvenanceRefV1<'a> {
+    offsets: OffsetRangeRefV1,
+    source_lineage: SourceLineagesRefV1<'a>,
+}
+
+struct SourceLineagesRefV1<'a>(&'a [SourceSegmentLineage]);
+
+impl Serialize for SourceLineagesRefV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for lineage in self.0 {
+            sequence.serialize_element(&SourceSegmentLineageRefV1::from(lineage))?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct SourceSegmentLineageRefV1 {
+    source: SourceSegmentIdentityRefV1,
+    offsets: OffsetRangeRefV1,
+}
+
+impl From<&SourceSegmentLineage> for SourceSegmentLineageRefV1 {
+    fn from(lineage: &SourceSegmentLineage) -> Self {
+        Self {
+            source: lineage.source.into(),
+            offsets: lineage.offsets.into(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SourceSegmentIdentityRefV1 {
+    segment_id: u64,
+    generation: u64,
+    writer_epoch: u64,
+}
+
+impl From<SourceSegmentIdentity> for SourceSegmentIdentityRefV1 {
+    fn from(identity: SourceSegmentIdentity) -> Self {
+        Self {
+            segment_id: identity.segment_id,
+            generation: identity.generation,
+            writer_epoch: identity.writer_epoch,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OffsetRangeRefV1 {
+    first: u64,
+    last: u64,
+}
+
+impl From<OffsetRange> for OffsetRangeRefV1 {
+    fn from(range: OffsetRange) -> Self {
+        Self {
+            first: range.first().get(),
+            last: range.last().get(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", content = "offset", rename_all = "snake_case")]
+enum OffsetWatermarkRefV1 {
+    Empty,
+    Known(u64),
+    LegacyUnknown,
+}
+
+impl From<OffsetWatermark> for OffsetWatermarkRefV1 {
+    fn from(offset: OffsetWatermark) -> Self {
+        match offset {
+            OffsetWatermark::Empty => Self::Empty,
+            OffsetWatermark::Known(offset) => Self::Known(offset.get()),
+            OffsetWatermark::LegacyUnknown => Self::LegacyUnknown,
+        }
+    }
+}
+
+struct MetadataMapRefV1<'a>(&'a MetadataMap);
+
+impl Serialize for MetadataMapRefV1<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0 {
+            map.serialize_entry(key, &MetadataScalarRefV1::from(value))?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum MetadataScalarRefV1<'a> {
+    Null,
+    Boolean(&'a bool),
+    Int64(&'a i64),
+    #[serde(rename = "uint64")]
+    UInt64(&'a u64),
+    Float64(f64),
+    String(&'a str),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> From<&'a MetadataScalar> for MetadataScalarRefV1<'a> {
+    fn from(value: &'a MetadataScalar) -> Self {
+        match value {
+            MetadataScalar::Null => Self::Null,
+            MetadataScalar::Boolean(value) => Self::Boolean(value),
+            MetadataScalar::Int64(value) => Self::Int64(value),
+            MetadataScalar::UInt64(value) => Self::UInt64(value),
+            MetadataScalar::Float64(value) => Self::Float64(value.get()),
+            MetadataScalar::String(value) => Self::String(value),
+            MetadataScalar::Bytes(value) => Self::Bytes(value),
         }
     }
 }

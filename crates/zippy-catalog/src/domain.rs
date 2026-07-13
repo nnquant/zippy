@@ -34,6 +34,8 @@ struct StoredIdempotentResponse {
 enum PreparedCommand {
     CreateNamespace(CreateNamespaceCommand),
     CreateTable(crate::table_domain::PreparedCreateTable),
+    CommitDataFiles(crate::manifest_domain::PreparedCommitDataFiles),
+    CommitCompaction(crate::manifest_domain::PreparedCommitCompaction),
 }
 
 /// Replays a committed response without a writer lock or executes one mutation atomically.
@@ -64,6 +66,7 @@ pub(crate) fn execute_command(
         return Ok(response);
     }
 
+    let actor_kind = envelope.actor.kind;
     let prepared = match envelope.command {
         CatalogCommandV1::CreateNamespace(create) => {
             validate_new_catalog_name(&create.name, "namespace")
@@ -72,6 +75,14 @@ pub(crate) fn execute_command(
         }
         CatalogCommandV1::CreateTable(create) => PreparedCommand::CreateTable(
             crate::table_domain::prepare_create_table(create)
+                .map_err(|error| error.with_request_id(request_id))?,
+        ),
+        CatalogCommandV1::CommitDataFiles(commit) => PreparedCommand::CommitDataFiles(
+            crate::manifest_domain::prepare_commit_data_files(actor_kind, commit)
+                .map_err(|error| error.with_request_id(request_id))?,
+        ),
+        CatalogCommandV1::CommitCompaction(commit) => PreparedCommand::CommitCompaction(
+            crate::manifest_domain::prepare_commit_compaction(actor_kind, commit)
                 .map_err(|error| error.with_request_id(request_id))?,
         ),
         ref unsupported => {
@@ -129,6 +140,24 @@ pub(crate) fn execute_command(
         PreparedCommand::CreateTable(create) => CatalogOutcomeV1::Table(
             crate::table_domain::create_table(&transaction, create, next_revision, committed_at_ns)
                 .map_err(|error| error.with_request_id(request_id))?,
+        ),
+        PreparedCommand::CommitDataFiles(commit) => CatalogOutcomeV1::Snapshot(
+            crate::manifest_domain::commit_data_files(
+                &transaction,
+                commit,
+                next_revision,
+                committed_at_ns,
+            )
+            .map_err(|error| error.with_request_id(request_id))?,
+        ),
+        PreparedCommand::CommitCompaction(commit) => CatalogOutcomeV1::Snapshot(
+            crate::manifest_domain::commit_compaction(
+                &transaction,
+                commit,
+                next_revision,
+                committed_at_ns,
+            )
+            .map_err(|error| error.with_request_id(request_id))?,
         ),
     };
 

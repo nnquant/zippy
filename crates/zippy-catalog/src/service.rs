@@ -1,6 +1,8 @@
 //! Asynchronous Catalog traits backed by one connection-owning SQLite actor.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use rusqlite::Connection;
@@ -14,7 +16,7 @@ use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, Result, ServerError};
 
 use crate::SqliteCatalogConfig;
-use crate::{domain, snapshot_domain, table_domain};
+use crate::{domain, manifest_domain, snapshot_domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 
@@ -33,6 +35,7 @@ const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 pub struct SqliteCatalog {
     sender: Option<SyncSender<ServiceMessage>>,
     actor: Option<JoinHandle<()>>,
+    manifest_queue_budget: Arc<ManifestQueueBudget>,
 }
 
 impl SqliteCatalog {
@@ -45,6 +48,9 @@ impl SqliteCatalog {
         crate::validate_config(&config)?;
         let (sender, receiver) = mpsc::sync_channel(config.command_capacity);
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let manifest_queue_budget = Arc::new(ManifestQueueBudget::new(
+            config.manifest_queue_capacity_bytes,
+        ));
         let actor = thread::Builder::new()
             .name(SERVICE_ACTOR_THREAD_NAME.to_owned())
             .spawn(move || run_actor(config, receiver, startup_sender))
@@ -58,6 +64,7 @@ impl SqliteCatalog {
             Ok(Ok(())) => Ok(Self {
                 sender: Some(sender),
                 actor: Some(actor),
+                manifest_queue_budget,
             }),
             Ok(Err(error)) => {
                 join_startup_actor(actor)?;
@@ -191,8 +198,79 @@ impl CatalogWrite for SqliteCatalog {
         command: VersionedCatalogCommand,
     ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
         Box::pin(async move {
-            await_response(self.request(|sender| ServiceMessage::Command(command, sender))).await
+            let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command)?;
+            let VersionedCatalogCommand::V1(envelope) = &command;
+            let permit = self
+                .manifest_queue_budget
+                .reserve(queued_bytes)
+                .map_err(|error| error.with_request_id(envelope.request_id))?;
+            await_response(self.request(|sender| ServiceMessage::Command(command, permit, sender)))
+                .await
         })
+    }
+}
+
+struct ManifestQueueBudget {
+    used: AtomicUsize,
+    maximum: usize,
+}
+
+impl ManifestQueueBudget {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            maximum,
+        }
+    }
+
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Option<ManifestQueuePermit>> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(bytes).ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "sqlite catalog manifest queue byte reservation overflow",
+                )
+            })?;
+            if next > self.maximum {
+                return Err(ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "sqlite catalog manifest queue byte budget exhausted used=[{current}] requested=[{bytes}] maximum=[{}]",
+                        self.maximum
+                    ),
+                ));
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(Some(ManifestQueuePermit {
+                        budget: Arc::clone(self),
+                        bytes,
+                    }));
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct ManifestQueuePermit {
+    budget: Arc<ManifestQueueBudget>,
+    bytes: usize,
+}
+
+impl Drop for ManifestQueuePermit {
+    fn drop(&mut self) {
+        let previous = self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        debug_assert!(previous >= self.bytes);
     }
 }
 
@@ -215,6 +293,7 @@ enum ServiceMessage {
     ),
     Command(
         VersionedCatalogCommand,
+        Option<ManifestQueuePermit>,
         oneshot::Sender<Result<VersionedCatalogResponse>>,
     ),
     Shutdown(SyncSender<Result<()>>),
@@ -280,7 +359,7 @@ fn actor_loop(mut connection: Connection, receiver: Receiver<ServiceMessage>) {
                     ));
                 }
             }
-            ServiceMessage::Command(command, response) => {
+            ServiceMessage::Command(command, _manifest_permit, response) => {
                 let _ = response.send(domain::execute_command(&mut connection, command));
             }
             ServiceMessage::Shutdown(response) => {
@@ -322,5 +401,36 @@ impl Drop for SqliteCatalog {
         if let Err(error) = self.shutdown() {
             tracing::error!(error = %error, "sqlite catalog shutdown failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zippy_types::ErrorCode;
+
+    use super::ManifestQueueBudget;
+
+    #[test]
+    fn manifest_queue_budget_releases_completed_reservations() {
+        let budget = Arc::new(ManifestQueueBudget::new(8));
+        assert!(budget.reserve(0).expect("zero-byte reservation").is_none());
+
+        let permit = budget
+            .reserve(8)
+            .expect("reserve complete byte budget")
+            .expect("nonzero reservation returns a permit");
+        let error = budget
+            .reserve(1)
+            .err()
+            .expect("occupied byte budget must reject another reservation");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+
+        drop(permit);
+        assert!(budget
+            .reserve(8)
+            .expect("released byte budget can be reserved again")
+            .is_some());
     }
 }

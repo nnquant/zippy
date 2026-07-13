@@ -13,6 +13,7 @@
 
 mod domain;
 mod encoding;
+mod manifest_domain;
 mod migration;
 mod service;
 mod snapshot_domain;
@@ -42,7 +43,9 @@ pub const CATALOG_FORMAT: &str = "zippy.sqlite.catalog";
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INTEGRITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
+const DEFAULT_MANIFEST_QUEUE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMMAND_CAPACITY: usize = 4_096;
+const MAX_MANIFEST_QUEUE_CAPACITY_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_BUSY_TIMEOUT_MILLIS: u128 = i32::MAX as u128;
 const ACTOR_THREAD_NAME: &str = "zippy-catalog-actor";
 const QUICK_CHECK_PROGRESS_INTERVAL: i32 = 1_000;
@@ -73,6 +76,7 @@ pub struct SqliteCatalogConfig {
     busy_timeout: Duration,
     integrity_check_timeout: Duration,
     command_capacity: usize,
+    manifest_queue_capacity_bytes: usize,
 }
 
 impl SqliteCatalogConfig {
@@ -92,6 +96,7 @@ impl SqliteCatalogConfig {
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
             integrity_check_timeout: DEFAULT_INTEGRITY_CHECK_TIMEOUT,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
+            manifest_queue_capacity_bytes: DEFAULT_MANIFEST_QUEUE_CAPACITY_BYTES,
         }
     }
 
@@ -113,6 +118,16 @@ impl SqliteCatalogConfig {
     #[must_use]
     pub const fn with_command_capacity(mut self, command_capacity: usize) -> Self {
         self.command_capacity = command_capacity;
+        self
+    }
+
+    /// Overrides the aggregate bytes reserved by queued native manifest commands.
+    #[must_use]
+    pub const fn with_manifest_queue_capacity_bytes(
+        mut self,
+        manifest_queue_capacity_bytes: usize,
+    ) -> Self {
+        self.manifest_queue_capacity_bytes = manifest_queue_capacity_bytes;
         self
     }
 
@@ -595,6 +610,15 @@ fn validate_config(config: &SqliteCatalogConfig) -> Result<()> {
             format!(
                 "catalog command capacity is outside bounds min=[1] max=[{}] actual=[{}]",
                 MAX_COMMAND_CAPACITY, config.command_capacity
+            ),
+        ));
+    }
+    if !(1..=MAX_MANIFEST_QUEUE_CAPACITY_BYTES).contains(&config.manifest_queue_capacity_bytes) {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "catalog manifest queue byte capacity is outside bounds min=[1] max=[{}] actual=[{}]",
+                MAX_MANIFEST_QUEUE_CAPACITY_BYTES, config.manifest_queue_capacity_bytes
             ),
         ));
     }

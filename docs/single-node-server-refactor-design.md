@@ -459,11 +459,17 @@ state = 'committed'
 Compaction 不修改旧文件记录，而是在同一事务中：
 
 ```text
-insert compacted file with added_snapshot_version = S+1
-mark source files removed_snapshot_version = S+1
 insert table_snapshots(S+1)
+insert compacted files with added_snapshot_version = S+1
+insert compacted-file source lineage
+mark source files removed_snapshot_version = S+1 while keeping state = 'committed'
 update tables.current_snapshot_version = S+1
 ```
+
+`data_files.added_snapshot_version` 的外键是立即约束，因此 snapshot 必须先于 file row 写入；
+`removed_snapshot_version` 与 `tables.current_snapshot_version` 的外键虽然是 deferred，也统一按上述
+顺序执行。事务提交前的中间顺序对读者不可见。source file 在 GC 判定无旧 lease 前保持
+`committed`，否则旧 snapshot 会提前失去可见文件。
 
 长查询持有旧 snapshot lease 时仍能读取 source files。GC 只有在不存在早于删除版本的 lease 后
 才能物理删除文件。
@@ -510,6 +516,32 @@ validate request hash
 ```
 
 同一个 `request_id` 携带不同 request hash 必须失败，不能返回旧响应。
+
+冻结 V1 中的两个 manifest command 只定义 server-internal 的窄能力：
+
+- `CommitDataFiles` 只接受 append table 的非空、按 file ID 严格排序的 native 文件。新文件的
+  row count、offset range 和 source lineage 必须完全一致；所有新范围的并集必须从 parent
+  watermark 的下一 offset 连续开始，并恰好结束于 command 的 `committed_log_offset`。
+- `CommitCompaction` 只接受 append table 的 row-preserving compaction。输入必须是规划 snapshot
+  中精确可见且按 file ID 严格排序的集合；输出的 row count、offset、按 schema version 分组的
+  offset coverage 与 source-lineage 并集必须与输入完全一致，且 `committed_log_offset` 必须等于
+  parent snapshot，不能借 compaction 推进水位或改写 schema。
+- SQLite admission 在进入 actor writer lock 前限制 new/output files 与 compaction inputs 各 4096
+  个、每文件 lineage 4096 条、总 lineage 65536 条、每 command 编码 metadata 64 MiB，以及每个
+  typed metadata BLOB 1 MiB；所有累计使用 checked arithmetic。进入 actor queue 前还会按命令的
+  输入结构预留内存，队列聚合预算默认 128 MiB 且可配置，避免 64 个最大命令同时驻留。
+  metadata JSON 使用 64 KiB 分块、有 1 MiB 硬上限的 writer，escaped string 超限时不会先构造
+  完整膨胀 JSON；command fingerprint 也直接把 canonical JSON 流入 SHA-256，不分配整条编码。
+  所有 catalog command 的 actor principal 在入队前限制为 4 KiB；manifest reservation 计入该
+  字符串，避免用超长审计身份绕过队列字节背压。
+
+这两个 command 不携带 producer ID/epoch/batch sequence，不能作为 producer-fenced public ingest
+协议；也不携带 maintenance job/lease generation/lease-bound worker identity，不能作为
+lease-fenced worker 协议。envelope 中的 actor 只是审计元数据，不是 RPC 鉴权或 lease token。
+文件和目录 fsync、producer fencing、maintenance lease 校验均由上层在调用前完成。
+preserve-order legacy 缺少 discovery ordinal，frame rewrite 缺少类型化 frame coverage，KV
+materialization 也不是 row-preserving；这些语义必须进入 V2 command，V1 明确返回
+`UnsupportedPlan`。
 
 ### 5.5 Catalog read snapshot
 
@@ -1725,14 +1757,19 @@ frontend 依赖 QueryService 的 query lifecycle，不应先用 Flight 包装 le
 
 当前实施状态（2026-07-13）：physical v2 domain schema、无损 BLOB 编码、physical v3 active-table
 cursor indexes、v1/v2 -> v3 migration、schema inventory、`CreateNamespace`/`CreateTable` 单写者事务、
-namespace/table get/list/resolve 和跨重启幂等回放已经实现。`CreateTable` 在同一事务中写入 table、
-schema version 1、snapshot version 1、catalog revision 与幂等响应；Arrow Schema 在获取 writer lock
-前按有界 schema-only IPC stream 校验：IPC payload 不超过 16 MiB、递归 field 不超过 4096、嵌套
-不超过 32 层、metadata 不超过 4096 项/1 MiB，FlatBuffer verifier 最多遍历 32768 个 table 和
-16 MiB apparent size；schema 以版本化 canonical logical SHA-256
+server-internal native append `CommitDataFiles`、append row-preserving `CommitCompaction`、
+namespace/table get/list/resolve 和跨重启幂等回放已经实现。manifest command 在同一个 immediate
+transaction 中先写 snapshot，再写 files/lineage、标记 compaction inputs、切换 current snapshot，
+最后提交 catalog revision 与幂等响应；严格验证 watermark 连续性，以及 input/output 的 row、
+logical offset、schema-version coverage 和 lineage 等价。
+`CreateTable` 在同一事务中写入 table、schema version 1、snapshot version 1、catalog revision 与幂等
+响应；Arrow Schema 在获取 writer lock 前按有界 schema-only IPC stream 校验：IPC payload 不超过
+16 MiB、递归 field 不超过 4096、嵌套不超过 32 层、metadata 不超过 4096 项/1 MiB，FlatBuffer
+verifier 最多遍历 32768 个 table 和 16 MiB apparent size；schema 以版本化 canonical logical SHA-256
 （`sha256-v1:<64 hex>`）标识；持久化 typed BLOB 通过冻结的 V1 storage DTO 编解码，避免运行时
-domain 类型演进静默改变落盘格式。其余 V1 mutation command、
-legacy importer/shadow/diff、绝对 shutdown deadline 尚未实现，因此 SQLite 仍不能成为
+domain 类型演进静默改变落盘格式。其余 V1 mutation command、producer-fenced public ingest、
+maintenance lease-fenced worker、legacy/frame/KV V2 manifest、legacy importer/shadow/diff、
+manifest preparation 与 read actor 隔离、绝对 shutdown deadline 尚未实现，因此 SQLite 仍不能成为
 `zippy server run` 的 read/write authority。modern manifest 的多表 exact `CatalogQuerySnapshot` 已在
 同一个 deferred transaction 中读取 table/schema/snapshot/visible files/native lineage；schema IPC 与
 hash、snapshot chain、metadata checksum、file visibility 和 lineage coverage 都会重新验证。
@@ -1753,6 +1790,14 @@ LegacyCatalogAdapter 的历史名称域，避免合法但超大的新请求在�
 队首阻塞；另外按实际落盘 name/definition/config 编码大小执行 4 MiB 单行 admission check，保证
 分页游标始终可以推进。迁移的版本读取、schema fingerprint 校验和所有待执行 migration 由同一个
 `BEGIN IMMEDIATE` 覆盖，因此并发首次打开或 v1/v2 升级不会使用锁外的过期版本判断。
+
+V1 manifest admission 同样在 writer lock 前执行：new/output files 与 compaction inputs 各最多
+4096 个，每文件 source lineage 最多 4096 条、每 command 总计最多 65536 条，三类 metadata 的
+实际编码总量最多 64 MiB，单个 partition/statistics/metadata typed BLOB 最多 1 MiB。该预算既限制
+内存，也限制单连接 writer 的锁持有时间；超过边界统一返回 `ResourceExhausted`，不会产生部分
+snapshot。进入 actor queue 前另按命令输入估算并原子预留字节，默认聚合上限 128 MiB，可通过
+`SqliteCatalogConfig::with_manifest_queue_capacity_bytes` 调整；它限制排队驻留内存，不替代上述
+单命令实际编码上限。
 
 SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立版本空间，不能用同一个
 “v1/v2”标签推断彼此已实现。

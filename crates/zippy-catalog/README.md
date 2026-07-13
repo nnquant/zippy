@@ -10,7 +10,7 @@ Implemented:
   actor thread;
 - the actor revalidates managed directories and opens `catalog.db` with
   `SQLITE_OPEN_NOFOLLOW`;
-- a bounded actor command queue rejects excess inspection work;
+- a bounded actor command queue rejects excess read or mutation work;
 - WAL, `synchronous=FULL`, foreign keys, disabled auto-checkpoint, busy timeout;
 - transactional physical migrations with `user_version`, checksum audit, and
   catalog metadata;
@@ -52,7 +52,26 @@ Implemented:
 - exact multi-table snapshots read table, schema, snapshot, visible files, and
   native lineage from one deferred transaction. Admission is capped at 4,096
   strictly ordered selectors; each all-or-nothing response is capped at 64 MiB,
-  65,536 visible files, and 262,144 lineage rows before owned allocation.
+  65,536 visible files, and 262,144 lineage rows before owned allocation;
+- server-internal frozen V1 manifest commits for native append tables:
+  `CommitDataFiles` advances one contiguous persisted watermark, while
+  `CommitCompaction` atomically replaces an exact visible input set with
+  row- and schema-preserving outputs. Both write the new snapshot before its
+  files, preserve exact historical visibility, and commit catalog revision plus
+  idempotent response in the same immediate transaction;
+- manifest admission before writer-lock acquisition: at most 4,096 new/output
+  files, 4,096 compaction inputs, 4,096 lineage rows per file, 65,536 lineage
+  rows in total, 64 MiB of encoded metadata per command, and 1 MiB per typed
+  partition/statistics/metadata BLOB;
+- metadata typed JSON is serialized through a 64 KiB chunked writer with a hard
+  1 MiB logical limit, so escaped strings cannot create an unbounded temporary
+  JSON allocation. Command fingerprints stream canonical JSON into SHA-256
+  rather than allocating the complete escaped command bytes;
+- queued manifest commands reserve an estimated in-memory byte charge before
+  enqueue. The configurable aggregate queue budget defaults to 128 MiB, so the
+  64-entry command queue cannot retain gigabytes of maximum-sized manifests.
+  Actor principals are capped at 4 KiB before every command enters the queue
+  and are included in each manifest reservation.
 
 Physical SQLite schema versions and `CatalogCommand` wire versions are separate
 version spaces. Physical v1 remains the immutable migration foundation.
@@ -72,8 +91,13 @@ Current typed capability matrix:
 | `CreateNamespace` and namespace discovery | implemented |
 | `CreateTable` and active table get/list/resolve | implemented transactionally |
 | exact modern multi-table query snapshots | implemented transactionally |
+| server-internal native append `CommitDataFiles` | implemented transactionally with contiguous watermark and lineage validation |
+| server-internal append row-preserving `CommitCompaction` | implemented transactionally with exact input/output coverage |
 | preserved legacy discovery-order snapshots | `UnsupportedPlan` pending V2 read DTO |
-| alter/drop/schema/manifest/producer/consumer/job commands | `UnsupportedPlan` |
+| producer-fenced public ingest manifest protocol | not provided by V1 manifest commands |
+| maintenance lease-fenced compaction worker protocol | not provided by V1 manifest commands |
+| legacy, frame-aware, or key-value materializing manifest mutations | `UnsupportedPlan` pending V2 commands |
+| alter/drop/schema/producer/consumer/job commands | `UnsupportedPlan` |
 | legacy primary + SQLite shadow fan-out | not connected |
 | SQLite read or write authority | disabled |
 
@@ -83,13 +107,27 @@ reads support native files and legacy files that do not require preserved
 discovery order. A request containing any visible preserve-order legacy file
 fails atomically with `UnsupportedPlan`; V2 must carry explicit scan order.
 
-Before server integration, the Catalog must still add remaining table and
-manifest command execution, a V2 legacy scan-order read contract, process-level
-ownership, network filesystem rejection, directory-handle pinning against
-parent replacement races,
-process-kill crash failpoints, and an absolute shutdown deadline. The current
-reliable `close` may wait indefinitely for an actor already executing work;
-dropping the handle invokes the same shutdown path.
+The V1 manifest commands are deliberately narrow Catalog primitives, not public
+ingest or maintenance-worker protocols. They carry no producer identity, epoch,
+batch sequence, maintenance job, or lease-bound worker identity. The envelope
+actor is audit metadata, not an RPC authentication or lease-fencing boundary.
+The server must complete file and directory durability plus producer fencing
+before `CommitDataFiles`; a maintenance coordinator must validate its job lease
+before `CommitCompaction`. V1 accepts only native append data. Persisted file
+ranges must form the exact contiguous interval after the parent watermark and
+end at the requested watermark. Compaction cannot change that watermark, row
+count, logical-offset coverage, or aggregate source-lineage coverage of its
+exact visible input set. Schema-version-specific logical coverage must also be
+identical; schema rewrites require a later command version.
+
+Before server integration, the Catalog must still add remaining table commands,
+public producer-fenced ingest and lease-fenced maintenance orchestration, V2
+legacy/frame/key-value manifest contracts, a V2 legacy scan-order read contract,
+process-level ownership, network filesystem rejection, directory-handle pinning
+against parent replacement races, manifest preparation isolation from the
+shared Catalog actor, process-kill crash failpoints, and an absolute shutdown
+deadline. The current reliable `close` may wait indefinitely for an actor
+already executing work; dropping the handle invokes the same shutdown path.
 
 The integrity timeout bounds SQLite VM progress-handler checks, not all wall
 time spent opening files, waiting in filesystem I/O, or running migrations.
