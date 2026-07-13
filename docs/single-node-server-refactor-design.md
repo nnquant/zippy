@@ -1732,10 +1732,18 @@ schema version 1、snapshot version 1、catalog revision 与幂等响应；Arrow
 16 MiB apparent size；schema 以版本化 canonical logical SHA-256
 （`sha256-v1:<64 hex>`）标识；持久化 typed BLOB 通过冻结的 V1 storage DTO 编解码，避免运行时
 domain 类型演进静默改变落盘格式。其余 V1 mutation command、
-非空 `CatalogQuerySnapshot`、legacy importer/shadow/diff、绝对 shutdown deadline 尚未实现，因此
-SQLite 仍不能成为 `zippy server run` 的 read/write authority。physical schema 中已经保留 legacy
-discovery order，但 frozen V1 snapshot DTO 无法无损携带该顺序；在 V2 typed read contract 冻结前，
-非空 snapshot read 必须返回 `UnsupportedPlan`。
+legacy importer/shadow/diff、绝对 shutdown deadline 尚未实现，因此 SQLite 仍不能成为
+`zippy server run` 的 read/write authority。modern manifest 的多表 exact `CatalogQuerySnapshot` 已在
+同一个 deferred transaction 中读取 table/schema/snapshot/visible files/native lineage；schema IPC 与
+hash、snapshot chain、metadata checksum、file visibility 和 lineage coverage 都会重新验证。
+
+snapshot admission 要求 selector 按 table ID 严格升序且版本非零，最多 4096 张表；全有或全无的
+raw response 上限为 64 MiB、65536 个 visible files 和 262144 条 source lineage。historical manifest
+通过 `data_files_visible_by_table` seek，不在 SQLite 内 `ORDER BY`，而是在预算内按 file ID 做 Rust
+排序，避免临时 B-tree；lineage 按最多 512 个 file ID 分块读取，避免逐文件 N+1。physical schema
+已经保留 legacy discovery order，但当前 snapshot DTO 无法无损携带该顺序；native 与
+`preserve_discovery_order=false` 的 legacy 文件可读，任何可见 preserve-order legacy 文件都会让
+整次请求返回 `UnsupportedPlan`。完整兼容仍需 V2 typed read contract 显式携带 scan order。
 
 轻量 table discovery 同时受条数与字节预算约束：list page 最多 4096 项，并在累计 raw descriptor
 达到 4 MiB 前提前结束、返回可继续的 keyset cursor；`resolve_tables` 保持全有或全无，累计超过

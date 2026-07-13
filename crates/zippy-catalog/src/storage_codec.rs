@@ -39,6 +39,9 @@ const SCHEMA_HASH_PREFIX: &str = "sha256-v1:";
 const TABLE_DEFINITION_BLOB_KIND: &str = "table_definition";
 const TABLE_CONFIG_BLOB_KIND: &str = "table_config";
 const SNAPSHOT_SUMMARY_BLOB_KIND: &str = "snapshot_summary";
+const DATA_FILE_PARTITION_BLOB_KIND: &str = "data_file_partition";
+const DATA_FILE_STATISTICS_BLOB_KIND: &str = "data_file_statistics";
+const DATA_FILE_METADATA_BLOB_KIND: &str = "data_file_metadata";
 
 /// Decodes exactly one schema-only Arrow IPC stream supplied by a command.
 pub(crate) fn decode_schema_ipc_stream(payload: &[u8]) -> Result<SchemaRef> {
@@ -724,10 +727,64 @@ pub(crate) fn decode_table_config_blob(encoded: &[u8]) -> Result<BTreeMap<String
 
 /// Encodes snapshot summary metadata through the frozen V1 storage DTO.
 pub(crate) fn encode_snapshot_summary_blob(value: &MetadataMap) -> Result<Vec<u8>> {
-    encode_versioned_json(
-        SNAPSHOT_SUMMARY_BLOB_KIND,
-        &StoredSnapshotSummaryV1::from(value),
-    )
+    encode_metadata_map_blob(SNAPSHOT_SUMMARY_BLOB_KIND, value)
+}
+
+/// Decodes snapshot summary metadata through the historical version dispatcher.
+pub(crate) fn decode_snapshot_summary_blob(encoded: &[u8]) -> Result<MetadataMap> {
+    decode_metadata_map_blob(SNAPSHOT_SUMMARY_BLOB_KIND, encoded)
+}
+
+/// Encodes data-file partition metadata through the frozen V1 storage DTO.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "manifest writers land after snapshot readers")
+)]
+pub(crate) fn encode_data_file_partition_blob(value: &MetadataMap) -> Result<Vec<u8>> {
+    encode_metadata_map_blob(DATA_FILE_PARTITION_BLOB_KIND, value)
+}
+
+/// Decodes data-file partition metadata through the historical version dispatcher.
+pub(crate) fn decode_data_file_partition_blob(encoded: &[u8]) -> Result<MetadataMap> {
+    decode_metadata_map_blob(DATA_FILE_PARTITION_BLOB_KIND, encoded)
+}
+
+/// Encodes data-file statistics through the frozen V1 storage DTO.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "manifest writers land after snapshot readers")
+)]
+pub(crate) fn encode_data_file_statistics_blob(value: &MetadataMap) -> Result<Vec<u8>> {
+    encode_metadata_map_blob(DATA_FILE_STATISTICS_BLOB_KIND, value)
+}
+
+/// Decodes data-file statistics through the historical version dispatcher.
+pub(crate) fn decode_data_file_statistics_blob(encoded: &[u8]) -> Result<MetadataMap> {
+    decode_metadata_map_blob(DATA_FILE_STATISTICS_BLOB_KIND, encoded)
+}
+
+/// Encodes data-file metadata through the frozen V1 storage DTO.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "manifest writers land after snapshot readers")
+)]
+pub(crate) fn encode_data_file_metadata_blob(value: &MetadataMap) -> Result<Vec<u8>> {
+    encode_metadata_map_blob(DATA_FILE_METADATA_BLOB_KIND, value)
+}
+
+/// Decodes data-file metadata through the historical version dispatcher.
+pub(crate) fn decode_data_file_metadata_blob(encoded: &[u8]) -> Result<MetadataMap> {
+    decode_metadata_map_blob(DATA_FILE_METADATA_BLOB_KIND, encoded)
+}
+
+fn encode_metadata_map_blob(kind: &str, value: &MetadataMap) -> Result<Vec<u8>> {
+    encode_versioned_json(kind, &StoredSnapshotSummaryV1::from(value))
+}
+
+fn decode_metadata_map_blob(kind: &str, encoded: &[u8]) -> Result<MetadataMap> {
+    Ok(MetadataMap::from(decode_versioned_json::<
+        StoredSnapshotSummaryV1,
+    >(kind, encoded)?))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1085,14 +1142,16 @@ mod tests {
     use zippy_types::ErrorCode;
 
     use super::{
-        canonical_schema_hash, decode_schema_ipc_stream, decode_table_config_blob,
-        decode_table_definition_blob, decode_versioned_json, encode_snapshot_summary_blob,
-        encode_table_config_blob, encode_table_definition_blob, typed_json_checksum,
-        StoredSnapshotSummaryV1, StoredTableConfigV1, StoredTableDefinitionV1,
+        canonical_schema_hash, decode_data_file_metadata_blob, decode_data_file_partition_blob,
+        decode_data_file_statistics_blob, decode_schema_ipc_stream, decode_snapshot_summary_blob,
+        decode_table_config_blob, decode_table_definition_blob, decode_versioned_json,
+        encode_data_file_metadata_blob, encode_data_file_partition_blob,
+        encode_data_file_statistics_blob, encode_snapshot_summary_blob, encode_table_config_blob,
+        encode_table_definition_blob, typed_json_checksum, StoredTableConfigV1,
+        StoredTableDefinitionV1, DATA_FILE_METADATA_BLOB_KIND,
         MAX_SCHEMA_FLATBUFFER_APPARENT_BYTES, MAX_SCHEMA_METADATA_BYTES,
         MAX_SCHEMA_METADATA_ENTRIES, MAX_SCHEMA_NESTING_DEPTH, MAX_SCHEMA_TOTAL_FIELDS,
-        SNAPSHOT_SUMMARY_BLOB_KIND, TABLE_CONFIG_BLOB_KIND, TYPED_JSON_HEADER_BYTES,
-        TYPED_JSON_PREFIX,
+        MAX_TYPED_JSON_BYTES, TABLE_CONFIG_BLOB_KIND, TYPED_JSON_HEADER_BYTES, TYPED_JSON_PREFIX,
     };
 
     fn schema_payload(schema: &Schema, include_batch: bool) -> Vec<u8> {
@@ -1257,12 +1316,105 @@ mod tests {
             ("uint".to_owned(), MetadataScalar::UInt64(u64::MAX)),
         ]);
         let encoded_summary = encode_snapshot_summary_blob(&summary).unwrap();
-        let decoded_summary = decode_versioned_json::<StoredSnapshotSummaryV1>(
-            SNAPSHOT_SUMMARY_BLOB_KIND,
-            &encoded_summary,
-        )
-        .unwrap();
-        assert_eq!(MetadataMap::from(decoded_summary), summary);
+        assert_eq!(
+            decode_snapshot_summary_blob(&encoded_summary).unwrap(),
+            summary
+        );
+    }
+
+    #[test]
+    fn metadata_blob_v1_golden_round_trips_and_binds_checksum_domains() {
+        const GOLDEN_PAYLOAD: &[u8] = br#"{"rows":{"type":"uint64","value":7}}"#;
+        const GOLDEN_CHECKSUMS: [[u8; 32]; 4] = [
+            [
+                0x3c, 0xfc, 0x16, 0x4e, 0x86, 0xf5, 0x64, 0xcf, 0xab, 0xc6, 0x3e, 0xfa, 0xb6, 0xa5,
+                0x90, 0xb0, 0x5a, 0x8b, 0x7a, 0xa8, 0xa4, 0x30, 0xc1, 0x39, 0x81, 0x99, 0xe6, 0x85,
+                0x2b, 0xcd, 0xda, 0x6a,
+            ],
+            [
+                0x0f, 0x63, 0x31, 0xcc, 0x79, 0x70, 0xff, 0x2a, 0x2b, 0x21, 0x11, 0x3a, 0x7d, 0x76,
+                0x3b, 0x28, 0xfb, 0x31, 0x2a, 0x83, 0x5a, 0x78, 0x91, 0xd0, 0xf7, 0xbb, 0x29, 0x10,
+                0x75, 0x24, 0x5e, 0xd6,
+            ],
+            [
+                0x20, 0x5b, 0xca, 0xd3, 0x39, 0x62, 0x51, 0xb5, 0x0f, 0xed, 0xa2, 0x98, 0xfb, 0x36,
+                0x84, 0x5f, 0xa7, 0x4e, 0x6a, 0x62, 0x2b, 0x80, 0x83, 0x0e, 0xf8, 0xc3, 0x33, 0xfc,
+                0x0d, 0x28, 0x66, 0xc0,
+            ],
+            [
+                0x93, 0x66, 0x90, 0xde, 0x4e, 0x59, 0xed, 0x3c, 0x1b, 0x31, 0x1e, 0x9d, 0xf9, 0xcb,
+                0x40, 0x45, 0xe2, 0xa8, 0x3a, 0x44, 0x6d, 0xdf, 0x1f, 0xc7, 0xaf, 0x23, 0x8d, 0x5f,
+                0x78, 0x44, 0xe3, 0xfd,
+            ],
+        ];
+
+        let metadata = MetadataMap::from([("rows".to_owned(), MetadataScalar::UInt64(7))]);
+        let encoded = [
+            encode_snapshot_summary_blob(&metadata).unwrap(),
+            encode_data_file_partition_blob(&metadata).unwrap(),
+            encode_data_file_statistics_blob(&metadata).unwrap(),
+            encode_data_file_metadata_blob(&metadata).unwrap(),
+        ];
+        type MetadataBlobDecoder = fn(&[u8]) -> zippy_types::Result<MetadataMap>;
+        let decoders: [MetadataBlobDecoder; 4] = [
+            decode_snapshot_summary_blob,
+            decode_data_file_partition_blob,
+            decode_data_file_statistics_blob,
+            decode_data_file_metadata_blob,
+        ];
+
+        for (index, blob) in encoded.iter().enumerate() {
+            assert_eq!(&blob[..TYPED_JSON_PREFIX.len()], TYPED_JSON_PREFIX);
+            assert_eq!(
+                &blob[TYPED_JSON_PREFIX.len()..TYPED_JSON_HEADER_BYTES],
+                GOLDEN_CHECKSUMS[index]
+            );
+            assert_eq!(&blob[TYPED_JSON_HEADER_BYTES..], GOLDEN_PAYLOAD);
+
+            for (decoder_index, decoder) in decoders.iter().enumerate() {
+                if decoder_index == index {
+                    assert_eq!(decoder(blob).unwrap(), metadata);
+                } else {
+                    assert_eq!(
+                        decoder(blob).unwrap_err().code(),
+                        ErrorCode::DataCorruption,
+                        "metadata BLOB must reject a checksum from a different kind"
+                    );
+                }
+            }
+
+            let mut tampered = blob.clone();
+            *tampered.last_mut().unwrap() ^= 1;
+            assert_eq!(
+                decoders[index](&tampered).unwrap_err().code(),
+                ErrorCode::DataCorruption
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_blob_v1_rejects_oversized_encode_and_decode_payloads() {
+        let oversized = MetadataMap::from([(
+            "oversized".to_owned(),
+            MetadataScalar::String("x".repeat(MAX_TYPED_JSON_BYTES)),
+        )]);
+        assert_eq!(
+            encode_data_file_metadata_blob(&oversized)
+                .unwrap_err()
+                .code(),
+            ErrorCode::ResourceExhausted
+        );
+
+        let payload = vec![b'0'; MAX_TYPED_JSON_BYTES + 1];
+        let checksum = typed_json_checksum(DATA_FILE_METADATA_BLOB_KIND, &payload);
+        let mut encoded = Vec::with_capacity(TYPED_JSON_HEADER_BYTES + payload.len());
+        encoded.extend_from_slice(TYPED_JSON_PREFIX);
+        encoded.extend_from_slice(&checksum);
+        encoded.extend_from_slice(&payload);
+        assert_eq!(
+            decode_data_file_metadata_blob(&encoded).unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{DataDirectory, ManagedDataDirectory};
@@ -17,9 +18,10 @@ use zippy_types::catalog::{
 };
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FrameTableDefinition,
-    KeyValueTableDefinition, SchemaIpcPayload, TableDefinition, TableRef, TableState,
+    KeyValueTableDefinition, SchemaCompatibility, SchemaIpcPayload, SnapshotOperation,
+    TableDefinition, TableRef, TableState,
 };
-use zippy_types::{ErrorCode, NamespaceId, RequestId, TableId};
+use zippy_types::{ErrorCode, FileId, NamespaceId, RequestId, TableId};
 
 type RawInitialSnapshotRow = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
@@ -52,6 +54,10 @@ fn namespace_id(value: u128) -> NamespaceId {
 
 fn table_id(value: u128) -> TableId {
     TableId::from_u128(value).expect("test table id must be nonzero")
+}
+
+fn file_id(value: u128) -> FileId {
+    FileId::from_u128(value).expect("test file id must be nonzero")
 }
 
 fn create_namespace(
@@ -148,6 +154,81 @@ fn append_definition() -> TableDefinition {
 
 fn decode_u64_blob(value: Vec<u8>) -> u64 {
     u64::from_be_bytes(value.try_into().expect("eight-byte unsigned encoding"))
+}
+
+fn encode_optional_u64(value: Option<u64>) -> [u8; 9] {
+    let mut encoded = [0_u8; 9];
+    if let Some(value) = value {
+        encoded[0] = 1;
+        encoded[1..].copy_from_slice(&value.to_be_bytes());
+    }
+    encoded
+}
+
+fn empty_metadata_blob(kind: &str) -> Vec<u8> {
+    const HASH_DOMAIN: &[u8] = b"zippy.catalog.typed-json.v1\0";
+    const PAYLOAD: &[u8] = b"{}";
+
+    let mut digest = Sha256::new();
+    digest.update(HASH_DOMAIN);
+    digest.update(kind.as_bytes());
+    digest.update([0]);
+    digest.update(PAYLOAD);
+    let mut encoded = b"ZCJ\x01".to_vec();
+    encoded.extend_from_slice(&digest.finalize());
+    encoded.extend_from_slice(PAYLOAD);
+    encoded
+}
+
+fn insert_legacy_data_file(
+    connection: &Connection,
+    table: TableId,
+    file: FileId,
+    preserve_discovery_order: bool,
+) {
+    let table_id = table.into_bytes();
+    let file_id = file.into_bytes();
+    let schema_version = 1_u64.to_be_bytes();
+    let file_size_bytes = 1_024_u64.to_be_bytes();
+    let row_count = 10_u64.to_be_bytes();
+    let absent = encode_optional_u64(None);
+    let legacy_order = encode_optional_u64(preserve_discovery_order.then_some(0));
+    let added_snapshot_version = 2_u64.to_be_bytes();
+    let created_at_ns = 1_u64.to_be_bytes();
+    let partition_blob = empty_metadata_blob("data_file_partition");
+    let statistics_blob = empty_metadata_blob("data_file_statistics");
+    let metadata_blob = empty_metadata_blob("data_file_metadata");
+    connection
+        .execute(
+            "INSERT INTO data_files(\
+                 file_id, table_id, schema_version, location_kind, file_path, \
+                 file_size_bytes, row_count, provenance_kind, min_log_offset, \
+                 max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+                 partition_blob, statistics_blob, metadata_blob, checksum, \
+                 added_snapshot_version, removed_snapshot_version, state, created_at_ns\
+             ) VALUES (\
+                 ?1, ?2, ?3, 'external_legacy', ?4, ?5, ?6, 'legacy', ?7, ?7, \
+                 ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?7, 'committed', ?15\
+             )",
+            rusqlite::params![
+                file_id.as_slice(),
+                table_id.as_slice(),
+                schema_version.as_slice(),
+                format!("/tmp/zippy-catalog-file-{}.parquet", file),
+                file_size_bytes.as_slice(),
+                row_count.as_slice(),
+                absent.as_slice(),
+                i64::from(preserve_discovery_order),
+                legacy_order.as_slice(),
+                partition_blob,
+                statistics_blob,
+                metadata_blob,
+                format!("sha256-v1:{:032x}", u128::from_be_bytes(file_id)),
+                added_snapshot_version.as_slice(),
+                created_at_ns.as_slice(),
+            ],
+        )
+        .expect("insert raw legacy data file");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -272,6 +353,41 @@ async fn creates_table_atomically_and_replays_exactly_across_restart() {
             .expect("get created table"),
         *created
     );
+    let selector = CatalogSnapshotSelector {
+        table_id: table_id(1),
+        snapshot_version: 1,
+        schema_version: 1,
+    };
+    let query_snapshot = catalog
+        .read_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect("read exact initial table snapshot");
+    assert_eq!(query_snapshot.catalog_revision(), 2);
+    assert_eq!(query_snapshot.tables().len(), 1);
+    let table_snapshot = &query_snapshot.tables()[0];
+    assert_eq!(table_snapshot.selector(), &selector);
+    assert_eq!(table_snapshot.table(), created);
+    assert_eq!(table_snapshot.schema().table_id, table_id(1));
+    assert_eq!(table_snapshot.schema().schema_version, 1);
+    assert_eq!(
+        table_snapshot.schema().compatibility,
+        SchemaCompatibility::Initial
+    );
+    assert_eq!(table_snapshot.snapshot().table_id, table_id(1));
+    assert_eq!(table_snapshot.snapshot().snapshot_version, 1);
+    assert_eq!(table_snapshot.snapshot().parent_snapshot_version, None);
+    assert_eq!(
+        table_snapshot.snapshot().operation,
+        SnapshotOperation::Create
+    );
+    assert_eq!(table_snapshot.snapshot().commit_lsn, 2);
+    assert!(table_snapshot.files().is_empty());
+    let empty_snapshot = catalog
+        .read_snapshot_at(&[])
+        .await
+        .expect("read empty snapshot after table creation");
+    assert!(empty_snapshot.is_empty());
+    assert_eq!(empty_snapshot.catalog_revision(), 2);
     catalog.close().expect("close catalog");
 
     let raw = Connection::open(catalog_path(&data_directory)).expect("inspect raw catalog");
@@ -439,9 +555,9 @@ async fn serves_empty_contracts_and_rejects_missing_or_unimplemented_paths() {
                 schema_version: 1,
             }])
             .await
-            .expect_err("nonempty snapshot read is not implemented")
+            .expect_err("missing selected table must fail")
             .code(),
-        ErrorCode::UnsupportedPlan
+        ErrorCode::NotFound
     );
     assert_eq!(
         catalog
@@ -460,6 +576,306 @@ async fn serves_empty_contracts_and_rejects_missing_or_unimplemented_paths() {
         ErrorCode::NotFound
     );
     assert_eq!(catalog.revision().await, Ok(0));
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_selector_validation_rejects_oversized_unsorted_and_duplicate_inputs() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+
+    let oversized = (1..=4_097_u128)
+        .map(|table| CatalogSnapshotSelector {
+            table_id: table_id(table),
+            snapshot_version: 1,
+            schema_version: 1,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        catalog
+            .read_snapshot_at(&oversized)
+            .await
+            .expect_err("oversized selector list must fail before enqueue")
+            .code(),
+        ErrorCode::ResourceExhausted
+    );
+
+    let unsorted = [
+        CatalogSnapshotSelector {
+            table_id: table_id(2),
+            snapshot_version: 1,
+            schema_version: 1,
+        },
+        CatalogSnapshotSelector {
+            table_id: table_id(1),
+            snapshot_version: 1,
+            schema_version: 1,
+        },
+    ];
+    assert_eq!(
+        catalog
+            .read_snapshot_at(&unsorted)
+            .await
+            .expect_err("unsorted selectors must fail before enqueue")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+
+    let duplicate = [
+        CatalogSnapshotSelector {
+            table_id: table_id(1),
+            snapshot_version: 1,
+            schema_version: 1,
+        },
+        CatalogSnapshotSelector {
+            table_id: table_id(1),
+            snapshot_version: 2,
+            schema_version: 2,
+        },
+    ];
+    assert_eq!(
+        catalog
+            .read_snapshot_at(&duplicate)
+            .await
+            .expect_err("duplicate selectors must fail before enqueue")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+
+    assert_eq!(catalog.revision().await, Ok(0));
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_reads_require_exact_versions_and_reject_versions_ahead_of_current() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    catalog
+        .command(create_namespace(1, 1, "market", Some(0)))
+        .await
+        .expect("create namespace");
+    catalog
+        .command(create_table(
+            2,
+            1,
+            1,
+            "ticks",
+            Some(1),
+            append_definition(),
+            schema_ipc(&table_schema()),
+        ))
+        .await
+        .expect("create table");
+
+    for (selector, reason) in [
+        (
+            CatalogSnapshotSelector {
+                table_id: table_id(1),
+                snapshot_version: 0,
+                schema_version: 1,
+            },
+            "zero snapshot version",
+        ),
+        (
+            CatalogSnapshotSelector {
+                table_id: table_id(1),
+                snapshot_version: 1,
+                schema_version: 0,
+            },
+            "zero schema version",
+        ),
+    ] {
+        let error = catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
+            .await
+            .expect_err(reason);
+        assert_eq!(
+            error.code(),
+            ErrorCode::InvalidArgument,
+            "unexpected error reason=[{reason}]"
+        );
+    }
+
+    let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
+    raw.pragma_update(None, "foreign_keys", false)
+        .expect("disable raw foreign keys for exact-gap fixture");
+    let version_two = 2_u64.to_be_bytes();
+    raw.execute(
+        "UPDATE tables \
+         SET current_schema_version = ?1, current_snapshot_version = ?1 \
+         WHERE table_id = ?2",
+        rusqlite::params![version_two.as_slice(), table_id(1).into_bytes().as_slice()],
+    )
+    .expect("seed missing nonzero exact versions");
+    drop(raw);
+
+    for (selector, expected_code, reason) in [
+        (
+            CatalogSnapshotSelector {
+                table_id: table_id(1),
+                snapshot_version: 2,
+                schema_version: 1,
+            },
+            ErrorCode::NotFound,
+            "missing exact snapshot version",
+        ),
+        (
+            CatalogSnapshotSelector {
+                table_id: table_id(1),
+                snapshot_version: 1,
+                schema_version: 2,
+            },
+            ErrorCode::NotFound,
+            "missing exact schema version",
+        ),
+        (
+            CatalogSnapshotSelector {
+                table_id: table_id(1),
+                snapshot_version: 3,
+                schema_version: 1,
+            },
+            ErrorCode::Conflict,
+            "snapshot version ahead of current",
+        ),
+        (
+            CatalogSnapshotSelector {
+                table_id: table_id(1),
+                snapshot_version: 1,
+                schema_version: 3,
+            },
+            ErrorCode::Conflict,
+            "schema version ahead of current",
+        ),
+    ] {
+        let error = catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
+            .await
+            .expect_err(reason);
+        assert_eq!(
+            error.code(),
+            expected_code,
+            "unexpected error reason=[{reason}]"
+        );
+    }
+
+    assert_eq!(catalog.revision().await, Ok(2));
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_manifest_sorts_modern_legacy_and_rejects_preserved_or_corrupt_metadata() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    catalog
+        .command(create_namespace(1, 1, "market", Some(0)))
+        .await
+        .expect("create namespace");
+    catalog
+        .command(create_table(
+            2,
+            1,
+            1,
+            "ticks",
+            Some(1),
+            append_definition(),
+            schema_ipc(&table_schema()),
+        ))
+        .await
+        .expect("create table");
+
+    let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
+    let table = table_id(1);
+    let table_bytes = table.into_bytes();
+    let version_one = 1_u64.to_be_bytes();
+    let version_two = 2_u64.to_be_bytes();
+    let parent_one = encode_optional_u64(Some(1));
+    let empty_offset = [0_u8; 9];
+    let (created_at_ns, summary_blob): (Vec<u8>, Vec<u8>) = raw
+        .query_row(
+            "SELECT created_at_ns, summary_blob FROM table_snapshots \
+             WHERE table_id = ?1 AND snapshot_version = ?2",
+            rusqlite::params![table_bytes.as_slice(), version_one.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read initial snapshot seed values");
+    raw.execute(
+        "INSERT INTO table_snapshots(\
+             table_id, snapshot_version, parent_snapshot_version, operation, commit_lsn, \
+             committed_log_offset, created_at_ns, summary_blob\
+         ) VALUES (?1, ?2, ?3, 'persist', ?2, ?4, ?5, ?6)",
+        rusqlite::params![
+            table_bytes.as_slice(),
+            version_two.as_slice(),
+            parent_one.as_slice(),
+            empty_offset.as_slice(),
+            created_at_ns,
+            summary_blob,
+        ],
+    )
+    .expect("insert raw second snapshot");
+    raw.execute(
+        "UPDATE tables SET current_snapshot_version = ?1 WHERE table_id = ?2",
+        rusqlite::params![version_two.as_slice(), table_bytes.as_slice()],
+    )
+    .expect("advance raw table snapshot version");
+    insert_legacy_data_file(&raw, table, file_id(2), false);
+    insert_legacy_data_file(&raw, table, file_id(1), false);
+
+    let selector = CatalogSnapshotSelector {
+        table_id: table,
+        snapshot_version: 2,
+        schema_version: 1,
+    };
+    let snapshot = catalog
+        .read_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect("read modern legacy manifest");
+    let files = snapshot.tables()[0].files().as_slice();
+    assert_eq!(
+        files.iter().map(|file| file.file_id()).collect::<Vec<_>>(),
+        [file_id(1), file_id(2)]
+    );
+
+    insert_legacy_data_file(&raw, table, file_id(3), true);
+    assert_eq!(
+        catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
+            .await
+            .expect_err("preserved legacy order must reject the whole V1 snapshot")
+            .code(),
+        ErrorCode::UnsupportedPlan
+    );
+    raw.execute(
+        "DELETE FROM data_files WHERE file_id = ?1",
+        [file_id(3).into_bytes().as_slice()],
+    )
+    .expect("remove preserved-order test file");
+
+    let mut corrupt_metadata = empty_metadata_blob("data_file_metadata");
+    *corrupt_metadata
+        .last_mut()
+        .expect("metadata blob must contain a payload") ^= 1;
+    raw.execute(
+        "UPDATE data_files SET metadata_blob = ?1 WHERE file_id = ?2",
+        rusqlite::params![corrupt_metadata, file_id(1).into_bytes().as_slice(),],
+    )
+    .expect("tamper raw file metadata blob");
+    assert_eq!(
+        catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
+            .await
+            .expect_err("metadata checksum corruption must fail the whole snapshot")
+            .code(),
+        ErrorCode::DataCorruption
+    );
+
+    drop(raw);
     catalog.close().expect("close sqlite catalog");
 }
 
@@ -1045,5 +1461,101 @@ async fn dropping_a_polled_command_future_does_not_cancel_its_commit() {
         .get_namespace(NamespaceRef::Id(namespace_id(1)))
         .await
         .is_ok());
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_validation_precedes_enqueue_and_cancelled_read_is_skippable() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog =
+        SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory).with_command_capacity(1))
+            .expect("open sqlite catalog");
+    let blocker = Connection::open(catalog_path(&data_directory)).expect("open lock holder");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold sqlite writer lock");
+
+    let mut blocked_write = catalog.command(create_namespace(1, 1, "market", Some(0)));
+    {
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            blocked_write.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+    }
+    let selectors = [CatalogSnapshotSelector {
+        table_id: table_id(1),
+        snapshot_version: 1,
+        schema_version: 1,
+    }];
+    let cancelled_read = loop {
+        let mut read = catalog.read_snapshot_at(&selectors);
+        let poll = {
+            let mut context = Context::from_waker(Waker::noop());
+            read.as_mut().poll(&mut context)
+        };
+        match poll {
+            Poll::Pending => break read,
+            Poll::Ready(Err(error)) if error.code() == ErrorCode::ResourceExhausted => {
+                tokio::task::yield_now().await;
+            }
+            result => panic!("unexpected queued read poll result result=[{result:?}]"),
+        }
+    };
+
+    let queue_full = catalog
+        .read_snapshot_at(&selectors)
+        .await
+        .expect_err("valid read must observe the saturated actor queue");
+    assert_eq!(queue_full.code(), ErrorCode::ResourceExhausted);
+    assert_eq!(
+        queue_full.message(),
+        "sqlite catalog actor command queue is full"
+    );
+    let unsorted = [
+        CatalogSnapshotSelector {
+            table_id: table_id(2),
+            snapshot_version: 1,
+            schema_version: 1,
+        },
+        CatalogSnapshotSelector {
+            table_id: table_id(1),
+            snapshot_version: 1,
+            schema_version: 1,
+        },
+    ];
+    assert_eq!(
+        catalog
+            .read_snapshot_at(&unsorted)
+            .await
+            .expect_err("selector order must be validated before enqueue")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+    let oversized = (1..=4_097_u128)
+        .map(|table| CatalogSnapshotSelector {
+            table_id: table_id(table),
+            snapshot_version: 1,
+            schema_version: 1,
+        })
+        .collect::<Vec<_>>();
+    let oversized_error = catalog
+        .read_snapshot_at(&oversized)
+        .await
+        .expect_err("selector count must be validated before enqueue");
+    assert_eq!(oversized_error.code(), ErrorCode::ResourceExhausted);
+    assert!(oversized_error
+        .message()
+        .starts_with("catalog snapshot selector count exceeds maximum"));
+    drop(cancelled_read);
+
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("release sqlite writer lock");
+    blocked_write
+        .await
+        .expect("write ahead of cancelled read must commit");
+    assert_eq!(catalog.revision().await, Ok(1));
     catalog.close().expect("close sqlite catalog");
 }

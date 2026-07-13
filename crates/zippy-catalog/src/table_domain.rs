@@ -43,6 +43,8 @@ macro_rules! table_select {
 
 const GET_TABLE_BY_ID_SQL: &str =
     table_select!("FROM tables t WHERE t.table_id = ?1 AND t.state = 'active'");
+pub(crate) const GET_TABLE_BY_ID_INCLUDING_INACTIVE_SQL: &str =
+    table_select!("FROM tables t WHERE t.table_id = ?1");
 const GET_TABLE_BY_NAME_SQL: &str = table_select!(
     "FROM tables t JOIN namespaces n ON n.namespace_id = t.namespace_id \
      WHERE n.name = ?1 AND t.name = ?2 AND t.state = 'active'"
@@ -622,7 +624,7 @@ where
     })
 }
 
-struct RawTableRow {
+pub(crate) struct RawTableRow {
     table_id: Vec<u8>,
     namespace_id: Vec<u8>,
     name: String,
@@ -638,7 +640,7 @@ struct RawTableRow {
 }
 
 impl RawTableRow {
-    fn encoded_size_bytes(&self) -> usize {
+    pub(crate) fn encoded_size_bytes(&self) -> usize {
         [
             self.table_id.len(),
             self.namespace_id.len(),
@@ -658,7 +660,7 @@ impl RawTableRow {
     }
 }
 
-fn table_row(row: &Row<'_>) -> rusqlite::Result<RawTableRow> {
+pub(crate) fn table_row(row: &Row<'_>) -> rusqlite::Result<RawTableRow> {
     Ok(RawTableRow {
         table_id: row.get(0)?,
         namespace_id: row.get(1)?,
@@ -675,7 +677,7 @@ fn table_row(row: &Row<'_>) -> rusqlite::Result<RawTableRow> {
     })
 }
 
-fn decode_table_row(raw: RawTableRow) -> Result<TableDescriptor> {
+pub(crate) fn decode_table_row(raw: RawTableRow) -> Result<TableDescriptor> {
     let RawTableRow {
         table_id,
         namespace_id,

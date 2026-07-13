@@ -1146,6 +1146,9 @@ pub trait CatalogRead: Send + Sync {
 
     /// Reads exact historical versions in one catalog read transaction.
     ///
+    /// Selectors must use nonzero schema and snapshot versions and be supplied
+    /// in strict table-id order without duplicates. This lets implementations
+    /// reject malformed input before copying it into a bounded actor queue.
     /// Implementations must never silently substitute a newer snapshot when a
     /// requested version is unavailable.
     /// An empty selector list succeeds with [`CatalogQuerySnapshot::empty`] at

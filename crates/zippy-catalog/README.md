@@ -48,18 +48,22 @@ Implemented:
   every newly created table descriptor fits the discovery byte budget;
 - one `BEGIN IMMEDIATE` transaction serializes the locked version read,
   fingerprint validation, and all remaining migrations, making concurrent
-  first-open and v1/v2 upgrade attempts deterministic.
+  first-open and v1/v2 upgrade attempts deterministic;
+- exact multi-table snapshots read table, schema, snapshot, visible files, and
+  native lineage from one deferred transaction. Admission is capped at 4,096
+  strictly ordered selectors; each all-or-nothing response is capped at 64 MiB,
+  65,536 visible files, and 262,144 lineage rows before owned allocation.
 
 Physical SQLite schema versions and `CatalogCommand` wire versions are separate
 version spaces. Physical v1 remains the immutable migration foundation.
 Physical v2 is the complete first domain layout. Physical v3 only adds table
 discovery indexes; neither version implies that every V1 command is executable.
 
-Current-manifest reads filter `data_files` by table, committed state, and the
-canonical empty removed-snapshot tag, then order by `file_id`. Both the partial
-`data_files_active_manifest` index and the composite `data_files_by_gc_state`
-index cover that access pattern; SQLite may select either from collected
-statistics without scanning the table or creating a temporary sort.
+Historical-manifest reads seek `data_files_visible_by_table` by table, committed
+state, and the half-open added/removed snapshot interval. SQLite returns bounded
+candidates without `ORDER BY`; the Catalog sorts the bounded result by `file_id`
+in Rust, avoiding a SQLite temporary B-tree. Native source lineage is fetched in
+chunks of at most 512 file IDs rather than with one query per file.
 
 Current typed capability matrix:
 
@@ -67,19 +71,20 @@ Current typed capability matrix:
 | --- | --- |
 | `CreateNamespace` and namespace discovery | implemented |
 | `CreateTable` and active table get/list/resolve | implemented transactionally |
-| empty query snapshot | implemented transactionally |
+| exact modern multi-table query snapshots | implemented transactionally |
+| preserved legacy discovery-order snapshots | `UnsupportedPlan` pending V2 read DTO |
 | alter/drop/schema/manifest/producer/consumer/job commands | `UnsupportedPlan` |
-| non-empty historical snapshot reads | `UnsupportedPlan` |
 | legacy primary + SQLite shadow fan-out | not connected |
 | SQLite read or write authority | disabled |
 
 The physical schema reserves `legacy_discovery_order`, but frozen V1 snapshot
-DTOs cannot return that order without violating their wire contract. Non-empty
-snapshot reads therefore remain disabled until a V2 typed read contract carries
-explicit scan order.
+DTOs cannot return that order without violating their ordering contract. Exact
+reads support native files and legacy files that do not require preserved
+discovery order. A request containing any visible preserve-order legacy file
+fails atomically with `UnsupportedPlan`; V2 must carry explicit scan order.
 
 Before server integration, the Catalog must still add remaining table and
-manifest command execution, exact non-empty read snapshots, process-level
+manifest command execution, a V2 legacy scan-order read contract, process-level
 ownership, network filesystem rejection, directory-handle pinning against
 parent replacement races,
 process-kill crash failpoints, and an absolute shutdown deadline. The current

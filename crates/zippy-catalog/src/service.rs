@@ -3,7 +3,7 @@
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 use tokio::sync::oneshot;
 use zippy_types::catalog::{
     CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
@@ -11,10 +11,10 @@ use zippy_types::catalog::{
     NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, Result, ServerError, ServerErrorDetails};
+use zippy_types::{BoxFuture, ErrorCode, Result, ServerError};
 
 use crate::SqliteCatalogConfig;
-use crate::{domain, table_domain};
+use crate::{domain, snapshot_domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 
@@ -177,10 +177,10 @@ impl CatalogRead for SqliteCatalog {
         selectors: &'a [CatalogSnapshotSelector],
     ) -> BoxFuture<'a, Result<CatalogQuerySnapshot>> {
         Box::pin(async move {
-            if !selectors.is_empty() {
-                return Err(unsupported("catalog.read.read_snapshot_at"));
-            }
-            await_response(self.request(ServiceMessage::ReadEmptySnapshot)).await
+            snapshot_domain::validate_snapshot_selectors(selectors)?;
+            let selectors = selectors.to_vec();
+            await_response(self.request(|sender| ServiceMessage::ReadSnapshot(selectors, sender)))
+                .await
         })
     }
 }
@@ -209,7 +209,10 @@ enum ServiceMessage {
         oneshot::Sender<Result<ListTablesResponse>>,
     ),
     ResolveTables(Vec<TableRef>, oneshot::Sender<Result<Vec<TableDescriptor>>>),
-    ReadEmptySnapshot(oneshot::Sender<Result<CatalogQuerySnapshot>>),
+    ReadSnapshot(
+        Vec<CatalogSnapshotSelector>,
+        oneshot::Sender<Result<CatalogQuerySnapshot>>,
+    ),
     Command(
         VersionedCatalogCommand,
         oneshot::Sender<Result<VersionedCatalogResponse>>,
@@ -269,9 +272,12 @@ fn actor_loop(mut connection: Connection, receiver: Receiver<ServiceMessage>) {
                     let _ = response.send(table_domain::resolve_tables(&mut connection, &tables));
                 }
             }
-            ServiceMessage::ReadEmptySnapshot(response) => {
+            ServiceMessage::ReadSnapshot(selectors, response) => {
                 if !response.is_closed() {
-                    let _ = response.send(read_empty_snapshot(&mut connection));
+                    let _ = response.send(snapshot_domain::read_snapshot_at(
+                        &mut connection,
+                        &selectors,
+                    ));
                 }
             }
             ServiceMessage::Command(command, response) => {
@@ -291,30 +297,8 @@ fn actor_loop(mut connection: Connection, receiver: Receiver<ServiceMessage>) {
     }
 }
 
-fn read_empty_snapshot(connection: &mut Connection) -> Result<CatalogQuerySnapshot> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(|error| crate::map_sqlite_error("begin empty catalog snapshot read", error))?;
-    let revision = domain::revision(&transaction)?;
-    transaction
-        .commit()
-        .map_err(|error| crate::map_sqlite_error("commit empty catalog snapshot read", error))?;
-    Ok(CatalogQuerySnapshot::empty(revision))
-}
-
 async fn await_response<T>(response: Result<oneshot::Receiver<Result<T>>>) -> Result<T> {
     response?.await.map_err(|_| actor_stopped())?
-}
-
-fn unsupported(operator: &str) -> ServerError {
-    ServerError::new(
-        ErrorCode::UnsupportedPlan,
-        format!("sqlite catalog operation is not implemented operator=[{operator}]"),
-    )
-    .with_details(ServerErrorDetails::UnsupportedPlan {
-        operator: operator.to_owned(),
-    })
-    .expect("unsupported-plan details match the unsupported-plan error code")
 }
 
 fn actor_stopped() -> ServerError {
