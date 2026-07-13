@@ -2,10 +2,13 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, Error as SqliteError, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, Connection, Error as SqliteError, OptionalExtension, Params, TransactionBehavior,
+};
 use zippy_types::catalog::{
-    CatalogCodec, CatalogCommandV1, CatalogOutcomeV1, CatalogResponseV1, ListNamespacesRequest,
-    ListNamespacesResponse, NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogCodec, CatalogCommandV1, CatalogOutcomeV1, CatalogResponseV1, CreateNamespaceCommand,
+    ListNamespacesRequest, ListNamespacesResponse, NamespaceRef, VersionedCatalogCommand,
+    VersionedCatalogResponse,
 };
 use zippy_types::table::{CatalogName, NamespaceDescriptor};
 use zippy_types::{ErrorCode, NamespaceId, RequestId, Result, ServerError, ServerErrorDetails};
@@ -15,12 +18,22 @@ use crate::encoding::{decode_u64, encode_u64};
 const CREATE_NAMESPACE_OPERATION: &str = "create_namespace";
 const DEFAULT_IDEMPOTENCY_RETENTION_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
 const MAX_NAMESPACE_PAGE_SIZE: u32 = 4_096;
+const LIST_NAMESPACES_SQL: &str = "SELECT namespace_id, name, created_at_ns FROM namespaces \
+     ORDER BY namespace_id LIMIT ?1";
+const LIST_NAMESPACES_AFTER_SQL: &str = "SELECT namespace_id, name, created_at_ns FROM namespaces \
+     WHERE namespace_id > ?1 ORDER BY namespace_id LIMIT ?2";
+const MAX_SQLITE_CATALOG_NAME_BYTES: usize = 1024;
 
 struct StoredIdempotentResponse {
     command_format_version: i64,
     operation: String,
     command_fingerprint: Vec<u8>,
     response_blob: Vec<u8>,
+}
+
+enum PreparedCommand {
+    CreateNamespace(CreateNamespaceCommand),
+    CreateTable(crate::table_domain::PreparedCreateTable),
 }
 
 /// Replays a committed response without a writer lock or executes one mutation atomically.
@@ -51,8 +64,16 @@ pub(crate) fn execute_command(
         return Ok(response);
     }
 
-    let create = match envelope.command {
-        CatalogCommandV1::CreateNamespace(create) => create,
+    let prepared = match envelope.command {
+        CatalogCommandV1::CreateNamespace(create) => {
+            validate_new_catalog_name(&create.name, "namespace")
+                .map_err(|error| error.with_request_id(request_id))?;
+            PreparedCommand::CreateNamespace(create)
+        }
+        CatalogCommandV1::CreateTable(create) => PreparedCommand::CreateTable(
+            crate::table_domain::prepare_create_table(create)
+                .map_err(|error| error.with_request_id(request_id))?,
+        ),
         ref unsupported => {
             return Err(unsupported_command(unsupported).with_request_id(request_id));
         }
@@ -69,13 +90,15 @@ pub(crate) fn execute_command(
         operation,
         &fingerprint,
     )? {
-        transaction
-            .commit()
-            .map_err(|error| crate::map_sqlite_error("commit catalog command replay", error))?;
+        transaction.commit().map_err(|error| {
+            crate::map_sqlite_error("commit catalog command replay", error)
+                .with_request_id(request_id)
+        })?;
         return Ok(response);
     }
 
-    let actual_revision = revision(&transaction)?;
+    let actual_revision =
+        revision(&transaction).map_err(|error| error.with_request_id(request_id))?;
     if let Some(expected_revision) = envelope.expected_revision {
         if expected_revision != actual_revision {
             return Err(revision_conflict(
@@ -89,34 +112,30 @@ pub(crate) fn execute_command(
         ServerError::new(ErrorCode::Internal, "catalog revision overflow")
             .with_request_id(request_id)
     })?;
-    let committed_at_ns = unix_time_ns()?;
+    let committed_at_ns = unix_time_ns().map_err(|error| error.with_request_id(request_id))?;
     let expires_at_ns = committed_at_ns
         .checked_add(DEFAULT_IDEMPOTENCY_RETENTION_NS)
         .ok_or_else(|| {
             ServerError::new(ErrorCode::Internal, "catalog idempotency expiry overflow")
                 .with_request_id(request_id)
         })?;
-    let descriptor = NamespaceDescriptor {
-        namespace_id: create.namespace_id,
-        name: create.name,
-        created_at_ns: committed_at_ns,
+    let outcome = match prepared {
+        PreparedCommand::CreateNamespace(create) => CatalogOutcomeV1::Namespace(create_namespace(
+            &transaction,
+            create,
+            committed_at_ns,
+            request_id,
+        )?),
+        PreparedCommand::CreateTable(create) => CatalogOutcomeV1::Table(
+            crate::table_domain::create_table(&transaction, create, next_revision, committed_at_ns)
+                .map_err(|error| error.with_request_id(request_id))?,
+        ),
     };
-
-    transaction
-        .execute(
-            "INSERT INTO namespaces(namespace_id, name, created_at_ns) VALUES (?1, ?2, ?3)",
-            params![
-                descriptor.namespace_id.into_bytes().as_slice(),
-                descriptor.name.as_str(),
-                encode_u64(descriptor.created_at_ns).as_slice(),
-            ],
-        )
-        .map_err(|error| map_namespace_insert_error(error, request_id))?;
 
     let response = VersionedCatalogResponse::V1(CatalogResponseV1 {
         request_id,
         catalog_revision: next_revision,
-        outcome: CatalogOutcomeV1::Namespace(descriptor),
+        outcome,
     });
     let response_blob = CatalogCodec::encode_response(&response).map_err(|error| {
         ServerError::new(
@@ -125,7 +144,8 @@ pub(crate) fn execute_command(
         )
         .with_request_id(request_id)
     })?;
-    update_revision(&transaction, next_revision)?;
+    update_revision(&transaction, next_revision)
+        .map_err(|error| error.with_request_id(request_id))?;
     transaction
         .execute(
             "INSERT INTO idempotent_requests(\
@@ -135,18 +155,63 @@ pub(crate) fn execute_command(
             params![
                 request_id.into_bytes().as_slice(),
                 command_format_version,
-                CREATE_NAMESPACE_OPERATION,
+                operation,
                 fingerprint.as_slice(),
                 response_blob,
                 encode_u64(committed_at_ns).as_slice(),
                 encode_u64(expires_at_ns).as_slice(),
             ],
         )
-        .map_err(|error| crate::map_sqlite_error("persist catalog idempotency response", error))?;
-    transaction
-        .commit()
-        .map_err(|error| crate::map_sqlite_error("commit catalog command", error))?;
+        .map_err(|error| {
+            crate::map_sqlite_error("persist catalog idempotency response", error)
+                .with_request_id(request_id)
+        })?;
+    transaction.commit().map_err(|error| {
+        crate::map_sqlite_error("commit catalog command", error).with_request_id(request_id)
+    })?;
     Ok(response)
+}
+
+/// Enforces the SQLite Catalog admission limit without changing frozen V1 decoding.
+pub(crate) fn validate_new_catalog_name(name: &CatalogName, entity: &str) -> Result<()> {
+    let actual_bytes = name.as_str().len();
+    if actual_bytes > MAX_SQLITE_CATALOG_NAME_BYTES {
+        return Err(ServerError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                concat!(
+                    "sqlite catalog {} name exceeds byte limit ",
+                    "actual=[{}] maximum=[{}]"
+                ),
+                entity, actual_bytes, MAX_SQLITE_CATALOG_NAME_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn create_namespace(
+    connection: &Connection,
+    create: CreateNamespaceCommand,
+    created_at_ns: u64,
+    request_id: RequestId,
+) -> Result<NamespaceDescriptor> {
+    let descriptor = NamespaceDescriptor {
+        namespace_id: create.namespace_id,
+        name: create.name,
+        created_at_ns,
+    };
+    connection
+        .execute(
+            "INSERT INTO namespaces(namespace_id, name, created_at_ns) VALUES (?1, ?2, ?3)",
+            params![
+                descriptor.namespace_id.into_bytes().as_slice(),
+                descriptor.name.as_str(),
+                encode_u64(descriptor.created_at_ns).as_slice(),
+            ],
+        )
+        .map_err(|error| map_namespace_insert_error(error, request_id))?;
+    Ok(descriptor)
 }
 
 /// Returns the current durable catalog revision.
@@ -208,30 +273,19 @@ pub(crate) fn list_namespaces(
         )
     })?;
     let sql_limit = i64::from(request.limit.get()) + 1;
-    let mut namespaces = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT namespace_id, name, created_at_ns FROM namespaces \
-                 WHERE (?1 IS NULL OR namespace_id > ?1) \
-                 ORDER BY namespace_id LIMIT ?2",
-            )
-            .map_err(|error| crate::map_sqlite_error("prepare catalog namespace listing", error))?;
-        let mut rows = statement
-            .query(params![
-                after.as_ref().map(|value| value.as_slice()),
-                sql_limit
-            ])
-            .map_err(|error| crate::map_sqlite_error("query catalog namespace listing", error))?;
-        let mut descriptors = Vec::with_capacity(requested_limit.saturating_add(1));
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| crate::map_sqlite_error("read catalog namespace page", error))?
-        {
-            let raw = namespace_row(row)
-                .map_err(|error| crate::map_sqlite_error("decode catalog namespace row", error))?;
-            descriptors.push(decode_namespace_row(raw)?);
-        }
-        descriptors
+    let mut namespaces = match after {
+        None => query_namespaces(
+            &transaction,
+            LIST_NAMESPACES_SQL,
+            [sql_limit],
+            requested_limit,
+        )?,
+        Some(after) => query_namespaces(
+            &transaction,
+            LIST_NAMESPACES_AFTER_SQL,
+            params![after.as_slice(), sql_limit],
+            requested_limit,
+        )?,
     };
     let has_more = namespaces.len() > requested_limit;
     namespaces.truncate(requested_limit);
@@ -249,6 +303,33 @@ pub(crate) fn list_namespaces(
         namespaces,
         next_after,
     })
+}
+
+fn query_namespaces<P>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    requested_limit: usize,
+) -> Result<Vec<NamespaceDescriptor>>
+where
+    P: Params,
+{
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| crate::map_sqlite_error("prepare catalog namespace listing", error))?;
+    let mut rows = statement
+        .query(params)
+        .map_err(|error| crate::map_sqlite_error("query catalog namespace listing", error))?;
+    let mut descriptors = Vec::with_capacity(requested_limit.saturating_add(1));
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| crate::map_sqlite_error("read catalog namespace page", error))?
+    {
+        let raw = namespace_row(row)
+            .map_err(|error| crate::map_sqlite_error("decode catalog namespace row", error))?;
+        descriptors.push(decode_namespace_row(raw)?);
+    }
+    Ok(descriptors)
 }
 
 fn load_idempotent_response(
@@ -336,7 +417,44 @@ fn replay_idempotent_response(
         )
         .with_request_id(request_id));
     }
+    if !response_matches_operation(&decoded.outcome, operation) {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "catalog idempotency response outcome does not match its operation",
+        )
+        .with_request_id(request_id));
+    }
     Ok(response)
+}
+
+fn response_matches_operation(outcome: &CatalogOutcomeV1, operation: &str) -> bool {
+    matches!(
+        (operation, outcome),
+        ("create_namespace", CatalogOutcomeV1::Namespace(_))
+            | ("create_table", CatalogOutcomeV1::Table(_))
+            | ("alter_table_schema", CatalogOutcomeV1::Schema(_))
+            | ("acquire_producer", CatalogOutcomeV1::Producer(_))
+            | ("commit_data_files", CatalogOutcomeV1::Snapshot(_))
+            | ("commit_compaction", CatalogOutcomeV1::Snapshot(_))
+            | (
+                "commit_consumer_offset",
+                CatalogOutcomeV1::ConsumerOffset { .. }
+            )
+            | ("acquire_snapshot_lease", CatalogOutcomeV1::SnapshotLease(_))
+            | (
+                "release_snapshot_lease",
+                CatalogOutcomeV1::SnapshotLeaseReleased { .. }
+            )
+            | (
+                "create_maintenance_job",
+                CatalogOutcomeV1::MaintenanceJob(_)
+            )
+            | (
+                "transition_maintenance_job",
+                CatalogOutcomeV1::MaintenanceJob(_)
+            )
+            | ("drop_table", CatalogOutcomeV1::TableDropped { .. })
+    )
 }
 
 fn update_revision(connection: &Connection, next_revision: u64) -> Result<()> {
@@ -472,8 +590,8 @@ mod tests {
     use rusqlite::Connection;
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
-        CreateNamespaceCommand, CreateTableCommand, ListNamespacesRequest, NamespaceRef,
-        VersionedCatalogCommand,
+        CreateNamespaceCommand, CreateTableCommand, DropTableCommand, ListNamespacesRequest,
+        NamespaceRef, VersionedCatalogCommand,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, SchemaIpcPayload, TableDefinition,
@@ -559,6 +677,20 @@ mod tests {
                 definition: TableDefinition::Append(AppendTableDefinition::default()),
                 schema_ipc: SchemaIpcPayload::new(vec![1]).unwrap(),
                 config: BTreeMap::new(),
+            }),
+        )
+        .unwrap()
+        .into()
+    }
+
+    fn unsupported_command(request_id: RequestId) -> VersionedCatalogCommand {
+        CatalogCommandEnvelopeV1::new(
+            request_id,
+            None,
+            actor(),
+            CatalogCommandV1::DropTable(DropTableCommand {
+                table_id: TableId::from_u128(1).unwrap(),
+                expected_snapshot_version: 1,
             }),
         )
         .unwrap()
@@ -666,7 +798,7 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::InvalidArgument);
 
         let error =
-            execute_command(&mut connection, create_table_command(request_id(2))).unwrap_err();
+            execute_command(&mut connection, unsupported_command(request_id(2))).unwrap_err();
         assert_eq!(error.code(), ErrorCode::UnsupportedPlan);
         assert_eq!(revision(&connection).unwrap(), 0);
     }

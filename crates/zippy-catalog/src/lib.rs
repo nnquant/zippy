@@ -1,9 +1,10 @@
 //! SQLite Catalog migration and typed command foundation for the single-node server.
 //!
 //! Physical schema v2 stores the complete first domain layout with lossless
-//! unsigned encodings. [`SqliteCatalog`] implements the first namespace command
-//! slice, but legacy metadata remains authoritative and non-empty table snapshot
-//! reads remain disabled. Physical SQLite schema versions are independent of
+//! unsigned encodings, while v3 adds the active-table cursor indexes.
+//! [`SqliteCatalog`] implements namespace and table-creation command slices, but
+//! legacy metadata remains authoritative and non-empty table snapshot reads
+//! remain disabled. Physical SQLite schema versions are independent of
 //! CatalogCommand wire versions. Each handle creates, uses, and drops its SQLite
 //! connection exclusively on one dedicated OS actor thread.
 
@@ -14,6 +15,8 @@ mod domain;
 mod encoding;
 mod migration;
 mod service;
+mod storage_codec;
+mod table_domain;
 
 pub use service::SqliteCatalog;
 
@@ -27,7 +30,7 @@ use zippy_core::{DataDirectory, ManagedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;

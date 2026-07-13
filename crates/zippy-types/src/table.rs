@@ -449,13 +449,22 @@ pub enum SchemaCompatibility {
     Breaking,
 }
 
-/// An Arrow schema encoded as an IPC message for persistence or transport.
+/// An Arrow schema encoded for persistence or transport.
+///
+/// Catalog commands interpret the bytes as one schema-only Arrow IPC stream:
+/// the stream must contain a schema message, no record batches, one end marker,
+/// and no trailing bytes. Other protocols may define a different envelope and
+/// must not pass their bare schema flatbuffers to the Catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct SchemaIpcPayload(Vec<u8>);
 
 impl SchemaIpcPayload {
-    /// Creates a non-empty encoded schema payload.
+    /// Creates a non-empty opaque schema payload.
+    ///
+    /// This transport-level constructor does not parse Arrow IPC. Catalog
+    /// command execution performs the protocol-specific validation before any
+    /// write transaction begins.
     pub fn new(bytes: Vec<u8>) -> Result<Self, EmptySchemaPayload> {
         if bytes.is_empty() {
             return Err(EmptySchemaPayload);
@@ -534,7 +543,7 @@ pub struct SchemaDescriptor {
     pub schema_version: u64,
     /// The Arrow schema encoded as IPC.
     pub schema_ipc: SchemaIpcPayload,
-    /// The catalog-computed canonical lowercase digest of the logical schema.
+    /// The versioned catalog digest, currently `sha256-v1:<64 lowercase hex>`.
     pub schema_hash: String,
     /// Compatibility computed by the catalog against the preceding version.
     pub compatibility: SchemaCompatibility,
@@ -1182,6 +1191,16 @@ mod tests {
         assert!(CatalogName::new(" \t ").is_err());
         assert!(CatalogName::new("bad\nname").is_err());
         assert!(serde_json::from_str::<CatalogName>("\"bad\\u0000name\"").is_err());
+    }
+
+    #[test]
+    fn catalog_names_preserve_historical_long_values() {
+        let name = CatalogName::new("x".repeat(2 * 1024)).unwrap();
+        let encoded = serde_json::to_vec(&name).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<CatalogName>(&encoded).unwrap(),
+            name
+        );
     }
 
     #[test]

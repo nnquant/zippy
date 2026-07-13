@@ -13,8 +13,8 @@ use zippy_types::catalog::{
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, Result, ServerError, ServerErrorDetails};
 
-use crate::domain;
 use crate::SqliteCatalogConfig;
+use crate::{domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 
@@ -147,15 +147,16 @@ impl CatalogRead for SqliteCatalog {
         })
     }
 
-    fn get_table(&self, _table: TableRef) -> BoxFuture<'_, Result<TableDescriptor>> {
-        Box::pin(async { Err(unsupported("catalog.read.get_table")) })
+    fn get_table(&self, table: TableRef) -> BoxFuture<'_, Result<TableDescriptor>> {
+        Box::pin(async move {
+            await_response(self.request(|sender| ServiceMessage::GetTable(table, sender))).await
+        })
     }
 
-    fn list_tables(
-        &self,
-        _request: ListTablesRequest,
-    ) -> BoxFuture<'_, Result<ListTablesResponse>> {
-        Box::pin(async { Err(unsupported("catalog.read.list_tables")) })
+    fn list_tables(&self, request: ListTablesRequest) -> BoxFuture<'_, Result<ListTablesResponse>> {
+        Box::pin(async move {
+            await_response(self.request(|sender| ServiceMessage::ListTables(request, sender))).await
+        })
     }
 
     fn resolve_tables<'a>(
@@ -163,10 +164,11 @@ impl CatalogRead for SqliteCatalog {
         tables: &'a [TableRef],
     ) -> BoxFuture<'a, Result<Vec<TableDescriptor>>> {
         Box::pin(async move {
-            if !tables.is_empty() {
-                return Err(unsupported("catalog.read.resolve_tables"));
-            }
-            await_response(self.request(ServiceMessage::ResolveEmptyTables)).await
+            table_domain::validate_table_resolution_request(tables)?;
+            await_response(
+                self.request(|sender| ServiceMessage::ResolveTables(tables.to_vec(), sender)),
+            )
+            .await
         })
     }
 
@@ -201,7 +203,12 @@ enum ServiceMessage {
         ListNamespacesRequest,
         oneshot::Sender<Result<ListNamespacesResponse>>,
     ),
-    ResolveEmptyTables(oneshot::Sender<Result<Vec<TableDescriptor>>>),
+    GetTable(TableRef, oneshot::Sender<Result<TableDescriptor>>),
+    ListTables(
+        ListTablesRequest,
+        oneshot::Sender<Result<ListTablesResponse>>,
+    ),
+    ResolveTables(Vec<TableRef>, oneshot::Sender<Result<Vec<TableDescriptor>>>),
     ReadEmptySnapshot(oneshot::Sender<Result<CatalogQuerySnapshot>>),
     Command(
         VersionedCatalogCommand,
@@ -247,9 +254,19 @@ fn actor_loop(mut connection: Connection, receiver: Receiver<ServiceMessage>) {
                     let _ = response.send(domain::list_namespaces(&mut connection, request));
                 }
             }
-            ServiceMessage::ResolveEmptyTables(response) => {
+            ServiceMessage::GetTable(table, response) => {
                 if !response.is_closed() {
-                    let _ = response.send(resolve_empty_tables(&mut connection));
+                    let _ = response.send(table_domain::get_table(&connection, table));
+                }
+            }
+            ServiceMessage::ListTables(request, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(table_domain::list_tables(&mut connection, request));
+                }
+            }
+            ServiceMessage::ResolveTables(tables, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(table_domain::resolve_tables(&mut connection, &tables));
                 }
             }
             ServiceMessage::ReadEmptySnapshot(response) => {
@@ -283,17 +300,6 @@ fn read_empty_snapshot(connection: &mut Connection) -> Result<CatalogQuerySnapsh
         .commit()
         .map_err(|error| crate::map_sqlite_error("commit empty catalog snapshot read", error))?;
     Ok(CatalogQuerySnapshot::empty(revision))
-}
-
-fn resolve_empty_tables(connection: &mut Connection) -> Result<Vec<TableDescriptor>> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Deferred)
-        .map_err(|error| crate::map_sqlite_error("begin empty catalog table resolution", error))?;
-    let _ = domain::revision(&transaction)?;
-    transaction
-        .commit()
-        .map_err(|error| crate::map_sqlite_error("commit empty catalog table resolution", error))?;
-    Ok(Vec::new())
 }
 
 async fn await_response<T>(response: Result<oneshot::Receiver<Result<T>>>) -> Result<T> {

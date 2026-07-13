@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -28,6 +28,9 @@ const EXPECTED_TABLES: [&str; 14] = [
     "table_snapshots",
     "tables",
 ];
+
+const EXPECTED_ACTIVE_TABLE_CURSOR_INDEXES: [&str; 2] =
+    ["tables_by_namespace_state_id", "tables_by_state_id"];
 
 fn data_directory(directory: &TempDir) -> DataDirectory {
     DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
@@ -210,6 +213,76 @@ fn initialized_raw_catalog(directory: &TempDir) -> Connection {
     connection
 }
 
+fn assert_active_table_cursor_indexes(connection: &Connection) {
+    let cursor_indexes = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+              WHERE type = 'index'
+                AND name IN ('tables_by_state_id', 'tables_by_namespace_state_id')",
+        )
+        .expect("prepare cursor index inventory")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query cursor index inventory")
+        .collect::<rusqlite::Result<BTreeSet<_>>>()
+        .expect("collect cursor index inventory");
+    assert_eq!(
+        cursor_indexes,
+        EXPECTED_ACTIVE_TABLE_CURSOR_INDEXES
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    );
+}
+
+fn initialize_catalog_at_physical_version(data_directory: &DataDirectory, physical_version: u32) {
+    if physical_version == 0 {
+        return;
+    }
+    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(data_directory))
+        .expect("initialize current catalog fixture")
+        .close()
+        .expect("close current catalog fixture");
+
+    let connection =
+        Connection::open(catalog_path(data_directory)).expect("open catalog fixture for downgrade");
+    match physical_version {
+        1 => connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE idempotent_requests;
+                 DROP TABLE maintenance_jobs;
+                 DROP TABLE snapshot_leases;
+                 DROP TABLE durable_consumer_offsets;
+                 DROP TABLE durable_consumers;
+                 DROP TABLE producers;
+                 DROP TABLE data_file_sources;
+                 DROP TABLE data_files;
+                 DROP TABLE table_snapshots;
+                 DROP TABLE table_schemas;
+                 DROP TABLE tables;
+                 DROP TABLE namespaces;
+                 DELETE FROM catalog_migrations WHERE schema_version > 1;
+                 UPDATE catalog_meta
+                    SET value = X'0000000000000001'
+                  WHERE key = 'schema_version';
+                 PRAGMA user_version = 1;",
+            )
+            .expect("construct exact physical v1 fixture"),
+        2 => connection
+            .execute_batch(
+                "DROP INDEX tables_by_state_id;
+                 DROP INDEX tables_by_namespace_state_id;
+                 DELETE FROM catalog_migrations WHERE schema_version > 2;
+                 UPDATE catalog_meta
+                    SET value = X'0000000000000002'
+                  WHERE key = 'schema_version';
+                 PRAGMA user_version = 2;",
+            )
+            .expect("construct exact physical v2 fixture"),
+        unsupported => panic!("unsupported physical catalog fixture version [{unsupported}]"),
+    }
+}
+
 #[test]
 fn rolls_back_an_interrupted_transaction_and_reopens_in_wal_mode() {
     let directory = TempDir::new().expect("create temp directory");
@@ -269,7 +342,7 @@ fn rolls_back_an_interrupted_transaction_and_reopens_in_wal_mode() {
 }
 
 #[test]
-fn migration_is_idempotent_and_creates_the_complete_v2_domain_schema() {
+fn migration_is_idempotent_and_creates_the_current_domain_schema() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
@@ -307,11 +380,69 @@ fn migration_is_idempotent_and_creates_the_complete_v2_domain_schema() {
         .expect("query migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect migration versions");
-    assert_eq!(migration_versions, vec![1, 2]);
+    assert_eq!(migration_versions, vec![1, 2, 3]);
 }
 
 #[test]
-fn upgrades_an_existing_physical_v1_catalog_to_v2_and_reopens() {
+fn concurrent_opens_migrate_fresh_v1_and_v2_catalogs_exactly_once() {
+    const ACTOR_COUNT: usize = 8;
+
+    for physical_version in [0, 1, 2] {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        initialize_catalog_at_physical_version(&data_directory, physical_version);
+
+        let barrier = Arc::new(Barrier::new(ACTOR_COUNT));
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let actors = (0..ACTOR_COUNT)
+            .map(|_| {
+                let actor_barrier = Arc::clone(&barrier);
+                let actor_config = config.clone();
+                thread::spawn(move || {
+                    actor_barrier.wait();
+                    let catalog = SqliteCatalogFoundation::open(actor_config)
+                        .expect("concurrently open and migrate catalog");
+                    let migrated_version = catalog
+                        .inspect()
+                        .expect("inspect concurrently migrated catalog")
+                        .metadata
+                        .schema_version;
+                    catalog.close().expect("close concurrent catalog actor");
+                    migrated_version
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for actor in actors {
+            assert_eq!(
+                actor.join().expect("join concurrent catalog actor"),
+                CATALOG_SCHEMA_VERSION,
+                "all actors must observe the current schema from physical version \
+                 [{physical_version}]"
+            );
+        }
+
+        let raw = Connection::open(catalog_path(&data_directory))
+            .expect("inspect concurrently migrated catalog");
+        let migration_versions = raw
+            .prepare("SELECT schema_version FROM catalog_migrations ORDER BY schema_version")
+            .expect("prepare concurrent migration audit query")
+            .query_map([], |row| row.get::<_, u32>(0))
+            .expect("query concurrent migration audit")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect concurrent migration versions");
+        assert_eq!(
+            migration_versions,
+            vec![1, 2, 3],
+            "each migration must be recorded exactly once from physical version \
+             [{physical_version}]"
+        );
+        assert_active_table_cursor_indexes(&raw);
+    }
+}
+
+#[test]
+fn upgrades_an_existing_physical_v1_catalog_to_v3_and_reopens() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
@@ -335,7 +466,7 @@ fn upgrades_an_existing_physical_v1_catalog_to_v2_and_reopens() {
          DROP TABLE table_schemas;
          DROP TABLE tables;
          DROP TABLE namespaces;
-         DELETE FROM catalog_migrations WHERE schema_version = 2;
+         DELETE FROM catalog_migrations WHERE schema_version > 1;
          UPDATE catalog_meta
             SET value = X'0000000000000001'
           WHERE key = 'schema_version';
@@ -352,7 +483,7 @@ fn upgrades_an_existing_physical_v1_catalog_to_v2_and_reopens() {
             .expect("inspect upgraded catalog")
             .metadata
             .schema_version,
-        2
+        CATALOG_SCHEMA_VERSION
     );
     upgraded.close().expect("close upgraded catalog");
 
@@ -385,7 +516,60 @@ fn upgrades_an_existing_physical_v1_catalog_to_v2_and_reopens() {
             row.get(0)
         })
         .expect("count upgraded migration audit");
-    assert_eq!(migration_count, 2);
+    assert_eq!(migration_count, 3);
+    assert_active_table_cursor_indexes(&raw);
+}
+
+#[test]
+fn upgrades_an_existing_physical_v2_catalog_to_v3_and_reopens() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let path = catalog_path(&data_directory);
+    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("initialize current catalog")
+        .close()
+        .expect("close current catalog");
+
+    let raw = Connection::open(&path).expect("open catalog for v2 fixture downgrade");
+    raw.execute_batch(
+        "DROP INDEX tables_by_state_id;
+         DROP INDEX tables_by_namespace_state_id;
+         DELETE FROM catalog_migrations WHERE schema_version = 3;
+         UPDATE catalog_meta
+            SET value = X'0000000000000002'
+          WHERE key = 'schema_version';
+         PRAGMA user_version = 2;",
+    )
+    .expect("construct exact physical v2 fixture");
+    drop(raw);
+
+    let upgraded = SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("upgrade physical v2 catalog");
+    assert_eq!(
+        upgraded
+            .inspect()
+            .expect("inspect upgraded catalog")
+            .metadata
+            .schema_version,
+        CATALOG_SCHEMA_VERSION
+    );
+    upgraded.close().expect("close upgraded catalog");
+
+    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("reopen upgraded catalog")
+        .close()
+        .expect("close reopened catalog");
+
+    let raw = Connection::open(path).expect("inspect upgraded schema");
+    let migration_versions = raw
+        .prepare("SELECT schema_version FROM catalog_migrations ORDER BY schema_version")
+        .expect("prepare upgraded migration audit query")
+        .query_map([], |row| row.get::<_, u32>(0))
+        .expect("query upgraded migration audit")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect upgraded migration versions");
+    assert_eq!(migration_versions, vec![1, 2, 3]);
+    assert_active_table_cursor_indexes(&raw);
 }
 
 #[test]
@@ -567,6 +751,124 @@ fn current_manifest_query_uses_a_covering_manifest_index() {
         plan.iter()
             .all(|detail| !detail.contains("USE TEMP B-TREE")),
         "current manifest plan must preserve file-id order in-index plan=[{plan:?}]"
+    );
+}
+
+#[test]
+fn namespace_cursor_listing_seeks_by_namespace_id_without_a_temp_sort() {
+    let directory = TempDir::new().expect("create temp directory");
+    let raw = initialized_raw_catalog(&directory);
+    let cursor = stable_id_bytes(2);
+    let mut statement = raw
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT namespace_id, name, created_at_ns FROM namespaces
+              WHERE namespace_id > ?1
+              ORDER BY namespace_id
+              LIMIT ?2",
+        )
+        .expect("prepare namespace cursor query plan");
+    let plan = statement
+        .query_map(params![cursor.as_slice(), 100_u32], |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query namespace cursor plan")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect namespace cursor plan");
+    assert!(
+        plan.iter().any(|detail| {
+            detail.contains("SEARCH namespaces") && detail.contains("namespace_id>?")
+        }),
+        "namespace cursor plan must seek from namespace_id plan=[{plan:?}]"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| !detail.contains("SCAN namespaces")),
+        "namespace cursor plan must not scan namespaces plan=[{plan:?}]"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "namespace cursor plan must preserve namespace-id order in-index plan=[{plan:?}]"
+    );
+}
+
+#[test]
+fn active_table_cursor_listing_uses_the_state_id_index() {
+    let directory = TempDir::new().expect("create temp directory");
+    let raw = initialized_raw_catalog(&directory);
+    let cursor = stable_id_bytes(2);
+    let mut statement = raw
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT table_id FROM tables
+              WHERE state = 'active'
+                AND table_id > ?1
+              ORDER BY table_id
+              LIMIT ?2",
+        )
+        .expect("prepare global active table cursor query plan");
+    let plan = statement
+        .query_map(params![cursor.as_slice(), 100_u32], |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query global active table cursor plan")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect global active table cursor plan");
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("tables_by_state_id")),
+        "global active table cursor plan must use the state-id index plan=[{plan:?}]"
+    );
+    assert!(
+        plan.iter().all(|detail| !detail.contains("SCAN tables")),
+        "global active table cursor plan must not scan the tables table plan=[{plan:?}]"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "global active table cursor plan must preserve table-id order in-index plan=[{plan:?}]"
+    );
+}
+
+#[test]
+fn active_table_cursor_listing_uses_the_namespace_state_id_index() {
+    let directory = TempDir::new().expect("create temp directory");
+    let raw = initialized_raw_catalog(&directory);
+    let namespace_id = stable_id_bytes(1);
+    let cursor = stable_id_bytes(2);
+    let mut statement = raw
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT table_id FROM tables
+              WHERE namespace_id = ?1
+                AND state = 'active'
+                AND table_id > ?2
+              ORDER BY table_id
+              LIMIT ?3",
+        )
+        .expect("prepare active table cursor query plan");
+    let plan = statement
+        .query_map(
+            params![namespace_id.as_slice(), cursor.as_slice(), 100_u32],
+            |row| row.get::<_, String>(3),
+        )
+        .expect("query active table cursor plan")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect active table cursor plan");
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("tables_by_namespace_state_id")),
+        "active table cursor plan must use the namespace-state-id index plan=[{plan:?}]"
+    );
+    assert!(
+        plan.iter().all(|detail| !detail.contains("SCAN tables")),
+        "active table cursor plan must not scan the tables table plan=[{plan:?}]"
+    );
+    assert!(
+        plan.iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "active table cursor plan must preserve table-id order in-index plan=[{plan:?}]"
     );
 }
 
@@ -1042,7 +1344,7 @@ fn inspect_rejects_tampered_catalog_format_metadata() {
 #[test]
 fn inspect_rejects_tampered_schema_metadata() {
     assert_live_tamper_rejected(
-        "UPDATE catalog_meta SET value = X'0000000000000003' \
+        "UPDATE catalog_meta SET value = X'0000000000000004' \
          WHERE key = 'schema_version'",
     );
 }
@@ -1120,7 +1422,7 @@ fn inspect_rejects_an_extra_migration_audit_record() {
     assert_live_tamper_rejected(
         "INSERT INTO catalog_migrations( \
              schema_version, migration_name, migration_checksum, applied_at_ns \
-         ) VALUES (3, 'unexpected', zeroblob(32), zeroblob(8))",
+         ) VALUES (4, 'unexpected', zeroblob(32), zeroblob(8))",
     );
 }
 
@@ -1145,8 +1447,13 @@ fn inspect_rejects_catalog_table_column_drift() {
 }
 
 #[test]
-fn inspect_rejects_catalog_index_drift() {
-    assert_live_tamper_rejected("DROP INDEX data_files_visible_by_table");
+fn inspect_rejects_global_table_cursor_index_drift() {
+    assert_live_tamper_rejected("DROP INDEX tables_by_state_id");
+}
+
+#[test]
+fn inspect_rejects_namespace_table_cursor_index_drift() {
+    assert_live_tamper_rejected("DROP INDEX tables_by_namespace_state_id");
 }
 
 #[test]

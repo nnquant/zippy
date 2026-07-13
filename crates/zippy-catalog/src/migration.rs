@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use zippy_types::{ErrorCode, Result, ServerError};
 
@@ -11,6 +11,8 @@ const MIGRATION_V1_VERSION: u32 = 1;
 const MIGRATION_V1_NAME: &str = "catalog_migration_foundation";
 const MIGRATION_V2_VERSION: u32 = 2;
 const MIGRATION_V2_NAME: &str = "catalog_domain_schema";
+const MIGRATION_V3_VERSION: u32 = 3;
+const MIGRATION_V3_NAME: &str = "active_tables_cursor_indexes";
 
 // Physical SQLite schema versions are independent of CatalogCommand wire
 // versions. Physical v1 intentionally creates no domain tables: those must
@@ -610,6 +612,21 @@ define_domain_schema! {
  ON idempotent_requests(expires_at_ns, request_id)"#;
 }
 
+macro_rules! define_v3_schema_additions {
+    ($($name:ident = $sql:literal;)+) => {
+        $(const $name: &str = $sql;)+
+        const MIGRATION_V3: &str = concat!($($sql, ";\n",)+);
+    };
+}
+
+define_v3_schema_additions! {
+    TABLES_BY_STATE_ID_SQL = r#"CREATE INDEX tables_by_state_id
+ ON tables(state, table_id)"#;
+
+    TABLES_BY_NAMESPACE_STATE_ID_SQL = r#"CREATE INDEX tables_by_namespace_state_id
+ ON tables(namespace_id, state, table_id)"#;
+}
+
 struct ExpectedSchemaObject {
     object_type: &'static str,
     name: &'static str,
@@ -917,45 +934,70 @@ const MIGRATION_V2_SCHEMA: &[ExpectedSchemaObject] = &[
     },
 ];
 
+const MIGRATION_V3_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 2] = [
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "tables_by_state_id",
+        table_name: "tables",
+        sql: Some(TABLES_BY_STATE_ID_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "tables_by_namespace_state_id",
+        table_name: "tables",
+        sql: Some(TABLES_BY_NAMESPACE_STATE_ID_SQL),
+    },
+];
+
 struct Migration {
     version: u32,
     name: &'static str,
     sql: &'static str,
-    expected_schema: &'static [ExpectedSchemaObject],
+    base_schema_version: Option<u32>,
+    schema_additions: &'static [ExpectedSchemaObject],
 }
 
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: MIGRATION_V1_VERSION,
         name: MIGRATION_V1_NAME,
         sql: MIGRATION_V1,
-        expected_schema: &MIGRATION_V1_SCHEMA,
+        base_schema_version: None,
+        schema_additions: &MIGRATION_V1_SCHEMA,
     },
     Migration {
         version: MIGRATION_V2_VERSION,
         name: MIGRATION_V2_NAME,
         sql: MIGRATION_V2,
-        expected_schema: MIGRATION_V2_SCHEMA,
+        base_schema_version: None,
+        schema_additions: MIGRATION_V2_SCHEMA,
+    },
+    Migration {
+        version: MIGRATION_V3_VERSION,
+        name: MIGRATION_V3_NAME,
+        sql: MIGRATION_V3,
+        base_schema_version: Some(MIGRATION_V2_VERSION),
+        schema_additions: &MIGRATION_V3_SCHEMA_ADDITIONS,
     },
 ];
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
     validate_migration_registry()?;
-    let mut actual = schema_version(connection)?;
-    reject_future_version(actual)?;
-    if actual > 0 {
-        let _ = validate_metadata_at_version(connection, actual)?;
-    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| crate::map_sqlite_error("begin catalog migration", error))?;
+    let mut actual = validate_catalog_state(&transaction)?;
     while actual < CATALOG_SCHEMA_VERSION {
         let next = actual.checked_add(1).ok_or_else(|| {
             ServerError::new(ErrorCode::Internal, "catalog migration version overflow")
         })?;
         let migration = migration_by_version(next)?;
-        apply_migration(connection, migration)?;
+        apply_migration(&transaction, migration)?;
         actual = next;
-        let _ = validate_metadata_at_version(connection, actual)?;
     }
-    Ok(())
+    transaction
+        .commit()
+        .map_err(|error| crate::map_sqlite_error("commit catalog migration", error))
 }
 
 fn validate_migration_registry() -> Result<()> {
@@ -977,6 +1019,24 @@ fn validate_migration_registry() -> Result<()> {
                     expected, migration.version
                 ),
             ));
+        }
+        if let Some(base_schema_version) = migration.base_schema_version {
+            if base_schema_version >= migration.version
+                || !MIGRATIONS
+                    .iter()
+                    .any(|candidate| candidate.version == base_schema_version)
+            {
+                return Err(ServerError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        concat!(
+                            "catalog migration has invalid base schema version ",
+                            "version=[{}] base=[{}]"
+                        ),
+                        migration.version, base_schema_version
+                    ),
+                ));
+            }
         }
     }
     if MIGRATIONS.last().map(|migration| migration.version) != Some(CATALOG_SCHEMA_VERSION) {
@@ -1027,6 +1087,15 @@ fn application_id(connection: &Connection) -> Result<u32> {
 }
 
 pub(crate) fn preflight(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Deferred)
+        .map_err(|error| crate::map_sqlite_error("begin catalog preflight", error))?;
+    let _ = validate_catalog_state(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| crate::map_sqlite_error("commit catalog preflight", error))
+}
+
+fn validate_catalog_state(connection: &Connection) -> Result<u32> {
     let application_id = application_id(connection)?;
     let version = schema_version(connection)?;
     let schema_objects: u64 = connection
@@ -1038,7 +1107,7 @@ pub(crate) fn preflight(connection: &Connection) -> Result<()> {
         .map_err(|error| crate::map_sqlite_error("inspect catalog schema objects", error))?;
 
     if application_id == 0 && version == 0 && schema_objects == 0 {
-        return Ok(());
+        return Ok(version);
     }
     if application_id != CATALOG_APPLICATION_ID {
         return Err(ServerError::new(
@@ -1054,7 +1123,7 @@ pub(crate) fn preflight(connection: &Connection) -> Result<()> {
         ));
     }
     let _ = validate_metadata_at_version(connection, version)?;
-    Ok(())
+    Ok(version)
 }
 
 pub(crate) fn schema_version(connection: &Connection) -> Result<u32> {
@@ -1069,21 +1138,18 @@ pub(crate) fn schema_version(connection: &Connection) -> Result<u32> {
     })
 }
 
-fn apply_migration(connection: &mut Connection, migration: &Migration) -> Result<()> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| crate::map_sqlite_error("begin catalog migration", error))?;
-    transaction
+fn apply_migration(connection: &Connection, migration: &Migration) -> Result<()> {
+    connection
         .execute_batch(migration.sql)
         .map_err(|error| crate::map_sqlite_error("apply catalog migration", error))?;
     if migration.version == MIGRATION_V1_VERSION {
-        transaction
+        connection
             .execute(
                 "INSERT INTO catalog_meta(key, value) VALUES (?1, ?2)",
                 params!["catalog_format", CATALOG_FORMAT.as_bytes()],
             )
             .map_err(|error| crate::map_sqlite_error("initialize catalog format", error))?;
-        transaction
+        connection
             .execute(
                 "INSERT INTO catalog_meta(key, value) VALUES (?1, ?2)",
                 params![
@@ -1094,14 +1160,14 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Result
             .map_err(|error| {
                 crate::map_sqlite_error("initialize catalog schema metadata", error)
             })?;
-        transaction
+        connection
             .execute(
                 "INSERT INTO catalog_meta(key, value) VALUES (?1, ?2)",
                 params!["catalog_revision", encode_u64(0).as_slice()],
             )
             .map_err(|error| crate::map_sqlite_error("initialize catalog revision", error))?;
     } else {
-        let updated = transaction
+        let updated = connection
             .execute(
                 "UPDATE catalog_meta SET value = ?1 WHERE key = 'schema_version'",
                 [encode_u64(u64::from(migration.version)).as_slice()],
@@ -1116,7 +1182,7 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Result
             ));
         }
     }
-    transaction
+    connection
         .execute(
             "INSERT INTO catalog_migrations(
                 schema_version, migration_name, migration_checksum, applied_at_ns
@@ -1129,17 +1195,14 @@ fn apply_migration(connection: &mut Connection, migration: &Migration) -> Result
             ],
         )
         .map_err(|error| crate::map_sqlite_error("record catalog migration", error))?;
-    transaction
+    connection
         .pragma_update(None, "application_id", CATALOG_APPLICATION_ID)
         .map_err(|error| crate::map_sqlite_error("record catalog application id", error))?;
-    transaction
+    connection
         .pragma_update(None, "user_version", migration.version)
         .map_err(|error| crate::map_sqlite_error("record catalog schema version", error))?;
-    let _ =
-        validate_metadata_at_version_with_migration(&transaction, migration.version, migration)?;
-    transaction
-        .commit()
-        .map_err(|error| crate::map_sqlite_error("commit catalog migration", error))
+    let _ = validate_metadata_at_version_with_migration(connection, migration.version, migration)?;
+    Ok(())
 }
 
 pub(crate) fn validate_metadata(connection: &Connection) -> Result<(String, u32, u64)> {
@@ -1286,18 +1349,7 @@ fn validate_schema_fingerprint_for_migration(
     connection: &Connection,
     migration: &Migration,
 ) -> Result<()> {
-    let mut expected = migration
-        .expected_schema
-        .iter()
-        .map(|object| {
-            canonical_schema_object(
-                object.object_type,
-                object.name,
-                object.table_name,
-                object.sql,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut expected = expected_schema_for_migration(migration)?;
     expected.sort();
     if expected.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(ServerError::new(
@@ -1357,6 +1409,42 @@ fn validate_schema_fingerprint_for_migration(
         ));
     }
     Ok(())
+}
+
+fn expected_schema_for_migration(migration: &Migration) -> Result<Vec<CanonicalSchemaObject>> {
+    let mut expected = match migration.base_schema_version {
+        Some(base_schema_version) => {
+            if base_schema_version >= migration.version {
+                return Err(ServerError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        concat!(
+                            "catalog migration has invalid base schema version ",
+                            "version=[{}] base=[{}]"
+                        ),
+                        migration.version, base_schema_version
+                    ),
+                ));
+            }
+            expected_schema_for_migration(migration_by_version(base_schema_version)?)?
+        }
+        None => Vec::new(),
+    };
+    expected.extend(
+        migration
+            .schema_additions
+            .iter()
+            .map(|object| {
+                canonical_schema_object(
+                    object.object_type,
+                    object.name,
+                    object.table_name,
+                    object.sql,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(expected)
 }
 
 fn canonical_schema_object(
@@ -1494,7 +1582,7 @@ fn unix_time_ns() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, TransactionBehavior};
     use zippy_types::ErrorCode;
 
     use super::{
@@ -1525,7 +1613,8 @@ mod tests {
             version: MIGRATION_V1_VERSION,
             name: MIGRATION_V1_NAME,
             sql: MIGRATION_V1,
-            expected_schema: &[],
+            base_schema_version: None,
+            schema_additions: &[],
         };
 
         assert_migration_rolls_back(&mut connection, &drifted_manifest);
@@ -1538,15 +1627,21 @@ mod tests {
             version: MIGRATION_V1_VERSION,
             name: "drifted_test_migration",
             sql: MIGRATION_V1,
-            expected_schema: &MIGRATION_V1_SCHEMA,
+            base_schema_version: None,
+            schema_additions: &MIGRATION_V1_SCHEMA,
         };
 
         assert_migration_rolls_back(&mut connection, &drifted_manifest);
     }
 
     fn assert_migration_rolls_back(connection: &mut Connection, migration: &Migration) {
-        let error = apply_migration(connection, migration)
-            .expect_err("migration drift must be rejected before commit");
+        let error = {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin drifted migration");
+            apply_migration(&transaction, migration)
+                .expect_err("migration drift must be rejected before commit")
+        };
         assert_eq!(error.code(), ErrorCode::DataCorruption);
 
         let schema_objects: u64 = connection

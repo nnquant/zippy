@@ -1723,12 +1723,28 @@ frontend 依赖 QueryService 的 query lifecycle，不应先用 Flight 包装 le
   subscription、lease、job 和 idempotency 表。所有 `u64`、watermark、writer epoch、lineage 与
   provenance 必须先定义无损编码和 golden migration test，之后才允许接入 server。
 
-当前实施状态（2026-07-13）：physical v2 domain schema、无损 BLOB 编码、v1 -> v2 migration、
-schema inventory、`CreateNamespace` 单写者事务和跨重启幂等回放已经实现。其余 V1 command、
+当前实施状态（2026-07-13）：physical v2 domain schema、无损 BLOB 编码、physical v3 active-table
+cursor indexes、v1/v2 -> v3 migration、schema inventory、`CreateNamespace`/`CreateTable` 单写者事务、
+namespace/table get/list/resolve 和跨重启幂等回放已经实现。`CreateTable` 在同一事务中写入 table、
+schema version 1、snapshot version 1、catalog revision 与幂等响应；Arrow Schema 在获取 writer lock
+前按有界 schema-only IPC stream 校验：IPC payload 不超过 16 MiB、递归 field 不超过 4096、嵌套
+不超过 32 层、metadata 不超过 4096 项/1 MiB，FlatBuffer verifier 最多遍历 32768 个 table 和
+16 MiB apparent size；schema 以版本化 canonical logical SHA-256
+（`sha256-v1:<64 hex>`）标识；持久化 typed BLOB 通过冻结的 V1 storage DTO 编解码，避免运行时
+domain 类型演进静默改变落盘格式。其余 V1 mutation command、
 非空 `CatalogQuerySnapshot`、legacy importer/shadow/diff、绝对 shutdown deadline 尚未实现，因此
 SQLite 仍不能成为 `zippy server run` 的 read/write authority。physical schema 中已经保留 legacy
 discovery order，但 frozen V1 snapshot DTO 无法无损携带该顺序；在 V2 typed read contract 冻结前，
 非空 snapshot read 必须返回 `UnsupportedPlan`。
+
+轻量 table discovery 同时受条数与字节预算约束：list page 最多 4096 项，并在累计 raw descriptor
+达到 4 MiB 前提前结束、返回可继续的 keyset cursor；`resolve_tables` 保持全有或全无，累计超过
+4 MiB 返回 `ResourceExhausted`。引用列表在复制进 actor queue 前限制为 4096 项和 1 MiB 名称字节，
+新 SQLite Catalog namespace/table 写入限制为 1 KiB UTF-8 字节，但不改变 frozen V1 decoder 与
+LegacyCatalogAdapter 的历史名称域，避免合法但超大的新请求在单连接 actor 中形成无界内存、
+队首阻塞；另外按实际落盘 name/definition/config 编码大小执行 4 MiB 单行 admission check，保证
+分页游标始终可以推进。迁移的版本读取、schema fingerprint 校验和所有待执行 migration 由同一个
+`BEGIN IMMEDIATE` 覆盖，因此并发首次打开或 v1/v2 升级不会使用锁外的过期版本判断。
 
 SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立版本空间，不能用同一个
 “v1/v2”标签推断彼此已实现。
