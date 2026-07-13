@@ -1711,11 +1711,24 @@ frontend 依赖 QueryService 的 query lifecycle，不应先用 Flight 包装 le
 
 目标：替换 Registry 和 JSON snapshot。
 
+实施必须拆成两个不可混淆的物理版本阶段：
+
+- P2.1 只建立非权威 migration foundation。SQLite physical schema v1 只包含
+  `catalog_meta` 和 `catalog_migrations`，用于验证单连接 actor、WAL、迁移审计、完整性检查与
+  fail-closed 边界；它不实现 `Catalog` trait，也不接受 shadow 或业务写入。
+- P2.2 冻结完整类型化 domain schema 后再增加 namespace/table/schema/snapshot/file、producer、
+  subscription、lease、job 和 idempotency 表。所有 `u64`、watermark、writer epoch、lineage 与
+  provenance 必须先定义无损编码和 golden migration test，之后才允许接入 server。
+
+SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立版本空间，不能用同一个
+“v1/v2”标签推断彼此已实现。
+
 任务：
 
-1. 新建 `zippy-catalog` 和 migration framework。
-2. 实现 SQLite 初始化、WAL、checkpoint、integrity check。
-3. 实现 namespace/table/schema/snapshot/file 表。
+1. 新建 `zippy-catalog` 和 foundation-only migration framework。
+2. 实现 SQLite 初始化、WAL、integrity check；checkpoint 与绝对 shutdown deadline 在接入
+   server 前补齐。
+3. 在独立 physical migration 中实现 namespace/table/schema/snapshot/file 表。
 4. 实现 producer、subscription、lease、job、idempotency 表。
 5. 实现类型化 `CatalogCommand` 和单 writer actor。
 6. 实现多表同事务的 `CatalogQuerySnapshot`。
@@ -1763,6 +1776,10 @@ frontend 依赖 QueryService 的 query lifecycle，不应先用 Flight 包装 le
 ### Phase 4：Maintenance worker
 
 目标：把大 IO/CPU 任务移出 server 热路径。
+
+WebUI、maintenance 和 compaction 的进程所有权、启动/关闭、健康、安全及资源预算契约见
+[`server-owned-auxiliary-services.md`](server-owned-auxiliary-services.md)。该文档当前只冻结目标设计，
+不会让 `zippy server run` 自动启动辅助进程。
 
 任务：
 
@@ -2146,9 +2163,10 @@ refactor: compose legacy runtime behind zippy server
 feat: add versioned sqlite catalog schema
 ```
 
-- 引入 SQLite。
-- 建 schema/migration/integrity check。
-- 不接业务写入。
+- 引入 SQLite，并由专用 OS actor thread 独占连接。
+- physical schema v1 只建 migration metadata，完成 WAL、迁移审计与 integrity check。
+- 明确标记为 foundation-only：不实现 `Catalog` trait，不接 shadow 或业务写入。
+- 完整类型化 domain schema 作为 P2.2 的后续 physical migration，不复用或改写 v1。
 
 ### Commit 4：Shadow Catalog
 
