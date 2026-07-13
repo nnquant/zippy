@@ -1,4 +1,5 @@
 pub mod daemon;
+pub mod legacy_catalog;
 pub mod registry;
 pub mod server;
 pub mod snapshot;

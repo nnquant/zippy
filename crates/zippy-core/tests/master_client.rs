@@ -231,6 +231,7 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
                         )
                     } else {
                         ControlResponse::Error {
+                            code: None,
                             reason: "fake server does not handle envelope".to_string(),
                         }
                     };

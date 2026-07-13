@@ -11,6 +11,7 @@ members = [
     "crates/zippy-master",
     "crates/zippy-segment-store",
     "crates/zippy-operator-runtime",
+    "crates/zippy-server",
 ]
 resolver = "2"
 

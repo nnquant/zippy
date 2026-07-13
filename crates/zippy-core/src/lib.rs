@@ -36,7 +36,11 @@ pub use config::{
     DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
     MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
-pub use control_transport::{connect_control_endpoint, send_control_line_request, ControlStream};
+pub use control_transport::{
+    connect_control_endpoint, control_response_result, send_control_line_request,
+    send_control_line_request_cancellable_with_deadline, send_control_line_request_with_timeout,
+    ControlStream, MAX_CONTROL_RESPONSE_LINE_BYTES,
+};
 pub use data_directory::{
     DataDirectory, DataDirectoryError, ManagedDataDirectory, DATA_FORMAT_VERSION,
     DATA_FORMAT_VERSION_FILE,
@@ -62,6 +66,7 @@ pub use spsc_data_queue::SpscDataQueue;
 pub use table::{SegmentRowView, SegmentTableView};
 pub use types::{EngineConfig, EngineStatus, LateDataPolicy, OverflowPolicy};
 pub use version::{base_version, python_dev_version, rust_dev_version};
+pub use zippy_types::ErrorCode as ControlErrorCode;
 
 pub fn crate_name() -> &'static str {
     "zippy-core"

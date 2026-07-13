@@ -41,6 +41,8 @@ pub struct StreamRecord {
     #[serde(default)]
     pub persist_revision: u64,
     #[serde(default)]
+    pub persisted_files_revision: u64,
+    #[serde(default)]
     pub segment_reader_leases: Vec<serde_json::Value>,
     pub buffer_size: usize,
     pub frame_size: usize,
@@ -406,6 +408,7 @@ pub struct Registry {
     next_process_id: u64,
     next_segment_reader_lease_id: u64,
     control_revision: u64,
+    catalog_revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -624,6 +627,19 @@ impl Registry {
     fn next_control_revision(&mut self) -> u64 {
         self.control_revision = self.control_revision.saturating_add(1).max(1);
         self.control_revision
+    }
+
+    fn next_catalog_revision(&mut self) -> u64 {
+        self.catalog_revision = self.catalog_revision.saturating_add(1).max(1);
+        self.catalog_revision
+    }
+
+    pub(crate) const fn catalog_revision(&self) -> u64 {
+        self.catalog_revision
+    }
+
+    pub(crate) fn restore_catalog_revision(&mut self, catalog_revision: u64) {
+        self.catalog_revision = catalog_revision;
     }
 
     pub fn ensure_stream(
@@ -895,6 +911,7 @@ impl Registry {
             persisted_files: Vec::new(),
             persist_events: Vec::new(),
             persist_revision: 0,
+            persisted_files_revision: 0,
             segment_reader_leases: Vec::new(),
             buffer_size,
             frame_size,
@@ -907,6 +924,7 @@ impl Registry {
             reader_process_ids: BTreeMap::new(),
         };
         self.streams.insert(stream_name.to_string(), record);
+        self.next_catalog_revision();
         Ok(())
     }
 
@@ -1090,6 +1108,14 @@ impl Registry {
         } else {
             existing_writer_epoch.max(current_stream_writer_epoch)
         };
+        let catalog_changed = self
+            .sources
+            .get(source_name)
+            .is_none_or(|source| source.writer_epoch != writer_epoch)
+            || self
+                .streams
+                .get(output_stream)
+                .is_some_and(|stream| stream.writer_epoch != writer_epoch);
         if let Some(existing) = self.sources.get(source_name) {
             if existing.source_type != source_type
                 || existing.output_stream != output_stream
@@ -1118,6 +1144,9 @@ impl Registry {
                 stream.active_writer_source_name = Some(source_name.to_string());
                 stream.writer_epoch = writer_epoch;
             }
+            if catalog_changed {
+                self.next_catalog_revision();
+            }
             return Ok(());
         }
         self.sources.insert(
@@ -1138,6 +1167,7 @@ impl Registry {
             stream.active_writer_source_name = Some(source_name.to_string());
             stream.writer_epoch = writer_epoch;
         }
+        self.next_catalog_revision();
         Ok(())
     }
 
@@ -1278,6 +1308,7 @@ impl Registry {
         persisted_files: Vec<serde_json::Value>,
         persist_events: Vec<serde_json::Value>,
         persist_revision: u64,
+        persisted_files_revision: u64,
         segment_reader_leases: Vec<serde_json::Value>,
         writer_epoch: u64,
     ) -> Result<(), RegistryError> {
@@ -1287,13 +1318,22 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        let catalog_changed = stream.persisted_files != persisted_files
+            || stream.persist_events != persist_events
+            || stream.persist_revision != persist_revision
+            || stream.persisted_files_revision != persisted_files_revision
+            || stream.writer_epoch != writer_epoch;
         stream.descriptor_generation = descriptor_generation;
         stream.sealed_segments = sealed_segments;
         stream.persisted_files = persisted_files;
         stream.persist_events = persist_events;
         stream.persist_revision = persist_revision;
+        stream.persisted_files_revision = persisted_files_revision;
         stream.segment_reader_leases = segment_reader_leases;
         stream.writer_epoch = writer_epoch;
+        if catalog_changed {
+            self.next_catalog_revision();
+        }
         Ok(())
     }
 
@@ -1302,11 +1342,20 @@ impl Registry {
         source_name: &str,
         writer_epoch: u64,
     ) -> Result<(), RegistryError> {
-        if !self.sources.contains_key(source_name) {
-            return Err(RegistryError::SourceNotFound {
-                source_name: source_name.to_string(),
-            });
-        }
+        let source =
+            self.sources
+                .get(source_name)
+                .ok_or_else(|| RegistryError::SourceNotFound {
+                    source_name: source_name.to_string(),
+                })?;
+        let catalog_changed = source.writer_epoch != writer_epoch
+            || self
+                .streams
+                .get(&source.output_stream)
+                .is_some_and(|stream| {
+                    stream.active_writer_source_name.as_deref() == Some(source_name)
+                        && stream.writer_epoch != writer_epoch
+                });
         let revision = self.next_control_revision();
         let source = self.sources.get_mut(source_name).unwrap();
         source.writer_epoch = writer_epoch;
@@ -1315,6 +1364,9 @@ impl Registry {
             if stream.active_writer_source_name.as_deref() == Some(source_name) {
                 stream.writer_epoch = writer_epoch;
             }
+        }
+        if catalog_changed {
+            self.next_catalog_revision();
         }
         Ok(())
     }
@@ -1371,11 +1423,15 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        let previous_writer_epoch = stream.writer_epoch;
         if stream.writer_process_id.as_deref() != Some(process_id) || stream.writer_epoch == 0 {
             stream.writer_epoch = stream.writer_epoch.saturating_add(1).max(1);
         }
         stream.writer_process_id = Some(process_id.to_string());
         stream.status = "writer_attached".to_string();
+        if stream.writer_epoch != previous_writer_epoch {
+            self.next_catalog_revision();
+        }
         Ok(())
     }
 
@@ -1415,12 +1471,16 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        let writer_epoch_changed = stream.writer_epoch == 0;
         stream.active_segment_descriptor = Some(active_descriptor);
         stream.sealed_segments = sealed_segments;
         stream.descriptor_generation = stream.descriptor_generation.saturating_add(1);
         stream.writer_process_id = Some(process_id.to_string());
         stream.writer_epoch = stream.writer_epoch.max(1);
         stream.status = "writer_attached".to_string();
+        if writer_epoch_changed {
+            self.next_catalog_revision();
+        }
         Ok(())
     }
 
@@ -1476,13 +1536,20 @@ impl Registry {
                     .and_then(serde_json::Value::as_str)
                     == Some(persist_file_id.as_str())
             }) {
+                if *existing != persisted_file {
+                    stream.persisted_files_revision =
+                        stream.persisted_files_revision.saturating_add(1).max(1);
+                }
                 *existing = persisted_file;
                 stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
+                self.next_catalog_revision();
                 return Ok(());
             }
         }
         stream.persisted_files.push(persisted_file);
         stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
+        stream.persisted_files_revision = stream.persisted_files_revision.saturating_add(1).max(1);
+        self.next_catalog_revision();
         Ok(())
     }
 
@@ -1511,8 +1578,13 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        if stream.persisted_files != normalized_files {
+            stream.persisted_files_revision =
+                stream.persisted_files_revision.saturating_add(1).max(1);
+        }
         stream.persisted_files = normalized_files;
         stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
+        self.next_catalog_revision();
         Ok(())
     }
 
@@ -1595,11 +1667,13 @@ impl Registry {
             }) {
                 *existing = persist_event;
                 stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
+                self.next_catalog_revision();
                 return Ok(());
             }
         }
         stream.persist_events.push(persist_event);
         stream.persist_revision = stream.persist_revision.saturating_add(1).max(1);
+        self.next_catalog_revision();
         Ok(())
     }
 
@@ -1614,7 +1688,13 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        let catalog_changed = stream.persisted_files != persisted_files;
         stream.persisted_files = persisted_files;
+        if catalog_changed {
+            stream.persisted_files_revision =
+                stream.persisted_files_revision.saturating_add(1).max(1);
+            self.next_catalog_revision();
+        }
         Ok(())
     }
 
@@ -1629,7 +1709,11 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
+        let catalog_changed = stream.persist_events != persist_events;
         stream.persist_events = persist_events;
+        if catalog_changed {
+            self.next_catalog_revision();
+        }
         Ok(())
     }
 
@@ -1862,6 +1946,17 @@ impl Registry {
             .collect()
     }
 
+    pub(crate) fn source_configs_by_stream(&self) -> BTreeMap<String, Vec<serde_json::Value>> {
+        let mut configs = BTreeMap::<String, Vec<serde_json::Value>>::new();
+        for source in self.sources.values() {
+            configs
+                .entry(source.output_stream.clone())
+                .or_default()
+                .push(source.config.clone());
+        }
+        configs
+    }
+
     pub fn streams_for_writer_process(&self, process_id: &str) -> Vec<String> {
         self.streams
             .values()
@@ -1925,6 +2020,7 @@ impl Registry {
         let removed = self.sources.remove(source_name);
         if let Some(source) = &removed {
             self.clear_active_writer_source(&source.output_stream, source_name);
+            self.next_catalog_revision();
         }
         removed
     }
@@ -1954,6 +2050,7 @@ impl Registry {
                     source_name: source_name.to_string(),
                 })?;
         self.clear_active_writer_source(&removed.output_stream, source_name);
+        self.next_catalog_revision();
         Ok(removed)
     }
 
@@ -1978,7 +2075,11 @@ impl Registry {
     }
 
     pub fn unregister_stream(&mut self, stream_name: &str) -> Option<StreamRecord> {
-        self.streams.remove(stream_name)
+        let removed = self.streams.remove(stream_name);
+        if removed.is_some() {
+            self.next_catalog_revision();
+        }
+        removed
     }
 
     pub fn drop_table(&mut self, table_name: &str) -> DroppedTableRecords {
@@ -2008,6 +2109,10 @@ impl Registry {
             if let Some(engine) = self.engines.remove(&engine_name) {
                 engines.push(engine);
             }
+        }
+
+        if stream.is_some() || !sources.is_empty() {
+            self.next_catalog_revision();
         }
 
         DroppedTableRecords {

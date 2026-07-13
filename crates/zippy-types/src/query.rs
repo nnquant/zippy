@@ -17,7 +17,11 @@ use crate::{BoxFuture, QueryId, ResourceLimit, Result, SessionId, TableId};
 /// The current Zippy logical-plan envelope format.
 pub const CURRENT_LOGICAL_PLAN_FORMAT_VERSION: u32 = 1;
 
-/// A versioned, non-empty Zippy logical-plan protobuf payload.
+/// A versioned, non-empty Zippy logical-plan payload.
+///
+/// Format version 1 is reserved for the native Zippy protobuf plan. Migration
+/// adapters may allocate a distinct version for a compatibility codec; an
+/// engine must reject every version it does not explicitly implement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LogicalPlanEnvelope {
     format_version: u32,
@@ -53,7 +57,7 @@ impl LogicalPlanEnvelope {
         self.format_version
     }
 
-    /// Borrows the version-specific protobuf payload.
+    /// Borrows the version-specific encoded payload.
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
@@ -93,7 +97,7 @@ pub enum InvalidLogicalPlanEnvelope {
 pub enum QueryInput {
     /// SQL text parsed, bound, and optimized by the server.
     Sql(String),
-    /// A versioned Zippy logical-plan protobuf.
+    /// A versioned Zippy logical-plan envelope.
     LogicalPlan(LogicalPlanEnvelope),
 }
 
@@ -159,7 +163,7 @@ impl QueryState {
                 Self::Planned | Self::Failed | Self::Cancelled | Self::TimedOut
             ) | (
                 Self::Planned,
-                Self::Running | Self::Cancelled | Self::TimedOut
+                Self::Running | Self::Failed | Self::Cancelled | Self::TimedOut
             ) | (
                 Self::Running,
                 Self::Finished | Self::Failed | Self::Cancelled | Self::TimedOut
@@ -499,6 +503,7 @@ mod tests {
     fn query_state_machine_has_explicit_plan_ownership_phase() {
         assert!(QueryState::Planning.can_transition_to(QueryState::Planned));
         assert!(QueryState::Planned.can_transition_to(QueryState::Running));
+        assert!(QueryState::Planned.can_transition_to(QueryState::Failed));
         assert!(QueryState::Running.can_transition_to(QueryState::Finished));
         assert!(!QueryState::Finished.can_transition_to(QueryState::Running));
         assert!(QueryState::Cancelled.is_terminal());

@@ -1,0 +1,21 @@
+[package]
+name = "zippy-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zippy-core = { path = "../zippy-core" }
+zippy-gateway = { path = "../zippy-gateway" }
+zippy-master = { path = "../zippy-master" }
+zippy-types = { path = "../zippy-types" }
+
+[dev-dependencies]
+parquet.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

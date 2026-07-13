@@ -38,12 +38,14 @@ use zippy_core::bus_protocol::{
     AcquireSegmentReaderLeaseRequest, ReleaseSegmentReaderLeaseRequest, WatchRequest, WatchResource,
 };
 use zippy_core::{
-    canonical_schema_hash, schema_metadata, send_control_line_request, ControlEndpoint,
-    ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
-    ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
-    RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
-    UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES,
-    DEFAULT_QUERY_MAX_BUFFERED_BYTES, MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
+    canonical_schema_hash, control_response_result, schema_metadata, send_control_line_request,
+    send_control_line_request_cancellable_with_deadline, ControlEndpoint, ControlRequest,
+    ControlResponse, Engine, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
+    PublishSegmentDescriptorRequest, RegisterProcessRequest, RegisterSourceRequest,
+    RegisterStreamRequest, Result, SegmentTableView, StreamInfo, UnregisterSourceRequest,
+    ZippyError, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES,
+    DEFAULT_QUERY_MAX_BUFFERED_BYTES, MAX_CONTROL_RESPONSE_LINE_BYTES, MAX_PARALLELISM,
+    MAX_QUERY_BUFFER_BYTES,
 };
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
@@ -52,6 +54,10 @@ use zippy_segment_store::{
     compile_schema as compile_segment_schema, ActiveSegmentDescriptor, ActiveSegmentReader,
     ColumnSpec, ColumnType, CompiledSchema, LayoutPlan, RowSpanBatchReader, RowSpanView,
 };
+
+pub mod legacy_query;
+
+pub use legacy_query::{LegacyCollectCursor, LegacyCollectFacade, LegacyCollectRequest};
 
 const MAX_GATEWAY_HEADER_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -156,6 +162,7 @@ struct GatewayScanPushdown {
     projection_columns: Option<Vec<String>>,
 }
 
+#[derive(Clone)]
 struct GatewayCollectStreamPlan {
     source: String,
     snapshot_id: Option<String>,
@@ -350,7 +357,7 @@ impl GatewayFileByteBudget {
         file_index: usize,
     ) -> Result<GatewayFileBytePermit> {
         if bytes > self.limit_bytes {
-            return Err(ZippyError::InvalidConfig {
+            return Err(ZippyError::ResourceExhausted {
                 reason: format!(
                     "persisted scan batch exceeds file buffer budget file_index=[{}] batch_bytes=[{}] file_buffer_budget_bytes=[{}]",
                     file_index, bytes, self.limit_bytes
@@ -806,7 +813,7 @@ impl GatewayPersistedStreamScanner {
         let active_file_limit = parallelism.min(file_paths.len()).max(1);
         let file_buffer_budget_bytes = query_buffer_budget_bytes / active_file_limit;
         if file_buffer_budget_bytes == 0 {
-            return Err(ZippyError::InvalidConfig {
+            return Err(ZippyError::ResourceExhausted {
                 reason: format!(
                     "gateway query buffer budget is smaller than active file slots query_buffer_budget_bytes=[{}] active_file_slots=[{}]",
                     query_buffer_budget_bytes, active_file_limit
@@ -1181,6 +1188,16 @@ impl GatewayCollectStreamProducer {
         }
     }
 
+    fn attach_cancellation_flag(&mut self, cancelled: Arc<AtomicBool>) {
+        if let Self::Persisted {
+            source: GatewayPersistedBatchSource::Streaming(scanner),
+            ..
+        } = self
+        {
+            scanner.cancelled = cancelled;
+        }
+    }
+
     fn metrics(&self) -> Value {
         match self {
             Self::Materialized { metrics, .. } => metrics.value(),
@@ -1194,6 +1211,17 @@ impl GatewayCollectStreamProducer {
             Self::Materialized { metrics, .. } => metrics,
             Self::Persisted { metrics, .. } => metrics,
             Self::Segment { metrics, .. } => metrics,
+        }
+    }
+
+    #[cfg(test)]
+    fn persisted_cancellation_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Persisted {
+                source: GatewayPersistedBatchSource::Streaming(scanner),
+                ..
+            } => Some(Arc::clone(&scanner.cancelled)),
+            _ => None,
         }
     }
 
@@ -1345,6 +1373,7 @@ struct GatewayMasterProcess {
 
 struct GatewayAsyncMasterClient {
     endpoint: ControlEndpoint,
+    request_timeout: Duration,
     process: Mutex<Option<GatewayMasterProcess>>,
     async_register_lock: tokio::sync::Mutex<()>,
     metrics: Arc<Mutex<GatewayMetrics>>,
@@ -1605,6 +1634,7 @@ impl GatewayServer {
         let master = Arc::new(GatewayAsyncMasterClient::new(
             config.master_endpoint.clone(),
             Arc::clone(&metrics),
+            write_timeout,
         ));
         Ok(Self {
             endpoint: normalize_endpoint(&config.endpoint),
@@ -1694,6 +1724,11 @@ impl GatewayServer {
     /// Return the effective listening endpoint.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Return a cloneable facade for legacy blocking collect adapters.
+    pub fn legacy_collect_facade(&self) -> LegacyCollectFacade {
+        LegacyCollectFacade::new(Arc::clone(&self.state))
     }
 
     /// Return GatewayServer metrics as JSON.
@@ -1888,9 +1923,14 @@ fn record_writer_descriptor_publish_elapsed(
 }
 
 impl GatewayAsyncMasterClient {
-    fn new(endpoint: ControlEndpoint, metrics: Arc<Mutex<GatewayMetrics>>) -> Self {
+    fn new(
+        endpoint: ControlEndpoint,
+        metrics: Arc<Mutex<GatewayMetrics>>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             endpoint,
+            request_timeout,
             process: Mutex::new(None),
             async_register_lock: tokio::sync::Mutex::new(()),
             metrics,
@@ -1982,6 +2022,25 @@ impl GatewayAsyncMasterClient {
         self.send_request_blocking(ControlRequest::GetStream(GetStreamRequest {
             stream_name: source.to_string(),
         }))
+        .and_then(|response| match response {
+            ControlResponse::StreamFetched(response) => Ok(response.stream),
+            other => Err(unexpected_response("StreamFetched", other)),
+        })
+    }
+
+    fn get_stream_blocking_cancellable_with_deadline(
+        &self,
+        source: &str,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<StreamInfo> {
+        self.send_request_blocking_cancellable_with_deadline(
+            ControlRequest::GetStream(GetStreamRequest {
+                stream_name: source.to_string(),
+            }),
+            deadline,
+            cancelled,
+        )
         .and_then(|response| match response {
             ControlResponse::StreamFetched(response) => Ok(response.stream),
             other => Err(unexpected_response("StreamFetched", other)),
@@ -2203,12 +2262,27 @@ impl GatewayAsyncMasterClient {
 
     async fn send_request_async(&self, request: ControlRequest) -> Result<ControlResponse> {
         self.metrics.lock().unwrap().master_async_requests_total += 1;
-        send_control_request_async(&self.endpoint, request).await
+        send_control_request_async(&self.endpoint, request, self.request_timeout).await
     }
 
     fn send_request_blocking(&self, request: ControlRequest) -> Result<ControlResponse> {
         self.metrics.lock().unwrap().master_async_requests_total += 1;
         send_control_line_request(&self.endpoint, request)
+    }
+
+    fn send_request_blocking_cancellable_with_deadline(
+        &self,
+        request: ControlRequest,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<ControlResponse> {
+        self.metrics.lock().unwrap().master_async_requests_total += 1;
+        send_control_line_request_cancellable_with_deadline(
+            &self.endpoint,
+            request,
+            deadline,
+            cancelled,
+        )
     }
 }
 
@@ -2360,6 +2434,78 @@ impl GatewayState {
             stream_plan.chunk_rows,
             metrics,
         ))
+    }
+
+    fn collect_stream_producer_direct(
+        &self,
+        stream_plan: GatewayCollectStreamPlan,
+        control_deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Result<GatewayCollectStreamProducer> {
+        if stream_plan.snapshot_id.is_some() {
+            return Err(ZippyError::InvalidConfig {
+                reason: "legacy collect facade does not support snapshots".to_string(),
+            });
+        }
+        if stream_plan.row_range_pushdown.is_some() {
+            return Err(ZippyError::InvalidConfig {
+                reason: concat!(
+                    "legacy collect facade does not support row-range operations; ",
+                    "use a streaming filter/projection plan"
+                )
+                .to_string(),
+            });
+        }
+
+        let active_writer = self
+            .writers
+            .lock()
+            .unwrap()
+            .get(&stream_plan.source)
+            .cloned();
+        if let Some(writer) = active_writer {
+            let span = {
+                let writer = writer.lock().unwrap();
+                writer.materializer.active_row_span()?
+            };
+            return GatewayCollectStreamProducer::segment(
+                span.schema_ref(),
+                vec![span],
+                stream_plan.scan_pushdown,
+                stream_plan.output_projection_columns,
+                stream_plan.chunk_rows,
+            );
+        }
+
+        let stream = self.master.get_stream_blocking_cancellable_with_deadline(
+            &stream_plan.source,
+            control_deadline,
+            cancelled,
+        )?;
+        if !stream_is_persisted_only(&stream) {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    concat!(
+                        "legacy collect facade requires an active local writer or a ",
+                        "persisted-only stream source=[{}]"
+                    ),
+                    stream_plan.source
+                ),
+            });
+        }
+        self.increment_metric(|metrics| metrics.collect_requests_total += 1);
+        GatewayCollectStreamProducer::persisted_serial(
+            &stream,
+            &stream_plan.scan_pushdown,
+            stream_plan.output_projection_columns.as_deref(),
+            None,
+            stream_plan.chunk_rows,
+            GatewayPersistedScanResources {
+                pool: Arc::clone(&self.persisted_scan_pool),
+                parallelism: self.query_parallelism,
+                query_buffer_budget_bytes: self.query_max_buffered_bytes,
+            },
+        )
     }
 
     fn handle_create_snapshot(&self, header: Value) -> Result<(Value, Vec<u8>)> {
@@ -4008,26 +4154,27 @@ async fn handle_collect_stream_async(
     if buffer_reservation_bytes > 0 {
         let reservation_started = Instant::now();
         let reservation_result = async {
-            let permits =
-                u32::try_from(buffer_reservation_bytes).map_err(|_| ZippyError::InvalidConfig {
+            let permits = u32::try_from(buffer_reservation_bytes).map_err(|_| {
+                ZippyError::ResourceExhausted {
                     reason: format!(
                         "gateway query buffer reservation exceeds supported range bytes=[{}]",
                         buffer_reservation_bytes
                     ),
-                })?;
+                }
+            })?;
             tokio::time::timeout(
                 state.write_timeout,
                 Arc::clone(&state.persisted_buffer_limit).acquire_many_owned(permits),
             )
             .await
-            .map_err(|_| ZippyError::Io {
+            .map_err(|_| ZippyError::ResourceExhausted {
                 reason: format!(
                     "gateway query buffer reservation timed out bytes=[{}] timeout_ms=[{}]",
                     buffer_reservation_bytes,
                     state.write_timeout.as_millis()
                 ),
             })?
-            .map_err(|_| ZippyError::Io {
+            .map_err(|_| ZippyError::ResourceExhausted {
                 reason: "gateway query buffer limit is closed".to_string(),
             })
         }
@@ -4438,6 +4585,35 @@ async fn timeout_io<T>(
 async fn send_control_request_async(
     endpoint: &ControlEndpoint,
     request: ControlRequest,
+    request_timeout: Duration,
+) -> Result<ControlResponse> {
+    if request_timeout.is_zero() {
+        return Err(ZippyError::InvalidConfig {
+            reason: "gateway master request timeout must be positive".to_string(),
+        });
+    }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(request_timeout)
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "gateway master request timeout exceeds monotonic clock range".to_string(),
+        })?;
+    let result = tokio::time::timeout_at(
+        deadline,
+        send_control_request_async_inner(endpoint, request),
+    )
+    .await;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(gateway_master_deadline_error(request_timeout));
+    }
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(gateway_master_deadline_error(request_timeout)),
+    }
+}
+
+async fn send_control_request_async_inner(
+    endpoint: &ControlEndpoint,
+    request: ControlRequest,
 ) -> Result<ControlResponse> {
     match endpoint {
         #[cfg(unix)]
@@ -4455,22 +4631,39 @@ async fn send_control_request_async(
             ),
         }),
         ControlEndpoint::Tcp(addr) => {
-            let stream =
-                tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(addr))
-                    .await
-                    .map_err(|_| ZippyError::Io {
-                        reason: format!("gateway master tcp connect timed out addr=[{}]", addr),
-                    })?
-                    .map_err(io_error)?;
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(io_error)?;
             stream.set_nodelay(true).map_err(io_error)?;
             send_control_line_over_async_stream(stream, request).await
         }
     }
 }
 
+fn gateway_master_deadline_error(request_timeout: Duration) -> ZippyError {
+    ZippyError::DeadlineExceeded {
+        reason: format!(
+            "gateway master control request deadline exceeded timeout_ms=[{}]",
+            request_timeout.as_millis()
+        ),
+    }
+}
+
 async fn send_control_line_over_async_stream<S>(
+    stream: S,
+    request: ControlRequest,
+) -> Result<ControlResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    send_control_line_over_async_stream_with_limit(stream, request, MAX_CONTROL_RESPONSE_LINE_BYTES)
+        .await
+}
+
+async fn send_control_line_over_async_stream_with_limit<S>(
     mut stream: S,
     request: ControlRequest,
+    max_response_line_bytes: usize,
 ) -> Result<ControlResponse>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -4483,18 +4676,31 @@ where
     stream.write_all(b"\n").await.map_err(io_error)?;
     stream.flush().await.map_err(io_error)?;
 
-    let mut response_line = String::new();
-    let mut reader = tokio::io::BufReader::new(stream);
+    let read_limit = u64::try_from(max_response_line_bytes)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| ZippyError::InvalidConfig {
+            reason: "gateway master response line limit exceeds supported range".to_string(),
+        })?;
+    let reader = tokio::io::BufReader::new(stream);
+    let mut reader = reader.take(read_limit);
+    let mut response_line = Vec::new();
     reader
-        .read_line(&mut response_line)
+        .read_until(b'\n', &mut response_line)
         .await
         .map_err(io_error)?;
-    let response = serde_json::from_str::<ControlResponse>(response_line.trim_end())
-        .map_err(json_zippy_error)?;
-    match response {
-        ControlResponse::Error { reason } => Err(ZippyError::Io { reason }),
-        other => Ok(other),
+    let newline_bytes = usize::from(response_line.last() == Some(&b'\n'));
+    if response_line.len() - newline_bytes > max_response_line_bytes {
+        return Err(ZippyError::ResourceExhausted {
+            reason: format!(
+                "gateway master control response line exceeds limit max_bytes=[{}]",
+                max_response_line_bytes
+            ),
+        });
     }
+    let response =
+        serde_json::from_slice::<ControlResponse>(&response_line).map_err(json_zippy_error)?;
+    control_response_result(response)
 }
 
 fn record_gateway_error_metric(state: &GatewayState, error: &ZippyError) {
@@ -4503,7 +4709,9 @@ fn record_gateway_error_metric(state: &GatewayState, error: &ZippyError) {
         metrics.errors_total += 1;
         if message.contains("payload read timed out") {
             metrics.payload_timeouts_total += 1;
-        } else if message.contains("timed out") {
+        } else if matches!(error, ZippyError::DeadlineExceeded { .. })
+            || message.contains("timed out")
+        {
             metrics.request_timeouts_total += 1;
         }
     });
@@ -4839,7 +5047,7 @@ fn advance_persisted_scan_cursor(
             }),
         };
     };
-    let batch = batch.map_err(|error| ZippyError::Io {
+    let batch = batch.map_err(|error| ZippyError::DataCorruption {
         reason: format!(
             "failed to read persisted parquet batch path=[{}] error=[{}]",
             cursor.task.file_path, error
@@ -5076,21 +5284,16 @@ fn read_parquet_record_batches_slice(
 }
 
 fn persisted_parquet_row_count(path: &Path) -> Result<usize> {
-    let file = File::open(path).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to open persisted parquet file path=[{}] error=[{}]",
-            path.display(),
-            error
-        ),
-    })?;
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| ZippyError::Io {
+    let file = File::open(path).map_err(|error| persisted_file_open_error(path, error))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+        ZippyError::DataCorruption {
             reason: format!(
                 "failed to read persisted parquet metadata path=[{}] error=[{}]",
                 path.display(),
                 error
             ),
-        })?;
+        }
+    })?;
     usize::try_from(builder.metadata().file_metadata().num_rows()).map_err(|_| {
         ZippyError::InvalidConfig {
             reason: format!(
@@ -5121,7 +5324,7 @@ fn read_parquet_record_batch_chunks(
         build_parquet_record_batch_reader(path, projection_columns, filters, row_range)?;
     let batches = reader
         .map(|batch| {
-            batch.map_err(|error| ZippyError::Io {
+            batch.map_err(|error| ZippyError::DataCorruption {
                 reason: format!(
                     "failed to read persisted parquet batch path=[{}] error=[{}]",
                     path.display(),
@@ -5139,21 +5342,16 @@ fn build_parquet_record_batch_reader(
     filters: &[Value],
     row_range: Option<PersistedParquetRowRange>,
 ) -> Result<(SchemaRef, ParquetRecordBatchReader)> {
-    let file = File::open(path).map_err(|error| ZippyError::Io {
-        reason: format!(
-            "failed to open persisted parquet file path=[{}] error=[{}]",
-            path.display(),
-            error
-        ),
-    })?;
-    let mut builder =
-        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| ZippyError::Io {
+    let file = File::open(path).map_err(|error| persisted_file_open_error(path, error))?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+        ZippyError::DataCorruption {
             reason: format!(
                 "failed to create persisted parquet reader path=[{}] error=[{}]",
                 path.display(),
                 error
             ),
-        })?;
+        }
+    })?;
     if let Some(projection_columns) = projection_columns {
         let indices = projection_columns
             .iter()
@@ -5226,7 +5424,7 @@ fn build_parquet_record_batch_reader(
     let reader = builder
         .with_batch_size(PERSISTED_PARQUET_SCAN_BATCH_SIZE)
         .build()
-        .map_err(|error| ZippyError::Io {
+        .map_err(|error| ZippyError::DataCorruption {
             reason: format!(
                 "failed to build persisted parquet reader path=[{}] error=[{}]",
                 path.display(),
@@ -5234,6 +5432,19 @@ fn build_parquet_record_batch_reader(
             ),
         })?;
     Ok((schema, reader))
+}
+
+fn persisted_file_open_error(path: &Path, error: std::io::Error) -> ZippyError {
+    let reason = format!(
+        "failed to open persisted parquet file path=[{}] error=[{}]",
+        path.display(),
+        error
+    );
+    if error.kind() == ErrorKind::NotFound {
+        ZippyError::NotFound { reason }
+    } else {
+        ZippyError::Io { reason }
+    }
 }
 
 fn parquet_row_group_may_match_filter(
@@ -5668,28 +5879,34 @@ fn persisted_file_path(value: &Value) -> Result<String> {
         .get("file_path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
-        .ok_or_else(|| ZippyError::InvalidConfig {
+        .ok_or_else(|| ZippyError::DataCorruption {
             reason: "persisted file metadata missing file_path".to_string(),
         })?;
     let Some(persist_root) = value.get("persist_data_root").and_then(Value::as_str) else {
         return Ok(file_path.to_string());
     };
-    let root = fs::canonicalize(persist_root).map_err(|error| ZippyError::InvalidConfig {
-        reason: format!(
-            "failed to canonicalize persisted file root path=[{}] error=[{}]",
-            persist_root, error
-        ),
+    let root = fs::canonicalize(persist_root).map_err(|error| {
+        persisted_path_io_error(
+            format!(
+                "failed to canonicalize persisted file root path=[{}] error=[{}]",
+                persist_root, error
+            ),
+            error,
+        )
     })?;
     let path = PathBuf::from(file_path);
-    let canonical_path = fs::canonicalize(&path).map_err(|error| ZippyError::InvalidConfig {
-        reason: format!(
-            "failed to canonicalize persisted file path=[{}] error=[{}]",
-            path.display(),
-            error
-        ),
+    let canonical_path = fs::canonicalize(&path).map_err(|error| {
+        persisted_path_io_error(
+            format!(
+                "failed to canonicalize persisted file path=[{}] error=[{}]",
+                path.display(),
+                error
+            ),
+            error,
+        )
     })?;
     if !canonical_path.starts_with(&root) {
-        return Err(ZippyError::InvalidConfig {
+        return Err(ZippyError::DataCorruption {
             reason: format!(
                 "persisted file outside persist data root path=[{}] root=[{}]",
                 canonical_path.display(),
@@ -5698,7 +5915,7 @@ fn persisted_file_path(value: &Value) -> Result<String> {
         });
     }
     if !canonical_path.is_file() {
-        return Err(ZippyError::InvalidConfig {
+        return Err(ZippyError::DataCorruption {
             reason: format!(
                 "persisted file path is not a file path=[{}]",
                 canonical_path.display()
@@ -5706,6 +5923,14 @@ fn persisted_file_path(value: &Value) -> Result<String> {
         });
     }
     Ok(canonical_path.to_string_lossy().to_string())
+}
+
+fn persisted_path_io_error(reason: String, error: std::io::Error) -> ZippyError {
+    if error.kind() == ErrorKind::NotFound {
+        ZippyError::NotFound { reason }
+    } else {
+        ZippyError::Io { reason }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -7578,7 +7803,39 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, TimestampNanosecondArray};
     use parquet::arrow::ArrowWriter;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    fn run_async_control_exchange(
+        response: Vec<u8>,
+        max_response_line_bytes: Option<usize>,
+    ) -> Result<ControlResponse> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let (client, master) = tokio::io::duplex(1024);
+                let master = tokio::spawn(async move {
+                    let mut reader = tokio::io::BufReader::new(master);
+                    let mut request_line = Vec::new();
+                    reader.read_until(b'\n', &mut request_line).await.unwrap();
+                    let request: ControlRequest = serde_json::from_slice(&request_line).unwrap();
+                    assert!(matches!(request, ControlRequest::RegisterProcess(_)));
+                    reader.into_inner().write_all(&response).await.unwrap();
+                });
+                let request = ControlRequest::RegisterProcess(RegisterProcessRequest {
+                    app: "async_transport_test".to_string(),
+                });
+                let result = match max_response_line_bytes {
+                    Some(limit) => {
+                        send_control_line_over_async_stream_with_limit(client, request, limit).await
+                    }
+                    None => send_control_line_over_async_stream(client, request).await,
+                };
+                master.await.unwrap();
+                result
+            })
+    }
 
     fn test_gateway_config() -> GatewayServerConfig {
         GatewayServerConfig {
@@ -7591,6 +7848,108 @@ mod tests {
             max_blocking_requests: None,
             write_timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn async_master_control_rejects_response_over_line_limit() {
+        let mut response = vec![b'x'; 33];
+        response.push(b'\n');
+
+        let error = run_async_control_exchange(response, Some(32)).unwrap_err();
+
+        assert!(matches!(error, ZippyError::ResourceExhausted { .. }));
+        assert!(error
+            .to_string()
+            .contains("control response line exceeds limit max_bytes=[32]"));
+    }
+
+    #[test]
+    fn async_master_control_accepts_normal_response_at_eof() {
+        let response = serde_json::to_vec(&ControlResponse::ProcessRegistered {
+            process_id: "proc_async".to_string(),
+            process_token: "token_async".to_string(),
+        })
+        .unwrap();
+
+        let decoded = run_async_control_exchange(response, None).unwrap();
+
+        assert!(matches!(
+            decoded,
+            ControlResponse::ProcessRegistered { ref process_id, .. }
+                if process_id == "proc_async"
+        ));
+    }
+
+    #[test]
+    fn async_master_control_preserves_structured_error_at_exact_limit() {
+        let response = ControlResponse::Error {
+            code: Some(zippy_core::ControlErrorCode::NotFound),
+            reason: "async stream missing".to_string(),
+        };
+        let mut payload = serde_json::to_vec(&response).unwrap();
+        let exact_limit = payload.len();
+        payload.push(b'\n');
+
+        let error = run_async_control_exchange(payload, Some(exact_limit)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ZippyError::NotFound { ref reason } if reason == "async stream missing"
+        ));
+    }
+
+    #[test]
+    fn async_master_control_deadline_interrupts_stalled_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let master = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut stream = reader.into_inner();
+            let mut closed = [0_u8; 1];
+            assert_eq!(stream.read(&mut closed).unwrap(), 0);
+        });
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(send_control_request_async(
+                &endpoint,
+                ControlRequest::RegisterProcess(RegisterProcessRequest {
+                    app: "async_deadline_test".to_string(),
+                }),
+                timeout,
+            ))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, ZippyError::DeadlineExceeded { .. }));
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "elapsed=[{elapsed:?}]"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "elapsed=[{elapsed:?}]"
+        );
+        master.join().unwrap();
+    }
+
+    #[test]
+    fn gateway_master_request_timeout_inherits_write_timeout() {
+        let mut config = test_gateway_config();
+        config.write_timeout_ms = Some(37);
+
+        let gateway = GatewayServer::new(config).unwrap();
+
+        assert_eq!(
+            gateway.state.master.request_timeout,
+            Duration::from_millis(37)
+        );
     }
 
     #[test]
@@ -7694,6 +8053,7 @@ mod tests {
                     }
                     ControlRequest::GetStream(request) => {
                         let response = ControlResponse::Error {
+                            code: None,
                             reason: format!(
                                 "gateway writer epoch preflight must use GetStreamStatus stream_name=[{}]",
                                 request.stream_name
@@ -7776,6 +8136,124 @@ mod tests {
         }
     }
 
+    fn spawn_get_stream_server(
+        stream_info: StreamInfo,
+        request_count: usize,
+    ) -> (ControlEndpoint, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let expected_stream_name = stream_info.stream_name.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                reader.read_line(&mut line).unwrap();
+                let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
+                match request {
+                    ControlRequest::GetStream(request) => {
+                        assert_eq!(request.stream_name, expected_stream_name);
+                    }
+                    other => panic!("unexpected control request request=[{other:?}]"),
+                }
+                let response = ControlResponse::StreamFetched(zippy_core::GetStreamResponse {
+                    stream: stream_info.clone(),
+                });
+                let response = serde_json::to_string(&response).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+        });
+        (endpoint, server)
+    }
+
+    fn persisted_test_stream(stream_name: &str, parquet_path: &Path, values: &[i64]) -> StreamInfo {
+        let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+        )
+        .unwrap();
+        let file = File::create(parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let mut stream = stream_info_for_gateway_status_test(stream_name, schema, 1);
+        stream.persisted_files = vec![json!({
+            "file_path": parquet_path.to_string_lossy(),
+            "row_count": values.len(),
+            "source_segment_id": 1,
+            "source_generation": 0,
+        })];
+        stream.status = "stale".to_string();
+        stream.writer_process_id = None;
+        stream
+    }
+
+    fn gateway_for_persisted_test(
+        endpoint: ControlEndpoint,
+        max_query_buffer_bytes: usize,
+        query_max_buffered_bytes: usize,
+    ) -> GatewayServer {
+        GatewayServer::new_with_query_limits(
+            GatewayServerConfig {
+                endpoint: "127.0.0.1:0".to_string(),
+                master_endpoint: endpoint,
+                token: None,
+                max_write_rows: None,
+                max_connections: None,
+                max_subscribers: None,
+                max_blocking_requests: None,
+                write_timeout_ms: None,
+            },
+            2,
+            2,
+            max_query_buffer_bytes,
+            query_max_buffered_bytes,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_facade_preserves_master_not_found() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: ControlRequest = serde_json::from_str(line.trim_end()).unwrap();
+            assert!(matches!(
+                request,
+                ControlRequest::GetStream(GetStreamRequest { ref stream_name })
+                    if stream_name == "missing"
+            ));
+            let response = ControlResponse::Error {
+                code: Some(zippy_core::ControlErrorCode::NotFound),
+                reason: "stream not found stream_name=[missing]".to_string(),
+            };
+            let payload = serde_json::to_string(&response).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let gateway = gateway_for_persisted_test(endpoint, 32 * 1024, 16 * 1024);
+        let facade = gateway.legacy_collect_facade();
+
+        let error = facade
+            .open(LegacyCollectRequest::new("missing", Vec::new(), 1).unwrap())
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            ZippyError::NotFound { ref reason }
+                if reason == "stream not found stream_name=[missing]"
+        ));
+        server.join().unwrap();
+    }
+
     #[test]
     fn materialized_stream_producer_splits_batches_by_chunk_rows() {
         let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
@@ -7836,9 +8314,161 @@ mod tests {
 
         let error = producer.next_batch().unwrap_err();
 
+        assert!(matches!(error, ZippyError::NotFound { .. }));
         assert!(error
             .to_string()
             .contains("failed to open persisted parquet file"));
+    }
+
+    #[test]
+    fn persisted_stream_producer_classifies_invalid_parquet_as_data_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("corrupt.parquet");
+        std::fs::write(&parquet_path, b"not a parquet file").unwrap();
+
+        let error = build_parquet_record_batch_reader(&parquet_path, None, &[], None)
+            .err()
+            .unwrap();
+
+        assert!(matches!(error, ZippyError::DataCorruption { .. }));
+    }
+
+    #[test]
+    fn legacy_facade_streams_persisted_batches_and_reports_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("legacy-stream.parquet");
+        let stream =
+            persisted_test_stream("legacy_stream_ticks", &parquet_path, &[1_i64, 2, 3, 4, 5]);
+        let (endpoint, server) = spawn_get_stream_server(stream, 1);
+        let query_buffer_budget = 32 * 1024;
+        let gateway = gateway_for_persisted_test(endpoint, 64 * 1024, query_buffer_budget);
+        let facade = gateway.legacy_collect_facade();
+        let request = LegacyCollectRequest::new("legacy_stream_ticks", Vec::new(), 2).unwrap();
+
+        facade.validate(&request).unwrap();
+        let mut cursor = facade.open(request).unwrap();
+        assert_eq!(cursor.schema().field(0).name(), "seq");
+        assert_eq!(
+            gateway.metrics()["query_buffer_reserved_bytes"],
+            json!(query_buffer_budget)
+        );
+        let mut values = Vec::new();
+        while let Some(batch) = cursor.next_batch().unwrap() {
+            assert!(batch.num_rows() <= 2);
+            values.extend_from_slice(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+
+        assert_eq!(values, vec![1_i64, 2, 3, 4, 5]);
+        let metrics = cursor.metrics();
+        assert_eq!(metrics["streaming"], json!(true));
+        assert_eq!(metrics["scanned_files"], json!(1));
+        assert_eq!(metrics["returned_rows"], json!(5));
+        assert_eq!(
+            metrics["query_buffer_budget_bytes"],
+            json!(query_buffer_budget)
+        );
+        assert!(metrics["max_buffered_bytes"].as_u64().unwrap() > 0);
+        assert!(metrics["max_buffered_bytes"].as_u64().unwrap() <= query_buffer_budget as u64);
+        assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_facade_enforces_global_buffer_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("legacy-reservation.parquet");
+        let stream = persisted_test_stream("legacy_budget_ticks", &parquet_path, &[1_i64]);
+        let (endpoint, server) = spawn_get_stream_server(stream, 3);
+        let query_buffer_budget = 16 * 1024;
+        let gateway =
+            gateway_for_persisted_test(endpoint, query_buffer_budget, query_buffer_budget);
+        let facade = gateway.legacy_collect_facade();
+
+        let first = facade
+            .open(LegacyCollectRequest::new("legacy_budget_ticks", Vec::new(), 1).unwrap())
+            .unwrap();
+        let error = facade
+            .open(LegacyCollectRequest::new("legacy_budget_ticks", Vec::new(), 1).unwrap())
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("query buffer reservation unavailable"));
+        assert_eq!(
+            gateway.metrics()["query_buffer_reserved_bytes"],
+            json!(query_buffer_budget)
+        );
+
+        drop(first);
+        assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
+        let third = facade
+            .open(LegacyCollectRequest::new("legacy_budget_ticks", Vec::new(), 1).unwrap())
+            .unwrap();
+        drop(third);
+        assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_facade_defers_scan_and_drop_cancels_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("legacy-cancel.parquet");
+        let stream = persisted_test_stream("legacy_cancel_ticks", &parquet_path, &[1_i64]);
+        let (endpoint, server) = spawn_get_stream_server(stream, 1);
+        let query_buffer_budget = 16 * 1024;
+        let gateway = gateway_for_persisted_test(endpoint, 32 * 1024, query_buffer_budget);
+        let facade = gateway.legacy_collect_facade();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cursor = facade
+            .open_cancellable(
+                LegacyCollectRequest::new("legacy_cancel_ticks", Vec::new(), 1).unwrap(),
+                Arc::clone(&cancelled),
+            )
+            .unwrap();
+        let scanner_cancelled = cursor.persisted_cancellation_flag().unwrap();
+
+        assert!(!cancelled.load(Ordering::Acquire));
+        assert!(Arc::ptr_eq(&cancelled, &scanner_cancelled));
+        assert_eq!(cursor.metrics()["scanned_files"], json!(0));
+        std::fs::remove_file(&parquet_path).unwrap();
+        drop(cursor);
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(gateway.metrics()["query_buffer_reserved_bytes"], json!(0));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_cursor_cancel_after_open_returns_typed_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("legacy-read-cancel.parquet");
+        let stream = persisted_test_stream("legacy_read_cancel", &parquet_path, &[1_i64]);
+        let (endpoint, server) = spawn_get_stream_server(stream, 1);
+        let gateway = gateway_for_persisted_test(endpoint, 32 * 1024, 16 * 1024);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut cursor = gateway
+            .legacy_collect_facade()
+            .open_cancellable(
+                LegacyCollectRequest::new("legacy_read_cancel", Vec::new(), 1).unwrap(),
+                Arc::clone(&cancelled),
+            )
+            .unwrap();
+
+        cancelled.store(true, Ordering::Release);
+        let error = cursor.next_batch().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ZippyError::Cancelled { ref reason } if reason == "legacy collect cancelled"
+        ));
+        server.join().unwrap();
     }
 
     #[test]
@@ -7916,6 +8546,7 @@ mod tests {
             .unwrap();
         assert_eq!(first_values.value(0), 0);
         assert_eq!(second_values.value(0), 1);
+        assert!(matches!(error, ZippyError::NotFound { .. }));
         assert!(error
             .to_string()
             .contains("failed to open persisted parquet file"));
@@ -8037,6 +8668,7 @@ mod tests {
 
         let error = producer.next_batch().unwrap_err();
 
+        assert!(matches!(error, ZippyError::ResourceExhausted { .. }));
         assert!(error
             .to_string()
             .contains("persisted scan batch exceeds file buffer budget"));
@@ -8748,6 +9380,7 @@ mod tests {
         )
         .unwrap_err();
 
+        assert!(matches!(error, ZippyError::NotFound { .. }));
         assert!(error
             .to_string()
             .contains("failed to canonicalize persisted file path"));

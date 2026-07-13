@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use zippy_types::ErrorCode;
 
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
@@ -385,6 +386,8 @@ pub enum ControlResponse {
         event: Option<ResourceEvent>,
     },
     Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ErrorCode>,
         reason: String,
     },
 }
@@ -508,7 +511,10 @@ impl fmt::Display for ControlResponse {
                 "resource changed has_event=[{}]",
                 event.is_some()
             ),
-            Self::Error { reason } => write!(f, "control error reason=[{}]", reason),
+            Self::Error { code, reason } => match code {
+                Some(code) => write!(f, "control error code=[{}] reason=[{}]", code, reason),
+                None => write!(f, "control error reason=[{}]", reason),
+            },
         }
     }
 }

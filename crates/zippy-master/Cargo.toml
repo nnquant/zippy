@@ -8,10 +8,12 @@ arrow.workspace = true
 parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-gateway = { path = "../zippy-gateway" }
 zippy-segment-store = { path = "../zippy-segment-store" }
+zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
 tempfile = "3"

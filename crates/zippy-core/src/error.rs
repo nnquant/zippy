@@ -6,8 +6,18 @@ pub type Result<T> = std::result::Result<T, ZippyError>;
 pub enum ZippyError {
     #[error("invalid config reason=[{reason}]")]
     InvalidConfig { reason: String },
+    #[error("resource exhausted reason=[{reason}]")]
+    ResourceExhausted { reason: String },
+    #[error("resource not found reason=[{reason}]")]
+    NotFound { reason: String },
+    #[error("data corruption reason=[{reason}]")]
+    DataCorruption { reason: String },
     #[error("schema mismatch reason=[{reason}]")]
     SchemaMismatch { reason: String },
+    #[error("operation cancelled reason=[{reason}]")]
+    Cancelled { reason: String },
+    #[error("deadline exceeded reason=[{reason}]")]
+    DeadlineExceeded { reason: String },
     #[error("late data detected dt=[{dt}] last_dt=[{last_dt}]")]
     LateData { dt: i64, last_dt: i64 },
     #[error("engine state invalid status=[{status}]")]

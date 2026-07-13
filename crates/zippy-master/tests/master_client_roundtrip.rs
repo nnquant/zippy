@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::{DataType, Field, Schema};
-use zippy_core::{canonical_schema_hash, MasterClient, SchemaRef, ZippyConfig};
+use zippy_core::{canonical_schema_hash, MasterClient, SchemaRef, ZippyConfig, ZippyError};
 use zippy_master::server::MasterServer;
 use zippy_master::snapshot::SnapshotStore;
 
@@ -81,6 +81,7 @@ fn seed_sealed_segment_identity(
             stream.persisted_files,
             stream.persist_events,
             stream.persist_revision,
+            stream.persisted_files_revision,
             stream.segment_reader_leases,
             stream.writer_epoch,
         )
@@ -314,6 +315,25 @@ fn master_client_fetches_master_runtime_config() {
 
     server.shutdown();
     handle.join().unwrap();
+}
+
+#[test]
+fn master_client_preserves_get_stream_not_found() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+    let client = MasterClient::connect(&socket_path).unwrap();
+
+    let error = client.get_stream("missing").unwrap_err();
+
+    assert!(matches!(
+        error,
+        ZippyError::NotFound { ref reason }
+            if reason == "stream not found stream_name=[missing]"
+    ));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
 }
 
 #[test]

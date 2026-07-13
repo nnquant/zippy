@@ -22,6 +22,8 @@ pub struct SnapshotStreamRecord {
     #[serde(default)]
     pub persist_revision: u64,
     #[serde(default)]
+    pub persisted_files_revision: u64,
+    #[serde(default)]
     pub segment_reader_leases: Vec<serde_json::Value>,
     #[serde(default)]
     pub writer_epoch: u64,
@@ -50,6 +52,8 @@ struct SnapshotStreamRecordV1 {
     #[serde(default)]
     persist_revision: u64,
     #[serde(default)]
+    persisted_files_revision: Option<u64>,
+    #[serde(default)]
     segment_reader_leases: Vec<serde_json::Value>,
     #[serde(default)]
     writer_epoch: u64,
@@ -73,6 +77,13 @@ impl<'de> Deserialize<'de> for SnapshotStreamRecord {
             .or(record.ring_capacity)
             .ok_or_else(|| serde::de::Error::missing_field("buffer_size"))?;
         let frame_size = record.frame_size.unwrap_or(buffer_size);
+        let persisted_files_revision = record.persisted_files_revision.unwrap_or_else(|| {
+            if record.persisted_files.is_empty() {
+                0
+            } else {
+                record.persist_revision.max(1)
+            }
+        });
         Ok(Self {
             stream_name: record.stream_name,
             schema: record.schema,
@@ -83,6 +94,7 @@ impl<'de> Deserialize<'de> for SnapshotStreamRecord {
             persisted_files: record.persisted_files,
             persist_events: record.persist_events,
             persist_revision: record.persist_revision,
+            persisted_files_revision,
             segment_reader_leases: record.segment_reader_leases,
             writer_epoch: record.writer_epoch,
             buffer_size,
@@ -132,6 +144,8 @@ pub struct SnapshotEngineRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistrySnapshot {
+    #[serde(default)]
+    pub catalog_revision: u64,
     pub streams: Vec<SnapshotStreamRecord>,
     pub sources: Vec<SnapshotSourceRecord>,
     pub engines: Vec<SnapshotEngineRecord>,

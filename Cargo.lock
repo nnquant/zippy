@@ -2224,6 +2224,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zippy-segment-store",
+ "zippy-types",
 ]
 
 [[package]]
@@ -2277,12 +2278,14 @@ dependencies = [
  "parquet",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "tracing",
  "zippy-core",
  "zippy-gateway",
  "zippy-segment-store",
+ "zippy-types",
 ]
 
 [[package]]
@@ -2352,6 +2355,22 @@ dependencies = [
  "thiserror",
  "tracing",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "zippy-server"
+version = "0.5.0"
+dependencies = [
+ "arrow",
+ "parquet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zippy-core",
+ "zippy-gateway",
+ "zippy-master",
+ "zippy-types",
 ]
 
 [[package]]

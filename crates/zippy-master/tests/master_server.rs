@@ -2,9 +2,10 @@
 
 use zippy_core::bus_protocol::{
     AcquireSegmentReaderLeaseRequest, ControlEnvelopeRequest, ControlRequest, ControlResponse,
-    ListStreamsRequest, RegisterEngineRequest, RegisterProcessRequest, RegisterSourceRequest,
-    RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest, UnregisterProcessRequest,
-    UpdateRecordStatusRequest, WatchRequest, WatchResource, CONTROL_PROTOCOL_VERSION,
+    GetStreamRequest, ListStreamsRequest, RegisterEngineRequest, RegisterProcessRequest,
+    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest,
+    UnregisterProcessRequest, UpdateRecordStatusRequest, WatchRequest, WatchResource,
+    CONTROL_PROTOCOL_VERSION,
 };
 use zippy_core::{setup_log, LogConfig, ZippyConfig};
 use zippy_master::registry::{Registry, RegistryError};
@@ -13,6 +14,7 @@ use zippy_master::snapshot::{
     RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
     SnapshotStreamRecord,
 };
+use zippy_types::{catalog::CatalogRead, ErrorCode};
 
 use std::fs;
 use std::io::{Read, Write};
@@ -32,6 +34,24 @@ use serde_json::Value;
 
 const MASTER_SERVER_LOGGING_CASE_ENV: &str = "ZIPPY_MASTER_SERVER_LOGGING_CASE";
 const MASTER_SERVER_LOGGING_TEMP_ENV: &str = "ZIPPY_MASTER_SERVER_LOGGING_TEMP";
+
+struct NoopWake;
+
+impl std::task::Wake for NoopWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::from(std::sync::Arc::new(NoopWake));
+    let mut context = std::task::Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(output) => return output,
+            std::task::Poll::Pending => thread::yield_now(),
+        }
+    }
+}
 
 fn test_stream_schema() -> Value {
     serde_json::json!({
@@ -186,6 +206,7 @@ fn seed_sealed_segment_identity(
             stream.persisted_files,
             stream.persist_events,
             stream.persist_revision,
+            stream.persisted_files_revision,
             stream.segment_reader_leases,
             stream.writer_epoch,
         )
@@ -262,6 +283,31 @@ fn protocol_types_roundtrip_debug_repr() {
         process_token: "token_1".to_string(),
     };
     assert!(format!("{response:?}").contains("proc_1"));
+}
+
+#[test]
+fn master_get_stream_reports_machine_readable_not_found() {
+    let socket_path = unique_socket_path();
+    let (server, join_handle) = spawn_test_server(&socket_path);
+
+    let response = send_control_request(
+        &socket_path,
+        ControlRequest::GetStream(GetStreamRequest {
+            stream_name: "missing".to_string(),
+        }),
+    );
+
+    assert!(matches!(
+        response,
+        ControlResponse::Error {
+            code: Some(ErrorCode::NotFound),
+            ref reason,
+        } if reason == "stream not found stream_name=[missing]"
+    ));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(socket_path);
 }
 
 #[test]
@@ -1244,6 +1290,7 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
     SnapshotStore::write(
         &snapshot_path,
         &RegistrySnapshot {
+            catalog_revision: 0,
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
                 schema: test_stream_schema(),
@@ -1254,6 +1301,7 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
                 persisted_files: Vec::new(),
                 persist_events: Vec::new(),
                 persist_revision: 0,
+                persisted_files_revision: 0,
                 segment_reader_leases: Vec::new(),
                 writer_epoch: 0,
                 buffer_size: 1024,
@@ -1323,6 +1371,7 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
     SnapshotStore::write(
         &snapshot_path,
         &RegistrySnapshot {
+            catalog_revision: 0,
             streams: vec![SnapshotStreamRecord {
                 stream_name: "openctp_ticks".to_string(),
                 schema: test_stream_schema(),
@@ -1333,6 +1382,7 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 persisted_files: Vec::new(),
                 persist_events: Vec::new(),
                 persist_revision: 0,
+                persisted_files_revision: 0,
                 segment_reader_leases: Vec::new(),
                 writer_epoch: 0,
                 buffer_size: 1024,
@@ -1346,7 +1396,7 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 output_stream: "openctp_ticks".to_string(),
                 config: serde_json::json!({"front": "tcp://example"}),
                 status: "running".to_string(),
-                metrics: serde_json::json!({}),
+                metrics: serde_json::json!({"rows_total": 99}),
                 writer_epoch: 1,
                 revision: 1,
             }],
@@ -1358,7 +1408,7 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 output_stream: "openctp_mid_price_factors".to_string(),
                 config: serde_json::json!({"id_filter": ["IF2606"]}),
                 status: "running".to_string(),
-                metrics: serde_json::json!({}),
+                metrics: serde_json::json!({"callbacks_total": 88}),
             }],
         },
     )
@@ -1384,8 +1434,16 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
         "restored"
     );
     assert_eq!(
+        registry.get_source("openctp_md").unwrap().metrics,
+        serde_json::json!({})
+    );
+    assert_eq!(
         registry.get_engine("mid_price_factor").unwrap().status,
         "restored"
+    );
+    assert_eq!(
+        registry.get_engine("mid_price_factor").unwrap().metrics,
+        serde_json::json!({})
     );
 }
 
@@ -1533,6 +1591,34 @@ fn snapshot_store_reads_legacy_ring_capacity_into_buffer_and_frame_size() {
 }
 
 #[test]
+fn snapshot_store_imports_legacy_file_view_revision_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot_path = temp.path().join("master-registry.json");
+    fs::write(
+        &snapshot_path,
+        r#"{
+  "streams": [
+    {
+      "stream_name": "events",
+      "ring_capacity": 512,
+      "persist_revision": 7,
+      "persisted_files": [{"file_path": "events.parquet"}],
+      "status": "registered"
+    }
+  ],
+  "sources": [],
+  "engines": []
+}"#,
+    )
+    .unwrap();
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+
+    assert_eq!(snapshot.streams[0].persist_revision, 7);
+    assert_eq!(snapshot.streams[0].persisted_files_revision, 7);
+}
+
+#[test]
 fn registry_updates_process_lease_timestamp_on_heartbeat() {
     let mut registry = Registry::default();
     let process_id = registry.register_process("local_dc");
@@ -1607,7 +1693,7 @@ fn master_server_returns_structured_error_for_unknown_process_heartbeat() {
     );
     let response: ControlResponse = serde_json::from_str(response.trim_end()).unwrap();
     match response {
-        ControlResponse::Error { reason } => {
+        ControlResponse::Error { reason, .. } => {
             assert!(reason.contains("process not found"));
             assert!(reason.contains("proc_missing"));
         }
@@ -1641,6 +1727,8 @@ fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
     wait_for_socket_ready(&wait_path);
 
     let (process_id, process_token) = register_process(&wait_path, "local_dc");
+    let catalog = server.legacy_catalog_adapter();
+    let revision_before = block_on(catalog.revision()).unwrap();
     let response = register_stream(
         &wait_path,
         &process_id,
@@ -1650,7 +1738,7 @@ fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
         256,
     );
     match response {
-        ControlResponse::Error { reason } => {
+        ControlResponse::Error { reason, .. } => {
             assert!(reason.contains("failed to create registry snapshot parent"));
         }
         other => panic!("unexpected register stream response: {:?}", other),
@@ -1663,6 +1751,398 @@ fn master_server_rolls_back_stream_registration_when_snapshot_write_fails() {
         .get_stream("openctp_ticks")
         .cloned();
     assert!(stream.is_none());
+    assert_eq!(block_on(catalog.revision()).unwrap(), revision_before);
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let _ = fs::remove_file(wait_path);
+}
+
+#[test]
+fn runtime_status_updates_ignore_snapshot_failures_and_keep_latest_live_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_parent = temp.path().join("snapshot");
+    let snapshot_path = snapshot_parent.join("master-registry.json");
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path));
+    wait_for_socket_ready(&wait_path);
+
+    let (process_id, process_token) = register_process(&wait_path, "runtime_status_test");
+    assert!(matches!(
+        register_stream(&wait_path, &process_id, &process_token, "ticks", 1024, 256,),
+        ControlResponse::StreamRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &wait_path,
+            ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: "ticks_source".to_string(),
+                source_type: "test".to_string(),
+                process_id: process_id.clone(),
+                process_token: Some(process_token.clone()),
+                output_stream: "ticks".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::SourceRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &wait_path,
+            ControlRequest::RegisterEngine(RegisterEngineRequest {
+                engine_name: "factor_engine".to_string(),
+                engine_type: "reactive".to_string(),
+                process_id: process_id.clone(),
+                process_token: Some(process_token.clone()),
+                input_stream: "ticks".to_string(),
+                output_stream: "factors".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::EngineRegistered { .. }
+    ));
+
+    fs::remove_dir_all(&snapshot_parent).unwrap();
+    fs::write(&snapshot_parent, b"not-a-directory").unwrap();
+    for sequence in 0..64 {
+        let source_response = send_control_request(
+            &wait_path,
+            ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+                process_id: Some(process_id.clone()),
+                process_token: Some(process_token.clone()),
+                token: None,
+                kind: "source".to_string(),
+                name: "ticks_source".to_string(),
+                status: format!("source-live-{sequence}"),
+                metrics: Some(serde_json::json!({"sequence": sequence})),
+            }),
+        );
+        assert!(matches!(
+            source_response,
+            ControlResponse::StatusUpdated { .. }
+        ));
+
+        let engine_response = send_control_request(
+            &wait_path,
+            ControlRequest::Envelope(ControlEnvelopeRequest {
+                version: CONTROL_PROTOCOL_VERSION,
+                request_id: format!("runtime-engine-status-{sequence}"),
+                process_id: Some(process_id.clone()),
+                process_token: Some(process_token.clone()),
+                token: None,
+                verb: Some("update_status".to_string()),
+                resource: None,
+                revision: None,
+                timeout_ms: None,
+                payload: Some(serde_json::json!({
+                    "kind": "engine",
+                    "name": "factor_engine",
+                    "status": format!("engine-live-{sequence}"),
+                    "metrics": {"sequence": sequence}
+                })),
+                inner: None,
+            }),
+        );
+        match engine_response {
+            ControlResponse::Envelope(envelope) => {
+                assert!(matches!(
+                    *envelope.inner,
+                    ControlResponse::StatusUpdated { .. }
+                ));
+            }
+            other => panic!("unexpected engine status response: {other:?}"),
+        }
+    }
+
+    let registry_handle = server.registry();
+    let registry = registry_handle.lock().unwrap();
+    let source = registry.get_source("ticks_source").unwrap();
+    assert_eq!(source.status, "source-live-63");
+    assert_eq!(source.metrics["sequence"], serde_json::json!(63));
+    let engine = registry.get_engine("factor_engine").unwrap();
+    assert_eq!(engine.status, "engine-live-63");
+    assert_eq!(engine.metrics["sequence"], serde_json::json!(63));
+    drop(registry);
+
+    server.shutdown();
+    let result = join_handle.join().unwrap();
+    assert!(
+        result.is_err(),
+        "shutdown flush must still report snapshot failure"
+    );
+}
+
+#[test]
+fn persistent_snapshots_exclude_live_status_and_metrics_before_reload() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path.clone()),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+
+    let (process_id, process_token) = register_process(&wait_path, "snapshot_status_test");
+    assert!(matches!(
+        register_stream(&wait_path, &process_id, &process_token, "ticks", 1024, 256,),
+        ControlResponse::StreamRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &wait_path,
+            ControlRequest::RegisterSource(RegisterSourceRequest {
+                source_name: "ticks_source".to_string(),
+                source_type: "test".to_string(),
+                process_id: process_id.clone(),
+                process_token: Some(process_token.clone()),
+                output_stream: "ticks".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::SourceRegistered { .. }
+    ));
+    assert!(matches!(
+        send_control_request(
+            &wait_path,
+            ControlRequest::RegisterEngine(RegisterEngineRequest {
+                engine_name: "factor_engine".to_string(),
+                engine_type: "reactive".to_string(),
+                process_id: process_id.clone(),
+                process_token: Some(process_token.clone()),
+                input_stream: "ticks".to_string(),
+                output_stream: "factors".to_string(),
+                config: serde_json::json!({}),
+            }),
+        ),
+        ControlResponse::EngineRegistered { .. }
+    ));
+    for (kind, name, metrics) in [
+        (
+            "source",
+            "ticks_source",
+            serde_json::json!({"rows_total": 123}),
+        ),
+        (
+            "engine",
+            "factor_engine",
+            serde_json::json!({"callbacks_total": 123}),
+        ),
+    ] {
+        assert!(matches!(
+            send_control_request(
+                &wait_path,
+                ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+                    process_id: Some(process_id.clone()),
+                    process_token: Some(process_token.clone()),
+                    token: None,
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                    status: "alive".to_string(),
+                    metrics: Some(metrics),
+                }),
+            ),
+            ControlResponse::StatusUpdated { .. }
+        ));
+    }
+
+    assert!(matches!(
+        register_stream(
+            &wait_path,
+            &process_id,
+            &process_token,
+            "durable_trigger",
+            1024,
+            256,
+        ),
+        ControlResponse::StreamRegistered { .. }
+    ));
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    let source = snapshot
+        .sources
+        .iter()
+        .find(|source| source.source_name == "ticks_source")
+        .unwrap();
+    assert_eq!(source.status, "registered");
+    assert_eq!(source.metrics, serde_json::json!({}));
+    let engine = snapshot
+        .engines
+        .iter()
+        .find(|engine| engine.engine_name == "factor_engine")
+        .unwrap();
+    assert_eq!(engine.status, "registered");
+    assert_eq!(engine.metrics, serde_json::json!({}));
+    assert!(snapshot
+        .streams
+        .iter()
+        .all(|stream| stream.status == "registered"));
+
+    server.shutdown();
+    join_handle.join().unwrap();
+    let restored = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let registry_handle = restored.registry();
+    let registry = registry_handle.lock().unwrap();
+    let source = registry.get_source("ticks_source").unwrap();
+    assert_eq!(source.status, "restored");
+    assert_eq!(source.metrics, serde_json::json!({}));
+    let engine = registry.get_engine("factor_engine").unwrap();
+    assert_eq!(engine.status, "restored");
+    assert_eq!(engine.metrics, serde_json::json!({}));
+}
+
+#[test]
+fn master_server_restores_exact_catalog_state_when_snapshot_write_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let blocked_parent = temp.path().join("blocked-parent");
+    fs::write(&blocked_parent, b"not-a-dir").unwrap();
+    let snapshot_path = blocked_parent.join("master-registry.json");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let persisted_file_path = persist_root.join("events.parquet");
+    fs::write(&persisted_file_path, b"not really parquet").unwrap();
+    let mut config = ZippyConfig::default();
+    config.table.persist.data_dir = persist_root.to_string_lossy().to_string();
+    let server = MasterServer::with_runtime_config_and_config(
+        Some(snapshot_path),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        config,
+    );
+    let (process_id, process_token) = {
+        let registry_handle = server.registry();
+        let mut registry = registry_handle.lock().unwrap();
+        let process_id = registry.register_process("local_dc");
+        let process_token = registry
+            .get_process(&process_id)
+            .unwrap()
+            .process_token
+            .clone();
+        registry
+            .register_stream(
+                "events",
+                test_stream_schema(),
+                test_stream_schema_hash(),
+                1024,
+                256,
+            )
+            .unwrap();
+        registry
+            .register_source(
+                "events_source",
+                "test",
+                &process_id,
+                "events",
+                serde_json::json!({"zippy_table_kind": "append_table"}),
+            )
+            .unwrap();
+        (process_id, process_token)
+    };
+    let catalog = server.legacy_catalog_adapter();
+    let revision_before = block_on(catalog.revision()).unwrap();
+    let (process_before, stream_before, source_before) = {
+        let registry_handle = server.registry();
+        let registry = registry_handle.lock().unwrap();
+        (
+            serde_json::to_value(registry.get_process(&process_id).unwrap()).unwrap(),
+            serde_json::to_value(registry.get_stream("events").unwrap()).unwrap(),
+            serde_json::to_value(registry.get_source("events_source").unwrap()).unwrap(),
+        )
+    };
+
+    let handle_server = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || handle_server.serve(&socket_path).unwrap_err());
+    wait_for_socket_ready(&wait_path);
+
+    let source_response = send_control_request(
+        &wait_path,
+        ControlRequest::RegisterSource(RegisterSourceRequest {
+            source_name: "events_source".to_string(),
+            source_type: "test".to_string(),
+            process_id: process_id.clone(),
+            process_token: Some(process_token.clone()),
+            output_stream: "events".to_string(),
+            config: serde_json::json!({"zippy_table_kind": "append_table"}),
+        }),
+    );
+    assert!(matches!(source_response, ControlResponse::Error { .. }));
+    {
+        let registry_handle = server.registry();
+        let registry = registry_handle.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(registry.get_stream("events").unwrap()).unwrap(),
+            stream_before
+        );
+        assert_eq!(
+            serde_json::to_value(registry.get_source("events_source").unwrap()).unwrap(),
+            source_before
+        );
+    }
+    assert_eq!(block_on(catalog.revision()).unwrap(), revision_before);
+
+    let persist_response = send_control_request(
+        &wait_path,
+        ControlRequest::PublishPersistedFile(
+            zippy_core::bus_protocol::PublishPersistedFileRequest {
+                stream_name: "events".to_string(),
+                process_id: process_id.clone(),
+                process_token: Some(process_token),
+                persisted_file: serde_json::json!({
+                    "persist_file_id": "events-1",
+                    "file_path": persisted_file_path,
+                    "created_at": 1
+                }),
+            },
+        ),
+    );
+    assert!(matches!(persist_response, ControlResponse::Error { .. }));
+    {
+        let registry_handle = server.registry();
+        let registry = registry_handle.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(registry.get_stream("events").unwrap()).unwrap(),
+            stream_before
+        );
+        assert_eq!(
+            serde_json::to_value(registry.get_source("events_source").unwrap()).unwrap(),
+            source_before
+        );
+    }
+    assert_eq!(block_on(catalog.revision()).unwrap(), revision_before);
+
+    let _expire_response = send_request(
+        &wait_path,
+        &format!("{{\"ExpireProcessForTest\":{{\"process_id\":\"{process_id}\"}}}}\n"),
+    );
+    {
+        let registry_handle = server.registry();
+        let registry = registry_handle.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(registry.get_process(&process_id).unwrap()).unwrap(),
+            process_before
+        );
+        assert_eq!(
+            serde_json::to_value(registry.get_stream("events").unwrap()).unwrap(),
+            stream_before
+        );
+        assert_eq!(
+            serde_json::to_value(registry.get_source("events_source").unwrap()).unwrap(),
+            source_before
+        );
+    }
+    assert_eq!(block_on(catalog.revision()).unwrap(), revision_before);
 
     server.shutdown();
     join_handle.join().unwrap();
@@ -1749,7 +2229,7 @@ fn master_server_rejects_segment_reader_lease_for_unknown_segment() {
         }),
     );
     match response {
-        ControlResponse::Error { reason } => {
+        ControlResponse::Error { reason, .. } => {
             assert!(reason.contains("segment reader lease target not found"));
         }
         other => panic!("unexpected acquire lease response: {other:?}"),
@@ -2969,7 +3449,7 @@ fn master_server_rejects_zero_capacity_stream_registration() {
         0,
     );
     match response {
-        ControlResponse::Error { reason } => {
+        ControlResponse::Error { reason, .. } => {
             assert!(reason.contains("invalid stream sizing"));
             assert!(reason.contains("buffer_size=[0]"));
             assert!(reason.contains("frame_size=[0]"));
@@ -3011,7 +3491,7 @@ fn master_server_rejects_stream_registration_with_frame_size_mismatch() {
         512,
     );
     match mismatch_response {
-        ControlResponse::Error { reason } => {
+        ControlResponse::Error { reason, .. } => {
             assert!(reason.contains("stream configuration mismatch"));
             assert!(reason.contains("existing_buffer_size=[1024]"));
             assert!(reason.contains("existing_frame_size=[256]"));

@@ -31,7 +31,9 @@ use zippy_core::{
     CONTROL_PROTOCOL_VERSION,
 };
 use zippy_segment_store::ShmRegion;
+use zippy_types::ErrorCode;
 
+use crate::legacy_catalog::LegacyCatalogAdapter;
 use crate::registry::{Registry, RegistryError, StreamRecord};
 use crate::snapshot::{
     RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
@@ -43,6 +45,8 @@ const DEFAULT_LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(2);
 const MASTER_ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const COMPACTION_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 const MASTER_SHUTDOWN_REASON: &str = "master shutdown requested";
+const SNAPSHOT_RUNTIME_STATUS: &str = "registered";
+const RESTORED_RUNTIME_STATUS: &str = "restored";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GracefulShutdownOutcome {
@@ -157,8 +161,14 @@ impl MasterServer {
         Arc::clone(&self.registry)
     }
 
+    /// Creates the read-only catalog compatibility adapter for this master.
+    pub fn legacy_catalog_adapter(&self) -> LegacyCatalogAdapter {
+        LegacyCatalogAdapter::new(Arc::clone(&self.registry), Arc::clone(&self.running))
+    }
+
     pub fn from_snapshot_path(snapshot_path: &Path) -> Result<Self> {
         let snapshot = SnapshotStore::load(snapshot_path)?;
+        let catalog_revision = snapshot.catalog_revision;
         let server = Self::with_runtime_config(
             Some(snapshot_path.to_path_buf()),
             DEFAULT_LEASE_TIMEOUT,
@@ -179,7 +189,7 @@ impl MasterServer {
                     )
                     .map_err(registry_error)?;
                 registry
-                    .set_stream_status(&stream.stream_name, restored_record_status(&stream.status))
+                    .set_stream_status(&stream.stream_name, RESTORED_RUNTIME_STATUS)
                     .map_err(registry_error)?;
                 registry
                     .set_stream_segment_metadata(
@@ -189,6 +199,7 @@ impl MasterServer {
                         stream.persisted_files,
                         stream.persist_events,
                         stream.persist_revision,
+                        stream.persisted_files_revision,
                         Vec::new(),
                         stream.writer_epoch,
                     )
@@ -197,7 +208,6 @@ impl MasterServer {
 
             for source in snapshot.sources {
                 registry.reserve_process_id(&source.process_id);
-                let status = restored_record_status(&source.status).to_string();
                 registry
                     .register_source(
                         &source.source_name,
@@ -211,13 +221,16 @@ impl MasterServer {
                     .set_source_writer_epoch(&source.source_name, source.writer_epoch)
                     .map_err(registry_error)?;
                 registry
-                    .set_source_status(&source.source_name, &status, Some(source.metrics))
+                    .set_source_status(
+                        &source.source_name,
+                        RESTORED_RUNTIME_STATUS,
+                        Some(serde_json::json!({})),
+                    )
                     .map_err(registry_error)?;
             }
 
             for engine in snapshot.engines {
                 registry.reserve_process_id(&engine.process_id);
-                let status = restored_record_status(&engine.status).to_string();
                 registry
                     .register_engine(
                         &engine.engine_name,
@@ -229,9 +242,15 @@ impl MasterServer {
                     )
                     .map_err(registry_error)?;
                 registry
-                    .set_engine_status(&engine.engine_name, &status, Some(engine.metrics))
+                    .set_engine_status(
+                        &engine.engine_name,
+                        RESTORED_RUNTIME_STATUS,
+                        Some(serde_json::json!({})),
+                    )
                     .map_err(registry_error)?;
             }
+
+            registry.restore_catalog_revision(catalog_revision);
         }
 
         Ok(server)
@@ -724,6 +743,7 @@ impl MasterServer {
                     "failed to watch shutdown resource"
                 );
                 ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 }
             }
@@ -803,6 +823,7 @@ impl MasterServer {
                     "failed to watch segment descriptor resource"
                 );
                 ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 }
             }
@@ -884,6 +905,7 @@ impl MasterServer {
                     "failed to watch process resource"
                 );
                 ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 }
             }
@@ -963,6 +985,7 @@ impl MasterServer {
                     "failed to watch source resource"
                 );
                 ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 }
             }
@@ -1046,6 +1069,7 @@ impl MasterServer {
                     "failed to watch persisted file resource"
                 );
                 ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 }
             }
@@ -1069,6 +1093,7 @@ impl MasterServer {
             },
             Ok(()) => ControlResponse::ResourceChanged { event: None },
             Err(error) => ControlResponse::Error {
+                code: None,
                 reason: error.to_string(),
             },
         }
@@ -1148,6 +1173,7 @@ impl MasterServer {
                     "failed to watch stream resource"
                 );
                 ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 }
             }
@@ -1157,6 +1183,7 @@ impl MasterServer {
     fn handle_enveloped_control_request(&self, request: ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::Envelope(_) => ControlResponse::Error {
+                code: None,
                 reason: "nested control envelope is not supported".to_string(),
             },
             ControlRequest::Watch(request) => self.handle_watch_request(request),
@@ -1181,6 +1208,7 @@ impl MasterServer {
                 config: self.config.to_json_value(),
             },
             other => ControlResponse::Error {
+                code: None,
                 reason: format!(
                     "control envelope does not support request kind kind=[{:?}]",
                     other
@@ -1201,6 +1229,7 @@ impl MasterServer {
             Some("register_process") => {
                 if self.shutdown_requested.load(Ordering::SeqCst) {
                     return ControlResponse::Error {
+                        code: None,
                         reason: MASTER_SHUTDOWN_REASON.to_string(),
                     };
                 }
@@ -1227,6 +1256,7 @@ impl MasterServer {
             Some("heartbeat") => {
                 let Some(process_id) = envelope.process_id else {
                     return ControlResponse::Error {
+                        code: None,
                         reason: "control envelope heartbeat requires process_id".to_string(),
                     };
                 };
@@ -1248,6 +1278,7 @@ impl MasterServer {
                         ControlResponse::HeartbeatAccepted { process_id }
                     }
                     Err(error) => ControlResponse::Error {
+                        code: None,
                         reason: error.to_string(),
                     },
                 }
@@ -1261,11 +1292,13 @@ impl MasterServer {
             Some("watch") => {
                 let Some(process_id) = envelope.process_id else {
                     return ControlResponse::Error {
+                        code: None,
                         reason: "control envelope watch requires process_id".to_string(),
                     };
                 };
                 let Some(resource) = envelope.resource else {
                     return ControlResponse::Error {
+                        code: None,
                         reason: "control envelope watch requires resource".to_string(),
                     };
                 };
@@ -1296,11 +1329,13 @@ impl MasterServer {
                             stream: stream_info_with_registry_metadata(&registry, stream),
                         }),
                         None => ControlResponse::Error {
+                            code: None,
                             reason: format!("stream not found stream_name=[{}]", stream_name),
                         },
                     }
                 }
                 _ => ControlResponse::Error {
+                    code: None,
                     reason: "control envelope get requires supported resource".to_string(),
                 },
             },
@@ -1314,9 +1349,11 @@ impl MasterServer {
                 ControlResponse::StreamsListed(ListStreamsResponse { streams })
             }
             Some(verb) => ControlResponse::Error {
+                code: None,
                 reason: format!("unsupported control envelope verb verb=[{}]", verb),
             },
             None => ControlResponse::Error {
+                code: None,
                 reason: "control envelope requires inner or verb".to_string(),
             },
         }
@@ -1331,21 +1368,25 @@ impl MasterServer {
     ) -> ControlResponse {
         let Some(payload) = payload else {
             return ControlResponse::Error {
+                code: None,
                 reason: "control envelope update_status requires payload".to_string(),
             };
         };
         let Some(kind) = payload.get("kind").and_then(serde_json::Value::as_str) else {
             return ControlResponse::Error {
+                code: None,
                 reason: "control envelope update_status requires payload.kind".to_string(),
             };
         };
         let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) else {
             return ControlResponse::Error {
+                code: None,
                 reason: "control envelope update_status requires payload.name".to_string(),
             };
         };
         let Some(status) = payload.get("status").and_then(serde_json::Value::as_str) else {
             return ControlResponse::Error {
+                code: None,
                 reason: "control envelope update_status requires payload.status".to_string(),
             };
         };
@@ -1353,6 +1394,7 @@ impl MasterServer {
         if !self.token_matches(token.as_deref()) {
             let Some(process_id) = process_id.as_deref() else {
                 return ControlResponse::Error {
+                    code: None,
                     reason: "control envelope update_status requires process_id".to_string(),
                 };
             };
@@ -1360,6 +1402,7 @@ impl MasterServer {
                 self.validate_process_capability(process_id, process_token.as_deref())
             {
                 return ControlResponse::Error {
+                    code: None,
                     reason: error.to_string(),
                 };
             }
@@ -1375,6 +1418,7 @@ impl MasterServer {
             };
             if owner_process_id != Some(process_id) {
                 return ControlResponse::Error {
+                    code: None,
                     reason: format!(
                         "status update not authorized kind=[{}] name=[{}] process_id=[{}]",
                         kind, name, process_id
@@ -1383,44 +1427,18 @@ impl MasterServer {
             }
         }
 
-        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
         let mut registry = self.registry.lock().unwrap();
         let update_result = match kind {
-            "source" => {
-                let previous = registry.get_source(name).cloned();
-                let result = registry.set_source_status(name, status, metrics);
-                (
-                    result,
-                    previous.map(|record| ("source", serde_json::to_value(record).unwrap())),
-                )
-            }
-            "engine" => {
-                let previous = registry.get_engine(name).cloned();
-                let result = registry.set_engine_status(name, status, metrics);
-                (
-                    result,
-                    previous.map(|record| ("engine", serde_json::to_value(record).unwrap())),
-                )
-            }
-            _ => (
-                Err(crate::registry::RegistryError::InvalidRecordKind {
-                    kind: kind.to_string(),
-                }),
-                None,
-            ),
+            "source" => registry.set_source_status(name, status, metrics),
+            "engine" => registry.set_engine_status(name, status, metrics),
+            _ => Err(crate::registry::RegistryError::InvalidRecordKind {
+                kind: kind.to_string(),
+            }),
         };
 
-        match update_result.0 {
+        match update_result {
             Ok(()) => {
-                let snapshot = Self::snapshot_from_registry(&registry);
-                if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                    if let Some((kind, previous)) = update_result.1 {
-                        let _ = restore_previous_record(&mut registry, kind, previous);
-                    }
-                    return ControlResponse::Error {
-                        reason: error.to_string(),
-                    };
-                }
+                drop(registry);
                 self.control_changed.notify_all();
                 ControlResponse::StatusUpdated {
                     kind: kind.to_string(),
@@ -1428,6 +1446,7 @@ impl MasterServer {
                 }
             }
             Err(error) => ControlResponse::Error {
+                code: None,
                 reason: error.to_string(),
             },
         }
@@ -1456,6 +1475,7 @@ impl MasterServer {
         self.validate_process_capability(process_id, process_token)
             .err()
             .map(|error| ControlResponse::Error {
+                code: None,
                 reason: error.to_string(),
             })
     }
@@ -1506,6 +1526,7 @@ impl MasterServer {
                     self.handle_control_envelope_request(envelope)
                 } else {
                     ControlResponse::Error {
+                        code: None,
                         reason: format!(
                             "unsupported control protocol version version=[{}]",
                             envelope.version
@@ -1525,6 +1546,7 @@ impl MasterServer {
             ControlRequest::RegisterProcess(request) => {
                 if self.shutdown_requested.load(Ordering::SeqCst) {
                     ControlResponse::Error {
+                        code: None,
                         reason: MASTER_SHUTDOWN_REASON.to_string(),
                     }
                 } else {
@@ -1600,6 +1622,7 @@ impl MasterServer {
                                 "failed to accept process heartbeat"
                             );
                             ControlResponse::Error {
+                                code: None,
                                 reason: error.to_string(),
                             }
                         }
@@ -1616,10 +1639,12 @@ impl MasterServer {
                 }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                let previous_registry = registry.clone();
                 match registry.unregister_process(&request.process_id) {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+                            *registry = previous_registry;
                             tracing::error!(
                                 component = "master_server",
                                 event = "unregister_process",
@@ -1629,6 +1654,7 @@ impl MasterServer {
                                 "failed to persist process unregister snapshot"
                             );
                             ControlResponse::Error {
+                                code: None,
                                 reason: error.to_string(),
                             }
                         } else {
@@ -1655,6 +1681,7 @@ impl MasterServer {
                             "failed to unregister process"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -1667,6 +1694,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: "register_stream requires process_id".to_string(),
                             },
                         );
@@ -1700,10 +1728,12 @@ impl MasterServer {
                     return write_control_response(
                         &mut stream,
                         &ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         },
                     );
                 }
+                let previous_registry = registry.clone();
                 match registry.ensure_stream(
                     &request.stream_name,
                     request.schema.clone(),
@@ -1716,9 +1746,11 @@ impl MasterServer {
                             if let Err(error) =
                                 registry.set_stream_owner(&request.stream_name, process_id)
                             {
+                                *registry = previous_registry.clone();
                                 return write_control_response(
                                     &mut stream,
                                     &ControlResponse::Error {
+                                        code: None,
                                         reason: error.to_string(),
                                     },
                                 );
@@ -1743,9 +1775,7 @@ impl MasterServer {
                         if !existing {
                             let snapshot = Self::snapshot_from_registry(&registry);
                             if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                                if registry_created {
-                                    registry.unregister_stream(&request.stream_name);
-                                }
+                                *registry = previous_registry;
                                 tracing::error!(
                                     component = "master_server",
                                     event = "snapshot_write_failure",
@@ -1757,6 +1787,7 @@ impl MasterServer {
                                 return write_control_response(
                                     &mut stream,
                                     &ControlResponse::Error {
+                                        code: None,
                                         reason: error.to_string(),
                                     },
                                 );
@@ -1778,6 +1809,7 @@ impl MasterServer {
                             "failed to register stream"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -1792,6 +1824,7 @@ impl MasterServer {
                 }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                let previous_registry = registry.clone();
                 match registry.register_source(
                     &request.source_name,
                     &request.source_type,
@@ -1802,7 +1835,7 @@ impl MasterServer {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            registry.unregister_source(&request.source_name);
+                            *registry = previous_registry;
                             tracing::error!(
                                 component = "master_server",
                                 event = "snapshot_write_failure",
@@ -1814,6 +1847,7 @@ impl MasterServer {
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -1833,6 +1867,7 @@ impl MasterServer {
                         }
                     }
                     Err(error) => ControlResponse::Error {
+                        code: None,
                         reason: error.to_string(),
                     },
                 }
@@ -1865,6 +1900,7 @@ impl MasterServer {
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -1883,6 +1919,7 @@ impl MasterServer {
                         }
                     }
                     Err(error) => ControlResponse::Error {
+                        code: None,
                         reason: error.to_string(),
                     },
                 }
@@ -1896,6 +1933,7 @@ impl MasterServer {
                 }
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
+                let previous_registry = registry.clone();
                 match registry.register_engine(
                     &request.engine_name,
                     &request.engine_type,
@@ -1907,7 +1945,7 @@ impl MasterServer {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            registry.unregister_engine(&request.engine_name);
+                            *registry = previous_registry;
                             tracing::error!(
                                 component = "master_server",
                                 event = "snapshot_write_failure",
@@ -1919,6 +1957,7 @@ impl MasterServer {
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -1938,6 +1977,7 @@ impl MasterServer {
                         }
                     }
                     Err(error) => ControlResponse::Error {
+                        code: None,
                         reason: error.to_string(),
                     },
                 }
@@ -1948,6 +1988,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: "update_status requires process_id".to_string(),
                             },
                         );
@@ -1972,6 +2013,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: format!(
                                     "status update not authorized kind=[{}] name=[{}] process_id=[{}]",
                                     request.kind, request.name, process_id
@@ -1980,56 +2022,25 @@ impl MasterServer {
                         );
                     }
                 }
-                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let update_result = match request.kind.as_str() {
-                    "source" => {
-                        let previous = registry.get_source(&request.name).cloned();
-                        let result = registry.set_source_status(
-                            &request.name,
-                            &request.status,
-                            request.metrics.clone(),
-                        );
-                        (
-                            result,
-                            previous
-                                .map(|record| ("source", serde_json::to_value(record).unwrap())),
-                        )
-                    }
-                    "engine" => {
-                        let previous = registry.get_engine(&request.name).cloned();
-                        let result = registry.set_engine_status(
-                            &request.name,
-                            &request.status,
-                            request.metrics.clone(),
-                        );
-                        (
-                            result,
-                            previous
-                                .map(|record| ("engine", serde_json::to_value(record).unwrap())),
-                        )
-                    }
-                    _ => (
-                        Err(crate::registry::RegistryError::InvalidRecordKind {
-                            kind: request.kind.clone(),
-                        }),
-                        None,
+                    "source" => registry.set_source_status(
+                        &request.name,
+                        &request.status,
+                        request.metrics.clone(),
                     ),
+                    "engine" => registry.set_engine_status(
+                        &request.name,
+                        &request.status,
+                        request.metrics.clone(),
+                    ),
+                    _ => Err(crate::registry::RegistryError::InvalidRecordKind {
+                        kind: request.kind.clone(),
+                    }),
                 };
-                match update_result.0 {
+                match update_result {
                     Ok(()) => {
-                        let snapshot = Self::snapshot_from_registry(&registry);
-                        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            if let Some((kind, previous)) = update_result.1 {
-                                let _ = restore_previous_record(&mut registry, kind, previous);
-                            }
-                            return write_control_response(
-                                &mut stream,
-                                &ControlResponse::Error {
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
+                        drop(registry);
                         tracing::info!(
                             component = "master_server",
                             event = "update_status",
@@ -2046,6 +2057,7 @@ impl MasterServer {
                         }
                     }
                     Err(error) => ControlResponse::Error {
+                        code: None,
                         reason: error.to_string(),
                     },
                 }
@@ -2091,6 +2103,7 @@ impl MasterServer {
                             "failed to publish segment descriptor"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2121,16 +2134,15 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: error.to_string(),
                             },
                         );
                     }
                 };
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                let previous_persisted_files = registry
-                    .get_stream(&request.stream_name)
-                    .map(|stream| stream.persisted_files.clone())
-                    .unwrap_or_default();
+                let previous_registry = registry.clone();
                 let publish_result = registry.publish_persisted_file(
                     &request.stream_name,
                     &request.process_id,
@@ -2140,13 +2152,11 @@ impl MasterServer {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            let _ = registry.set_stream_persisted_files(
-                                &request.stream_name,
-                                previous_persisted_files,
-                            );
+                            *registry = previous_registry;
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -2175,6 +2185,7 @@ impl MasterServer {
                             "failed to publish persisted file"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2186,6 +2197,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: "replace_persisted_files requires process_id".to_string(),
                             },
                         );
@@ -2214,6 +2226,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: format!(
                                     "replace persisted files not authorized stream_name=[{}] process_id=[{}]",
                                     request.stream_name, process_id
@@ -2229,29 +2242,26 @@ impl MasterServer {
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
                         }
                     };
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                let previous_persisted_files = registry
-                    .get_stream(&request.stream_name)
-                    .map(|stream| stream.persisted_files.clone())
-                    .unwrap_or_default();
+                let previous_registry = registry.clone();
                 let replace_result =
                     registry.replace_persisted_files(&request.stream_name, persisted_files);
                 match replace_result {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            let _ = registry.set_stream_persisted_files(
-                                &request.stream_name,
-                                previous_persisted_files,
-                            );
+                            *registry = previous_registry;
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -2278,6 +2288,7 @@ impl MasterServer {
                             "failed to replace persisted files"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2290,11 +2301,9 @@ impl MasterServer {
                 ) {
                     return write_control_response(&mut stream, &response);
                 }
+                let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
-                let previous_persist_events = registry
-                    .get_stream(&request.stream_name)
-                    .map(|stream| stream.persist_events.clone())
-                    .unwrap_or_default();
+                let previous_registry = registry.clone();
                 let publish_result = registry.publish_persist_event(
                     &request.stream_name,
                     &request.process_id,
@@ -2304,13 +2313,11 @@ impl MasterServer {
                     Ok(()) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-                            let _ = registry.set_stream_persist_events(
-                                &request.stream_name,
-                                previous_persist_events,
-                            );
+                            *registry = previous_registry;
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -2339,6 +2346,7 @@ impl MasterServer {
                             "failed to publish persist event"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2385,6 +2393,7 @@ impl MasterServer {
                             "failed to acquire segment reader lease"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2431,6 +2440,7 @@ impl MasterServer {
                             "failed to release segment reader lease"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2473,6 +2483,7 @@ impl MasterServer {
                             "failed to fetch segment descriptor"
                         );
                         ControlResponse::Error {
+                            code: None,
                             reason: error.to_string(),
                         }
                     }
@@ -2534,6 +2545,7 @@ impl MasterServer {
                             "failed to fetch stream"
                         );
                         ControlResponse::Error {
+                            code: Some(ErrorCode::NotFound),
                             reason: format!(
                                 "stream not found stream_name=[{}]",
                                 request.stream_name
@@ -2567,6 +2579,7 @@ impl MasterServer {
                             "failed to fetch stream status"
                         );
                         ControlResponse::Error {
+                            code: Some(ErrorCode::NotFound),
                             reason: format!(
                                 "stream not found stream_name=[{}]",
                                 request.stream_name
@@ -2581,6 +2594,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: "drop_table requires process_id or token".to_string(),
                             },
                         );
@@ -2607,6 +2621,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: format!(
                                     "drop_table not authorized table_name=[{}] process_id=[{}]",
                                     request.table_name, process_id
@@ -2631,6 +2646,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: error.to_string(),
                             },
                         );
@@ -2647,6 +2663,7 @@ impl MasterServer {
                         return write_control_response(
                             &mut stream,
                             &ControlResponse::Error {
+                                code: None,
                                 reason: error.to_string(),
                             },
                         );
@@ -2662,6 +2679,7 @@ impl MasterServer {
                             return write_control_response(
                                 &mut stream,
                                 &ControlResponse::Error {
+                                    code: None,
                                     reason: error.to_string(),
                                 },
                             );
@@ -2738,8 +2756,10 @@ impl MasterServer {
 
     #[cfg(debug_assertions)]
     fn expire_process_for_test_internal(&self, process_id: &str) -> Result<()> {
-        let snapshot = {
-            let mut registry = self.registry.lock().unwrap();
+        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
+        let previous_registry = registry.clone();
+        let update_result = (|| -> Result<()> {
             registry
                 .force_expire_process(process_id)
                 .map_err(registry_error)?;
@@ -2762,10 +2782,20 @@ impl MasterServer {
             }
             registry.remove_segment_reader_leases_for_process(process_id);
             registry.mark_records_lost_for_process(process_id);
-            Self::snapshot_from_registry(&registry)
-        };
+            Ok(())
+        })();
+        if let Err(error) = update_result {
+            *registry = previous_registry;
+            return Err(error);
+        }
+        let snapshot = Self::snapshot_from_registry(&registry);
+        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+            *registry = previous_registry;
+            return Err(error);
+        }
+        drop(registry);
         self.control_changed.notify_all();
-        self.write_snapshot_from_snapshot(&snapshot)
+        Ok(())
     }
 
     fn start_lease_reaper(&self) {
@@ -2881,6 +2911,7 @@ impl MasterServer {
             .collect::<HashSet<_>>();
         let _snapshot_guard = self.snapshot_lock.lock().unwrap();
         let mut registry = self.registry.lock().unwrap();
+        let previous_registry = registry.clone();
         let previous_persisted_files = registry
             .get_stream(stream_name)
             .map(|stream| stream.persisted_files.clone())
@@ -2897,7 +2928,7 @@ impl MasterServer {
             .map_err(registry_error)?;
         let snapshot = Self::snapshot_from_registry(&registry);
         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
-            let _ = registry.set_stream_persisted_files(stream_name, previous_persisted_files);
+            *registry = previous_registry;
             return Err(error);
         }
         self.control_changed.notify_all();
@@ -2907,13 +2938,15 @@ impl MasterServer {
     }
 
     fn expire_process_attachments(&self, process_id: &str) -> Result<()> {
-        let snapshot = {
-            let mut registry = self.registry.lock().unwrap();
+        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+        let mut registry = self.registry.lock().unwrap();
+        let previous_registry = registry.clone();
+        let update_result = (|| -> Result<bool> {
             let claimed = registry
                 .claim_expired_process(process_id, self.lease_timeout.as_millis() as u64)
                 .map_err(registry_error)?;
             if !claimed {
-                return Ok(());
+                return Ok(false);
             }
 
             tracing::warn!(
@@ -2971,14 +3004,31 @@ impl MasterServer {
                 );
             }
             registry.mark_records_lost_for_process(process_id);
-            Self::snapshot_from_registry(&registry)
+            Ok(true)
+        })();
+        let changed = match update_result {
+            Ok(changed) => changed,
+            Err(error) => {
+                *registry = previous_registry;
+                return Err(error);
+            }
         };
+        if !changed {
+            return Ok(());
+        }
+        let snapshot = Self::snapshot_from_registry(&registry);
+        if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
+            *registry = previous_registry;
+            return Err(error);
+        }
+        drop(registry);
         self.control_changed.notify_all();
-        self.write_snapshot_from_snapshot(&snapshot)
+        Ok(())
     }
 
     fn snapshot_from_registry(registry: &Registry) -> RegistrySnapshot {
         RegistrySnapshot {
+            catalog_revision: registry.catalog_revision(),
             streams: registry
                 .list_streams()
                 .into_iter()
@@ -2992,11 +3042,12 @@ impl MasterServer {
                     persisted_files: stream.persisted_files,
                     persist_events: stream.persist_events,
                     persist_revision: stream.persist_revision,
+                    persisted_files_revision: stream.persisted_files_revision,
                     segment_reader_leases: Vec::new(),
                     writer_epoch: stream.writer_epoch,
                     buffer_size: stream.buffer_size,
                     frame_size: stream.frame_size,
-                    status: stream.status,
+                    status: SNAPSHOT_RUNTIME_STATUS.to_string(),
                 })
                 .collect(),
             sources: registry
@@ -3008,8 +3059,8 @@ impl MasterServer {
                     process_id: source.process_id,
                     output_stream: source.output_stream,
                     config: source.config,
-                    status: source.status,
-                    metrics: source.metrics,
+                    status: SNAPSHOT_RUNTIME_STATUS.to_string(),
+                    metrics: serde_json::json!({}),
                     writer_epoch: source.writer_epoch,
                     revision: source.revision,
                 })
@@ -3024,8 +3075,8 @@ impl MasterServer {
                     input_stream: engine.input_stream,
                     output_stream: engine.output_stream,
                     config: engine.config,
-                    status: engine.status,
-                    metrics: engine.metrics,
+                    status: SNAPSHOT_RUNTIME_STATUS.to_string(),
+                    metrics: serde_json::json!({}),
                 })
                 .collect(),
         }
@@ -3055,32 +3106,6 @@ impl MasterServer {
             "wrote registry snapshot"
         );
         Ok(())
-    }
-}
-
-fn restore_previous_record(
-    registry: &mut Registry,
-    kind: &str,
-    previous: serde_json::Value,
-) -> Result<()> {
-    match kind {
-        "source" => {
-            let record: crate::snapshot::SnapshotSourceRecord =
-                serde_json::from_value(previous).map_err(json_error)?;
-            registry
-                .set_source_status(&record.source_name, &record.status, Some(record.metrics))
-                .map_err(registry_error)
-        }
-        "engine" => {
-            let record: crate::snapshot::SnapshotEngineRecord =
-                serde_json::from_value(previous).map_err(json_error)?;
-            registry
-                .set_engine_status(&record.engine_name, &record.status, Some(record.metrics))
-                .map_err(registry_error)
-        }
-        _ => Err(ZippyError::Io {
-            reason: format!("invalid restore kind kind=[{}]", kind),
-        }),
     }
 }
 
@@ -3907,22 +3932,9 @@ fn io_error(error: std::io::Error) -> ZippyError {
     }
 }
 
-fn json_error(error: serde_json::Error) -> ZippyError {
-    ZippyError::Io {
-        reason: error.to_string(),
-    }
-}
-
 fn registry_error(error: crate::registry::RegistryError) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
-    }
-}
-
-fn restored_record_status(status: &str) -> &str {
-    match status {
-        "lost" | "stale" => status,
-        _ => "restored",
     }
 }
 
