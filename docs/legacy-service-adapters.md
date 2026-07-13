@@ -1,6 +1,6 @@
 # Legacy service adapters
 
-`LegacyCatalogAdapter` and `LegacyQueryEngineAdapter` are Phase 1 migration components. They let
+`LegacyCatalogAdapter`, `LegacyRuntimeRegistryAdapter`, and `LegacyQueryEngineAdapter` are Phase 1 migration components. They let
 the new single-node composition root depend on stable `zippy-types` service traits while the
 runtime still uses the existing master registry and gateway collect implementation.
 
@@ -13,6 +13,11 @@ zippy-server
   -> CatalogRead/CatalogWrite
   -> LegacyCatalogAdapter
   -> master Registry
+
+zippy-server
+  -> RuntimeRegistry
+  -> LegacyRuntimeRegistryAdapter
+  -> boot-scoped state embedded in master Registry
 
 zippy-server
   -> QueryEngine
@@ -38,6 +43,12 @@ delivery.
 | Current snapshot version | Advances only when the committed persisted-file view changes |
 | Exact historical catalog snapshot | Rejected with `UNSUPPORTED_PLAN` |
 | Typed catalog mutation | Rejected with `UNSUPPORTED_PLAN` |
+| Process/source/engine runtime status | Supported from the same legacy Registry critical section |
+| Subscription connection status | Supported for legacy reader attach/detach registrations |
+| Segment reader lease status | Not projected; these query/storage leases remain on their legacy owner path |
+| Query runtime status | Intentionally absent; `QueryEngine` is the sole authority |
+| Runtime restart recovery | Never restored; every master boot receives a new boot ID and empty records |
+| Runtime owner authorization | Not expressible by the current trait; trusted in-process callers only |
 | Legacy filter/projection collect | Supported through the bounded producer path |
 | SQL | Rejected with `UNSUPPORTED_PLAN` |
 | Snapshot query pinning | Rejected; no materialized fallback is allowed |
@@ -55,6 +66,49 @@ in-memory registry and notify watchers without cloning or serializing the persis
 Durable catalog mutations still use full rollback on snapshot failure, but their snapshots encode
 the restart-safe `registered` status and empty metrics instead of copying live values. Reloaded
 streams, sources, and engines enter `restored` with empty metrics.
+
+The runtime adapter does not maintain a best-effort mirror. Its boot-scoped records are embedded in
+the legacy `Registry` and are mutated while holding the same registry mutex as legacy
+process/source/engine/reader state. Existing full-registry rollback therefore restores both views
+together when a durable snapshot write fails. Heartbeats and status updates mutate one indexed
+record, advance only the runtime revision, and neither clone the registry nor write the legacy JSON
+snapshot. Runtime records are omitted by the explicit `RegistrySnapshot` DTO, and snapshot restore
+clears any temporary records created while reconstructing durable source and engine definitions.
+
+Legacy typed IDs use a reserved, domain-separated SHA-256 namespace over the server boot ID,
+legacy identity, and registration revision. Adapter clones see the same ID; re-registration gets a
+new nonce and ID; a new server boot gets a new boot ID. A single monotonic runtime revision guards
+compare-and-set, while removal guards both boot ID and revision, so stale work cannot operate on a
+replacement instance. Direct
+trait registration rejects the reserved legacy ID prefix, preventing caller IDs from colliding
+with derived IDs.
+
+Legacy status mapping is centralized. Known active, degraded, stopping, stopped, and failed values
+map to legal `RuntimeState` transitions; unknown strings fail closed as `Failed`. Only top-level
+finite JSON numbers become typed metrics. Non-numeric and nested values are ignored
+deterministically. Records keep low-cardinality legacy name/type/process/input/output stream
+attributes, but never expose the process token.
+
+The `RuntimeRegistry` trait currently carries boot ID, revision, and expected state but no owner
+capability or instance nonce argument. Those guards prevent cross-boot and stale-instance CAS, but
+they do not authenticate which in-process caller owns a record. Phase 1 therefore exposes this
+adapter only as a trusted local service. A future public control boundary must add an opaque owner
+capability before it permits remote runtime mutation.
+
+Legacy-derived records are read-only through the generic trait mutation methods. Their mutation
+must pass through the existing control path, where the process token is checked before the same
+Registry critical section updates legacy and typed runtime views. Generic trait registration and
+CAS remain available for non-legacy IDs to support new trusted in-process runtime objects.
+
+Query lifecycle is not copied into the runtime adapter. `QueryEngine` remains the sole authority
+for plan, execution, status, cancellation, TTL, and retention. Legacy subscription coverage is
+limited to reader attach/detach paths; the current legacy wire protocol has no general-purpose
+subscription connection registration message.
+
+The composition root creates this runtime adapter with closed admission. `activate()` opens it only
+after legacy dependencies are ready, and `begin_shutdown()` closes it irreversibly under the same
+Registry lock used by mutations. Master lifecycle shutdown also takes that lock before publishing
+the stopped flag, giving runtime mutation a clear before-or-after shutdown ordering.
 
 The query adapter accepts only `LEGACY_GATEWAY_PLAN_FORMAT_VERSION`. This JSON compatibility codec
 has a distinct version and cannot be decoded as the native version 1 protobuf plan. The gateway
@@ -129,6 +183,7 @@ server-owned runtime phase.
 Use these adapters for:
 
 - moving business services to `CatalogRead` and `QueryEngine` before storage replacement;
+- moving local status consumers to `RuntimeRegistry` without persisting heartbeat or metrics;
 - running existing filter/projection queries without changing current wire behavior;
 - comparing legacy results with future SQLite catalog or DataFusion shadow implementations;
 - proving lifecycle, cancellation, readiness, and capability contracts independently of the old
@@ -144,5 +199,6 @@ belong to the SQLite catalog, manifest storage, and DataFusion phases.
 2. Manifest storage provides exact schema/file snapshots and leases.
 3. DataFusion implements native plan version 1 and server-side SQL.
 4. The composition root switches trait objects to the new implementations.
-5. Legacy adapters and the compatibility plan version are removed after wire and result parity is
+5. Runtime mutation receives an owner-capability contract before it becomes a remote API.
+6. Legacy adapters and the compatibility plan version are removed after wire and result parity is
    proven.

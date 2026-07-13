@@ -58,24 +58,24 @@ impl LegacyCatalogAdapter {
         Self { registry, running }
     }
 
-    fn ensure_available(&self) -> Result<()> {
-        if self.running.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        Err(ServerError::new(
-            ErrorCode::Unavailable,
-            "legacy catalog master lifecycle is stopped",
-        ))
-    }
-
-    fn capture_view(&self) -> Result<LegacyCatalogView> {
-        self.ensure_available()?;
+    fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, Registry>> {
         let registry = self.registry.lock().map_err(|_| {
             ServerError::new(
                 ErrorCode::Internal,
                 "legacy catalog registry lock is poisoned",
             )
         })?;
+        if !self.running.load(Ordering::Acquire) {
+            return Err(ServerError::new(
+                ErrorCode::Unavailable,
+                "legacy catalog master lifecycle is stopped",
+            ));
+        }
+        Ok(registry)
+    }
+
+    fn capture_view(&self) -> Result<LegacyCatalogView> {
+        let registry = self.lock_registry()?;
         let mut source_configs = registry.source_configs_by_stream();
         let streams = registry
             .stream_records()
@@ -95,16 +95,7 @@ impl LegacyCatalogAdapter {
     }
 
     fn read_revision(&self) -> Result<u64> {
-        self.ensure_available()?;
-        self.registry
-            .lock()
-            .map(|registry| registry.catalog_revision())
-            .map_err(|_| {
-                ServerError::new(
-                    ErrorCode::Internal,
-                    "legacy catalog registry lock is poisoned",
-                )
-            })
+        Ok(self.lock_registry()?.catalog_revision())
     }
 }
 
@@ -215,9 +206,9 @@ impl CatalogRead for LegacyCatalogAdapter {
         selectors: &'a [CatalogSnapshotSelector],
     ) -> BoxFuture<'a, Result<CatalogQuerySnapshot>> {
         Box::pin(async move {
-            self.ensure_available()?;
+            let revision = self.read_revision()?;
             if selectors.is_empty() {
-                return Ok(CatalogQuerySnapshot::empty(self.read_revision()?));
+                return Ok(CatalogQuerySnapshot::empty(revision));
             }
             Err(unsupported_plan("legacy_catalog.read_snapshot_at"))
         })

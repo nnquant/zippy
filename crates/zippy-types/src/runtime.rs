@@ -487,8 +487,13 @@ pub trait RuntimeRegistry: Send + Sync {
     /// boot id, revision, and expected state still match.
     fn compare_and_set(&self, update: RuntimeCasUpdate) -> Result<RuntimeRecord>;
 
-    /// Removes one record only if its exact revision still matches.
-    fn remove(&self, object_id: RuntimeObjectId, expected_revision: u64) -> Result<()>;
+    /// Removes one record only if its boot identity and exact revision still match.
+    fn remove(
+        &self,
+        object_id: RuntimeObjectId,
+        expected_boot_id: SessionId,
+        expected_revision: u64,
+    ) -> Result<()>;
 
     /// Returns one current runtime record.
     fn get(&self, object_id: RuntimeObjectId) -> Result<Option<RuntimeRecord>>;

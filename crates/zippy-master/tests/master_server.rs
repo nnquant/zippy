@@ -2,10 +2,10 @@
 
 use zippy_core::bus_protocol::{
     AcquireSegmentReaderLeaseRequest, ControlEnvelopeRequest, ControlRequest, ControlResponse,
-    GetStreamRequest, ListStreamsRequest, RegisterEngineRequest, RegisterProcessRequest,
-    RegisterSourceRequest, RegisterStreamRequest, ReleaseSegmentReaderLeaseRequest,
-    UnregisterProcessRequest, UpdateRecordStatusRequest, WatchRequest, WatchResource,
-    CONTROL_PROTOCOL_VERSION,
+    GetStreamRequest, HeartbeatRequest, ListStreamsRequest, RegisterEngineRequest,
+    RegisterProcessRequest, RegisterSourceRequest, RegisterStreamRequest,
+    ReleaseSegmentReaderLeaseRequest, UnregisterProcessRequest, UpdateRecordStatusRequest,
+    WatchRequest, WatchResource, CONTROL_PROTOCOL_VERSION,
 };
 use zippy_core::{setup_log, LogConfig, ZippyConfig};
 use zippy_master::registry::{Registry, RegistryError};
@@ -14,7 +14,7 @@ use zippy_master::snapshot::{
     RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
     SnapshotStreamRecord,
 };
-use zippy_types::{catalog::CatalogRead, ErrorCode};
+use zippy_types::{catalog::CatalogRead, runtime::RuntimeRegistry, ErrorCode};
 
 use std::fs;
 use std::io::{Read, Write};
@@ -1928,34 +1928,46 @@ fn persistent_snapshots_exclude_live_status_and_metrics_before_reload() {
         ),
         ControlResponse::EngineRegistered { .. }
     ));
-    for (kind, name, metrics) in [
-        (
-            "source",
-            "ticks_source",
-            serde_json::json!({"rows_total": 123}),
-        ),
-        (
-            "engine",
-            "factor_engine",
-            serde_json::json!({"callbacks_total": 123}),
-        ),
-    ] {
+    let persisted_before = fs::read(&snapshot_path).unwrap();
+    let runtime = server.legacy_runtime_registry_adapter();
+    let runtime_revision_before = runtime.snapshot().unwrap().revision();
+    for sequence in 0..64 {
         assert!(matches!(
             send_control_request(
                 &wait_path,
-                ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
-                    process_id: Some(process_id.clone()),
+                ControlRequest::Heartbeat(HeartbeatRequest {
+                    process_id: process_id.clone(),
                     process_token: Some(process_token.clone()),
-                    token: None,
-                    kind: kind.to_string(),
-                    name: name.to_string(),
-                    status: "alive".to_string(),
-                    metrics: Some(metrics),
                 }),
             ),
-            ControlResponse::StatusUpdated { .. }
+            ControlResponse::HeartbeatAccepted { .. }
         ));
+        for (kind, name, metric_name) in [
+            ("source", "ticks_source", "rows_total"),
+            ("engine", "factor_engine", "callbacks_total"),
+        ] {
+            assert!(matches!(
+                send_control_request(
+                    &wait_path,
+                    ControlRequest::UpdateStatus(UpdateRecordStatusRequest {
+                        process_id: Some(process_id.clone()),
+                        process_token: Some(process_token.clone()),
+                        token: None,
+                        kind: kind.to_string(),
+                        name: name.to_string(),
+                        status: "alive".to_string(),
+                        metrics: Some(serde_json::json!({metric_name: sequence})),
+                    }),
+                ),
+                ControlResponse::StatusUpdated { .. }
+            ));
+        }
     }
+    assert_eq!(fs::read(&snapshot_path).unwrap(), persisted_before);
+    assert_eq!(
+        runtime.snapshot().unwrap().revision(),
+        runtime_revision_before + 64 * 3
+    );
 
     assert!(matches!(
         register_stream(
@@ -1991,6 +2003,12 @@ fn persistent_snapshots_exclude_live_status_and_metrics_before_reload() {
     server.shutdown();
     join_handle.join().unwrap();
     let restored = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    assert!(restored
+        .legacy_runtime_registry_adapter()
+        .snapshot()
+        .unwrap()
+        .records()
+        .is_empty());
     let registry_handle = restored.registry();
     let registry = registry_handle.lock().unwrap();
     let source = registry.get_source("ticks_source").unwrap();

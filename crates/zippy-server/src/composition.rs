@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use zippy_gateway::{GatewayServer, LegacyCollectFacade, LegacyCollectRequest};
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
+use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
 use zippy_types::catalog::CatalogRead;
 use zippy_types::{ErrorCode, Result, ServerError};
@@ -21,6 +22,7 @@ pub struct LegacyServerServices {
     gateway_facade: LegacyCollectFacade,
     gateway_health_probe: LegacyCollectRequest,
     catalog: Arc<LegacyCatalogAdapter>,
+    runtime: Arc<LegacyRuntimeRegistryAdapter>,
     query: Arc<LegacyQueryEngineAdapter>,
 }
 
@@ -28,6 +30,7 @@ impl LegacyServerServices {
     /// Builds stable catalog and query services without changing wire behavior.
     pub fn new(master: &MasterServer, gateway: &GatewayServer) -> Result<Self> {
         let catalog = Arc::new(master.legacy_catalog_adapter());
+        let runtime = Arc::new(master.legacy_runtime_registry_adapter_inactive());
         let catalog_read: Arc<dyn CatalogRead> = catalog.clone();
         let gateway_facade = gateway.legacy_collect_facade();
         let gateway_health_probe =
@@ -48,6 +51,7 @@ impl LegacyServerServices {
             gateway_facade,
             gateway_health_probe,
             catalog,
+            runtime,
             query,
         })
     }
@@ -61,6 +65,12 @@ impl LegacyServerServices {
     #[must_use]
     pub fn catalog(&self) -> Arc<LegacyCatalogAdapter> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Returns the boot-scoped legacy runtime registry adapter.
+    #[must_use]
+    pub fn runtime(&self) -> Arc<LegacyRuntimeRegistryAdapter> {
+        Arc::clone(&self.runtime)
     }
 
     /// Returns the legacy query engine adapter.
@@ -89,11 +99,17 @@ impl LegacyServerServices {
                     format!("legacy gateway facade is unavailable: {error}"),
                 )
             })?;
-        self.query.activate()
+        self.runtime.activate()?;
+        if let Err(error) = self.query.activate() {
+            self.runtime.begin_shutdown();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Rejects new composition-root work before legacy runtime shutdown begins.
     pub fn begin_shutdown(&self) {
+        self.runtime.begin_shutdown();
         self.query.begin_shutdown();
     }
 
@@ -124,6 +140,7 @@ mod tests {
     use zippy_master::server::MasterServer;
     use zippy_types::catalog::CatalogRead;
     use zippy_types::query::{QueryEngine, QueryInput, QueryPriority, QueryRequest};
+    use zippy_types::runtime::RuntimeRegistry;
     use zippy_types::{ErrorCode, QueryId, ResourceLimit, SessionId};
 
     use super::LegacyServerServices;
@@ -146,7 +163,16 @@ mod tests {
         let services = LegacyServerServices::new(&master, &gateway).unwrap();
 
         assert_eq!(services.health().catalog, ServiceHealth::Unavailable);
+        assert_eq!(
+            services.runtime().boot_id(),
+            master.legacy_runtime_registry_adapter().boot_id()
+        );
+        assert_eq!(
+            services.runtime().snapshot().unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
         services.activate().unwrap();
+        assert!(services.runtime().snapshot().unwrap().records().is_empty());
         assert_eq!(services.health().catalog, ServiceHealth::Degraded);
         assert_eq!(services.health().query, ServiceHealth::Degraded);
         assert_eq!(services.health().end_to_end_liveness, None);
@@ -155,6 +181,10 @@ mod tests {
         assert!(!services.health().accepting_work);
         assert_eq!(services.health().catalog, ServiceHealth::Unavailable);
         assert_eq!(services.health().query, ServiceHealth::Unavailable);
+        assert_eq!(
+            services.runtime().snapshot().unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
         assert_eq!(services.activate().unwrap_err().code(), ErrorCode::Conflict);
     }
 

@@ -7,6 +7,10 @@ use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use zippy_types::runtime::{RuntimeCasUpdate, RuntimeObjectId, RuntimeRecord, RuntimeRegistration};
+use zippy_types::Result as ServerResult;
+
+use crate::legacy_runtime::LegacyRuntimeState;
 
 type PersistedFileUpdate = Option<(u64, Vec<serde_json::Value>, Vec<serde_json::Value>)>;
 
@@ -409,6 +413,7 @@ pub struct Registry {
     next_segment_reader_lease_id: u64,
     control_revision: u64,
     catalog_revision: u64,
+    runtime_state: LegacyRuntimeState,
 }
 
 #[derive(Debug, Default)]
@@ -617,6 +622,46 @@ fn retained_replacement_segment_identities(value: &serde_json::Value) -> Vec<(u6
 }
 
 impl Registry {
+    #[cfg(test)]
+    pub(crate) fn with_runtime_state(runtime_state: LegacyRuntimeState) -> Self {
+        Self {
+            runtime_state,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn runtime_state(&self) -> &LegacyRuntimeState {
+        &self.runtime_state
+    }
+
+    pub(crate) fn runtime_register(
+        &mut self,
+        registration: RuntimeRegistration,
+    ) -> ServerResult<RuntimeRecord> {
+        self.runtime_state.register(registration)
+    }
+
+    pub(crate) fn runtime_compare_and_set(
+        &mut self,
+        update: RuntimeCasUpdate,
+    ) -> ServerResult<RuntimeRecord> {
+        self.runtime_state.compare_and_set(update)
+    }
+
+    pub(crate) fn runtime_remove(
+        &mut self,
+        object_id: RuntimeObjectId,
+        expected_boot_id: zippy_types::SessionId,
+        expected_revision: u64,
+    ) -> ServerResult<()> {
+        self.runtime_state
+            .remove(object_id, expected_boot_id, expected_revision)
+    }
+
+    pub(crate) fn clear_runtime_records_for_restart(&mut self) {
+        self.runtime_state.clear_records_for_restart();
+    }
+
     fn now_epoch_millis() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -697,6 +742,7 @@ impl Registry {
             lease_status: "alive".to_string(),
             revision,
         };
+        self.runtime_state.observe_process_registered(&record);
         self.processes.insert(process_id.clone(), record);
         process_id
     }
@@ -734,6 +780,8 @@ impl Registry {
         process.last_heartbeat_at = Self::now_epoch_millis();
         process.lease_status = "alive".to_string();
         process.revision = revision;
+        let process = process.clone();
+        self.runtime_state.observe_process_heartbeat(&process);
         Ok(())
     }
 
@@ -764,6 +812,7 @@ impl Registry {
                 stream.reader_count = stream.reader_count.saturating_sub(1);
             }
         }
+        self.runtime_state.remove_legacy_process(process_id);
         Ok(())
     }
 
@@ -836,6 +885,8 @@ impl Registry {
         let process = self.processes.get_mut(process_id).unwrap();
         process.lease_status = "expired".to_string();
         process.revision = revision;
+        let process = process.clone();
+        self.runtime_state.observe_process_failed(&process);
         Ok(true)
     }
 
@@ -853,6 +904,8 @@ impl Registry {
         let process = self.processes.get_mut(process_id).unwrap();
         process.lease_status = "expired".to_string();
         process.revision = revision;
+        let process = process.clone();
+        self.runtime_state.observe_process_failed(&process);
         Ok(())
     }
 
@@ -1147,22 +1200,23 @@ impl Registry {
             if catalog_changed {
                 self.next_catalog_revision();
             }
+            let source = self.sources.get(source_name).unwrap().clone();
+            self.runtime_state.observe_source_registered(&source);
             return Ok(());
         }
-        self.sources.insert(
-            source_name.to_string(),
-            SourceRecord {
-                source_name: source_name.to_string(),
-                source_type: source_type.to_string(),
-                process_id: process_id.to_string(),
-                output_stream: output_stream.to_string(),
-                config,
-                status: "registered".to_string(),
-                metrics: serde_json::json!({}),
-                writer_epoch,
-                revision,
-            },
-        );
+        let source = SourceRecord {
+            source_name: source_name.to_string(),
+            source_type: source_type.to_string(),
+            process_id: process_id.to_string(),
+            output_stream: output_stream.to_string(),
+            config,
+            status: "registered".to_string(),
+            metrics: serde_json::json!({}),
+            writer_epoch,
+            revision,
+        };
+        self.runtime_state.observe_source_registered(&source);
+        self.sources.insert(source_name.to_string(), source);
         if let Some(stream) = self.streams.get_mut(output_stream) {
             stream.active_writer_source_name = Some(source_name.to_string());
             stream.writer_epoch = writer_epoch;
@@ -1268,19 +1322,18 @@ impl Registry {
                 engine_name: engine_name.to_string(),
             });
         }
-        self.engines.insert(
-            engine_name.to_string(),
-            EngineRecord {
-                engine_name: engine_name.to_string(),
-                engine_type: engine_type.to_string(),
-                process_id: process_id.to_string(),
-                input_stream: input_stream.to_string(),
-                output_stream: output_stream.to_string(),
-                config,
-                status: "registered".to_string(),
-                metrics: serde_json::json!({}),
-            },
-        );
+        let engine = EngineRecord {
+            engine_name: engine_name.to_string(),
+            engine_type: engine_type.to_string(),
+            process_id: process_id.to_string(),
+            input_stream: input_stream.to_string(),
+            output_stream: output_stream.to_string(),
+            config,
+            status: "registered".to_string(),
+            metrics: serde_json::json!({}),
+        };
+        self.runtime_state.observe_engine_registered(&engine);
+        self.engines.insert(engine_name.to_string(), engine);
         Ok(())
     }
 
@@ -1368,6 +1421,8 @@ impl Registry {
         if catalog_changed {
             self.next_catalog_revision();
         }
+        let source = self.sources.get(source_name).unwrap().clone();
+        self.runtime_state.observe_source_status(&source);
         Ok(())
     }
 
@@ -1389,6 +1444,8 @@ impl Registry {
             source.metrics = metrics;
         }
         source.revision = revision;
+        let source = source.clone();
+        self.runtime_state.observe_source_status(&source);
         Ok(())
     }
 
@@ -1408,6 +1465,8 @@ impl Registry {
         if let Some(metrics) = metrics {
             engine.metrics = metrics;
         }
+        let engine = engine.clone();
+        self.runtime_state.observe_engine_status(&engine);
         Ok(())
     }
 
@@ -1862,15 +1921,28 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
-        stream.reader_count += 1;
+        if let Some(owner_process_id) = stream.reader_process_ids.get(reader_id) {
+            if owner_process_id != process_id {
+                return Err(RegistryError::ReaderNotOwnedByProcess {
+                    stream_name: stream_name.to_string(),
+                    reader_id: reader_id.to_string(),
+                    process_id: process_id.to_string(),
+                    owner_process_id: Some(owner_process_id.clone()),
+                });
+            }
+            return Ok(());
+        }
         stream
             .reader_process_ids
             .insert(reader_id.to_string(), process_id.to_string());
+        stream.reader_count += 1;
         if stream.writer_process_id.is_some() {
             stream.status = "active".to_string();
         } else {
             stream.status = "reader_attached".to_string();
         }
+        self.runtime_state
+            .observe_connection_attached(stream_name, process_id, reader_id);
         Ok(())
     }
 
@@ -1910,8 +1982,9 @@ impl Registry {
                 .ok_or_else(|| RegistryError::StreamNotFound {
                     stream_name: stream_name.to_string(),
                 })?;
-        stream.reader_process_ids.remove(reader_id);
-        stream.reader_count = stream.reader_count.saturating_sub(1);
+        if stream.reader_process_ids.remove(reader_id).is_some() {
+            stream.reader_count = stream.reader_count.saturating_sub(1);
+        }
         stream.status = if stream.writer_process_id.is_some() {
             "writer_attached".to_string()
         } else if stream.reader_count > 0 {
@@ -1919,6 +1992,8 @@ impl Registry {
         } else {
             "registered".to_string()
         };
+        self.runtime_state
+            .remove_legacy_connection(stream_name, reader_id);
         Ok(())
     }
 
@@ -2014,6 +2089,11 @@ impl Registry {
                 engine.status = "lost".to_string();
             }
         }
+        if let Some(process) = self.processes.get(process_id).cloned() {
+            self.runtime_state.observe_process_failed(&process);
+        } else {
+            self.runtime_state.observe_process_owner_failed(process_id);
+        }
     }
 
     pub fn unregister_source(&mut self, source_name: &str) -> Option<SourceRecord> {
@@ -2021,6 +2101,7 @@ impl Registry {
         if let Some(source) = &removed {
             self.clear_active_writer_source(&source.output_stream, source_name);
             self.next_catalog_revision();
+            self.runtime_state.remove_legacy_source(source_name);
         }
         removed
     }
@@ -2051,6 +2132,7 @@ impl Registry {
                 })?;
         self.clear_active_writer_source(&removed.output_stream, source_name);
         self.next_catalog_revision();
+        self.runtime_state.remove_legacy_source(source_name);
         Ok(removed)
     }
 
@@ -2071,13 +2153,19 @@ impl Registry {
     }
 
     pub fn unregister_engine(&mut self, engine_name: &str) -> Option<EngineRecord> {
-        self.engines.remove(engine_name)
+        let removed = self.engines.remove(engine_name);
+        if removed.is_some() {
+            self.runtime_state.remove_legacy_engine(engine_name);
+        }
+        removed
     }
 
     pub fn unregister_stream(&mut self, stream_name: &str) -> Option<StreamRecord> {
         let removed = self.streams.remove(stream_name);
         if removed.is_some() {
             self.next_catalog_revision();
+            self.runtime_state
+                .remove_connections_for_stream(stream_name);
         }
         removed
     }
@@ -2114,6 +2202,13 @@ impl Registry {
         if stream.is_some() || !sources.is_empty() {
             self.next_catalog_revision();
         }
+        for source in &sources {
+            self.runtime_state.remove_legacy_source(&source.source_name);
+        }
+        for engine in &engines {
+            self.runtime_state.remove_legacy_engine(&engine.engine_name);
+        }
+        self.runtime_state.remove_connections_for_stream(table_name);
 
         DroppedTableRecords {
             stream,

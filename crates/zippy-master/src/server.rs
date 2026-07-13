@@ -34,6 +34,7 @@ use zippy_segment_store::ShmRegion;
 use zippy_types::ErrorCode;
 
 use crate::legacy_catalog::LegacyCatalogAdapter;
+use crate::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use crate::registry::{Registry, RegistryError, StreamRecord};
 use crate::snapshot::{
     RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
@@ -166,6 +167,19 @@ impl MasterServer {
         LegacyCatalogAdapter::new(Arc::clone(&self.registry), Arc::clone(&self.running))
     }
 
+    /// Creates the boot-scoped runtime compatibility adapter for this master.
+    pub fn legacy_runtime_registry_adapter(&self) -> LegacyRuntimeRegistryAdapter {
+        LegacyRuntimeRegistryAdapter::new(Arc::clone(&self.registry), Arc::clone(&self.running))
+    }
+
+    /// Creates an inactive runtime adapter for composition-root admission.
+    pub fn legacy_runtime_registry_adapter_inactive(&self) -> LegacyRuntimeRegistryAdapter {
+        LegacyRuntimeRegistryAdapter::new_inactive(
+            Arc::clone(&self.registry),
+            Arc::clone(&self.running),
+        )
+    }
+
     pub fn from_snapshot_path(snapshot_path: &Path) -> Result<Self> {
         let snapshot = SnapshotStore::load(snapshot_path)?;
         let catalog_revision = snapshot.catalog_revision;
@@ -251,6 +265,7 @@ impl MasterServer {
             }
 
             registry.restore_catalog_revision(catalog_revision);
+            registry.clear_runtime_records_for_restart();
         }
 
         Ok(server)
@@ -506,6 +521,14 @@ impl MasterServer {
     }
 
     pub fn shutdown(&self) {
+        self.stop_runtime();
+    }
+
+    fn stop_runtime(&self) {
+        let _registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.running.store(false, Ordering::SeqCst);
     }
 
@@ -518,7 +541,7 @@ impl MasterServer {
         loop {
             let alive = self.registry.lock().unwrap().alive_process_ids();
             if alive.is_empty() {
-                self.running.store(false, Ordering::SeqCst);
+                self.stop_runtime();
                 return GracefulShutdownOutcome {
                     timed_out_processes: Vec::new(),
                 };
@@ -531,7 +554,7 @@ impl MasterServer {
                     timed_out_processes = ?alive,
                     "timed out waiting for child processes to unregister"
                 );
-                self.running.store(false, Ordering::SeqCst);
+                self.stop_runtime();
                 return GracefulShutdownOutcome {
                     timed_out_processes: alive,
                 };
