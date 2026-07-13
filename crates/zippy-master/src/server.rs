@@ -139,7 +139,7 @@ impl MasterServer {
                 component = "master",
                 event = "master_token_generated",
                 status = "ready",
-                token = self.token.as_str(),
+                token_source = "generated",
                 "master generated control token"
             );
         }
@@ -4273,7 +4273,61 @@ fn socket_creation_timestamp() -> Result<u128> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::MakeWriter;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedGuard {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CapturedGuard {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedWriter {
+        type Writer = CapturedGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedGuard {
+                bytes: Arc::clone(&self.bytes),
+            }
+        }
+    }
+
+    #[test]
+    fn generated_master_token_log_never_contains_the_secret() {
+        let server = MasterServer::default();
+        let secret = server.token().to_string();
+        let writer = CapturedWriter::default();
+        let captured = Arc::clone(&writer.bytes);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || server.log_generated_token());
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("master_token_generated"));
+        assert!(output.contains("token_source=\"generated\""));
+        assert!(!output.contains(&secret));
+    }
 
     #[test]
     fn accept_loop_idle_sleep_stays_below_control_plane_latency_budget() {

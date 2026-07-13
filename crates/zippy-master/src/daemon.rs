@@ -22,6 +22,8 @@ use crate::server::MasterServer;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterDaemonConfig {
     pub control_endpoint: ControlEndpoint,
+    /// Whether the caller explicitly selected the endpoint, including the default value.
+    pub control_endpoint_explicit: bool,
     pub config_path: Option<PathBuf>,
     pub log_dir: PathBuf,
     pub log_level: Option<String>,
@@ -73,6 +75,7 @@ impl MasterDaemonConfig {
     pub fn new(control_endpoint: impl Into<ControlEndpoint>) -> Self {
         Self {
             control_endpoint: control_endpoint.into(),
+            control_endpoint_explicit: false,
             config_path: None,
             log_dir: PathBuf::from("logs"),
             log_level: None,
@@ -82,6 +85,13 @@ impl MasterDaemonConfig {
 
     pub fn with_config_path(mut self, config_path: impl AsRef<Path>) -> Self {
         self.config_path = Some(config_path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Prevents file or environment configuration from replacing the caller-selected endpoint.
+    #[must_use]
+    pub fn with_explicit_control_endpoint(mut self) -> Self {
+        self.control_endpoint_explicit = true;
         self
     }
 
@@ -175,13 +185,14 @@ pub fn prepare_master_runtime(
 ) -> zippy_core::Result<PreparedMasterRuntime> {
     let MasterDaemonConfig {
         mut control_endpoint,
+        control_endpoint_explicit,
         config_path,
         log_dir,
         log_level,
         console_log,
     } = config;
     let mut runtime_config = load_runtime_config(config_path.as_deref())?;
-    if control_endpoint == default_control_endpoint() {
+    if !control_endpoint_explicit && control_endpoint == default_control_endpoint() {
         if let Some(endpoint) = runtime_config.master_endpoint() {
             control_endpoint = resolve_control_endpoint(format!("tcp://{endpoint}"))?;
         }

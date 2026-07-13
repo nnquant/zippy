@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
 use tracing::Subscriber;
@@ -80,6 +83,55 @@ impl LazyFileWriter {
     }
 }
 
+fn open_log_file(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("log path is not a regular file path=[{}]", path.display()),
+            ));
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "opened log path is not a regular file path=[{}]",
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != effective_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "log file is not owned by current user path=[{}]",
+                    path.display()
+                ),
+            ));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(file)
+}
+
 impl Write for LazyFileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut state = self
@@ -87,15 +139,7 @@ impl Write for LazyFileWriter {
             .lock()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "logging file lock poisoned"))?;
         if state.file.is_none() {
-            if let Some(parent) = state.path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&state.path)?;
-            state.file = Some(file);
+            state.file = Some(open_log_file(&state.path)?);
         }
 
         state

@@ -5,11 +5,28 @@ import pyarrow as pa
 
 __version__: str
 
+def _signal_server_process(
+    pid: int,
+    boot_id: str,
+    start_ticks: str,
+    signal_number: int,
+) -> bool: ...
+def resolve_server_control_endpoint(
+    uri: str | None = None,
+    *,
+    config: str | None = None,
+    endpoint_explicit: bool = False,
+) -> str: ...
 def run_server_daemon(
     uri: str | None = None,
     *,
     control_endpoint: str | None = None,
     config: str | None = None,
+    ready_file: str | None = None,
+    launch_nonce: str | None = None,
+    log_dir: str | None = None,
+    startup_timeout_sec: float | None = None,
+    endpoint_explicit: bool = False,
 ) -> None: ...
 def run_master_daemon(
     uri: str | None = None,

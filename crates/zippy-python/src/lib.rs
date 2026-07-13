@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::hint::spin_loop;
-use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -152,7 +154,8 @@ fn parse_startup_timeout(startup_timeout_sec: f64) -> PyResult<Duration> {
             "startup_timeout_sec must be a positive finite number",
         ));
     }
-    Ok(Duration::from_secs_f64(startup_timeout_sec))
+    Duration::try_from_secs_f64(startup_timeout_sec)
+        .map_err(|_| py_value_error("startup_timeout_sec exceeds the supported duration range"))
 }
 
 fn python_json_dumps(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -7703,6 +7706,8 @@ impl CrossSectionalEngine {
 fn _internal(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", python_dev_version())?;
     module.add_function(wrap_pyfunction!(version, module)?)?;
+    module.add_function(wrap_pyfunction!(_signal_server_process, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_server_control_endpoint, module)?)?;
     module.add_function(wrap_pyfunction!(run_server_daemon, module)?)?;
     module.add("run_master_daemon", module.getattr("run_server_daemon")?)?;
     module.add_function(wrap_pyfunction!(setup_log, module)?)?;
@@ -7757,29 +7762,185 @@ fn version() -> String {
 }
 
 #[pyfunction]
-#[pyo3(signature = (uri=None, *, control_endpoint=None, config=None))]
+fn _signal_server_process(
+    pid: u32,
+    boot_id: &str,
+    start_ticks: &str,
+    signal_number: i32,
+) -> PyResult<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::OwnedFd;
+
+        if boot_id.is_empty() || start_ticks.is_empty() {
+            return Err(py_value_error("server process identity must be complete"));
+        }
+        if !matches!(signal_number, 0 | libc::SIGTERM | libc::SIGKILL) {
+            return Err(py_value_error("unsupported server process signal"));
+        }
+        let native_pid = libc::pid_t::try_from(pid)
+            .map_err(|_| py_value_error("server process PID is out of range"))?;
+        // Opening the pidfd first pins the process generation before `/proc` identity validation.
+        let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, native_pid, 0) };
+        if raw_pidfd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(false);
+            }
+            return Err(py_runtime_error(format!("open server pidfd: {error}")));
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd as libc::c_int) };
+        let actual_boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| py_runtime_error(format!("read Linux boot identity: {error}")))?;
+        let stat_line = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(py_runtime_error(format!(
+                    "read server process identity: {error}"
+                )))
+            }
+        };
+        let actual_start_ticks = stat_line
+            .rfind(')')
+            .and_then(|index| stat_line.get(index + 2..))
+            .and_then(|suffix| suffix.split_whitespace().nth(19))
+            .ok_or_else(|| py_runtime_error("parse server process identity"))?;
+        if actual_boot_id.trim() != boot_id || actual_start_ticks != start_ticks {
+            return Ok(false);
+        }
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                std::os::fd::AsRawFd::as_raw_fd(&pidfd),
+                signal_number,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(false);
+            }
+            return Err(py_runtime_error(format!(
+                "signal server process through pidfd: {error}"
+            )));
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, boot_id, start_ticks, signal_number);
+        Err(py_runtime_error(
+            "pidfd server process control requires Linux",
+        ))
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (uri=None, *, config=None, endpoint_explicit=false))]
+fn resolve_server_control_endpoint(
+    uri: Option<String>,
+    config: Option<String>,
+    endpoint_explicit: bool,
+) -> PyResult<String> {
+    let requested = uri.unwrap_or_else(|| DEFAULT_CONTROL_ENDPOINT_URI.to_string());
+    let mut endpoint = resolve_control_endpoint_value(&requested)?;
+    let runtime_config = match config {
+        Some(path) => ZippyConfig::load_from_path(Some(Path::new(&path))),
+        None => ZippyConfig::load_default(),
+    }
+    .map_err(|_| py_value_error("load server configuration failed"))?;
+    if !endpoint_explicit {
+        if let Some(configured) = runtime_config.master_endpoint() {
+            endpoint = resolve_control_endpoint_value(&format!("tcp://{configured}"))?;
+        }
+    }
+    Ok(endpoint.display_string())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    uri=None,
+    *,
+    control_endpoint=None,
+    config=None,
+    ready_file=None,
+    launch_nonce=None,
+    log_dir=None,
+    startup_timeout_sec=None,
+    endpoint_explicit=false
+))]
+#[allow(clippy::too_many_arguments)]
 fn run_server_daemon(
     py: Python<'_>,
     uri: Option<String>,
     control_endpoint: Option<String>,
     config: Option<String>,
+    ready_file: Option<String>,
+    launch_nonce: Option<String>,
+    log_dir: Option<String>,
+    startup_timeout_sec: Option<f64>,
+    endpoint_explicit: bool,
 ) -> PyResult<()> {
-    run_server_daemon_impl(py, uri, control_endpoint, config)
+    run_server_daemon_impl(
+        py,
+        ServerDaemonArguments {
+            uri,
+            control_endpoint,
+            config,
+            ready_file,
+            launch_nonce,
+            log_dir,
+            startup_timeout_sec,
+            endpoint_explicit,
+        },
+    )
 }
 
-fn run_server_daemon_impl(
-    py: Python<'_>,
+struct ServerDaemonArguments {
     uri: Option<String>,
     control_endpoint: Option<String>,
     config: Option<String>,
-) -> PyResult<()> {
-    let control_endpoint = resolve_uri_argument(uri, control_endpoint)?;
+    ready_file: Option<String>,
+    launch_nonce: Option<String>,
+    log_dir: Option<String>,
+    startup_timeout_sec: Option<f64>,
+    endpoint_explicit: bool,
+}
+
+fn run_server_daemon_impl(py: Python<'_>, arguments: ServerDaemonArguments) -> PyResult<()> {
+    let control_endpoint = resolve_uri_argument(arguments.uri, arguments.control_endpoint)?;
     let control_endpoint = prepare_control_endpoint(&control_endpoint)?;
     let mut daemon_config = MasterDaemonConfig::new(control_endpoint);
-    if let Some(config) = config {
+    if arguments.endpoint_explicit {
+        daemon_config = daemon_config.with_explicit_control_endpoint();
+    }
+    if let Some(config) = arguments.config {
         daemon_config = daemon_config.with_config_path(PathBuf::from(config));
     }
-    py.allow_threads(move || run_rust_server_daemon(LegacyServerRuntimeConfig::new(daemon_config)))
+    if let Some(log_dir) = arguments.log_dir {
+        daemon_config.log_dir = PathBuf::from(log_dir);
+    }
+    let mut runtime_config = LegacyServerRuntimeConfig::new(daemon_config);
+    if let Some(startup_timeout_sec) = arguments.startup_timeout_sec {
+        runtime_config =
+            runtime_config.with_startup_timeout(parse_startup_timeout(startup_timeout_sec)?);
+    }
+    match (arguments.ready_file, arguments.launch_nonce) {
+        (Some(ready_file), Some(launch_nonce)) => {
+            runtime_config = runtime_config.with_ready_file(ready_file, launch_nonce);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(py_value_error(
+                "ready_file and launch_nonce must be set together".to_string(),
+            ));
+        }
+    }
+    py.allow_threads(move || run_rust_server_daemon(runtime_config))
         .map_err(|error| py_runtime_error(error.to_string()))
 }
 

@@ -1481,14 +1481,22 @@ def test_master_run_returns_click_error_when_server_start_fails(
 def test_server_run_returns_click_error_when_runtime_start_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def failing_run_server_daemon(control_endpoint: str) -> None:
+    def failing_run_server_daemon(
+        control_endpoint: str,
+        *,
+        endpoint_explicit: bool = False,
+    ) -> None:
         assert control_endpoint
+        assert endpoint_explicit
         raise RuntimeError("failed to compose server runtime")
 
     monkeypatch.setattr(zippy, "run_server_daemon", failing_run_server_daemon, raising=False)
 
     runner = CliRunner()
-    result = runner.invoke(main, ["server", "run", "/tmp/zippy-server-fail.sock"])
+    result = runner.invoke(
+        main,
+        ["server", "run", "/tmp/zippy-server-fail.sock", "--foreground"],
+    )
 
     assert result.exit_code != 0
     assert "failed to compose server runtime" in result.output
@@ -1544,7 +1552,12 @@ def test_master_run_uses_default_tcp_control_endpoint(monkeypatch: pytest.Monkey
 def test_server_run_uses_default_tcp_control_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, str]] = []
 
-    def recording_run_server_daemon(control_endpoint: str) -> None:
+    def recording_run_server_daemon(
+        control_endpoint: str,
+        *,
+        endpoint_explicit: bool = False,
+    ) -> None:
+        assert endpoint_explicit
         events.append(("run_server_daemon", control_endpoint))
 
     def unexpected_run_master_daemon(control_endpoint: str) -> None:
@@ -1566,7 +1579,7 @@ def test_server_run_uses_default_tcp_control_endpoint(monkeypatch: pytest.Monkey
     )
 
     runner = CliRunner()
-    result = runner.invoke(main, ["server", "run"])
+    result = runner.invoke(main, ["server", "run", "--foreground"])
 
     assert result.exit_code == 0
     assert events == [("run_server_daemon", "tcp://127.0.0.1:17690")]
@@ -1708,7 +1721,9 @@ enabled = false
         control_endpoint: str,
         *,
         config: str | None = None,
+        endpoint_explicit: bool = False,
     ) -> None:
+        assert endpoint_explicit
         events.append((control_endpoint, config or ""))
 
     monkeypatch.setattr(
@@ -1719,7 +1734,10 @@ enabled = false
     )
 
     runner = CliRunner()
-    result = runner.invoke(main, ["server", "run", "--config", str(config_path)])
+    result = runner.invoke(
+        main,
+        ["server", "run", "--foreground", "--config", str(config_path)],
+    )
 
     assert result.exit_code == 0
     assert events == [("tcp://127.0.0.1:28690", str(config_path))]

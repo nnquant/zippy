@@ -56,6 +56,7 @@ select = ["E4", "E7", "E9", "F"]
 python_version = "3.11"
 files = [
     "python/zippy/__main__.py",
+    "python/zippy/_server_bootstrap.py",
     "python/zippy/_internal.pyi",
     "python/zippy/cli.py",
     "python/zippy/cli_common.py",
@@ -63,6 +64,7 @@ files = [
     "python/zippy/cli_master.py",
     "python/zippy/cli_pm.py",
     "python/zippy/cli_server.py",
+    "python/zippy/server_process.py",
     "python/zippy/cli_stream.py",
     "python/zippy/pm_bridge.py",
     "python/zippy/cli_webui.py",

@@ -254,6 +254,7 @@ if _NATIVE_AVAILABLE:
         from ._internal import AggMinSpec
         from ._internal import AggSumSpec
         from ._internal import AggVwapSpec
+        from ._internal import _signal_server_process
         from ._internal import BarGeneratorEngine
         from ._internal import CastSpec
         from ._internal import ClipSpec
@@ -274,6 +275,7 @@ if _NATIVE_AVAILABLE:
         from ._internal import Query as _NativeQuery
         from ._internal import ReactiveLatestEngine
         from ._internal import ReactiveStateEngine
+        from ._internal import resolve_server_control_endpoint
         from ._internal import StreamSubscriber as _NativeStreamSubscriber
         from ._internal import StreamTableMaterializer as _StreamTableMaterializer
         from ._internal import TimeSeriesEngine
@@ -296,6 +298,7 @@ if _NATIVE_AVAILABLE:
         _NATIVE_IMPORT_ERROR = error
 
 if not _NATIVE_AVAILABLE:
+    _signal_server_process = _native_unavailable("_signal_server_process")
     AbsSpec = _native_unavailable("AbsSpec")
     AggCountSpec = _native_unavailable("AggCountSpec")
     AggFirstSpec = _native_unavailable("AggFirstSpec")
@@ -342,6 +345,13 @@ if not _NATIVE_AVAILABLE:
         del args, kwargs
         raise RuntimeError(
             "zippy native extension is unavailable; run_server_daemon requires "
+            "the platform-specific zippy wheel"
+        ) from _NATIVE_IMPORT_ERROR
+
+    def resolve_server_control_endpoint(*args, **kwargs) -> str:
+        del args, kwargs
+        raise RuntimeError(
+            "zippy native extension is unavailable; server endpoint resolution requires "
             "the platform-specific zippy wheel"
         ) from _NATIVE_IMPORT_ERROR
 
@@ -11419,6 +11429,7 @@ __all__ = [
     "MasterServer",
     "run_master_daemon",
     "run_server_daemon",
+    "resolve_server_control_endpoint",
     "NullPublisher",
     "OverflowPolicy",
     "ParquetPersist",

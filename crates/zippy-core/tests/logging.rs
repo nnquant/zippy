@@ -17,8 +17,12 @@ fn logging_case_dispatch() {
     match case.as_str() {
         "create_snapshot" => create_snapshot_case(&temp_dir),
         "console_format" => console_format_case(&temp_dir),
+        #[cfg(unix)]
+        "existing_file_permissions" => existing_file_permissions_case(&temp_dir),
         "reuse_snapshot" => reuse_snapshot_case(&temp_dir),
         "reject_different_config" => reject_different_config_case(&temp_dir),
+        #[cfg(unix)]
+        "reject_symlink" => reject_symlink_case(&temp_dir),
         other => panic!("unknown logging test case: {other}"),
     }
 }
@@ -26,6 +30,18 @@ fn logging_case_dispatch() {
 #[test]
 fn setup_log_creates_jsonl_file_and_returns_snapshot() {
     run_logging_case("create_snapshot");
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_log_restricts_existing_file_to_owner_only() {
+    run_logging_case("existing_file_permissions");
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_log_refuses_to_follow_existing_symlink() {
+    run_logging_case("reject_symlink");
 }
 
 #[test]
@@ -84,6 +100,8 @@ fn run_logging_case(case: &str) {
 }
 
 fn create_snapshot_case(temp_dir: &Path) {
+    #[cfg(unix)]
+    let previous_umask = unsafe { libc::umask(0) };
     let snapshot = zippy_core::setup_log(zippy_core::LogConfig::new(
         "runtime_test",
         "info",
@@ -133,6 +151,75 @@ fn create_snapshot_case(temp_dir: &Path) {
     assert_eq!(record["component"], "logging_test");
     assert_eq!(record["event"], "create_snapshot");
     assert_eq!(record["message"], "created logging snapshot");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+        unsafe {
+            libc::umask(previous_umask);
+        }
+        assert_eq!(mode, 0o600);
+    }
+}
+
+#[cfg(unix)]
+fn existing_file_permissions_case(temp_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let snapshot = zippy_core::setup_log(zippy_core::LogConfig::new(
+        "runtime_test",
+        "info",
+        temp_dir,
+        false,
+        true,
+    ))
+    .unwrap();
+    let file_path = snapshot.file_path.expect("missing file path");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, []).unwrap();
+    std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    tracing::info!(
+        component = "logging_test",
+        event = "existing_file_permissions",
+        "restricted existing logging file"
+    );
+
+    let mode = std::fs::metadata(&file_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+fn reject_symlink_case(temp_dir: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let snapshot = zippy_core::setup_log(zippy_core::LogConfig::new(
+        "runtime_test",
+        "info",
+        temp_dir,
+        false,
+        true,
+    ))
+    .unwrap();
+    let file_path = snapshot.file_path.expect("missing file path");
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    let external = temp_dir.join("external.log");
+    std::fs::write(&external, b"unchanged").unwrap();
+    symlink(&external, &file_path).unwrap();
+
+    tracing::info!(
+        component = "logging_test",
+        event = "reject_symlink",
+        "must not follow logging symlink"
+    );
+
+    assert_eq!(std::fs::read(&external).unwrap(), b"unchanged");
+    assert!(std::fs::symlink_metadata(&file_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 fn console_format_case(temp_dir: &Path) {

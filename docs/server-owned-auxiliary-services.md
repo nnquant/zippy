@@ -14,11 +14,13 @@ manifest、查询快照或存储格式设计；同时收紧该文档中“mainte
 当前版本继续保持以下行为：
 
 - `zippy server run` 只组合 master、Gateway 和 Phase 1 兼容适配层。
+- `zippy server run` 默认后台化并在启动摘要中探测、显示 WebUI 地址，但
+  `managed=[no]` 明确表示它不会启动或关闭 WebUI；WebUI 不可达也不会降低核心 server 健康。
 - `zippy webui` 仍由用户显式启动为独立 Python/Uvicorn 进程。
 - `[table.persist.compaction]` 若启用，仍由 legacy master 内部线程执行。
 - `zippy-rspm` 仍按现有 PM 配置管理任务，不会因为本文档出现新的隐式任务。
 
-本轮不修改上述运行行为，是为了先冻结进程所有权、失败语义和安全边界，再逐阶段接入。任何
+本轮不修改上述组件所有权行为，是为了先冻结进程所有权、失败语义和安全边界，再逐阶段接入。任何
 后续实现都必须通过“配置关闭时不创建进程、线程、socket 或端口”的回归测试。
 
 ## 2. 现状审计
@@ -88,8 +90,8 @@ maintenance worker，否则一次故障可能触发两套 restart、两个 worke
 默认部署的所有权树固定为：
 
 ```text
-zippy-rspm / systemd / shell
-└── zippy server run
+zippy-rspm / systemd
+└── zippy server run --foreground
     ├── core runtimes (same process)
     ├── zippy webui --managed-child     # 配置启用后才拉起
     └── zippy-maintenance worker        # 配置启用后才拉起
@@ -97,7 +99,7 @@ zippy-rspm / systemd / shell
 
 约束如下：
 
-1. 默认 PM 配置只能包含顶层 `zippy server run`，不能再列独立 master、Gateway、WebUI 或
+1. 默认 PM 配置只能包含顶层 `zippy server run --foreground`，不能再列独立 master、Gateway、WebUI 或
    maintenance task。
 2. server 启动的 child 必须具备 parent-death 行为；server 异常退出后 child 不能成为孤儿服务。
 3. 高级部署若选择 `ownership = "external"`，server 只接受一个经过认证的外部 worker，且不得再
@@ -521,7 +523,7 @@ degraded 状态继续。
 
 ### Phase F：运维收口
 
-1. 更新 PM helper，使默认任务只有 `zippy server run`。
+1. 更新 PM helper，使默认任务只有 `zippy server run --foreground`。
 2. 更新 runbook、examples 和 WebUI 术语，legacy master/gateway/compaction 标记 deprecated。
 3. 在两个发布周期稳定后删除 legacy compaction scheduler；手工 WebUI 入口根据兼容承诺另行决定。
 

@@ -2289,6 +2289,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "crossbeam-channel",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -2355,6 +2356,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "zippy-core",
  "zippy-gateway",
  "zippy-segment-store",
@@ -2402,6 +2404,7 @@ name = "zippy-python"
 version = "0.5.0"
 dependencies = [
  "arrow",
+ "libc",
  "pyo3",
  "pyo3-build-config",
  "serde_json",

@@ -15,3 +15,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zippy-segment-store = { path = "../zippy-segment-store" }
 zippy-types = { path = "../zippy-types" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

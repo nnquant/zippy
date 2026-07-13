@@ -1,8 +1,14 @@
 //! Server-owned lifecycle for the Phase 1 legacy runtime.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -11,6 +17,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use zippy_core::bus_protocol::GetConfigRequest;
 use zippy_core::{
+    current_log_snapshot, python_dev_version, resolve_control_endpoint,
     send_control_line_request_with_timeout, ControlEndpoint, ControlRequest, ControlResponse,
     Result as CoreResult, ZippyConfig, ZippyError,
 };
@@ -79,7 +86,28 @@ fn run_server_daemon_with_waiter<F>(
 where
     F: FnOnce(&LegacyServerRuntime) -> Result<&'static str, ServerError>,
 {
+    let launcher_state = validate_ready_configuration(&config)?;
+    let ready_file = config.ready_file.clone();
+    let launch_nonce = config.launch_nonce.clone();
     let mut runtime = LegacyServerRuntime::start(config)?;
+    if let Some(path) = ready_file.as_deref() {
+        if let Err(ready_error) = publish_ready_record(
+            &runtime,
+            path,
+            launch_nonce.as_deref(),
+            launcher_state.as_ref(),
+        ) {
+            runtime.begin_shutdown();
+            let outcome = runtime.shutdown();
+            return match shutdown_outcome_error(&outcome) {
+                Some(shutdown_error) => Err(ServerError::new(
+                    ErrorCode::Unavailable,
+                    format!("{ready_error}; {shutdown_error}"),
+                )),
+                None => Err(ready_error),
+            };
+        }
+    }
     let shutdown_signal = match wait_for_shutdown(&runtime) {
         Ok(signal) => signal,
         Err(wait_error) => {
@@ -173,6 +201,8 @@ fn signal_name(signal: i32) -> &'static str {
 pub struct LegacyServerRuntimeConfig {
     master: MasterDaemonConfig,
     startup_timeout: Duration,
+    ready_file: Option<PathBuf>,
+    launch_nonce: Option<String>,
 }
 
 impl LegacyServerRuntimeConfig {
@@ -182,6 +212,8 @@ impl LegacyServerRuntimeConfig {
         Self {
             master,
             startup_timeout: DEFAULT_SERVER_STARTUP_TIMEOUT,
+            ready_file: None,
+            launch_nonce: None,
         }
     }
 
@@ -189,6 +221,18 @@ impl LegacyServerRuntimeConfig {
     #[must_use]
     pub fn with_startup_timeout(mut self, startup_timeout: Duration) -> Self {
         self.startup_timeout = startup_timeout;
+        self
+    }
+
+    /// Promotes an existing typed `starting` record after every server component is ready.
+    #[must_use]
+    pub fn with_ready_file(
+        mut self,
+        ready_file: impl AsRef<Path>,
+        launch_nonce: impl Into<String>,
+    ) -> Self {
+        self.ready_file = Some(ready_file.as_ref().to_path_buf());
+        self.launch_nonce = Some(launch_nonce.into());
         self
     }
 
@@ -203,6 +247,262 @@ impl LegacyServerRuntimeConfig {
     pub const fn startup_timeout(&self) -> Duration {
         self.startup_timeout
     }
+}
+
+#[derive(Serialize)]
+struct ServerReadyGateway<'a> {
+    enabled: bool,
+    endpoint: Option<&'a str>,
+    protocol_version: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerLauncherProcessIdentity {
+    boot_id: String,
+    start_ticks: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerLauncherWebUi {
+    managed: bool,
+    status: String,
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerLauncherState {
+    process_identity: ServerLauncherProcessIdentity,
+    started_at: String,
+    requested_control_endpoint: String,
+    config_path: Option<String>,
+    webui: ServerLauncherWebUi,
+    bootstrap_log: String,
+    state_file: String,
+    lock_file: String,
+    outcome_file: String,
+    run_dir: String,
+    log_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerStartingRecord {
+    schema_version: u8,
+    status: String,
+    launch_nonce: String,
+    pid: u32,
+    launcher: ServerLauncherState,
+}
+
+#[derive(Serialize)]
+struct ServerReadyRecord<'a> {
+    schema_version: u8,
+    status: &'static str,
+    launch_nonce: &'a str,
+    pid: u32,
+    version: String,
+    ready_at_unix_ns: u128,
+    control_endpoint: String,
+    gateway: ServerReadyGateway<'a>,
+    mode: LegacyServerMode,
+    health: LegacyServerRuntimeHealth,
+    log_file: Option<String>,
+    launcher: Option<&'a ServerLauncherState>,
+}
+
+fn validate_ready_configuration(
+    config: &LegacyServerRuntimeConfig,
+) -> Result<Option<ServerLauncherState>, ServerError> {
+    match (&config.ready_file, &config.launch_nonce) {
+        (None, None) => Ok(None),
+        (Some(ready_file), Some(nonce)) if !nonce.trim().is_empty() => {
+            load_launcher_state(ready_file, nonce).map(Some)
+        }
+        (Some(_), Some(_)) => Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server ready file requires a non-empty launch nonce",
+        )),
+        _ => Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server ready file and launch nonce must be set together",
+        )),
+    }
+}
+
+fn load_launcher_state(
+    ready_file: &Path,
+    launch_nonce: &str,
+) -> Result<ServerLauncherState, ServerError> {
+    const MAX_STARTING_RECORD_BYTES: u64 = 64 * 1024;
+    let metadata = fs::metadata(ready_file)
+        .map_err(|error| ready_io_error("read starting metadata", ready_file, error))?;
+    if metadata.len() > MAX_STARTING_RECORD_BYTES {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server starting record exceeds the size limit",
+        ));
+    }
+    let payload = fs::read(ready_file)
+        .map_err(|error| ready_io_error("read starting record", ready_file, error))?;
+    let record: ServerStartingRecord = serde_json::from_slice(&payload).map_err(|_| {
+        ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server starting record does not match the typed schema",
+        )
+    })?;
+    if record.schema_version != 1
+        || record.status != "starting"
+        || record.launch_nonce != launch_nonce
+        || record.pid != std::process::id()
+        || !valid_launcher_state(&record.launcher, ready_file)
+    {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server starting record does not match this process generation",
+        ));
+    }
+    Ok(record.launcher)
+}
+
+fn valid_launcher_state(state: &ServerLauncherState, ready_file: &Path) -> bool {
+    let Some(run_dir) = ready_file.parent() else {
+        return false;
+    };
+    let log_dir = Path::new(&state.log_dir);
+    let webui_url = state.webui.url.as_str();
+    !state.process_identity.boot_id.is_empty()
+        && !state.process_identity.start_ticks.is_empty()
+        && state
+            .process_identity
+            .start_ticks
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+        && state.started_at.contains('T')
+        && state.started_at.ends_with("+00:00")
+        && resolve_control_endpoint(&state.requested_control_endpoint).is_ok()
+        && state
+            .config_path
+            .as_ref()
+            .is_none_or(|path| !path.is_empty() && Path::new(path).is_absolute())
+        && !state.webui.managed
+        && state.webui.status == "unknown"
+        && (webui_url.starts_with("http://") || webui_url.starts_with("https://"))
+        && !webui_url.contains(['@', '?', '#'])
+        && Path::new(&state.state_file) == ready_file
+        && Path::new(&state.run_dir) == run_dir
+        && Path::new(&state.lock_file).parent() == Some(run_dir)
+        && Path::new(&state.outcome_file).parent() == Some(run_dir)
+        && log_dir.is_absolute()
+        && Path::new(&state.bootstrap_log).parent() == Some(log_dir)
+}
+
+fn publish_ready_record(
+    runtime: &LegacyServerRuntime,
+    ready_file: &Path,
+    launch_nonce: Option<&str>,
+    launcher_state: Option<&ServerLauncherState>,
+) -> Result<(), ServerError> {
+    let launch_nonce = launch_nonce
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "server ready file requires a non-empty launch nonce",
+            )
+        })?;
+    if launcher_state.is_some_and(|state| {
+        resolve_control_endpoint(&state.requested_control_endpoint)
+            .map(|endpoint| endpoint != *runtime.control_endpoint())
+            .unwrap_or(true)
+    }) {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server launcher endpoint does not match the running server",
+        ));
+    }
+    let parent = ready_file.parent().ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "server ready file has no parent path=[{}]",
+                ready_file.display()
+            ),
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| ready_io_error("create parent", ready_file, error))?;
+
+    let ready_at_unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                format!("read system time for server ready record: {error}"),
+            )
+        })?
+        .as_nanos();
+    let log_file = current_log_snapshot()
+        .and_then(|snapshot| snapshot.file_path)
+        .map(|path| path.display().to_string());
+    let record = ServerReadyRecord {
+        schema_version: 1,
+        status: "ready",
+        launch_nonce,
+        pid: std::process::id(),
+        version: python_dev_version(),
+        ready_at_unix_ns,
+        control_endpoint: runtime.control_endpoint().display_string(),
+        gateway: ServerReadyGateway {
+            enabled: runtime.gateway_endpoint().is_some(),
+            endpoint: runtime.gateway_endpoint(),
+            protocol_version: runtime.runtime_config().gateway.protocol_version,
+        },
+        mode: runtime.mode(),
+        health: runtime.health(),
+        log_file,
+        launcher: launcher_state,
+    };
+    let payload = serde_json::to_vec_pretty(&record).map_err(|error| {
+        ServerError::new(
+            ErrorCode::Internal,
+            format!("serialize server ready record: {error}"),
+        )
+    })?;
+
+    let temporary = ready_file.with_extension(format!("{}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let write_result = (|| {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| ready_io_error("create temporary file", &temporary, error))?;
+        file.write_all(&payload)
+            .map_err(|error| ready_io_error("write temporary file", &temporary, error))?;
+        file.sync_all()
+            .map_err(|error| ready_io_error("sync temporary file", &temporary, error))?;
+        fs::rename(&temporary, ready_file)
+            .map_err(|error| ready_io_error("publish", ready_file, error))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn ready_io_error(stage: &str, path: &Path, error: std::io::Error) -> ServerError {
+    ServerError::new(
+        ErrorCode::Unavailable,
+        format!(
+            "{stage} server ready record path=[{}] error=[{error}]",
+            path.display()
+        ),
+    )
 }
 
 /// Active compatibility mode selected from the existing gateway configuration.
@@ -991,6 +1291,9 @@ mod tests {
     use std::fs;
     use std::net::TcpListener;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn runtime_test_log_dir() -> std::path::PathBuf {
@@ -998,6 +1301,50 @@ mod tests {
             "zippy-server-runtime-unit-test-logs-{}",
             std::process::id()
         ))
+    }
+
+    fn test_starting_record(
+        ready_file: &Path,
+        control_endpoint: &ControlEndpoint,
+        launch_nonce: &str,
+    ) -> ServerStartingRecord {
+        let run_dir = ready_file.parent().unwrap();
+        let log_dir = run_dir.join("logs");
+        ServerStartingRecord {
+            schema_version: 1,
+            status: "starting".to_string(),
+            launch_nonce: launch_nonce.to_string(),
+            pid: std::process::id(),
+            launcher: ServerLauncherState {
+                process_identity: ServerLauncherProcessIdentity {
+                    boot_id: "boot-1".to_string(),
+                    start_ticks: "123".to_string(),
+                },
+                started_at: "2026-07-13T00:00:00+00:00".to_string(),
+                requested_control_endpoint: control_endpoint.display_string(),
+                config_path: None,
+                webui: ServerLauncherWebUi {
+                    managed: false,
+                    status: "unknown".to_string(),
+                    url: "http://127.0.0.1:17688/".to_string(),
+                },
+                bootstrap_log: log_dir.join("server.log").display().to_string(),
+                state_file: ready_file.display().to_string(),
+                lock_file: run_dir.join("server.lock").display().to_string(),
+                outcome_file: run_dir.join("server.outcome.json").display().to_string(),
+                run_dir: run_dir.display().to_string(),
+                log_dir: log_dir.display().to_string(),
+            },
+        }
+    }
+
+    fn write_test_starting_record(
+        ready_file: &Path,
+        control_endpoint: &ControlEndpoint,
+        launch_nonce: &str,
+    ) {
+        let record = test_starting_record(ready_file, control_endpoint, launch_nonce);
+        fs::write(ready_file, serde_json::to_vec(&record).unwrap()).unwrap();
     }
 
     #[test]
@@ -1057,6 +1404,102 @@ shutdown_timeout_ms = 1000
 
         assert!(!socket_path.exists());
         assert!(!socket_path.with_extension("sock.owner").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_publishes_owner_only_ready_record_after_full_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("ready-daemon.sock");
+        let ready_path = temp.path().join("server-ready.json");
+        let config_path = temp.path().join("zippy.toml");
+        fs::write(
+            &config_path,
+            r#"
+[master]
+shutdown_timeout_ms = 1000
+token = "must-not-appear-in-ready-record"
+"#,
+        )
+        .unwrap();
+        let control_endpoint = ControlEndpoint::Unix(socket_path);
+        write_test_starting_record(&ready_path, &control_endpoint, "launch-nonce-1");
+        let master = MasterDaemonConfig::new(control_endpoint)
+            .with_config_path(config_path)
+            .with_logging(runtime_test_log_dir(), "info", false);
+        let config =
+            LegacyServerRuntimeConfig::new(master).with_ready_file(&ready_path, "launch-nonce-1");
+
+        run_server_daemon_with_waiter(config, |runtime| {
+            assert!(runtime.health().readiness.is_ready());
+            let payload = fs::read_to_string(&ready_path).unwrap();
+            let record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(record["schema_version"], 1);
+            assert_eq!(record["status"], "ready");
+            assert_eq!(record["launch_nonce"], "launch-nonce-1");
+            assert_eq!(record["pid"], std::process::id());
+            assert_eq!(record["version"], python_dev_version());
+            assert_eq!(record["mode"], "catalog_only");
+            assert_eq!(
+                record["launcher"]["state_file"],
+                ready_path.display().to_string()
+            );
+            assert_eq!(record["launcher"]["webui"]["managed"], false);
+            assert_eq!(record["health"]["readiness"]["admission_open"], true);
+            assert!(!payload.contains("must-not-appear-in-ready-record"));
+            assert_eq!(
+                fs::metadata(&ready_path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+            Ok("TEST")
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_rejects_empty_ready_nonce_before_binding_listener() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("invalid-ready-daemon.sock");
+        let ready_path = temp.path().join("server-ready.json");
+        let master = MasterDaemonConfig::new(ControlEndpoint::Unix(socket_path.clone()))
+            .with_logging(runtime_test_log_dir(), "info", false);
+        let config = LegacyServerRuntimeConfig::new(master).with_ready_file(&ready_path, "");
+
+        let error = run_server_daemon_with_waiter(config, |_| Ok("TEST")).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(!socket_path.exists());
+        assert!(!ready_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_rejects_unknown_launcher_state_fields_before_binding_listener() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("invalid-launcher-daemon.sock");
+        let ready_path = temp.path().join("server-ready.json");
+        let control_endpoint = ControlEndpoint::Unix(socket_path.clone());
+        let master = MasterDaemonConfig::new(control_endpoint.clone()).with_logging(
+            runtime_test_log_dir(),
+            "info",
+            false,
+        );
+        let record = test_starting_record(&ready_path, &control_endpoint, "launch-nonce-2");
+        let mut record = serde_json::to_value(record).unwrap();
+        record["launcher"].as_object_mut().unwrap().insert(
+            "token".to_string(),
+            serde_json::Value::String("must-not-persist".to_string()),
+        );
+        fs::write(&ready_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let config =
+            LegacyServerRuntimeConfig::new(master).with_ready_file(&ready_path, "launch-nonce-2");
+
+        let error = run_server_daemon_with_waiter(config, |_| Ok("TEST")).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(!socket_path.exists());
+        assert!(ready_path.exists());
     }
 
     #[test]
