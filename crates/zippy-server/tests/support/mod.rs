@@ -186,6 +186,29 @@ pub(crate) fn wait_until_bindable(addr: SocketAddr) {
     }
 }
 
+/// Waits until Gateway has completed its boot-scoped process registration.
+pub(crate) fn wait_for_gateway_process(master: &MasterServer) -> String {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let registry = master.registry();
+        let registry = registry.lock().unwrap();
+        let process_id = registry.alive_process_ids().into_iter().find(|process_id| {
+            registry
+                .get_process(process_id)
+                .is_some_and(|process| process.app == "zippy_gateway")
+        });
+        if let Some(process_id) = process_id {
+            return process_id;
+        }
+        drop(registry);
+        assert!(
+            Instant::now() < deadline,
+            "gateway did not register a master process before timeout"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Executes the legacy gateway metrics frame as an end-to-end listener probe.
 pub(crate) fn gateway_metrics(addr: SocketAddr) -> Value {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))

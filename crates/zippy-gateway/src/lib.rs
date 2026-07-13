@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, ErrorKind};
-use std::net::{TcpListener as StdTcpListener, TcpStream};
+use std::net::TcpListener as StdTcpListener;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -33,20 +33,24 @@ use parquet::arrow::{
 use parquet::file::statistics::Statistics;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zippy_core::bus_protocol::{
-    AcquireSegmentReaderLeaseRequest, ReleaseSegmentReaderLeaseRequest, WatchRequest, WatchResource,
+    AcquireSegmentReaderLeaseRequest, GetConfigRequest, ReleaseSegmentReaderLeaseRequest,
+    WatchRequest, WatchResource,
 };
 use zippy_core::{
-    canonical_schema_hash, control_response_result, schema_metadata, send_control_line_request,
-    send_control_line_request_cancellable_with_deadline, send_control_line_request_with_timeout,
-    ControlEndpoint, ControlRequest, ControlResponse, Engine, GetStreamRequest, HeartbeatRequest,
-    ListStreamsRequest, PublishSegmentDescriptorRequest, RegisterProcessRequest,
-    RegisterSourceRequest, RegisterStreamRequest, Result, SegmentTableView, StreamInfo,
-    UnregisterProcessRequest, UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM,
-    DEFAULT_MAX_QUERY_BUFFER_BYTES, DEFAULT_QUERY_MAX_BUFFERED_BYTES,
-    MAX_CONTROL_RESPONSE_LINE_BYTES, MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
+    canonical_schema_hash, schema_metadata, send_control_line_request_cancellable_with_deadline,
+    send_control_line_request_with_timeout, ControlEndpoint, ControlRequest, ControlResponse,
+    Engine, GetStreamRequest, HeartbeatRequest, ListStreamsRequest,
+    PublishSegmentDescriptorRequest, RegisterProcessRequest, RegisterSourceRequest,
+    RegisterStreamRequest, Result, SegmentTableView, StreamInfo, UnregisterProcessRequest,
+    UnregisterSourceRequest, ZippyError, DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES,
+    DEFAULT_QUERY_MAX_BUFFERED_BYTES, MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
 };
+#[cfg(test)]
+use zippy_core::{control_response_result, MAX_CONTROL_RESPONSE_LINE_BYTES};
 use zippy_engines::{
     StreamTableDescriptorPublisher, StreamTableMaterializer, DEFAULT_STREAM_TABLE_ROW_CAPACITY,
 };
@@ -67,6 +71,7 @@ const DEFAULT_MAX_GATEWAY_BLOCKING_REQUESTS: usize = 64;
 const DEFAULT_GATEWAY_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_GATEWAY_PAYLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_GATEWAY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const GATEWAY_SHUTDOWN_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_GATEWAY_SUBSCRIBE_ACTIVE_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_GATEWAY_STREAMING_PENDING_FILE_RESULTS: usize = 8;
@@ -87,11 +92,65 @@ pub struct GatewayServerConfig {
     pub write_timeout_ms: Option<u64>,
 }
 
+/// Structured result of one bounded Gateway shutdown attempt.
+///
+/// A deadline-expired result means admission and registration were closed, but blocking work such
+/// as a materializer `on_stop` call may still be finishing in a detached cleanup thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayShutdownOutcome {
+    /// Whether the Tokio runtime thread acknowledged shutdown and was joined.
+    pub runtime_joined: bool,
+    /// Whether the writer cleanup worker returned before its deadline.
+    pub writer_cleanup_completed: bool,
+    /// Number of writers observed by a completed cleanup worker.
+    pub writers_total: usize,
+    /// Number of writers whose materializer and source cleanup both succeeded.
+    pub writers_closed: usize,
+    /// Per-writer cleanup failures collected before the cleanup deadline.
+    pub writer_failures: Vec<String>,
+    /// Whether the Gateway process lease was absent or explicitly released.
+    pub process_unregistered: bool,
+    /// Whether any shutdown stage exhausted the shared absolute deadline.
+    pub deadline_exceeded: bool,
+    /// Runtime thread failure, if the runtime exited abnormally.
+    pub runtime_error: Option<String>,
+    /// Process-unregister failure, if cleanup completed before the deadline with an error.
+    pub process_error: Option<String>,
+}
+
+impl GatewayShutdownOutcome {
+    /// Return whether every observable Gateway cleanup stage completed successfully.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.runtime_joined
+            && self.writer_cleanup_completed
+            && self.writer_failures.is_empty()
+            && self.writers_closed == self.writers_total
+            && self.process_unregistered
+            && !self.deadline_exceeded
+            && self.runtime_error.is_none()
+            && self.process_error.is_none()
+    }
+
+    fn into_result(self) -> Result<()> {
+        if self.is_clean() {
+            return Ok(());
+        }
+        let reason = format!("gateway shutdown incomplete outcome=[{self:?}]");
+        if self.deadline_exceeded {
+            Err(ZippyError::DeadlineExceeded { reason })
+        } else {
+            Err(ZippyError::Io { reason })
+        }
+    }
+}
+
 /// Native TCP gateway for cross-platform remote writes and queries.
 pub struct GatewayServer {
     endpoint: String,
     state: Arc<GatewayState>,
     runtime: Option<GatewayRuntime>,
+    shutdown_attempted: bool,
 }
 
 struct GatewayState {
@@ -120,8 +179,41 @@ struct GatewayState {
 }
 
 struct GatewayRuntime {
-    shutdown: tokio::sync::watch::Sender<bool>,
+    shutdown: tokio::sync::watch::Sender<Option<Instant>>,
+    exited: mpsc::Receiver<()>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct GatewayWriterShutdownReport {
+    writers_total: usize,
+    writers_closed: usize,
+    failures: Vec<String>,
+    deadline_exceeded: bool,
+}
+
+enum GatewayThreadJoinOutcome {
+    Joined,
+    Panicked,
+    DeadlineExceeded,
+}
+
+fn join_gateway_thread_until(
     join_handle: JoinHandle<()>,
+    deadline: Instant,
+) -> GatewayThreadJoinOutcome {
+    while !join_handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return GatewayThreadJoinOutcome::DeadlineExceeded;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
+    if join_handle.join().is_ok() {
+        GatewayThreadJoinOutcome::Joined
+    } else {
+        GatewayThreadJoinOutcome::Panicked
+    }
 }
 
 struct GatewayTableWriter {
@@ -596,7 +688,9 @@ impl Drop for GatewayPersistedScanPool {
             }
         }
         for worker in self.workers.lock().unwrap().drain(..) {
-            let _ = worker.join();
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -1366,7 +1460,7 @@ fn expire_gateway_snapshots(
     before.saturating_sub(snapshots.len())
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GatewayMasterProcess {
     process_id: String,
     process_token: String,
@@ -1376,7 +1470,8 @@ struct GatewayAsyncMasterClient {
     endpoint: ControlEndpoint,
     request_timeout: Duration,
     process: Mutex<Option<GatewayMasterProcess>>,
-    async_register_lock: tokio::sync::Mutex<()>,
+    registrations_open: AtomicBool,
+    shutdown_deadline: Mutex<Option<Instant>>,
     metrics: Arc<Mutex<GatewayMetrics>>,
 }
 
@@ -1664,6 +1759,7 @@ impl GatewayServer {
                 write_timeout,
             }),
             runtime: None,
+            shutdown_attempted: false,
         })
     }
 
@@ -1708,16 +1804,24 @@ impl GatewayServer {
                 ),
             })?
         };
-        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(None);
+        let (exited_tx, exited) = mpsc::sync_channel(1);
         let state = Arc::clone(&self.state);
         let join_handle = thread::spawn(move || {
-            runtime.block_on(async move {
-                async_serve_loop(listener, state, shutdown_rx).await;
-            });
+            let shutdown_deadline = runtime
+                .block_on(async move { async_serve_loop(listener, state, shutdown_rx).await });
+            match shutdown_deadline {
+                Some(deadline) => {
+                    runtime.shutdown_timeout(deadline.saturating_duration_since(Instant::now()))
+                }
+                None => runtime.shutdown_background(),
+            }
+            let _ = exited_tx.send(());
         });
         self.runtime = Some(GatewayRuntime {
             shutdown,
-            join_handle,
+            exited,
+            join_handle: Some(join_handle),
         });
         Ok(self)
     }
@@ -1727,9 +1831,31 @@ impl GatewayServer {
         &self.endpoint
     }
 
+    /// Return whether the background listener is still accepting work.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.state.stopped.load(Ordering::Acquire)
+            && self.runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .join_handle
+                    .as_ref()
+                    .is_some_and(|join_handle| !join_handle.is_finished())
+            })
+    }
+
     /// Return a cloneable facade for legacy blocking collect adapters.
     pub fn legacy_collect_facade(&self) -> LegacyCollectFacade {
         LegacyCollectFacade::new(Arc::clone(&self.state))
+    }
+
+    /// Verify the configured Master dependency with one bounded control request.
+    pub fn probe_master_dependency(&self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(ZippyError::InvalidConfig {
+                reason: "gateway master dependency probe timeout must be positive".to_string(),
+            });
+        }
+        self.state.master.probe_dependency_blocking(timeout)
     }
 
     /// Return GatewayServer metrics as JSON.
@@ -1738,11 +1864,7 @@ impl GatewayServer {
         let mut value = gateway_metrics_json(&metrics);
         let fields = value.as_object_mut().unwrap();
         insert_json_metric(fields, "endpoint", self.endpoint.clone());
-        insert_json_metric(
-            fields,
-            "running",
-            !self.state.stopped.load(Ordering::SeqCst),
-        );
+        insert_json_metric(fields, "running", self.is_running());
         insert_json_metric(fields, "max_connections", self.state.max_connections);
         insert_json_metric(
             fields,
@@ -1783,43 +1905,283 @@ impl GatewayServer {
 
     /// Stop the background gateway listener and flush table writers.
     pub fn stop(mut self) {
-        if let Err(error) = self.shutdown() {
-            tracing::warn!(
-                event = "gateway_shutdown_incomplete",
-                error = %error,
-                "gateway stopped with incomplete master cleanup"
-            );
+        match self.shutdown_with_timeout(DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT) {
+            Ok(outcome) if outcome.is_clean() => {}
+            Ok(outcome) => {
+                tracing::warn!(
+                    event = "gateway_shutdown_incomplete",
+                    outcome = ?outcome,
+                    "gateway stopped with incomplete cleanup"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "gateway_shutdown_incomplete",
+                    error = %error,
+                    "gateway stopped with invalid shutdown budget"
+                );
+            }
         }
     }
 
     /// Stop the Gateway and report whether its Master process lease was released.
     pub fn stop_gracefully(mut self) -> Result<()> {
-        self.shutdown()
+        self.shutdown_with_timeout(DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT)?
+            .into_result()
     }
 
-    fn shutdown(&mut self) -> Result<()> {
+    /// Stop the Gateway under one monotonic timeout budget and return a structured outcome.
+    ///
+    /// The method bounds how long the caller waits. Started blocking tasks and materializer
+    /// `on_stop` calls cannot be force-cancelled and are reported as incomplete when they outlive
+    /// the deadline.
+    pub fn stop_gracefully_with_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<GatewayShutdownOutcome> {
+        self.shutdown_with_timeout(timeout)
+    }
+
+    fn shutdown_with_timeout(&mut self, timeout: Duration) -> Result<GatewayShutdownOutcome> {
+        let now = Instant::now();
+        let Some(deadline) = now.checked_add(timeout) else {
+            let _ = self.shutdown_until(now);
+            return Err(ZippyError::InvalidConfig {
+                reason: "gateway shutdown timeout exceeds monotonic clock range".to_string(),
+            });
+        };
+        Ok(self.shutdown_until(deadline))
+    }
+
+    fn shutdown_until(&mut self, deadline: Instant) -> GatewayShutdownOutcome {
+        debug_assert!(!self.shutdown_attempted);
+        self.shutdown_attempted = true;
         self.state.stopped.store(true, Ordering::SeqCst);
+        self.state.connection_limit.close();
+        self.state.blocking_limit.close();
+        self.state.subscriber_limit.close();
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let process_reserve = GATEWAY_SHUTDOWN_UNREGISTER_TIMEOUT
+            .min(remaining / 2)
+            .min(remaining);
+        let cleanup_deadline = deadline.checked_sub(process_reserve).unwrap_or(deadline);
+        self.state.master.begin_shutdown(cleanup_deadline);
         if let Some(runtime) = self.runtime.as_ref() {
-            let _ = runtime.shutdown.send(true);
+            let _ = runtime.shutdown.send(Some(cleanup_deadline));
         }
-        let _ = TcpStream::connect(&self.endpoint);
-        if let Some(runtime) = self.runtime.take() {
-            let _ = runtime.join_handle.join();
+
+        let (writer_tx, writer_rx) = mpsc::sync_channel(1);
+        let writer_state = Arc::clone(&self.state);
+        let writer_handle = thread::Builder::new()
+            .name("zippy-gateway-shutdown-writers".to_string())
+            .spawn(move || {
+                let report = writer_state.close_all_writers_until(cleanup_deadline);
+                let _ = writer_tx.send(report);
+            });
+
+        let mut outcome = GatewayShutdownOutcome::default();
+        self.wait_for_runtime_until(cleanup_deadline, &mut outcome);
+        match writer_handle {
+            Ok(writer_handle) => {
+                let writer_wait = cleanup_deadline.saturating_duration_since(Instant::now());
+                match writer_rx.recv_timeout(writer_wait) {
+                    Ok(report) => {
+                        outcome.writer_cleanup_completed = true;
+                        outcome.writers_total = report.writers_total;
+                        outcome.writers_closed = report.writers_closed;
+                        outcome.writer_failures = report.failures;
+                        outcome.deadline_exceeded |= report.deadline_exceeded;
+                        match join_gateway_thread_until(writer_handle, cleanup_deadline) {
+                            GatewayThreadJoinOutcome::Joined => {}
+                            GatewayThreadJoinOutcome::Panicked => {
+                                outcome.writer_cleanup_completed = false;
+                                outcome
+                                    .writer_failures
+                                    .push("gateway writer cleanup thread panicked".to_string());
+                            }
+                            GatewayThreadJoinOutcome::DeadlineExceeded => {
+                                outcome.writer_cleanup_completed = false;
+                                outcome.deadline_exceeded = true;
+                                outcome.writer_failures.push(
+                                    "gateway writer cleanup thread did not exit before deadline"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        outcome.deadline_exceeded = true;
+                        outcome.writer_failures.push(
+                            concat!(
+                                "gateway writer cleanup exceeded the shutdown deadline; ",
+                                "materializer on_stop may still be running"
+                            )
+                            .to_string(),
+                        );
+                        drop(writer_handle);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        outcome.writer_failures.push(
+                            "gateway writer cleanup thread exited without a report".to_string(),
+                        );
+                        if writer_handle.is_finished() && writer_handle.join().is_err() {
+                            outcome
+                                .writer_failures
+                                .push("gateway writer cleanup thread panicked".to_string());
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                outcome.writer_failures.push(format!(
+                    "failed to start gateway writer cleanup thread error=[{error}]"
+                ));
+            }
         }
-        self.state.close_all_writers();
-        self.state.snapshots.lock().unwrap().clear();
-        self.state.master.unregister_process_blocking()
+
+        if let Ok(mut snapshots) = self.state.snapshots.try_lock() {
+            snapshots.clear();
+        }
+        self.unregister_process_until(deadline, &mut outcome);
+        outcome
+    }
+
+    fn wait_for_runtime_until(&mut self, deadline: Instant, outcome: &mut GatewayShutdownOutcome) {
+        let Some(mut runtime) = self.runtime.take() else {
+            outcome.runtime_joined = true;
+            return;
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match runtime.exited.recv_timeout(wait) {
+            Ok(()) => {
+                let Some(join_handle) = runtime.join_handle.take() else {
+                    outcome.runtime_error = Some("gateway runtime join handle missing".to_string());
+                    return;
+                };
+                match join_gateway_thread_until(join_handle, deadline) {
+                    GatewayThreadJoinOutcome::Joined => outcome.runtime_joined = true,
+                    GatewayThreadJoinOutcome::Panicked => {
+                        outcome.runtime_error = Some("gateway runtime thread panicked".to_string());
+                    }
+                    GatewayThreadJoinOutcome::DeadlineExceeded => {
+                        outcome.deadline_exceeded = true;
+                        outcome.runtime_error =
+                            Some("gateway runtime did not exit before deadline".to_string());
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                outcome.deadline_exceeded = true;
+                outcome.runtime_error = Some(
+                    concat!(
+                        "gateway runtime exceeded the shutdown deadline; ",
+                        "started blocking tasks may still be running"
+                    )
+                    .to_string(),
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let runtime_error = match runtime.join_handle.take() {
+                    Some(join_handle) if join_handle.is_finished() => {
+                        if join_handle.join().is_err() {
+                            "gateway runtime thread panicked"
+                        } else {
+                            "gateway runtime exited without completion acknowledgement"
+                        }
+                    }
+                    Some(join_handle) => {
+                        drop(join_handle);
+                        "gateway runtime completion channel closed before the thread exited"
+                    }
+                    None => "gateway runtime join handle missing",
+                };
+                outcome.runtime_error = Some(runtime_error.to_string());
+            }
+        }
+    }
+
+    fn unregister_process_until(&self, deadline: Instant, outcome: &mut GatewayShutdownOutcome) {
+        let (process_tx, process_rx) = mpsc::sync_channel(1);
+        let master = Arc::clone(&self.state.master);
+        let process_handle = thread::Builder::new()
+            .name("zippy-gateway-shutdown-process".to_string())
+            .spawn(move || {
+                let result = master.unregister_process_until(deadline);
+                let _ = process_tx.send(result);
+            });
+        let Ok(process_handle) = process_handle else {
+            outcome.process_error = Some("failed to start process cleanup thread".to_string());
+            return;
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match process_rx.recv_timeout(wait) {
+            Ok(Ok(())) => match join_gateway_thread_until(process_handle, deadline) {
+                GatewayThreadJoinOutcome::Joined => outcome.process_unregistered = true,
+                GatewayThreadJoinOutcome::Panicked => {
+                    outcome.process_error = Some("process cleanup thread panicked".to_string());
+                }
+                GatewayThreadJoinOutcome::DeadlineExceeded => {
+                    outcome.deadline_exceeded = true;
+                    outcome.process_error =
+                        Some("process cleanup thread did not exit before deadline".to_string());
+                }
+            },
+            Ok(Err(error)) => {
+                if matches!(error, ZippyError::DeadlineExceeded { .. }) {
+                    outcome.deadline_exceeded = true;
+                }
+                outcome.process_error = Some(error.to_string());
+                if matches!(
+                    join_gateway_thread_until(process_handle, deadline),
+                    GatewayThreadJoinOutcome::DeadlineExceeded
+                ) {
+                    outcome.deadline_exceeded = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                outcome.deadline_exceeded = true;
+                outcome.process_error =
+                    Some("gateway process unregister exceeded the shutdown deadline".to_string());
+                drop(process_handle);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                outcome.process_error = Some(if process_handle.is_finished() {
+                    if process_handle.join().is_err() {
+                        "process cleanup thread panicked".to_string()
+                    } else {
+                        "process cleanup thread exited without a report".to_string()
+                    }
+                } else {
+                    drop(process_handle);
+                    "process cleanup channel closed before the thread exited".to_string()
+                });
+            }
+        }
     }
 }
 
 impl Drop for GatewayServer {
     fn drop(&mut self) {
-        if let Err(error) = self.shutdown() {
-            tracing::warn!(
-                event = "gateway_shutdown_incomplete",
-                error = %error,
-                "gateway dropped with incomplete master cleanup"
-            );
+        if self.shutdown_attempted {
+            return;
+        }
+        match self.shutdown_with_timeout(DEFAULT_GATEWAY_SHUTDOWN_TIMEOUT) {
+            Ok(outcome) if outcome.is_clean() => {}
+            Ok(outcome) => {
+                tracing::warn!(
+                    event = "gateway_shutdown_incomplete",
+                    outcome = ?outcome,
+                    "gateway dropped with incomplete cleanup"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "gateway_shutdown_incomplete",
+                    error = %error,
+                    "gateway dropped with invalid shutdown budget"
+                );
+            }
         }
     }
 }
@@ -1951,19 +2313,33 @@ impl GatewayAsyncMasterClient {
             endpoint,
             request_timeout,
             process: Mutex::new(None),
-            async_register_lock: tokio::sync::Mutex::new(()),
+            registrations_open: AtomicBool::new(true),
+            shutdown_deadline: Mutex::new(None),
             metrics,
         }
     }
 
-    async fn heartbeat(&self) -> Result<()> {
-        self.with_process_async(|process| {
+    fn begin_shutdown(&self, deadline: Instant) {
+        self.registrations_open.store(false, Ordering::Release);
+        *self.shutdown_deadline.lock().unwrap() = Some(deadline);
+    }
+
+    async fn heartbeat(self: &Arc<Self>) -> Result<()> {
+        let client = Arc::clone(self);
+        tokio::task::spawn_blocking(move || client.heartbeat_blocking())
+            .await
+            .map_err(|_error| ZippyError::InvalidState {
+                status: "gateway heartbeat task failed",
+            })?
+    }
+
+    fn heartbeat_blocking(&self) -> Result<()> {
+        self.with_process_blocking(|process| {
             ControlRequest::Heartbeat(HeartbeatRequest {
                 process_id: process.process_id,
                 process_token: Some(process.process_token),
             })
         })
-        .await
         .and_then(|response| match response {
             ControlResponse::HeartbeatAccepted { .. } => Ok(()),
             ControlResponse::ShutdownRequested { process_id, reason } => {
@@ -2031,6 +2407,30 @@ impl GatewayAsyncMasterClient {
                 process_token: Some(process.process_token),
             })
         })
+        .and_then(|response| match response {
+            ControlResponse::SourceUnregistered { .. } => Ok(()),
+            other => Err(unexpected_response("SourceUnregistered", other)),
+        })
+    }
+
+    fn unregister_source_existing_until(&self, source_name: &str, deadline: Instant) -> Result<()> {
+        let process = self
+            .process
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(ZippyError::InvalidState {
+                status: "gateway master process is unavailable during source cleanup",
+            })?;
+        self.send_request_blocking_until(
+            ControlRequest::UnregisterSource(UnregisterSourceRequest {
+                source_name: source_name.to_string(),
+                process_id: process.process_id,
+                process_token: Some(process.process_token),
+            }),
+            deadline,
+            self.request_timeout,
+        )
         .and_then(|response| match response {
             ControlResponse::SourceUnregistered { .. } => Ok(()),
             other => Err(unexpected_response("SourceUnregistered", other)),
@@ -2179,25 +2579,6 @@ impl GatewayAsyncMasterClient {
         })
     }
 
-    async fn with_process_async(
-        &self,
-        request: impl Fn(GatewayMasterProcess) -> ControlRequest,
-    ) -> Result<ControlResponse> {
-        let mut last_error = None;
-        for _ in 0..2 {
-            let process = self.ensure_process_async().await?;
-            match self.send_request_async(request(process)).await {
-                Ok(response) => return Ok(response),
-                Err(error) if gateway_master_process_invalid(&error) => {
-                    self.clear_process();
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_error.expect("gateway async master retry must store the last error"))
-    }
-
     fn with_process_blocking(
         &self,
         request: impl Fn(GatewayMasterProcess) -> ControlRequest,
@@ -2205,10 +2586,10 @@ impl GatewayAsyncMasterClient {
         let mut last_error = None;
         for _ in 0..2 {
             let process = self.ensure_process_blocking()?;
-            match self.send_request_blocking(request(process)) {
+            match self.send_request_blocking(request(process.clone())) {
                 Ok(response) => return Ok(response),
                 Err(error) if gateway_master_process_invalid(&error) => {
-                    self.clear_process();
+                    self.clear_process_if(&process);
                     last_error = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -2217,41 +2598,15 @@ impl GatewayAsyncMasterClient {
         Err(last_error.expect("gateway blocking master retry must store the last error"))
     }
 
-    async fn ensure_process_async(&self) -> Result<GatewayMasterProcess> {
-        if let Some(process) = self.process.lock().unwrap().clone() {
-            return Ok(process);
-        }
-        let _guard = self.async_register_lock.lock().await;
-        if let Some(process) = self.process.lock().unwrap().clone() {
-            return Ok(process);
-        }
-        let response = self
-            .send_request_async(ControlRequest::RegisterProcess(RegisterProcessRequest {
-                app: "zippy_gateway".to_string(),
-            }))
-            .await?;
-        let process = match response {
-            ControlResponse::ProcessRegistered {
-                process_id,
-                process_token,
-            } => GatewayMasterProcess {
-                process_id,
-                process_token,
-            },
-            other => return Err(unexpected_response("ProcessRegistered", other)),
-        };
-        self.metrics
-            .lock()
-            .unwrap()
-            .master_process_reregistrations_total += 1;
-        *self.process.lock().unwrap() = Some(process.clone());
-        Ok(process)
-    }
-
     fn ensure_process_blocking(&self) -> Result<GatewayMasterProcess> {
         let mut guard = self.process.lock().unwrap();
         if let Some(process) = guard.clone() {
             return Ok(process);
+        }
+        if !self.registrations_open.load(Ordering::Acquire) {
+            return Err(ZippyError::InvalidState {
+                status: "gateway master registration is closed",
+            });
         }
         let response =
             self.send_request_blocking(ControlRequest::RegisterProcess(RegisterProcessRequest {
@@ -2275,38 +2630,86 @@ impl GatewayAsyncMasterClient {
         Ok(process)
     }
 
-    fn clear_process(&self) {
-        *self.process.lock().unwrap() = None;
+    fn clear_process_if(&self, expected: &GatewayMasterProcess) {
+        let mut process = self.process.lock().unwrap();
+        if process.as_ref() == Some(expected) {
+            *process = None;
+        }
     }
 
-    fn unregister_process_blocking(&self) -> Result<()> {
-        let Some(process) = self.process.lock().unwrap().take() else {
+    fn unregister_process_until(&self, deadline: Instant) -> Result<()> {
+        let Some(process) = self.process.lock().unwrap().clone() else {
             return Ok(());
         };
-        self.metrics.lock().unwrap().master_async_requests_total += 1;
-        let response = send_control_line_request_with_timeout(
-            &self.endpoint,
+        let response = match self.send_request_blocking_until(
             ControlRequest::UnregisterProcess(UnregisterProcessRequest {
-                process_id: process.process_id,
-                process_token: Some(process.process_token),
+                process_id: process.process_id.clone(),
+                process_token: Some(process.process_token.clone()),
             }),
+            deadline,
             self.request_timeout
                 .min(GATEWAY_SHUTDOWN_UNREGISTER_TIMEOUT),
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(ZippyError::NotFound { .. }) => {
+                self.clear_process_if(&process);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         match response {
-            ControlResponse::ProcessUnregistered { .. } => Ok(()),
+            ControlResponse::ProcessUnregistered { .. } => {
+                self.clear_process_if(&process);
+                Ok(())
+            }
             other => Err(unexpected_response("ProcessUnregistered", other)),
         }
     }
 
-    async fn send_request_async(&self, request: ControlRequest) -> Result<ControlResponse> {
-        self.metrics.lock().unwrap().master_async_requests_total += 1;
-        send_control_request_async(&self.endpoint, request, self.request_timeout).await
+    fn probe_dependency_blocking(&self, timeout: Duration) -> Result<()> {
+        let response = send_control_line_request_with_timeout(
+            &self.endpoint,
+            ControlRequest::GetConfig(GetConfigRequest {}),
+            timeout,
+        )?;
+        match response {
+            ControlResponse::ConfigFetched { .. } => Ok(()),
+            other => Err(unexpected_response("ConfigFetched", other)),
+        }
     }
 
     fn send_request_blocking(&self, request: ControlRequest) -> Result<ControlResponse> {
+        if let Some(deadline) = *self.shutdown_deadline.lock().unwrap() {
+            return self.send_request_blocking_until(request, deadline, self.request_timeout);
+        }
         self.metrics.lock().unwrap().master_async_requests_total += 1;
-        send_control_line_request(&self.endpoint, request)
+        send_control_line_request_with_timeout(&self.endpoint, request, self.request_timeout)
+    }
+
+    fn send_request_blocking_until(
+        &self,
+        request: ControlRequest,
+        shutdown_deadline: Instant,
+        request_timeout: Duration,
+    ) -> Result<ControlResponse> {
+        let now = Instant::now();
+        if now >= shutdown_deadline {
+            return Err(ZippyError::DeadlineExceeded {
+                reason: "gateway shutdown control deadline exceeded".to_string(),
+            });
+        }
+        let request_deadline = now
+            .checked_add(request_timeout)
+            .map(|deadline| deadline.min(shutdown_deadline))
+            .unwrap_or(shutdown_deadline);
+        let cancelled = AtomicBool::new(false);
+        self.metrics.lock().unwrap().master_async_requests_total += 1;
+        send_control_line_request_cancellable_with_deadline(
+            &self.endpoint,
+            request,
+            request_deadline,
+            &cancelled,
+        )
     }
 
     fn send_request_blocking_cancellable_with_deadline(
@@ -2331,6 +2734,7 @@ impl GatewayState {
         header: Value,
         payload: Vec<u8>,
     ) -> Result<(Value, Vec<u8>)> {
+        self.ensure_accepting()?;
         match header
             .get("kind")
             .and_then(Value::as_str)
@@ -3068,15 +3472,48 @@ impl GatewayState {
         Ok(())
     }
 
-    fn close_all_writers(&self) {
+    fn close_all_writers_until(&self, deadline: Instant) -> GatewayWriterShutdownReport {
         let writers = {
             let mut guard = self.writers.lock().unwrap();
             std::mem::take(&mut *guard)
         };
-        for writer in writers.into_values() {
+        let mut report = GatewayWriterShutdownReport {
+            writers_total: writers.len(),
+            ..GatewayWriterShutdownReport::default()
+        };
+        for (stream_name, writer) in writers {
+            if Instant::now() >= deadline {
+                report.deadline_exceeded = true;
+                report.failures.push(format!(
+                    "writer cleanup deadline exceeded stream_name=[{stream_name}]"
+                ));
+                continue;
+            }
             let mut writer = writer.lock().unwrap();
-            let _ = self.close_table_writer(&mut writer);
+            let stop_result = writer.materializer.on_stop();
+            let unregister_result = self
+                .master
+                .unregister_source_existing_until(&writer.source_name, deadline);
+            let mut failed = false;
+            if let Err(error) = stop_result {
+                failed = true;
+                report.deadline_exceeded |= matches!(&error, ZippyError::DeadlineExceeded { .. });
+                report.failures.push(format!(
+                    "writer materializer stop failed stream_name=[{stream_name}] error=[{error}]"
+                ));
+            }
+            if let Err(error) = unregister_result {
+                failed = true;
+                report.deadline_exceeded |= matches!(&error, ZippyError::DeadlineExceeded { .. });
+                report.failures.push(format!(
+                    "writer source unregister failed stream_name=[{stream_name}] error=[{error}]"
+                ));
+            }
+            if !failed {
+                report.writers_closed += 1;
+            }
         }
+        report
     }
 
     fn close_table_writer(&self, writer: &mut GatewayTableWriter) -> Result<()> {
@@ -3090,8 +3527,10 @@ impl GatewayState {
         stream_name: &str,
         schema: SchemaRef,
     ) -> Result<GatewayTableWriterHandle> {
+        self.ensure_accepting()?;
         let map_lock_started = Instant::now();
         let mut writers = self.writers.lock().unwrap();
+        self.ensure_accepting()?;
         let map_lock_wait = map_lock_started.elapsed();
         if let Some(writer) = writers.get(stream_name) {
             let writer = Arc::clone(writer);
@@ -3108,6 +3547,15 @@ impl GatewayState {
         self.record_writer_map_lock_wait(map_lock_wait);
         self.record_writer_create_elapsed(create_elapsed);
         Ok(writer)
+    }
+
+    fn ensure_accepting(&self) -> Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(ZippyError::InvalidState {
+                status: "gateway is stopping",
+            });
+        }
+        Ok(())
     }
 
     fn create_writer(&self, stream_name: &str, schema: SchemaRef) -> Result<GatewayTableWriter> {
@@ -3995,22 +4443,27 @@ impl GatewayActiveSubscribeDriver {
 async fn async_serve_loop(
     listener: tokio::net::TcpListener,
     state: Arc<GatewayState>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<Option<Instant>>,
+) -> Option<Instant> {
     let heartbeat = tokio::spawn(heartbeat_loop_async(Arc::clone(&state), shutdown.clone()));
-    loop {
-        if state.stopped.load(Ordering::SeqCst) {
-            break;
-        }
+    let mut clients = tokio::task::JoinSet::new();
+    let shutdown_deadline = loop {
         tokio::select! {
+            biased;
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
+                if changed.is_err() {
+                    break None;
                 }
+                if let Some(deadline) = *shutdown.borrow_and_update() {
+                    break Some(deadline);
+                }
+            }
+            completed = clients.join_next(), if !clients.is_empty() => {
+                let _ = completed;
             }
             accepted = listener.accept() => {
                 let Ok((mut stream, _)) = accepted else {
-                    break;
+                    break None;
                 };
                 let Ok(connection_permit) = state.connection_limit.clone().try_acquire_owned() else {
                     state.increment_metric(|metrics| metrics.connections_rejected_total += 1);
@@ -4027,7 +4480,7 @@ async fn async_serve_loop(
                 };
                 state.increment_metric(|metrics| metrics.connections_active += 1);
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
+                clients.spawn(async move {
                     let _connection_permit = connection_permit;
                     handle_client_async(stream, Arc::clone(&state)).await;
                     state.increment_metric(|metrics| {
@@ -4037,20 +4490,31 @@ async fn async_serve_loop(
                 });
             }
         }
+    };
+    state.stopped.store(true, Ordering::Release);
+    state.connection_limit.close();
+    state.blocking_limit.close();
+    state.subscriber_limit.close();
+    if shutdown_deadline.is_none() {
+        state.master.begin_shutdown(Instant::now());
     }
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+    heartbeat.abort();
     let _ = heartbeat.await;
+    shutdown_deadline
 }
 
 async fn heartbeat_loop_async(
     state: Arc<GatewayState>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: tokio::sync::watch::Receiver<Option<Instant>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
+                if changed.is_err() || shutdown.borrow().is_some() {
                     break;
                 }
             }
@@ -4621,6 +5085,7 @@ async fn timeout_io<T>(
     }
 }
 
+#[cfg(test)]
 async fn send_control_request_async(
     endpoint: &ControlEndpoint,
     request: ControlRequest,
@@ -4650,6 +5115,7 @@ async fn send_control_request_async(
     }
 }
 
+#[cfg(test)]
 async fn send_control_request_async_inner(
     endpoint: &ControlEndpoint,
     request: ControlRequest,
@@ -4679,6 +5145,7 @@ async fn send_control_request_async_inner(
     }
 }
 
+#[cfg(test)]
 fn gateway_master_deadline_error(request_timeout: Duration) -> ZippyError {
     ZippyError::DeadlineExceeded {
         reason: format!(
@@ -4688,6 +5155,7 @@ fn gateway_master_deadline_error(request_timeout: Duration) -> ZippyError {
     }
 }
 
+#[cfg(test)]
 async fn send_control_line_over_async_stream<S>(
     stream: S,
     request: ControlRequest,
@@ -4699,6 +5167,7 @@ where
         .await
 }
 
+#[cfg(test)]
 async fn send_control_line_over_async_stream_with_limit<S>(
     mut stream: S,
     request: ControlRequest,
@@ -7989,6 +8458,366 @@ mod tests {
             gateway.state.master.request_timeout,
             Duration::from_millis(37)
         );
+    }
+
+    #[test]
+    fn blocking_first_registration_is_single_flight_across_callers() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let (request_received_tx, request_received_rx) = mpsc::sync_channel(1);
+        let master = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(request_line.trim_end()).unwrap(),
+                ControlRequest::RegisterProcess(_)
+            ));
+            request_received_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let mut response = serde_json::to_vec(&ControlResponse::ProcessRegistered {
+                process_id: "proc_single_flight".to_string(),
+                process_token: "token_single_flight".to_string(),
+            })
+            .unwrap();
+            response.push(b'\n');
+            stream.write_all(&response).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(matches!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let metrics = Arc::new(Mutex::new(GatewayMetrics::default()));
+        let client = Arc::new(GatewayAsyncMasterClient::new(
+            endpoint,
+            Arc::clone(&metrics),
+            Duration::from_secs(1),
+        ));
+        let first_client = Arc::clone(&client);
+        let first = std::thread::spawn(move || first_client.ensure_process_blocking().unwrap());
+        request_received_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let second_client = Arc::clone(&client);
+        let second = std::thread::spawn(move || second_client.ensure_process_blocking().unwrap());
+
+        let first_process = first.join().unwrap();
+        let second_process = second.join().unwrap();
+        assert_eq!(first_process, second_process);
+        assert_eq!(
+            metrics.lock().unwrap().master_process_reregistrations_total,
+            1
+        );
+        master.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_gate_prevents_process_reregistration() {
+        let client = GatewayAsyncMasterClient::new(
+            ControlEndpoint::Tcp("127.0.0.1:1".parse().unwrap()),
+            Arc::new(Mutex::new(GatewayMetrics::default())),
+            Duration::from_millis(50),
+        );
+
+        client.begin_shutdown(Instant::now() + Duration::from_secs(1));
+
+        assert!(matches!(
+            client.ensure_process_blocking().unwrap_err(),
+            ZippyError::InvalidState {
+                status: "gateway master registration is closed"
+            }
+        ));
+    }
+
+    #[test]
+    fn shutdown_gate_prevents_retry_after_master_rejects_existing_process() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let master = std::thread::spawn(move || {
+            let (mut register_stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(register_stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(request_line.trim_end()).unwrap(),
+                ControlRequest::RegisterProcess(_)
+            ));
+            let mut response = serde_json::to_vec(&ControlResponse::ProcessRegistered {
+                process_id: "proc_shutdown_gate".to_string(),
+                process_token: "token_shutdown_gate".to_string(),
+            })
+            .unwrap();
+            response.push(b'\n');
+            register_stream.write_all(&response).unwrap();
+
+            let (mut heartbeat_stream, _) = listener.accept().unwrap();
+            request_line.clear();
+            BufReader::new(heartbeat_stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(request_line.trim_end()).unwrap(),
+                ControlRequest::Heartbeat(_)
+            ));
+            let mut response = serde_json::to_vec(&ControlResponse::Error {
+                code: None,
+                reason: "process not found process_id=[proc_shutdown_gate]".to_string(),
+            })
+            .unwrap();
+            response.push(b'\n');
+            heartbeat_stream.write_all(&response).unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "shutdown must not issue a replacement RegisterProcess request"
+            );
+        });
+        let client = GatewayAsyncMasterClient::new(
+            endpoint,
+            Arc::new(Mutex::new(GatewayMetrics::default())),
+            Duration::from_secs(1),
+        );
+        client.ensure_process_blocking().unwrap();
+        client.begin_shutdown(Instant::now() + Duration::from_secs(1));
+
+        let error = client.heartbeat_blocking().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ZippyError::InvalidState {
+                status: "gateway master registration is closed"
+            }
+        ));
+        master.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_budget_bounds_stalled_heartbeat_and_does_not_retry_on_drop() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let unregisters = Arc::new(AtomicUsize::new(0));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let master_registrations = Arc::clone(&registrations);
+        let master_unregisters = Arc::clone(&unregisters);
+        let master_stopping = Arc::clone(&stopping);
+        let master = std::thread::spawn(move || {
+            while !master_stopping.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let registrations = Arc::clone(&master_registrations);
+                        let unregisters = Arc::clone(&master_unregisters);
+                        let heartbeat_tx = heartbeat_tx.clone();
+                        std::thread::spawn(move || {
+                            let mut stream = stream;
+                            let mut request_line = String::new();
+                            if BufReader::new(stream.try_clone().unwrap())
+                                .read_line(&mut request_line)
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let Ok(request) =
+                                serde_json::from_str::<ControlRequest>(request_line.trim_end())
+                            else {
+                                return;
+                            };
+                            let response = match request {
+                                ControlRequest::RegisterProcess(_) => {
+                                    registrations.fetch_add(1, Ordering::AcqRel);
+                                    ControlResponse::ProcessRegistered {
+                                        process_id: "proc_bounded_shutdown".to_string(),
+                                        process_token: "token_bounded_shutdown".to_string(),
+                                    }
+                                }
+                                ControlRequest::Heartbeat(_) => {
+                                    let _ = heartbeat_tx.send(());
+                                    std::thread::sleep(Duration::from_millis(300));
+                                    ControlResponse::HeartbeatAccepted {
+                                        process_id: "proc_bounded_shutdown".to_string(),
+                                    }
+                                }
+                                ControlRequest::UnregisterProcess(_) => {
+                                    unregisters.fetch_add(1, Ordering::AcqRel);
+                                    std::thread::sleep(Duration::from_millis(300));
+                                    ControlResponse::ProcessUnregistered {
+                                        process_id: "proc_bounded_shutdown".to_string(),
+                                    }
+                                }
+                                other => panic!("unexpected shutdown test request: {other:?}"),
+                            };
+                            let mut response = serde_json::to_vec(&response).unwrap();
+                            response.push(b'\n');
+                            let _ = stream.write_all(&response);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("shutdown test master accept failed: {error}"),
+                }
+            }
+        });
+        let mut config = test_gateway_config();
+        config.master_endpoint = endpoint;
+        config.write_timeout_ms = Some(1_000);
+        let gateway = GatewayServer::new(config).unwrap().start().unwrap();
+        let gateway_endpoint: std::net::SocketAddr = gateway.endpoint().parse().unwrap();
+        heartbeat_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        let outcome = gateway
+            .stop_gracefully_with_timeout(Duration::from_millis(120))
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "shutdown exceeded caller budget by too much elapsed=[{elapsed:?}] outcome=[{outcome:?}]"
+        );
+        assert!(!outcome.runtime_joined, "outcome: {outcome:?}");
+        assert!(outcome.runtime_error.is_some(), "outcome: {outcome:?}");
+        assert!(outcome.writer_cleanup_completed, "outcome: {outcome:?}");
+        assert!(outcome.deadline_exceeded, "outcome: {outcome:?}");
+        assert!(!outcome.process_unregistered, "outcome: {outcome:?}");
+        assert!(std::net::TcpStream::connect(gateway_endpoint).is_err());
+
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(registrations.load(Ordering::Acquire), 1);
+        assert_eq!(
+            unregisters.load(Ordering::Acquire),
+            1,
+            "Gateway Drop must not retry a timed-out unregister"
+        );
+        stopping.store(true, Ordering::Release);
+        master.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_reports_writer_cleanup_that_outlives_deadline() {
+        let gateway = GatewayServer::new(test_gateway_config()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let writer = Arc::new(Mutex::new(GatewayTableWriter {
+            source_name: "gateway.locked_shutdown_writer".to_string(),
+            materializer: StreamTableMaterializer::new("locked_shutdown_writer", schema).unwrap(),
+        }));
+        gateway
+            .state
+            .writers
+            .lock()
+            .unwrap()
+            .insert("locked_shutdown_writer".to_string(), Arc::clone(&writer));
+        let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+        let holder = std::thread::spawn(move || {
+            let _guard = writer.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        let outcome = gateway
+            .stop_gracefully_with_timeout(Duration::from_millis(80))
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(!outcome.writer_cleanup_completed, "outcome: {outcome:?}");
+        assert!(outcome.deadline_exceeded, "outcome: {outcome:?}");
+        assert!(outcome.process_unregistered, "outcome: {outcome:?}");
+        assert!(outcome
+            .writer_failures
+            .iter()
+            .any(|failure| { failure.contains("materializer on_stop may still be running") }));
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn zero_shutdown_budget_does_not_fall_back_to_drop_timeout() {
+        let gateway = GatewayServer::new(test_gateway_config()).unwrap();
+
+        let started = Instant::now();
+        let _outcome = gateway
+            .stop_gracefully_with_timeout(Duration::ZERO)
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "zero-budget shutdown must not retry with the default Drop timeout"
+        );
+    }
+
+    #[test]
+    fn unexpected_runtime_exit_marks_gateway_stopped() {
+        let mut gateway = GatewayServer::new(test_gateway_config())
+            .unwrap()
+            .start()
+            .unwrap();
+        let runtime = gateway.runtime.take().unwrap();
+        let GatewayRuntime {
+            shutdown,
+            exited,
+            mut join_handle,
+        } = runtime;
+
+        drop(shutdown);
+        exited.recv_timeout(Duration::from_secs(1)).unwrap();
+        join_handle.take().unwrap().join().unwrap();
+
+        assert!(gateway.state.stopped.load(Ordering::Acquire));
+        assert!(!gateway.is_running());
+        assert_eq!(gateway.metrics()["running"], json!(false));
+        assert!(matches!(
+            gateway
+                .legacy_collect_facade()
+                .validate(&LegacyCollectRequest::new("ticks", Vec::new(), 1).unwrap())
+                .unwrap_err(),
+            ZippyError::InvalidState { status: "stopped" }
+        ));
+    }
+
+    #[test]
+    fn gateway_dependency_probe_uses_configured_master_control_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = ControlEndpoint::Tcp(listener.local_addr().unwrap());
+        let master = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request_line)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<ControlRequest>(request_line.trim_end()).unwrap(),
+                ControlRequest::GetConfig(_)
+            ));
+            let mut response = serde_json::to_vec(&ControlResponse::ConfigFetched {
+                config: json!({"gateway": {"enabled": true}}),
+            })
+            .unwrap();
+            response.push(b'\n');
+            stream.write_all(&response).unwrap();
+        });
+        let mut config = test_gateway_config();
+        config.master_endpoint = endpoint;
+        let gateway = GatewayServer::new(config).unwrap();
+
+        gateway
+            .probe_master_dependency(Duration::from_secs(1))
+            .unwrap();
+        master.join().unwrap();
     }
 
     #[test]

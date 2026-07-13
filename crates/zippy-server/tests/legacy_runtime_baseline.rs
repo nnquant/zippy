@@ -11,8 +11,8 @@ use zippy_server::{LegacyServerServices, ServiceHealth};
 use zippy_types::catalog::{CatalogRead, ListTablesRequest};
 
 use support::{
-    gateway_metrics, gateway_server, reserve_tcp_addr, wait_until_bindable, GatewayHarness,
-    MasterHarness,
+    gateway_metrics, gateway_server, reserve_tcp_addr, wait_for_gateway_process,
+    wait_until_bindable, GatewayHarness, MasterHarness,
 };
 
 #[test]
@@ -57,12 +57,21 @@ fn gateway_bind_conflict_leaves_no_gateway_runtime_or_bound_port() {
     let mut gateway = GatewayHarness::start_at(master.endpoint().clone(), gateway_addr);
     let response = gateway_metrics(gateway.addr());
     assert_eq!(response["status"], "ok");
+    let gateway_process_id = wait_for_gateway_process(master.server());
     gateway.shutdown();
+    assert!(master
+        .server()
+        .registry()
+        .lock()
+        .unwrap()
+        .alive_process_ids()
+        .is_empty());
     let outcome = master.graceful_shutdown(Duration::from_secs(1));
     assert!(
         outcome.timed_out_processes.is_empty(),
-        "gateway left master process leases behind: {:?}",
-        outcome.timed_out_processes
+        "gateway process lease was not released process_id=[{}] timed_out={:?}",
+        gateway_process_id,
+        outcome.timed_out_processes,
     );
 }
 
@@ -82,11 +91,19 @@ fn legacy_composition_baseline_preserves_both_listener_wires() {
     client.register_process("phase1_wire_probe").unwrap();
     assert!(client.list_streams().unwrap().is_empty());
     assert_eq!(gateway_metrics(gateway.addr())["status"], "ok");
+    let _gateway_process_id = wait_for_gateway_process(master.server());
 
     services.begin_shutdown();
     assert!(!services.health().admission_open);
     client.unregister_process().unwrap();
     gateway.shutdown();
+    assert!(master
+        .server()
+        .registry()
+        .lock()
+        .unwrap()
+        .alive_process_ids()
+        .is_empty());
     let outcome = master.graceful_shutdown(Duration::from_secs(1));
     assert!(
         outcome.timed_out_processes.is_empty(),
