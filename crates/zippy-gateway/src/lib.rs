@@ -79,6 +79,66 @@ const PERSISTED_PARQUET_SCAN_BATCH_SIZE: usize = 1024;
 const MAX_GATEWAY_SNAPSHOTS: usize = 1024;
 const GATEWAY_SNAPSHOT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// An immutable persisted-file view used by one gateway read.
+///
+/// The file descriptors intentionally retain the legacy JSON representation while the authority
+/// that selects them is hidden behind [`PersistedReadSnapshotSource`]. This keeps the existing
+/// Parquet reader contract stable during the catalog authority migration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedReadSnapshot {
+    stream_name: String,
+    persisted_files: Vec<Value>,
+}
+
+impl PersistedReadSnapshot {
+    /// Create a persisted read snapshot for one stream.
+    #[must_use]
+    pub fn new(stream_name: impl Into<String>, persisted_files: Vec<Value>) -> Self {
+        Self {
+            stream_name: stream_name.into(),
+            persisted_files,
+        }
+    }
+
+    /// Return the stream whose persisted files were resolved.
+    #[must_use]
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
+    }
+
+    /// Return the ordered persisted-file descriptors visible to this read.
+    #[must_use]
+    pub fn persisted_files(&self) -> &[Value] {
+        &self.persisted_files
+    }
+
+    fn into_persisted_files(self) -> Vec<Value> {
+        self.persisted_files
+    }
+}
+
+/// Resolves the persisted files visible to one gateway read.
+///
+/// Implementations must return an immutable point-in-time view. The gateway invokes the source
+/// once when a persisted query starts, or once when a long-lived gateway snapshot is created.
+pub trait PersistedReadSnapshotSource: Send + Sync + 'static {
+    /// Resolve the persisted-file view corresponding to `legacy_stream`.
+    fn snapshot(&self, legacy_stream: &StreamInfo) -> Result<PersistedReadSnapshot>;
+}
+
+/// Reads persisted file descriptors from the legacy Master `StreamInfo` response.
+#[derive(Debug, Default)]
+pub struct LegacyPersistedReadSnapshotSource;
+
+impl PersistedReadSnapshotSource for LegacyPersistedReadSnapshotSource {
+    fn snapshot(&self, legacy_stream: &StreamInfo) -> Result<PersistedReadSnapshot> {
+        Ok(PersistedReadSnapshot::new(
+            legacy_stream.stream_name.clone(),
+            legacy_stream.persisted_files.clone(),
+        ))
+    }
+}
+
 /// Native Rust GatewayServer configuration.
 #[derive(Debug, Clone)]
 pub struct GatewayServerConfig {
@@ -155,6 +215,7 @@ pub struct GatewayServer {
 
 struct GatewayState {
     master: Arc<GatewayAsyncMasterClient>,
+    persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
     token: Option<String>,
     max_write_rows: Option<usize>,
     writers: Mutex<BTreeMap<String, GatewayTableWriterHandle>>,
@@ -1625,6 +1686,21 @@ impl GatewayServer {
         )
     }
 
+    /// Create a native GatewayServer with a custom persisted read authority.
+    pub fn new_with_persisted_read_snapshot_source(
+        config: GatewayServerConfig,
+        persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
+    ) -> Result<Self> {
+        Self::new_with_query_limits_and_persisted_read_snapshot_source(
+            config,
+            DEFAULT_MAX_PARALLELISM,
+            DEFAULT_MAX_PARALLELISM,
+            DEFAULT_MAX_QUERY_BUFFER_BYTES,
+            DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+            persisted_read_snapshot_source,
+        )
+    }
+
     /// Create a native GatewayServer with one shared query and runtime limit.
     pub fn new_with_query_parallelism(
         config: GatewayServerConfig,
@@ -1661,6 +1737,25 @@ impl GatewayServer {
         query_parallelism: usize,
         max_query_buffer_bytes: usize,
         query_max_buffered_bytes: usize,
+    ) -> Result<Self> {
+        Self::new_with_query_limits_and_persisted_read_snapshot_source(
+            config,
+            max_parallelism,
+            query_parallelism,
+            max_query_buffer_bytes,
+            query_max_buffered_bytes,
+            Arc::new(LegacyPersistedReadSnapshotSource),
+        )
+    }
+
+    /// Create a native GatewayServer with explicit query limits and persisted read authority.
+    pub fn new_with_query_limits_and_persisted_read_snapshot_source(
+        config: GatewayServerConfig,
+        max_parallelism: usize,
+        query_parallelism: usize,
+        max_query_buffer_bytes: usize,
+        query_max_buffered_bytes: usize,
+        persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
     ) -> Result<Self> {
         if max_parallelism == 0 || max_parallelism > MAX_PARALLELISM {
             return Err(ZippyError::InvalidConfig {
@@ -1736,6 +1831,7 @@ impl GatewayServer {
             endpoint: normalize_endpoint(&config.endpoint),
             state: Arc::new(GatewayState {
                 master,
+                persisted_read_snapshot_source,
                 token: config.token,
                 max_write_rows: config.max_write_rows,
                 writers: Mutex::new(BTreeMap::new()),
@@ -2729,6 +2825,21 @@ impl GatewayAsyncMasterClient {
 }
 
 impl GatewayState {
+    fn resolve_persisted_read_stream(&self, mut stream: StreamInfo) -> Result<StreamInfo> {
+        let snapshot = self.persisted_read_snapshot_source.snapshot(&stream)?;
+        if snapshot.stream_name() != stream.stream_name {
+            return Err(ZippyError::DataCorruption {
+                reason: format!(
+                    "persisted read snapshot stream mismatch expected=[{}] actual=[{}]",
+                    stream.stream_name,
+                    snapshot.stream_name()
+                ),
+            });
+        }
+        stream.persisted_files = snapshot.into_persisted_files();
+        Ok(stream)
+    }
+
     fn handle_authorized_request(
         &self,
         header: Value,
@@ -2823,7 +2934,9 @@ impl GatewayState {
                 );
             }
             {
-                let stream = self.master.get_stream_blocking(&stream_plan.source)?;
+                let stream = self.resolve_persisted_read_stream(
+                    self.master.get_stream_blocking(&stream_plan.source)?,
+                )?;
                 if stream_is_persisted_only(&stream) {
                     self.increment_metric(|metrics| metrics.collect_requests_total += 1);
                     return GatewayCollectStreamProducer::persisted_serial(
@@ -2920,10 +3033,12 @@ impl GatewayState {
             );
         }
 
-        let stream = self.master.get_stream_blocking_cancellable_with_deadline(
-            &stream_plan.source,
-            control_deadline,
-            cancelled,
+        let stream = self.resolve_persisted_read_stream(
+            self.master.get_stream_blocking_cancellable_with_deadline(
+                &stream_plan.source,
+                control_deadline,
+                cancelled,
+            )?,
         )?;
         if !stream_is_persisted_only(&stream) {
             return Err(ZippyError::InvalidConfig {
@@ -2958,7 +3073,8 @@ impl GatewayState {
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "create_snapshot requires source".to_string(),
             })?;
-        let stream = self.master.get_stream_blocking(source)?;
+        let stream =
+            self.resolve_persisted_read_stream(self.master.get_stream_blocking(source)?)?;
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
                 reason: format!(
@@ -3822,7 +3938,8 @@ impl GatewayState {
         source: &str,
         scan_pushdown: &GatewayScanPushdown,
     ) -> Result<GatewayScannedBatch> {
-        let stream = self.master.get_stream_blocking(source)?;
+        let stream =
+            self.resolve_persisted_read_stream(self.master.get_stream_blocking(source)?)?;
         if stream.data_path != "segment" {
             return Err(ZippyError::Io {
                 reason: format!(
@@ -3911,7 +4028,8 @@ impl GatewayState {
         pushdown: GatewayRowRangePushdown,
         scan_pushdown: &GatewayScanPushdown,
     ) -> Result<GatewayScannedBatch> {
-        let stream = self.master.get_stream_blocking(source)?;
+        let stream =
+            self.resolve_persisted_read_stream(self.master.get_stream_blocking(source)?)?;
         if stream_has_persisted_files(&stream) {
             return match pushdown {
                 GatewayRowRangePushdown::Tail(n) => {
@@ -9080,6 +9198,177 @@ mod tests {
             query_max_buffered_bytes,
         )
         .unwrap()
+    }
+
+    struct SpyPersistedReadSnapshotSource {
+        calls: Arc<Mutex<Vec<String>>>,
+        persisted_files: Vec<Value>,
+    }
+
+    impl PersistedReadSnapshotSource for SpyPersistedReadSnapshotSource {
+        fn snapshot(&self, legacy_stream: &StreamInfo) -> Result<PersistedReadSnapshot> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(legacy_stream.stream_name.clone());
+            Ok(PersistedReadSnapshot::new(
+                legacy_stream.stream_name.clone(),
+                self.persisted_files.clone(),
+            ))
+        }
+    }
+
+    fn payload_int64_values(payload: &[u8]) -> Vec<i64> {
+        decode_ipc_batches(payload)
+            .unwrap()
+            .into_iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn persisted_read_entrypoints_share_injected_snapshot_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_path = temp.path().join("source-authority.parquet");
+        let mut master_stream =
+            persisted_test_stream("source_authority_ticks", &parquet_path, &[1_i64, 2, 3, 4]);
+        let persisted_files = std::mem::take(&mut master_stream.persisted_files);
+        master_stream.status = "active".to_string();
+        let (endpoint, server) = spawn_get_stream_server(master_stream, 6);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::new(SpyPersistedReadSnapshotSource {
+            calls: Arc::clone(&calls),
+            persisted_files,
+        });
+        let gateway = GatewayServer::new_with_query_limits_and_persisted_read_snapshot_source(
+            GatewayServerConfig {
+                endpoint: "127.0.0.1:0".to_string(),
+                master_endpoint: endpoint,
+                token: None,
+                max_write_rows: None,
+                max_connections: None,
+                max_subscribers: None,
+                max_blocking_requests: None,
+                write_timeout_ms: None,
+            },
+            2,
+            2,
+            64 * 1024,
+            32 * 1024,
+            source,
+        )
+        .unwrap();
+
+        let (_, default_payload) = gateway
+            .state
+            .handle_collect(json!({
+                "source": "source_authority_ticks",
+                "plan": [],
+            }))
+            .unwrap();
+        assert_eq!(payload_int64_values(&default_payload), vec![1, 2, 3, 4]);
+
+        for (op, expected) in [
+            (json!({"op": "head", "n": 2}), vec![1, 2]),
+            (json!({"op": "tail", "n": 2}), vec![3, 4]),
+            (json!({"op": "slice", "offset": 1, "length": 2}), vec![2, 3]),
+        ] {
+            let (_, payload) = gateway
+                .state
+                .handle_collect(json!({
+                    "source": "source_authority_ticks",
+                    "plan": [op],
+                }))
+                .unwrap();
+            assert_eq!(payload_int64_values(&payload), expected);
+        }
+
+        let mut producer = gateway
+            .state
+            .collect_stream_producer(
+                collect_stream_plan_from_header(json!({
+                    "source": "source_authority_ticks",
+                    "plan": [],
+                    "chunk_rows": 2,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut streamed_values = Vec::new();
+        while let Some(batch) = producer.next_batch().unwrap() {
+            streamed_values.extend_from_slice(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+        assert_eq!(streamed_values, vec![1, 2, 3, 4]);
+
+        let (snapshot_response, _) = gateway
+            .state
+            .handle_create_snapshot(json!({"source": "source_authority_ticks"}))
+            .unwrap();
+        let snapshot_id = snapshot_response["snapshot"]["snapshot_id"]
+            .as_str()
+            .unwrap();
+        let (_, snapshot_payload) = gateway
+            .state
+            .handle_collect(json!({
+                "source": "source_authority_ticks",
+                "snapshot_id": snapshot_id,
+                "plan": [],
+            }))
+            .unwrap();
+        assert_eq!(payload_int64_values(&snapshot_payload), vec![1, 2, 3, 4]);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["source_authority_ticks"; 6]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn persisted_read_source_rejects_a_mismatched_stream_snapshot() {
+        struct MismatchedSource;
+
+        impl PersistedReadSnapshotSource for MismatchedSource {
+            fn snapshot(&self, _legacy_stream: &StreamInfo) -> Result<PersistedReadSnapshot> {
+                Ok(PersistedReadSnapshot::new("other_stream", Vec::new()))
+            }
+        }
+
+        let gateway = GatewayServer::new_with_persisted_read_snapshot_source(
+            test_gateway_config(),
+            Arc::new(MismatchedSource),
+        )
+        .unwrap();
+        let stream = stream_info_for_gateway_status_test(
+            "expected_stream",
+            Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)])),
+            1,
+        );
+
+        let error = gateway
+            .state
+            .resolve_persisted_read_stream(stream)
+            .unwrap_err();
+
+        assert!(matches!(error, ZippyError::DataCorruption { .. }));
+        assert!(error.to_string().contains(
+            "persisted read snapshot stream mismatch expected=[expected_stream] actual=[other_stream]"
+        ));
     }
 
     #[test]
