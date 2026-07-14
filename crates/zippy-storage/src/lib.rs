@@ -14,6 +14,7 @@ mod catalog_verify;
 mod checksum;
 mod commit;
 mod commit_intent;
+mod persist;
 mod reconcile;
 
 pub use candidate::{
@@ -28,6 +29,10 @@ pub use catalog_verify::{
 pub use commit::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,
     CommitDataFilesReceipt,
+};
+pub use persist::{
+    PersistCandidateInput, PersistController, PersistControllerConfig, PersistControllerHandle,
+    PersistRequest, PersistTicket, MAX_PERSIST_PARALLEL_WRITERS,
 };
 pub use reconcile::{
     ReconciledFile, ReconciledFileDisposition, ReconciliationIssue, ReconciliationIssueKind,

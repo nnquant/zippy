@@ -36,6 +36,25 @@ Default outstanding budgets are 64 commits, 128 MiB of frozen command bytes, and
 uncommitted candidate bytes. Candidate-byte accounting rounds each request up to 64 KiB. These are
 backlog budgets, not Parquet writer memory limits.
 
+## Persist controller
+
+`PersistController` is the non-cloneable owner of native Parquet execution and the
+`CatalogCommitCoordinator`. Its cloneable handle can only perform immediate bounded admission:
+every accepted request first reserves an outstanding-job permit, a conservative retained
+request-memory charge, a per-table single-flight permit, and one queue slot. A request larger than
+the total memory budget is a nonretryable `ResourceExhausted`; temporary table, job, memory, or queue
+pressure is retryable. Shared
+Arrow buffers referenced by multiple batches are deliberately charged once per batch, so admission
+never relies on fragile buffer-identity deduplication.
+
+The defaults are 64 outstanding jobs, 512 MiB of retained request input, and four concurrent
+blocking Parquet writers. Hard limits are 4,096 jobs, 64 GiB, and 64 writers. `submit()` returns a
+`PersistTicket` only after the request is in the bounded queue. Dropping that ticket abandons only
+the response: candidate publication, Catalog commit replay, and cleanup continue. Any writer or
+commit error closes global admission, but the controller still drains every accepted queue item,
+joins all blocking writers, and finally drains its exclusively owned coordinator before returning
+the first error.
+
 ## Startup reconciliation
 
 `StartupOrphanReconciler` runs only while table-writer admission is closed. The server composition
@@ -86,5 +105,5 @@ compatibility wrapper that returns only the verification report. External legacy
 historical files removed from the current snapshot are outside this startup gate; maintenance
 verification remains responsible for historical/deep audits.
 
-Logical drop, snapshot leases, safe GC, compaction, PersistController integration, and public
+Logical drop, snapshot leases, safe GC, compaction, TableActor persist-state integration, and public
 native write admission remain later refactor steps.

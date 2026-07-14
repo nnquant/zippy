@@ -28,6 +28,7 @@ use zippy_master::daemon::{
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use zippy_master::server::MasterServer;
+use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
 
 use crate::{
@@ -1144,8 +1145,15 @@ fn start_native_storage_if_enabled(
         return Ok(None);
     }
     remaining_before(startup_deadline, "start native storage")?;
+    let persist_controller = PersistControllerConfig::new().with_max_parallel_writers(
+        runtime_config
+            .runtime
+            .max_parallelism
+            .min(MAX_PERSIST_PARALLEL_WRITERS),
+    );
     match NativeStorageRuntime::start_until(
-        NativeStorageRuntimeConfig::new(data_directory),
+        NativeStorageRuntimeConfig::new(data_directory)
+            .with_persist_controller_config(persist_controller),
         startup_deadline,
     ) {
         NativeStorageStartOutcome::Ready(runtime) => Ok(Some(runtime)),

@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +35,7 @@ const DICTIONARY_PAGE_SIZE_BYTES: usize = 1024 * 1024;
 const WRITE_BATCH_ROWS: usize = 1024;
 const METADATA_TRUNCATE_BYTES: usize = 64;
 const MAX_CANDIDATE_FOOTER_METADATA_BYTES: usize = 1024 * 1024;
+const CANDIDATE_FOOTER_BUFFER_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_PARQUET_FOOTER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Immutable metadata fixed before writing one native Parquet candidate.
@@ -56,6 +57,41 @@ pub struct ParquetCandidateSpec {
     pub metadata: MetadataMap,
     /// Candidate creation time as Unix nanoseconds in UTC.
     pub created_at_ns: u64,
+}
+
+/// A validated candidate specification paired with its bounded footer bytes.
+///
+/// Keeping the opaque pair together prevents the persist queue from retaining
+/// metadata that has not passed the footer limit and prevents a writer from
+/// accidentally attaching a footer generated for another specification.
+#[derive(Debug)]
+pub(crate) struct PreparedParquetCandidateSpec {
+    spec: ParquetCandidateSpec,
+    footer_metadata: String,
+}
+
+impl PreparedParquetCandidateSpec {
+    pub(crate) fn new(spec: ParquetCandidateSpec) -> Result<Self> {
+        validate_spec(&spec)?;
+        validate_parquet_schema(&spec)?;
+        let footer_metadata = encode_footer_metadata(&spec)?;
+        Ok(Self {
+            spec,
+            footer_metadata,
+        })
+    }
+
+    pub(crate) const fn spec(&self) -> &ParquetCandidateSpec {
+        &self.spec
+    }
+
+    pub(crate) fn footer_capacity(&self) -> usize {
+        self.footer_metadata.capacity()
+    }
+
+    fn into_parts(self) -> (ParquetCandidateSpec, String) {
+        (self.spec, self.footer_metadata)
+    }
 }
 
 /// A complete, durable Parquet file that is not yet Catalog-visible.
@@ -112,15 +148,18 @@ impl ParquetCandidateWriter {
     where
         I: IntoIterator<Item = RecordBatch>,
     {
-        validate_spec(&spec)?;
-        arrow_to_parquet_schema(spec.schema.as_ref()).map_err(|error| {
-            ServerError::new(
-                ErrorCode::SchemaMismatch,
-                format!("schema is not representable as Parquet error=[{error}]"),
-            )
-            .with_table_id(spec.table_id)
-        })?;
-        let footer_metadata = encode_footer_metadata(&spec)?;
+        self.write_prepared_candidate(PreparedParquetCandidateSpec::new(spec)?, batches)
+    }
+
+    pub(crate) fn write_prepared_candidate<I>(
+        &self,
+        prepared: PreparedParquetCandidateSpec,
+        batches: I,
+    ) -> Result<DurableParquetCandidate>
+    where
+        I: IntoIterator<Item = RecordBatch>,
+    {
+        let (spec, footer_metadata) = prepared.into_parts();
         let managed_path = candidate_managed_path(spec.table_id, spec.file_id)?;
         let final_path = self
             .data_directory
@@ -217,36 +256,157 @@ fn validate_spec(spec: &ParquetCandidateSpec) -> Result<()> {
     Ok(())
 }
 
-fn encode_footer_metadata(spec: &ParquetCandidateSpec) -> Result<String> {
-    let value = serde_json::to_string(&StoredCandidateMetadataV1 {
-        format_version: PARQUET_CANDIDATE_FORMAT_VERSION,
-        file_id: spec.file_id,
-        table_id: spec.table_id,
-        schema_version: spec.schema_version,
-        provenance: spec.provenance.clone(),
-        partition: spec.partition.clone(),
-        metadata: spec.metadata.clone(),
-        created_at_ns: spec.created_at_ns,
-    })
-    .map_err(|error| {
+fn validate_parquet_schema(spec: &ParquetCandidateSpec) -> Result<()> {
+    arrow_to_parquet_schema(spec.schema.as_ref()).map_err(|error| {
         ServerError::new(
-            ErrorCode::Internal,
-            format!("serialize candidate footer metadata error=[{error}]"),
+            ErrorCode::SchemaMismatch,
+            format!("schema is not representable as Parquet error=[{error}]"),
         )
         .with_table_id(spec.table_id)
     })?;
-    if value.len() > MAX_CANDIDATE_FOOTER_METADATA_BYTES {
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct StoredCandidateMetadataRefV1<'a> {
+    format_version: u32,
+    file_id: &'a FileId,
+    table_id: &'a TableId,
+    schema_version: u64,
+    provenance: &'a NativeDataFileProvenance,
+    partition: &'a MetadataMap,
+    metadata: &'a MetadataMap,
+    created_at_ns: u64,
+}
+
+fn encode_footer_metadata(spec: &ParquetCandidateSpec) -> Result<String> {
+    let metadata = StoredCandidateMetadataRefV1 {
+        format_version: PARQUET_CANDIDATE_FORMAT_VERSION,
+        file_id: &spec.file_id,
+        table_id: &spec.table_id,
+        schema_version: spec.schema_version,
+        provenance: &spec.provenance,
+        partition: &spec.partition,
+        metadata: &spec.metadata,
+        created_at_ns: spec.created_at_ns,
+    };
+    let mut output = BoundedFooterBuffer::new();
+    if let Err(error) = serde_json::to_writer(&mut output, &metadata) {
+        if output.limit_exceeded {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "candidate footer metadata exceeds limit maximum=[{}]",
+                    MAX_CANDIDATE_FOOTER_METADATA_BYTES
+                ),
+            )
+            .with_table_id(spec.table_id)
+            .with_retryable(false));
+        }
         return Err(ServerError::new(
-            ErrorCode::ResourceExhausted,
-            format!(
-                "candidate footer metadata exceeds limit actual=[{}] maximum=[{}]",
-                value.len(),
-                MAX_CANDIDATE_FOOTER_METADATA_BYTES
-            ),
+            if output.allocation_failed {
+                ErrorCode::ResourceExhausted
+            } else {
+                ErrorCode::Internal
+            },
+            format!("serialize candidate footer metadata error=[{error}]"),
         )
         .with_table_id(spec.table_id));
     }
-    Ok(value)
+    output.into_string(spec.table_id)
+}
+
+struct BoundedFooterBuffer {
+    bytes: Vec<u8>,
+    limit_exceeded: bool,
+    allocation_failed: bool,
+}
+
+impl BoundedFooterBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit_exceeded: false,
+            allocation_failed: false,
+        }
+    }
+
+    fn into_string(self, table_id: TableId) -> Result<String> {
+        let mut compact = Vec::new();
+        compact
+            .try_reserve_exact(self.bytes.len())
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    format!("allocate compact candidate footer error=[{error}]"),
+                )
+                .with_table_id(table_id)
+            })?;
+        if compact.capacity() > MAX_CANDIDATE_FOOTER_METADATA_BYTES {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "compact candidate footer allocation exceeds its hard limit",
+            )
+            .with_table_id(table_id));
+        }
+        compact.extend_from_slice(&self.bytes);
+        String::from_utf8(compact).map_err(|error| {
+            ServerError::new(
+                ErrorCode::Internal,
+                format!("candidate footer serializer produced invalid UTF-8 error=[{error}]"),
+            )
+            .with_table_id(table_id)
+        })
+    }
+}
+
+impl Write for BoundedFooterBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(required) = self.bytes.len().checked_add(bytes.len()) else {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "candidate footer byte count overflow",
+            ));
+        };
+        if required > MAX_CANDIDATE_FOOTER_METADATA_BYTES {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "candidate footer metadata byte limit exceeded",
+            ));
+        }
+        if required > self.bytes.capacity() {
+            let target_capacity = required
+                .checked_add(CANDIDATE_FOOTER_BUFFER_CHUNK_BYTES - 1)
+                .map(|bytes| bytes / CANDIDATE_FOOTER_BUFFER_CHUNK_BYTES)
+                .and_then(|chunks| chunks.checked_mul(CANDIDATE_FOOTER_BUFFER_CHUNK_BYTES))
+                .filter(|capacity| *capacity <= MAX_CANDIDATE_FOOTER_METADATA_BYTES)
+                .ok_or_else(|| {
+                    self.limit_exceeded = true;
+                    std::io::Error::other("candidate footer capacity limit exceeded")
+                })?;
+            if let Err(error) = self
+                .bytes
+                .try_reserve_exact(target_capacity.saturating_sub(self.bytes.len()))
+            {
+                self.allocation_failed = true;
+                return Err(std::io::Error::other(format!(
+                    "reserve candidate footer buffer error=[{error}]"
+                )));
+            }
+            if self.bytes.capacity() > MAX_CANDIDATE_FOOTER_METADATA_BYTES {
+                self.limit_exceeded = true;
+                return Err(std::io::Error::other(
+                    "candidate footer allocation exceeds its hard limit",
+                ));
+            }
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn candidate_managed_path(

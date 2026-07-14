@@ -1860,8 +1860,8 @@ durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、�
 通过 data-root/table directory fd 逐级 `openat(O_NOFOLLOW)`，有界核验每个当前可见 managed 文件的
 路径归属、大小、checksum、Parquet footer 和 row count；缺失、symlink 替换或内容损坏均 fail closed。
 该 gate 不声明历史 snapshot 可用，native historical query admission 仍关闭，历史文件深度审计属于
-maintenance。snapshot lease、logical drop、safe GC、PersistController 和权威 Gateway 写入口接线尚未
-完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
+maintenance。snapshot lease、logical drop、safe GC、TableActor persist 状态机和权威 Gateway 写入口
+接线尚未完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
 `[server].native_storage_enabled = true`（或 `ZIPPY_SERVER_NATIVE_STORAGE=true`）后，
 `NativeStorageRuntime` 会在任何 listener 绑定前依次执行 Catalog open、pre-replay reconciliation、
 durable intent replay、post-replay reconciliation 和 Catalog-to-physical current-snapshot verification；
@@ -1879,10 +1879,14 @@ schema 使用递归字段大小、root metadata、Arc/allocator 裕量形成保�
 Catalog 的唯一受限 persisted-schema decoder 复核 schema hash、table definition 列引用、current
 version、writer epoch 和 committed log watermark，再一次性构建 server-owned table runtime registry。
 每张 active table 会在 ready 前创建串行 actor；默认 per-table mailbox 64、全局 outstanding command
-4096，均为立即有界 admission。shutdown 顺序为关闭 table actor admission、排空已接受 actor command、
-排空 Catalog commit coordinator、关闭 SQLite Catalog。当前 actor 仅开放内部状态观察，尚未接入
-RecordBatch append、segment rollover、PersistController 或 Gateway 权威写入口，因此 legacy Gateway
-仍是业务写 authority，不能据此宣称 native ingest 可用。
+4096，均为立即有界 admission。server 现在还会启动独占 Catalog commit coordinator 的
+`PersistController`：默认 64 个 accepted jobs、512 MiB 完整 retained input、4 路 Parquet writer，writer
+并发取 process-wide `runtime.max_parallelism` 并受 64 路硬上限约束。同表只允许一个 accepted persist，
+不同表可以并行；footer 在准入前完成 1 MiB 有界流式编码，schema、provenance、metadata、容器和 Arrow
+buffer 都计入输入预算。shutdown 顺序为关闭 table actor admission、排空已接受 actor command、排空
+PersistController 的 writer 与 Catalog commit、关闭 SQLite Catalog。当前 actor 仅开放内部状态观察，
+尚未把 sealed RecordBatch 和 persist receipt 接入自身状态机，也未接入 Gateway 权威写入口，因此 legacy
+Gateway 仍是业务写 authority，不能据此宣称 native ingest 可用。
 
 任务：
 

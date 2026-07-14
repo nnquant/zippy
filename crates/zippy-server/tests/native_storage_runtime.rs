@@ -16,8 +16,8 @@ use zippy_server::{
 };
 use zippy_storage::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,
-    ParquetCandidateSpec, ParquetCandidateWriter, StartupCatalogFileVerifier,
-    StartupCatalogFileVerifierConfig,
+    ParquetCandidateSpec, ParquetCandidateWriter, PersistControllerConfig,
+    StartupCatalogFileVerifier, StartupCatalogFileVerifierConfig,
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
@@ -268,6 +268,31 @@ fn invalid_table_actor_budget_fails_before_catalog_startup() {
         NativeStorageStartOutcome::TimedOut(startup) => {
             startup.cancel();
             panic!("invalid table actor budget unexpectedly reached supervisor startup");
+        }
+    }
+}
+
+#[test]
+fn invalid_persist_controller_budget_fails_before_catalog_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("database");
+    let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(&root).unwrap());
+    let config = NativeStorageRuntimeConfig::new(&ownership).with_persist_controller_config(
+        PersistControllerConfig::new().with_max_parallel_writers(0),
+    );
+
+    match NativeStorageRuntime::start_with_timeout(config, Duration::from_secs(1)) {
+        NativeStorageStartOutcome::Failed(error) => {
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(!root.join("catalog/catalog.db").exists());
+        }
+        NativeStorageStartOutcome::Ready(mut runtime) => {
+            let _ = runtime.shutdown(Duration::from_secs(1));
+            panic!("invalid persist controller budget unexpectedly started native storage");
+        }
+        NativeStorageStartOutcome::TimedOut(startup) => {
+            startup.cancel();
+            panic!("invalid persist controller budget unexpectedly reached supervisor startup");
         }
     }
 }

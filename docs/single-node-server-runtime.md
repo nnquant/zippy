@@ -84,7 +84,11 @@ The foreground form retains native `SIGINT`/`SIGTERM` graceful shutdown behavior
 
 The server owns startup and shutdown order. When native storage is enabled, it first opens and
 checks SQLite, runs pre-replay reconciliation, replays durable Catalog intents, and runs final
-reconciliation. It then reads the current Catalog snapshots at one stable revision and verifies
+reconciliation. The storage supervisor then starts a bounded `PersistController`, which exclusively
+owns native Parquet writer jobs and the durable Catalog commit coordinator. Writer concurrency uses
+`runtime.max_parallelism` (or `ZIPPY_MAX_PARALLELISM`) with a storage safety ceiling of 64; the
+controller defaults retain at most 64 accepted jobs and 512 MiB of complete request input. It then reads the
+current Catalog snapshots at one stable revision and verifies
 every visible managed Parquet path, size, checksum, footer, and row count before binding any
 listener. It then binds the master listener, waits for its
 readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master
@@ -124,8 +128,10 @@ file and directory durability, and retains the old file as rollback evidence. An
 configured data root never imports endpoint state. Once the managed file exists it is always
 authoritative, even if the server later uses a different control endpoint.
 
-A clean server shutdown releases data-root ownership only after Gateway, native storage, and
-Master/listener cleanup have completed. An incomplete shutdown retains the top-level capability,
+A clean native-storage shutdown first closes and drains all per-table actors, then drains every
+accepted Parquet write and Catalog commit, and only then closes SQLite. The server releases
+data-root ownership only after Gateway, native storage, and Master/listener cleanup have completed.
+An incomplete shutdown retains the top-level capability,
 and a listener or storage supervisor that has not joined retains its own capability clone. Ordinary
 `DataDirectory::open` remains a read-only layout validation operation and does not create missing
 directories. Writable SQLite Catalog

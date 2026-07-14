@@ -12,7 +12,8 @@ use zippy_ingest::{
     TableActorRegistryHandle, TableRuntimeBootstrap, TableRuntimeRegistry,
 };
 use zippy_storage::{
-    CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, StartupCatalogBootstrap,
+    CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, ParquetCandidateWriter,
+    PersistController, PersistControllerConfig, StartupCatalogBootstrap,
     StartupCatalogFileVerificationReport, StartupCatalogFileVerifier,
     StartupCatalogFileVerifierConfig, StartupOrphanReconciler, StartupOrphanReconcilerConfig,
     StartupOrphanReconciliationReport,
@@ -33,6 +34,7 @@ pub struct NativeStorageRuntimeConfig {
     data_directory: Arc<OwnedDataDirectory>,
     catalog: SqliteCatalogConfig,
     coordinator: CatalogCommitCoordinatorConfig,
+    persist_controller: PersistControllerConfig,
     reconciliation: StartupOrphanReconcilerConfig,
     catalog_file_verification: StartupCatalogFileVerifierConfig,
     table_actors: TableActorRegistryConfig,
@@ -47,6 +49,7 @@ impl NativeStorageRuntimeConfig {
             data_directory: Arc::clone(data_directory),
             catalog: SqliteCatalogConfig::new(data_directory),
             coordinator: CatalogCommitCoordinatorConfig::new(),
+            persist_controller: PersistControllerConfig::new(),
             reconciliation: StartupOrphanReconcilerConfig::new(),
             catalog_file_verification: StartupCatalogFileVerifierConfig::new(),
             table_actors: TableActorRegistryConfig::new(),
@@ -72,6 +75,16 @@ impl NativeStorageRuntimeConfig {
     #[must_use]
     pub fn with_coordinator_config(mut self, coordinator: CatalogCommitCoordinatorConfig) -> Self {
         self.coordinator = coordinator;
+        self
+    }
+
+    /// Replaces the bounded Parquet persist execution policy.
+    #[must_use]
+    pub fn with_persist_controller_config(
+        mut self,
+        persist_controller: PersistControllerConfig,
+    ) -> Self {
+        self.persist_controller = persist_controller;
         self
     }
 
@@ -120,6 +133,7 @@ impl NativeStorageRuntimeConfig {
                 "native storage commit recovery requires a server Catalog actor",
             ));
         }
+        self.persist_controller.validate()?;
         self.table_actors.validate()?;
         Ok(())
     }
@@ -599,6 +613,16 @@ async fn supervise_storage(
         Ok(coordinator) => coordinator,
         Err(error) => return (false, fail_startup(error, None, None, catalog).await),
     };
+    let persist_controller = match PersistController::start(
+        config.persist_controller.clone(),
+        ParquetCandidateWriter::new(Arc::clone(&config.data_directory)),
+        coordinator,
+    )
+    .await
+    {
+        Ok(controller) => controller,
+        Err(error) => return (false, fail_startup(error, None, None, catalog).await),
+    };
 
     let post_replay =
         match reconcile_once(&config, Arc::clone(&catalog), &mut shutdown, "post-replay").await {
@@ -606,7 +630,7 @@ async fn supervise_storage(
             Err(error) => {
                 return (
                     false,
-                    fail_startup(error, None, Some(coordinator), catalog).await,
+                    fail_startup(error, None, Some(persist_controller), catalog).await,
                 );
             }
         };
@@ -627,7 +651,7 @@ async fn supervise_storage(
             Err(error) => {
                 return (
                     false,
-                    fail_startup(error, None, Some(coordinator), catalog).await,
+                    fail_startup(error, None, Some(persist_controller), catalog).await,
                 );
             }
         };
@@ -646,7 +670,7 @@ async fn supervise_storage(
         .with_retryable(true);
         return (
             false,
-            fail_startup(error, None, Some(coordinator), catalog).await,
+            fail_startup(error, None, Some(persist_controller), catalog).await,
         );
     }
 
@@ -660,7 +684,7 @@ async fn supervise_storage(
         Err(error) => {
             return (
                 false,
-                fail_startup(error, None, Some(coordinator), catalog).await,
+                fail_startup(error, None, Some(persist_controller), catalog).await,
             );
         }
     };
@@ -670,7 +694,7 @@ async fn supervise_storage(
         Err(error) => {
             return (
                 false,
-                fail_startup(error, None, Some(coordinator), catalog).await,
+                fail_startup(error, None, Some(persist_controller), catalog).await,
             );
         }
     };
@@ -680,7 +704,7 @@ async fn supervise_storage(
             fail_startup(
                 startup_cancelled(),
                 Some(table_actors),
-                Some(coordinator),
+                Some(persist_controller),
                 catalog,
             )
             .await,
@@ -693,7 +717,7 @@ async fn supervise_storage(
         Err(error) => {
             return (
                 false,
-                fail_startup(error, Some(table_actors), Some(coordinator), catalog).await,
+                fail_startup(error, Some(table_actors), Some(persist_controller), catalog).await,
             );
         }
     };
@@ -712,7 +736,7 @@ async fn supervise_storage(
         .with_retryable(true);
         return (
             false,
-            fail_startup(error, Some(table_actors), Some(coordinator), catalog).await,
+            fail_startup(error, Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
     tracing::info!(
@@ -736,14 +760,14 @@ async fn supervise_storage(
     {
         return (
             false,
-            close_storage(Some(table_actors), Some(coordinator), catalog).await,
+            close_storage(Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
 
     wait_for_shutdown(&mut shutdown).await;
     (
         true,
-        close_storage(Some(table_actors), Some(coordinator), catalog).await,
+        close_storage(Some(table_actors), Some(persist_controller), catalog).await,
     )
 }
 
@@ -845,10 +869,10 @@ where
 async fn fail_startup(
     error: ServerError,
     table_actors: Option<TableActorRegistry>,
-    coordinator: Option<CatalogCommitCoordinator>,
+    persist_controller: Option<PersistController>,
     catalog: Arc<SqliteCatalog>,
 ) -> Result<()> {
-    let cleanup = close_storage(table_actors, coordinator, catalog).await;
+    let cleanup = close_storage(table_actors, persist_controller, catalog).await;
     let surfaced = match cleanup {
         Ok(()) => error,
         Err(cleanup_error) => combine_errors(error, cleanup_error),
@@ -858,15 +882,15 @@ async fn fail_startup(
 
 async fn close_storage(
     table_actors: Option<TableActorRegistry>,
-    coordinator: Option<CatalogCommitCoordinator>,
+    persist_controller: Option<PersistController>,
     catalog: Arc<SqliteCatalog>,
 ) -> Result<()> {
     let actor_result = match table_actors {
         Some(table_actors) => table_actors.drain().await,
         None => Ok(()),
     };
-    let coordinator_result = match coordinator {
-        Some(coordinator) => coordinator.drain().await,
+    let persist_result = match persist_controller {
+        Some(persist_controller) => persist_controller.drain().await,
         None => Ok(()),
     };
     let catalog_result = match Arc::try_unwrap(catalog) {
@@ -877,7 +901,7 @@ async fn close_storage(
         )),
     };
     let mut error = None;
-    for result in [actor_result, coordinator_result, catalog_result] {
+    for result in [actor_result, persist_result, catalog_result] {
         if let Err(next) = result {
             error = Some(match error {
                 Some(previous) => combine_errors(previous, next),
