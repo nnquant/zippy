@@ -37,7 +37,8 @@ use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
 
 use crate::legacy_catalog_migration::{
-    plan_legacy_catalog_metadata_import, LegacyCatalogMigrationStartup,
+    plan_legacy_catalog_metadata_import, LegacyCatalogMetadataImportPlan,
+    LegacyCatalogMigrationStartup,
 };
 use crate::{
     catalog_shadow::SqliteCatalogPersistedReadShadowSource, LegacyCatalogMigrationDegradation,
@@ -1564,7 +1565,7 @@ fn prepare_legacy_catalog_migration(
             );
         }
     };
-    match plan_legacy_catalog_metadata_import(&snapshot) {
+    match plan_legacy_catalog_migration(runtime_config, &snapshot) {
         Ok(plan) => LegacyCatalogMigrationStartup::Planned(plan),
         Err(error) => {
             LegacyCatalogMigrationStartup::Degraded(LegacyCatalogMigrationDegradation::from_error(
@@ -1573,6 +1574,68 @@ fn prepare_legacy_catalog_migration(
             ))
         }
     }
+}
+
+fn plan_legacy_catalog_migration(
+    runtime_config: &ZippyConfig,
+    snapshot: &zippy_master::legacy_catalog::LegacyCatalogMigrationSnapshot,
+) -> Result<LegacyCatalogMetadataImportPlan, ServerError> {
+    let needs_fallback = snapshot.tables().iter().any(|table| {
+        table
+            .migration_files()
+            .iter()
+            .any(|file| file.persist_data_root().is_none())
+    });
+    if !needs_fallback {
+        return plan_legacy_catalog_metadata_import(snapshot);
+    }
+    let fallback_root = resolve_legacy_fallback_root(&runtime_config.table.persist.data_dir)?;
+    LegacyCatalogMetadataImportPlan::with_trusted_fallback_root(snapshot, &fallback_root)
+}
+
+fn resolve_legacy_fallback_root(configured: &str) -> Result<PathBuf, ServerError> {
+    let canonical = fs::canonicalize(configured).map_err(|error| {
+        ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "legacy fallback data root cannot be resolved error_kind=[{:?}]",
+                error.kind()
+            ),
+        )
+        .with_retryable(false)
+    })?;
+    if canonical == Path::new("/") {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "legacy fallback data root cannot be the filesystem root",
+        )
+        .with_retryable(false));
+    }
+    let metadata = fs::metadata(&canonical).map_err(|error| {
+        ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "legacy fallback data root cannot be inspected error_kind=[{:?}]",
+                error.kind()
+            ),
+        )
+        .with_retryable(false)
+    })?;
+    if !metadata.is_dir() {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "legacy fallback data root must resolve to a directory",
+        )
+        .with_retryable(false));
+    }
+    if canonical.to_str().is_none() {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "legacy fallback data root must be valid UTF-8",
+        )
+        .with_retryable(false));
+    }
+    Ok(canonical)
 }
 
 fn gateway_persisted_read_snapshot_source(
@@ -2134,6 +2197,26 @@ mod tests {
     ) {
         let record = test_starting_record(ready_file, control_endpoint, launch_nonce);
         fs::write(ready_file, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_fallback_root_requires_an_existing_scoped_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = resolve_legacy_fallback_root(temp.path().to_str().unwrap()).unwrap();
+        assert_eq!(resolved, fs::canonicalize(temp.path()).unwrap());
+
+        let missing = temp.path().join("missing");
+        let error = resolve_legacy_fallback_root(missing.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(!error.message().contains(missing.to_str().unwrap()));
+
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"not a root").unwrap();
+        let error = resolve_legacy_fallback_root(file.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+
+        let error = resolve_legacy_fallback_root("/").unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
     }
 
     #[test]

@@ -561,7 +561,12 @@ async fn sqlite_shadow_migration_failure_is_degraded_without_closing_legacy_auth
     assert!(degradation
         .message
         .as_deref()
-        .is_some_and(|message| { message.contains("target revision does not match") }));
+        .is_some_and(|message| {
+            message.contains("code=[CONFLICT]")
+                && message.contains("request_id=[")
+                && message.contains("table_id=[")
+                && !message.contains("target revision does not match")
+        }));
     let metrics = runtime.legacy_catalog_migration_metrics();
     assert_eq!(metrics["state"], "degraded");
     assert_eq!(metrics["degraded_reason"], "execution_failed");
