@@ -386,6 +386,16 @@ impl ManifestQueueBudget {
         if bytes == 0 {
             return Ok(None);
         }
+        if bytes > self.maximum {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    "sqlite catalog manifest command exceeds queue byte budget requested=[{bytes}] maximum=[{}]",
+                    self.maximum
+                ),
+            )
+            .with_retryable(false));
+        }
         let mut current = self.used.load(Ordering::Acquire);
         loop {
             let next = current.checked_add(bytes).ok_or_else(|| {
@@ -393,6 +403,7 @@ impl ManifestQueueBudget {
                     ErrorCode::ResourceExhausted,
                     "sqlite catalog manifest queue byte reservation overflow",
                 )
+                .with_retryable(false)
             })?;
             if next > self.maximum {
                 return Err(ServerError::new(
@@ -1515,6 +1526,14 @@ mod tests {
             .err()
             .expect("occupied byte budget must reject another reservation");
         assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert!(error.retryable());
+
+        let oversized = budget
+            .reserve(9)
+            .err()
+            .expect("single oversized command must be rejected permanently");
+        assert_eq!(oversized.code(), ErrorCode::ResourceExhausted);
+        assert!(!oversized.retryable());
 
         drop(permit);
         assert!(budget
@@ -1546,6 +1565,7 @@ mod tests {
             .await
             .expect_err("preflight must hold the global command permit until cancellation");
         assert_eq!(occupied.code(), ErrorCode::ResourceExhausted);
+        assert!(occupied.retryable());
         drop(scanning);
 
         let VersionedCatalogResponse::V1(response) = catalog

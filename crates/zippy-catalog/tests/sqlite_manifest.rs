@@ -643,6 +643,7 @@ async fn rejects_manifest_before_queue_when_byte_budget_is_exhausted() {
         .await
         .expect_err("manifest reservation must respect the queue byte budget");
     assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+    assert!(!error.retryable());
     assert_eq!(error.request_id(), Some(request_id(3)));
     assert_eq!(catalog.revision().await, Ok(2));
     assert!(exact_snapshot(&catalog, 1).await.tables()[0]
@@ -671,7 +672,7 @@ async fn bounds_actor_principal_and_charges_it_to_the_manifest_queue() {
         (
             4,
             MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
-            "manifest queue byte budget exhausted",
+            "manifest command exceeds queue byte budget",
         ),
     ] {
         let actor = CatalogActor {
@@ -701,6 +702,7 @@ async fn bounds_actor_principal_and_charges_it_to_the_manifest_queue() {
             .await
             .expect_err("principal admission must reject the command");
         assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert!(!error.retryable());
         assert!(
             error.message().contains(expected_message),
             "unexpected principal admission error error=[{error}]"

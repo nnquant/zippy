@@ -1793,7 +1793,7 @@ fn invalid(message: impl Into<String>) -> ServerError {
 }
 
 fn resource(message: impl Into<String>) -> ServerError {
-    ServerError::new(ErrorCode::ResourceExhausted, message)
+    ServerError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
 }
 
 fn conflict(message: impl Into<String>) -> ServerError {

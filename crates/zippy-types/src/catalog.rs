@@ -1269,7 +1269,17 @@ pub trait CatalogWrite: Send + Sync {
     /// Validates format, fingerprint, revision, and invariants before commit.
     ///
     /// The catalog writer assigns all audit and commit timestamps inside its
-    /// transaction. Command callers cannot supply or override server time.
+    /// transaction. Command callers cannot supply or override server time. A
+    /// successful mutation and its idempotency response must become durable in
+    /// the same atomic transaction. Replaying the exact envelope, including
+    /// its request ID, must return the original response; reusing that request
+    /// ID with a different fingerprint must conflict.
+    ///
+    /// Once this future has been polled, cancellation may abandon only the
+    /// response while the mutation still commits. Callers must treat that state
+    /// as commit-unknown and replay the unchanged envelope. Implementations
+    /// must mark an error retryable only when replaying that exact envelope can
+    /// make progress without changing its payload or server configuration.
     fn command(
         &self,
         command: VersionedCatalogCommand,
