@@ -10,10 +10,11 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::Connection;
 use tokio::sync::oneshot;
 use zippy_types::catalog::{
-    CatalogDataFileReferenceSnapshot, CatalogFileRead, CatalogQuerySnapshot, CatalogRead,
-    CatalogSnapshotSelector, CatalogWrite, ListNamespacesRequest, ListNamespacesResponse,
-    ListTablesRequest, ListTablesResponse, ManagedDataFileProbe, NamespaceRef,
-    VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogCommandReplayProbe, CatalogDataFileReferenceSnapshot, CatalogFileRead,
+    CatalogIdempotencyRead, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
+    CatalogWrite, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
+    ListTablesResponse, ManagedDataFileProbe, NamespaceRef, VersionedCatalogCommand,
+    VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
@@ -25,6 +26,7 @@ const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
 const CONTROL_READ_THREAD_NAME: &str = "zippy-catalog-control-read";
 const SNAPSHOT_READ_THREAD_NAME: &str = "zippy-catalog-snapshot-read";
+const REPLAY_PROBE_CAPACITY: usize = 4;
 
 /// A typed SQLite Catalog with thread-confined writer and read-only connections.
 ///
@@ -49,6 +51,7 @@ pub struct SqliteCatalog {
     read_pool: Option<CatalogReadPool>,
     command_budget: Arc<CommandBudget>,
     manifest_queue_budget: Arc<ManifestQueueBudget>,
+    replay_probe_budget: Arc<ReplayProbeBudget>,
 }
 
 impl SqliteCatalog {
@@ -85,6 +88,7 @@ impl SqliteCatalog {
         let manifest_queue_budget = Arc::new(ManifestQueueBudget::new(
             config.manifest_queue_capacity_bytes,
         ));
+        let replay_probe_budget = Arc::new(ReplayProbeBudget::new(REPLAY_PROBE_CAPACITY));
         let actor_config = config.clone();
         let actor = thread::Builder::new()
             .name(SERVICE_ACTOR_THREAD_NAME.to_owned())
@@ -105,6 +109,7 @@ impl SqliteCatalog {
                     actor: Some(actor),
                     command_budget,
                     manifest_queue_budget,
+                    replay_probe_budget,
                 };
                 match CatalogReadPool::start(&config, read_backend) {
                     Ok(read_pool) => {
@@ -300,6 +305,40 @@ impl CatalogFileRead for SqliteCatalog {
     }
 }
 
+impl CatalogIdempotencyRead for SqliteCatalog {
+    fn probe_command_replay<'a>(
+        &'a self,
+        command: &'a VersionedCatalogCommand,
+    ) -> BoxFuture<'a, Result<CatalogCommandReplayProbe>> {
+        Box::pin(async move {
+            let VersionedCatalogCommand::V1(envelope) = command;
+            let request_id = envelope.request_id;
+            let probe_permit = self
+                .replay_probe_budget
+                .reserve()
+                .map_err(|error| error.with_request_id(request_id))?;
+            let (key, probe_permit) = verify_replay_probe_command(
+                request_id,
+                command.clone(),
+                probe_permit,
+                domain::verify_command_replay_key,
+            )
+            .await?;
+            let result = await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|response| {
+                    ControlReadMessage::ProbeCommandReplay(CommandReplayProbeRequest {
+                        key,
+                        response,
+                        probe_permit,
+                    })
+                })
+            }))
+            .await;
+            result.map_err(|error| error.with_request_id(request_id))
+        })
+    }
+}
+
 impl CatalogWrite for SqliteCatalog {
     fn command(
         &self,
@@ -377,6 +416,59 @@ impl CommandBudget {
 
 struct CommandPermit {
     budget: Arc<CommandBudget>,
+}
+
+struct ReplayProbeBudget {
+    used: AtomicUsize,
+    maximum: usize,
+}
+
+impl ReplayProbeBudget {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            maximum,
+        }
+    }
+
+    fn reserve(self: &Arc<Self>) -> Result<ReplayProbePermit> {
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            if current >= self.maximum {
+                return Err(ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "sqlite catalog replay probe budget exhausted used=[{current}] maximum=[{}]",
+                        self.maximum
+                    ),
+                ));
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ReplayProbePermit {
+                        budget: Arc::clone(self),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct ReplayProbePermit {
+    budget: Arc<ReplayProbeBudget>,
+}
+
+impl Drop for ReplayProbePermit {
+    fn drop(&mut self) {
+        let previous = self.budget.used.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
 }
 
 impl Drop for CommandPermit {
@@ -517,6 +609,14 @@ trait CatalogReadBackend: Send + Sync + 'static {
     ) -> Result<CatalogDataFileReferenceSnapshot> {
         file_domain::inspect_data_file_references(connection, probes)
     }
+
+    fn probe_command_replay(
+        &self,
+        connection: &Connection,
+        key: &domain::VerifiedCommandReplayKey,
+    ) -> Result<CatalogCommandReplayProbe> {
+        domain::probe_command_replay(connection, key)
+    }
 }
 
 struct DomainCatalogReadBackend;
@@ -540,6 +640,13 @@ enum ControlReadMessage {
         Vec<ManagedDataFileProbe>,
         oneshot::Sender<Result<CatalogDataFileReferenceSnapshot>>,
     ),
+    ProbeCommandReplay(CommandReplayProbeRequest),
+}
+
+struct CommandReplayProbeRequest {
+    key: domain::VerifiedCommandReplayKey,
+    response: oneshot::Sender<Result<CatalogCommandReplayProbe>>,
+    probe_permit: ReplayProbePermit,
 }
 
 enum SnapshotReadMessage {
@@ -750,6 +857,20 @@ fn control_read_loop(
                     let _ = response
                         .send(backend.inspect_data_file_references(&mut connection, &probes));
                 }
+            }
+            ControlReadMessage::ProbeCommandReplay(request) => {
+                let CommandReplayProbeRequest {
+                    key,
+                    response,
+                    probe_permit,
+                } = request;
+                if response.is_closed() {
+                    drop(probe_permit);
+                    continue;
+                }
+                let result = backend.probe_command_replay(&connection, &key);
+                drop(probe_permit);
+                let _ = response.send(result);
             }
         }
     }
@@ -1225,6 +1346,35 @@ fn actor_stopped() -> ServerError {
     )
 }
 
+fn replay_probe_verification_stopped(
+    request_id: RequestId,
+    error: tokio::task::JoinError,
+) -> ServerError {
+    ServerError::new(
+        ErrorCode::Internal,
+        format!("sqlite catalog replay probe verification task stopped error=[{error}]"),
+    )
+    .with_request_id(request_id)
+    .with_retryable(false)
+}
+
+async fn verify_replay_probe_command<F>(
+    request_id: RequestId,
+    command: VersionedCatalogCommand,
+    probe_permit: ReplayProbePermit,
+    verify: F,
+) -> Result<(domain::VerifiedCommandReplayKey, ReplayProbePermit)>
+where
+    F: FnOnce(&VersionedCatalogCommand) -> Result<domain::VerifiedCommandReplayKey>
+        + Send
+        + 'static,
+{
+    let (key, probe_permit) = tokio::task::spawn_blocking(move || (verify(&command), probe_permit))
+        .await
+        .map_err(|error| replay_probe_verification_stopped(request_id, error))?;
+    Ok((key?, probe_permit))
+}
+
 fn read_pool_stopped() -> ServerError {
     ServerError::new(
         ErrorCode::Unavailable,
@@ -1264,8 +1414,9 @@ mod tests {
     use tempfile::TempDir;
     use zippy_core::OwnedDataDirectory;
     use zippy_types::catalog::{
-        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
-        CatalogSnapshotSelector, CatalogWrite, CommitDataFilesCommand, CreateNamespaceCommand,
+        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
+        CatalogCommandV1, CatalogIdempotencyRead, CatalogRead, CatalogSnapshotSelector,
+        CatalogWrite, CommandFingerprint, CommitDataFilesCommand, CreateNamespaceCommand,
         CreateTableCommand, VersionedCatalogCommand, VersionedCatalogResponse,
     };
     use zippy_types::table::{
@@ -1278,8 +1429,9 @@ mod tests {
     };
 
     use super::{
-        domain, snapshot_domain, CatalogReadBackend, DomainManifestPreparationBackend,
-        ManifestPreparationBackend, ManifestQueueBudget, SqliteCatalog, SqliteCatalogConfig,
+        domain, snapshot_domain, verify_replay_probe_command, CatalogReadBackend,
+        DomainManifestPreparationBackend, ManifestPreparationBackend, ManifestQueueBudget,
+        ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig,
     };
 
     const NAMESPACE_ID: u128 = 1;
@@ -1292,6 +1444,15 @@ mod tests {
 
     struct PanickingManifestBackend {
         panic_prepare_once: AtomicBool,
+    }
+
+    struct CountingManifestBackend {
+        verify_calls: Arc<AtomicUsize>,
+        prepare_calls: Arc<AtomicUsize>,
+    }
+
+    struct CountingReplayReadBackend {
+        probe_calls: Arc<AtomicUsize>,
     }
 
     struct BlockingSnapshotBackend {
@@ -1339,6 +1500,35 @@ mod tests {
                 panic!("injected manifest preparation panic");
             }
             domain::prepare_manifest_command(preparation)
+        }
+    }
+
+    impl ManifestPreparationBackend for CountingManifestBackend {
+        fn verify(
+            &self,
+            command: VersionedCatalogCommand,
+        ) -> zippy_types::Result<domain::VerifiedManifestCommand> {
+            self.verify_calls.fetch_add(1, Ordering::AcqRel);
+            domain::verify_manifest_command(command)
+        }
+
+        fn prepare(
+            &self,
+            preparation: domain::ManifestCommandPreparation,
+        ) -> domain::ManifestPreparationResult {
+            self.prepare_calls.fetch_add(1, Ordering::AcqRel);
+            domain::prepare_manifest_command(preparation)
+        }
+    }
+
+    impl CatalogReadBackend for CountingReplayReadBackend {
+        fn probe_command_replay(
+            &self,
+            connection: &rusqlite::Connection,
+            key: &domain::VerifiedCommandReplayKey,
+        ) -> zippy_types::Result<CatalogCommandReplayProbe> {
+            self.probe_calls.fetch_add(1, Ordering::AcqRel);
+            domain::probe_command_replay(connection, key)
         }
     }
 
@@ -1575,6 +1765,237 @@ mod tests {
             .reserve(8)
             .expect("released byte budget can be reserved again")
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_probe_is_bounded_read_only_and_skips_manifest_preparation() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let verify_calls = Arc::new(AtomicUsize::new(0));
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let catalog = SqliteCatalog::open_with_manifest_backend(
+            SqliteCatalogConfig::new(&data_directory),
+            Arc::new(CountingManifestBackend {
+                verify_calls: Arc::clone(&verify_calls),
+                prepare_calls: Arc::clone(&prepare_calls),
+            }),
+        )
+        .expect("open catalog with counting manifest backend");
+        create_append_table(&catalog).await;
+
+        let command = commit_data_file(3, 10, 2, 1, 0);
+        assert_eq!(
+            catalog
+                .probe_command_replay(&command)
+                .await
+                .expect("probe missing command"),
+            CatalogCommandReplayProbe::Missing
+        );
+        assert_eq!(catalog.revision().await, Ok(2));
+        assert_eq!(verify_calls.load(Ordering::Acquire), 0);
+        assert_eq!(prepare_calls.load(Ordering::Acquire), 0);
+
+        let committed = catalog
+            .command(command.clone())
+            .await
+            .expect("commit manifest once");
+        assert_eq!(verify_calls.load(Ordering::Acquire), 1);
+        assert_eq!(prepare_calls.load(Ordering::Acquire), 1);
+
+        assert_eq!(
+            catalog
+                .probe_command_replay(&command)
+                .await
+                .expect("probe exact committed command"),
+            CatalogCommandReplayProbe::Exact {
+                response: committed
+            }
+        );
+        let conflict = catalog
+            .probe_command_replay(&commit_data_file(3, 11, 3, 2, 1))
+            .await
+            .expect_err("same request id with another fingerprint must conflict");
+        assert_eq!(conflict.code(), ErrorCode::Conflict);
+        assert_eq!(conflict.request_id(), Some(request_id(3)));
+        assert_eq!(catalog.revision().await, Ok(3));
+        assert_eq!(verify_calls.load(Ordering::Acquire), 1);
+        assert_eq!(prepare_calls.load(Ordering::Acquire), 1);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_probe_ignores_manifest_write_budget_for_missing_and_exact_results() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let writer = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+            .expect("open catalog writer");
+        create_append_table(&writer).await;
+        let committed_command = commit_data_file(3, 10, 2, 1, 0);
+        let committed = writer
+            .command(committed_command.clone())
+            .await
+            .expect("commit replay fixture");
+        writer.close().expect("close catalog writer");
+
+        let verify_calls = Arc::new(AtomicUsize::new(0));
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+        let catalog = SqliteCatalog::open_with_manifest_backend(
+            SqliteCatalogConfig::new(&data_directory).with_manifest_queue_capacity_bytes(1),
+            Arc::new(CountingManifestBackend {
+                verify_calls: Arc::clone(&verify_calls),
+                prepare_calls: Arc::clone(&prepare_calls),
+            }),
+        )
+        .expect("open catalog with one-byte manifest budget");
+
+        assert_eq!(
+            catalog
+                .probe_command_replay(&commit_data_file(4, 11, 3, 2, 1))
+                .await
+                .expect("low manifest budget must still probe a missing command"),
+            CatalogCommandReplayProbe::Missing
+        );
+        assert_eq!(
+            catalog
+                .probe_command_replay(&committed_command)
+                .await
+                .expect("low manifest budget must replay a retained command"),
+            CatalogCommandReplayProbe::Exact {
+                response: committed
+            }
+        );
+        assert_eq!(catalog.revision().await, Ok(3));
+        assert_eq!(verify_calls.load(Ordering::Acquire), 0);
+        assert_eq!(prepare_calls.load(Ordering::Acquire), 0);
+        catalog.close().expect("close bounded catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_probe_releases_fixed_admission_before_observing_its_response() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open(
+            SqliteCatalogConfig::new(&data_directory).with_control_read_capacity(1),
+        )
+        .expect("open single-probe catalog");
+        let command = commit_data_file(3, 10, 2, 1, 0);
+
+        for _ in 0..32 {
+            assert_eq!(
+                catalog
+                    .probe_command_replay(&command)
+                    .await
+                    .expect("immediate replay probe admission must remain available"),
+                CatalogCommandReplayProbe::Missing
+            );
+            assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 0);
+        }
+
+        catalog.close().expect("close single-probe catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_probe_rejects_bad_fingerprint_before_control_read_worker() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let catalog = SqliteCatalog::open_with_backends(
+            SqliteCatalogConfig::new(&data_directory),
+            Arc::new(DomainManifestPreparationBackend),
+            Arc::new(CountingReplayReadBackend {
+                probe_calls: Arc::clone(&probe_calls),
+            }),
+        )
+        .expect("open catalog with counting replay backend");
+        let mut command = commit_data_file(3, 10, 2, 1, 0);
+        let VersionedCatalogCommand::V1(envelope) = &mut command;
+        envelope.canonical_fingerprint = CommandFingerprint::from_bytes([0_u8; 32]);
+
+        let error = catalog
+            .probe_command_replay(&command)
+            .await
+            .expect_err("bad fingerprint must fail before SQLite read admission");
+
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.request_id(), Some(request_id(3)));
+        assert_eq!(probe_calls.load(Ordering::Acquire), 0);
+        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 0);
+        catalog
+            .close()
+            .expect("close catalog with counting replay backend");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_replay_verification_retains_admission_until_blocking_work_exits() {
+        let budget = Arc::new(ReplayProbeBudget::new(1));
+        let permit = budget.reserve().expect("reserve only replay probe slot");
+        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
+        let verification = tokio::spawn(verify_replay_probe_command(
+            request_id(3),
+            commit_data_file(3, 10, 2, 1, 0),
+            permit,
+            move |command| {
+                started_sender
+                    .send(())
+                    .expect("observe blocking replay verification");
+                release_receiver
+                    .recv()
+                    .expect("release blocking replay verification");
+                domain::verify_command_replay_key(command)
+            },
+        ));
+        tokio::task::yield_now().await;
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking replay verification must start");
+
+        verification.abort();
+        let join_error = match verification.await {
+            Ok(_) => panic!("aborted replay verification unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
+        assert_eq!(budget.used.load(Ordering::Acquire), 1);
+
+        release_sender
+            .send(())
+            .expect("finish cancelled blocking verification");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.used.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled verification must eventually release admission");
+        drop(
+            budget
+                .reserve()
+                .expect("released replay probe slot must be reusable"),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_verification_panic_is_terminal_and_releases_admission() {
+        let budget = Arc::new(ReplayProbeBudget::new(1));
+        let permit = budget.reserve().expect("reserve replay probe slot");
+
+        let result = verify_replay_probe_command(
+            request_id(3),
+            commit_data_file(3, 10, 2, 1, 0),
+            permit,
+            |_| panic!("injected replay verification panic"),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("replay verification panic unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(!error.retryable());
+        assert_eq!(error.request_id(), Some(request_id(3)));
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

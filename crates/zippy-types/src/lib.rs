@@ -29,7 +29,7 @@ pub mod table;
 use std::future::Future;
 use std::pin::Pin;
 
-pub use catalog::{Catalog, CatalogRead, CatalogWrite};
+pub use catalog::{Catalog, CatalogIdempotencyRead, CatalogPersistence, CatalogRead, CatalogWrite};
 pub use error::{ErrorCode, Result, ServerError, ServerErrorDetails};
 pub use id::{
     ConnectionId, ConsumerGroupId, DurableConsumerId, EngineId, FileId, JobId, LeaseId,

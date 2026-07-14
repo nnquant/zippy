@@ -1293,6 +1293,22 @@ pub struct CatalogDataFileReferenceSnapshot {
     pub results: Vec<CatalogDataFileProbeResult>,
 }
 
+/// Read-only outcome for one complete Catalog command idempotency probe.
+///
+/// A missing record proves only that the supplied envelope has no retained
+/// response at the instant of the read. It does not authorize the caller to
+/// execute the mutation without the normal Catalog write protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCommandReplayProbe {
+    /// No retained idempotency record exists for the command request identity.
+    Missing,
+    /// The exact command fingerprint has an authoritative committed response.
+    Exact {
+        /// The original response committed atomically with the mutation.
+        response: VersionedCatalogResponse,
+    },
+}
+
 /// Read-only access to immutable persistent catalog state.
 pub trait CatalogRead: Send + Sync {
     /// Returns the current catalog revision.
@@ -1359,6 +1375,24 @@ pub trait CatalogFileRead: CatalogRead {
     ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>>;
 }
 
+/// Read-only access to durable Catalog command idempotency records.
+///
+/// Implementations must validate the complete versioned envelope and compare
+/// its canonical fingerprint, operation, and format against the retained
+/// record. Reusing a request ID with a different fingerprint must return a
+/// conflict. This capability must never prepare or execute the mutation.
+pub trait CatalogIdempotencyRead: Send + Sync {
+    /// Probes whether an exact command already has a committed response.
+    ///
+    /// Constructing and dropping the returned future before polling must not
+    /// perform work. A missing result is a read observation, not a reservation;
+    /// callers that may execute a new mutation must still use [`CatalogWrite`].
+    fn probe_command_replay<'a>(
+        &'a self,
+        command: &'a VersionedCatalogCommand,
+    ) -> BoxFuture<'a, Result<CatalogCommandReplayProbe>>;
+}
+
 /// Serialized mutation access to persistent catalog state.
 pub trait CatalogWrite: Send + Sync {
     /// Validates format, fingerprint, revision, and invariants before commit.
@@ -1381,6 +1415,17 @@ pub trait CatalogWrite: Send + Sync {
     ) -> BoxFuture<'_, Result<VersionedCatalogResponse>>;
 }
 
+/// Native persistence Catalog capabilities required for safe file publication.
+///
+/// The explicit composition keeps legacy adapters that cannot expose stable
+/// file identities or durable idempotency records out of native persistence.
+pub trait CatalogPersistence: CatalogFileRead + CatalogIdempotencyRead + CatalogWrite {}
+
+impl<T> CatalogPersistence for T where
+    T: CatalogFileRead + CatalogIdempotencyRead + CatalogWrite + ?Sized
+{
+}
+
 /// The complete persistent catalog boundary.
 pub trait Catalog: CatalogRead + CatalogWrite {}
 
@@ -1399,13 +1444,14 @@ mod tests {
         AcquireProducerCommand, AcquireSnapshotLeaseCommand, AlterTableSchemaCommand, Catalog,
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCodecError, CatalogCommandEnvelopeV1,
         CatalogCommandFingerprintInputV1, CatalogCommandFormatVersion, CatalogCommandV1,
-        CatalogFileRead, CatalogFingerprintError, CatalogOutcomeV1, CatalogQuerySnapshot,
-        CatalogRead, CatalogResponseV1, CatalogSnapshotSelector, CatalogTableSnapshot,
-        CatalogWrite, CommitCompactionCommand, CommitConsumerOffsetCommand, CommitDataFilesCommand,
-        CreateMaintenanceJobCommand, CreateNamespaceCommand, CreateTableCommand, DropTableCommand,
-        MaintenanceJobDescriptor, MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor,
-        ReleaseSnapshotLeaseCommand, SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand,
-        VersionedCatalogCommand, VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+        CatalogFileRead, CatalogFingerprintError, CatalogIdempotencyRead, CatalogOutcomeV1,
+        CatalogPersistence, CatalogQuerySnapshot, CatalogRead, CatalogResponseV1,
+        CatalogSnapshotSelector, CatalogTableSnapshot, CatalogWrite, CommitCompactionCommand,
+        CommitConsumerOffsetCommand, CommitDataFilesCommand, CreateMaintenanceJobCommand,
+        CreateNamespaceCommand, CreateTableCommand, DropTableCommand, MaintenanceJobDescriptor,
+        MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor, ReleaseSnapshotLeaseCommand,
+        SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand, VersionedCatalogCommand,
+        VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
     };
     use crate::table::{
         AppendTableDefinition, CatalogName, ColumnName, ColumnSet, DataFileDescriptor,
@@ -1798,6 +1844,8 @@ mod tests {
     fn assert_catalog_is_object_safe(_: Option<&dyn Catalog>) {}
     fn assert_catalog_read_is_object_safe(_: Option<&dyn CatalogRead>) {}
     fn assert_catalog_file_read_is_object_safe(_: Option<&dyn CatalogFileRead>) {}
+    fn assert_catalog_idempotency_read_is_object_safe(_: Option<&dyn CatalogIdempotencyRead>) {}
+    fn assert_catalog_persistence_is_object_safe(_: Option<&dyn CatalogPersistence>) {}
     fn assert_catalog_write_is_object_safe(_: Option<&dyn CatalogWrite>) {}
 
     #[test]
@@ -1805,6 +1853,8 @@ mod tests {
         assert_catalog_is_object_safe(None);
         assert_catalog_read_is_object_safe(None);
         assert_catalog_file_read_is_object_safe(None);
+        assert_catalog_idempotency_read_is_object_safe(None);
+        assert_catalog_persistence_is_object_safe(None);
         assert_catalog_write_is_object_safe(None);
     }
 

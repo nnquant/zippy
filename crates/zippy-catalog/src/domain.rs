@@ -6,9 +6,10 @@ use rusqlite::{
     params, Connection, Error as SqliteError, OptionalExtension, Params, TransactionBehavior,
 };
 use zippy_types::catalog::{
-    CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogOutcomeV1,
-    CatalogResponseV1, CreateNamespaceCommand, ListNamespacesRequest, ListNamespacesResponse,
-    NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
+    CatalogCommandV1, CatalogOutcomeV1, CatalogResponseV1, CreateNamespaceCommand,
+    ListNamespacesRequest, ListNamespacesResponse, NamespaceRef, VersionedCatalogCommand,
+    VersionedCatalogResponse,
 };
 use zippy_types::table::{CatalogName, NamespaceDescriptor};
 use zippy_types::{ErrorCode, NamespaceId, RequestId, Result, ServerError, ServerErrorDetails};
@@ -45,6 +46,11 @@ struct CommandContext {
     command_format_version: i64,
     operation: &'static str,
     fingerprint: [u8; 32],
+}
+
+/// A fixed-size replay lookup key derived from one completely verified command envelope.
+pub(crate) struct VerifiedCommandReplayKey {
+    context: CommandContext,
 }
 
 /// A manifest command whose complete frozen fingerprint has been validated.
@@ -105,6 +111,28 @@ pub(crate) fn execute_command(
     }
     let prepared = prepare_command(envelope.actor.kind, envelope.command, context.request_id)?;
     commit_prepared_command(connection, context, prepared)
+}
+
+/// Validates one complete command envelope and reduces it to a fixed-size replay lookup key.
+pub(crate) fn verify_command_replay_key(
+    command: &VersionedCatalogCommand,
+) -> Result<VerifiedCommandReplayKey> {
+    let VersionedCatalogCommand::V1(envelope) = command;
+    verify_envelope(envelope)?;
+    Ok(VerifiedCommandReplayKey {
+        context: command_context(envelope),
+    })
+}
+
+/// Returns an exact retained response without preparing or executing a mutation.
+pub(crate) fn probe_command_replay(
+    connection: &Connection,
+    key: &VerifiedCommandReplayKey,
+) -> Result<CatalogCommandReplayProbe> {
+    Ok(match try_replay_context(connection, &key.context)? {
+        Some(response) => CatalogCommandReplayProbe::Exact { response },
+        None => CatalogCommandReplayProbe::Missing,
+    })
 }
 
 /// Returns whether a command requires the database-independent manifest pipeline.
@@ -784,16 +812,19 @@ mod tests {
 
     use rusqlite::Connection;
     use zippy_types::catalog::{
-        CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
-        CreateNamespaceCommand, CreateTableCommand, DropTableCommand, ListNamespacesRequest,
-        NamespaceRef, VersionedCatalogCommand,
+        CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1,
+        CatalogCommandReplayProbe, CatalogCommandV1, CreateNamespaceCommand, CreateTableCommand,
+        DropTableCommand, ListNamespacesRequest, NamespaceRef, VersionedCatalogCommand,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, SchemaIpcPayload, TableDefinition,
     };
     use zippy_types::{ErrorCode, NamespaceId, RequestId, ServerErrorDetails, TableId};
 
-    use super::{execute_command, get_namespace, list_namespaces, revision};
+    use super::{
+        execute_command, get_namespace, list_namespaces, probe_command_replay, revision,
+        verify_command_replay_key,
+    };
     use crate::encoding::encode_u64;
 
     fn connection() -> Connection {
@@ -942,6 +973,54 @@ mod tests {
         let error =
             execute_command(&mut connection, create_table_command(request_id(1))).unwrap_err();
         assert_eq!(error.code(), ErrorCode::Conflict);
+        assert_eq!(revision(&connection).unwrap(), 1);
+    }
+
+    #[test]
+    fn command_replay_probe_is_read_only_and_matches_only_the_exact_fingerprint() {
+        let mut connection = connection();
+        let command = create_command(request_id(1), Some(0), namespace_id(1), "market");
+        let key = verify_command_replay_key(&command).unwrap();
+
+        assert_eq!(
+            probe_command_replay(&connection, &key).unwrap(),
+            CatalogCommandReplayProbe::Missing
+        );
+        assert_eq!(revision(&connection).unwrap(), 0);
+
+        let committed = execute_command(&mut connection, command.clone()).unwrap();
+        assert_eq!(
+            probe_command_replay(&connection, &key).unwrap(),
+            CatalogCommandReplayProbe::Exact {
+                response: committed
+            }
+        );
+        assert_eq!(revision(&connection).unwrap(), 1);
+
+        let changed = create_command(request_id(1), None, namespace_id(2), "changed");
+        let changed_key = verify_command_replay_key(&changed).unwrap();
+        let conflict = probe_command_replay(&connection, &changed_key).unwrap_err();
+        assert_eq!(conflict.code(), ErrorCode::Conflict);
+        assert_eq!(conflict.request_id(), Some(request_id(1)));
+        assert_eq!(revision(&connection).unwrap(), 1);
+    }
+
+    #[test]
+    fn command_replay_probe_fails_closed_on_a_corrupt_retained_response() {
+        let mut connection = connection();
+        let command = create_command(request_id(1), Some(0), namespace_id(1), "market");
+        execute_command(&mut connection, command.clone()).unwrap();
+        let key = verify_command_replay_key(&command).unwrap();
+        connection
+            .execute(
+                "UPDATE idempotent_requests SET response_blob = X'00' WHERE request_id = ?1",
+                [request_id(1).into_bytes().as_slice()],
+            )
+            .unwrap();
+
+        let error = probe_command_replay(&connection, &key).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(1)));
         assert_eq!(revision(&connection).unwrap(), 1);
     }
 
