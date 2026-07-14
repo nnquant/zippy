@@ -2,6 +2,7 @@
 members = [
     "crates/zippy-types",
     "crates/zippy-catalog",
+    "crates/zippy-storage",
     "crates/zippy-core",
     "crates/zippy-operators",
     "crates/zippy-engines",

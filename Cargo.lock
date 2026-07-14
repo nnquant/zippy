@@ -2460,6 +2460,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zippy-storage"
+version = "0.5.0"
+dependencies = [
+ "arrow",
+ "parquet",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zippy-core",
+ "zippy-types",
+]
+
+[[package]]
 name = "zippy-types"
 version = "0.5.0"
 dependencies = [
