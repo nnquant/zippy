@@ -50,7 +50,7 @@ pub use data_directory::{
 pub use data_directory_ownership::{
     DataDirectoryOwner, OwnedDataDirectory, DATA_DIRECTORY_LOCK_FILE,
 };
-pub use durable_file::{DurableFileTransaction, DurablePublishedFile};
+pub use durable_file::{DurableFileTransaction, DurablePublishedFile, DurableRemoveOutcome};
 pub use endpoint::{
     default_control_endpoint, default_control_endpoint_path, resolve_control_endpoint,
     resolve_control_endpoint_uri, resolve_control_endpoint_with_home, ControlEndpoint,

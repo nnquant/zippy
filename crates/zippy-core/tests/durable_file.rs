@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 
 use tempfile::TempDir;
-use zippy_core::{DataDirectory, DataDirectoryError, OwnedDataDirectory};
+use zippy_core::{DataDirectory, DataDirectoryError, DurableRemoveOutcome, OwnedDataDirectory};
 use zippy_types::table::ManagedDataPath;
 
 fn data_directory(directory: &TempDir) -> OwnedDataDirectory {
@@ -148,4 +148,97 @@ fn durable_file_rejects_a_regular_file_parent_component() {
         error,
         DataDirectoryError::NotDirectory { path } if path == parent
     ));
+}
+
+#[test]
+fn durable_remove_is_idempotent_and_syncs_a_published_file() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let path = managed_path("wal/manifest-intents/request.json");
+    let mut transaction = data_directory
+        .begin_durable_file(&path)
+        .expect("begin durable file");
+    transaction
+        .write_all(b"pending commit")
+        .expect("write durable file");
+    let published = transaction
+        .publish_noclobber()
+        .expect("publish durable file");
+
+    assert_eq!(
+        data_directory
+            .remove_durable_file(&path)
+            .expect("remove durable file"),
+        DurableRemoveOutcome::Removed
+    );
+    assert!(!published.path().exists());
+    assert_eq!(
+        data_directory
+            .remove_durable_file(&path)
+            .expect("repeat durable removal"),
+        DurableRemoveOutcome::NotFound
+    );
+}
+
+#[test]
+fn durable_remove_of_a_missing_parent_is_idempotent() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+
+    assert_eq!(
+        data_directory
+            .remove_durable_file(&managed_path("wal/missing/request.json"))
+            .expect("remove absent file"),
+        DurableRemoveOutcome::NotFound
+    );
+    assert!(!data_directory
+        .directory()
+        .root()
+        .join("wal/missing")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_remove_rejects_symbolic_links_and_hard_links() {
+    use std::os::unix::fs::symlink;
+
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let source_path = data_directory.directory().root().join("wal/source");
+    fs::write(&source_path, b"source").expect("write source file");
+    let symlink_path = managed_path("wal/request-link");
+    symlink(
+        &source_path,
+        data_directory
+            .directory()
+            .root()
+            .join(symlink_path.as_str()),
+    )
+    .expect("create symlink");
+
+    assert!(matches!(
+        data_directory.remove_durable_file(&symlink_path),
+        Err(DataDirectoryError::SymbolicLink { .. })
+    ));
+    assert_eq!(fs::read(&source_path).expect("read source"), b"source");
+
+    let hard_link_path = managed_path("wal/request-hard-link");
+    fs::hard_link(
+        &source_path,
+        data_directory
+            .directory()
+            .root()
+            .join(hard_link_path.as_str()),
+    )
+    .expect("create hard link");
+    assert!(matches!(
+        data_directory.remove_durable_file(&hard_link_path),
+        Err(DataDirectoryError::UnexpectedLinkCount { links: 2, .. })
+    ));
+    assert!(data_directory
+        .directory()
+        .root()
+        .join(hard_link_path.as_str())
+        .exists());
 }

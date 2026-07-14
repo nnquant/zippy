@@ -93,6 +93,15 @@ pub struct DurablePublishedFile {
     size_bytes: u64,
 }
 
+/// Result of durably removing one managed regular file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableRemoveOutcome {
+    /// The file was unlinked and its parent directory was synchronized.
+    Removed,
+    /// No directory entry existed at the requested managed path.
+    NotFound,
+}
+
 impl DurablePublishedFile {
     /// Returns the validated path relative to the data root.
     pub fn managed_path(&self) -> &ManagedDataPath {
@@ -121,6 +130,18 @@ impl OwnedDataDirectory {
         managed_path: &ManagedDataPath,
     ) -> Result<DurableFileTransaction, DataDirectoryError> {
         begin_durable_file(self.directory().root(), managed_path)
+    }
+
+    /// Removes one managed regular file and synchronizes its parent directory.
+    ///
+    /// Missing files are idempotent. Symbolic links, non-regular targets,
+    /// insecure permissions, foreign ownership, and extra hard links are
+    /// rejected before unlinking.
+    pub fn remove_durable_file(
+        &self,
+        managed_path: &ManagedDataPath,
+    ) -> Result<DurableRemoveOutcome, DataDirectoryError> {
+        remove_durable_file(self.directory().root(), managed_path)
     }
 }
 
@@ -199,4 +220,126 @@ fn validate_parent_component(
         });
     }
     require_owner_permissions(path)
+}
+
+fn remove_durable_file(
+    root: &Path,
+    managed_path: &ManagedDataPath,
+) -> Result<DurableRemoveOutcome, DataDirectoryError> {
+    let relative = Path::new(managed_path.as_str());
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let Some(parent) = find_existing_parent(root, relative_parent)? else {
+        return Ok(DurableRemoveOutcome::NotFound);
+    };
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| DataDirectoryError::InvalidManagedPath {
+            path: relative.to_path_buf(),
+        })?;
+    remove_file_from_parent(&parent, file_name)
+}
+
+fn find_existing_parent(
+    root: &Path,
+    relative_parent: &Path,
+) -> Result<Option<PathBuf>, DataDirectoryError> {
+    let mut current = root.to_path_buf();
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(DataDirectoryError::InvalidManagedPath {
+                path: relative_parent.to_path_buf(),
+            });
+        };
+        let next = current.join(component);
+        match fs::symlink_metadata(&next) {
+            Ok(metadata) => validate_parent_component(&next, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(&next, error)),
+        }
+        current = next;
+    }
+    Ok(Some(current))
+}
+
+#[cfg(unix)]
+fn remove_file_from_parent(
+    parent: &Path,
+    file_name: &std::ffi::OsStr,
+) -> Result<DurableRemoveOutcome, DataDirectoryError> {
+    use std::fs::File;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = parent.join(file_name);
+    let parent_descriptor = rustix::fs::open(
+        parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| io_error(parent, std::io::Error::from(error)))?;
+    let parent_directory = File::from(parent_descriptor);
+    let target_descriptor = match rustix::fs::openat(
+        &parent_directory,
+        file_name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(DurableRemoveOutcome::NotFound),
+        Err(rustix::io::Errno::LOOP) => return Err(DataDirectoryError::SymbolicLink { path }),
+        Err(error) => return Err(io_error(&path, std::io::Error::from(error))),
+    };
+    let target = File::from(target_descriptor);
+    let descriptor_metadata = target.metadata().map_err(|error| io_error(&path, error))?;
+    if !descriptor_metadata.is_file() {
+        return Err(DataDirectoryError::NotRegularFile { path });
+    }
+    let current_uid = rustix::process::geteuid().as_raw();
+    if descriptor_metadata.uid() != current_uid {
+        return Err(DataDirectoryError::WrongOwner {
+            path,
+            owner_uid: descriptor_metadata.uid(),
+            current_uid,
+        });
+    }
+    if descriptor_metadata.nlink() != 1 {
+        return Err(DataDirectoryError::UnexpectedLinkCount {
+            path,
+            links: descriptor_metadata.nlink(),
+        });
+    }
+    let mode = descriptor_metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(DataDirectoryError::InsecurePermissions { path, mode });
+    }
+    let path_metadata = fs::symlink_metadata(&path).map_err(|error| io_error(&path, error))?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(DataDirectoryError::SymbolicLink { path });
+    }
+    if descriptor_metadata.dev() != path_metadata.dev()
+        || descriptor_metadata.ino() != path_metadata.ino()
+    {
+        return Err(DataDirectoryError::PathIdentityChanged { path });
+    }
+    match rustix::fs::unlinkat(&parent_directory, file_name, rustix::fs::AtFlags::empty()) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::NOENT) => {
+            return Err(DataDirectoryError::PathIdentityChanged { path });
+        }
+        Err(error) => return Err(io_error(&path, std::io::Error::from(error))),
+    }
+    parent_directory
+        .sync_all()
+        .map_err(|error| io_error(parent, error))?;
+    Ok(DurableRemoveOutcome::Removed)
+}
+
+#[cfg(not(unix))]
+fn remove_file_from_parent(
+    _parent: &Path,
+    _file_name: &std::ffi::OsStr,
+) -> Result<DurableRemoveOutcome, DataDirectoryError> {
+    Err(DataDirectoryError::UnsupportedPlatformSecurity)
 }
