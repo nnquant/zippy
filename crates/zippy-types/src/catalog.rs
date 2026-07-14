@@ -1,6 +1,7 @@
 //! Persistent catalog commands, immutable historical snapshots, and service traits.
 
 mod wire_v1;
+mod wire_v2;
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -27,6 +28,11 @@ use crate::{
 pub const CURRENT_CATALOG_COMMAND_FORMAT_VERSION: u32 = 1;
 /// The permanently assigned wire version for frozen V1 catalog records.
 pub const CATALOG_COMMAND_FORMAT_VERSION_V1: u32 = 1;
+/// The migration-only typed legacy table import format.
+pub const LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2: u32 = 2;
+/// Reserved file metadata key binding verifier-observed Arrow Schema to a V2 import command.
+pub const LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY: &str =
+    "zippy.legacy_import.verified_schema_hash";
 /// Maximum UTF-8 byte length of an audited catalog actor principal.
 pub const MAX_CATALOG_ACTOR_PRINCIPAL_BYTES: usize = 4 * 1024;
 
@@ -258,6 +264,9 @@ pub enum CatalogCodecError {
     /// Frozen V1 fields failed explicit conversion into validated domain types.
     #[error("invalid frozen V1 catalog payload error=[{0}]")]
     InvalidV1(String),
+    /// Frozen V2 legacy-import fields failed explicit conversion into validated domain types.
+    #[error("invalid frozen V2 legacy import payload error=[{0}]")]
+    InvalidLegacyImportV2(String),
 }
 
 /// An idempotent and optionally revision-guarded catalog mutation.
@@ -275,6 +284,184 @@ pub struct CatalogCommandEnvelopeV1 {
     pub command: CatalogCommandV1,
     /// SHA-256 of the canonical fingerprint input.
     pub canonical_fingerprint: CommandFingerprint,
+}
+
+/// One externally verified legacy file and its Gateway-compatible scan position.
+///
+/// This DTO belongs to a trusted, startup-only internal migration boundary. It must be constructed
+/// from physical verifier output and must not be accepted directly from an RPC or untrusted input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogImportFileV2 {
+    /// Complete immutable physical metadata proven before Catalog admission.
+    pub file: PendingDataFile,
+    /// Zero-based position after applying the legacy Gateway's stable persisted-file ordering key.
+    /// The original registry index is audit metadata and must not be used here.
+    pub discovery_order: u64,
+}
+
+/// Migration-only command that atomically creates one table and imports its legacy files.
+///
+/// This is a trusted, startup-only internal DTO, not a public RPC request. Every file entry must
+/// already have passed the local physical verifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogImportCommandV2 {
+    /// The caller-assigned immutable table identifier.
+    pub table_id: TableId,
+    /// The existing namespace that will own the table.
+    pub namespace_id: NamespaceId,
+    /// The name, unique within the namespace.
+    pub name: CatalogName,
+    /// The typed table storage and mutation definition.
+    pub definition: TableDefinition,
+    /// The first Arrow schema encoded as IPC.
+    pub schema_ipc: SchemaIpcPayload,
+    /// Catalog canonical logical Schema hash, independent of IPC metadata map order.
+    pub canonical_schema_hash: String,
+    /// Stable table configuration values.
+    pub config: BTreeMap<String, String>,
+    /// Exact writer epoch captured atomically from the legacy registry.
+    pub writer_epoch: u64,
+    /// Externally verified files in strict Gateway-compatible scan order.
+    pub files: Vec<LegacyCatalogImportFileV2>,
+    /// Legacy persisted-file view revision represented by this import.
+    pub legacy_files_revision: u64,
+}
+
+/// Idempotent migration-only V2 envelope.
+///
+/// This envelope is restricted to trusted startup-time migration orchestration and must not be
+/// exposed as an RPC contract. `actor` is audit metadata only; neither its kind nor principal
+/// proves authentication, authorization, or possession of a migration capability.
+///
+/// `schema_ipc` is intentionally excluded from the fingerprint. Its decoded logical Schema must
+/// match `canonical_schema_hash` before the first transaction; exact replays may therefore use a
+/// byte-different IPC stream that represents the same canonical Schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogImportEnvelopeV2 {
+    /// The fixed migration import format version.
+    pub format_version: CatalogCommandFormatVersion,
+    /// The idempotency key for this logical table import.
+    pub request_id: RequestId,
+    /// The Catalog revision that must still be current on first execution.
+    pub expected_revision: Option<u64>,
+    /// The audited migration actor; this field does not grant migration authority.
+    pub actor: CatalogActor,
+    /// Digest of the atomic legacy registry snapshot used to build the command.
+    pub source_snapshot_hash: String,
+    /// Legacy Catalog revision captured with the source snapshot.
+    pub source_catalog_revision: u64,
+    /// The typed table and verified-file import body.
+    pub command: LegacyCatalogImportCommandV2,
+    /// SHA-256 of the canonical logical import fields.
+    pub canonical_fingerprint: CommandFingerprint,
+}
+
+impl LegacyCatalogImportEnvelopeV2 {
+    /// Creates a V2 envelope and computes its canonical logical fingerprint.
+    pub fn new(
+        request_id: RequestId,
+        expected_revision: Option<u64>,
+        actor: CatalogActor,
+        source_snapshot_hash: String,
+        source_catalog_revision: u64,
+        command: LegacyCatalogImportCommandV2,
+    ) -> std::result::Result<Self, CatalogFingerprintError> {
+        let mut envelope = Self {
+            format_version: CatalogCommandFormatVersion::new(
+                LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2,
+            ),
+            request_id,
+            expected_revision,
+            actor,
+            source_snapshot_hash,
+            source_catalog_revision,
+            command,
+            canonical_fingerprint: CommandFingerprint::from_bytes([0; 32]),
+        };
+        envelope.canonical_fingerprint = envelope.fingerprint()?;
+        Ok(envelope)
+    }
+
+    /// Recomputes and validates the canonical logical fingerprint.
+    pub fn verify_fingerprint(&self) -> std::result::Result<(), CatalogFingerprintError> {
+        if self.fingerprint()? == self.canonical_fingerprint {
+            Ok(())
+        } else {
+            Err(CatalogFingerprintError::Mismatch)
+        }
+    }
+
+    fn fingerprint(&self) -> std::result::Result<CommandFingerprint, CatalogFingerprintError> {
+        if self.format_version.get() != LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2 {
+            return Err(CatalogFingerprintError::UnsupportedFormatVersion {
+                actual: self.format_version.get(),
+            });
+        }
+        let actual = self.actor.principal.len();
+        if actual > MAX_CATALOG_ACTOR_PRINCIPAL_BYTES {
+            return Err(CatalogFingerprintError::ActorPrincipalTooLarge {
+                actual,
+                maximum: MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+            });
+        }
+        let mut writer = FingerprintWriter(Sha256::new());
+        serde_json::to_writer(&mut writer, &wire_v2::FingerprintInputRefV2::from(self))
+            .map_err(CatalogFingerprintError::Encode)?;
+        let digest = writer.0.finalize();
+        let mut fingerprint = [0_u8; 32];
+        fingerprint.copy_from_slice(&digest);
+        Ok(CommandFingerprint::from_bytes(fingerprint))
+    }
+}
+
+/// Durable result of one atomic legacy table import.
+///
+/// This response belongs to the trusted startup-only internal migration boundary and is not an RPC
+/// response contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogImportResponseV2 {
+    /// The idempotency key from the command envelope.
+    pub request_id: RequestId,
+    /// The Catalog revision after the import committed.
+    pub catalog_revision: u64,
+    /// The imported table descriptor.
+    pub table: TableDescriptor,
+    /// The final nonempty-table `import` snapshot.
+    pub snapshot: TableSnapshot,
+}
+
+/// Stable codec for durable V2 legacy-import response records.
+///
+/// The codec uses a private frozen wire mirror and never serializes domain structs directly.
+pub struct LegacyCatalogImportCodecV2;
+
+impl LegacyCatalogImportCodecV2 {
+    /// Encodes one response in the permanently assigned V2 response envelope.
+    pub fn encode_response(
+        response: &LegacyCatalogImportResponseV2,
+    ) -> std::result::Result<Vec<u8>, CatalogCodecError> {
+        Ok(serde_json::to_vec(&wire_v2::ResponseEnvelopeV2::from(
+            response,
+        ))?)
+    }
+
+    /// Decodes one frozen V2 response and rejects unknown versions or fields.
+    pub fn decode_response(
+        bytes: &[u8],
+    ) -> std::result::Result<LegacyCatalogImportResponseV2, CatalogCodecError> {
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            format_version: u32,
+        }
+
+        let version = serde_json::from_slice::<VersionProbe>(bytes)?.format_version;
+        if version != LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2 {
+            return Err(CatalogCodecError::UnsupportedVersion { actual: version });
+        }
+        serde_json::from_slice::<wire_v2::ResponseEnvelopeV2>(bytes)?
+            .into_domain()
+            .map_err(CatalogCodecError::InvalidLegacyImportV2)
+    }
 }
 
 impl CatalogCommandEnvelopeV1 {

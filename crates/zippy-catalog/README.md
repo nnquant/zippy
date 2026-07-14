@@ -16,8 +16,9 @@ Implemented:
   catalog metadata;
 - per-version normalized `sqlite_schema` inventory fingerprints, including
   implicit auto-indexes, validated before each migration commits and on reopen;
-- VM-step-interruptible startup and explicit `quick_check(1)` plus
-  `foreign_key_check`; ordinary inspection returns the cached integrity result;
+- VM-step-interruptible pre-migration and post-migration `quick_check(1)` plus
+  `foreign_key_check`, so a corrupt old Catalog is not advanced before startup rejects it; ordinary
+  inspection returns the cached integrity result;
 - future physical schema versions fail closed;
 - physical v2 domain tables for namespaces, tables, schemas, snapshots, files,
   source lineage, producer checkpoints, durable consumer offsets, long-lived
@@ -26,6 +27,10 @@ Implemented:
   discovery without table scans or temporary sorts;
 - physical v4 table-first partial indexes for bounded safe-GC retry/claim
   scans and table-first snapshot-lease protection checks;
+- physical v5 adds the dedicated permanent `legacy_import_requests` replay table in O(1) schema
+  work. It does not rebuild or widen `idempotent_requests`; its historical DDL, index roots, and row
+  bytes remain untouched. Hard-coded migration-checksum and complete schema-inventory goldens freeze
+  physical v1-v4 compatibility;
 - lossless big-endian BLOB encodings for stable IDs, every `u64`, optional
   values, and explicit empty/known/legacy-unknown watermarks;
 - a second single-connection actor implementing `CreateNamespace`,
@@ -56,17 +61,29 @@ Implemented:
   strictly ordered selectors; each all-or-nothing response is capped at 64 MiB,
   65,536 visible files, and 262,144 lineage rows before owned allocation;
 - lifecycle-safe read handles expose `read_pinned_snapshot_at` as the Catalog half of physical
-  query execution. It admits an in-process pin before reading exact metadata and returns an owner
-  that retains every table pin until drop. The metadata view remains cloneable for planning, so a
-  physical QueryService must retain the owner, or an opaque lease derived from it, through every
-  scan task instead of treating a cloned view as a lifetime capability. Pin admission is split
-  across 64 table-keyed shards. Its configurable defaults are 131,072 active pins and 16,384
-  active tables, with hard platform ceilings of 1,048,576 and 131,072 respectively, so unrelated
-  tables do not serialize on one mutex and abandoned queries cannot grow unbounded state.
-  `SqliteCatalog::runtime_snapshot_pin_status()` and the lifecycle-safe read handle return
-  lock-free active gauges, configured limits, and cumulative pin/table budget-exhaustion counters
-  without entering a SQLite lane. A retained guard makes shutdown observable as closed admission;
-  after the last guard drops, the read handle returns terminal unavailability;
+  query execution. It admits every in-process table pin before reading exact metadata and returns
+  an opaque `SqliteCatalogPinnedQuerySnapshot`. Raw `CatalogQuerySnapshot`,
+  `CatalogTableSnapshot`, `DataFileDescriptor`, and physical locations are deliberately not
+  exposed by this pinned API. Planning uses location-free metadata from `PinnedTableManifest`;
+  parallel scans clone `PinnedDataFile` tasks and call synchronous `open_reader` on a bounded
+  blocking scan worker once per physical file scan, producing independent seek cursors. Executors
+  must not open the same external legacy file once per parallel worker because each open performs a
+  full checksum pass. Every task and every `PinnedDataFileReader` shares one `Arc` owner that
+  retains all pins and the owned data-root capability until the final task or reader drops. Managed
+  files are opened component by component relative to the stable data-root descriptor with
+  `NOFOLLOW`, then checked for regular-file type, exact Catalog size, owner, link count, and
+  owner-only permissions. External legacy files are reopened with `NOFOLLOW|NONBLOCK`, hashed on
+  the same descriptor, compared with the Catalog checksum, and rewound before scanning. This
+  transitional correctness check is O(file size) per opened external reader; legacy roots must
+  remain quiescent/read-only, and native managed files do not pay this extra full-file hash. Pin
+  admission is split across
+  64 table-keyed shards. Its configurable defaults are 131,072 active pins and 16,384 active
+  tables, with hard platform ceilings of 1,048,576 and 131,072 respectively, so unrelated tables
+  do not serialize on one mutex and abandoned queries cannot grow unbounded state.
+  `SqliteCatalog::runtime_snapshot_pin_status()` and the lifecycle-safe read handle return lock-free
+  active gauges, configured limits, and cumulative pin/table budget-exhaustion counters without
+  entering a SQLite lane. A retained task or reader makes shutdown observable as closed admission;
+  after the final owner drops, the read handle returns terminal unavailability;
 - server-internal frozen V1 manifest commits for native append tables:
   `CommitDataFiles` advances one contiguous persisted watermark, while
   `CommitCompaction` atomically replaces an exact visible input set with
@@ -112,8 +129,9 @@ Implemented:
 Physical SQLite schema versions and `CatalogCommand` wire versions are separate
 version spaces. Physical v1 remains the immutable migration foundation.
 Physical v2 is the complete first domain layout. Physical v3 adds table
-discovery indexes and physical v4 adds safe-GC indexes; neither changes typed
-domain encodings or implies that every V1 command is executable.
+discovery indexes, physical v4 adds safe-GC indexes, and physical v5 adds a
+dedicated permanent replay table for the trusted V2 legacy importer. These
+versions do not imply that every V1 command is executable.
 
 Historical-manifest reads seek `data_files_visible_by_table` by table, committed
 state, and the half-open added/removed snapshot interval. SQLite returns bounded
@@ -132,12 +150,13 @@ Current typed capability matrix:
 | server-internal append row-preserving `CommitCompaction` | implemented transactionally with exact input/output coverage |
 | durable `AcquireSnapshotLease` / `ReleaseSnapshotLease` | implemented transactionally; incomplete deleting/deleted historical snapshots reject new leases |
 | managed historical-file safe-GC claim/finalize | implemented transactionally with durable-lease and runtime-min-pin protection |
-| preserved legacy discovery-order snapshots | `UnsupportedPlan` pending V2 read DTO |
+| trusted startup-only V2 legacy table import | implemented as one create/import/file/revision/permanent-replay transaction behind a non-cloneable instance-bound startup session; physical files must first pass `zippy-storage` verification |
+| preserved legacy Gateway scan-order snapshots | `UnsupportedPlan` pending V2 read DTO |
 | producer-fenced public ingest manifest protocol | not provided by V1 manifest commands |
 | maintenance lease-fenced compaction worker protocol | not provided by V1 manifest commands |
 | legacy, frame-aware, or key-value materializing manifest mutations | `UnsupportedPlan` pending V2 commands |
 | alter/drop/schema/producer/consumer/job commands | `UnsupportedPlan` |
-| legacy primary + SQLite shadow fan-out | bounded Gateway comparison worker connected in `sqlite_shadow`; exact legacy manifest import/revision mapping remains pending for nonempty file sets |
+| legacy primary + SQLite shadow fan-out | bounded Gateway comparison worker connected in `sqlite_shadow`; Master exposes a typed immutable file projection and the V2 import primitive exists, but Server planning, scan-order reads, and revision mapping remain pending |
 | SQLite read or write authority | disabled |
 
 The physical schema reserves `legacy_discovery_order`, but frozen V1 snapshot
@@ -176,10 +195,10 @@ default to 64 control reads and 8 snapshot reads. CreateTable schema preparation
 manifest finalization, configurable snapshot parallelism, active-read
 interruption, and absolute shutdown deadlines remain future isolation work.
 
-Before server integration, the Catalog must still add remaining table commands,
+Before authority integration, the Catalog must still add remaining table commands,
 public producer-fenced ingest and lease-fenced maintenance orchestration, V2
-legacy/frame/key-value manifest contracts, a V2 legacy scan-order read contract,
-process-level ownership, network filesystem rejection, directory-handle pinning
+frame/key-value manifest contracts, a V2 legacy scan-order read contract, an
+authority-only raw snapshot read boundary, network filesystem rejection, directory-handle pinning
 against parent replacement races, process-kill crash failpoints, and an absolute
 shutdown deadline. The current reliable `close` may wait indefinitely for a
 worker already executing work; dropping the handle invokes the same shutdown path.

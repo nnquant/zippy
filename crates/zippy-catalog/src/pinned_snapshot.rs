@@ -1,0 +1,669 @@
+//! Lease-bound query manifests and controlled physical file readers.
+
+use std::fmt;
+use std::fs::{File, Metadata};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::num::NonZeroU64;
+use std::path::{Component, Path};
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+use zippy_core::OwnedDataDirectory;
+use zippy_types::catalog::{CatalogQuerySnapshot, CatalogSnapshotSelector};
+use zippy_types::table::{
+    DataFileDescriptor, DataFileLocation, DataFileProvenance, DataFileState, MetadataMap,
+    SchemaDescriptor, TableDescriptor, TableSnapshot,
+};
+use zippy_types::{ErrorCode, FileId, Result, ServerError, TableId};
+
+/// Exact Catalog metadata retained together with its in-process GC pins.
+///
+/// The raw Catalog snapshot and every physical location remain private. Callers split work by
+/// cloning [`PinnedTableManifest`] or [`PinnedDataFile`] values; each clone retains the same
+/// opaque owner, so the final task or reader releases all table pins.
+///
+/// ```compile_fail
+/// fn raw_snapshot_cannot_escape(
+///     pinned: &zippy_catalog::SqliteCatalogPinnedQuerySnapshot,
+/// ) {
+///     let _ = pinned.snapshot();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct SqliteCatalogPinnedQuerySnapshot {
+    owner: Arc<PinnedSnapshotOwner>,
+}
+
+struct PinnedSnapshotOwner {
+    snapshot: CatalogQuerySnapshot,
+    _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
+    _data_directory: Arc<OwnedDataDirectory>,
+}
+
+impl SqliteCatalogPinnedQuerySnapshot {
+    pub(crate) fn new(
+        snapshot: CatalogQuerySnapshot,
+        pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
+        data_directory: Arc<OwnedDataDirectory>,
+    ) -> Self {
+        Self {
+            owner: Arc::new(PinnedSnapshotOwner {
+                snapshot,
+                _pins: pins,
+                _data_directory: data_directory,
+            }),
+        }
+    }
+
+    /// Returns the Catalog revision shared by every pinned table manifest.
+    #[must_use]
+    pub fn catalog_revision(&self) -> u64 {
+        self.owner.snapshot.catalog_revision()
+    }
+
+    /// Returns the number of exact table manifests retained by this owner.
+    #[must_use]
+    pub fn table_count(&self) -> usize {
+        self.owner.snapshot.tables().len()
+    }
+
+    /// Returns true when the query references no tables.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.owner.snapshot.is_empty()
+    }
+
+    /// Creates lease-bound task manifests in deterministic table-id order.
+    pub fn tables(&self) -> impl ExactSizeIterator<Item = PinnedTableManifest> + '_ {
+        (0..self.table_count()).map(|table_index| PinnedTableManifest {
+            owner: Arc::clone(&self.owner),
+            table_index,
+        })
+    }
+
+    /// Creates one lease-bound table task by deterministic manifest index.
+    #[must_use]
+    pub fn table(&self, table_index: usize) -> Option<PinnedTableManifest> {
+        (table_index < self.table_count()).then(|| PinnedTableManifest {
+            owner: Arc::clone(&self.owner),
+            table_index,
+        })
+    }
+}
+
+impl fmt::Debug for SqliteCatalogPinnedQuerySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteCatalogPinnedQuerySnapshot")
+            .field("catalog_revision", &self.catalog_revision())
+            .field("table_count", &self.table_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One exact table manifest whose clones retain the query snapshot owner.
+///
+/// This type exposes planning metadata that contains no data-file location. Physical files are
+/// represented only by [`PinnedDataFile`] task values.
+#[derive(Clone)]
+pub struct PinnedTableManifest {
+    owner: Arc<PinnedSnapshotOwner>,
+    table_index: usize,
+}
+
+impl PinnedTableManifest {
+    /// Returns the exact Catalog selector protected by this manifest.
+    #[must_use]
+    pub fn selector(&self) -> &CatalogSnapshotSelector {
+        self.raw_table().selector()
+    }
+
+    /// Borrows persistent table metadata, which contains no physical file location.
+    #[must_use]
+    pub fn table_descriptor(&self) -> &TableDescriptor {
+        self.raw_table().table()
+    }
+
+    /// Borrows the exact decoder schema selected for this table.
+    #[must_use]
+    pub fn schema(&self) -> &SchemaDescriptor {
+        self.raw_table().schema()
+    }
+
+    /// Borrows logical snapshot metadata without exposing its physical manifest.
+    #[must_use]
+    pub fn snapshot_metadata(&self) -> &TableSnapshot {
+        self.raw_table().snapshot()
+    }
+
+    /// Returns the number of visible physical files in this exact snapshot.
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.raw_table().files().len()
+    }
+
+    /// Returns true when the exact snapshot contains no persisted files.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.raw_table().files().is_empty()
+    }
+
+    /// Creates lease-bound file tasks in the exact deterministic Catalog manifest order.
+    pub fn files(&self) -> impl ExactSizeIterator<Item = PinnedDataFile> + '_ {
+        (0..self.file_count()).map(|file_index| PinnedDataFile {
+            owner: Arc::clone(&self.owner),
+            table_index: self.table_index,
+            file_index,
+        })
+    }
+
+    /// Creates one lease-bound file task by deterministic manifest index.
+    #[must_use]
+    pub fn file(&self, file_index: usize) -> Option<PinnedDataFile> {
+        (file_index < self.file_count()).then(|| PinnedDataFile {
+            owner: Arc::clone(&self.owner),
+            table_index: self.table_index,
+            file_index,
+        })
+    }
+
+    fn raw_table(&self) -> &zippy_types::catalog::CatalogTableSnapshot {
+        &self.owner.snapshot.tables()[self.table_index]
+    }
+}
+
+impl fmt::Debug for PinnedTableManifest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedTableManifest")
+            .field("selector", self.selector())
+            .field("file_count", &self.file_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The non-sensitive class of a pinned data-file location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedDataFileLocationKind {
+    /// A server-managed file below the exclusively owned data root.
+    Managed,
+    /// An explicitly mounted read-only legacy file outside the managed root.
+    ExternalLegacy,
+}
+
+/// One physical scan task that retains the complete query snapshot owner.
+///
+/// No method exposes a path or a cloneable [`DataFileDescriptor`]. Use [`Self::open_reader`] to
+/// obtain a controlled reader that independently keeps the same owner alive.
+///
+/// ```compile_fail
+/// fn raw_location_cannot_escape(file: &zippy_catalog::PinnedDataFile) {
+///     let _ = file.location();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct PinnedDataFile {
+    owner: Arc<PinnedSnapshotOwner>,
+    table_index: usize,
+    file_index: usize,
+}
+
+impl PinnedDataFile {
+    /// Returns the immutable Catalog file identity.
+    #[must_use]
+    pub fn file_id(&self) -> FileId {
+        self.raw_file().file_id()
+    }
+
+    /// Returns the immutable owning table identity.
+    #[must_use]
+    pub fn table_id(&self) -> TableId {
+        self.raw_file().table_id()
+    }
+
+    /// Returns the schema version encoded in this physical file.
+    #[must_use]
+    pub fn schema_version(&self) -> u64 {
+        self.raw_file().file.schema_version
+    }
+
+    /// Returns the expected immutable physical length in bytes.
+    #[must_use]
+    pub fn file_size_bytes(&self) -> u64 {
+        self.raw_file().file.file_size_bytes
+    }
+
+    /// Returns the nonzero logical row count recorded at commit time.
+    #[must_use]
+    pub fn row_count(&self) -> NonZeroU64 {
+        self.raw_file().file.row_count
+    }
+
+    /// Returns whether the file is managed or an external read-only legacy file.
+    #[must_use]
+    pub fn location_kind(&self) -> PinnedDataFileLocationKind {
+        match &self.raw_file().file.location {
+            DataFileLocation::Managed(_) => PinnedDataFileLocationKind::Managed,
+            DataFileLocation::ExternalLegacy(_) => PinnedDataFileLocationKind::ExternalLegacy,
+        }
+    }
+
+    /// Borrows typed source provenance, which contains no physical location.
+    #[must_use]
+    pub fn provenance(&self) -> &DataFileProvenance {
+        &self.raw_file().file.provenance
+    }
+
+    /// Borrows stable partition metadata used for pruning.
+    #[must_use]
+    pub fn partition(&self) -> &MetadataMap {
+        &self.raw_file().file.partition
+    }
+
+    /// Borrows stable statistics used for pruning.
+    #[must_use]
+    pub fn statistics(&self) -> &MetadataMap {
+        &self.raw_file().file.statistics
+    }
+
+    /// Borrows additional implementation-independent file metadata.
+    #[must_use]
+    pub fn metadata(&self) -> &MetadataMap {
+        &self.raw_file().file.metadata
+    }
+
+    /// Borrows the content checksum recorded at commit time.
+    #[must_use]
+    pub fn checksum(&self) -> &str {
+        &self.raw_file().file.checksum
+    }
+
+    /// Returns when the complete physical candidate was created, in UTC Unix nanoseconds.
+    #[must_use]
+    pub fn created_at_ns(&self) -> u64 {
+        self.raw_file().file.created_at_ns
+    }
+
+    /// Returns the first snapshot version that exposed this file.
+    #[must_use]
+    pub fn added_snapshot_version(&self) -> u64 {
+        self.raw_file().added_snapshot_version
+    }
+
+    /// Returns the first snapshot version that stopped exposing this file, when present.
+    #[must_use]
+    pub fn removed_snapshot_version(&self) -> Option<u64> {
+        self.raw_file().removed_snapshot_version
+    }
+
+    /// Returns the committed physical lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> DataFileState {
+        self.raw_file().state
+    }
+
+    /// Opens the physical file without exposing its Catalog path.
+    ///
+    /// Managed paths are traversed descriptor-relative with `NOFOLLOW`. The opened object must be
+    /// a secure regular file of the Catalog-recorded size. External legacy files are additionally
+    /// hashed through the same opened descriptor and compared with the Catalog checksum before the
+    /// cursor is rewound to zero. The returned reader retains the same opaque snapshot owner.
+    ///
+    /// This is synchronous physical I/O and must run on a bounded blocking scan worker, never on an
+    /// async runtime worker. External legacy opens perform a full-file checksum pass, so an
+    /// executor must open one reader per physical file scan rather than one reader per parallel
+    /// worker for the same file.
+    pub fn open_reader(&self) -> Result<PinnedDataFileReader> {
+        let file = open_pinned_file(&self.owner._data_directory, self.raw_file())?;
+        Ok(PinnedDataFileReader {
+            file,
+            _owner: Arc::clone(&self.owner),
+            table_id: self.table_id(),
+            file_id: self.file_id(),
+            file_size_bytes: self.file_size_bytes(),
+        })
+    }
+
+    fn raw_file(&self) -> &DataFileDescriptor {
+        &self.owner.snapshot.tables()[self.table_index]
+            .files()
+            .as_slice()[self.file_index]
+    }
+}
+
+impl fmt::Debug for PinnedDataFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedDataFile")
+            .field("file_id", &self.file_id())
+            .field("table_id", &self.table_id())
+            .field("schema_version", &self.schema_version())
+            .field("file_size_bytes", &self.file_size_bytes())
+            .field("row_count", &self.row_count())
+            .field("location_kind", &self.location_kind())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A controlled physical reader that retains its pinned snapshot owner.
+pub struct PinnedDataFileReader {
+    file: File,
+    _owner: Arc<PinnedSnapshotOwner>,
+    table_id: TableId,
+    file_id: FileId,
+    file_size_bytes: u64,
+}
+
+impl PinnedDataFileReader {
+    /// Returns the immutable Catalog file identity associated with this descriptor.
+    #[must_use]
+    pub const fn file_id(&self) -> FileId {
+        self.file_id
+    }
+
+    /// Returns the immutable owning table identity associated with this descriptor.
+    #[must_use]
+    pub const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    /// Returns the physical length verified when the descriptor was opened.
+    #[must_use]
+    pub const fn file_size_bytes(&self) -> u64 {
+        self.file_size_bytes
+    }
+}
+
+impl fmt::Debug for PinnedDataFileReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedDataFileReader")
+            .field("file_id", &self.file_id)
+            .field("table_id", &self.table_id)
+            .field("file_size_bytes", &self.file_size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Read for PinnedDataFileReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for PinnedDataFileReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+#[cfg(unix)]
+fn open_pinned_file(
+    data_directory: &OwnedDataDirectory,
+    descriptor: &DataFileDescriptor,
+) -> Result<File> {
+    let managed;
+    let (root, path) = match &descriptor.file.location {
+        DataFileLocation::Managed(path) => {
+            managed = true;
+            let root = data_directory.try_clone_root_directory().map_err(|_| {
+                file_io_error(
+                    descriptor,
+                    "clone owned data-root descriptor for pinned read",
+                )
+            })?;
+            (root, Path::new(path.as_str()))
+        }
+        DataFileLocation::ExternalLegacy(path) => {
+            managed = false;
+            let root = rustix::fs::open(
+                Path::new("/"),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|error| map_open_error(descriptor, "open external root", error))?;
+            (root, Path::new(path.as_str()))
+        }
+    };
+
+    let components = normal_path_components(path, managed, descriptor)?;
+    let Some((file_name, directories)) = components.split_last() else {
+        return Err(file_corruption(
+            descriptor,
+            "catalog data-file location has no file component",
+        ));
+    };
+    let mut parent = root;
+    for directory_name in directories {
+        parent = open_directory_at(&parent, directory_name, managed, descriptor)?;
+    }
+    let file_descriptor = rustix::fs::openat(
+        &parent,
+        *file_name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| map_open_error(descriptor, "open pinned data file", error))?;
+    let mut file = File::from(file_descriptor);
+    let opened_metadata = validate_open_file(&file, managed, descriptor)?;
+    if !managed {
+        validate_external_legacy_content(&mut file, &opened_metadata, descriptor)?;
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_pinned_file(
+    _data_directory: &OwnedDataDirectory,
+    descriptor: &DataFileDescriptor,
+) -> Result<File> {
+    Err(ServerError::new(
+        ErrorCode::UnsupportedPlan,
+        "secure pinned data-file opening is unsupported on this platform",
+    )
+    .with_table_id(descriptor.table_id()))
+}
+
+#[cfg(unix)]
+fn normal_path_components<'a>(
+    path: &'a Path,
+    managed: bool,
+    descriptor: &DataFileDescriptor,
+) -> Result<Vec<&'a std::ffi::OsStr>> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir if !managed => {}
+            Component::Normal(value) => components.push(value),
+            _ => {
+                return Err(file_corruption(
+                    descriptor,
+                    "catalog data-file location contains an unsafe component",
+                ));
+            }
+        }
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn open_directory_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    managed: bool,
+    descriptor: &DataFileDescriptor,
+) -> Result<File> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let directory_descriptor = rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| map_open_error(descriptor, "open pinned data-file directory", error))?;
+    let directory = File::from(directory_descriptor);
+    let metadata = directory
+        .metadata()
+        .map_err(|_| file_io_error(descriptor, "inspect pinned data-file directory descriptor"))?;
+    if !metadata.is_dir() {
+        return Err(file_corruption(
+            descriptor,
+            "pinned data-file parent is not a directory",
+        ));
+    }
+    if managed {
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || mode & 0o077 != 0 {
+            return Err(file_corruption(
+                descriptor,
+                "managed data-file directory ownership or permissions are invalid",
+            ));
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_open_file(
+    file: &File,
+    managed: bool,
+    descriptor: &DataFileDescriptor,
+) -> Result<Metadata> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| file_io_error(descriptor, "inspect pinned data-file descriptor"))?;
+    if !metadata.is_file() {
+        return Err(file_corruption(
+            descriptor,
+            "pinned data-file descriptor is not a regular file",
+        ));
+    }
+    if metadata.len() != descriptor.file.file_size_bytes {
+        return Err(file_corruption(
+            descriptor,
+            "pinned data-file length does not match Catalog metadata",
+        ));
+    }
+    if managed {
+        let mode = metadata.permissions().mode() & 0o777;
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() != 1
+            || mode & 0o077 != 0
+        {
+            return Err(file_corruption(
+                descriptor,
+                "managed data-file ownership, links, or permissions are invalid",
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+#[cfg(unix)]
+fn validate_external_legacy_content(
+    file: &mut File,
+    opened_metadata: &Metadata,
+    descriptor: &DataFileDescriptor,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    file.seek(SeekFrom::Start(0)).map_err(|_| {
+        file_io_error(
+            descriptor,
+            "rewind external legacy data file before checksum",
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(file_io_error(
+                    descriptor,
+                    "checksum external legacy data file",
+                ));
+            }
+        }
+    }
+
+    let checked_metadata = file
+        .metadata()
+        .map_err(|_| file_io_error(descriptor, "reinspect external legacy data-file descriptor"))?;
+    if !checked_metadata.is_file()
+        || opened_metadata.dev() != checked_metadata.dev()
+        || opened_metadata.ino() != checked_metadata.ino()
+        || opened_metadata.len() != checked_metadata.len()
+        || opened_metadata.mtime() != checked_metadata.mtime()
+        || opened_metadata.mtime_nsec() != checked_metadata.mtime_nsec()
+        || opened_metadata.ctime() != checked_metadata.ctime()
+        || opened_metadata.ctime_nsec() != checked_metadata.ctime_nsec()
+    {
+        return Err(file_corruption(
+            descriptor,
+            "external legacy data file changed during checksum validation",
+        ));
+    }
+
+    let actual_checksum = format!("sha256-v1:{:x}", hasher.finalize());
+    if actual_checksum != descriptor.file.checksum {
+        return Err(file_corruption(
+            descriptor,
+            "external legacy data-file checksum does not match Catalog metadata",
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| {
+        file_io_error(
+            descriptor,
+            "rewind external legacy data file after checksum",
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn map_open_error(
+    descriptor: &DataFileDescriptor,
+    operation: &str,
+    error: rustix::io::Errno,
+) -> ServerError {
+    if matches!(
+        error,
+        rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR
+    ) {
+        file_corruption(descriptor, "pinned data-file location is missing or unsafe")
+    } else {
+        file_io_error(descriptor, operation)
+    }
+}
+
+fn file_corruption(descriptor: &DataFileDescriptor, reason: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::DataCorruption,
+        format!("{reason} file_id=[{}]", descriptor.file_id()),
+    )
+    .with_table_id(descriptor.table_id())
+}
+
+fn file_io_error(descriptor: &DataFileDescriptor, operation: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::Unavailable,
+        format!("{operation} failed file_id=[{}]", descriptor.file_id()),
+    )
+    .with_table_id(descriptor.table_id())
+}

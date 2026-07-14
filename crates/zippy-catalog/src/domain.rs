@@ -606,6 +606,7 @@ fn try_replay_idempotent_response(
     operation: &str,
     fingerprint: &[u8; 32],
 ) -> Result<Option<VersionedCatalogResponse>> {
+    reject_legacy_import_request_id(connection, request_id)?;
     load_idempotent_response(connection, request_id)?
         .map(|stored| {
             replay_idempotent_response(
@@ -617,6 +618,30 @@ fn try_replay_idempotent_response(
             )
         })
         .transpose()
+}
+
+fn reject_legacy_import_request_id(connection: &Connection, request_id: RequestId) -> Result<()> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM legacy_import_requests WHERE request_id = ?1",
+            [request_id.into_bytes().as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            crate::map_sqlite_error("check legacy import request-id conflict", error)
+                .with_request_id(request_id)
+        })?
+        .is_some();
+    if exists {
+        return Err(ServerError::new(
+            ErrorCode::Conflict,
+            "catalog request id is already committed in the legacy import namespace",
+        )
+        .with_request_id(request_id)
+        .with_retryable(false));
+    }
+    Ok(())
 }
 
 fn replay_idempotent_response(
@@ -867,6 +892,13 @@ mod tests {
                      response_blob BLOB NOT NULL,\
                      committed_at_ns BLOB NOT NULL,\
                      expires_at_ns BLOB NOT NULL\
+                 );\
+                 CREATE TABLE legacy_import_requests (\
+                     request_id BLOB PRIMARY KEY,\
+                     format_version INTEGER NOT NULL,\
+                     fingerprint BLOB NOT NULL,\
+                     response_blob BLOB NOT NULL,\
+                     committed_at_ns BLOB NOT NULL\
                  );",
             )
             .unwrap();

@@ -15,6 +15,7 @@ mod catalog_verify;
 mod checksum;
 mod commit;
 mod commit_intent;
+mod legacy_import;
 mod persist;
 mod reconcile;
 
@@ -31,6 +32,7 @@ pub use commit::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,
     CommitDataFilesReceipt,
 };
+pub use legacy_import::{verify_legacy_parquet_import, LegacyParquetImportSpec};
 pub use persist::{
     PersistCandidateInput, PersistCompletionFailure, PersistCompletionResult, PersistController,
     PersistControllerConfig, PersistControllerFailureMonitor, PersistControllerHandle, PersistMode,

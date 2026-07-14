@@ -3,6 +3,27 @@
 `zippy-storage` owns the new server-side durable data-file boundary. It does not make legacy
 `persisted_files` authoritative.
 
+## Legacy import verification
+
+`verify_legacy_parquet_import()` is a trusted startup-only migration helper, not an RPC boundary.
+It opens an absolute legacy file below its optional canonical root descriptor component by
+component with `NOFOLLOW|NONBLOCK`, verifies regular-file identity, Parquet footer, logical Arrow
+Schema, row count, and full `sha256-v1` content, then derives a stable file ID. The resulting DTO is
+accepted only through the Catalog's non-cloneable, instance-bound startup import session.
+The verifier computes the Catalog canonical hash from the same Arrow Schema compared with the
+Parquet footer and writes a reserved proof field; the Catalog transaction requires that proof to
+match the table command. `CatalogActor` remains audit metadata and is not authorization. Before
+verification, Server planning must sort files by the legacy Gateway key
+`(writer_epoch, source_segment_id, source_generation, created_at, file_path)` and assign the
+resulting contiguous position to `discovery_order`; the original Registry index is retained only
+for audit diagnostics.
+
+The verifier cannot make an externally owned pathname immutable after it returns. Startup
+orchestration must keep legacy roots quiescent/read-only until the Catalog transaction terminates,
+and query execution reopens and rechecks the recorded checksum for every external reader. The
+long-term authority path should copy or reflink legacy files into managed immutable storage; the
+current helper does not make SQLite or Gateway authoritative by itself.
+
 ## Candidate protocol
 
 `ParquetCandidateWriter` writes one immutable native file to:

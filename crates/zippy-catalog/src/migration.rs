@@ -15,6 +15,8 @@ const MIGRATION_V3_VERSION: u32 = 3;
 const MIGRATION_V3_NAME: &str = "active_tables_cursor_indexes";
 const MIGRATION_V4_VERSION: u32 = 4;
 const MIGRATION_V4_NAME: &str = "safe_gc_claim_indexes";
+const MIGRATION_V5_VERSION: u32 = 5;
+const MIGRATION_V5_NAME: &str = "legacy_import_requests";
 
 // Physical SQLite schema versions are independent of CatalogCommand wire
 // versions. Physical v1 intentionally creates no domain tables: those must
@@ -614,6 +616,35 @@ define_domain_schema! {
  ON idempotent_requests(expires_at_ns, request_id)"#;
 }
 
+macro_rules! define_v5_schema_addition {
+    ($name:ident = $sql:literal;) => {
+        const $name: &str = $sql;
+        const MIGRATION_V5: &str = concat!($sql, ";\n");
+    };
+}
+
+define_v5_schema_addition! {
+    LEGACY_IMPORT_REQUESTS_SQL = r#"CREATE TABLE legacy_import_requests (
+    request_id BLOB PRIMARY KEY CHECK(
+        typeof(request_id) = 'blob'
+        AND length(request_id) = 16
+        AND request_id != zeroblob(16)
+    ),
+    format_version INTEGER NOT NULL CHECK(
+        typeof(format_version) = 'integer' AND format_version > 0
+    ),
+    fingerprint BLOB NOT NULL CHECK(
+        typeof(fingerprint) = 'blob' AND length(fingerprint) = 32
+    ),
+    response_blob BLOB NOT NULL CHECK(
+        typeof(response_blob) = 'blob' AND length(response_blob) > 0
+    ),
+    committed_at_ns BLOB NOT NULL CHECK(
+        typeof(committed_at_ns) = 'blob' AND length(committed_at_ns) = 8
+    )
+ )"#;
+}
+
 macro_rules! define_v3_schema_additions {
     ($($name:ident = $sql:literal;)+) => {
         $(const $name: &str = $sql;)+
@@ -996,6 +1027,21 @@ const MIGRATION_V4_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 3] = [
     },
 ];
 
+const MIGRATION_V5_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 2] = [
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_import_requests_1",
+        table_name: "legacy_import_requests",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_import_requests",
+        table_name: "legacy_import_requests",
+        sql: Some(LEGACY_IMPORT_REQUESTS_SQL),
+    },
+];
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -1004,7 +1050,7 @@ struct Migration {
     schema_additions: &'static [ExpectedSchemaObject],
 }
 
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: MIGRATION_V1_VERSION,
         name: MIGRATION_V1_NAME,
@@ -1032,6 +1078,13 @@ const MIGRATIONS: [Migration; 4] = [
         sql: MIGRATION_V4,
         base_schema_version: Some(MIGRATION_V3_VERSION),
         schema_additions: &MIGRATION_V4_SCHEMA_ADDITIONS,
+    },
+    Migration {
+        version: MIGRATION_V5_VERSION,
+        name: MIGRATION_V5_NAME,
+        sql: MIGRATION_V5,
+        base_schema_version: Some(MIGRATION_V4_VERSION),
+        schema_additions: &MIGRATION_V5_SCHEMA_ADDITIONS,
     },
 ];
 
@@ -1640,8 +1693,10 @@ mod tests {
     use zippy_types::ErrorCode;
 
     use super::{
-        apply_migration, decode_u64, encode_u64, validate_migration_registry, Migration,
-        MIGRATION_V1, MIGRATION_V1_NAME, MIGRATION_V1_SCHEMA, MIGRATION_V1_VERSION,
+        apply_migration, decode_u64, encode_u64, expected_schema_for_migration, migration_checksum,
+        schema_fingerprint, validate_migration_registry, Migration, MIGRATIONS, MIGRATION_V1,
+        MIGRATION_V1_NAME, MIGRATION_V1_SCHEMA, MIGRATION_V1_VERSION, MIGRATION_V5,
+        MIGRATION_V5_NAME, MIGRATION_V5_VERSION,
     };
 
     #[test]
@@ -1658,6 +1713,99 @@ mod tests {
         for pair in values.windows(2) {
             assert!(encode_u64(pair[0]) < encode_u64(pair[1]));
         }
+    }
+
+    #[test]
+    fn frozen_physical_v1_v4_migration_and_schema_fingerprints_match_golden() {
+        const GOLDENS: [(u32, &str, &str); 4] = [
+            (
+                1,
+                "1d76944b8a0385993c31e6d3c9c02735bb0b206109d9f05de26270b9fec8ea0d",
+                "e1a0af37a36ed5d38cac35cfe3ebb74ec5d12ef7c835ac14488c5effb62a7c08",
+            ),
+            (
+                2,
+                "a392f1c27d9d810890fd739b52656489baf02881d5a8fc177115619b0ecd3b2a",
+                "4fe9f32a22b45fb0b5add76bdb7ae3aaea9ee87c31fde84cab5a3342176494a6",
+            ),
+            (
+                3,
+                "30055f90285c90809e0969da420796d96b92840ad881847ce4a7545fd353796d",
+                "53d8d1070662bcb429a8b99d4ffc29f6fab0f5f2967ba5028541efbc850b2ae2",
+            ),
+            (
+                4,
+                "c8038a185b4aca4d1424da4394c20b5b33be5bc48d75a6372d1e21c3db944c54",
+                "8cebe1c67d71abbf7bb71b6f21d335b174334993cfd7989e055acca19a721f59",
+            ),
+        ];
+
+        for (migration, (version, migration_golden, schema_golden)) in
+            MIGRATIONS.iter().take(4).zip(GOLDENS)
+        {
+            let mut schema = expected_schema_for_migration(migration).expect("build frozen schema");
+            schema.sort();
+            assert_eq!(migration.version, version);
+            assert_eq!(hex(&migration_checksum(migration)), migration_golden);
+            assert_eq!(hex(&schema_fingerprint(&schema)), schema_golden);
+        }
+    }
+
+    #[test]
+    fn physical_v5_schema_failure_rolls_back_the_dedicated_replay_table() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory Catalog");
+        for migration in MIGRATIONS.iter().take(4) {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin frozen migration");
+            apply_migration(&transaction, migration).expect("apply frozen migration");
+            transaction.commit().expect("commit frozen migration");
+        }
+
+        let drifted_v5 = Migration {
+            version: MIGRATION_V5_VERSION,
+            name: MIGRATION_V5_NAME,
+            sql: MIGRATION_V5,
+            base_schema_version: Some(4),
+            schema_additions: &[],
+        };
+        let error = {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin failing physical v5 migration");
+            apply_migration(&transaction, &drifted_v5)
+                .expect_err("schema validation must reject incomplete physical v5 inventory")
+        };
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+        let user_version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back physical version");
+        assert_eq!(user_version, 4);
+        let migration_count: u32 = connection
+            .query_row("SELECT COUNT(*) FROM catalog_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("count rolled-back migration ledger");
+        assert_eq!(migration_count, 4);
+        let replay_tables: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema \
+                 WHERE type = 'table' AND name = 'legacy_import_requests'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rolled-back replay tables");
+        assert_eq!(replay_tables, 0);
+        let idempotency_tables: u32 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema \
+                 WHERE type = 'table' AND name = 'idempotent_requests'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained idempotency tables");
+        assert_eq!(idempotency_tables, 1);
     }
 
     #[test]
@@ -1714,5 +1862,15 @@ mod tests {
             .query_row("PRAGMA application_id", [], |row| row.get(0))
             .expect("read application id after rollback");
         assert_eq!(application_id, 0);
+    }
+
+    fn hex(bytes: &[u8; 32]) -> String {
+        use std::fmt::Write;
+
+        let mut encoded = String::with_capacity(64);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").expect("write to String");
+        }
+        encoded
     }
 }

@@ -2279,6 +2279,7 @@ dependencies = [
  "crossbeam-channel",
  "flatbuffers",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

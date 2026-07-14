@@ -215,8 +215,9 @@ publication, moves an affine publication permit into the Catalog actor, and take
 publication exclusion before rejected-candidate cleanup. Exact, conflicting, and missing historical
 replays therefore never publish final candidates. Snapshot leases, runtime pins, safe-GC claim,
 and bounded Gateway shadow comparison are now implemented internally. Public ingest wiring, exact
-legacy-manifest import, a physical GC worker, QueryService integration, and the explicit authority
-cutover remain required before the native path becomes the production authority.
+legacy-manifest Server planning around the available V2 import primitive and its dedicated permanent
+replay table, a physical GC worker, QueryService integration, and the explicit authority cutover
+remain required before the native path becomes the production authority.
 
 `catalog.backend=sqlite_shadow` keeps the legacy persisted-file view authoritative and installs a
 single bounded comparison worker behind Gateway. Query threads never wait for SQLite shadow reads;
@@ -225,8 +226,8 @@ shadow metrics and fails open to the legacy result. `LegacyServerRuntime::gatewa
 the active bounds, queue depth, outstanding bytes, mismatch counters, and worker state under
 `persisted_read_shadow`. Environment equivalents use the `ZIPPY_CATALOG_SHADOW_*` prefix. This mode
 currently proves lifecycle and comparison isolation only: tables with nonempty legacy manifests
-still require an exact V2 import and revision mapping before their comparisons can succeed or SQLite
-can become authoritative.
+still require the Server planner to execute the exact V2 import and revision mapping before their
+comparisons can succeed or SQLite can become authoritative.
 
 On shutdown the order is reversed: adapter and native admission close first, Gateway releases its
 master lease and stops, the native coordinator drains and closes SQLite, then master performs its

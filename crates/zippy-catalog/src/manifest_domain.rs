@@ -170,15 +170,35 @@ async fn estimate_manifest_queue_bytes_cooperative(
     context: &str,
     work_since_yield: &mut usize,
 ) -> Result<usize> {
-    if files.len() > MAX_MANIFEST_FILES {
+    estimate_pending_files_queue_bytes(files.len(), files.iter(), context, work_since_yield).await
+}
+
+pub(crate) async fn legacy_import_files_preflight_bytes(
+    files: &[zippy_types::catalog::LegacyCatalogImportFileV2],
+    work_since_yield: &mut usize,
+) -> Result<usize> {
+    estimate_pending_files_queue_bytes(
+        files.len(),
+        files.iter().map(|file| &file.file),
+        "legacy import",
+        work_since_yield,
+    )
+    .await
+}
+
+async fn estimate_pending_files_queue_bytes<'a>(
+    file_count: usize,
+    files: impl Iterator<Item = &'a PendingDataFile> + Send,
+    context: &str,
+    work_since_yield: &mut usize,
+) -> Result<usize> {
+    if file_count > MAX_MANIFEST_FILES {
         return Err(resource(format!(
             "{context} file count exceeds maximum actual=[{}] maximum=[{}]",
-            files.len(),
-            MAX_MANIFEST_FILES
+            file_count, MAX_MANIFEST_FILES
         )));
     }
-    let mut total = files
-        .len()
+    let mut total = file_count
         .checked_mul(size_of::<PendingDataFile>())
         .ok_or_else(|| resource("manifest queue file byte estimate overflow"))?;
     let mut admitted_payload = 0_usize;

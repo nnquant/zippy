@@ -16,8 +16,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zippy_types::table::{
     AppendTableDefinition, ColumnName, ColumnSet, FiniteMetadataFloat, FrameTableDefinition,
-    KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaDescriptor, TableDefinition,
-    TableDescriptor,
+    KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaDescriptor, SchemaIpcPayload,
+    TableDefinition, TableDescriptor,
 };
 use zippy_types::{ErrorCode, Result, ServerError};
 
@@ -628,13 +628,22 @@ fn persisted_schema_corruption(
 }
 
 /// Computes the durable logical schema hash from the frozen V1 encoding.
-pub(crate) fn canonical_schema_hash(schema: &SchemaRef) -> Result<String> {
+///
+/// Physical verifiers use this same function to bind the Arrow Schema observed in a data-file
+/// footer to the Schema later admitted by the Catalog.
+pub fn canonical_schema_hash(schema: &SchemaRef) -> Result<String> {
     let mut encoder = CanonicalArrowSchemaEncoderV1::new();
     encoder.schema(schema.as_ref());
     Ok(format!(
         "{SCHEMA_HASH_PREFIX}{:x}",
         encoder.digest.finalize()
     ))
+}
+
+/// Decodes a schema-only Arrow IPC stream and returns its canonical logical hash.
+pub fn canonical_schema_hash_from_ipc(schema_ipc: &SchemaIpcPayload) -> Result<String> {
+    let schema = decode_schema_ipc_stream(schema_ipc.as_bytes())?;
+    canonical_schema_hash(&schema)
 }
 
 struct CanonicalArrowSchemaEncoderV1 {

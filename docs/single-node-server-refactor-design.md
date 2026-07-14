@@ -1773,7 +1773,7 @@ preparation 已移到独立有界 worker。control read 与 exact snapshot read 
 worker 和 read-only WAL connection，因此大 snapshot 不再阻塞 discovery/revision 或 writer commit。
 mutation 保持 actor admission 顺序；重叠 read 可以读取前一个 committed revision，取消响应不会取消
 已接受写入，close 会排空已接受工作。其余 V1 mutation command、producer-fenced public ingest、
-maintenance lease-fenced worker、legacy/frame/KV V2 manifest、legacy importer/shadow/diff、
+maintenance lease-fenced worker、frame/KV V2 manifest、legacy importer 的 Server planner/shadow/diff、
 CreateTable preparation 隔离、manifest finalize 减负、read parallelism 和 active read interrupt 尚未
 实现。SQLite actor 内部仍没有绝对 shutdown deadline；启用 native storage 时由独立 OS supervisor
 隔离同步 open/close，server timeout 只停止等待且保留 supervisor、Catalog 与 data-root ownership，
@@ -1810,6 +1810,32 @@ snapshot。进入 actor queue 前另按命令输入估算并原子预留字节�
 
 SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立版本空间，不能用同一个
 “v1/v2”标签推断彼此已实现。
+
+当前补充状态（2026-07-14）：physical schema v5 以 O(1) schema migration 新增独立永久
+`legacy_import_requests` replay 表，不重建、不扩展长期 `idempotent_requests`，并保持其历史 rows、
+indexes 与 response bytes 不变；硬编码 migration checksum 和完整 schema-inventory golden 冻结
+v1-v4 兼容性。迁移前、迁移后各执行一次有界 `quick_check`/`foreign_key_check`，因此损坏的 v4
+Catalog 会在写入 v5 之前 fail closed，保留旧 binary rollback 边界。可信启动期内部 V2 legacy
+import primitive 已能
+在一个事务中创建 table、发布 Import snapshot、写入经过物理验证的 ExternalLegacy files、恢复
+writer epoch、推进 revision 并在专表保存永久幂等响应；预处理复用既有单个有界 manifest worker
+和命令字节预算。`zippy-storage` verifier 会从 canonical legacy-root fd 逐组件
+`openat(NOFOLLOW|NONBLOCK)`，先验证 Parquet footer/Schema/row count，再计算完整 SHA-256。查询侧
+pinned reader 会在同一打开 FD 上重新校验 external checksum，并在成功后回卷到 offset 0；managed
+file 不承担该额外 O(file size) 成本。导入只能经不可克隆、绑定单个 Catalog instance 的 startup
+session 执行；session drop/seal 或第一个普通 mutation 会永久关闭本实例的导入窗口，actor 仍只用于
+审计。verifier 从实际比对 Parquet footer 的 Arrow Schema 计算 Catalog canonical hash，并把保留 proof
+写入 file metadata，Catalog 事务要求它和 table command 完全一致。V1 与 V2 replay 表共享全局
+RequestId 空间，任一方向的重复都会在 mutation 前冲突。Master
+已经在不改变 frozen source hash 的前提下提供强类型 persisted-file snapshot 和 Gateway-compatible
+effective scan order；Server planner 接线、显式 scan-order read DTO 和权威切换仍未完成，因此
+preserve-order legacy snapshot 继续 fail closed 为
+`UnsupportedPlan`。
+
+V2 `discovery_order` 表示旧 Gateway 对 persisted files 应用
+`(writer_epoch, source_segment_id, source_generation, created_at, file_path)` 后的零基稳定扫描位置，
+不是 Registry vector index。Registry index 只保留为迁移审计信息；Server planner 必须在任何文件
+读取前完成全 snapshot 路径去重和单表文件数准入，避免部分表先提交后才发现后续表不可导入。
 
 任务：
 

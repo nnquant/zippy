@@ -78,6 +78,12 @@ pub(crate) struct PreparedCreateTable {
     initial_summary_blob: Vec<u8>,
 }
 
+impl PreparedCreateTable {
+    pub(crate) fn schema_hash(&self) -> &str {
+        &self.schema_hash
+    }
+}
+
 /// Validates and encodes a CreateTable command without holding SQLite's writer lock.
 pub(crate) fn prepare_create_table(command: CreateTableCommand) -> Result<PreparedCreateTable> {
     let CreateTableCommand {

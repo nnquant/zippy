@@ -1,8 +1,9 @@
 //! Asynchronous Catalog traits backed by isolated SQLite writer and read workers.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 
@@ -15,7 +16,8 @@ use zippy_types::catalog::{
     CatalogPublicationControl, CatalogPublicationExclusion, CatalogPublicationPermit,
     CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
     ClaimGarbageCollectionFilesRequest, ClaimedGarbageCollectionFiles,
-    FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles, ListNamespacesRequest,
+    FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles,
+    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportResponseV2, ListNamespacesRequest,
     ListNamespacesResponse, ListTablesRequest, ListTablesResponse, ManagedDataFileProbe,
     NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
@@ -23,13 +25,18 @@ use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
 
 use crate::SqliteCatalogConfig;
-use crate::{domain, file_domain, manifest_domain, snapshot_domain, table_domain};
+use crate::{
+    domain, file_domain, legacy_import_domain, manifest_domain, snapshot_domain, table_domain,
+};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
 const CONTROL_READ_THREAD_NAME: &str = "zippy-catalog-control-read";
 const SNAPSHOT_READ_THREAD_NAME: &str = "zippy-catalog-snapshot-read";
 const REPLAY_PROBE_CAPACITY: usize = 4;
+const LEGACY_IMPORT_AVAILABLE: u8 = 0;
+const LEGACY_IMPORT_ACTIVE: u8 = 1;
+const LEGACY_IMPORT_SEALED: u8 = 2;
 
 /// A typed SQLite Catalog with thread-confined writer and read-only connections.
 ///
@@ -58,6 +65,28 @@ pub struct SqliteCatalog {
     publication_gate: Arc<Semaphore>,
     publication_gate_capacity: u32,
     runtime_snapshot_pins: Arc<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
+    ownership: Arc<zippy_core::OwnedDataDirectory>,
+    legacy_import_state: AtomicU8,
+}
+
+/// Exclusive startup capability for verified V2 legacy table imports.
+///
+/// The handle is bound to one running Catalog instance, cannot be cloned, and permanently seals
+/// that instance's import window when dropped. Ordinary Catalog mutation admission also seals an
+/// unused window before executing, so V2 imports cannot be opened after normal service writes have
+/// started. The handle is intentionally not an RPC or serializable authorization token.
+pub struct SqliteCatalogLegacyImportSession<'catalog> {
+    catalog: &'catalog SqliteCatalog,
+    active: bool,
+}
+
+impl fmt::Debug for SqliteCatalogLegacyImportSession<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteCatalogLegacyImportSession")
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Cloneable read-only view over one running [`SqliteCatalog`].
@@ -71,24 +100,7 @@ pub struct SqliteCatalog {
 pub struct SqliteCatalogReadHandle {
     endpoint: Arc<CatalogReadEndpoint>,
     runtime_snapshot_pins: Weak<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
-}
-
-/// Exact Catalog metadata retained together with its in-process GC pins.
-///
-/// Query execution must keep this value alive until every physical file read has completed.
-/// Dropping it releases all table pins atomically from the caller's ownership perspective.
-#[derive(Debug)]
-pub struct SqliteCatalogPinnedQuerySnapshot {
-    snapshot: CatalogQuerySnapshot,
-    _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
-}
-
-impl SqliteCatalogPinnedQuerySnapshot {
-    /// Borrows the revision-consistent Catalog snapshot protected by this guard.
-    #[must_use]
-    pub const fn snapshot(&self) -> &CatalogQuerySnapshot {
-        &self.snapshot
-    }
+    ownership: Weak<zippy_core::OwnedDataDirectory>,
 }
 
 impl SqliteCatalog {
@@ -119,6 +131,7 @@ impl SqliteCatalog {
         read_backend: Arc<dyn CatalogReadBackend>,
     ) -> Result<Self> {
         crate::validate_config(&config)?;
+        let ownership = Arc::clone(config.ownership());
         let runtime_ownership = config
             .ownership
             .acquire_catalog_runtime_ownership()
@@ -167,6 +180,8 @@ impl SqliteCatalog {
                     publication_gate,
                     publication_gate_capacity,
                     runtime_snapshot_pins,
+                    ownership,
+                    legacy_import_state: AtomicU8::new(LEGACY_IMPORT_AVAILABLE),
                 };
                 match CatalogReadPool::start(&config, read_backend) {
                     Ok(read_pool) => {
@@ -215,6 +230,35 @@ impl SqliteCatalog {
         Ok(SqliteCatalogReadHandle {
             endpoint: Arc::clone(&read_pool.endpoint),
             runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
+            ownership: Arc::downgrade(&self.ownership),
+        })
+    }
+
+    /// Acquires the only V2 legacy-import capability for this Catalog instance.
+    ///
+    /// Startup orchestration must acquire this handle before submitting ordinary non-migration
+    /// writes, retain it through every verified table import, and then explicitly seal it before
+    /// publishing server readiness. Dropping the handle has the same fail-closed sealing effect.
+    pub fn begin_legacy_import_session(&self) -> Result<SqliteCatalogLegacyImportSession<'_>> {
+        self.check_runtime_health()?;
+        self.legacy_import_state
+            .compare_exchange(
+                LEGACY_IMPORT_AVAILABLE,
+                LEGACY_IMPORT_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|state| {
+                let message = if state == LEGACY_IMPORT_ACTIVE {
+                    "legacy import session is already active"
+                } else {
+                    "legacy import window is permanently sealed for this Catalog instance"
+                };
+                ServerError::new(ErrorCode::Conflict, message).with_retryable(false)
+            })?;
+        Ok(SqliteCatalogLegacyImportSession {
+            catalog: self,
+            active: true,
         })
     }
 
@@ -321,6 +365,7 @@ impl SqliteCatalog {
     ) -> Result<VersionedCatalogResponse> {
         let VersionedCatalogCommand::V1(envelope) = &command;
         let request_id = envelope.request_id;
+        self.seal_legacy_imports_for_command(envelope.actor.kind, request_id)?;
         let publication_permit = publication_permit
             .try_into_opaque::<SqlitePublicationPermit>()
             .map_err(|_| {
@@ -356,6 +401,95 @@ impl SqliteCatalog {
             })
         }))
         .await
+    }
+
+    fn seal_legacy_imports_for_command(
+        &self,
+        actor_kind: zippy_types::catalog::CatalogActorKind,
+        request_id: RequestId,
+    ) -> Result<()> {
+        if actor_kind == zippy_types::catalog::CatalogActorKind::Migration {
+            return Ok(());
+        }
+        self.seal_legacy_imports_for_ordinary_mutation()
+            .map_err(|error| error.with_request_id(request_id))
+    }
+
+    fn seal_legacy_imports_for_ordinary_mutation(&self) -> Result<()> {
+        loop {
+            match self.legacy_import_state.load(Ordering::Acquire) {
+                LEGACY_IMPORT_AVAILABLE => {
+                    if self
+                        .legacy_import_state
+                        .compare_exchange(
+                            LEGACY_IMPORT_AVAILABLE,
+                            LEGACY_IMPORT_SEALED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                LEGACY_IMPORT_ACTIVE => {
+                    return Err(ServerError::new(
+                        ErrorCode::Conflict,
+                        "ordinary Catalog writes are closed while legacy import is active",
+                    )
+                    .with_retryable(false));
+                }
+                LEGACY_IMPORT_SEALED => return Ok(()),
+                _ => {
+                    return Err(ServerError::new(
+                        ErrorCode::Internal,
+                        "legacy import lifecycle entered an invalid state",
+                    )
+                    .with_retryable(false));
+                }
+            }
+        }
+    }
+
+    fn submit_legacy_import(
+        &self,
+        command: LegacyCatalogImportEnvelopeV2,
+    ) -> BoxFuture<'_, Result<LegacyCatalogImportResponseV2>> {
+        Box::pin(async move {
+            let request_id = command.request_id;
+            let publication_permit = self
+                .acquire_shared_publication_permit()
+                .await
+                .map_err(|error| error.with_request_id(request_id))?;
+            let publication_permit = publication_permit
+                .try_into_opaque::<SqlitePublicationPermit>()
+                .map_err(|_| {
+                    ServerError::new(
+                        ErrorCode::Internal,
+                        "sqlite Catalog created an invalid publication capability",
+                    )
+                    .with_request_id(request_id)
+                    .with_retryable(false)
+                })?;
+            let queued_bytes =
+                legacy_import_domain::legacy_import_preflight_bytes(&command).await?;
+            let manifest_permit = self
+                .manifest_queue_budget
+                .reserve(queued_bytes)
+                .map_err(|error| error.with_request_id(request_id))?;
+            await_response(self.writer_request(|response| {
+                ServiceMessage::LegacyImport(LegacyImportRequest {
+                    command,
+                    state: LegacyImportRequestState {
+                        request_id,
+                        response,
+                        _manifest_permit: manifest_permit,
+                        _publication_permit: publication_permit,
+                    },
+                })
+            }))
+            .await
+        })
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -522,7 +656,7 @@ impl SqliteCatalogReadHandle {
     pub async fn read_pinned_snapshot_at(
         &self,
         selectors: &[CatalogSnapshotSelector],
-    ) -> Result<SqliteCatalogPinnedQuerySnapshot> {
+    ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
         self.read_pinned_snapshot_at_with_limits(
             selectors,
             snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
@@ -535,19 +669,25 @@ impl SqliteCatalogReadHandle {
         &self,
         selectors: &[CatalogSnapshotSelector],
         limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
-    ) -> Result<SqliteCatalogPinnedQuerySnapshot> {
+    ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
         snapshot_domain::validate_snapshot_selectors(selectors)?;
         let limits = limits.validate()?;
+        let ownership = self.ownership.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "sqlite catalog data-directory ownership is no longer available",
+            )
+            .with_retryable(false)
+        })?;
         let runtime_snapshot_pins = self.runtime_snapshot_pin_registry()?;
         let mut pins = Vec::with_capacity(selectors.len());
         for selector in selectors {
             pins.push(runtime_snapshot_pins.pin(selector.table_id, selector.snapshot_version)?);
         }
         let snapshot = self.read_snapshot_at_with_limits(selectors, limits).await?;
-        Ok(SqliteCatalogPinnedQuerySnapshot {
-            snapshot,
-            _pins: pins,
-        })
+        Ok(crate::SqliteCatalogPinnedQuerySnapshot::new(
+            snapshot, pins, ownership,
+        ))
     }
 
     fn runtime_snapshot_pin_registry(
@@ -732,6 +872,46 @@ impl CatalogWrite for SqliteCatalog {
     }
 }
 
+impl SqliteCatalogLegacyImportSession<'_> {
+    /// Imports one fully verified legacy table or replays its exact permanent response.
+    pub fn import_legacy_table_v2(
+        &self,
+        command: LegacyCatalogImportEnvelopeV2,
+    ) -> BoxFuture<'_, Result<LegacyCatalogImportResponseV2>> {
+        if !self.active
+            || self.catalog.legacy_import_state.load(Ordering::Acquire) != LEGACY_IMPORT_ACTIVE
+        {
+            return Box::pin(async {
+                Err(ServerError::new(
+                    ErrorCode::Unavailable,
+                    "legacy import session is no longer active",
+                )
+                .with_retryable(false))
+            });
+        }
+        self.catalog.submit_legacy_import(command)
+    }
+
+    /// Permanently closes the V2 import window before server admission becomes visible.
+    pub fn seal(mut self) {
+        self.active = false;
+        self.catalog
+            .legacy_import_state
+            .store(LEGACY_IMPORT_SEALED, Ordering::Release);
+    }
+}
+
+impl Drop for SqliteCatalogLegacyImportSession<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.catalog
+                .legacy_import_state
+                .store(LEGACY_IMPORT_SEALED, Ordering::Release);
+            self.active = false;
+        }
+    }
+}
+
 impl CatalogPublicationControl for SqliteCatalog {
     fn acquire_publication_permit(&self) -> BoxFuture<'_, Result<CatalogPublicationPermit>> {
         Box::pin(self.acquire_shared_publication_permit())
@@ -763,6 +943,7 @@ impl CatalogGarbageCollection for SqliteCatalog {
         request: ClaimGarbageCollectionFilesRequest,
     ) -> BoxFuture<'_, Result<ClaimedGarbageCollectionFiles>> {
         Box::pin(async move {
+            self.seal_legacy_imports_for_ordinary_mutation()?;
             let guard = guard
                 .try_into_opaque::<crate::runtime_pins::SqliteGarbageCollectionGuard>()
                 .map_err(|_| {
@@ -811,6 +992,7 @@ impl CatalogGarbageCollection for SqliteCatalog {
         request: FinalizeGarbageCollectionFilesRequest,
     ) -> BoxFuture<'_, Result<FinalizedGarbageCollectionFiles>> {
         Box::pin(async move {
+            self.seal_legacy_imports_for_ordinary_mutation()?;
             crate::gc_domain::validate_finalize_request(&request)?;
             let command_permit = self.command_budget.reserve()?;
             await_response(self.writer_request(|response| {
@@ -1448,6 +1630,7 @@ fn join_read_worker(actor: JoinHandle<Result<()>>, role: &str) -> Result<()> {
 
 enum ServiceMessage {
     Command(CommandRequest),
+    LegacyImport(LegacyImportRequest),
     ClaimGarbageCollection(GarbageCollectionClaimRequest),
     FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
     Shutdown(Sender<Result<()>>),
@@ -1455,6 +1638,7 @@ enum ServiceMessage {
 
 enum WriterRequest {
     Command(CommandRequest),
+    LegacyImport(LegacyImportRequest),
     ClaimGarbageCollection(GarbageCollectionClaimRequest),
     FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
 }
@@ -1462,6 +1646,45 @@ enum WriterRequest {
 struct CommandRequest {
     command: VersionedCatalogCommand,
     state: CommandRequestState,
+}
+
+struct LegacyImportRequest {
+    command: LegacyCatalogImportEnvelopeV2,
+    state: LegacyImportRequestState,
+}
+
+struct LegacyImportRequestState {
+    request_id: RequestId,
+    response: oneshot::Sender<Result<LegacyCatalogImportResponseV2>>,
+    _manifest_permit: Option<ManifestQueuePermit>,
+    _publication_permit: SqlitePublicationPermit,
+}
+
+impl LegacyImportRequestState {
+    fn send(self, result: Result<LegacyCatalogImportResponseV2>) {
+        let _ = self.response.send(result);
+    }
+}
+
+enum PreparationRequestState {
+    Command(CommandRequestState),
+    LegacyImport(LegacyImportRequestState),
+}
+
+impl PreparationRequestState {
+    fn request_id(&self) -> RequestId {
+        match self {
+            Self::Command(state) => state.request_id,
+            Self::LegacyImport(state) => state.request_id,
+        }
+    }
+
+    fn send_error(self, error: ServerError) {
+        match self {
+            Self::Command(state) => state.send(Err(error)),
+            Self::LegacyImport(state) => state.send(Err(error)),
+        }
+    }
 }
 
 struct CommandRequestState {
@@ -1548,6 +1771,7 @@ impl ManifestPreparationBackend for DomainManifestPreparationBackend {
 enum ManifestWorkerJob {
     Verify(VersionedCatalogCommand),
     Prepare(domain::ManifestCommandPreparation),
+    PrepareLegacyImport(LegacyCatalogImportEnvelopeV2),
 }
 
 impl ManifestWorkerJob {
@@ -1555,6 +1779,7 @@ impl ManifestWorkerJob {
         match self {
             Self::Verify(command) => command_request_id(command),
             Self::Prepare(preparation) => preparation.request_id(),
+            Self::PrepareLegacyImport(command) => command.request_id,
         }
     }
 }
@@ -1562,6 +1787,7 @@ impl ManifestWorkerJob {
 enum ManifestWorkerCompletion {
     Verified(Result<domain::VerifiedManifestCommand>),
     Prepared(domain::ManifestPreparationResult),
+    LegacyImportPrepared(Result<legacy_import_domain::PreparedLegacyCatalogImportV2>),
 }
 
 enum ManifestWorkerSubmitError {
@@ -1646,6 +1872,13 @@ fn manifest_worker_loop(
                 let result = catch_unwind(AssertUnwindSafe(|| backend.prepare(preparation)))
                     .unwrap_or(panic_result);
                 ManifestWorkerCompletion::Prepared(result)
+            }
+            ManifestWorkerJob::PrepareLegacyImport(command) => {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    legacy_import_domain::prepare_legacy_catalog_import_v2(command)
+                }))
+                .unwrap_or_else(|_| Err(manifest_worker_panicked(request_id, "legacy_import")));
+                ManifestWorkerCompletion::LegacyImportPrepared(result)
             }
         };
         if completion_sender.send(completion).is_err() {
@@ -1818,7 +2051,7 @@ fn actor_loop(
 fn handle_service_message(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     pending_requests: &mut VecDeque<WriterRequest>,
     draining: &mut bool,
     shutdown_response: &mut Option<Sender<Result<()>>>,
@@ -1831,6 +2064,13 @@ fn handle_service_message(
             active_manifest,
             pending_requests,
             WriterRequest::Command(command),
+        ),
+        ServiceMessage::LegacyImport(request) => admit_writer_request(
+            connection,
+            manifest_worker,
+            active_manifest,
+            pending_requests,
+            WriterRequest::LegacyImport(request),
         ),
         ServiceMessage::ClaimGarbageCollection(request) => admit_writer_request(
             connection,
@@ -1856,7 +2096,7 @@ fn handle_service_message(
 fn admit_writer_request(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     pending_requests: &mut VecDeque<WriterRequest>,
     request: WriterRequest,
 ) {
@@ -1870,12 +2110,21 @@ fn admit_writer_request(
 fn start_writer_request(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     request: WriterRequest,
 ) {
     match request {
         WriterRequest::Command(command) => {
             start_command(connection, manifest_worker, active_manifest, command);
+        }
+        WriterRequest::LegacyImport(request) => {
+            let LegacyImportRequest { command, state } = request;
+            submit_manifest_job(
+                manifest_worker,
+                active_manifest,
+                ManifestWorkerJob::PrepareLegacyImport(command),
+                PreparationRequestState::LegacyImport(state),
+            );
         }
         WriterRequest::ClaimGarbageCollection(request) => request.execute(connection),
         WriterRequest::FinalizeGarbageCollection(request) => request.execute(connection),
@@ -1885,7 +2134,7 @@ fn start_writer_request(
 fn start_command(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     request: CommandRequest,
 ) {
     let CommandRequest { command, state } = request;
@@ -1894,7 +2143,7 @@ fn start_command(
             manifest_worker,
             active_manifest,
             ManifestWorkerJob::Verify(command),
-            state,
+            PreparationRequestState::Command(state),
         );
     } else {
         state.send(domain::execute_command(connection, command));
@@ -1904,7 +2153,7 @@ fn start_command(
 fn handle_manifest_completion(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     completion: ManifestWorkerCompletion,
 ) {
     let Some(state) = active_manifest.take() else {
@@ -1912,62 +2161,94 @@ fn handle_manifest_completion(
         return;
     };
     match completion {
-        ManifestWorkerCompletion::Verified(Err(error)) => state.send(Err(error)),
+        ManifestWorkerCompletion::Verified(Err(error)) => state.send_error(error),
         ManifestWorkerCompletion::Verified(Ok(verified)) => {
+            let PreparationRequestState::Command(state) = state else {
+                state.send_error(ServerError::new(
+                    ErrorCode::Internal,
+                    "sqlite Catalog preparation state mismatched verified manifest",
+                ));
+                return;
+            };
             match domain::begin_verified_manifest_command(connection, verified) {
                 Ok(domain::ManifestCommandStart::Replay(response)) => state.send(Ok(response)),
                 Ok(domain::ManifestCommandStart::Prepare(preparation)) => submit_manifest_job(
                     manifest_worker,
                     active_manifest,
                     ManifestWorkerJob::Prepare(preparation),
-                    state,
+                    PreparationRequestState::Command(state),
                 ),
                 Err(error) => state.send(Err(error)),
             }
         }
         ManifestWorkerCompletion::Prepared(result) => {
+            let PreparationRequestState::Command(state) = state else {
+                state.send_error(ServerError::new(
+                    ErrorCode::Internal,
+                    "sqlite Catalog preparation state mismatched prepared manifest",
+                ));
+                return;
+            };
             state.send(domain::finalize_manifest_preparation(connection, result));
+        }
+        ManifestWorkerCompletion::LegacyImportPrepared(result) => {
+            let PreparationRequestState::LegacyImport(state) = state else {
+                state.send_error(ServerError::new(
+                    ErrorCode::Internal,
+                    "sqlite Catalog preparation state mismatched legacy import",
+                ));
+                return;
+            };
+            state.send(result.and_then(|prepared| {
+                legacy_import_domain::commit_legacy_catalog_import_v2(connection, prepared)
+            }));
         }
     }
 }
 
 fn submit_manifest_job(
     manifest_worker: &ManifestPreparationWorker,
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     job: ManifestWorkerJob,
-    state: CommandRequestState,
+    state: PreparationRequestState,
 ) {
     match manifest_worker.submit(job) {
         Ok(()) => *active_manifest = Some(state),
         Err(ManifestWorkerSubmitError::Full(job)) => {
             let request_id = job.request_id();
-            state.send(Err(ServerError::new(
-                ErrorCode::ResourceExhausted,
-                "sqlite catalog manifest preparation queue is full",
-            )
-            .with_request_id(request_id)));
+            state.send_error(
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "sqlite catalog manifest preparation queue is full",
+                )
+                .with_request_id(request_id),
+            );
         }
         Err(ManifestWorkerSubmitError::Stopped(job)) => {
             let request_id = job.request_id();
-            state.send(Err(ServerError::new(
-                ErrorCode::Unavailable,
-                "sqlite catalog manifest preparation worker is not running",
-            )
-            .with_request_id(request_id)
-            .with_retryable(false)));
+            state.send_error(
+                ServerError::new(
+                    ErrorCode::Unavailable,
+                    "sqlite catalog manifest preparation worker is not running",
+                )
+                .with_request_id(request_id)
+                .with_retryable(false),
+            );
         }
     }
 }
 
 fn fail_active_manifest_worker(
-    active_manifest: &mut Option<CommandRequestState>,
+    active_manifest: &mut Option<PreparationRequestState>,
     message: &'static str,
 ) {
     if let Some(state) = active_manifest.take() {
-        let request_id = state.request_id;
-        state.send(Err(ServerError::new(ErrorCode::Unavailable, message)
-            .with_request_id(request_id)
-            .with_retryable(false)));
+        let request_id = state.request_id();
+        state.send_error(
+            ServerError::new(ErrorCode::Unavailable, message)
+                .with_request_id(request_id)
+                .with_retryable(false),
+        );
     }
 }
 
@@ -2057,6 +2338,7 @@ impl Drop for SqliteCatalog {
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
+    use std::io::Read;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2065,22 +2347,26 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use zippy_core::OwnedDataDirectory;
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
         CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
         CatalogGarbageCollectionGuard, CatalogIdempotencyRead, CatalogPublicationControl,
-        CatalogPublicationPermit, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
-        ClaimGarbageCollectionFilesRequest, CommandFingerprint, CommitCompactionCommand,
-        CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand, ManagedDataFileProbe,
-        VersionedCatalogCommand, VersionedCatalogResponse,
+        CatalogPublicationPermit, CatalogRead, CatalogSnapshotSelector, CatalogTableSnapshot,
+        CatalogWrite, ClaimGarbageCollectionFilesRequest, CommandFingerprint,
+        CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand,
+        CreateTableCommand, LegacyCatalogImportCommandV2, LegacyCatalogImportEnvelopeV2,
+        LegacyCatalogImportFileV2, ManagedDataFileProbe, VersionedCatalogCommand,
+        VersionedCatalogResponse, LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
     };
     use zippy_types::table::{
-        AppendTableDefinition, CatalogName, DataFileLocation, DataFileProvenance, DataFileState,
-        ManagedDataPath, MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile,
-        SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
-        TableDefinition,
+        AppendTableDefinition, CatalogName, DataFileDescriptor, DataFileLocation,
+        DataFileProvenance, DataFileState, DataFiles, ExternalDataPath, ManagedDataPath,
+        MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile,
+        SchemaCompatibility, SchemaDescriptor, SchemaIpcPayload, SourceSegmentIdentity,
+        SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
     };
     use zippy_types::{
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
@@ -2225,6 +2511,30 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn write_managed_file_fixture(
+        data_directory: &OwnedDataDirectory,
+        file: u128,
+        contents: &[u8],
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let table_directory = data_directory.directory().root().join("tables/ticks");
+        std::fs::create_dir_all(&table_directory).expect("create table data directory");
+        std::fs::set_permissions(
+            table_directory.parent().expect("tables parent"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("secure tables directory");
+        std::fs::set_permissions(&table_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("secure table directory");
+        let physical_file = table_directory.join(format!("{file}.parquet"));
+        std::fs::write(&physical_file, contents).expect("write physical file fixture");
+        std::fs::set_permissions(&physical_file, std::fs::Permissions::from_mode(0o600))
+            .expect("secure physical file fixture");
+        physical_file
+    }
+
     fn request_id(value: u128) -> RequestId {
         RequestId::from_u128(value).expect("nonzero request id")
     }
@@ -2248,6 +2558,24 @@ mod tests {
             command,
         )
         .expect("valid command envelope")
+        .into()
+    }
+
+    fn migration_command(
+        request: u128,
+        expected_revision: Option<u64>,
+        command: CatalogCommandV1,
+    ) -> VersionedCatalogCommand {
+        CatalogCommandEnvelopeV1::new(
+            request_id(request),
+            expected_revision,
+            CatalogActor {
+                kind: CatalogActorKind::Migration,
+                principal: "catalog-service-migration-test".to_owned(),
+            },
+            command,
+        )
+        .expect("valid migration command envelope")
         .into()
     }
 
@@ -2291,6 +2619,280 @@ mod tests {
             ))
             .await
             .expect("create append table");
+    }
+
+    #[cfg(unix)]
+    fn external_legacy_import_command(
+        path: &std::path::Path,
+        contents: &[u8],
+    ) -> LegacyCatalogImportEnvelopeV2 {
+        let schema_ipc = schema_ipc();
+        let canonical_schema_hash = crate::canonical_schema_hash_from_ipc(&schema_ipc)
+            .expect("hash external legacy Schema");
+        let checksum = format!("sha256-v1:{:x}", Sha256::digest(contents));
+        let pending_file = PendingDataFile {
+            file_id: FileId::from_u128(10).expect("nonzero file id"),
+            table_id: table_id(),
+            schema_version: 1,
+            location: DataFileLocation::ExternalLegacy(
+                ExternalDataPath::new(path.to_str().expect("UTF-8 external legacy fixture path"))
+                    .expect("valid external legacy fixture path"),
+            ),
+            file_size_bytes: u64::try_from(contents.len())
+                .expect("external legacy fixture size fits u64"),
+            row_count: NonZeroU64::new(1).expect("nonzero row count"),
+            provenance: DataFileProvenance::Legacy {
+                offsets: None,
+                preserve_discovery_order: true,
+            },
+            partition: MetadataMap::new(),
+            statistics: MetadataMap::new(),
+            metadata: MetadataMap::from([(
+                LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY.to_owned(),
+                MetadataScalar::String(canonical_schema_hash.clone()),
+            )]),
+            checksum,
+            created_at_ns: 1,
+        };
+        LegacyCatalogImportEnvelopeV2::new(
+            request_id(2),
+            Some(1),
+            CatalogActor {
+                kind: CatalogActorKind::Migration,
+                principal: "catalog-service-external-legacy-test".to_owned(),
+            },
+            format!("sha256-v1:{}", "7".repeat(64)),
+            1,
+            LegacyCatalogImportCommandV2 {
+                table_id: table_id(),
+                namespace_id: NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id"),
+                name: CatalogName::new("ticks").expect("valid table name"),
+                definition: TableDefinition::Append(AppendTableDefinition {
+                    event_time_column: None,
+                }),
+                schema_ipc,
+                canonical_schema_hash,
+                config: BTreeMap::new(),
+                writer_epoch: 1,
+                files: vec![LegacyCatalogImportFileV2 {
+                    file: pending_file,
+                    discovery_order: 0,
+                }],
+                legacy_files_revision: 1,
+            },
+        )
+        .expect("build external legacy import")
+    }
+
+    #[cfg(unix)]
+    async fn import_external_legacy_file(
+        catalog: &SqliteCatalog,
+        path: &std::path::Path,
+        contents: &[u8],
+    ) -> zippy_types::catalog::CatalogQuerySnapshot {
+        std::fs::write(path, contents).expect("write external legacy fixture");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire external legacy import session");
+        catalog
+            .command(migration_command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create external legacy namespace");
+
+        let command = external_legacy_import_command(path, contents);
+        let schema_ipc = command.command.schema_ipc.clone();
+        let canonical_schema_hash = command.command.canonical_schema_hash.clone();
+        let pending_file = command.command.files[0].file.clone();
+        let response = session
+            .import_legacy_table_v2(command)
+            .await
+            .expect("import external legacy file");
+        session.seal();
+        let selector = CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 2,
+            schema_version: 1,
+        };
+        let schema = SchemaDescriptor {
+            table_id: table_id(),
+            schema_version: 1,
+            schema_ipc,
+            schema_hash: canonical_schema_hash,
+            compatibility: SchemaCompatibility::Initial,
+            created_at_ns: response.table.created_at_ns,
+        };
+        let files = DataFiles::new(vec![DataFileDescriptor {
+            file: pending_file,
+            added_snapshot_version: 2,
+            removed_snapshot_version: None,
+            state: DataFileState::Committed,
+        }])
+        .expect("build external legacy pinned file set");
+        let table =
+            CatalogTableSnapshot::new(selector, response.table, schema, response.snapshot, files)
+                .expect("build external legacy pinned table");
+        zippy_types::catalog::CatalogQuerySnapshot::new(response.catalog_revision, vec![table])
+            .expect("build external legacy pinned query snapshot")
+    }
+
+    #[cfg(unix)]
+    fn overwrite_legacy_import_response(
+        database_path: &std::path::Path,
+        response: &serde_json::Value,
+    ) {
+        let connection = rusqlite::Connection::open(database_path).expect("open Catalog database");
+        let encoded = serde_json::to_vec(response).expect("encode tampered legacy response");
+        connection
+            .execute(
+                "UPDATE legacy_import_requests SET response_blob = ?1 WHERE request_id = ?2",
+                rusqlite::params![encoded, request_id(2).into_bytes().as_slice()],
+            )
+            .expect("tamper retained legacy response");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_import_replay_rejects_semantically_tampered_responses() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let physical_file = directory.path().join("legacy.parquet");
+        let contents = b"legacy-replay-revision-fixture";
+        std::fs::write(&physical_file, contents).expect("write external legacy fixture");
+        let import_command = external_legacy_import_command(&physical_file, contents);
+
+        let catalog = SqliteCatalog::open(config.clone()).expect("open Catalog");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire legacy import session");
+        catalog
+            .command(migration_command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create external legacy namespace");
+        session
+            .import_legacy_table_v2(import_command.clone())
+            .await
+            .expect("commit legacy import");
+        session.seal();
+        catalog.close().expect("close Catalog before tampering");
+
+        let database_path = data_directory.directory().root().join("catalog/catalog.db");
+        let connection = rusqlite::Connection::open(&database_path).expect("open Catalog database");
+        let response_blob: Vec<u8> = connection
+            .query_row(
+                "SELECT response_blob FROM legacy_import_requests WHERE request_id = ?1",
+                [request_id(2).into_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("read retained legacy response");
+        let response: serde_json::Value =
+            serde_json::from_slice(&response_blob).expect("decode retained legacy response");
+        drop(connection);
+
+        let mut wrong_created_at = response.clone();
+        wrong_created_at["response"]["table"]["created_at_ns"] = serde_json::json!(1);
+        overwrite_legacy_import_response(&database_path, &wrong_created_at);
+        let reopened = SqliteCatalog::open(config.clone()).expect("reopen Catalog");
+        let replay_session = reopened
+            .begin_legacy_import_session()
+            .expect("acquire replay import session");
+        let error = replay_session
+            .import_legacy_table_v2(import_command.clone())
+            .await
+            .expect_err("wrong replay creation time must fail closed");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(2)));
+        replay_session.seal();
+        reopened.close().expect("close reopened Catalog");
+
+        let mut wrong_revision = response;
+        wrong_revision["response"]["catalog_revision"] = serde_json::json!(3);
+        wrong_revision["response"]["snapshot"]["commit_lsn"] = serde_json::json!(3);
+        overwrite_legacy_import_response(&database_path, &wrong_revision);
+        let reopened = SqliteCatalog::open(config).expect("reopen Catalog for revision check");
+        let replay_session = reopened
+            .begin_legacy_import_session()
+            .expect("acquire revision replay session");
+        let error = replay_session
+            .import_legacy_table_v2(import_command)
+            .await
+            .expect_err("wrong replay revision must fail closed");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(2)));
+        replay_session.seal();
+        reopened.close().expect("close revision replay Catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_import_session_is_exclusive_and_sealed_by_ordinary_writes() {
+        let directory = TempDir::new().expect("create session test directory");
+        let owned = data_directory(&directory);
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open Catalog");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire first import session");
+        let duplicate = catalog
+            .begin_legacy_import_session()
+            .expect_err("second active import session must be rejected");
+        assert_eq!(duplicate.code(), ErrorCode::Conflict);
+
+        let ordinary_write = catalog
+            .command(command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect_err("ordinary writes must not cross an active import session");
+        assert_eq!(ordinary_write.code(), ErrorCode::Conflict);
+        drop(session);
+        let sealed = catalog
+            .begin_legacy_import_session()
+            .expect_err("dropping a session must seal the Catalog instance");
+        assert_eq!(sealed.code(), ErrorCode::Conflict);
+        catalog.close().expect("close first Catalog");
+
+        let second_directory = TempDir::new().expect("create ordinary-write test directory");
+        let second_owned = data_directory(&second_directory);
+        let second = SqliteCatalog::open(SqliteCatalogConfig::new(&second_owned))
+            .expect("open second Catalog");
+        second
+            .command(command(
+                2,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("commit ordinary Catalog write");
+        let sealed = second
+            .begin_legacy_import_session()
+            .expect_err("ordinary mutation must seal an unused import window");
+        assert_eq!(sealed.code(), ErrorCode::Conflict);
+        second.close().expect("close second Catalog");
     }
 
     fn pending_file(file: u128, offset: u64) -> PendingDataFile {
@@ -2516,10 +3118,13 @@ mod tests {
         assert!(!snapshot_error.retryable());
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn pinned_read_handle_snapshot_protects_physical_files_until_drop() {
+    async fn pinned_file_tasks_and_readers_protect_physical_files_until_final_drop() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
+        let contents: Vec<u8> = (0..128).collect();
+        write_managed_file_fixture(&data_directory, 10, &contents);
         let catalog =
             SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
         create_append_table(&catalog).await;
@@ -2541,7 +3146,16 @@ mod tests {
             }])
             .await
             .expect("read and pin historical snapshot");
-        assert_eq!(pinned.snapshot().tables()[0].files().as_slice().len(), 1);
+        assert_eq!(pinned.catalog_revision(), 4);
+        let table = pinned.table(0).expect("pinned table manifest");
+        assert_eq!(table.file_count(), 1);
+        let file = table.file(0).expect("pinned data-file task");
+        assert_eq!(file.file_id(), FileId::from_u128(10).unwrap());
+        assert!(!format!("{file:?}").contains("tables/ticks"));
+        let worker_file = file.clone();
+        drop(file);
+        drop(table);
+        drop(pinned);
 
         let protected = catalog
             .claim_garbage_collection_files(
@@ -2555,10 +3169,44 @@ mod tests {
                 },
             )
             .await
-            .expect("claim while historical snapshot is pinned");
+            .expect("claim while cloned file task retains pin owner");
         assert!(protected.files.is_empty());
 
-        drop(pinned);
+        let second_worker_file = worker_file.clone();
+        let mut reader = worker_file.open_reader().expect("open controlled reader");
+        let mut second_reader = second_worker_file
+            .open_reader()
+            .expect("open independent controlled reader");
+        let mut first_byte = [u8::MAX];
+        let mut second_first_byte = [u8::MAX];
+        reader
+            .read_exact(&mut first_byte)
+            .expect("read first worker cursor");
+        second_reader
+            .read_exact(&mut second_first_byte)
+            .expect("read independent worker cursor");
+        assert_eq!(first_byte, [0]);
+        assert_eq!(second_first_byte, [0]);
+        drop(worker_file);
+        drop(second_worker_file);
+        drop(reader);
+
+        let reader_protected = catalog
+            .claim_garbage_collection_files(
+                catalog
+                    .acquire_garbage_collection_guard(table_id())
+                    .expect("exclude pins retained by independent reader"),
+                ClaimGarbageCollectionFilesRequest {
+                    table_id: table_id(),
+                    retry_limit: 1,
+                    new_claim_limit: 1,
+                },
+            )
+            .await
+            .expect("claim while independent reader retains pin owner");
+        assert!(reader_protected.files.is_empty());
+
+        drop(second_reader);
         let claimed = catalog
             .claim_garbage_collection_files(
                 catalog
@@ -2571,9 +3219,149 @@ mod tests {
                 },
             )
             .await
-            .expect("claim after pinned read completes");
+            .expect("claim after final pinned reader drops");
         assert_eq!(claimed.files.len(), 1);
         assert_eq!(claimed.files[0].file_id(), FileId::from_u128(10).unwrap());
+        catalog.close().expect("close catalog");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_external_legacy_reader_starts_at_offset_zero_after_checksum() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let physical_file = directory.path().join("legacy-events.parquet");
+        let contents = (0_u8..=127).collect::<Vec<_>>();
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let snapshot = import_external_legacy_file(&catalog, &physical_file, &contents).await;
+        let pin = catalog
+            .pin_runtime_snapshot(table_id(), 2)
+            .expect("pin external legacy snapshot");
+        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::new(
+            snapshot,
+            vec![pin],
+            Arc::clone(&data_directory),
+        );
+        let file = pinned
+            .table(0)
+            .expect("pinned external legacy table")
+            .file(0)
+            .expect("pinned external legacy file");
+        let mut reader = file
+            .open_reader()
+            .expect("open checksum-validated external legacy reader");
+        let mut actual = Vec::new();
+        reader
+            .read_to_end(&mut actual)
+            .expect("read external legacy file from its first byte");
+        assert_eq!(actual, contents);
+
+        drop((reader, file, pinned));
+        catalog.close().expect("close catalog");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_external_legacy_reader_rejects_same_size_content_replacement() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let physical_file = directory.path().join("legacy-events.parquet");
+        let contents = [0x5a_u8; 128];
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let snapshot = import_external_legacy_file(&catalog, &physical_file, &contents).await;
+        let pin = catalog
+            .pin_runtime_snapshot(table_id(), 2)
+            .expect("pin external legacy snapshot");
+        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::new(
+            snapshot,
+            vec![pin],
+            Arc::clone(&data_directory),
+        );
+        let file = pinned
+            .table(0)
+            .expect("pinned external legacy table")
+            .file(0)
+            .expect("pinned external legacy file");
+
+        std::fs::write(&physical_file, [0xa5_u8; 128])
+            .expect("replace external legacy contents without changing length");
+        let error = file
+            .open_reader()
+            .expect_err("same-size external legacy replacement must fail closed");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert!(!error.message().contains(
+            physical_file
+                .to_str()
+                .expect("UTF-8 external legacy fixture path")
+        ));
+
+        drop((file, pinned));
+        catalog.close().expect("close catalog");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_reader_rejects_unsafe_or_changed_managed_files_without_path_disclosure() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let physical_file = write_managed_file_fixture(&data_directory, 10, &[0x5a; 127]);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+        catalog
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .expect("commit physical file metadata");
+        let pinned = catalog
+            .read_handle()
+            .expect("create read handle")
+            .read_pinned_snapshot_at(&[CatalogSnapshotSelector {
+                table_id: table_id(),
+                snapshot_version: 2,
+                schema_version: 1,
+            }])
+            .await
+            .expect("read pinned snapshot");
+        let table = pinned.table(0).expect("pinned table manifest");
+        let file = table.file(0).expect("pinned data-file task");
+
+        let wrong_size = file
+            .open_reader()
+            .expect_err("changed physical length must fail closed");
+        assert_eq!(wrong_size.code(), ErrorCode::DataCorruption);
+        assert!(!wrong_size.message().contains("tables/ticks"));
+        assert!(!wrong_size
+            .message()
+            .contains(data_directory.directory().root().to_string_lossy().as_ref()));
+
+        std::fs::write(&physical_file, [0x5a; 128]).expect("restore expected length");
+        std::fs::set_permissions(&physical_file, std::fs::Permissions::from_mode(0o600))
+            .expect("restore secure permissions");
+        let hard_link = physical_file.with_extension("hardlink");
+        std::fs::hard_link(&physical_file, &hard_link).expect("create unsafe hard link");
+        let linked = file
+            .open_reader()
+            .expect_err("multiply linked managed file must fail closed");
+        assert_eq!(linked.code(), ErrorCode::DataCorruption);
+        std::fs::remove_file(hard_link).expect("remove hard-link fixture");
+
+        file.open_reader()
+            .expect("restored secure physical file must open");
+        std::fs::remove_file(&physical_file).expect("remove physical file fixture");
+        symlink("/etc/passwd", &physical_file).expect("create unsafe symlink fixture");
+        let symlinked = file
+            .open_reader()
+            .expect_err("symbolic-link replacement must fail closed");
+        assert_eq!(symlinked.code(), ErrorCode::DataCorruption);
+        assert!(!symlinked.message().contains("/etc/passwd"));
+
+        drop(file);
+        drop(table);
+        drop(pinned);
         catalog.close().expect("close catalog");
     }
 

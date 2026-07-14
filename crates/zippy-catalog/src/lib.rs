@@ -16,19 +16,26 @@ mod encoding;
 mod file_domain;
 mod gc_domain;
 mod lease_domain;
+mod legacy_import_domain;
 mod manifest_domain;
 mod migration;
+mod pinned_snapshot;
 mod runtime_pins;
 mod service;
 mod snapshot_domain;
 mod storage_codec;
 mod table_domain;
 
+pub use pinned_snapshot::{
+    PinnedDataFile, PinnedDataFileLocationKind, PinnedDataFileReader, PinnedTableManifest,
+    SqliteCatalogPinnedQuerySnapshot,
+};
 pub use runtime_pins::{SqliteCatalogRuntimeSnapshotPin, SqliteCatalogRuntimeSnapshotPinStatus};
-pub use service::{SqliteCatalog, SqliteCatalogPinnedQuerySnapshot, SqliteCatalogReadHandle};
+pub use service::{SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogReadHandle};
 pub use snapshot_domain::SqliteCatalogSnapshotReadLimits;
 pub use storage_codec::{
-    decode_persisted_schema, decode_persisted_table_schema, DecodedPersistedTableSchema,
+    canonical_schema_hash, canonical_schema_hash_from_ipc, decode_persisted_schema,
+    decode_persisted_table_schema, DecodedPersistedTableSchema,
 };
 
 use std::path::{Path, PathBuf};
@@ -42,7 +49,7 @@ use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const CATALOG_SCHEMA_VERSION: u32 = 5;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;
@@ -409,6 +416,10 @@ fn open_on_actor(
         .busy_timeout(config.busy_timeout)
         .map_err(|error| map_sqlite_error("configure catalog busy timeout", error))?;
     migration::preflight(&connection)?;
+    // Never advance the physical schema of a corrupt database. A failed post-migration check
+    // cannot roll back a transaction that has already committed, so the old version must first be
+    // proven healthy to preserve binary rollback.
+    run_quick_check(&connection, config.integrity_check_timeout)?;
     configure_durable_pragmas(&connection)?;
     migration::migrate(&mut connection)?;
     let integrity = run_quick_check(&connection, config.integrity_check_timeout)?;
