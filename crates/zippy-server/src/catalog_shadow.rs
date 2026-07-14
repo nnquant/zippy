@@ -138,7 +138,21 @@ impl PersistedReadShadowSource for SqliteCatalogPersistedReadShadowSource {
             let legacy_schema_hash = canonical_schema_hash(&schema);
             let mut encoded_bytes = 2_usize;
             let mut persisted_files = Vec::with_capacity(native.files().as_slice().len());
-            for (index, file) in native.files().as_slice().iter().enumerate() {
+            let mut ordered_files = native.files().as_slice().iter().collect::<Vec<_>>();
+            ordered_files.sort_unstable_by(|left, right| {
+                match (
+                    left.legacy_discovery_order(),
+                    right.legacy_discovery_order(),
+                ) {
+                    (Some(left_order), Some(right_order)) => left_order
+                        .cmp(&right_order)
+                        .then_with(|| left.file_id().cmp(&right.file_id())),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => left.file_id().cmp(&right.file_id()),
+                }
+            });
+            for (index, file) in ordered_files.into_iter().enumerate() {
                 if index % 32 == 0 {
                     tokio::task::yield_now().await;
                 }

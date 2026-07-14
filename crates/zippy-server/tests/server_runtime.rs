@@ -360,6 +360,8 @@ fn configured_native_storage_recovers_before_server_readiness() {
         .expect("enabled native storage must expose physical verification evidence");
     assert_eq!(physical.table_count, 0);
     assert_eq!(physical.managed_file_count, 0);
+    assert_eq!(physical.external_legacy_file_count, 0);
+    assert_eq!(physical.file_count, 0);
     assert!(data_dir.join("catalog/catalog.db").is_file());
 
     assert!(runtime.shutdown().is_clean());
@@ -558,15 +560,12 @@ async fn sqlite_shadow_migration_failure_is_degraded_without_closing_legacy_auth
         LegacyCatalogMigrationDegradedReason::ExecutionFailed
     );
     assert_eq!(degradation.error_code, Some(ErrorCode::Conflict));
-    assert!(degradation
-        .message
-        .as_deref()
-        .is_some_and(|message| {
-            message.contains("code=[CONFLICT]")
-                && message.contains("request_id=[")
-                && message.contains("table_id=[")
-                && !message.contains("target revision does not match")
-        }));
+    assert!(degradation.message.as_deref().is_some_and(|message| {
+        message.contains("code=[CONFLICT]")
+            && message.contains("request_id=[")
+            && message.contains("table_id=[")
+            && !message.contains("target revision does not match")
+    }));
     let metrics = runtime.legacy_catalog_migration_metrics();
     assert_eq!(metrics["state"], "degraded");
     assert_eq!(metrics["degraded_reason"], "execution_failed");

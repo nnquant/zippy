@@ -1257,7 +1257,7 @@ fn open_catalog_visible_candidate(
     .with_retryable(false))
 }
 
-fn validate_parquet_footer_length(
+pub(crate) fn validate_parquet_footer_length(
     file: &mut File,
     file_size_bytes: u64,
     table_id: TableId,

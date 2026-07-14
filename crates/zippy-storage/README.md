@@ -18,11 +18,21 @@ verification, Server planning must sort files by the legacy Gateway key
 resulting contiguous position to `discovery_order`; the original Registry index is retained only
 for audit diagnostics.
 
+The Server V2 planner/executor is wired to this verifier. It first performs the Catalog's bounded
+request-ID replay probe. A committed probe result is only a hint: because it contains no physical
+file fingerprint, the Server must compare every plan-derivable response identity, revision,
+table/snapshot shape, file count, legacy revision, and known row count before classifying it as a
+replay. Only `Missing` at the plan's expected Catalog revision is allowed to scan and hash the
+physical files and submit the import transaction. Consequently the initial commit pays the full
+legacy-file scan, while an exact replay does not repeat migration I/O.
+
 The verifier cannot make an externally owned pathname immutable after it returns. Startup
 orchestration must keep legacy roots quiescent/read-only until the Catalog transaction terminates,
-and query execution reopens and rechecks the recorded checksum for every external reader. The
-long-term authority path should copy or reflink legacy files into managed immutable storage; the
-current helper does not make SQLite or Gateway authoritative by itself.
+and query execution reopens and rechecks the recorded checksum for every external reader. This is
+still a mutable-file/TOCTOU boundary, not an immutable storage guarantee. Authority cutover must
+remain blocked until external files are copied or reflinked into managed immutable storage and
+opened through the managed capability. The current helper does not make SQLite or Gateway
+authoritative by itself.
 
 ## Candidate protocol
 
@@ -145,22 +155,34 @@ scans physical files toward the Catalog.
 
 After replay and final reconciliation, `StartupCatalogFileVerifier` performs the reverse startup
 gate. It lists active tables in 512-table pages, reads current snapshots in batches of 512 at one
-stable Catalog revision, and fully verifies every currently visible managed file. Verification
-opens each path relative to the retained data-root and table directory descriptors with
-`O_NOFOLLOW`, then reuses the candidate size, checksum, Parquet footer, and row-count invariants.
-Missing files, symlink substitutions, and corrupted content fail startup with
-`DataCorruption`. The default pass admits at most 65,536 active tables, 65,536 current managed
-files, 8 GiB of checksummed content, and 128 MiB of retained runtime metadata plus schema data.
+stable Catalog revision, and fully verifies every currently visible managed or external legacy
+file. Managed paths remain descriptor-relative to the retained data-root. External absolute paths
+are traversed one component at a time with `O_NOFOLLOW`; verification retains one file descriptor,
+checks regular-file type and Catalog size, SHA-256, bounded Parquet footer, exact snapshot Schema,
+row count, and the descriptor identity before and after content reads. External paths are never
+included in startup errors. Missing files, symlink substitutions, identity changes, and corrupted
+content fail the readiness gate. For an `Import` snapshot, the visible manifest's aggregate file,
+row, and byte counts must exactly match the strictly typed `added_files`, `added_rows`, and
+`added_bytes` summary entries; `legacy_files_revision` must be the only fourth entry and nonzero.
+The Catalog reader separately requires a frozen V2 import to be snapshot 2 with parent 1 and a
+complete `0..file_count` order of schema-v1 ExternalLegacy descriptors, so startup never verifies a
+partially reconstructed or mixed import manifest.
+This full check runs on every native startup, including a startup whose migration path accepted a
+Catalog replay without rescanning files. The replay optimization therefore never turns readiness
+into a metadata-only check.
+The default pass admits at most 65,536 active tables, 65,536 current files across both location
+classes, 8 GiB of checksummed content, and 128 MiB of retained runtime metadata plus schema data.
+The verification report exposes managed, external legacy, and aggregate file counts separately.
 `verify_with_bootstrap()` returns one atomic result containing the verification report and every
 active table's `TableDescriptor`, current `SchemaDescriptor`, and current `TableSnapshot`, ordered
 by table ID. Its metadata budget charges JSON-encoded table/snapshot/schema fields plus raw schema
 IPC bytes. During server bootstrap, every decoded Arrow schema adds a conservative retained-memory
 charge against that same 128 MiB limit before its table runtime is published. Visible file
 descriptors remain batch-local and are not retained in the bootstrap result. Pagination, snapshot
-alignment, physical verification, decoded-schema charging, budget enforcement, or the final
-Catalog revision guard failing discards the entire result. The existing `verify()` API remains a
-compatibility wrapper that returns only the verification report. External legacy paths and
-historical files removed from the current snapshot are outside this startup gate; maintenance
+alignment, import-summary validation, physical verification, decoded-schema charging, budget
+enforcement, or the final Catalog revision guard failing discards the entire result. The existing
+`verify()` API remains a compatibility wrapper that returns only the verification report.
+Historical files removed from the current snapshot remain outside this startup gate; maintenance
 verification remains responsible for historical/deep audits.
 
 Logical drop, snapshot leases, safe GC, compaction, and public native write admission remain later

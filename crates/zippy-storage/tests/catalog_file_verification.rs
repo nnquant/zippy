@@ -1,27 +1,32 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+use parquet::arrow::ArrowWriter;
+use zippy_catalog::{canonical_schema_hash_from_ipc, SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::OwnedDataDirectory;
 use zippy_storage::{
-    ParquetCandidateSpec, ParquetCandidateWriter, StartupCatalogFileVerifier,
-    StartupCatalogFileVerifierConfig,
+    verify_legacy_parquet_import, LegacyParquetImportSpec, ParquetCandidateSpec,
+    ParquetCandidateWriter, StartupCatalogFileVerifier, StartupCatalogFileVerifierConfig,
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
     CatalogWrite, CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand,
-    CreateTableCommand, VersionedCatalogCommand,
+    CreateTableCommand, LegacyCatalogImportCommandV2, LegacyCatalogImportEnvelopeV2,
+    VersionedCatalogCommand,
 };
 use zippy_types::table::{
-    AppendTableDefinition, CatalogName, DataFileLocation, ManagedDataPath, MetadataMap,
-    NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload, SourceSegmentIdentity,
-    SourceSegmentLineage, SourceSegmentLineages, TableDefinition, TableState,
+    AppendTableDefinition, CatalogName, DataFileLocation, ExternalDataPath, ManagedDataPath,
+    MetadataMap, NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload,
+    SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
+    TableState,
 };
 use zippy_types::{
     ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
@@ -53,6 +58,13 @@ fn actor() -> CatalogActor {
     }
 }
 
+fn migration_actor() -> CatalogActor {
+    CatalogActor {
+        kind: CatalogActorKind::Migration,
+        principal: "catalog-file-verification-migration".to_owned(),
+    }
+}
+
 fn command(
     request: u128,
     expected_revision: Option<u64>,
@@ -61,6 +73,21 @@ fn command(
     CatalogCommandEnvelopeV1::new(request_id(request), expected_revision, actor(), body)
         .expect("valid Catalog command")
         .into()
+}
+
+fn migration_command(
+    request: u128,
+    expected_revision: Option<u64>,
+    body: CatalogCommandV1,
+) -> VersionedCatalogCommand {
+    CatalogCommandEnvelopeV1::new(
+        request_id(request),
+        expected_revision,
+        migration_actor(),
+        body,
+    )
+    .expect("valid migration Catalog command")
+    .into()
 }
 
 fn schema() -> SchemaRef {
@@ -98,7 +125,7 @@ fn provenance(first: u64, last: u64) -> NativeDataFileProvenance {
 }
 
 struct Fixture {
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     owned: Arc<OwnedDataDirectory>,
     catalog: Arc<SqliteCatalog>,
 }
@@ -114,7 +141,7 @@ impl Fixture {
             SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open test Catalog"),
         );
         catalog
-            .command(command(
+            .command(migration_command(
                 1,
                 Some(0),
                 CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
@@ -125,7 +152,7 @@ impl Fixture {
             .await
             .expect("create test namespace");
         Self {
-            _temp: temp,
+            temp,
             owned,
             catalog,
         }
@@ -204,6 +231,84 @@ impl Fixture {
             .expect("commit test files");
     }
 
+    async fn import_external_legacy_table(
+        &self,
+        table: u128,
+        request: u128,
+        expected_revision: u64,
+        values: Vec<i64>,
+    ) -> (PathBuf, PendingDataFile) {
+        let legacy_root = self.temp.path().join(format!("legacy-{table}"));
+        fs::create_dir(&legacy_root).expect("create external legacy root");
+        let path = legacy_root.join("events.parquet");
+        let legacy_schema = schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&legacy_schema),
+            vec![Arc::new(Int64Array::from(values.clone()))],
+        )
+        .expect("valid legacy batch");
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).expect("create legacy file"),
+            Arc::clone(&legacy_schema),
+            None,
+        )
+        .expect("create legacy Parquet writer");
+        writer.write(&batch).expect("write legacy batch");
+        writer.close().expect("close legacy Parquet writer");
+
+        let schema_ipc = schema_ipc(legacy_schema.as_ref());
+        let verified = verify_legacy_parquet_import(LegacyParquetImportSpec {
+            table_id: table_id(table),
+            schema_version: 1,
+            path: ExternalDataPath::new(path.to_str().expect("temporary legacy path is UTF-8"))
+                .expect("absolute external path"),
+            allowed_root: Some(legacy_root),
+            expected_schema: legacy_schema,
+            expected_row_count: NonZeroU64::new(
+                u64::try_from(values.len()).expect("legacy row count fits u64"),
+            ),
+            expected_checksum: None,
+            discovery_order: 0,
+            partition: MetadataMap::new(),
+            statistics: MetadataMap::new(),
+            metadata: MetadataMap::new(),
+        })
+        .expect("verify legacy Parquet file");
+        let pending = verified.file.clone();
+        let envelope = LegacyCatalogImportEnvelopeV2::new(
+            request_id(request),
+            Some(expected_revision),
+            migration_actor(),
+            format!("sha256-v1:{}", "1".repeat(64)),
+            expected_revision,
+            LegacyCatalogImportCommandV2 {
+                table_id: table_id(table),
+                namespace_id: namespace_id(),
+                name: CatalogName::new(format!("legacy_{table}"))
+                    .expect("valid imported table name"),
+                definition: TableDefinition::Append(AppendTableDefinition::default()),
+                canonical_schema_hash: canonical_schema_hash_from_ipc(&schema_ipc)
+                    .expect("hash Catalog schema"),
+                schema_ipc,
+                config: BTreeMap::new(),
+                writer_epoch: 1,
+                files: vec![verified],
+                legacy_files_revision: 1,
+            },
+        )
+        .expect("valid legacy import envelope");
+        let session = self
+            .catalog
+            .begin_legacy_import_session()
+            .expect("acquire startup legacy import session");
+        session
+            .import_legacy_table_v2(envelope)
+            .await
+            .expect("import external legacy table");
+        session.seal();
+        (path, pending)
+    }
+
     fn verifier(&self) -> StartupCatalogFileVerifier {
         let catalog: Arc<dyn CatalogRead> = self.catalog.clone();
         StartupCatalogFileVerifier::new(Arc::clone(&self.owned), catalog)
@@ -234,7 +339,143 @@ async fn verifies_current_visible_managed_candidate() {
     assert_eq!(report.catalog_revision, 3);
     assert_eq!(report.table_count, 1);
     assert_eq!(report.managed_file_count, 1);
+    assert_eq!(report.external_legacy_file_count, 0);
+    assert_eq!(report.file_count, 1);
     assert_eq!(report.verified_bytes, expected_bytes);
+}
+
+#[tokio::test]
+async fn verifies_current_visible_external_legacy_file() {
+    let fixture = Fixture::new().await;
+    let (_path, pending) = fixture
+        .import_external_legacy_table(TABLE, 2, 1, vec![100, 101, 102])
+        .await;
+
+    let report = fixture
+        .verifier()
+        .verify()
+        .await
+        .expect("verify external legacy file");
+
+    assert_eq!(report.catalog_revision, 2);
+    assert_eq!(report.table_count, 1);
+    assert_eq!(report.managed_file_count, 0);
+    assert_eq!(report.external_legacy_file_count, 1);
+    assert_eq!(report.file_count, 1);
+    assert_eq!(report.verified_bytes, pending.file_size_bytes);
+}
+
+#[tokio::test]
+async fn managed_and_external_files_share_the_total_file_budget() {
+    let fixture = Fixture::new().await;
+    let (external_path, external) = fixture
+        .import_external_legacy_table(TABLE, 2, 1, vec![100, 101, 102])
+        .await;
+    fixture.create_table(TABLE + 1, 3, 2).await;
+    let managed = fixture.write_candidate(TABLE + 1, 20, 0, vec![200, 201]);
+    let managed_bytes = managed.pending().file_size_bytes;
+    fixture
+        .commit_files(4, 3, TABLE + 1, vec![managed.into_pending()], 1)
+        .await;
+
+    let report = fixture
+        .verifier()
+        .verify()
+        .await
+        .expect("verify both location classes");
+    assert_eq!(report.managed_file_count, 1);
+    assert_eq!(report.external_legacy_file_count, 1);
+    assert_eq!(report.file_count, 2);
+    assert_eq!(
+        report.verified_bytes,
+        external.file_size_bytes + managed_bytes
+    );
+
+    fs::remove_file(external_path).expect("remove external file after successful verification");
+    let limited = fixture.verifier_with(StartupCatalogFileVerifierConfig::new().with_max_files(1));
+    let error = limited
+        .verify()
+        .await
+        .expect_err("aggregate file budget must fail before physical reads");
+    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+}
+
+#[tokio::test]
+async fn managed_and_external_files_share_the_verification_byte_budget() {
+    let fixture = Fixture::new().await;
+    let (_external_path, external) = fixture
+        .import_external_legacy_table(TABLE, 2, 1, vec![100, 101, 102])
+        .await;
+    fixture.create_table(TABLE + 1, 3, 2).await;
+    let managed = fixture.write_candidate(TABLE + 1, 20, 0, vec![200, 201]);
+    let managed_bytes = managed.pending().file_size_bytes;
+    fixture
+        .commit_files(4, 3, TABLE + 1, vec![managed.into_pending()], 1)
+        .await;
+    let aggregate_bytes = external
+        .file_size_bytes
+        .checked_add(managed_bytes)
+        .expect("small test files cannot overflow");
+    let verifier = fixture.verifier_with(
+        StartupCatalogFileVerifierConfig::new().with_max_verification_bytes(aggregate_bytes - 1),
+    );
+
+    let error = verifier
+        .verify()
+        .await
+        .expect_err("aggregate byte budget must cover both location classes");
+
+    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+    assert!(!error.retryable());
+}
+
+#[tokio::test]
+async fn changed_external_legacy_file_blocks_startup_without_exposing_path() {
+    let fixture = Fixture::new().await;
+    let (path, _) = fixture
+        .import_external_legacy_table(TABLE, 2, 1, vec![100, 101, 102])
+        .await;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open external legacy file for corruption");
+    file.write_all(b"FAIL")
+        .expect("change external legacy content");
+    file.sync_all().expect("sync external legacy corruption");
+
+    let error = fixture
+        .verifier()
+        .verify()
+        .await
+        .expect_err("changed external legacy file must block startup");
+
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+    assert!(!error.retryable());
+    assert!(!error.message().contains(path.to_string_lossy().as_ref()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_external_legacy_file_blocks_startup_without_exposing_path() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new().await;
+    let (path, _) = fixture
+        .import_external_legacy_table(TABLE, 2, 1, vec![100, 101, 102])
+        .await;
+    let replacement = path.with_file_name("replacement.parquet");
+    fs::copy(&path, &replacement).expect("copy external legacy file");
+    fs::remove_file(&path).expect("remove imported external legacy file");
+    symlink(&replacement, &path).expect("replace external legacy file with symlink");
+
+    let error = fixture
+        .verifier()
+        .verify()
+        .await
+        .expect_err("symlinked external legacy file must block startup");
+
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+    assert!(!error.message().contains(path.to_string_lossy().as_ref()));
 }
 
 #[tokio::test]

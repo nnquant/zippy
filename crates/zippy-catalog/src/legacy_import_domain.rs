@@ -6,7 +6,7 @@ use std::mem::size_of;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 use zippy_types::catalog::{
     CatalogActorKind, CreateTableCommand, LegacyCatalogImportCodecV2, LegacyCatalogImportCommandV2,
-    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportResponseV2,
+    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportReplayProbeV2, LegacyCatalogImportResponseV2,
     LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2, LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
     MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
 };
@@ -16,7 +16,7 @@ use zippy_types::table::{
 };
 use zippy_types::{ErrorCode, OffsetWatermark, RequestId, Result, ServerError, ServerErrorDetails};
 
-use crate::encoding::{encode_offset_watermark, encode_optional_u64, encode_u64};
+use crate::encoding::{decode_u64, encode_offset_watermark, encode_optional_u64, encode_u64};
 use crate::storage_codec::{
     encode_data_file_metadata_blob, encode_data_file_partition_blob,
     encode_data_file_statistics_blob, encode_snapshot_summary_blob,
@@ -24,9 +24,19 @@ use crate::storage_codec::{
 
 const IMPORT_SNAPSHOT_VERSION: u64 = 2;
 const INITIAL_SNAPSHOT_VERSION: u64 = 1;
+const INITIAL_SCHEMA_VERSION: u64 = 1;
 const MAX_IMPORT_FILES: usize = 4_096;
 const SQLITE_IDENTITY_QUERY_CHUNK: usize = 256;
 const MAX_LEGACY_IMPORT_COMMAND_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LEGACY_IMPORT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+struct StoredLegacyImportReplayHeader {
+    format_version: i64,
+    fingerprint: Vec<u8>,
+    response_blob_type: String,
+    response_blob_len: i64,
+    committed_at_ns: Vec<u8>,
+}
 
 pub(crate) struct PreparedLegacyCatalogImportV2 {
     envelope: LegacyCatalogImportEnvelopeV2,
@@ -221,6 +231,12 @@ fn prepare_files(
             return Err(invalid(
                 request_id,
                 "legacy file table identity or schema version does not match its import",
+            ));
+        }
+        if file.file_size_bytes == 0 {
+            return Err(invalid(
+                request_id,
+                "legacy import requires nonempty verified files",
             ));
         }
         let DataFileLocation::ExternalLegacy(path) = &file.location else {
@@ -436,6 +452,17 @@ pub(crate) fn commit_legacy_catalog_import_v2(
             )
             .with_request_id(request_id)
         })?;
+    if response_blob.len() > MAX_LEGACY_IMPORT_RESPONSE_BYTES {
+        return Err(ServerError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "legacy Catalog V2 response exceeds byte limit actual=[{}] maximum=[{MAX_LEGACY_IMPORT_RESPONSE_BYTES}]",
+                response_blob.len()
+            ),
+        )
+        .with_request_id(request_id)
+        .with_retryable(false));
+    }
     let fingerprint = prepared.envelope.canonical_fingerprint.into_bytes();
     crate::domain::update_revision(&transaction, next_revision)
         .map_err(|error| error.with_request_id(request_id))?;
@@ -468,25 +495,11 @@ fn replay(
     envelope: &LegacyCatalogImportEnvelopeV2,
 ) -> Result<Option<LegacyCatalogImportResponseV2>> {
     reject_v1_request_id(connection, envelope.request_id)?;
-    let stored = connection
-        .query_row(
-            "SELECT format_version, fingerprint, response_blob \
-             FROM legacy_import_requests WHERE request_id = ?1",
-            [envelope.request_id.into_bytes().as_slice()],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| crate::map_sqlite_error("read legacy Catalog V2 replay", error))?;
-    let Some((version, fingerprint, response_blob)) = stored else {
+    let Some(stored) = load_legacy_import_replay_header(connection, envelope.request_id)? else {
         return Ok(None);
     };
-    if fingerprint.as_slice() != envelope.canonical_fingerprint.into_bytes() {
+    validate_replay_fingerprint_width(envelope.request_id, &stored.fingerprint)?;
+    if stored.fingerprint.as_slice() != envelope.canonical_fingerprint.into_bytes() {
         return Err(ServerError::new(
             ErrorCode::Conflict,
             "legacy Catalog request id was reused with a different fingerprint",
@@ -494,12 +507,174 @@ fn replay(
         .with_request_id(envelope.request_id)
         .with_retryable(false));
     }
-    if version != i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2) {
+    let observed_catalog_revision = crate::domain::revision(connection)
+        .map_err(|error| error.with_request_id(envelope.request_id))?;
+    let response = load_and_validate_intrinsic_replay_response(
+        connection,
+        envelope.request_id,
+        observed_catalog_revision,
+        &stored,
+    )?;
+    validate_replay_response_matches_command(envelope, &response)?;
+    Ok(Some(response))
+}
+
+/// Looks up one permanent V2 response without materializing or validating an import command.
+///
+/// Revision, cross-version request-ID conflict, and the retained V2 record are observed in one
+/// deferred read transaction. The response remains a startup hint: callers must still compare it
+/// with their independently reconstructed migration plan.
+pub(crate) fn probe_legacy_catalog_import_v2(
+    connection: &mut Connection,
+    request_id: RequestId,
+) -> Result<LegacyCatalogImportReplayProbeV2> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| {
+            crate::map_sqlite_error("begin legacy Catalog V2 replay probe", error)
+                .with_request_id(request_id)
+        })?;
+    let observed_catalog_revision =
+        crate::domain::revision(&transaction).map_err(|error| error.with_request_id(request_id))?;
+    reject_v1_request_id(&transaction, request_id)?;
+    let probe = match load_legacy_import_replay_header(&transaction, request_id)? {
+        None => LegacyCatalogImportReplayProbeV2::Missing {
+            observed_catalog_revision,
+        },
+        Some(stored) => {
+            validate_replay_fingerprint_width(request_id, &stored.fingerprint)?;
+            let response = load_and_validate_intrinsic_replay_response(
+                &transaction,
+                request_id,
+                observed_catalog_revision,
+                &stored,
+            )?;
+            LegacyCatalogImportReplayProbeV2::Committed {
+                observed_catalog_revision,
+                response,
+            }
+        }
+    };
+    transaction.commit().map_err(|error| {
+        crate::map_sqlite_error("commit legacy Catalog V2 replay probe", error)
+            .with_request_id(request_id)
+    })?;
+    Ok(probe)
+}
+
+fn load_legacy_import_replay_header(
+    connection: &Connection,
+    request_id: RequestId,
+) -> Result<Option<StoredLegacyImportReplayHeader>> {
+    connection
+        .query_row(
+            "SELECT format_version, fingerprint, typeof(response_blob), length(response_blob), \
+                    committed_at_ns \
+             FROM legacy_import_requests WHERE request_id = ?1",
+            [request_id.into_bytes().as_slice()],
+            |row| {
+                Ok(StoredLegacyImportReplayHeader {
+                    format_version: row.get(0)?,
+                    fingerprint: row.get(1)?,
+                    response_blob_type: row.get(2)?,
+                    response_blob_len: row.get(3)?,
+                    committed_at_ns: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            crate::map_sqlite_error("read legacy Catalog V2 replay header", error)
+                .with_request_id(request_id)
+        })
+}
+
+fn validate_replay_fingerprint_width(request_id: RequestId, fingerprint: &[u8]) -> Result<()> {
+    if fingerprint.len() != 32 {
         return Err(ServerError::new(
             ErrorCode::DataCorruption,
-            "legacy Catalog V2 permanent replay metadata is inconsistent",
+            "legacy Catalog V2 replay fingerprint has invalid width",
         )
-        .with_request_id(envelope.request_id));
+        .with_request_id(request_id));
+    }
+    Ok(())
+}
+
+fn validate_replay_blob_header(
+    request_id: RequestId,
+    stored: &StoredLegacyImportReplayHeader,
+) -> Result<usize> {
+    if stored.format_version != i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2) {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy Catalog V2 permanent replay format is inconsistent",
+        )
+        .with_request_id(request_id));
+    }
+    let response_blob_len = usize::try_from(stored.response_blob_len).map_err(|_| {
+        ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy Catalog V2 response has an invalid byte length",
+        )
+        .with_request_id(request_id)
+    })?;
+    if stored.response_blob_type != "blob" || response_blob_len == 0 {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy Catalog V2 response is not a nonempty blob",
+        )
+        .with_request_id(request_id));
+    }
+    if response_blob_len > MAX_LEGACY_IMPORT_RESPONSE_BYTES {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            format!(
+                "legacy Catalog V2 response exceeds byte limit actual=[{response_blob_len}] maximum=[{MAX_LEGACY_IMPORT_RESPONSE_BYTES}]"
+            ),
+        )
+        .with_request_id(request_id));
+    }
+    Ok(response_blob_len)
+}
+
+fn load_and_validate_intrinsic_replay_response(
+    connection: &Connection,
+    request_id: RequestId,
+    observed_catalog_revision: u64,
+    stored: &StoredLegacyImportReplayHeader,
+) -> Result<LegacyCatalogImportResponseV2> {
+    let expected_blob_len = validate_replay_blob_header(request_id, stored)?;
+    let committed_at_ns = decode_u64(&stored.committed_at_ns).map_err(|_| {
+        ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy Catalog V2 replay commit time has an invalid encoding",
+        )
+        .with_request_id(request_id)
+    })?;
+    let response_blob = connection
+        .query_row(
+            "SELECT response_blob FROM legacy_import_requests WHERE request_id = ?1",
+            [request_id.into_bytes().as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| {
+            crate::map_sqlite_error("read bounded legacy Catalog V2 response", error)
+                .with_request_id(request_id)
+        })?
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::DataCorruption,
+                "legacy Catalog V2 response disappeared inside a replay transaction",
+            )
+            .with_request_id(request_id)
+        })?;
+    if response_blob.len() != expected_blob_len {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy Catalog V2 response length changed inside a replay transaction",
+        )
+        .with_request_id(request_id));
     }
     let response =
         LegacyCatalogImportCodecV2::decode_response(&response_blob).map_err(|error| {
@@ -507,15 +682,70 @@ fn replay(
                 ErrorCode::DataCorruption,
                 format!("decode frozen legacy Catalog V2 response error=[{error}]"),
             )
-            .with_request_id(envelope.request_id)
+            .with_request_id(request_id)
         })?;
-    if response.request_id != envelope.request_id {
+    validate_intrinsic_replay_response(
+        request_id,
+        observed_catalog_revision,
+        committed_at_ns,
+        &response,
+    )?;
+    Ok(response)
+}
+
+fn validate_intrinsic_replay_response(
+    request_id: RequestId,
+    observed_catalog_revision: u64,
+    committed_at_ns: u64,
+    response: &LegacyCatalogImportResponseV2,
+) -> Result<()> {
+    let summary = &response.snapshot.summary;
+    let summary_value = |key: &str| match summary.get(key) {
+        Some(MetadataScalar::UInt64(value)) => Some(*value),
+        _ => None,
+    };
+    let added_files = summary_value("added_files");
+    let added_rows = summary_value("added_rows");
+    let added_bytes = summary_value("added_bytes");
+    let legacy_files_revision = summary_value("legacy_files_revision");
+    let summary_is_valid = summary.len() == 4
+        && added_files.is_some_and(|value| {
+            value > 0 && value <= u64::try_from(MAX_IMPORT_FILES).expect("file limit fits u64")
+        })
+        && added_rows.is_some_and(|value| value > 0)
+        && added_bytes.is_some_and(|value| value > 0)
+        && legacy_files_revision.is_some_and(|value| value > 0);
+    let response_is_valid = response.request_id == request_id
+        && response.catalog_revision > 0
+        && response.catalog_revision <= observed_catalog_revision
+        && committed_at_ns > 0
+        && response.table.state == TableState::Active
+        && response.table.current_schema_version == INITIAL_SCHEMA_VERSION
+        && response.table.current_snapshot_version == IMPORT_SNAPSHOT_VERSION
+        && response.table.created_at_ns == committed_at_ns
+        && response.table.updated_at_ns == committed_at_ns
+        && response.snapshot.table_id == response.table.table_id
+        && response.snapshot.snapshot_version == IMPORT_SNAPSHOT_VERSION
+        && response.snapshot.parent_snapshot_version == Some(INITIAL_SNAPSHOT_VERSION)
+        && response.snapshot.operation == SnapshotOperation::Import
+        && response.snapshot.commit_lsn == response.catalog_revision
+        && response.snapshot.committed_log_offset == OffsetWatermark::LegacyUnknown
+        && response.snapshot.created_at_ns == committed_at_ns
+        && summary_is_valid;
+    if !response_is_valid {
         return Err(ServerError::new(
             ErrorCode::DataCorruption,
-            "legacy Catalog V2 response request identity mismatch",
+            "legacy Catalog V2 replay response violates intrinsic import invariants",
         )
-        .with_request_id(envelope.request_id));
+        .with_request_id(request_id));
     }
+    Ok(())
+}
+
+fn validate_replay_response_matches_command(
+    envelope: &LegacyCatalogImportEnvelopeV2,
+    response: &LegacyCatalogImportResponseV2,
+) -> Result<()> {
     let expected_catalog_revision = envelope
         .expected_revision
         .and_then(|revision| revision.checked_add(1))
@@ -535,16 +765,8 @@ fn replay(
         && response.table.current_schema_version == 1
         && response.table.current_snapshot_version == IMPORT_SNAPSHOT_VERSION
         && response.table.writer_epoch == command.writer_epoch
-        && response.table.state == TableState::Active
         && response.table.config == command.config
-        && response.table.created_at_ns == response.table.updated_at_ns
         && response.snapshot.table_id == command.table_id
-        && response.snapshot.snapshot_version == IMPORT_SNAPSHOT_VERSION
-        && response.snapshot.parent_snapshot_version == Some(INITIAL_SNAPSHOT_VERSION)
-        && response.snapshot.operation == SnapshotOperation::Import
-        && response.snapshot.commit_lsn == response.catalog_revision
-        && response.snapshot.created_at_ns == response.table.updated_at_ns
-        && response.snapshot.committed_log_offset == OffsetWatermark::LegacyUnknown
         && response.snapshot.summary == import_summary(command)?;
     if !response_matches {
         return Err(ServerError::new(
@@ -553,7 +775,7 @@ fn replay(
         )
         .with_request_id(envelope.request_id));
     }
-    Ok(Some(response))
+    Ok(())
 }
 
 fn reject_v1_request_id(connection: &Connection, request_id: RequestId) -> Result<()> {

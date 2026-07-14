@@ -1755,7 +1755,7 @@ frontend 依赖 QueryService 的 query lifecycle，不应先用 Flight 包装 le
   subscription、lease、job 和 idempotency 表。所有 `u64`、watermark、writer epoch、lineage 与
   provenance 必须先定义无损编码和 golden migration test，之后才允许接入 server。
 
-当前实施状态（2026-07-13）：physical v2 domain schema、无损 BLOB 编码、physical v3 active-table
+当前实施状态（2026-07-14）：physical v2 domain schema、无损 BLOB 编码、physical v3 active-table
 cursor indexes、v1/v2 -> v3 migration、schema inventory、`CreateNamespace`/`CreateTable` 单写者事务、
 server-internal native append `CommitDataFiles`、append row-preserving `CommitCompaction`、
 namespace/table get/list/resolve 和跨重启幂等回放已经实现。manifest command 在同一个 immediate
@@ -1772,10 +1772,11 @@ metadata work item 协作式 yield，完成后仍以精确 byte charge 进入聚
 preparation 已移到独立有界 worker。control read 与 exact snapshot read 分别使用独立的有界队列、OS
 worker 和 read-only WAL connection，因此大 snapshot 不再阻塞 discovery/revision 或 writer commit。
 mutation 保持 actor admission 顺序；重叠 read 可以读取前一个 committed revision，取消响应不会取消
-已接受写入，close 会排空已接受工作。其余 V1 mutation command、producer-fenced public ingest、
-maintenance lease-fenced worker、frame/KV V2 manifest、legacy importer 的 Server planner/shadow/diff、
-CreateTable preparation 隔离、manifest finalize 减负、read parallelism 和 active read interrupt 尚未
-实现。SQLite actor 内部仍没有绝对 shutdown deadline；启用 native storage 时由独立 OS supervisor
+已接受写入，close 会排空已接受工作。legacy importer 的 Server V2 planner/executor 已接线；完整的
+shadow command fan-out/diff authority gate 仍待收口。其余 V1 mutation command、producer-fenced public
+ingest、maintenance lease-fenced worker、frame/KV V2 manifest、CreateTable preparation 隔离、manifest
+finalize 减负、read parallelism 和 active read interrupt 尚未实现。SQLite actor 内部仍没有绝对
+shutdown deadline；启用 native storage 时由独立 OS supervisor
 隔离同步 open/close，server timeout 只停止等待且保留 supervisor、Catalog 与 data-root ownership，
 后台继续按 coordinator drain -> Catalog close 清理。因此 SQLite 可以作为显式灰度的 required
 startup dependency，但尚不能成为 `zippy server run` 的 read/write authority。
@@ -1786,10 +1787,10 @@ hash、snapshot chain、metadata checksum、file visibility 和 lineage coverage
 snapshot admission 要求 selector 按 table ID 严格升序且版本非零，最多 4096 张表；全有或全无的
 raw response 上限为 64 MiB、65536 个 visible files 和 262144 条 source lineage。historical manifest
 通过 `data_files_visible_by_table` seek，不在 SQLite 内 `ORDER BY`，而是在预算内按 file ID 做 Rust
-排序，避免临时 B-tree；lineage 按最多 512 个 file ID 分块读取，避免逐文件 N+1。physical schema
-已经保留 legacy discovery order，但当前 snapshot DTO 无法无损携带该顺序；native 与
-`preserve_discovery_order=false` 的 legacy 文件可读，任何可见 preserve-order legacy 文件都会让
-整次请求返回 `UnsupportedPlan`。完整兼容仍需 V2 typed read contract 显式携带 scan order。
+排序，避免临时 B-tree；lineage 按最多 512 个 file ID 分块读取，避免逐文件 N+1。raw snapshot 继续
+保持 `file_id` 规范顺序，preserve-order legacy descriptor 另外携带显式 discovery ordinal；pinned
+query manifest/task 才按该 ordinal 生成旧 Gateway 兼容的逻辑扫描顺序，native 与 non-preserved 文件
+保持 `file_id` 顺序。这样 raw Catalog 序列化/影子比对顺序与物理 scan scheduling 不再混为一层。
 
 轻量 table discovery 同时受条数与字节预算约束：list page 最多 4096 项，并在累计 raw descriptor
 达到 4 MiB 前提前结束、返回可继续的 keyset cursor；`resolve_tables` 保持全有或全无，累计超过
@@ -1826,16 +1827,29 @@ file 不承担该额外 O(file size) 成本。导入只能经不可克隆、绑�
 session 执行；session drop/seal 或第一个普通 mutation 会永久关闭本实例的导入窗口，actor 仍只用于
 审计。verifier 从实际比对 Parquet footer 的 Arrow Schema 计算 Catalog canonical hash，并把保留 proof
 写入 file metadata，Catalog 事务要求它和 table command 完全一致。V1 与 V2 replay 表共享全局
-RequestId 空间，任一方向的重复都会在 mutation 前冲突。Master
-已经在不改变 frozen source hash 的前提下提供强类型 persisted-file snapshot 和 Gateway-compatible
-effective scan order；Server planner 接线、显式 scan-order read DTO 和权威切换仍未完成，因此
-preserve-order legacy snapshot 继续 fail closed 为
-`UnsupportedPlan`。
+RequestId 空间，任一方向的重复都会在 mutation 前冲突。Master 已经在不改变 frozen source hash 的
+前提下提供强类型 persisted-file snapshot 和 Gateway-compatible effective scan order，Server V2
+planner/executor 也已接线。执行器先走固定成本的 request-ID replay probe；它只返回有界 committed
+response 或 `Missing` 以及同一只读事务观察到的 revision，不携带物理文件 fingerprint，因此只能作为
+hint。Server 必须把 replay response 中可由当前 plan 推导的 request、revision、namespace/table、
+definition/config、writer epoch、snapshot 形状以及 summary 文件数、legacy revision 和已知 row count
+逐项比对。只有在 expected revision 上得到 `Missing` 时才允许扫描、校验和 hash 物理文件并首次
+提交；replay 不重复 migration I/O。
+
+每次 native startup 仍会在 ready 前，对固定 Catalog revision 下所有当前可见 ExternalLegacy 文件
+执行 fail-closed 完整物理校验，包括 regular-file identity、Catalog size、SHA-256、Parquet footer、
+精确 Schema、row count 以及读取前后 descriptor identity。因此 replay probe 不会把启动健康门降级成
+metadata-only。ExternalLegacy 路径在验证后仍可被外部修改，校验与后续读取之间的 TOCTOU 只能靠
+legacy root 静默/只读和逐 reader 重校验暂时约束；切换 SQLite/Query 权威前，必须把文件 copy/reflink
+到 managed immutable storage，并通过受管 capability 打开。
 
 V2 `discovery_order` 表示旧 Gateway 对 persisted files 应用
 `(writer_epoch, source_segment_id, source_generation, created_at, file_path)` 后的零基稳定扫描位置，
 不是 Registry vector index。Registry index 只保留为迁移审计信息；Server planner 必须在任何文件
 读取前完成全 snapshot 路径去重和单表文件数准入，避免部分表先提交后才发现后续表不可导入。
+raw snapshot 仍按 `file_id` 排序；只有 pinned scan view 根据 discovery ordinal 调度读取。Step 3 需要
+把 QueryService 接到生命周期绑定的 snapshot pin/lease capability API，并关闭直接持有 raw path DTO
+或绕过 pin owner 打开文件的权威侧入口。
 
 任务：
 
@@ -1886,8 +1900,11 @@ durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、�
 cleanup token，并在 Catalog publication exclusion 内完成 revision、引用、物理身份复核和 unlink；
 普通历史文件删除仍依赖 snapshot lease 和 Catalog GC 状态机。反向
 `StartupCatalogFileVerifier` 已按固定 revision 分页读取 active table/current snapshot，并在 ready 前
-通过 data-root/table directory fd 逐级 `openat(O_NOFOLLOW)`，有界核验每个当前可见 managed 文件的
-路径归属、大小、checksum、Parquet footer 和 row count；缺失、symlink 替换或内容损坏均 fail closed。
+有界核验每个当前可见 managed 或 ExternalLegacy 文件。managed 文件通过 data-root/table directory
+fd 逐级 `openat(O_NOFOLLOW)`；ExternalLegacy 逐组件拒绝 symlink，并复核路径身份、大小、完整
+checksum、Parquet footer、精确 Schema、row count 及读取前后 descriptor identity。缺失、symlink
+替换、身份变化或内容损坏均 fail closed；该完整检查在每次 native startup 执行，包括 migration
+request-ID 已 replay、未重复扫描导入文件的启动。
 该 gate 不声明历史 snapshot 可用，native historical query admission 仍关闭，历史文件深度审计属于
 maintenance。snapshot lease、logical drop、safe GC 和权威 Gateway 写入口
 接线尚未完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置

@@ -200,7 +200,7 @@ fn insert_legacy_data_file(
     connection: &Connection,
     table: TableId,
     file: FileId,
-    preserve_discovery_order: bool,
+    legacy_discovery_order: Option<u64>,
 ) {
     let table_id = table.into_bytes();
     let file_id = file.into_bytes();
@@ -208,7 +208,7 @@ fn insert_legacy_data_file(
     let file_size_bytes = 1_024_u64.to_be_bytes();
     let row_count = 10_u64.to_be_bytes();
     let absent = encode_optional_u64(None);
-    let legacy_order = encode_optional_u64(preserve_discovery_order.then_some(0));
+    let legacy_order = encode_optional_u64(legacy_discovery_order);
     let added_snapshot_version = 2_u64.to_be_bytes();
     let created_at_ns = 1_u64.to_be_bytes();
     let partition_blob = empty_metadata_blob("data_file_partition");
@@ -234,7 +234,7 @@ fn insert_legacy_data_file(
                 file_size_bytes.as_slice(),
                 row_count.as_slice(),
                 absent.as_slice(),
-                i64::from(preserve_discovery_order),
+                i64::from(legacy_discovery_order.is_some()),
                 legacy_order.as_slice(),
                 partition_blob,
                 statistics_blob,
@@ -245,6 +245,69 @@ fn insert_legacy_data_file(
             ],
         )
         .expect("insert raw legacy data file");
+}
+
+fn insert_native_data_file(connection: &Connection, table: TableId, file: FileId) {
+    let table_id = table.into_bytes();
+    let file_id = file.into_bytes();
+    let schema_version = 1_u64.to_be_bytes();
+    let file_size_bytes = 1_024_u64.to_be_bytes();
+    let row_count = 10_u64.to_be_bytes();
+    let first_offset = encode_optional_u64(Some(0));
+    let last_offset = encode_optional_u64(Some(9));
+    let absent = encode_optional_u64(None);
+    let added_snapshot_version = 2_u64.to_be_bytes();
+    let created_at_ns = 1_u64.to_be_bytes();
+    let partition_blob = empty_metadata_blob("data_file_partition");
+    let statistics_blob = empty_metadata_blob("data_file_statistics");
+    let metadata_blob = empty_metadata_blob("data_file_metadata");
+    connection
+        .execute(
+            "INSERT INTO data_files(\
+                 file_id, table_id, schema_version, location_kind, file_path, \
+                 file_size_bytes, row_count, provenance_kind, min_log_offset, \
+                 max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+                 partition_blob, statistics_blob, metadata_blob, checksum, \
+                 added_snapshot_version, removed_snapshot_version, state, created_at_ns\
+             ) VALUES (\
+                 ?1, ?2, ?3, 'managed', ?4, ?5, ?6, 'native', ?7, ?8, \
+                 0, ?9, ?10, ?11, ?12, ?13, ?14, ?9, 'committed', ?15\
+             )",
+            rusqlite::params![
+                file_id.as_slice(),
+                table_id.as_slice(),
+                schema_version.as_slice(),
+                format!("tables/test/{}.parquet", file),
+                file_size_bytes.as_slice(),
+                row_count.as_slice(),
+                first_offset.as_slice(),
+                last_offset.as_slice(),
+                absent.as_slice(),
+                partition_blob,
+                statistics_blob,
+                metadata_blob,
+                format!("sha256-v1:{:032x}", u128::from_be_bytes(file_id)),
+                added_snapshot_version.as_slice(),
+                created_at_ns.as_slice(),
+            ],
+        )
+        .expect("insert raw native data file");
+    connection
+        .execute(
+            "INSERT INTO data_file_sources(\
+                 file_id, source_segment_id, source_generation, writer_epoch, \
+                 min_log_offset, max_log_offset\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                file_id.as_slice(),
+                1_u64.to_be_bytes().as_slice(),
+                1_u64.to_be_bytes().as_slice(),
+                1_u64.to_be_bytes().as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                9_u64.to_be_bytes().as_slice(),
+            ],
+        )
+        .expect("insert raw native source lineage");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -782,31 +845,7 @@ async fn snapshot_reads_require_exact_versions_and_reject_versions_ahead_of_curr
     catalog.close().expect("close sqlite catalog");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_manifest_sorts_modern_legacy_and_rejects_preserved_or_corrupt_metadata() {
-    let directory = TempDir::new().expect("create temp directory");
-    let data_directory = data_directory(&directory);
-    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
-        .expect("open sqlite catalog");
-    catalog
-        .command(create_namespace(1, 1, "market", Some(0)))
-        .await
-        .expect("create namespace");
-    catalog
-        .command(create_table(
-            2,
-            1,
-            1,
-            "ticks",
-            Some(1),
-            append_definition(),
-            schema_ipc(&table_schema()),
-        ))
-        .await
-        .expect("create table");
-
-    let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
-    let table = table_id(1);
+fn insert_raw_second_snapshot(raw: &Connection, table: TableId) -> CatalogSnapshotSelector {
     let table_bytes = table.into_bytes();
     let version_one = 1_u64.to_be_bytes();
     let version_two = 2_u64.to_be_bytes();
@@ -840,38 +879,88 @@ async fn snapshot_manifest_sorts_modern_legacy_and_rejects_preserved_or_corrupt_
         rusqlite::params![version_two.as_slice(), table_bytes.as_slice()],
     )
     .expect("advance raw table snapshot version");
-    insert_legacy_data_file(&raw, table, file_id(2), false);
-    insert_legacy_data_file(&raw, table, file_id(1), false);
-
-    let selector = CatalogSnapshotSelector {
+    CatalogSnapshotSelector {
         table_id: table,
         snapshot_version: 2,
         schema_version: 1,
-    };
+    }
+}
+
+async fn catalog_with_raw_second_snapshot(
+    directory: &TempDir,
+) -> (SqliteCatalog, Connection, CatalogSnapshotSelector) {
+    let data_directory = data_directory(directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    catalog
+        .command(create_namespace(1, 1, "market", Some(0)))
+        .await
+        .expect("create namespace");
+    catalog
+        .command(create_table(
+            2,
+            1,
+            1,
+            "ticks",
+            Some(1),
+            append_definition(),
+            schema_ipc(&table_schema()),
+        ))
+        .await
+        .expect("create table");
+
+    let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
+    let selector = insert_raw_second_snapshot(&raw, table_id(1));
+    (catalog, raw, selector)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discovery_order() {
+    let directory = TempDir::new().expect("create temp directory");
+    let (catalog, raw, selector) = catalog_with_raw_second_snapshot(&directory).await;
+    let table = selector.table_id;
+    insert_native_data_file(&raw, table, file_id(2));
+    insert_legacy_data_file(&raw, table, file_id(1), None);
+    insert_legacy_data_file(&raw, table, file_id(4), Some(0));
+    insert_legacy_data_file(&raw, table, file_id(3), Some(1));
+
     let snapshot = catalog
         .read_snapshot_at(std::slice::from_ref(&selector))
         .await
-        .expect("read modern legacy manifest");
+        .expect("read raw mixed-provenance manifest");
     let files = snapshot.tables()[0].files().as_slice();
     assert_eq!(
         files.iter().map(|file| file.file_id()).collect::<Vec<_>>(),
-        [file_id(1), file_id(2)]
+        [file_id(1), file_id(2), file_id(3), file_id(4)]
     );
+    assert_eq!(files[0].legacy_discovery_order(), None);
+    assert_eq!(files[1].legacy_discovery_order(), None);
+    assert_eq!(files[2].legacy_discovery_order(), Some(1));
+    assert_eq!(files[3].legacy_discovery_order(), Some(0));
 
-    insert_legacy_data_file(&raw, table, file_id(3), true);
+    let pinned = catalog
+        .read_handle()
+        .expect("create Catalog read handle")
+        .read_pinned_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect("read pinned mixed-provenance manifest");
+    let manifest = pinned.table(0).expect("pinned table manifest");
     assert_eq!(
-        catalog
-            .read_snapshot_at(std::slice::from_ref(&selector))
-            .await
-            .expect_err("preserved legacy order must reject the whole V1 snapshot")
-            .code(),
-        ErrorCode::UnsupportedPlan
+        manifest
+            .files()
+            .map(|file| file.file_id())
+            .collect::<Vec<_>>(),
+        [file_id(4), file_id(3), file_id(1), file_id(2)]
     );
-    raw.execute(
-        "DELETE FROM data_files WHERE file_id = ?1",
-        [file_id(3).into_bytes().as_slice()],
-    )
-    .expect("remove preserved-order test file");
+    assert_eq!(
+        manifest.file(0).expect("first pinned file").file_id(),
+        file_id(4)
+    );
+    assert_eq!(
+        manifest.file(3).expect("last pinned file").file_id(),
+        file_id(2)
+    );
+    drop((manifest, pinned));
 
     let mut corrupt_metadata = empty_metadata_blob("data_file_metadata");
     *corrupt_metadata
@@ -890,6 +979,155 @@ async fn snapshot_manifest_sorts_modern_legacy_and_rejects_preserved_or_corrupt_
             .code(),
         ErrorCode::DataCorruption
     );
+
+    drop(raw);
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_rejects_invalid_legacy_discovery_order_and_incomplete_import_manifest() {
+    let directory = TempDir::new().expect("create temp directory");
+    let (catalog, raw, selector) = catalog_with_raw_second_snapshot(&directory).await;
+    insert_legacy_data_file(&raw, selector.table_id, file_id(1), Some(0));
+    insert_legacy_data_file(&raw, selector.table_id, file_id(2), Some(0));
+
+    let error = catalog
+        .read_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect_err("duplicate legacy discovery positions must fail closed");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+    raw.execute(
+        "DELETE FROM data_files WHERE file_id = ?1",
+        [file_id(2).into_bytes().as_slice()],
+    )
+    .expect("remove duplicate legacy file");
+    raw.execute(
+        "UPDATE data_files SET legacy_discovery_order = ?1 WHERE file_id = ?2",
+        rusqlite::params![
+            encode_optional_u64(Some(2)).as_slice(),
+            file_id(1).into_bytes().as_slice(),
+        ],
+    )
+    .expect("make imported legacy order noncontiguous");
+    raw.execute(
+        "UPDATE table_snapshots SET operation = 'import' \
+         WHERE table_id = ?1 AND snapshot_version = ?2",
+        rusqlite::params![
+            selector.table_id.into_bytes().as_slice(),
+            2_u64.to_be_bytes().as_slice(),
+        ],
+    )
+    .expect("mark raw snapshot as an import");
+    let error = catalog
+        .read_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect_err("an import snapshot must cover a contiguous discovery order");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+    raw.execute(
+        "UPDATE data_files SET legacy_preserve_discovery_order = 0, \
+         legacy_discovery_order = ?1 WHERE file_id = ?2",
+        rusqlite::params![
+            encode_optional_u64(None).as_slice(),
+            file_id(1).into_bytes().as_slice(),
+        ],
+    )
+    .expect("remove imported legacy order");
+    let error = catalog
+        .read_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect_err("an import snapshot must preserve every external legacy order");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+    let schema_two = Schema::new_with_metadata(
+        table_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+        HashMap::from([
+            ("source".to_owned(), "integration".to_owned()),
+            ("version".to_owned(), "2".to_owned()),
+        ]),
+    );
+    let schema_two_ipc = schema_ipc(&schema_two);
+    let schema_two_hash = zippy_catalog::canonical_schema_hash_from_ipc(&schema_two_ipc)
+        .expect("hash valid second schema");
+    raw.execute(
+        "INSERT INTO table_schemas(\
+             table_id, schema_version, schema_ipc, schema_hash, compatibility, created_at_ns\
+         ) VALUES (?1, ?2, ?3, ?4, 'full', ?5)",
+        rusqlite::params![
+            selector.table_id.into_bytes().as_slice(),
+            2_u64.to_be_bytes().as_slice(),
+            schema_two_ipc.as_bytes(),
+            schema_two_hash,
+            2_u64.to_be_bytes().as_slice(),
+        ],
+    )
+    .expect("insert a valid second schema for import corruption");
+    raw.execute(
+        "UPDATE tables SET current_schema_version = ?1 WHERE table_id = ?2",
+        rusqlite::params![
+            2_u64.to_be_bytes().as_slice(),
+            selector.table_id.into_bytes().as_slice(),
+        ],
+    )
+    .expect("advance raw table schema version");
+    raw.execute(
+        "UPDATE data_files SET schema_version = ?1, legacy_preserve_discovery_order = 1, \
+         legacy_discovery_order = ?2 WHERE file_id = ?3",
+        rusqlite::params![
+            2_u64.to_be_bytes().as_slice(),
+            encode_optional_u64(Some(0)).as_slice(),
+            file_id(1).into_bytes().as_slice(),
+        ],
+    )
+    .expect("corrupt imported legacy file schema version");
+    let schema_two_selector = CatalogSnapshotSelector {
+        schema_version: 2,
+        ..selector.clone()
+    };
+    let error = catalog
+        .read_snapshot_at(std::slice::from_ref(&schema_two_selector))
+        .await
+        .expect_err("an import snapshot must use the frozen initial file schema");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+    drop(raw);
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_discovery_order_is_scoped_to_each_table() {
+    let directory = TempDir::new().expect("create temp directory");
+    let (catalog, raw, first_selector) = catalog_with_raw_second_snapshot(&directory).await;
+    catalog
+        .command(create_table(
+            3,
+            2,
+            1,
+            "quotes",
+            Some(2),
+            append_definition(),
+            schema_ipc(&table_schema()),
+        ))
+        .await
+        .expect("create second table");
+    let second_selector = insert_raw_second_snapshot(&raw, table_id(2));
+    insert_legacy_data_file(&raw, first_selector.table_id, file_id(1), Some(0));
+    insert_legacy_data_file(&raw, second_selector.table_id, file_id(2), Some(0));
+
+    let snapshot = catalog
+        .read_snapshot_at(&[first_selector, second_selector])
+        .await
+        .expect("the same discovery position in different tables must be valid");
+    assert_eq!(snapshot.tables().len(), 2);
+    assert!(snapshot
+        .tables()
+        .iter()
+        .all(|table| { table.files().as_slice()[0].legacy_discovery_order() == Some(0) }));
 
     drop(raw);
     catalog.close().expect("close sqlite catalog");

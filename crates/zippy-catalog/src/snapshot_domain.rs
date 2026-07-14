@@ -197,8 +197,14 @@ struct PendingTableSnapshot {
 }
 
 enum PendingFileProvenance {
-    Native { offsets: OffsetRange },
-    Legacy { offsets: Option<OffsetRange> },
+    Native {
+        offsets: OffsetRange,
+    },
+    Legacy {
+        offsets: Option<OffsetRange>,
+        preserve_discovery_order: bool,
+        discovery_order: Option<u64>,
+    },
 }
 
 struct PendingVisibleFile {
@@ -309,6 +315,7 @@ pub(crate) fn read_snapshot_at_with_limits(
         let snapshot = read_snapshot(&transaction, selector, catalog_revision, &mut budget)?;
         ensure_snapshot_files_readable(&transaction, selector)?;
         let files = read_visible_files(&transaction, selector, &mut budget)?;
+        validate_legacy_discovery_orders(&files, &snapshot)?;
         if snapshot.operation == SnapshotOperation::Create && !files.is_empty() {
             return Err(corruption(
                 "initial create snapshot must not contain visible data files",
@@ -918,20 +925,67 @@ fn decode_file_provenance(
                     "legacy catalog discovery policy does not match its order value",
                 ));
             }
-            if preserve_discovery_order {
-                return Err(ServerError::new(
-                    ErrorCode::UnsupportedPlan,
-                    "catalog V1 snapshot cannot represent preserved legacy discovery order",
-                ));
-            }
             Ok(PendingFileProvenance::Legacy {
                 offsets: offset_range(min_log_offset, max_log_offset, "legacy data file")?,
+                preserve_discovery_order,
+                discovery_order: legacy_discovery_order,
             })
         }
         _ => Err(corruption(format!(
             "catalog data file provenance kind is invalid value=[{kind}]"
         ))),
     }
+}
+
+fn validate_legacy_discovery_orders(
+    files: &[PendingVisibleFile],
+    snapshot: &TableSnapshot,
+) -> Result<()> {
+    let mut orders = files
+        .iter()
+        .filter_map(|file| match &file.provenance {
+            PendingFileProvenance::Legacy {
+                preserve_discovery_order: true,
+                discovery_order,
+                ..
+            } => *discovery_order,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    orders.sort_unstable();
+    if orders.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(corruption(
+            "catalog legacy discovery order contains a duplicate position",
+        ));
+    }
+    if snapshot.operation == SnapshotOperation::Import {
+        let complete_import_manifest = snapshot.snapshot_version == 2
+            && snapshot.parent_snapshot_version == Some(1)
+            && !files.is_empty()
+            && orders.len() == files.len()
+            && files.iter().all(|file| {
+                file.schema_version == 1
+                    && matches!(&file.location, DataFileLocation::ExternalLegacy(_))
+                    && matches!(
+                        &file.provenance,
+                        PendingFileProvenance::Legacy {
+                            offsets: None,
+                            preserve_discovery_order: true,
+                            discovery_order: Some(_),
+                        }
+                    )
+            })
+            && orders
+                .iter()
+                .enumerate()
+                .all(|(index, order)| u64::try_from(index) == Ok(*order));
+        if !complete_import_manifest {
+            return Err(corruption(
+                "catalog import snapshot is not a complete ordered external legacy manifest",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn offset_range(
@@ -1046,7 +1100,7 @@ impl PendingVisibleFile {
         self,
         source_lineage: Vec<SourceSegmentLineage>,
     ) -> Result<DataFileDescriptor> {
-        let provenance = match self.provenance {
+        let (provenance, legacy_discovery_order) = match self.provenance {
             PendingFileProvenance::Native { offsets } => {
                 let source_lineage =
                     SourceSegmentLineages::new(source_lineage).map_err(|error| {
@@ -1054,24 +1108,36 @@ impl PendingVisibleFile {
                             "catalog native source lineage is invalid error=[{error}]"
                         ))
                     })?;
-                DataFileProvenance::Native(
-                    NativeDataFileProvenance::new(offsets, source_lineage).map_err(|error| {
-                        corruption(format!(
-                            "catalog native file provenance is invalid error=[{error}]"
-                        ))
-                    })?,
+                (
+                    DataFileProvenance::Native(
+                        NativeDataFileProvenance::new(offsets, source_lineage).map_err(
+                            |error| {
+                                corruption(format!(
+                                    "catalog native file provenance is invalid error=[{error}]"
+                                ))
+                            },
+                        )?,
+                    ),
+                    None,
                 )
             }
-            PendingFileProvenance::Legacy { offsets } => {
+            PendingFileProvenance::Legacy {
+                offsets,
+                preserve_discovery_order,
+                discovery_order,
+            } => {
                 if !source_lineage.is_empty() {
                     return Err(corruption(
                         "legacy catalog data file contains native source lineage",
                     ));
                 }
-                DataFileProvenance::Legacy {
-                    offsets,
-                    preserve_discovery_order: false,
-                }
+                (
+                    DataFileProvenance::Legacy {
+                        offsets,
+                        preserve_discovery_order,
+                    },
+                    discovery_order,
+                )
             }
         };
         let descriptor = DataFileDescriptor {
@@ -1089,6 +1155,7 @@ impl PendingVisibleFile {
                 checksum: self.checksum,
                 created_at_ns: self.created_at_ns,
             },
+            legacy_discovery_order,
             added_snapshot_version: self.added_snapshot_version,
             removed_snapshot_version: self.removed_snapshot_version,
             state: self.state,

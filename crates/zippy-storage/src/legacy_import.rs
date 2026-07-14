@@ -212,6 +212,195 @@ pub fn verify_legacy_parquet_import(
     })
 }
 
+/// Revalidates one Catalog-visible external legacy Parquet file before read admission opens.
+///
+/// The absolute Catalog path is never copied into an error. Every component is opened with
+/// `NOFOLLOW`; all content checks use that retained file descriptor and compare its identity
+/// before and after checksum and footer reads.
+pub(crate) fn verify_catalog_visible_external_legacy_file(
+    pending: &PendingDataFile,
+    expected_schema: &Schema,
+) -> Result<()> {
+    let DataFileLocation::ExternalLegacy(external_path) = &pending.location else {
+        return Err(catalog_legacy_corruption(
+            pending,
+            "catalog external legacy verifier received a managed location",
+        ));
+    };
+    if !matches!(pending.provenance, DataFileProvenance::Legacy { .. }) {
+        return Err(catalog_legacy_corruption(
+            pending,
+            "catalog external legacy file has non-legacy provenance",
+        ));
+    }
+    let path = Path::new(external_path.as_str());
+    validate_expected_checksum_format(pending.table_id, Some(&pending.checksum)).map_err(|_| {
+        catalog_legacy_corruption(
+            pending,
+            "catalog external legacy checksum format is invalid",
+        )
+    })?;
+    let mut file = open_nofollow(pending.table_id, path, None).map_err(|error| {
+        sanitize_catalog_legacy_error(pending, "open external legacy file", error)
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        sanitize_catalog_legacy_io_error(pending, "inspect external legacy descriptor", error)
+    })?;
+    validate_regular_file(pending.table_id, path, &opened_metadata).map_err(|_| {
+        catalog_legacy_corruption(pending, "external legacy descriptor is not a regular file")
+    })?;
+    if opened_metadata.len() != pending.file_size_bytes {
+        return Err(catalog_legacy_corruption(
+            pending,
+            "external legacy file size does not match Catalog metadata",
+        ));
+    }
+    crate::candidate::validate_parquet_footer_length(
+        &mut file,
+        opened_metadata.len(),
+        pending.table_id,
+        path,
+    )
+    .map_err(|_| {
+        catalog_legacy_corruption(pending, "external legacy Parquet footer length is invalid")
+    })?;
+
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        sanitize_catalog_legacy_io_error(
+            pending,
+            "rewind external legacy file before checksum",
+            error,
+        )
+    })?;
+    let actual_checksum = sha256_v1_reader(&mut file).map_err(|error| {
+        sanitize_catalog_legacy_io_error(pending, "checksum external legacy file", error)
+    })?;
+    let checksummed_metadata = file.metadata().map_err(|error| {
+        sanitize_catalog_legacy_io_error(
+            pending,
+            "reinspect external legacy descriptor after checksum",
+            error,
+        )
+    })?;
+    validate_same_identity(
+        pending.table_id,
+        path,
+        &opened_metadata,
+        &checksummed_metadata,
+    )
+    .map_err(|_| {
+        catalog_legacy_corruption(pending, "external legacy file changed during checksum")
+    })?;
+    if actual_checksum != pending.checksum {
+        return Err(catalog_legacy_corruption(
+            pending,
+            "external legacy checksum does not match Catalog metadata",
+        ));
+    }
+
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        sanitize_catalog_legacy_io_error(
+            pending,
+            "rewind external legacy file before footer validation",
+            error,
+        )
+    })?;
+    let parquet_file = file.try_clone().map_err(|error| {
+        sanitize_catalog_legacy_io_error(
+            pending,
+            "clone external legacy descriptor for footer validation",
+            error,
+        )
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).map_err(|_| {
+        catalog_legacy_corruption(pending, "external legacy Parquet footer is invalid")
+    })?;
+    if builder.schema().as_ref() != expected_schema {
+        return Err(catalog_legacy_corruption(
+            pending,
+            "external legacy Parquet schema does not match the Catalog snapshot",
+        ));
+    }
+    let row_count = u64::try_from(builder.metadata().file_metadata().num_rows()).map_err(|_| {
+        catalog_legacy_corruption(pending, "external legacy Parquet row count is invalid")
+    })?;
+    if row_count != pending.row_count.get() {
+        return Err(catalog_legacy_corruption(
+            pending,
+            "external legacy Parquet row count does not match Catalog metadata",
+        ));
+    }
+    let final_metadata = file.metadata().map_err(|error| {
+        sanitize_catalog_legacy_io_error(
+            pending,
+            "reinspect external legacy descriptor after footer validation",
+            error,
+        )
+    })?;
+    validate_same_identity(pending.table_id, path, &opened_metadata, &final_metadata).map_err(
+        |_| {
+            catalog_legacy_corruption(
+                pending,
+                "external legacy file changed during footer validation",
+            )
+        },
+    )?;
+    Ok(())
+}
+
+fn catalog_legacy_corruption(pending: &PendingDataFile, message: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::DataCorruption,
+        format!(
+            "{message} table_id=[{}] file_id=[{}]",
+            pending.table_id, pending.file_id
+        ),
+    )
+    .with_table_id(pending.table_id)
+    .with_retryable(false)
+}
+
+fn sanitize_catalog_legacy_error(
+    pending: &PendingDataFile,
+    operation: &str,
+    error: ServerError,
+) -> ServerError {
+    let code = match error.code() {
+        ErrorCode::Unavailable | ErrorCode::UnsupportedPlan => error.code(),
+        _ => ErrorCode::DataCorruption,
+    };
+    ServerError::new(
+        code,
+        format!(
+            "{operation} failed table_id=[{}] file_id=[{}]",
+            pending.table_id, pending.file_id
+        ),
+    )
+    .with_table_id(pending.table_id)
+    .with_retryable(false)
+}
+
+fn sanitize_catalog_legacy_io_error(
+    pending: &PendingDataFile,
+    operation: &str,
+    error: std::io::Error,
+) -> ServerError {
+    let code = if error.kind() == std::io::ErrorKind::NotFound {
+        ErrorCode::DataCorruption
+    } else {
+        ErrorCode::Unavailable
+    };
+    ServerError::new(
+        code,
+        format!(
+            "{operation} failed table_id=[{}] file_id=[{}]",
+            pending.table_id, pending.file_id
+        ),
+    )
+    .with_table_id(pending.table_id)
+    .with_retryable(false)
+}
+
 fn validate_canonical_path(
     path: &Path,
     allowed_root: Option<&Path>,
@@ -310,11 +499,11 @@ fn open_nofollow(table_id: TableId, path: &Path, allowed_root: Option<&Path>) ->
         };
         let descriptor = rustix::fs::openat(&parent, name, flags, rustix::fs::Mode::empty())
             .map_err(|error| {
-                physical_error(
+                nofollow_open_error(
                     table_id,
                     path,
                     "open legacy path component without following links",
-                    std::io::Error::from(error),
+                    error,
                 )
             })?;
         let opened = File::from(descriptor);
@@ -387,14 +576,34 @@ fn open_directory_at(
         rustix::fs::Mode::empty(),
     )
     .map_err(|error| {
-        physical_error(
+        nofollow_open_error(
             table_id,
             path,
             "open legacy data-root component without following links",
-            std::io::Error::from(error),
+            error,
         )
     })?;
     Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn nofollow_open_error(
+    table_id: TableId,
+    path: &Path,
+    operation: &str,
+    error: rustix::io::Errno,
+) -> ServerError {
+    if matches!(
+        error,
+        rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR
+    ) {
+        return blocked(
+            table_id,
+            path,
+            "legacy path is missing or contains an unsafe component",
+        );
+    }
+    physical_error(table_id, path, operation, std::io::Error::from(error))
 }
 
 #[cfg(not(unix))]
@@ -580,12 +789,66 @@ fn physical_error(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::fs::File;
+    use std::num::NonZeroU64;
     use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{open_nofollow, validate_regular_file, validate_same_identity};
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use zippy_types::table::{ExternalDataPath, MetadataMap, PendingDataFile};
+
+    use super::{
+        open_nofollow, validate_regular_file, validate_same_identity,
+        verify_catalog_visible_external_legacy_file, verify_legacy_parquet_import,
+        LegacyParquetImportSpec,
+    };
     use zippy_types::{ErrorCode, TableId};
+
+    fn verified_catalog_file(root: &Path) -> (PathBuf, PendingDataFile, Arc<Schema>) {
+        let path = root.join("catalog-visible.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![100, 101, 102]))],
+        )
+        .expect("create legacy test batch");
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).expect("create legacy Parquet test file"),
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("create legacy Parquet test writer");
+        writer
+            .write(&batch)
+            .expect("write legacy Parquet test batch");
+        writer.close().expect("close legacy Parquet test writer");
+        let verified = verify_legacy_parquet_import(LegacyParquetImportSpec {
+            table_id: TableId::from_u128(1).expect("nonzero table id"),
+            schema_version: 1,
+            path: ExternalDataPath::new(path.to_str().expect("temporary path is UTF-8"))
+                .expect("absolute external data path"),
+            allowed_root: Some(root.to_path_buf()),
+            expected_schema: Arc::clone(&schema),
+            expected_row_count: NonZeroU64::new(3),
+            expected_checksum: None,
+            discovery_order: 0,
+            partition: MetadataMap::new(),
+            statistics: MetadataMap::new(),
+            metadata: MetadataMap::new(),
+        })
+        .expect("verify legacy Parquet test file");
+        (path, verified.file, schema)
+    }
 
     #[test]
     fn final_component_fifo_replacement_does_not_block_and_fails_closed() {
@@ -683,5 +946,31 @@ mod tests {
         let error = validate_same_identity(table_id, &path, &before, &after)
             .expect_err("ctime change must reject the rewritten identity");
         assert_eq!(error.code(), ErrorCode::DataCorruption);
+    }
+
+    #[test]
+    fn catalog_visible_external_file_requires_snapshot_schema() {
+        let root = tempfile::tempdir().expect("create legacy schema test root");
+        let (path, pending, _schema) = verified_catalog_file(root.path());
+        let wrong_schema = Schema::new(vec![Field::new("price", DataType::Utf8, false)]);
+
+        let error = verify_catalog_visible_external_legacy_file(&pending, &wrong_schema)
+            .expect_err("physical schema mismatch must fail closed");
+
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert!(!error.message().contains(path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn catalog_visible_external_file_requires_catalog_row_count() {
+        let root = tempfile::tempdir().expect("create legacy row-count test root");
+        let (path, mut pending, schema) = verified_catalog_file(root.path());
+        pending.row_count = NonZeroU64::new(2).expect("nonzero mismatched row count");
+
+        let error = verify_catalog_visible_external_legacy_file(&pending, schema.as_ref())
+            .expect_err("physical row-count mismatch must fail closed");
+
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert!(!error.message().contains(path.to_string_lossy().as_ref()));
     }
 }

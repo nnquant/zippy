@@ -942,6 +942,11 @@ pub enum DataFileState {
 pub struct DataFileDescriptor {
     /// The complete pre-commit file metadata.
     pub file: PendingDataFile,
+    /// Gateway-compatible scan position for a preserved legacy manifest.
+    ///
+    /// Frozen mutation wires carry this value separately from `PendingDataFile`; descriptor JSON
+    /// includes it so inspection round trips remain lossless.
+    pub legacy_discovery_order: Option<u64>,
     /// The first snapshot version in which the file is visible.
     pub added_snapshot_version: u64,
     /// The first snapshot version in which the file is no longer visible.
@@ -953,6 +958,20 @@ pub struct DataFileDescriptor {
 impl DataFileDescriptor {
     /// Validates lifecycle state against the immutable visibility interval.
     pub fn validate(&self) -> Result<(), InvalidDataFileDescriptor> {
+        let preserve_discovery_order = matches!(
+            &self.file.provenance,
+            DataFileProvenance::Legacy {
+                preserve_discovery_order: true,
+                ..
+            }
+        );
+        if preserve_discovery_order != self.legacy_discovery_order.is_some() {
+            return Err(InvalidDataFileDescriptor::LegacyDiscoveryOrderMismatch {
+                file_id: self.file_id(),
+                preserve_discovery_order,
+                has_discovery_order: self.legacy_discovery_order.is_some(),
+            });
+        }
         if matches!(self.state, DataFileState::Deleting | DataFileState::Deleted)
             && self.removed_snapshot_version.is_none()
         {
@@ -984,6 +1003,12 @@ impl DataFileDescriptor {
         self.file.table_id
     }
 
+    /// Returns the Gateway-compatible scan position for a preserved legacy file.
+    #[must_use]
+    pub const fn legacy_discovery_order(&self) -> Option<u64> {
+        self.legacy_discovery_order
+    }
+
     /// Returns whether this file is visible at an exact historical snapshot.
     #[must_use]
     pub const fn is_visible_at(&self, snapshot_version: u64) -> bool {
@@ -1004,6 +1029,8 @@ impl<'de> Deserialize<'de> for DataFileDescriptor {
         #[derive(Deserialize)]
         struct RawDataFileDescriptor {
             file: PendingDataFile,
+            #[serde(default)]
+            legacy_discovery_order: Option<u64>,
             added_snapshot_version: u64,
             removed_snapshot_version: Option<u64>,
             state: DataFileState,
@@ -1011,6 +1038,7 @@ impl<'de> Deserialize<'de> for DataFileDescriptor {
         let raw = RawDataFileDescriptor::deserialize(deserializer)?;
         let descriptor = Self {
             file: raw.file,
+            legacy_discovery_order: raw.legacy_discovery_order,
             added_snapshot_version: raw.added_snapshot_version,
             removed_snapshot_version: raw.removed_snapshot_version,
             state: raw.state,
@@ -1023,6 +1051,18 @@ impl<'de> Deserialize<'de> for DataFileDescriptor {
 /// An invalid relationship between file lifecycle state and visibility versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum InvalidDataFileDescriptor {
+    /// Preserved legacy provenance and its Catalog scan position must appear together.
+    #[error(
+        "legacy discovery order presence mismatch file_id=[{file_id}] preserve=[{preserve_discovery_order}] has_order=[{has_discovery_order}]"
+    )]
+    LegacyDiscoveryOrderMismatch {
+        /// The invalid file identity.
+        file_id: FileId,
+        /// Whether provenance requires the old Gateway ordering contract.
+        preserve_discovery_order: bool,
+        /// Whether the Catalog descriptor retained a concrete scan position.
+        has_discovery_order: bool,
+    },
     /// Deleting and deleted files require the snapshot that removed them.
     #[error("removed file state lacks removal version file_id=[{file_id}] state=[{state:?}]")]
     RemovedStateWithoutVersion {

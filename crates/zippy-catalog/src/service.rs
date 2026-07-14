@@ -17,9 +17,9 @@ use zippy_types::catalog::{
     CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
     ClaimGarbageCollectionFilesRequest, ClaimedGarbageCollectionFiles,
     FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles,
-    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportResponseV2, ListNamespacesRequest,
-    ListNamespacesResponse, ListTablesRequest, ListTablesResponse, ManagedDataFileProbe,
-    NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
+    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportReplayProbeV2, LegacyCatalogImportResponseV2,
+    ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest, ListTablesResponse,
+    ManagedDataFileProbe, NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
@@ -873,6 +873,46 @@ impl CatalogWrite for SqliteCatalog {
 }
 
 impl SqliteCatalogLegacyImportSession<'_> {
+    /// Probes one V2 request ID through the bounded control-read lane.
+    ///
+    /// This lookup does not reserve publication or manifest-preparation capacity and does not
+    /// validate a new import command. The returned response has only passed intrinsic permanent
+    /// record checks; startup orchestration must compare it with its current migration plan.
+    pub fn probe_legacy_import_v2(
+        &self,
+        request_id: RequestId,
+    ) -> BoxFuture<'_, Result<LegacyCatalogImportReplayProbeV2>> {
+        if !self.active
+            || self.catalog.legacy_import_state.load(Ordering::Acquire) != LEGACY_IMPORT_ACTIVE
+        {
+            return Box::pin(async {
+                Err(ServerError::new(
+                    ErrorCode::Unavailable,
+                    "legacy import session is no longer active",
+                )
+                .with_retryable(false))
+            });
+        }
+        Box::pin(async move {
+            let probe_permit = self
+                .catalog
+                .replay_probe_budget
+                .reserve()
+                .map_err(|error| error.with_request_id(request_id))?;
+            let result = await_response(self.catalog.read_pool().and_then(|pool| {
+                pool.control_request(|response| {
+                    ControlReadMessage::ProbeLegacyImport(LegacyImportReplayProbeRequest {
+                        request_id,
+                        response,
+                        probe_permit,
+                    })
+                })
+            }))
+            .await;
+            result.map_err(|error| error.with_request_id(request_id))
+        })
+    }
+
     /// Imports one fully verified legacy table or replays its exact permanent response.
     pub fn import_legacy_table_v2(
         &self,
@@ -1259,6 +1299,14 @@ trait CatalogReadBackend: Send + Sync + 'static {
     ) -> Result<CatalogCommandReplayProbe> {
         domain::probe_command_replay(connection, key)
     }
+
+    fn probe_legacy_import_v2(
+        &self,
+        connection: &mut Connection,
+        request_id: RequestId,
+    ) -> Result<LegacyCatalogImportReplayProbeV2> {
+        legacy_import_domain::probe_legacy_catalog_import_v2(connection, request_id)
+    }
 }
 
 struct DomainCatalogReadBackend;
@@ -1283,12 +1331,19 @@ enum ControlReadMessage {
         oneshot::Sender<Result<CatalogDataFileReferenceSnapshot>>,
     ),
     ProbeCommandReplay(CommandReplayProbeRequest),
+    ProbeLegacyImport(LegacyImportReplayProbeRequest),
     Shutdown,
 }
 
 struct CommandReplayProbeRequest {
     key: domain::VerifiedCommandReplayKey,
     response: oneshot::Sender<Result<CatalogCommandReplayProbe>>,
+    probe_permit: ReplayProbePermit,
+}
+
+struct LegacyImportReplayProbeRequest {
+    request_id: RequestId,
+    response: oneshot::Sender<Result<LegacyCatalogImportReplayProbeV2>>,
     probe_permit: ReplayProbePermit,
 }
 
@@ -1582,6 +1637,20 @@ fn control_read_loop(
                     continue;
                 }
                 let result = backend.probe_command_replay(&connection, &key);
+                drop(probe_permit);
+                let _ = response.send(result);
+            }
+            ControlReadMessage::ProbeLegacyImport(request) => {
+                let LegacyImportReplayProbeRequest {
+                    request_id,
+                    response,
+                    probe_permit,
+                } = request;
+                if response.is_closed() {
+                    drop(probe_permit);
+                    continue;
+                }
+                let result = backend.probe_legacy_import_v2(&mut connection, request_id);
                 drop(probe_permit);
                 let _ = response.send(result);
             }
@@ -2358,8 +2427,9 @@ mod tests {
         CatalogWrite, ClaimGarbageCollectionFilesRequest, CommandFingerprint,
         CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand,
         CreateTableCommand, LegacyCatalogImportCommandV2, LegacyCatalogImportEnvelopeV2,
-        LegacyCatalogImportFileV2, ManagedDataFileProbe, VersionedCatalogCommand,
-        VersionedCatalogResponse, LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
+        LegacyCatalogImportFileV2, LegacyCatalogImportReplayProbeV2, ManagedDataFileProbe,
+        VersionedCatalogCommand, VersionedCatalogResponse,
+        LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, DataFileDescriptor, DataFileLocation,
@@ -2375,7 +2445,7 @@ mod tests {
     use super::{
         domain, snapshot_domain, verify_replay_probe_command, CatalogReadBackend,
         DomainManifestPreparationBackend, ManifestPreparationBackend, ManifestQueueBudget,
-        ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig,
+        ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig, REPLAY_PROBE_CAPACITY,
     };
 
     const NAMESPACE_ID: u128 = 1;
@@ -2399,6 +2469,12 @@ mod tests {
 
     struct CountingReplayReadBackend {
         probe_calls: Arc<AtomicUsize>,
+    }
+
+    struct BlockingLegacyReplayReadBackend {
+        started: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        block_once: AtomicBool,
     }
 
     struct BlockingSnapshotBackend {
@@ -2475,6 +2551,24 @@ mod tests {
         ) -> zippy_types::Result<CatalogCommandReplayProbe> {
             self.probe_calls.fetch_add(1, Ordering::AcqRel);
             domain::probe_command_replay(connection, key)
+        }
+    }
+
+    impl CatalogReadBackend for BlockingLegacyReplayReadBackend {
+        fn probe_legacy_import_v2(
+            &self,
+            connection: &mut rusqlite::Connection,
+            request_id: RequestId,
+        ) -> zippy_types::Result<LegacyCatalogImportReplayProbeV2> {
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.started
+                    .send(())
+                    .expect("observe blocking legacy replay probe");
+                self.release
+                    .recv()
+                    .expect("release blocking legacy replay probe");
+            }
+            crate::legacy_import_domain::probe_legacy_catalog_import_v2(connection, request_id)
         }
     }
 
@@ -2731,6 +2825,7 @@ mod tests {
         };
         let files = DataFiles::new(vec![DataFileDescriptor {
             file: pending_file,
+            legacy_discovery_order: Some(0),
             added_snapshot_version: 2,
             removed_snapshot_version: None,
             state: DataFileState::Committed,
@@ -2744,12 +2839,220 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_replay_probe_reports_transactional_revision_and_committed_response() {
+        let directory = TempDir::new().expect("create replay probe directory");
+        let owned = data_directory(&directory);
+        let physical_file = directory.path().join("legacy-probe.parquet");
+        let contents = b"legacy-replay-probe-fixture";
+        std::fs::write(&physical_file, contents).expect("write external legacy fixture");
+        let import = external_legacy_import_command(&physical_file, contents);
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&owned))
+            .expect("open replay probe Catalog");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire replay probe session");
+        catalog
+            .command(migration_command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create import namespace");
+
+        assert_eq!(
+            session
+                .probe_legacy_import_v2(request_id(2))
+                .await
+                .expect("probe missing legacy import"),
+            LegacyCatalogImportReplayProbeV2::Missing {
+                observed_catalog_revision: 1,
+            }
+        );
+        let committed = session
+            .import_legacy_table_v2(import)
+            .await
+            .expect("commit legacy import");
+        catalog
+            .command(migration_command(
+                3,
+                Some(2),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(3).expect("nonzero namespace id"),
+                    name: CatalogName::new("audit").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("advance Catalog after legacy import");
+
+        assert_eq!(
+            session
+                .probe_legacy_import_v2(request_id(2))
+                .await
+                .expect("probe committed legacy import"),
+            LegacyCatalogImportReplayProbeV2::Committed {
+                observed_catalog_revision: 3,
+                response: committed,
+            }
+        );
+        session.seal();
+        catalog.close().expect("close replay probe Catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_replay_probe_rejects_v1_request_id_conflicts() {
+        let directory = TempDir::new().expect("create conflict directory");
+        let owned = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open conflict Catalog");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire conflict probe session");
+        catalog
+            .command(migration_command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("commit V1 request-id fixture");
+
+        let error = session
+            .probe_legacy_import_v2(request_id(1))
+            .await
+            .expect_err("V1 request ID must conflict with a V2 replay probe");
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert_eq!(error.request_id(), Some(request_id(1)));
+        assert!(!error.retryable());
+        session.seal();
+        catalog.close().expect("close conflict Catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_replay_probe_uses_only_fixed_control_read_admission() {
+        let directory = TempDir::new().expect("create bounded probe directory");
+        let owned = data_directory(&directory);
+        let catalog = SqliteCatalog::open(
+            SqliteCatalogConfig::new(&owned)
+                .with_command_capacity(1)
+                .with_manifest_queue_capacity_bytes(1),
+        )
+        .expect("open bounded probe Catalog");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire bounded probe session");
+        let publication_permit = catalog
+            .acquire_publication_permit()
+            .await
+            .expect("occupy only publication permit");
+
+        assert_eq!(catalog.command_budget.used.load(Ordering::Acquire), 1);
+        assert_eq!(
+            catalog.manifest_queue_budget.used.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            session
+                .probe_legacy_import_v2(request_id(1))
+                .await
+                .expect("publication exhaustion must not block replay probe"),
+            LegacyCatalogImportReplayProbeV2::Missing {
+                observed_catalog_revision: 0,
+            }
+        );
+        assert_eq!(catalog.command_budget.used.load(Ordering::Acquire), 1);
+        assert_eq!(
+            catalog.manifest_queue_budget.used.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 0);
+
+        let replay_permits = (0..REPLAY_PROBE_CAPACITY)
+            .map(|_| {
+                catalog
+                    .replay_probe_budget
+                    .reserve()
+                    .expect("reserve fixed replay slot")
+            })
+            .collect::<Vec<_>>();
+        let exhausted = session
+            .probe_legacy_import_v2(request_id(1))
+            .await
+            .expect_err("fixed replay capacity must reject excess work");
+        assert_eq!(exhausted.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(exhausted.request_id(), Some(request_id(1)));
+        drop(replay_permits);
+        drop(publication_permit);
+        session.seal();
+        catalog.close().expect("close bounded probe Catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_legacy_replay_probe_retains_admission_until_read_exits() {
+        let directory = TempDir::new().expect("create cancelled probe directory");
+        let owned = data_directory(&directory);
+        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
+        let catalog = SqliteCatalog::open_with_backends(
+            SqliteCatalogConfig::new(&owned),
+            Arc::new(DomainManifestPreparationBackend),
+            Arc::new(BlockingLegacyReplayReadBackend {
+                started: started_sender,
+                release: release_receiver,
+                block_once: AtomicBool::new(true),
+            }),
+        )
+        .expect("open Catalog with blocking legacy probe backend");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire cancelled probe session");
+        let mut probe = session.probe_legacy_import_v2(request_id(1));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(probe.as_mut().poll(&mut context), Poll::Pending));
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("legacy replay probe must enter the read backend");
+        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 1);
+
+        drop(probe);
+        assert_eq!(catalog.replay_probe_budget.used.load(Ordering::Acquire), 1);
+        release_sender
+            .send(())
+            .expect("release cancelled legacy replay probe");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while catalog.replay_probe_budget.used.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled legacy replay probe must release fixed admission");
+        session.seal();
+        catalog
+            .close()
+            .expect("close Catalog with blocking legacy probe backend");
+    }
+
+    #[cfg(unix)]
     fn overwrite_legacy_import_response(
         database_path: &std::path::Path,
         response: &serde_json::Value,
     ) {
-        let connection = rusqlite::Connection::open(database_path).expect("open Catalog database");
         let encoded = serde_json::to_vec(response).expect("encode tampered legacy response");
+        overwrite_legacy_import_response_blob(database_path, encoded);
+    }
+
+    #[cfg(unix)]
+    fn overwrite_legacy_import_response_blob(database_path: &std::path::Path, encoded: Vec<u8>) {
+        let connection = rusqlite::Connection::open(database_path).expect("open Catalog database");
         connection
             .execute(
                 "UPDATE legacy_import_requests SET response_blob = ?1 WHERE request_id = ?2",
@@ -2813,6 +3116,12 @@ mod tests {
             .begin_legacy_import_session()
             .expect("acquire replay import session");
         let error = replay_session
+            .probe_legacy_import_v2(request_id(2))
+            .await
+            .expect_err("probe must reject wrong replay creation time");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(2)));
+        let error = replay_session
             .import_legacy_table_v2(import_command.clone())
             .await
             .expect_err("wrong replay creation time must fail closed");
@@ -2820,6 +3129,38 @@ mod tests {
         assert_eq!(error.request_id(), Some(request_id(2)));
         replay_session.seal();
         reopened.close().expect("close reopened Catalog");
+
+        let mut invalid_summary = response.clone();
+        invalid_summary["response"]["snapshot"]["summary"]["added_files"]["value"] =
+            serde_json::json!(4097);
+        overwrite_legacy_import_response(&database_path, &invalid_summary);
+        let reopened = SqliteCatalog::open(config.clone()).expect("reopen summary Catalog");
+        let replay_session = reopened
+            .begin_legacy_import_session()
+            .expect("acquire summary replay session");
+        let error = replay_session
+            .probe_legacy_import_v2(request_id(2))
+            .await
+            .expect_err("probe must reject impossible import file count");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(2)));
+        replay_session.seal();
+        reopened.close().expect("close summary replay Catalog");
+
+        overwrite_legacy_import_response_blob(&database_path, vec![0_u8; 4 * 1024 * 1024 + 1]);
+        let reopened = SqliteCatalog::open(config.clone()).expect("reopen oversized Catalog");
+        let replay_session = reopened
+            .begin_legacy_import_session()
+            .expect("acquire oversized replay session");
+        let error = replay_session
+            .probe_legacy_import_v2(request_id(2))
+            .await
+            .expect_err("probe must reject oversized response before decoding it");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(2)));
+        assert!(error.to_string().contains("exceeds byte limit"));
+        replay_session.seal();
+        reopened.close().expect("close oversized replay Catalog");
 
         let mut wrong_revision = response;
         wrong_revision["response"]["catalog_revision"] = serde_json::json!(3);
@@ -2829,6 +3170,12 @@ mod tests {
         let replay_session = reopened
             .begin_legacy_import_session()
             .expect("acquire revision replay session");
+        let error = replay_session
+            .probe_legacy_import_v2(request_id(2))
+            .await
+            .expect_err("probe must reject replay revisions newer than its transaction");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.request_id(), Some(request_id(2)));
         let error = replay_session
             .import_legacy_table_v2(import_command)
             .await

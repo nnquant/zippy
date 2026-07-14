@@ -105,6 +105,13 @@ Implemented:
   and are included in each manifest reservation;
 - complete command replay probes use an independent bounded read lane and never
   execute mutation preparation;
+- the trusted V2 legacy importer also exposes a fixed-cost request-ID replay
+  probe. One read-only transaction returns the observed Catalog revision and
+  either a bounded committed response or `Missing`; it does not read file
+  descriptors or prove the current migration plan's physical fingerprint. The
+  Server therefore treats the result only as a replay hint and must compare every
+  plan-derivable response identity, revision, table/snapshot shape, and summary
+  value before accepting a replay;
 - `CatalogPersistence` exposes shared publication permits and an exclusive
   cleanup exclusion. Each permit includes bounded command admission and moves
   into the writer actor, so cancellation cannot release it before an admitted
@@ -150,20 +157,26 @@ Current typed capability matrix:
 | server-internal append row-preserving `CommitCompaction` | implemented transactionally with exact input/output coverage |
 | durable `AcquireSnapshotLease` / `ReleaseSnapshotLease` | implemented transactionally; incomplete deleting/deleted historical snapshots reject new leases |
 | managed historical-file safe-GC claim/finalize | implemented transactionally with durable-lease and runtime-min-pin protection |
-| trusted startup-only V2 legacy table import | implemented as one create/import/file/revision/permanent-replay transaction behind a non-cloneable instance-bound startup session; physical files must first pass `zippy-storage` verification |
-| preserved legacy Gateway scan-order snapshots | `UnsupportedPlan` pending V2 read DTO |
+| trusted startup-only V2 legacy table import | Catalog transaction and Server V2 planner/executor are wired behind a non-cloneable instance-bound startup session; only a missing replay at the expected revision performs the initial `zippy-storage` file scan |
+| preserved legacy Gateway scan-order snapshots | implemented without changing raw snapshot order: raw files remain canonical by `file_id`, while pinned query manifests/tasks expose the explicit legacy discovery order |
 | producer-fenced public ingest manifest protocol | not provided by V1 manifest commands |
 | maintenance lease-fenced compaction worker protocol | not provided by V1 manifest commands |
 | legacy, frame-aware, or key-value materializing manifest mutations | `UnsupportedPlan` pending V2 commands |
 | alter/drop/schema/producer/consumer/job commands | `UnsupportedPlan` |
-| legacy primary + SQLite shadow fan-out | bounded Gateway comparison worker connected in `sqlite_shadow`; Master exposes a typed immutable file projection and the V2 import primitive exists, but Server planning, scan-order reads, and revision mapping remain pending |
+| legacy primary + SQLite shadow fan-out | bounded Gateway comparison worker is connected in `sqlite_shadow`; Master exposes a typed immutable file projection, and Server V2 planning/import plus pinned scan ordering are wired; complete authority cutover and its diff gates remain pending |
 | SQLite read or write authority | disabled |
 
-The physical schema reserves `legacy_discovery_order`, but frozen V1 snapshot
-DTOs cannot return that order without violating their ordering contract. Exact
-reads support native files and legacy files that do not require preserved
-discovery order. A request containing any visible preserve-order legacy file
-fails atomically with `UnsupportedPlan`; V2 must carry explicit scan order.
+Raw exact snapshots keep the frozen canonical `file_id` ordering contract. A
+preserve-order legacy descriptor carries its explicit `legacy_discovery_order`,
+but the raw file vector is not reordered. `read_pinned_snapshot_at` derives the
+logical scan order for query planning: preserved legacy files are ordered by
+their discovery ordinal, and native/non-preserved files retain canonical
+`file_id` order. This separates deterministic Catalog serialization and shadow
+comparison from legacy-compatible physical scan scheduling.
+The frozen V2 `Import` snapshot is stricter: it must be snapshot 2 with parent 1,
+contain only schema-v1 external legacy files with unknown offsets, and preserve a
+complete unique discovery range `0..file_count`. Any partial, mixed, or drifted
+manifest fails the entire snapshot read as Catalog corruption.
 
 The V1 manifest commands are deliberately narrow Catalog primitives, not public
 ingest or maintenance-worker protocols. They carry no producer identity, epoch,
@@ -197,11 +210,12 @@ interruption, and absolute shutdown deadlines remain future isolation work.
 
 Before authority integration, the Catalog must still add remaining table commands,
 public producer-fenced ingest and lease-fenced maintenance orchestration, V2
-frame/key-value manifest contracts, a V2 legacy scan-order read contract, an
-authority-only raw snapshot read boundary, network filesystem rejection, directory-handle pinning
-against parent replacement races, process-kill crash failpoints, and an absolute
-shutdown deadline. The current reliable `close` may wait indefinitely for a
-worker already executing work; dropping the handle invokes the same shutdown path.
+frame/key-value manifest contracts, network filesystem rejection, directory-handle pinning against
+parent replacement races, process-kill crash failpoints, and an absolute shutdown deadline. Step 3
+must also replace authority-side access to raw location-bearing snapshots with a lifecycle-owned
+capability API, so query planning and physical open cannot bypass the pin owner or retain a pathname
+after its lease/capability is gone. The current reliable `close` may wait indefinitely for a worker
+already executing work; dropping the handle invokes the same shutdown path.
 
 The integrity timeout bounds SQLite VM progress-handler checks, not all wall
 time spent opening files, waiting in filesystem I/O, or running migrations.

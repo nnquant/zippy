@@ -430,6 +430,28 @@ pub struct LegacyCatalogImportResponseV2 {
     pub snapshot: TableSnapshot,
 }
 
+/// Fixed-cost lookup result for one startup-only V2 legacy-import request ID.
+///
+/// The probe validates the retained response's intrinsic import invariants but intentionally does
+/// not prove that it matches a newly constructed import command. Startup orchestration must derive
+/// request IDs deterministically from its source snapshot and compare committed response fields
+/// with the current migration plan before accepting a replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyCatalogImportReplayProbeV2 {
+    /// No V2 import exists for this request ID in the observed Catalog revision.
+    Missing {
+        /// Catalog revision read in the same transaction as the replay lookup.
+        observed_catalog_revision: u64,
+    },
+    /// A structurally and intrinsically valid permanent V2 response exists.
+    Committed {
+        /// Catalog revision read in the same transaction as the replay lookup.
+        observed_catalog_revision: u64,
+        /// The validated permanent response.
+        response: LegacyCatalogImportResponseV2,
+    },
+}
+
 /// Stable codec for durable V2 legacy-import response records.
 ///
 /// The codec uses a private frozen wire mirror and never serializes domain structs directly.
@@ -2134,6 +2156,7 @@ mod tests {
                 checksum: "sha256:00".to_owned(),
                 created_at_ns: 1,
             },
+            legacy_discovery_order: None,
             added_snapshot_version: added,
             removed_snapshot_version: removed,
             state: DataFileState::Committed,

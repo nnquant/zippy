@@ -36,6 +36,7 @@ pub struct SqliteCatalogPinnedQuerySnapshot {
 
 struct PinnedSnapshotOwner {
     snapshot: CatalogQuerySnapshot,
+    scan_file_indices: Vec<Box<[usize]>>,
     _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
     _data_directory: Arc<OwnedDataDirectory>,
 }
@@ -46,9 +47,34 @@ impl SqliteCatalogPinnedQuerySnapshot {
         pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
         data_directory: Arc<OwnedDataDirectory>,
     ) -> Self {
+        let scan_file_indices = snapshot
+            .tables()
+            .iter()
+            .map(|table| {
+                let files = table.files().as_slice();
+                let mut indices = (0..files.len()).collect::<Vec<_>>();
+                indices.sort_unstable_by(|left, right| {
+                    let left_file = &files[*left];
+                    let right_file = &files[*right];
+                    match (
+                        left_file.legacy_discovery_order(),
+                        right_file.legacy_discovery_order(),
+                    ) {
+                        (Some(left), Some(right)) => left
+                            .cmp(&right)
+                            .then_with(|| left_file.file_id().cmp(&right_file.file_id())),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => left_file.file_id().cmp(&right_file.file_id()),
+                    }
+                });
+                indices.into_boxed_slice()
+            })
+            .collect();
         Self {
             owner: Arc::new(PinnedSnapshotOwner {
                 snapshot,
+                scan_file_indices,
                 _pins: pins,
                 _data_directory: data_directory,
             }),
@@ -139,7 +165,7 @@ impl PinnedTableManifest {
     /// Returns the number of visible physical files in this exact snapshot.
     #[must_use]
     pub fn file_count(&self) -> usize {
-        self.raw_table().files().len()
+        self.scan_file_indices().len()
     }
 
     /// Returns true when the exact snapshot contains no persisted files.
@@ -150,21 +176,31 @@ impl PinnedTableManifest {
 
     /// Creates lease-bound file tasks in the exact deterministic Catalog manifest order.
     pub fn files(&self) -> impl ExactSizeIterator<Item = PinnedDataFile> + '_ {
-        (0..self.file_count()).map(|file_index| PinnedDataFile {
-            owner: Arc::clone(&self.owner),
-            table_index: self.table_index,
-            file_index,
-        })
+        self.scan_file_indices()
+            .iter()
+            .copied()
+            .map(|file_index| PinnedDataFile {
+                owner: Arc::clone(&self.owner),
+                table_index: self.table_index,
+                file_index,
+            })
     }
 
     /// Creates one lease-bound file task by deterministic manifest index.
     #[must_use]
     pub fn file(&self, file_index: usize) -> Option<PinnedDataFile> {
-        (file_index < self.file_count()).then(|| PinnedDataFile {
-            owner: Arc::clone(&self.owner),
-            table_index: self.table_index,
-            file_index,
-        })
+        self.scan_file_indices()
+            .get(file_index)
+            .copied()
+            .map(|file_index| PinnedDataFile {
+                owner: Arc::clone(&self.owner),
+                table_index: self.table_index,
+                file_index,
+            })
+    }
+
+    fn scan_file_indices(&self) -> &[usize] {
+        &self.owner.scan_file_indices[self.table_index]
     }
 
     fn raw_table(&self) -> &zippy_types::catalog::CatalogTableSnapshot {

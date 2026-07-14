@@ -22,8 +22,8 @@ use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
     CatalogCommandV1, CatalogIdempotencyRead, CatalogOutcomeV1, CatalogRead, CatalogWrite,
     CreateNamespaceCommand, CreateTableCommand, LegacyCatalogImportCommandV2,
-    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportResponseV2, VersionedCatalogCommand,
-    VersionedCatalogResponse,
+    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportReplayProbeV2, LegacyCatalogImportResponseV2,
+    VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{
     CatalogName, ExternalDataPath, MetadataMap, MetadataScalar, SchemaCompatibility,
@@ -1004,11 +1004,14 @@ fn canonical_absolute_path_components(
 
 /// Executes an immutable V1/V2 plan through Catalog idempotency and revision guards.
 ///
-/// It acquires and permanently seals the Catalog's one-time startup import session. Physical file
-/// verification runs one file at a time on the blocking pool; the first failure stops the plan.
-/// This function owns no legacy handle and cannot mutate or stop the legacy runtime, so callers may
-/// report any error as shadow degradation while keeping the legacy authority available.
-pub async fn execute_legacy_catalog_metadata_import(
+/// It acquires and permanently seals the Catalog's one-time startup import session. Committed V2
+/// request IDs take a bounded metadata-only replay path after plan comparison. A missing request at
+/// its exact expected revision verifies physical files one at a time on the blocking pool; the
+/// first failure stops the plan. This function owns no legacy handle and cannot mutate or stop the
+/// legacy runtime, so callers may report any error as shadow degradation while keeping the legacy
+/// authority available. A successful replay proves Catalog metadata only; the native-storage
+/// startup verifier must still validate every visible physical file before readiness opens.
+pub(crate) async fn execute_legacy_catalog_metadata_import(
     plan: &LegacyCatalogMetadataImportPlan,
     catalog: &SqliteCatalog,
 ) -> Result<LegacyCatalogMetadataMigrationReport> {
@@ -1093,6 +1096,34 @@ async fn execute_import(
 
     let mut v2_dispositions = Vec::with_capacity(plan.v2_imports.len());
     for planned in &plan.v2_imports {
+        match session.probe_legacy_import_v2(planned.request_id).await? {
+            LegacyCatalogImportReplayProbeV2::Committed {
+                observed_catalog_revision,
+                response,
+            } => {
+                validate_v2_replay_response(planned, observed_catalog_revision, &response)?;
+                v2_dispositions.push(LegacyCatalogCommandDisposition::Replayed);
+                continue;
+            }
+            LegacyCatalogImportReplayProbeV2::Missing {
+                observed_catalog_revision,
+            } => {
+                if observed_catalog_revision != planned.expected_revision {
+                    return Err(ServerError::new(
+                        ErrorCode::Conflict,
+                        format!(
+                            concat!(
+                                "legacy V2 import target revision does not match the exact ",
+                                "committed import prefix expected=[{}] actual=[{}]"
+                            ),
+                            planned.expected_revision, observed_catalog_revision
+                        ),
+                    )
+                    .with_request_id(planned.request_id)
+                    .with_table_id(planned.command.table_id));
+                }
+            }
+        }
         let files = verify_v2_table_files(planned).await?;
         let mut command = planned.command.clone();
         command.files = files;
@@ -1114,44 +1145,18 @@ async fn execute_import(
             .with_table_id(planned.command.table_id)
             .with_retryable(false)
         })?;
-        let revision_before = catalog.revision().await?;
-        if revision_before < planned.expected_revision {
-            return Err(ServerError::new(
-                ErrorCode::Conflict,
-                format!(
-                    "legacy V2 import target is missing a committed prefix expected_at_least=[{}] \
-                     actual=[{revision_before}]",
-                    planned.expected_revision
-                ),
-            )
-            .with_request_id(planned.request_id)
-            .with_table_id(planned.command.table_id));
-        }
         let response = session.import_legacy_table_v2(envelope).await?;
         validate_v2_response(planned, &expected_summary, &response)?;
         let revision_after = catalog.revision().await?;
-        let disposition = if revision_before == planned.expected_revision {
-            if revision_after != response.catalog_revision {
-                return Err(v2_revision_corruption(
-                    planned,
-                    revision_before,
-                    revision_after,
-                    "submitted import did not advance to its response revision",
-                ));
-            }
-            LegacyCatalogCommandDisposition::Submitted
-        } else {
-            if revision_after != revision_before {
-                return Err(v2_revision_corruption(
-                    planned,
-                    revision_before,
-                    revision_after,
-                    "replayed import changed the current Catalog revision",
-                ));
-            }
-            LegacyCatalogCommandDisposition::Replayed
-        };
-        v2_dispositions.push(disposition);
+        if revision_after != response.catalog_revision {
+            return Err(v2_revision_corruption(
+                planned,
+                planned.expected_revision,
+                revision_after,
+                "submitted import did not advance to its response revision",
+            ));
+        }
+        v2_dispositions.push(LegacyCatalogCommandDisposition::Submitted);
     }
 
     let target_revision_after = catalog.revision().await?;
@@ -1256,6 +1261,71 @@ fn validate_v2_response(
     expected_summary: &MetadataMap,
     response: &LegacyCatalogImportResponseV2,
 ) -> Result<()> {
+    validate_v2_response_shape(
+        planned,
+        response,
+        response.snapshot.summary == *expected_summary,
+    )
+}
+
+fn validate_v2_replay_response(
+    planned: &PlannedLegacyTableImportV2,
+    observed_catalog_revision: u64,
+    response: &LegacyCatalogImportResponseV2,
+) -> Result<()> {
+    let file_count = u64::try_from(planned.file_specs.len()).map_err(|_| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "legacy V2 replay file count overflow",
+        )
+        .with_request_id(planned.request_id)
+        .with_table_id(planned.command.table_id)
+        .with_retryable(false)
+    })?;
+    let expected_rows = planned
+        .file_specs
+        .iter()
+        .try_fold(Some(0_u64), |total, file| {
+            match (total, file.expected_row_count) {
+                (Some(total), Some(rows)) => {
+                    total.checked_add(rows.get()).map(Some).ok_or_else(|| {
+                        ServerError::new(
+                            ErrorCode::ResourceExhausted,
+                            "legacy V2 replay row count overflow",
+                        )
+                        .with_request_id(planned.request_id)
+                        .with_table_id(planned.command.table_id)
+                        .with_retryable(false)
+                    })
+                }
+                _ => Ok(None),
+            }
+        })?;
+    let summary = &response.snapshot.summary;
+    let summary_matches = summary.get("added_files") == Some(&MetadataScalar::UInt64(file_count))
+        && summary.get("legacy_files_revision")
+            == Some(&MetadataScalar::UInt64(
+                planned.command.legacy_files_revision,
+            ))
+        && expected_rows
+            .is_none_or(|rows| summary.get("added_rows") == Some(&MetadataScalar::UInt64(rows)));
+    validate_v2_response_shape(planned, response, summary_matches)?;
+    if observed_catalog_revision < response.catalog_revision {
+        return Err(v2_revision_corruption(
+            planned,
+            response.catalog_revision,
+            observed_catalog_revision,
+            "replay response is newer than the observed Catalog revision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v2_response_shape(
+    planned: &PlannedLegacyTableImportV2,
+    response: &LegacyCatalogImportResponseV2,
+    summary_matches: bool,
+) -> Result<()> {
     let expected_revision = planned.expected_revision.checked_add(1).ok_or_else(|| {
         ServerError::new(
             ErrorCode::ResourceExhausted,
@@ -1284,7 +1354,7 @@ fn validate_v2_response(
         && response.snapshot.commit_lsn == response.catalog_revision
         && response.snapshot.created_at_ns == response.table.updated_at_ns
         && response.snapshot.committed_log_offset == OffsetWatermark::LegacyUnknown
-        && response.snapshot.summary == *expected_summary;
+        && summary_matches;
     if matches {
         return Ok(());
     }
@@ -2203,7 +2273,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn verified_v2_import_replays_exactly_after_catalog_restart() {
+    async fn committed_v2_import_replays_without_physical_io_after_catalog_restart() {
         let root = TempDir::new().unwrap();
         let legacy_root = root.path().join("legacy");
         std::fs::create_dir(&legacy_root).unwrap();
@@ -2240,6 +2310,7 @@ mod tests {
         );
         catalog.close().unwrap();
 
+        std::fs::remove_file(&file).unwrap();
         let replay_plan = plan_legacy_catalog_metadata_import(&snapshot).unwrap();
         assert_eq!(replay_plan.v2_imports[0].request_id, request_id);
         let catalog = open_catalog(&root);
@@ -2254,6 +2325,53 @@ mod tests {
             replay.tables[0].outcome,
             LegacyCatalogTableMigrationOutcome::PhysicalReplayed
         );
+        catalog.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_v2_replay_with_advanced_revision_fails_before_file_io() {
+        let root = TempDir::new().unwrap();
+        let legacy_root = root.path().join("legacy");
+        std::fs::create_dir(&legacy_root).unwrap();
+        let file = legacy_root.join("events.parquet");
+        write_parquet(&file, vec![1, 2, 3]);
+        let (_master, snapshot) = snapshot_with_tables(vec![(
+            "physical_events",
+            vec![legacy_file_value(&file, Some(&legacy_root), 7, 11, 3)],
+        )]);
+        let plan = plan_legacy_catalog_metadata_import(&snapshot).unwrap();
+        assert_eq!(plan.command_count(), 1);
+        assert_eq!(plan.v2_import_count(), 1);
+
+        let catalog = open_catalog(&root);
+        catalog
+            .command(plan.commands[0].command.clone())
+            .await
+            .unwrap();
+        let unrelated = CatalogCommandEnvelopeV1::new(
+            RequestId::from_u128(99).unwrap(),
+            Some(1),
+            CatalogActor {
+                kind: CatalogActorKind::User,
+                principal: "migration-test".to_owned(),
+            },
+            CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                namespace_id: NamespaceId::from_u128(99).unwrap(),
+                name: CatalogName::new("unrelated").unwrap(),
+            }),
+        )
+        .unwrap();
+        catalog
+            .command(VersionedCatalogCommand::V1(unrelated))
+            .await
+            .unwrap();
+        std::fs::remove_file(&file).unwrap();
+
+        let error = execute_legacy_catalog_metadata_import(&plan, &catalog)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert_eq!(catalog.revision().await.unwrap(), 2);
         catalog.close().unwrap();
     }
 

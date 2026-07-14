@@ -872,7 +872,9 @@ async fn supervise_storage(
         event = "native_storage_ready",
         catalog_revision = table_actor_handle.catalog_revision(),
         tables = table_actor_handle.len(),
+        files = catalog_file_verification.file_count,
         managed_files = catalog_file_verification.managed_file_count,
+        external_legacy_files = catalog_file_verification.external_legacy_file_count,
         verified_bytes = catalog_file_verification.verified_bytes,
         "native storage recovery and bidirectional verification completed"
     );

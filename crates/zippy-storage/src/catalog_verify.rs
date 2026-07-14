@@ -1,4 +1,4 @@
-//! Bounded startup verification of Catalog-visible managed Parquet files.
+//! Bounded startup verification of Catalog-visible Parquet files.
 
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -10,23 +10,24 @@ use zippy_types::catalog::{
     CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, ListTablesRequest,
 };
 use zippy_types::table::{
-    DataFileLocation, SchemaCompatibility, SchemaDescriptor, TableDescriptor, TableSnapshot,
-    TableState,
+    DataFileLocation, MetadataScalar, SchemaCompatibility, SchemaDescriptor, SnapshotOperation,
+    TableDescriptor, TableSnapshot, TableState,
 };
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
 use crate::candidate::verify_catalog_visible_candidate;
+use crate::legacy_import::verify_catalog_visible_external_legacy_file;
 
 const DEFAULT_MAX_TABLES: usize = 65_536;
 const DEFAULT_TABLE_PAGE_SIZE: u32 = 512;
 const DEFAULT_SNAPSHOT_BATCH_SIZE: usize = 512;
-const DEFAULT_MAX_MANAGED_FILES: usize = 65_536;
+const DEFAULT_MAX_FILES: usize = 65_536;
 const DEFAULT_MAX_VERIFICATION_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_RUNTIME_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TABLES: usize = 1_000_000;
 const MAX_TABLE_PAGE_SIZE: u32 = 4_096;
 const MAX_SNAPSHOT_BATCH_SIZE: usize = 4_096;
-const MAX_MANAGED_FILES: usize = 1_000_000;
+const MAX_FILES: usize = 1_000_000;
 const MAX_VERIFICATION_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 const MAX_RUNTIME_METADATA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -36,7 +37,7 @@ pub struct StartupCatalogFileVerifierConfig {
     max_tables: usize,
     table_page_size: u32,
     snapshot_batch_size: usize,
-    max_managed_files: usize,
+    max_files: usize,
     max_verification_bytes: u64,
     max_runtime_metadata_bytes: u64,
 }
@@ -47,7 +48,7 @@ impl Default for StartupCatalogFileVerifierConfig {
             max_tables: DEFAULT_MAX_TABLES,
             table_page_size: DEFAULT_TABLE_PAGE_SIZE,
             snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
-            max_managed_files: DEFAULT_MAX_MANAGED_FILES,
+            max_files: DEFAULT_MAX_FILES,
             max_verification_bytes: DEFAULT_MAX_VERIFICATION_BYTES,
             max_runtime_metadata_bytes: DEFAULT_MAX_RUNTIME_METADATA_BYTES,
         }
@@ -82,10 +83,20 @@ impl StartupCatalogFileVerifierConfig {
         self
     }
 
-    /// Sets the maximum current visible managed files admitted by one pass.
+    /// Sets the maximum current visible files admitted by one verification pass.
+    #[must_use]
+    pub const fn with_max_files(mut self, maximum: usize) -> Self {
+        self.max_files = maximum;
+        self
+    }
+
+    /// Sets the maximum current visible files admitted by one verification pass.
+    ///
+    /// This compatibility alias predates external-legacy startup verification. Its limit now
+    /// covers the aggregate of managed and external-legacy files.
     #[must_use]
     pub const fn with_max_managed_files(mut self, maximum: usize) -> Self {
-        self.max_managed_files = maximum;
+        self.max_files = maximum;
         self
     }
 
@@ -123,7 +134,11 @@ pub struct StartupCatalogFileVerificationReport {
     pub table_count: usize,
     /// Number of current visible managed files fully verified.
     pub managed_file_count: usize,
-    /// Aggregate physical bytes checksummed and footer-validated.
+    /// Number of current visible external legacy files fully verified.
+    pub external_legacy_file_count: usize,
+    /// Aggregate number of current visible files fully verified.
+    pub file_count: usize,
+    /// Aggregate physical bytes checksummed and footer-validated across both location classes.
     pub verified_bytes: u64,
 }
 
@@ -156,7 +171,7 @@ pub struct StartupCatalogBootstrap {
     pub runtime_metadata_bytes: u64,
 }
 
-/// Verifies every current Catalog-visible managed file before read admission opens.
+/// Verifies every current Catalog-visible file before read admission opens.
 pub struct StartupCatalogFileVerifier {
     config: StartupCatalogFileVerifierConfig,
     data_directory: Arc<OwnedDataDirectory>,
@@ -188,7 +203,7 @@ impl StartupCatalogFileVerifier {
         })
     }
 
-    /// Reads current snapshots and verifies every visible managed Parquet descriptor.
+    /// Reads current snapshots and verifies every visible Parquet descriptor.
     ///
     /// This compatibility wrapper discards the bounded runtime bootstrap descriptors.
     pub async fn verify(&self) -> Result<StartupCatalogFileVerificationReport> {
@@ -206,7 +221,9 @@ impl StartupCatalogFileVerifier {
         let mut catalog_revision = None;
         let mut after = None;
         let mut table_count = 0_usize;
+        let mut file_count = 0_usize;
         let mut managed_file_count = 0_usize;
+        let mut external_legacy_file_count = 0_usize;
         let mut verified_bytes = 0_u64;
         let mut runtime_metadata_bytes = 0_u64;
         let mut active_tables = Vec::new();
@@ -253,22 +270,28 @@ impl StartupCatalogFileVerifier {
                     .expect("validated bounded batch index cannot overflow");
                 let expected_tables = &page.tables[first_table..first_table + batch.len()];
                 validate_snapshot_response(batch, expected_tables, &snapshot)?;
-                let (batch_files, batch_bytes) = measure_managed_files(&snapshot)?;
+                let measured_files = measure_snapshot_files(&snapshot)?;
                 let batch_runtime_metadata_bytes = measure_runtime_metadata(&snapshot)?;
-                let next_files = managed_file_count
-                    .checked_add(batch_files)
-                    .ok_or_else(|| resource("startup managed file count overflow"))?;
-                if next_files > self.config.max_managed_files {
+                let next_files = file_count
+                    .checked_add(measured_files.file_count)
+                    .ok_or_else(|| resource("startup file count overflow"))?;
+                if next_files > self.config.max_files {
                     return Err(resource(format!(
                         concat!(
-                            "startup visible managed file count exceeds maximum ",
+                            "startup visible file count exceeds maximum ",
                             "actual=[{}] maximum=[{}]"
                         ),
-                        next_files, self.config.max_managed_files
+                        next_files, self.config.max_files
                     )));
                 }
+                let next_managed_files = managed_file_count
+                    .checked_add(measured_files.managed_file_count)
+                    .ok_or_else(|| resource("startup managed file count overflow"))?;
+                let next_external_legacy_files = external_legacy_file_count
+                    .checked_add(measured_files.external_legacy_file_count)
+                    .ok_or_else(|| resource("startup external legacy file count overflow"))?;
                 let next_bytes = verified_bytes
-                    .checked_add(batch_bytes)
+                    .checked_add(measured_files.bytes)
                     .ok_or_else(|| resource("startup verification byte count overflow"))?;
                 if next_bytes > self.config.max_verification_bytes {
                     return Err(resource(format!(
@@ -307,8 +330,10 @@ impl StartupCatalogFileVerifier {
                     verify_snapshot_files(data_directory.as_ref(), &snapshot)
                 })
                 .await
-                .map_err(|error| join_error("verify Catalog-visible managed files", error))??;
-                managed_file_count = next_files;
+                .map_err(|error| join_error("verify Catalog-visible files", error))??;
+                file_count = next_files;
+                managed_file_count = next_managed_files;
+                external_legacy_file_count = next_external_legacy_files;
                 verified_bytes = next_bytes;
                 runtime_metadata_bytes = next_runtime_metadata_bytes;
                 active_tables.extend(batch_active_tables);
@@ -331,6 +356,8 @@ impl StartupCatalogFileVerifier {
                 catalog_revision,
                 table_count,
                 managed_file_count,
+                external_legacy_file_count,
+                file_count,
                 verified_bytes,
             },
             active_tables,
@@ -409,22 +436,105 @@ fn validate_snapshot_response(
     Ok(())
 }
 
-fn measure_managed_files(snapshot: &CatalogQuerySnapshot) -> Result<(usize, u64)> {
-    let mut files = 0_usize;
-    let mut bytes = 0_u64;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MeasuredSnapshotFiles {
+    file_count: usize,
+    managed_file_count: usize,
+    external_legacy_file_count: usize,
+    bytes: u64,
+}
+
+fn measure_snapshot_files(snapshot: &CatalogQuerySnapshot) -> Result<MeasuredSnapshotFiles> {
+    let mut measured = MeasuredSnapshotFiles::default();
     for table in snapshot.tables() {
+        let mut table_file_count = 0_u64;
+        let mut table_rows = 0_u64;
+        let mut table_bytes = 0_u64;
         for descriptor in table.files().as_slice() {
-            if matches!(descriptor.file.location, DataFileLocation::Managed(_)) {
-                files = files
-                    .checked_add(1)
-                    .ok_or_else(|| resource("startup managed file count overflow"))?;
-                bytes = bytes
-                    .checked_add(descriptor.file.file_size_bytes)
-                    .ok_or_else(|| resource("startup verification byte count overflow"))?;
+            measured.file_count = measured
+                .file_count
+                .checked_add(1)
+                .ok_or_else(|| resource("startup file count overflow"))?;
+            match descriptor.file.location {
+                DataFileLocation::Managed(_) => {
+                    measured.managed_file_count = measured
+                        .managed_file_count
+                        .checked_add(1)
+                        .ok_or_else(|| resource("startup managed file count overflow"))?;
+                }
+                DataFileLocation::ExternalLegacy(_) => {
+                    measured.external_legacy_file_count = measured
+                        .external_legacy_file_count
+                        .checked_add(1)
+                        .ok_or_else(|| resource("startup external legacy file count overflow"))?;
+                }
             }
+            measured.bytes = measured
+                .bytes
+                .checked_add(descriptor.file.file_size_bytes)
+                .ok_or_else(|| resource("startup verification byte count overflow"))?;
+            table_file_count = table_file_count
+                .checked_add(1)
+                .ok_or_else(|| resource("startup import file count overflow"))?;
+            table_rows = table_rows
+                .checked_add(descriptor.file.row_count.get())
+                .ok_or_else(|| resource("startup import row count overflow"))?;
+            table_bytes = table_bytes
+                .checked_add(descriptor.file.file_size_bytes)
+                .ok_or_else(|| resource("startup import byte count overflow"))?;
+        }
+        if table.snapshot().operation == SnapshotOperation::Import {
+            validate_import_summary(
+                table.table().table_id,
+                table.snapshot(),
+                table_file_count,
+                table_rows,
+                table_bytes,
+            )?;
         }
     }
-    Ok((files, bytes))
+    Ok(measured)
+}
+
+fn validate_import_summary(
+    table_id: TableId,
+    snapshot: &TableSnapshot,
+    file_count: u64,
+    rows: u64,
+    bytes: u64,
+) -> Result<()> {
+    const ADDED_FILES: &str = "added_files";
+    const ADDED_ROWS: &str = "added_rows";
+    const ADDED_BYTES: &str = "added_bytes";
+    const LEGACY_FILES_REVISION: &str = "legacy_files_revision";
+
+    let summary = &snapshot.summary;
+    let legacy_files_revision = match summary.get(LEGACY_FILES_REVISION) {
+        Some(MetadataScalar::UInt64(value)) if *value != 0 => *value,
+        _ => {
+            return Err(table_corruption(
+                table_id,
+                "catalog import snapshot has an invalid legacy file revision",
+            ));
+        }
+    };
+    let expected = [
+        (ADDED_FILES, file_count),
+        (ADDED_ROWS, rows),
+        (ADDED_BYTES, bytes),
+        (LEGACY_FILES_REVISION, legacy_files_revision),
+    ];
+    if summary.len() != expected.len()
+        || expected.iter().any(|(key, expected_value)| {
+            summary.get(*key) != Some(&MetadataScalar::UInt64(*expected_value))
+        })
+    {
+        return Err(table_corruption(
+            table_id,
+            "catalog import snapshot summary does not match its visible manifest",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -504,9 +614,32 @@ fn verify_snapshot_files(
     snapshot: &CatalogQuerySnapshot,
 ) -> Result<()> {
     for table in snapshot.tables() {
+        let external_schema = table
+            .files()
+            .as_slice()
+            .iter()
+            .any(|descriptor| {
+                matches!(
+                    descriptor.file.location,
+                    DataFileLocation::ExternalLegacy(_)
+                )
+            })
+            .then(|| zippy_catalog::decode_persisted_schema(table.schema()))
+            .transpose()?;
         for descriptor in table.files().as_slice() {
-            if matches!(descriptor.file.location, DataFileLocation::Managed(_)) {
-                verify_catalog_visible_candidate(data_directory, &descriptor.file)?;
+            match descriptor.file.location {
+                DataFileLocation::Managed(_) => {
+                    verify_catalog_visible_candidate(data_directory, &descriptor.file)?;
+                }
+                DataFileLocation::ExternalLegacy(_) => {
+                    verify_catalog_visible_external_legacy_file(
+                        &descriptor.file,
+                        external_schema
+                            .as_ref()
+                            .expect("external file requires a decoded Catalog schema")
+                            .as_ref(),
+                    )?;
+                }
             }
         }
     }
@@ -535,10 +668,10 @@ fn validate_config(config: &StartupCatalogFileVerifierConfig) -> Result<()> {
             config.snapshot_batch_size, MAX_SNAPSHOT_BATCH_SIZE
         )));
     }
-    if config.max_managed_files == 0 || config.max_managed_files > MAX_MANAGED_FILES {
+    if config.max_files == 0 || config.max_files > MAX_FILES {
         return Err(invalid(format!(
             "startup file budget is outside supported range actual=[{}] maximum=[{}]",
-            config.max_managed_files, MAX_MANAGED_FILES
+            config.max_files, MAX_FILES
         )));
     }
     if config.max_verification_bytes == 0 || config.max_verification_bytes > MAX_VERIFICATION_BYTES
@@ -583,6 +716,10 @@ fn corruption(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::DataCorruption, message).with_retryable(false)
 }
 
+fn table_corruption(table_id: TableId, message: impl Into<String>) -> ServerError {
+    corruption(message).with_table_id(table_id)
+}
+
 fn resource(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
 }
@@ -597,4 +734,79 @@ fn join_error(operation: &str, error: tokio::task::JoinError) -> ServerError {
         format!("{operation} blocking task failed error=[{error}]"),
     )
     .with_retryable(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use zippy_types::table::{MetadataMap, MetadataScalar, SnapshotOperation, TableSnapshot};
+    use zippy_types::{ErrorCode, OffsetWatermark, TableId};
+
+    use super::validate_import_summary;
+
+    fn table_id() -> TableId {
+        TableId::from_u128(1).expect("nonzero table id")
+    }
+
+    fn import_snapshot(summary: MetadataMap) -> TableSnapshot {
+        TableSnapshot {
+            table_id: table_id(),
+            snapshot_version: 2,
+            parent_snapshot_version: Some(1),
+            operation: SnapshotOperation::Import,
+            commit_lsn: 2,
+            committed_log_offset: OffsetWatermark::LegacyUnknown,
+            created_at_ns: 1,
+            summary,
+        }
+    }
+
+    fn valid_summary() -> MetadataMap {
+        MetadataMap::from([
+            ("added_files".to_owned(), MetadataScalar::UInt64(2)),
+            ("added_rows".to_owned(), MetadataScalar::UInt64(5)),
+            ("added_bytes".to_owned(), MetadataScalar::UInt64(13)),
+            (
+                "legacy_files_revision".to_owned(),
+                MetadataScalar::UInt64(7),
+            ),
+        ])
+    }
+
+    #[test]
+    fn import_summary_requires_exact_manifest_aggregates() {
+        validate_import_summary(table_id(), &import_snapshot(valid_summary()), 2, 5, 13)
+            .expect("exact import summary");
+
+        for (files, rows, bytes) in [(3, 5, 13), (2, 6, 13), (2, 5, 14)] {
+            let error = validate_import_summary(
+                table_id(),
+                &import_snapshot(valid_summary()),
+                files,
+                rows,
+                bytes,
+            )
+            .expect_err("mismatched aggregate must fail closed");
+            assert_eq!(error.code(), ErrorCode::DataCorruption);
+        }
+    }
+
+    #[test]
+    fn import_summary_requires_exact_keys_types_and_nonzero_revision() {
+        let mut extra = valid_summary();
+        extra.insert("unexpected".to_owned(), MetadataScalar::UInt64(1));
+        let mut wrong_type = valid_summary();
+        wrong_type.insert("added_rows".to_owned(), MetadataScalar::Int64(5));
+        let mut zero_revision = valid_summary();
+        zero_revision.insert(
+            "legacy_files_revision".to_owned(),
+            MetadataScalar::UInt64(0),
+        );
+
+        for summary in [extra, wrong_type, zero_revision] {
+            let error = validate_import_summary(table_id(), &import_snapshot(summary), 2, 5, 13)
+                .expect_err("noncanonical import summary must fail closed");
+            assert_eq!(error.code(), ErrorCode::DataCorruption);
+            assert!(!error.retryable());
+        }
+    }
 }
