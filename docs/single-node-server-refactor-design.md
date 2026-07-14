@@ -1774,8 +1774,11 @@ worker 和 read-only WAL connection，因此大 snapshot 不再阻塞 discovery/
 mutation 保持 actor admission 顺序；重叠 read 可以读取前一个 committed revision，取消响应不会取消
 已接受写入，close 会排空已接受工作。其余 V1 mutation command、producer-fenced public ingest、
 maintenance lease-fenced worker、legacy/frame/KV V2 manifest、legacy importer/shadow/diff、
-CreateTable preparation 隔离、manifest finalize 减负、read parallelism、active read interrupt 和绝对
-shutdown deadline 尚未实现，因此 SQLite 仍不能成为 `zippy server run` 的 read/write authority。
+CreateTable preparation 隔离、manifest finalize 减负、read parallelism 和 active read interrupt 尚未
+实现。SQLite actor 内部仍没有绝对 shutdown deadline；启用 native storage 时由独立 OS supervisor
+隔离同步 open/close，server timeout 只停止等待且保留 supervisor、Catalog 与 data-root ownership，
+后台继续按 coordinator drain -> Catalog close 清理。因此 SQLite 可以作为显式灰度的 required
+startup dependency，但尚不能成为 `zippy server run` 的 read/write authority。
 modern manifest 的多表 exact `CatalogQuerySnapshot` 已在同一个 deferred transaction 中读取
 table/schema/snapshot/visible files/native lineage；schema IPC 与
 hash、snapshot chain、metadata checksum、file visibility 和 lineage coverage 都会重新验证。
@@ -1852,9 +1855,22 @@ durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、�
 启动期 orphan reconciliation 已实现规范化物理扫描、durable intent 保护、`FileId + managed path`
 同事务双键 probe、全程 revision 稳定性检查以及只读分类报告；扫描、验证、intent 总字节和报告
 常驻元数据均有独立预算，多文件 intent 必须整体 exact 或整体 unreferenced。它刻意不删除文件，
-在线删除仍需 publication gate，普通历史文件删除还依赖 snapshot lease 和 Catalog GC 状态机。snapshot lease、
+在线删除仍需 publication gate，普通历史文件删除还依赖 snapshot lease 和 Catalog GC 状态机。反向
+`StartupCatalogFileVerifier` 已按固定 revision 分页读取 active table/current snapshot，并在 ready 前
+通过 data-root/table directory fd 逐级 `openat(O_NOFOLLOW)`，有界核验每个当前可见 managed 文件的
+路径归属、大小、checksum、Parquet footer 和 row count；缺失、symlink 替换或内容损坏均 fail closed。
+该 gate 不声明历史 snapshot 可用，native historical query admission 仍关闭，历史文件深度审计属于
+maintenance。snapshot lease、
 logical drop、safe GC 以及权威 server table actor 接线尚未完成，因此 legacy metadata 仍是 server
-authority，不能把本段基础设施视为 Phase 3 验收完成。
+authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
+`[server].native_storage_enabled = true`（或 `ZIPPY_SERVER_NATIVE_STORAGE=true`）后，
+`NativeStorageRuntime` 会在任何 listener 绑定前依次执行 Catalog open、pre-replay reconciliation、
+durable intent replay、post-replay reconciliation 和 Catalog-to-physical current-snapshot verification；
+只有双向报告完成且 revision 一致才允许 ready。supervisor 使用独立 OS 线程和 Tokio runtime；server
+启动超时会先取消并把 owning handle 交给具名后台 reaper，再按时返回；reaper 持有 supervisor join
+handle 和 data-root lock 直到 Catalog cleanup 完成。shutdown timeout 不会取消已接受 commit 或提前释放
+data-root lock。该 gate
+默认关闭，启用后失败必须阻止启动，不允许静默降级到 legacy-only。
 
 任务：
 
@@ -2122,6 +2138,17 @@ ingest.wal.enabled = false | true
 subscription.durable_offsets = false | true
 compatibility.legacy_gateway = true | false
 ```
+
+当前增量实现先提供临时 bootstrap gate：
+
+```toml
+[server]
+native_storage_enabled = false
+```
+
+它只控制 SQLite Catalog、commit recovery 和 reconciliation 的 server-owned 生命周期，不等价于
+`catalog.backend=sqlite_shadow`，也不复用 legacy `table.persist.enabled`。完成 shadow/diff 后应由上面的
+最终 authority gate 替换并删除此临时布尔项。
 
 这些 gate 只用于迁移，最终必须删除，不能永久形成两套内核。
 

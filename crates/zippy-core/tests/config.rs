@@ -7,6 +7,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "HOME",
     "ZIPPY_SERVER_DATA_DIR",
     "ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT",
+    "ZIPPY_SERVER_NATIVE_STORAGE",
     "ZIPPY_LOG_LEVEL",
     "ZIPPY_MAX_PARALLELISM",
     "ZIPPY_MAX_QUERY_BUFFER_BYTES",
@@ -188,10 +189,58 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     assert_eq!(config.query_max_buffered_bytes(), 134217728);
     assert_eq!(config.server.data_dir, None);
     assert!(!config.server.import_legacy_endpoint_snapshot);
+    assert!(!config.server.native_storage_enabled);
     assert_eq!(
         config.server_data_dir("endpoint-data"),
         std::path::PathBuf::from("endpoint-data")
     );
+}
+
+#[test]
+fn zippy_config_merges_native_storage_toml_and_environment_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+"#,
+    )
+    .unwrap();
+
+    let from_toml = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+    assert!(from_toml.server.native_storage_enabled);
+
+    let from_env = with_env(&[("ZIPPY_SERVER_NATIVE_STORAGE", "false")], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
+    assert!(!from_env.server.native_storage_enabled);
+}
+
+#[test]
+fn zippy_config_rejects_invalid_native_storage_environment_value() {
+    let error = with_env(&[("ZIPPY_SERVER_NATIVE_STORAGE", "enabled")], || {
+        ZippyConfig::load_from_path(None::<&std::path::Path>)
+    })
+    .expect_err("native storage environment value must be a supported boolean");
+
+    assert!(error
+        .to_string()
+        .contains("env var must parse as bool name=[ZIPPY_SERVER_NATIVE_STORAGE] value=[enabled]"));
+}
+
+#[test]
+fn zippy_config_serializes_native_storage_and_round_trips_equality() {
+    let mut config = ZippyConfig::default();
+    config.server.native_storage_enabled = true;
+
+    let value = config.to_json_value();
+    assert_eq!(value["server"]["native_storage_enabled"], true);
+
+    let decoded = serde_json::from_value::<ZippyConfig>(value).unwrap();
+    assert_eq!(decoded, config);
 }
 
 #[test]

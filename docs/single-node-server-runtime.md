@@ -39,6 +39,19 @@ owner-only, code-only failure outcome for startup diagnostics. A minimal child b
 file to `ready`. The short-lived launcher never rewrites authoritative child state, so killing the
 launcher does not orphan an unmanageable daemon.
 
+The bootstrap `starting` and failure-outcome records remain schema v1. The promoted `ready` record
+uses schema v2 and requires typed `gateway_configured` and `native_storage_configured` facts; when
+either dependency is configured, all of its readiness gates must be explicitly true. The CLI
+rejects older or partially populated ready records instead of interpreting missing facts as a
+disabled dependency. `native_catalog_ready` covers Catalog migration/integrity/recovery;
+`native_current_snapshot_files_ready` separately proves that every managed file in each active
+table's current snapshot passed physical verification. It does not claim historical snapshot
+availability, and native historical-query admission remains closed in this migration phase.
+Fresh startup accepts only ready v2. During a rolling CLI upgrade, `status` and `stop` still accept
+an already-running ready-v1 generation after validating its unchanged PID/boot/start-tick/nonce
+identity; status uses a non-persisted compatibility copy that explicitly treats native storage as
+disabled.
+
 Use the following commands for the detached process:
 
 ```bash
@@ -69,7 +82,11 @@ zippy server run --foreground --config /path/to/zippy.toml
 Use `--foreground` for systemd, RSPM, containers, PM task definitions, and interactive debugging.
 The foreground form retains native `SIGINT`/`SIGTERM` graceful shutdown behavior.
 
-The server owns startup and shutdown order. It binds the master listener first, waits for its
+The server owns startup and shutdown order. When native storage is enabled, it first opens and
+checks SQLite, runs pre-replay reconciliation, replays durable Catalog intents, and runs final
+reconciliation. It then reads the current Catalog snapshots at one stable revision and verifies
+every visible managed Parquet path, size, checksum, footer, and row count before binding any
+listener. It then binds the master listener, waits for its
 readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master
 control probe, and only then opens service admission. With Gateway disabled it intentionally runs
 in catalog-only mode; it does not publish a query service that cannot execute.
@@ -107,26 +124,48 @@ file and directory durability, and retains the old file as rollback evidence. An
 configured data root never imports endpoint state. Once the managed file exists it is always
 authoritative, even if the server later uses a different control endpoint.
 
-A clean server shutdown releases data-root ownership only after Gateway and Master/listener cleanup
-has completed. An incomplete shutdown retains the top-level capability, and a listener that has not
-joined retains its own capability clone. Ordinary `DataDirectory::open` remains a read-only layout
-validation operation and does not create missing directories. Writable SQLite Catalog
+A clean server shutdown releases data-root ownership only after Gateway, native storage, and
+Master/listener cleanup have completed. An incomplete shutdown retains the top-level capability,
+and a listener or storage supervisor that has not joined retains its own capability clone. Ordinary
+`DataDirectory::open` remains a read-only layout validation operation and does not create missing
+directories. Writable SQLite Catalog
 configurations and durable file publication require an `OwnedDataDirectory` capability.
 Runtime inspection APIs expose only a borrowed capability; they do not expose the internal `Arc`
 used to retain ownership across the top-level runtime and listener thread.
 
-This phase establishes process ownership and crash-safe publication primitives. The production
-runtime still uses the legacy metadata authority until Parquet candidate publication, Catalog
-manifest visibility, reconciliation, and authority cutover are completed.
+Native storage lifecycle is an explicit migration gate and is disabled by default:
 
-On shutdown the order is reversed: adapter admission closes first, Gateway releases its master
-lease and stops, then master performs its graceful shutdown and persists the catalog snapshot.
-Gateway, master process draining, and listener join share one absolute monotonic deadline from
-`master.shutdown_timeout_ms`; a later stage receives only the remaining budget. The structured
-shutdown result records incomplete writer cleanup, process leases, listener errors, and deadline
-exhaustion. Repeated shutdown calls return the first result without retrying cleanup or hiding an
-earlier failure. Any timeout is returned as `DEADLINE_EXCEEDED`; other cleanup failures also make
-the daemon return an error.
+```toml
+[server]
+native_storage_enabled = true
+```
+
+`ZIPPY_SERVER_NATIVE_STORAGE=true` is the strict boolean environment override. Once enabled, SQLite
+Catalog recovery is a required dependency: migration, integrity, retained intent replay, or either
+direction of storage verification failure prevents listener bind and readiness. It never silently
+falls back to the legacy-only path. The supervisor owns a dedicated OS thread and Tokio runtime, so synchronous
+SQLite open/close never nests a runtime on the server caller thread. The low-level startup timeout
+returns an owning handle rather than detaching the supervisor. The server composition root cancels
+that handle and transfers it to a named background reaper before returning the deadline error. The
+reaper retains the supervisor join handle and data-root ownership until coordinator drain and
+Catalog close complete, without turning cleanup latency into an unbounded startup wait. Shutdown
+timeout remains observational: accepted work is not cancelled and ownership remains held until
+cleanup actually completes. If the process cannot create the reaper because of OS resource
+exhaustion, startup still returns on time and logs a detached-cleanup error; the original supervisor
+continues to retain the Catalog and data-root capability until it exits.
+
+This phase establishes process ownership, crash-safe publication, and gated recovery. The
+production runtime still uses the legacy metadata authority until the server-owned table actor,
+query mirror, shadow comparison, and authority cutover are completed.
+
+On shutdown the order is reversed: adapter and native admission close first, Gateway releases its
+master lease and stops, the native coordinator drains and closes SQLite, then master performs its
+graceful shutdown and persists the legacy catalog snapshot. Gateway, native storage, master process
+draining, and listener join share one absolute monotonic deadline from `master.shutdown_timeout_ms`;
+a later stage receives only the remaining budget. The structured shutdown result records native
+cleanup, process leases, listener errors, and deadline exhaustion. Repeated top-level shutdown calls
+return the first result without hiding an earlier failure. Any timeout is returned as
+`DEADLINE_EXCEEDED`; other cleanup failures also make the daemon return an error.
 
 ## WebUI reporting boundary
 
@@ -198,5 +237,7 @@ that a PID-only signal completed the server's persistence and lease cleanup cont
 The startup timeout is an admission deadline, not a mechanism for cancelling synchronous file I/O.
 Configuration and snapshot loading, Gateway runtime construction, and rollback are checked against
 the deadline, but an already-running filesystem call cannot be force-cancelled by Rust. Startup
-never publishes readiness after the deadline; cleanup uses its own bounded shutdown budget and any
-incomplete rollback is appended to the returned startup error.
+never publishes readiness after the deadline. General rollback uses its own bounded shutdown budget
+and appends any incomplete cleanup to the returned startup error; native-storage startup
+cancellation hands the owning handle to a background reaper before returning, so a failed startup
+neither waits indefinitely nor discards the only handle retaining the data-root lock.

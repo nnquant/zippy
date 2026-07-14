@@ -31,7 +31,7 @@ if os.name == "posix":
 
 
 _STATE_SCHEMA_VERSION = 1
-_READY_SCHEMA_VERSION = 1
+_READY_SCHEMA_VERSION = 2
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024
 _PROCESS_POLL_INTERVAL_SEC = 0.05
 
@@ -415,10 +415,26 @@ def _validate_ready_record(record: dict[str, object]) -> None:
     services = health.get("services")
     if not isinstance(facts, dict) or not isinstance(services, dict):
         raise _ServerProcessError("native server ready record is missing readiness facts")
-    gateway_configured = facts.get("gateway_configured") is True
+    gateway_configured = facts.get("gateway_configured")
+    if not isinstance(gateway_configured, bool):
+        raise _ServerProcessError(
+            "native server ready record has invalid gateway configuration fact"
+        )
+    native_storage_configured = facts.get("native_storage_configured")
+    if not isinstance(native_storage_configured, bool):
+        raise _ServerProcessError(
+            "native server ready record has invalid native storage configuration fact"
+        )
+    native_storage_ready = not native_storage_configured or (
+        facts.get("native_catalog_ready") is True
+        and facts.get("native_current_snapshot_files_ready") is True
+        and facts.get("storage_reconciliation_complete") is True
+        and facts.get("commit_recovery_complete") is True
+    )
     runtime_ready = (
         facts.get("admission_open") is True
         and facts.get("master_listener_ready") is True
+        and native_storage_ready
         and (
             not gateway_configured
             or (
@@ -438,6 +454,33 @@ def _validate_ready_record(record: dict[str, object]) -> None:
     )
     if not runtime_ready or not services_ready:
         raise _ServerProcessError("native server ready record did not satisfy full readiness")
+
+
+def _ready_record_for_status_validation(record: dict[str, object]) -> dict[str, object]:
+    if record.get("schema_version") != 1:
+        return record
+    health = record.get("health")
+    if not isinstance(health, dict):
+        return record
+    facts = health.get("readiness")
+    if not isinstance(facts, dict):
+        return record
+    compatibility_facts = dict(facts)
+    compatibility_facts.update(
+        {
+            "native_storage_configured": False,
+            "native_catalog_ready": False,
+            "native_current_snapshot_files_ready": False,
+            "storage_reconciliation_complete": False,
+            "commit_recovery_complete": False,
+        }
+    )
+    compatibility_health = dict(health)
+    compatibility_health["readiness"] = compatibility_facts
+    compatibility_record = dict(record)
+    compatibility_record["schema_version"] = _READY_SCHEMA_VERSION
+    compatibility_record["health"] = compatibility_health
+    return compatibility_record
 
 
 def _tcp_address(endpoint: str) -> tuple[str, int]:
@@ -944,7 +987,13 @@ def _state_for_endpoint(
         state = _read_json_file(paths.state_file)
     except FileNotFoundError:
         return paths, None
-    if state.get("schema_version") != _STATE_SCHEMA_VERSION:
+    schema_version = state.get("schema_version")
+    schema_supported = (
+        schema_version in {1, _READY_SCHEMA_VERSION}
+        if state.get("status") == "ready"
+        else schema_version == _STATE_SCHEMA_VERSION
+    )
+    if not schema_supported:
         raise _ServerProcessError(f"server state has unsupported schema path=[{paths.state_file}]")
     return paths, state
 
@@ -1002,7 +1051,8 @@ def _generation_still_owned(
         return False
     expected_identity = _launcher_from_state(state).get("process_identity")
     if (
-        latest.get("schema_version") != _STATE_SCHEMA_VERSION
+        latest.get("schema_version") != state.get("schema_version")
+        or latest.get("schema_version") not in {1, _READY_SCHEMA_VERSION}
         or latest.get("status") != "ready"
         or latest.get("pid") != pid
         or latest.get("launch_nonce") != state.get("launch_nonce")
@@ -1058,7 +1108,7 @@ def _server_status(
         return result
 
     try:
-        _validate_ready_record(state)
+        _validate_ready_record(_ready_record_for_status_validation(state))
     except _ServerProcessError as error:
         result = _compose_starting_payload(state)
         result["status"] = "unhealthy"

@@ -11,8 +11,10 @@ signal-hook = { version = "0.3", features = ["iterator"] }
 tokio.workspace = true
 tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
+zippy-catalog = { path = "../zippy-catalog" }
 zippy-gateway = { path = "../zippy-gateway" }
 zippy-master = { path = "../zippy-master" }
+zippy-storage = { path = "../zippy-storage" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]

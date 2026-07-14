@@ -2453,9 +2453,11 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zippy-catalog",
  "zippy-core",
  "zippy-gateway",
  "zippy-master",
+ "zippy-storage",
  "zippy-types",
 ]
 

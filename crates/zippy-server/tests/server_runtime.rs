@@ -124,6 +124,78 @@ fn runtime_config_with_data_dir(
     LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
 }
 
+fn runtime_config_with_native_storage(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+) -> LegacyServerRuntimeConfig {
+    let config_path = temp.path().join("zippy-native-storage.toml");
+    fs::write(
+        &config_path,
+        format!(
+            concat!(
+                "[server]\n",
+                "data_dir = {:?}\n",
+                "native_storage_enabled = true\n\n",
+                "[master]\n",
+                "shutdown_timeout_ms = 1000\n"
+            ),
+            data_dir.display().to_string()
+        ),
+    )
+    .unwrap();
+    let master =
+        MasterDaemonConfig::new(ControlEndpoint::Unix(temp.path().join("zippy-server.sock")))
+            .with_config_path(config_path)
+            .with_logging(
+                std::env::temp_dir().join(format!(
+                    "zippy-server-runtime-test-logs-{}",
+                    std::process::id()
+                )),
+                "info",
+                false,
+            );
+    LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
+}
+
+fn runtime_config_with_native_storage_and_gateway(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+    gateway_endpoint: std::net::SocketAddr,
+) -> LegacyServerRuntimeConfig {
+    let config_path = temp.path().join("zippy-native-storage-gateway.toml");
+    fs::write(
+        &config_path,
+        format!(
+            concat!(
+                "[server]\n",
+                "data_dir = {:?}\n",
+                "native_storage_enabled = true\n\n",
+                "[master]\n",
+                "shutdown_timeout_ms = 1000\n\n",
+                "[gateway]\n",
+                "enabled = true\n",
+                "endpoint = {:?}\n",
+                "token = \"native-storage-rollback-test\"\n"
+            ),
+            data_dir.display().to_string(),
+            gateway_endpoint.to_string()
+        ),
+    )
+    .unwrap();
+    let master =
+        MasterDaemonConfig::new(ControlEndpoint::Unix(temp.path().join("zippy-server.sock")))
+            .with_config_path(config_path)
+            .with_logging(
+                std::env::temp_dir().join(format!(
+                    "zippy-server-runtime-test-logs-{}",
+                    std::process::id()
+                )),
+                "info",
+                false,
+            );
+    LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
+}
+
 #[tokio::test]
 async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
     let temp = tempfile::tempdir().unwrap();
@@ -147,6 +219,9 @@ async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
     );
     assert_eq!(runtime.gateway_endpoint(), None);
     assert!(runtime.query().is_none());
+    assert!(!runtime.runtime_config().server.native_storage_enabled);
+    assert!(runtime.native_storage_reconciliation_report().is_none());
+    assert!(!data_directory.root().join("catalog/catalog.db").exists());
     assert_eq!(runtime.catalog().revision().await.unwrap(), 0);
 
     let health = runtime.health();
@@ -180,6 +255,61 @@ async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
         .acquire_process_ownership()
         .expect("clean server shutdown releases data ownership");
     assert!(!temp.path().join("zippy-server.sock").exists());
+}
+
+#[test]
+fn configured_native_storage_recovers_before_server_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let mut runtime =
+        LegacyServerRuntime::start(runtime_config_with_native_storage(&temp, &data_dir)).unwrap();
+
+    let health = runtime.health();
+    assert!(health.readiness.is_ready());
+    assert!(health.readiness.native_storage_configured);
+    assert!(health.readiness.native_catalog_ready);
+    assert!(health.readiness.native_current_snapshot_files_ready);
+    assert!(health.readiness.storage_reconciliation_complete);
+    assert!(health.readiness.commit_recovery_complete);
+    assert!(runtime
+        .native_storage_reconciliation_report()
+        .expect("enabled native storage must expose startup evidence")
+        .has_no_observed_backlog());
+    let physical = runtime
+        .native_storage_catalog_file_verification_report()
+        .expect("enabled native storage must expose physical verification evidence");
+    assert_eq!(physical.table_count, 0);
+    assert_eq!(physical.managed_file_count, 0);
+    assert!(data_dir.join("catalog/catalog.db").is_file());
+
+    assert!(runtime.shutdown().is_clean());
+}
+
+#[test]
+fn corrupt_native_catalog_prevents_listener_bind_and_releases_ownership_after_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let ownership = zippy_core::OwnedDataDirectory::acquire_or_initialize(&data_dir).unwrap();
+    fs::write(
+        data_dir.join("catalog/catalog.db"),
+        b"not a sqlite database",
+    )
+    .unwrap();
+    drop(ownership);
+
+    let error =
+        match LegacyServerRuntime::start(runtime_config_with_native_storage(&temp, &data_dir)) {
+            Ok(mut runtime) => {
+                let _ = runtime.shutdown();
+                panic!("corrupt native Catalog unexpectedly started the server");
+            }
+            Err(error) => error,
+        };
+
+    assert!(error.to_string().to_ascii_lowercase().contains("catalog"));
+    assert!(!temp.path().join("zippy-server.sock").exists());
+    zippy_core::OwnedDataDirectory::acquire_or_initialize(&data_dir)
+        .expect("failed native startup must finish cleanup before returning an error");
 }
 
 #[test]
@@ -274,6 +404,34 @@ fn gateway_bind_failure_rolls_back_ready_master_listener() {
         LegacyServerRuntime::start(runtime_config(&temp, Some(gateway_addr))).unwrap();
     let outcome = restarted.shutdown();
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+}
+
+#[test]
+fn gateway_bind_failure_also_closes_configured_native_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let gateway_addr = reserve_tcp_addr();
+    let blocker = TcpListener::bind(gateway_addr).unwrap();
+
+    let error = match LegacyServerRuntime::start(runtime_config_with_native_storage_and_gateway(
+        &temp,
+        &data_dir,
+        gateway_addr,
+    )) {
+        Ok(mut runtime) => {
+            let _ = runtime.shutdown();
+            panic!("server unexpectedly bound an occupied Gateway port");
+        }
+        Err(error) => error,
+    };
+
+    assert!(error.message().contains("failed to bind gateway endpoint"));
+    assert!(!temp.path().join("zippy-server.sock").exists());
+    zippy_core::OwnedDataDirectory::acquire_or_initialize(&data_dir)
+        .expect("Gateway rollback must close native storage before returning");
+
+    drop(blocker);
+    wait_until_bindable(gateway_addr);
 }
 
 #[test]

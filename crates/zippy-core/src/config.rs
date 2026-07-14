@@ -43,6 +43,9 @@ pub struct ZippyServerConfig {
     pub data_dir: Option<PathBuf>,
     /// Allows one offline import from the legacy endpoint-scoped snapshot.
     pub import_legacy_endpoint_snapshot: bool,
+    /// Enables the server-owned native storage lifecycle during migration.
+    #[serde(default)]
+    pub native_storage_enabled: bool,
 }
 
 /// Process-wide execution resource limits.
@@ -188,6 +191,7 @@ struct PartialZippyConfig {
 struct PartialServerConfig {
     data_dir: Option<String>,
     import_legacy_endpoint_snapshot: Option<bool>,
+    native_storage_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,6 +333,9 @@ impl ZippyConfig {
             if let Some(import) = server.import_legacy_endpoint_snapshot {
                 self.server.import_legacy_endpoint_snapshot = import;
             }
+            if let Some(enabled) = server.native_storage_enabled {
+                self.server.native_storage_enabled = enabled;
+            }
         }
         if let Some(runtime) = partial.runtime {
             if let Some(max_parallelism) = runtime.max_parallelism {
@@ -459,6 +466,10 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT") {
             self.server.import_legacy_endpoint_snapshot =
                 parse_bool_env("ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_SERVER_NATIVE_STORAGE") {
+            self.server.native_storage_enabled =
+                parse_bool_env("ZIPPY_SERVER_NATIVE_STORAGE", &value)?;
         }
         if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
             self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;

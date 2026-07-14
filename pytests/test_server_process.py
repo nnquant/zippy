@@ -39,6 +39,36 @@ def _unused_gateway_endpoint() -> str:
     return f"{host}:{port}"
 
 
+def _valid_ready_record() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "status": "ready",
+        "health": {
+            "readiness": {
+                "admission_open": True,
+                "master_listener_ready": True,
+                "gateway_configured": True,
+                "gateway_listener_ready": True,
+                "gateway_master_reachable": True,
+                "native_storage_configured": True,
+                "native_catalog_ready": True,
+                "native_current_snapshot_files_ready": True,
+                "storage_reconciliation_complete": True,
+                "commit_recovery_complete": True,
+            },
+            "services": {
+                "accepting_work": True,
+                "admission_open": True,
+                "catalog": "degraded",
+                "query": "degraded",
+                "master_lifecycle_running": True,
+                "gateway_facade_available": True,
+                "end_to_end_liveness": True,
+            },
+        },
+    }
+
+
 def test_server_instance_paths_are_endpoint_scoped(tmp_path: Path) -> None:
     first = _server_paths(
         "tcp://127.0.0.1:17690",
@@ -327,34 +357,17 @@ def test_server_lock_without_state_is_starting_and_not_stoppable(
         ("readiness", "master_listener_ready"),
         ("readiness", "gateway_listener_ready"),
         ("readiness", "gateway_master_reachable"),
+        ("readiness", "native_catalog_ready"),
+        ("readiness", "native_current_snapshot_files_ready"),
+        ("readiness", "storage_reconciliation_complete"),
+        ("readiness", "commit_recovery_complete"),
         ("services", "accepting_work"),
         ("services", "gateway_facade_available"),
         ("services", "end_to_end_liveness"),
     ],
 )
 def test_server_ready_record_requires_all_runtime_facts(section: str, field: str) -> None:
-    record: dict[str, object] = {
-        "schema_version": 1,
-        "status": "ready",
-        "health": {
-            "readiness": {
-                "admission_open": True,
-                "master_listener_ready": True,
-                "gateway_configured": True,
-                "gateway_listener_ready": True,
-                "gateway_master_reachable": True,
-            },
-            "services": {
-                "accepting_work": True,
-                "admission_open": True,
-                "catalog": "degraded",
-                "query": "degraded",
-                "master_lifecycle_running": True,
-                "gateway_facade_available": True,
-                "end_to_end_liveness": True,
-            },
-        },
-    }
+    record = _valid_ready_record()
     health = record["health"]
     assert isinstance(health, dict)
     target = health[section]
@@ -363,6 +376,81 @@ def test_server_ready_record_requires_all_runtime_facts(section: str, field: str
 
     with pytest.raises(_ServerProcessError, match="full readiness"):
         _validate_ready_record(record)
+
+
+@pytest.mark.parametrize(
+    ("mode", "value"),
+    [
+        ("missing", None),
+        ("null", None),
+        ("string", "true"),
+    ],
+)
+def test_server_ready_record_requires_boolean_native_storage_configuration(
+    mode: str,
+    value: object,
+) -> None:
+    record = _valid_ready_record()
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    if mode == "missing":
+        readiness.pop("native_storage_configured")
+    else:
+        readiness["native_storage_configured"] = value
+
+    with pytest.raises(_ServerProcessError, match="invalid native storage configuration"):
+        _validate_ready_record(record)
+
+
+@pytest.mark.parametrize("value", [None, "true"])
+def test_server_ready_record_requires_boolean_gateway_configuration(value: object) -> None:
+    record = _valid_ready_record()
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    readiness["gateway_configured"] = value
+
+    with pytest.raises(_ServerProcessError, match="invalid gateway configuration"):
+        _validate_ready_record(record)
+
+
+def test_server_ready_record_rejects_previous_schema_version() -> None:
+    record = _valid_ready_record()
+    record["schema_version"] = 1
+
+    with pytest.raises(_ServerProcessError, match="unsupported ready schema"):
+        _validate_ready_record(record)
+
+
+def test_server_status_normalizes_ready_v1_without_mutating_authoritative_state() -> None:
+    record = _valid_ready_record()
+    record["schema_version"] = 1
+    health = record["health"]
+    assert isinstance(health, dict)
+    readiness = health["readiness"]
+    assert isinstance(readiness, dict)
+    for field in (
+        "native_storage_configured",
+        "native_catalog_ready",
+        "native_current_snapshot_files_ready",
+        "storage_reconciliation_complete",
+        "commit_recovery_complete",
+    ):
+        readiness.pop(field)
+
+    compatibility = server_process._ready_record_for_status_validation(record)
+
+    _validate_ready_record(compatibility)
+    assert record["schema_version"] == 1
+    assert "native_storage_configured" not in readiness
+    compatibility_health = compatibility["health"]
+    assert isinstance(compatibility_health, dict)
+    compatibility_readiness = compatibility_health["readiness"]
+    assert isinstance(compatibility_readiness, dict)
+    assert compatibility_readiness["native_storage_configured"] is False
 
 
 def test_master_health_probe_uses_one_absolute_deadline() -> None:
@@ -410,7 +498,7 @@ def test_server_status_rejects_generation_change_during_health_probe(
         log_dir=tmp_path / "logs",
     )
     state: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "ready",
         "launch_nonce": "old-generation",
         "pid": 43001,
@@ -465,6 +553,19 @@ def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Pa
     control_endpoint = tmp_path / "server.sock"
     run_dir = tmp_path / "run"
     log_dir = tmp_path / "logs"
+    data_dir = tmp_path / "database"
+    config_path = tmp_path / "zippy.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "[server]",
+                f"data_dir = {json.dumps(str(data_dir))}",
+                "native_storage_enabled = true",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
     runner = CliRunner()
     pid: int | None = None
     try:
@@ -474,6 +575,8 @@ def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Pa
                 "server",
                 "run",
                 str(control_endpoint),
+                "--config",
+                str(config_path),
                 "--run-dir",
                 str(run_dir),
                 "--log-dir",
@@ -494,6 +597,13 @@ def test_server_detached_lifecycle_is_ready_probeable_and_stoppable(tmp_path: Pa
         assert startup["gateway"]["status"] == "disabled"
         assert startup["webui"]["status"] == "not_running"
         assert startup["webui"]["managed"] is False
+        readiness = startup["runtime_health"]["readiness"]
+        assert readiness["native_storage_configured"] is True
+        assert readiness["native_catalog_ready"] is True
+        assert readiness["native_current_snapshot_files_ready"] is True
+        assert readiness["storage_reconciliation_complete"] is True
+        assert readiness["commit_recovery_complete"] is True
+        assert data_dir.joinpath("catalog", "catalog.db").is_file()
         assert "launch_nonce" not in startup
         assert "process_identity" not in startup
         assert "lock_file" not in startup
@@ -637,7 +747,7 @@ def test_server_child_remains_manageable_when_launcher_is_killed(tmp_path: Path)
                 break
             time.sleep(0.05)
         assert state is not None
-        child_pid = int(state["pid"])
+        child_pid = server_process._state_pid(state)
 
         launcher.kill()
         launcher.wait(timeout=5.0)
@@ -744,7 +854,7 @@ def test_server_bootstrap_state_is_stoppable_before_zippy_import(tmp_path: Path)
                 break
             time.sleep(0.05)
         assert starting is not None
-        child_pid = int(starting["pid"])
+        child_pid = server_process._state_pid(starting)
 
         launcher.kill()
         launcher.wait(timeout=5.0)
