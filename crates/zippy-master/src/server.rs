@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,11 @@ use zippy_segment_store::ShmRegion;
 use zippy_types::ErrorCode;
 
 use crate::legacy_catalog::LegacyCatalogAdapter;
+use crate::legacy_catalog_commit::{
+    LegacyCatalogCommitEvent, LegacyCatalogCommitMutationKind, LegacyCatalogCommitPublisher,
+    LegacyCatalogCommitPublisherInstallError, LegacyCatalogCommitPublisherMetricsSnapshot,
+    LegacyCatalogCommitPublisherSealError, LegacyCatalogMutationAdmission,
+};
 use crate::legacy_runtime::LegacyRuntimeRegistryAdapter;
 use crate::registry::{Registry, RegistryError, StreamRecord};
 use crate::snapshot::{
@@ -46,6 +51,8 @@ const DEFAULT_LEASE_REAPER_INTERVAL: Duration = Duration::from_secs(2);
 const MASTER_ACCEPT_IDLE_SLEEP: Duration = Duration::from_millis(1);
 const COMPACTION_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 const MASTER_SHUTDOWN_REASON: &str = "master shutdown requested";
+const LEGACY_CATALOG_MUTATION_ADMISSION_CLOSED_REASON: &str =
+    "legacy Catalog mutation admission is closed";
 const SNAPSHOT_RUNTIME_STATUS: &str = "registered";
 const RESTORED_RUNTIME_STATUS: &str = "restored";
 
@@ -63,6 +70,10 @@ pub struct MasterServer {
     running: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     envelope_responses: Arc<Mutex<BTreeMap<String, ControlResponse>>>,
+    legacy_catalog_commit_publisher: Arc<OnceLock<LegacyCatalogCommitPublisher>>,
+    legacy_catalog_commit_publisher_install_lock: Arc<Mutex<()>>,
+    legacy_catalog_mutation_admission: Arc<LegacyCatalogMutationAdmission>,
+    listener_started: Arc<AtomicBool>,
     snapshot_lock: Arc<Mutex<()>>,
     snapshot_path: Option<PathBuf>,
     lease_timeout: Duration,
@@ -119,6 +130,10 @@ impl MasterServer {
             running: Arc::new(AtomicBool::new(true)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             envelope_responses: Arc::new(Mutex::new(BTreeMap::new())),
+            legacy_catalog_commit_publisher: Arc::new(OnceLock::new()),
+            legacy_catalog_commit_publisher_install_lock: Arc::new(Mutex::new(())),
+            legacy_catalog_mutation_admission: LegacyCatalogMutationAdmission::new(),
+            listener_started: Arc::new(AtomicBool::new(false)),
             snapshot_lock: Arc::new(Mutex::new(())),
             snapshot_path,
             lease_timeout,
@@ -160,6 +175,100 @@ impl MasterServer {
 
     pub fn registry(&self) -> Arc<Mutex<Registry>> {
         Arc::clone(&self.registry)
+    }
+
+    /// Installs non-blocking observation of committed legacy Catalog mutations.
+    ///
+    /// Installation is accepted only once and before either Master listener starts. Publication
+    /// loss never changes primary Master behavior; consumers must inspect the publisher metrics and
+    /// reconcile fully when continuity is lost.
+    pub fn install_legacy_catalog_commit_publisher(
+        &self,
+        publisher: LegacyCatalogCommitPublisher,
+    ) -> std::result::Result<(), LegacyCatalogCommitPublisherInstallError> {
+        let _install_guard = self
+            .legacy_catalog_commit_publisher_install_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.listener_started.load(Ordering::Acquire) {
+            return Err(LegacyCatalogCommitPublisherInstallError::ListenerStarted);
+        }
+        if self.legacy_catalog_commit_publisher.get().is_some() {
+            return Err(LegacyCatalogCommitPublisherInstallError::AlreadyInstalled);
+        }
+        let _snapshot_guard = self.snapshot_lock.lock().unwrap();
+        let registry = self.registry.lock().unwrap();
+        publisher.seed_baseline_revision(registry.catalog_revision());
+        self.legacy_catalog_commit_publisher
+            .set(publisher)
+            .map_err(|_| LegacyCatalogCommitPublisherInstallError::AlreadyInstalled)
+    }
+
+    fn mark_listener_started(&self) {
+        let _install_guard = self
+            .legacy_catalog_commit_publisher_install_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.listener_started.store(true, Ordering::Release);
+    }
+
+    fn publish_legacy_catalog_commit(
+        &self,
+        previous_revision: u64,
+        committed_revision: u64,
+        mutation_kind: LegacyCatalogCommitMutationKind,
+        stream_name: &str,
+    ) {
+        if let Some(publisher) = self.legacy_catalog_commit_publisher.get() {
+            publisher.try_publish(LegacyCatalogCommitEvent::for_stream(
+                previous_revision,
+                committed_revision,
+                mutation_kind,
+                stream_name,
+            ));
+        }
+    }
+
+    fn record_unpublished_legacy_catalog_mutation(&self, catalog_revision: u64) {
+        if let Some(publisher) = self.legacy_catalog_commit_publisher.get() {
+            publisher.record_unpublished_mutation(catalog_revision);
+        }
+    }
+
+    fn seal_legacy_catalog_commit_publisher(&self) {
+        if let Some(publisher) = self.legacy_catalog_commit_publisher.get() {
+            let final_revision = self.registry.lock().unwrap().catalog_revision();
+            publisher.seal(final_revision);
+        }
+    }
+
+    /// Closes legacy Catalog mutation admission, drains admitted mutations, and seals commit events.
+    ///
+    /// The Master remains readable and running after this call. A server can therefore drain the
+    /// event receiver, capture one final stable migration snapshot, and close the native Catalog
+    /// before stopping the legacy listener. The operation is irreversible and idempotent.
+    pub fn seal_legacy_catalog_commit_events(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<
+        Option<LegacyCatalogCommitPublisherMetricsSnapshot>,
+        LegacyCatalogCommitPublisherSealError,
+    > {
+        self.legacy_catalog_mutation_admission
+            .close_and_wait(timeout)?;
+        let _snapshot_guard = self
+            .snapshot_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(publisher) = self.legacy_catalog_commit_publisher.get() else {
+            return Ok(None);
+        };
+        publisher.seal(registry.catalog_revision());
+        Ok(Some(publisher.metrics().snapshot()))
     }
 
     /// Creates the read-only catalog compatibility adapter for this master.
@@ -314,6 +423,7 @@ impl MasterServer {
             }
             return Ok(());
         }
+        self.mark_listener_started();
 
         if let Some(pause_ms) = std::env::var_os("ZIPPY_MASTER_TEST_PAUSE_BEFORE_READY_MS") {
             let pause_ms = pause_ms.to_string_lossy().parse::<u64>().map_err(|error| {
@@ -453,6 +563,7 @@ impl MasterServer {
 
         let cleanup_result = cleanup_socket(socket_path, &socket_ownership);
         let snapshot_flush_result = self.write_snapshot();
+        self.seal_legacy_catalog_commit_publisher();
 
         if let Err(error) = &snapshot_flush_result {
             tracing::error!(
@@ -532,7 +643,14 @@ impl MasterServer {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    pub fn request_graceful_shutdown(&self, timeout: Duration) -> GracefulShutdownOutcome {
+    /// Notifies registered processes and waits for them without stopping the Master listener.
+    ///
+    /// This is the first phase of server-owned shutdown. Keeping the Master alive after process
+    /// drain allows callers to seal legacy Catalog mutations and reconcile the final stable view.
+    pub fn drain_registered_processes_for_shutdown(
+        &self,
+        timeout: Duration,
+    ) -> GracefulShutdownOutcome {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.descriptor_changed.notify_all();
         self.control_changed.notify_all();
@@ -541,7 +659,6 @@ impl MasterServer {
         loop {
             let alive = self.registry.lock().unwrap().alive_process_ids();
             if alive.is_empty() {
-                self.stop_runtime();
                 return GracefulShutdownOutcome {
                     timed_out_processes: Vec::new(),
                 };
@@ -554,7 +671,6 @@ impl MasterServer {
                     timed_out_processes = ?alive,
                     "timed out waiting for child processes to unregister"
                 );
-                self.stop_runtime();
                 return GracefulShutdownOutcome {
                     timed_out_processes: alive,
                 };
@@ -565,6 +681,12 @@ impl MasterServer {
                     .min(Duration::from_millis(10)),
             );
         }
+    }
+
+    pub fn request_graceful_shutdown(&self, timeout: Duration) -> GracefulShutdownOutcome {
+        let outcome = self.drain_registered_processes_for_shutdown(timeout);
+        self.stop_runtime();
+        outcome
     }
 
     fn serve_tcp_with_ready(
@@ -580,6 +702,7 @@ impl MasterServer {
             }
             return Ok(());
         }
+        self.mark_listener_started();
 
         let listener = match TcpListener::bind(addr).map_err(io_error) {
             Ok(listener) => listener,
@@ -665,6 +788,7 @@ impl MasterServer {
 
         drop(listener);
         let snapshot_flush_result = self.write_snapshot();
+        self.seal_legacy_catalog_commit_publisher();
 
         match (accept_result, snapshot_flush_result) {
             (Ok(()), Ok(())) => {
@@ -1529,6 +1653,22 @@ impl MasterServer {
                 reason: format!("failed to decode control request error=[{}]", error),
             }
         })?;
+        let _legacy_catalog_mutation_permit = if is_legacy_catalog_mutation(&request) {
+            match self.legacy_catalog_mutation_admission.try_enter() {
+                Some(permit) => Some(permit),
+                None => {
+                    return write_control_response(
+                        &mut stream,
+                        &ControlResponse::Error {
+                            code: None,
+                            reason: LEGACY_CATALOG_MUTATION_ADMISSION_CLOSED_REASON.to_string(),
+                        },
+                    );
+                }
+            }
+        } else {
+            None
+        };
 
         let response = match request {
             ControlRequest::Envelope(envelope) => {
@@ -1761,6 +1901,7 @@ impl MasterServer {
                     );
                 }
                 let previous_registry = registry.clone();
+                let previous_catalog_revision = registry.catalog_revision();
                 match registry.ensure_stream(
                     &request.stream_name,
                     request.schema.clone(),
@@ -1819,6 +1960,12 @@ impl MasterServer {
                                     },
                                 );
                             }
+                            self.publish_legacy_catalog_commit(
+                                previous_catalog_revision,
+                                registry.catalog_revision(),
+                                LegacyCatalogCommitMutationKind::RegisterStream,
+                                &request.stream_name,
+                            );
                         }
                         ControlResponse::StreamRegistered {
                             stream_name: request.stream_name,
@@ -1852,6 +1999,7 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let previous_registry = registry.clone();
+                let previous_catalog_revision = registry.catalog_revision();
                 match registry.register_source(
                     &request.source_name,
                     &request.source_type,
@@ -1877,6 +2025,14 @@ impl MasterServer {
                                     code: None,
                                     reason: error.to_string(),
                                 },
+                            );
+                        }
+                        if registry.catalog_revision() != previous_catalog_revision {
+                            self.publish_legacy_catalog_commit(
+                                previous_catalog_revision,
+                                registry.catalog_revision(),
+                                LegacyCatalogCommitMutationKind::RegisterSource,
+                                &request.output_stream,
                             );
                         }
                         tracing::info!(
@@ -1909,10 +2065,11 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let previous_registry = registry.clone();
+                let previous_catalog_revision = registry.catalog_revision();
                 match registry
                     .unregister_source_for_process(&request.source_name, &request.process_id)
                 {
-                    Ok(_source) => {
+                    Ok(source) => {
                         let snapshot = Self::snapshot_from_registry(&registry);
                         if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
                             *registry = previous_registry;
@@ -1932,6 +2089,12 @@ impl MasterServer {
                                 },
                             );
                         }
+                        self.publish_legacy_catalog_commit(
+                            previous_catalog_revision,
+                            registry.catalog_revision(),
+                            LegacyCatalogCommitMutationKind::UnregisterSource,
+                            &source.output_stream,
+                        );
                         tracing::info!(
                             component = "master_server",
                             event = "unregister_source",
@@ -2098,11 +2261,18 @@ impl MasterServer {
                 }
                 let publish_result = {
                     let mut registry = self.registry.lock().unwrap();
-                    registry.publish_segment_descriptor(
+                    let previous_catalog_revision = registry.catalog_revision();
+                    let result = registry.publish_segment_descriptor(
                         &request.stream_name,
                         &request.process_id,
                         request.descriptor,
-                    )
+                    );
+                    if result.is_ok() && registry.catalog_revision() != previous_catalog_revision {
+                        self.record_unpublished_legacy_catalog_mutation(
+                            registry.catalog_revision(),
+                        );
+                    }
+                    result
                 };
                 match publish_result {
                     Ok(()) => {
@@ -2170,6 +2340,7 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let previous_registry = registry.clone();
+                let previous_catalog_revision = registry.catalog_revision();
                 let publish_result = registry.publish_persisted_file(
                     &request.stream_name,
                     &request.process_id,
@@ -2186,6 +2357,14 @@ impl MasterServer {
                                     code: None,
                                     reason: error.to_string(),
                                 },
+                            );
+                        }
+                        if registry.catalog_revision() != previous_catalog_revision {
+                            self.publish_legacy_catalog_commit(
+                                previous_catalog_revision,
+                                registry.catalog_revision(),
+                                LegacyCatalogCommitMutationKind::PublishPersistedFile,
+                                &request.stream_name,
                             );
                         }
                         tracing::info!(
@@ -2278,6 +2457,7 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let previous_registry = registry.clone();
+                let previous_catalog_revision = registry.catalog_revision();
                 let replace_result =
                     registry.replace_persisted_files(&request.stream_name, persisted_files);
                 match replace_result {
@@ -2291,6 +2471,14 @@ impl MasterServer {
                                     code: None,
                                     reason: error.to_string(),
                                 },
+                            );
+                        }
+                        if registry.catalog_revision() != previous_catalog_revision {
+                            self.publish_legacy_catalog_commit(
+                                previous_catalog_revision,
+                                registry.catalog_revision(),
+                                LegacyCatalogCommitMutationKind::ReplacePersistedFiles,
+                                &request.stream_name,
                             );
                         }
                         tracing::info!(
@@ -2331,6 +2519,7 @@ impl MasterServer {
                 let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                 let mut registry = self.registry.lock().unwrap();
                 let previous_registry = registry.clone();
+                let previous_catalog_revision = registry.catalog_revision();
                 let publish_result = registry.publish_persist_event(
                     &request.stream_name,
                     &request.process_id,
@@ -2347,6 +2536,14 @@ impl MasterServer {
                                     code: None,
                                     reason: error.to_string(),
                                 },
+                            );
+                        }
+                        if registry.catalog_revision() != previous_catalog_revision {
+                            self.publish_legacy_catalog_commit(
+                                previous_catalog_revision,
+                                registry.catalog_revision(),
+                                LegacyCatalogCommitMutationKind::PersistEventWatermark,
+                                &request.stream_name,
                             );
                         }
                         tracing::info!(
@@ -2683,6 +2880,7 @@ impl MasterServer {
                     let _snapshot_guard = self.snapshot_lock.lock().unwrap();
                     let mut registry = self.registry.lock().unwrap();
                     let previous_registry = registry.clone();
+                    let previous_catalog_revision = registry.catalog_revision();
                     let dropped_records = registry.drop_table(&table_name);
                     let snapshot = Self::snapshot_from_registry(&registry);
                     if let Err(error) = self.write_snapshot_from_snapshot(&snapshot) {
@@ -2693,6 +2891,14 @@ impl MasterServer {
                                 code: None,
                                 reason: error.to_string(),
                             },
+                        );
+                    }
+                    if registry.catalog_revision() != previous_catalog_revision {
+                        self.publish_legacy_catalog_commit(
+                            previous_catalog_revision,
+                            registry.catalog_revision(),
+                            LegacyCatalogCommitMutationKind::DropTable,
+                            &table_name,
                         );
                     }
                     self.descriptor_changed.notify_all();
@@ -2903,13 +3109,17 @@ impl MasterServer {
                 if group_files.len() < self.config.table.persist.compaction.min_files {
                     continue;
                 }
+                let Some(_mutation_permit) = self.legacy_catalog_mutation_admission.try_enter()
+                else {
+                    return Ok(());
+                };
                 let compacted_file = compact_persisted_file_group(
                     &stream.stream_name,
                     &stream.schema_hash,
                     group_files,
                     self.config.table.persist.compaction.sort_column.as_deref(),
                 )?;
-                self.replace_compacted_persisted_files(
+                self.replace_compacted_persisted_files_with_permit(
                     &stream.stream_name,
                     group_files,
                     compacted_file,
@@ -2919,7 +3129,27 @@ impl MasterServer {
         Ok(())
     }
 
+    #[cfg(test)]
     fn replace_compacted_persisted_files(
+        &self,
+        stream_name: &str,
+        source_files: &[serde_json::Value],
+        compacted_file: serde_json::Value,
+    ) -> Result<()> {
+        let _mutation_permit = self
+            .legacy_catalog_mutation_admission
+            .try_enter()
+            .ok_or_else(|| ZippyError::InvalidConfig {
+                reason: LEGACY_CATALOG_MUTATION_ADMISSION_CLOSED_REASON.to_string(),
+            })?;
+        self.replace_compacted_persisted_files_with_permit(
+            stream_name,
+            source_files,
+            compacted_file,
+        )
+    }
+
+    fn replace_compacted_persisted_files_with_permit(
         &self,
         stream_name: &str,
         source_files: &[serde_json::Value],
@@ -2939,6 +3169,7 @@ impl MasterServer {
         let _snapshot_guard = self.snapshot_lock.lock().unwrap();
         let mut registry = self.registry.lock().unwrap();
         let previous_registry = registry.clone();
+        let previous_catalog_revision = registry.catalog_revision();
         let previous_persisted_files = registry
             .get_stream(stream_name)
             .map(|stream| stream.persisted_files.clone())
@@ -2958,6 +3189,12 @@ impl MasterServer {
             *registry = previous_registry;
             return Err(error);
         }
+        self.publish_legacy_catalog_commit(
+            previous_catalog_revision,
+            registry.catalog_revision(),
+            LegacyCatalogCommitMutationKind::Compaction,
+            stream_name,
+        );
         self.control_changed.notify_all();
         drop(registry);
 
@@ -4273,8 +4510,23 @@ fn socket_creation_timestamp() -> Result<u128> {
     Ok(duration.as_nanos())
 }
 
+fn is_legacy_catalog_mutation(request: &ControlRequest) -> bool {
+    matches!(
+        request,
+        ControlRequest::RegisterStream(_)
+            | ControlRequest::RegisterSource(_)
+            | ControlRequest::UnregisterSource(_)
+            | ControlRequest::DropTable(_)
+            | ControlRequest::PublishSegmentDescriptor(_)
+            | ControlRequest::PublishPersistedFile(_)
+            | ControlRequest::ReplacePersistedFiles(_)
+            | ControlRequest::PublishPersistEvent(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
 
     use tracing_subscriber::fmt::MakeWriter;
@@ -4382,6 +4634,95 @@ mod tests {
         let groups = compaction_groups(&persisted_files, &stream);
 
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn committed_compaction_publishes_after_manifest_replacement() {
+        let mut config = ZippyConfig::default();
+        config.table.persist.compaction.delete_sources = false;
+        let server = MasterServer::with_config(config);
+        let (publisher, receiver) =
+            LegacyCatalogCommitPublisher::bounded(NonZeroUsize::new(1).unwrap());
+        server
+            .install_legacy_catalog_commit_publisher(publisher)
+            .unwrap();
+        let source_files = vec![serde_json::json!({
+            "file_path": "/legacy/events-1.parquet",
+            "persist_file_id": "events-1",
+            "row_count": 1,
+        })];
+        {
+            let registry = server.registry();
+            let mut registry = registry.lock().unwrap();
+            registry
+                .register_stream(
+                    "events",
+                    serde_json::json!({"fields": [], "metadata": {}}),
+                    "schema-v1",
+                    64,
+                    4096,
+                )
+                .unwrap();
+            registry
+                .replace_persisted_files("events", source_files)
+                .unwrap();
+        }
+        let source_files = server
+            .registry()
+            .lock()
+            .unwrap()
+            .get_stream("events")
+            .unwrap()
+            .persisted_files
+            .clone();
+
+        server
+            .replace_compacted_persisted_files(
+                "events",
+                &source_files,
+                serde_json::json!({
+                    "file_path": "/legacy/events-compacted.parquet",
+                    "persist_file_id": "events-compacted",
+                    "row_count": 1,
+                }),
+            )
+            .unwrap();
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(
+            event.mutation_kind(),
+            LegacyCatalogCommitMutationKind::Compaction
+        );
+        assert_eq!(event.catalog_revision(), 3);
+    }
+
+    #[test]
+    fn staged_shutdown_seals_commits_while_final_catalog_snapshot_remains_readable() {
+        let server = MasterServer::default();
+        let (publisher, receiver) =
+            LegacyCatalogCommitPublisher::bounded(NonZeroUsize::new(1).unwrap());
+        server
+            .install_legacy_catalog_commit_publisher(publisher)
+            .unwrap();
+
+        let graceful = server.drain_registered_processes_for_shutdown(Duration::ZERO);
+        assert!(graceful.timed_out_processes.is_empty());
+        let metrics = server
+            .seal_legacy_catalog_commit_events(Duration::ZERO)
+            .unwrap()
+            .unwrap();
+
+        assert!(metrics.sealed);
+        assert_eq!(metrics.final_revision, 0);
+        assert!(receiver.try_recv().is_err());
+        assert!(server.is_running());
+        server
+            .legacy_catalog_adapter()
+            .capture_migration_snapshot()
+            .unwrap();
+
+        server.shutdown();
+        assert!(!server.is_running());
     }
 
     #[test]

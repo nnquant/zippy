@@ -1,5 +1,6 @@
 pub mod daemon;
 pub mod legacy_catalog;
+pub mod legacy_catalog_commit;
 pub mod legacy_runtime;
 pub mod registry;
 pub mod server;

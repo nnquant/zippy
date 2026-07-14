@@ -1299,7 +1299,7 @@ fn legacy_namespace_id() -> NamespaceId {
         .expect("legacy namespace id is forced nonzero")
 }
 
-fn legacy_table_id(stream_name: &str) -> TableId {
+pub(crate) fn legacy_table_id(stream_name: &str) -> TableId {
     TableId::from_bytes(derive_legacy_id(
         "table",
         &[b"default", stream_name.as_bytes()],
