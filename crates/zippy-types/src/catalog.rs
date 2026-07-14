@@ -2,6 +2,7 @@
 
 mod wire_v1;
 mod wire_v2;
+mod wire_v3;
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -30,9 +31,20 @@ pub const CURRENT_CATALOG_COMMAND_FORMAT_VERSION: u32 = 1;
 pub const CATALOG_COMMAND_FORMAT_VERSION_V1: u32 = 1;
 /// The migration-only typed legacy table import format.
 pub const LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2: u32 = 2;
+/// The online typed legacy file-view reconcile format.
+pub const LEGACY_CATALOG_RECONCILE_FORMAT_VERSION_V3: u32 = 3;
 /// Reserved file metadata key binding verifier-observed Arrow Schema to a V2 import command.
 pub const LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY: &str =
     "zippy.legacy_import.verified_schema_hash";
+/// Legacy planner audit metadata recording the file's source registry position.
+///
+/// This value is snapshot-local planner evidence, not immutable physical file identity.
+pub const LEGACY_REGISTRY_INDEX_METADATA_KEY: &str = "zippy.migration.legacy_registry_index";
+/// Legacy planner audit metadata recording the file's effective scan position.
+///
+/// This value is snapshot-local planner evidence, not immutable physical file identity.
+pub const LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY: &str =
+    "zippy.migration.legacy_effective_scan_order";
 /// Maximum UTF-8 byte length of an audited catalog actor principal.
 pub const MAX_CATALOG_ACTOR_PRINCIPAL_BYTES: usize = 4 * 1024;
 
@@ -428,6 +440,164 @@ pub struct LegacyCatalogImportResponseV2 {
     pub table: TableDescriptor,
     /// The final nonempty-table `import` snapshot.
     pub snapshot: TableSnapshot,
+}
+
+/// One online legacy file-view reconcile command.
+///
+/// Unlike [`LegacyCatalogImportCommandV2`], this command does not create a table. It replaces the
+/// complete externally visible legacy file set of an existing migrated table. Every file must be
+/// produced by the trusted physical verifier before Catalog admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogReconcileCommandV3 {
+    /// The migrated table whose legacy file view is being reconciled.
+    pub table_id: TableId,
+    /// The table schema version proven by the physical verifier.
+    pub expected_schema_version: u64,
+    /// The Catalog canonical hash of the verifier-observed Arrow schema.
+    pub expected_schema_hash: String,
+    /// Writer epoch that must still be current for the migrated table.
+    pub expected_writer_epoch: u64,
+    /// Authoritative writer epoch captured with the target legacy view.
+    pub writer_epoch: u64,
+    /// Per-table legacy file revision that must currently be mapped to the active snapshot.
+    pub expected_legacy_files_revision: u64,
+    /// New authoritative legacy file revision represented by `files`.
+    pub legacy_files_revision: u64,
+    /// Complete verified target file set in strict legacy Gateway scan order.
+    pub files: Vec<LegacyCatalogImportFileV2>,
+}
+
+/// Idempotent trusted V3 envelope for an online full legacy file-view reconcile.
+///
+/// This DTO is an internal server boundary, not a public RPC contract. `actor` is audit metadata;
+/// it does not grant authority. A revision jump is allowed so a restarted worker can recover from
+/// lost notifications, while the resulting mapping records degraded continuity explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogReconcileEnvelopeV3 {
+    /// The fixed reconcile format version.
+    pub format_version: CatalogCommandFormatVersion,
+    /// The idempotency key for this logical reconcile.
+    pub request_id: RequestId,
+    /// The audited server actor; this field does not grant reconcile authority.
+    pub actor: CatalogActor,
+    /// Digest of the atomic legacy registry snapshot used to construct the target view.
+    pub source_snapshot_hash: String,
+    /// Legacy Catalog revision captured with the source snapshot.
+    pub source_catalog_revision: u64,
+    /// Complete typed reconcile body.
+    pub command: LegacyCatalogReconcileCommandV3,
+    /// SHA-256 of the canonical logical reconcile fields.
+    pub canonical_fingerprint: CommandFingerprint,
+}
+
+impl LegacyCatalogReconcileEnvelopeV3 {
+    /// Creates a V3 envelope and computes its canonical logical fingerprint.
+    pub fn new(
+        request_id: RequestId,
+        actor: CatalogActor,
+        source_snapshot_hash: String,
+        source_catalog_revision: u64,
+        command: LegacyCatalogReconcileCommandV3,
+    ) -> std::result::Result<Self, CatalogFingerprintError> {
+        let mut envelope = Self {
+            format_version: CatalogCommandFormatVersion::new(
+                LEGACY_CATALOG_RECONCILE_FORMAT_VERSION_V3,
+            ),
+            request_id,
+            actor,
+            source_snapshot_hash,
+            source_catalog_revision,
+            command,
+            canonical_fingerprint: CommandFingerprint::from_bytes([0; 32]),
+        };
+        envelope.canonical_fingerprint = envelope.fingerprint()?;
+        Ok(envelope)
+    }
+
+    /// Recomputes and validates the canonical logical fingerprint.
+    pub fn verify_fingerprint(&self) -> std::result::Result<(), CatalogFingerprintError> {
+        if self.fingerprint()? == self.canonical_fingerprint {
+            Ok(())
+        } else {
+            Err(CatalogFingerprintError::Mismatch)
+        }
+    }
+
+    fn fingerprint(&self) -> std::result::Result<CommandFingerprint, CatalogFingerprintError> {
+        if self.format_version.get() != LEGACY_CATALOG_RECONCILE_FORMAT_VERSION_V3 {
+            return Err(CatalogFingerprintError::UnsupportedFormatVersion {
+                actual: self.format_version.get(),
+            });
+        }
+        let actual = self.actor.principal.len();
+        if actual > MAX_CATALOG_ACTOR_PRINCIPAL_BYTES {
+            return Err(CatalogFingerprintError::ActorPrincipalTooLarge {
+                actual,
+                maximum: MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+            });
+        }
+        let mut writer = FingerprintWriter(Sha256::new());
+        serde_json::to_writer(&mut writer, &wire_v3::FingerprintInputRefV3::from(self))
+            .map_err(CatalogFingerprintError::Encode)?;
+        let digest = writer.0.finalize();
+        let mut fingerprint = [0_u8; 32];
+        fingerprint.copy_from_slice(&digest);
+        Ok(CommandFingerprint::from_bytes(fingerprint))
+    }
+}
+
+/// Whether a legacy revision-to-snapshot mapping preserved notification continuity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyFileViewContinuity {
+    /// The startup import established the first explicit mapping.
+    Base,
+    /// The reconcile advanced by exactly one legacy revision.
+    Contiguous,
+    /// The reconcile recovered to a later authoritative revision after a notification gap.
+    Gap,
+}
+
+/// Durable explicit mapping from one per-table legacy revision to one native snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyFileViewSnapshotMapping {
+    /// The migrated table.
+    pub table_id: TableId,
+    /// The authoritative legacy persisted-files revision.
+    pub legacy_files_revision: u64,
+    /// The exact immutable native snapshot representing that legacy revision.
+    pub native_snapshot_version: u64,
+    /// The request that created the mapping, absent for a strictly validated V1 base bootstrap.
+    pub request_id: Option<RequestId>,
+    /// Catalog revision committed with the mapping.
+    pub catalog_revision: u64,
+    /// Source legacy Catalog revision captured by the request.
+    pub source_catalog_revision: u64,
+    /// Source legacy snapshot digest captured by the request.
+    pub source_snapshot_hash: String,
+    /// Notification continuity observed when the mapping was created.
+    pub continuity: LegacyFileViewContinuity,
+    /// Commit time in Unix nanoseconds.
+    pub committed_at_ns: u64,
+}
+
+/// Durable minimal result of one online full legacy file-view reconcile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogReconcileResponseV3 {
+    /// The idempotency key from the command envelope.
+    pub request_id: RequestId,
+    /// Catalog revision after the reconcile committed.
+    pub catalog_revision: u64,
+    /// The reconciled table.
+    pub table_id: TableId,
+    /// Legacy revision replaced by this reconcile.
+    pub previous_legacy_files_revision: u64,
+    /// New authoritative legacy revision.
+    pub legacy_files_revision: u64,
+    /// New native snapshot representing the target file view.
+    pub native_snapshot_version: u64,
+    /// Notification continuity recorded by the mapping.
+    pub continuity: LegacyFileViewContinuity,
 }
 
 /// Fixed-cost lookup result for one startup-only V2 legacy-import request ID.

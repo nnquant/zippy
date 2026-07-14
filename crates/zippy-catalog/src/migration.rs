@@ -17,6 +17,8 @@ const MIGRATION_V4_VERSION: u32 = 4;
 const MIGRATION_V4_NAME: &str = "safe_gc_claim_indexes";
 const MIGRATION_V5_VERSION: u32 = 5;
 const MIGRATION_V5_NAME: &str = "legacy_import_requests";
+const MIGRATION_V6_VERSION: u32 = 6;
+const MIGRATION_V6_NAME: &str = "legacy_file_view_mappings";
 
 // Physical SQLite schema versions are independent of CatalogCommand wire
 // versions. Physical v1 intentionally creates no domain tables: those must
@@ -645,6 +647,96 @@ define_v5_schema_addition! {
  )"#;
 }
 
+macro_rules! define_v6_schema_additions {
+    ($($name:ident = $sql:literal;)+) => {
+        $(const $name: &str = $sql;)+
+        const MIGRATION_V6: &str = concat!($($sql, ";\n",)+);
+    };
+}
+
+define_v6_schema_additions! {
+    LEGACY_FILE_VIEW_MAPPINGS_SQL = r#"CREATE TABLE legacy_file_view_mappings (
+    table_id BLOB NOT NULL CHECK(
+        typeof(table_id) = 'blob'
+        AND length(table_id) = 16
+        AND table_id != zeroblob(16)
+    ),
+    legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(legacy_files_revision) = 'blob' AND length(legacy_files_revision) = 8
+    ),
+    native_snapshot_version BLOB NOT NULL CHECK(
+        typeof(native_snapshot_version) = 'blob' AND length(native_snapshot_version) = 8
+    ),
+    request_id BLOB CHECK(
+        request_id IS NULL
+        OR (
+            typeof(request_id) = 'blob'
+            AND length(request_id) = 16
+            AND request_id != zeroblob(16)
+        )
+    ),
+    format_version INTEGER NOT NULL CHECK(
+        typeof(format_version) = 'integer' AND format_version IN (0, 2, 3)
+    ),
+    fingerprint BLOB CHECK(
+        fingerprint IS NULL
+        OR (typeof(fingerprint) = 'blob' AND length(fingerprint) = 32)
+    ),
+    previous_legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(previous_legacy_files_revision) = 'blob'
+        AND length(previous_legacy_files_revision) = 8
+    ),
+    source_catalog_revision BLOB NOT NULL CHECK(
+        typeof(source_catalog_revision) = 'blob' AND length(source_catalog_revision) = 8
+    ),
+    source_snapshot_hash TEXT NOT NULL CHECK(
+        typeof(source_snapshot_hash) = 'text' AND length(source_snapshot_hash) > 0
+    ),
+    catalog_revision BLOB NOT NULL CHECK(
+        typeof(catalog_revision) = 'blob' AND length(catalog_revision) = 8
+    ),
+    continuity TEXT NOT NULL CHECK(continuity IN ('base', 'contiguous', 'gap')),
+    committed_at_ns BLOB NOT NULL CHECK(
+        typeof(committed_at_ns) = 'blob' AND length(committed_at_ns) = 8
+    ),
+    PRIMARY KEY(table_id, legacy_files_revision),
+    UNIQUE(table_id, native_snapshot_version),
+    UNIQUE(request_id),
+    CHECK(
+        (request_id IS NULL AND format_version = 0 AND fingerprint IS NULL AND continuity = 'base')
+        OR
+        (request_id IS NOT NULL AND format_version IN (2, 3) AND fingerprint IS NOT NULL)
+    ),
+    FOREIGN KEY(table_id) REFERENCES tables(table_id),
+    FOREIGN KEY(table_id, native_snapshot_version)
+        REFERENCES table_snapshots(table_id, snapshot_version)
+ )"#;
+
+    LEGACY_RECONCILE_SNAPSHOT_FILES_SQL = r#"CREATE TABLE legacy_reconcile_snapshot_files (
+    table_id BLOB NOT NULL CHECK(
+        typeof(table_id) = 'blob'
+        AND length(table_id) = 16
+        AND table_id != zeroblob(16)
+    ),
+    snapshot_version BLOB NOT NULL CHECK(
+        typeof(snapshot_version) = 'blob' AND length(snapshot_version) = 8
+    ),
+    file_id BLOB NOT NULL CHECK(
+        typeof(file_id) = 'blob'
+        AND length(file_id) = 16
+        AND file_id != zeroblob(16)
+    ),
+    discovery_order BLOB NOT NULL CHECK(
+        typeof(discovery_order) = 'blob' AND length(discovery_order) = 8
+    ),
+    PRIMARY KEY(table_id, snapshot_version, file_id),
+    UNIQUE(table_id, snapshot_version, discovery_order),
+    FOREIGN KEY(table_id, snapshot_version)
+        REFERENCES table_snapshots(table_id, snapshot_version),
+    FOREIGN KEY(file_id) REFERENCES data_files(file_id)
+ )"#;
+}
+
 macro_rules! define_v3_schema_additions {
     ($($name:ident = $sql:literal;)+) => {
         $(const $name: &str = $sql;)+
@@ -1042,6 +1134,51 @@ const MIGRATION_V5_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 2] = [
     },
 ];
 
+const MIGRATION_V6_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 7] = [
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_file_view_mappings_1",
+        table_name: "legacy_file_view_mappings",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_file_view_mappings_2",
+        table_name: "legacy_file_view_mappings",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_file_view_mappings_3",
+        table_name: "legacy_file_view_mappings",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_reconcile_snapshot_files_1",
+        table_name: "legacy_reconcile_snapshot_files",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_reconcile_snapshot_files_2",
+        table_name: "legacy_reconcile_snapshot_files",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_file_view_mappings",
+        table_name: "legacy_file_view_mappings",
+        sql: Some(LEGACY_FILE_VIEW_MAPPINGS_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_reconcile_snapshot_files",
+        table_name: "legacy_reconcile_snapshot_files",
+        sql: Some(LEGACY_RECONCILE_SNAPSHOT_FILES_SQL),
+    },
+];
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -1050,7 +1187,7 @@ struct Migration {
     schema_additions: &'static [ExpectedSchemaObject],
 }
 
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: MIGRATION_V1_VERSION,
         name: MIGRATION_V1_NAME,
@@ -1085,6 +1222,13 @@ const MIGRATIONS: [Migration; 5] = [
         sql: MIGRATION_V5,
         base_schema_version: Some(MIGRATION_V4_VERSION),
         schema_additions: &MIGRATION_V5_SCHEMA_ADDITIONS,
+    },
+    Migration {
+        version: MIGRATION_V6_VERSION,
+        name: MIGRATION_V6_NAME,
+        sql: MIGRATION_V6,
+        base_schema_version: Some(MIGRATION_V5_VERSION),
+        schema_additions: &MIGRATION_V6_SCHEMA_ADDITIONS,
     },
 ];
 

@@ -8,14 +8,14 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transact
 use zippy_types::catalog::{CatalogQuerySnapshot, CatalogSnapshotSelector, CatalogTableSnapshot};
 use zippy_types::table::{
     DataFileDescriptor, DataFileLocation, DataFileProvenance, DataFileState, DataFiles,
-    ExternalDataPath, ManagedDataPath, MetadataMap, NativeDataFileProvenance, PendingDataFile,
-    SchemaCompatibility, SchemaDescriptor, SchemaIpcPayload, SnapshotOperation,
+    ExternalDataPath, ManagedDataPath, MetadataMap, MetadataScalar, NativeDataFileProvenance,
+    PendingDataFile, SchemaCompatibility, SchemaDescriptor, SchemaIpcPayload, SnapshotOperation,
     SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages, TableDescriptor,
     TableSnapshot,
 };
 use zippy_types::{ErrorCode, FileId, LogOffset, OffsetRange, Result, ServerError, TableId};
 
-use crate::encoding::{decode_offset_watermark, decode_optional_u64, decode_u64};
+use crate::encoding::{decode_offset_watermark, decode_optional_u64, decode_u64, encode_u64};
 use crate::storage_codec::{
     decode_data_file_metadata_blob, decode_data_file_partition_blob,
     decode_data_file_statistics_blob, decode_persisted_schema, decode_snapshot_summary_blob,
@@ -314,7 +314,8 @@ pub(crate) fn read_snapshot_at_with_limits(
         let schema = read_schema(&transaction, selector, &mut budget)?;
         let snapshot = read_snapshot(&transaction, selector, catalog_revision, &mut budget)?;
         ensure_snapshot_files_readable(&transaction, selector)?;
-        let files = read_visible_files(&transaction, selector, &mut budget)?;
+        let mut files = read_visible_files(&transaction, selector, &mut budget)?;
+        apply_explicit_legacy_snapshot_order(&transaction, selector, &mut files, &mut budget)?;
         validate_legacy_discovery_orders(&files, &snapshot)?;
         if snapshot.operation == SnapshotOperation::Create && !files.is_empty() {
             return Err(corruption(
@@ -677,6 +678,93 @@ fn read_visible_files(
     Ok(files)
 }
 
+fn apply_explicit_legacy_snapshot_order(
+    connection: &Connection,
+    selector: &CatalogSnapshotSelector,
+    files: &mut [PendingVisibleFile],
+    budget: &mut SnapshotReadBudget,
+) -> Result<()> {
+    let table_id = selector.table_id.into_bytes();
+    let snapshot_version = encode_u64(selector.snapshot_version);
+    let has_mapping = connection
+        .query_row(
+            "SELECT 1 FROM legacy_file_view_mappings \
+              WHERE table_id = ?1 AND native_snapshot_version = ?2",
+            [table_id.as_slice(), snapshot_version.as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| crate::map_sqlite_error("check explicit legacy snapshot mapping", error))?
+        .is_some();
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT file_id, discovery_order FROM legacy_reconcile_snapshot_files \
+              WHERE table_id = ?1 AND snapshot_version = ?2 ORDER BY file_id",
+        )
+        .map_err(|error| {
+            crate::map_sqlite_error("prepare explicit legacy snapshot order", error)
+        })?;
+    let mut rows = statement
+        .query([table_id.as_slice(), snapshot_version.as_slice()])
+        .map_err(|error| crate::map_sqlite_error("query explicit legacy snapshot order", error))?;
+    let mut orders = HashMap::with_capacity(files.len());
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| crate::map_sqlite_error("read explicit legacy snapshot order", error))?
+    {
+        let file_id: Vec<u8> = row
+            .get(0)
+            .map_err(|error| crate::map_sqlite_error("decode explicit legacy file id", error))?;
+        let discovery_order: Vec<u8> = row.get(1).map_err(|error| {
+            crate::map_sqlite_error("decode explicit legacy discovery order", error)
+        })?;
+        budget.charge_bytes(file_id.len().saturating_add(discovery_order.len()))?;
+        let file_id = decode_file_id(file_id)?;
+        let discovery_order = decode_u64(&discovery_order)?;
+        if orders.insert(file_id, discovery_order).is_some() {
+            return Err(corruption(
+                "explicit legacy snapshot order contains a duplicate file id",
+            ));
+        }
+    }
+    if !has_mapping {
+        if orders.is_empty() {
+            return Ok(());
+        }
+        return Err(corruption(
+            "legacy snapshot order exists without a revision mapping",
+        ));
+    }
+    if orders.len() != files.len() {
+        return Err(corruption(
+            "explicit legacy snapshot order is not a complete visible manifest",
+        ));
+    }
+    for file in files {
+        let order = orders.remove(&file.file_id).ok_or_else(|| {
+            corruption("explicit legacy snapshot order is missing a visible file")
+        })?;
+        match &mut file.provenance {
+            PendingFileProvenance::Legacy {
+                offsets: None,
+                preserve_discovery_order: true,
+                discovery_order,
+            } => *discovery_order = Some(order),
+            _ => {
+                return Err(corruption(
+                    "explicit legacy snapshot order references a non-legacy file",
+                ));
+            }
+        }
+    }
+    if !orders.is_empty() {
+        return Err(corruption(
+            "explicit legacy snapshot order contains a non-visible file",
+        ));
+    }
+    Ok(())
+}
+
 /// Rebuilds complete deleting descriptors for an exact, strictly ordered set.
 pub(crate) fn read_deleting_file_descriptors(
     connection: &Connection,
@@ -959,13 +1047,9 @@ fn validate_legacy_discovery_orders(
         ));
     }
     if snapshot.operation == SnapshotOperation::Import {
-        let complete_import_manifest = snapshot.snapshot_version == 2
-            && snapshot.parent_snapshot_version == Some(1)
-            && !files.is_empty()
-            && orders.len() == files.len()
+        let ordered_external_legacy = orders.len() == files.len()
             && files.iter().all(|file| {
-                file.schema_version == 1
-                    && matches!(&file.location, DataFileLocation::ExternalLegacy(_))
+                matches!(&file.location, DataFileLocation::ExternalLegacy(_))
                     && matches!(
                         &file.provenance,
                         PendingFileProvenance::Legacy {
@@ -979,6 +1063,17 @@ fn validate_legacy_discovery_orders(
                 .iter()
                 .enumerate()
                 .all(|(index, order)| u64::try_from(index) == Ok(*order));
+        let complete_import_manifest = if snapshot.snapshot_version == 2 {
+            snapshot.parent_snapshot_version == Some(1)
+                && !files.is_empty()
+                && files.iter().all(|file| file.schema_version == 1)
+                && ordered_external_legacy
+        } else {
+            snapshot.snapshot_version > 2
+                && snapshot.parent_snapshot_version == snapshot.snapshot_version.checked_sub(1)
+                && ordered_external_legacy
+                && validate_reconcile_summary(files, snapshot)
+        };
         if !complete_import_manifest {
             return Err(corruption(
                 "catalog import snapshot is not a complete ordered external legacy manifest",
@@ -986,6 +1081,55 @@ fn validate_legacy_discovery_orders(
         }
     }
     Ok(())
+}
+
+fn validate_reconcile_summary(files: &[PendingVisibleFile], snapshot: &TableSnapshot) -> bool {
+    let value = |key: &str| match snapshot.summary.get(key) {
+        Some(MetadataScalar::UInt64(value)) => Some(*value),
+        _ => None,
+    };
+    let Some(target_files) = value("target_files") else {
+        return false;
+    };
+    let Some(target_rows) = value("target_rows") else {
+        return false;
+    };
+    let Some(target_bytes) = value("target_bytes") else {
+        return false;
+    };
+    let Some(retained_files) = value("retained_files") else {
+        return false;
+    };
+    let Some(added_files) = value("added_files") else {
+        return false;
+    };
+    let Some(removed_files) = value("removed_files") else {
+        return false;
+    };
+    let Some(previous_revision) = value("previous_legacy_files_revision") else {
+        return false;
+    };
+    let Some(legacy_revision) = value("legacy_files_revision") else {
+        return false;
+    };
+    let Some(continuity_gap) = value("continuity_gap") else {
+        return false;
+    };
+    let actual_files = u64::try_from(files.len()).ok();
+    let actual_rows = files
+        .iter()
+        .try_fold(0_u64, |total, file| total.checked_add(file.row_count.get()));
+    let actual_bytes = files
+        .iter()
+        .try_fold(0_u64, |total, file| total.checked_add(file.file_size_bytes));
+    snapshot.summary.len() == 9
+        && actual_files == Some(target_files)
+        && actual_rows == Some(target_rows)
+        && actual_bytes == Some(target_bytes)
+        && retained_files.checked_add(added_files) == Some(target_files)
+        && removed_files <= u64::try_from(MAX_VISIBLE_FILES).expect("file bound fits u64")
+        && legacy_revision > previous_revision
+        && continuity_gap == u64::from(previous_revision.checked_add(1) != Some(legacy_revision))
 }
 
 fn offset_range(

@@ -621,25 +621,27 @@ fn try_replay_idempotent_response(
 }
 
 fn reject_legacy_import_request_id(connection: &Connection, request_id: RequestId) -> Result<()> {
-    let exists = connection
-        .query_row(
-            "SELECT 1 FROM legacy_import_requests WHERE request_id = ?1",
-            [request_id.into_bytes().as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| {
-            crate::map_sqlite_error("check legacy import request-id conflict", error)
-                .with_request_id(request_id)
-        })?
-        .is_some();
-    if exists {
-        return Err(ServerError::new(
-            ErrorCode::Conflict,
-            "catalog request id is already committed in the legacy import namespace",
-        )
-        .with_request_id(request_id)
-        .with_retryable(false));
+    for (table, namespace) in [
+        ("legacy_import_requests", "legacy import"),
+        ("legacy_file_view_mappings", "legacy reconcile"),
+    ] {
+        let sql = format!("SELECT 1 FROM {table} WHERE request_id = ?1");
+        let exists = connection
+            .query_row(&sql, [request_id.into_bytes().as_slice()], |_| Ok(()))
+            .optional()
+            .map_err(|error| {
+                crate::map_sqlite_error("check cross-version request-id conflict", error)
+                    .with_request_id(request_id)
+            })?
+            .is_some();
+        if exists {
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                format!("catalog request id is already committed in the {namespace} namespace"),
+            )
+            .with_request_id(request_id)
+            .with_retryable(false));
+        }
     }
     Ok(())
 }
@@ -899,6 +901,9 @@ mod tests {
                      fingerprint BLOB NOT NULL,\
                      response_blob BLOB NOT NULL,\
                      committed_at_ns BLOB NOT NULL\
+                 );\
+                 CREATE TABLE legacy_file_view_mappings (\
+                     request_id BLOB UNIQUE\
                  );",
             )
             .unwrap();

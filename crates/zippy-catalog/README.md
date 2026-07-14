@@ -31,6 +31,9 @@ Implemented:
   work. It does not rebuild or widen `idempotent_requests`; its historical DDL, index roots, and row
   bytes remain untouched. Hard-coded migration-checksum and complete schema-inventory goldens freeze
   physical v1-v4 compatibility;
+- physical v6 adds explicit per-table `legacy_files_revision` to native snapshot mappings and a
+  complete per-snapshot legacy discovery-order table. Retained files may therefore move to a new
+  scan position without mutating their immutable `data_files` row or changing historical reads;
 - lossless big-endian BLOB encodings for stable IDs, every `u64`, optional
   values, and explicit empty/known/legacy-unknown watermarks;
 - a second single-connection actor implementing `CreateNamespace`,
@@ -112,6 +115,16 @@ Implemented:
   Server therefore treats the result only as a replay hint and must compare every
   plan-derivable response identity, revision, table/snapshot shape, and summary
   value before accepting a replay;
+- a cloneable, lifecycle-bound `SqliteCatalogLegacyReconcileHandle` submits trusted V3 online
+  full-view reconciles through the same bounded publication, command, byte, and preparation gates.
+  The transaction performs per-table legacy-revision, schema, and writer-epoch CAS; classifies
+  retained/new/removed files; rejects immutable identity drift and removed identity resurrection;
+  creates one `Import` snapshot; writes its complete scan order and explicit revision mapping; and
+  advances the table and Catalog revision atomically. Exact request replay does not advance either
+  revision. Revision jumps are accepted but persisted as `gap` continuity. Retained-file metadata
+  comparison ignores only the planner's snapshot-local `legacy_registry_index` and
+  `legacy_effective_scan_order` audit fields; all other metadata remains immutable. Creating the
+  handle seals startup V2 imports, and retained handles fail terminally after Catalog close;
 - `CatalogPersistence` exposes shared publication permits and an exclusive
   cleanup exclusion. Each permit includes bounded command admission and moves
   into the writer actor, so cancellation cannot release it before an admitted
@@ -137,7 +150,8 @@ Physical SQLite schema versions and `CatalogCommand` wire versions are separate
 version spaces. Physical v1 remains the immutable migration foundation.
 Physical v2 is the complete first domain layout. Physical v3 adds table
 discovery indexes, physical v4 adds safe-GC indexes, and physical v5 adds a
-dedicated permanent replay table for the trusted V2 legacy importer. These
+dedicated permanent replay table for the trusted V2 legacy importer. Physical
+v6 adds explicit legacy revision mappings and snapshot-local file order. These
 versions do not imply that every V1 command is executable.
 
 Historical-manifest reads seek `data_files_visible_by_table` by table, committed
@@ -158,12 +172,14 @@ Current typed capability matrix:
 | durable `AcquireSnapshotLease` / `ReleaseSnapshotLease` | implemented transactionally; incomplete deleting/deleted historical snapshots reject new leases |
 | managed historical-file safe-GC claim/finalize | implemented transactionally with durable-lease and runtime-min-pin protection |
 | trusted startup-only V2 legacy table import | Catalog transaction and Server V2 planner/executor are wired behind a non-cloneable instance-bound startup session; only a missing replay at the expected revision performs the initial `zippy-storage` file scan |
-| preserved legacy Gateway scan-order snapshots | implemented without changing raw snapshot order: raw files remain canonical by `file_id`, while pinned query manifests/tasks expose the explicit legacy discovery order |
+| trusted online V3 legacy full-view reconcile for an existing migrated table | implemented transactionally behind a cloneable lifecycle-bound handle, with typed verified files, per-table revision/schema/writer-epoch CAS, exact replay, explicit revision mapping, logical removal, and gap continuity |
+| exact legacy revision-to-native snapshot lookup | implemented on the Catalog and lifecycle-safe read handle; callers do not infer snapshots with base-plus-delta arithmetic |
+| preserved legacy Gateway scan-order snapshots | implemented without changing raw snapshot order: raw files remain canonical by `file_id`, while snapshot-local ordinals preserve both historical and current pinned query order |
 | producer-fenced public ingest manifest protocol | not provided by V1 manifest commands |
 | maintenance lease-fenced compaction worker protocol | not provided by V1 manifest commands |
 | legacy, frame-aware, or key-value materializing manifest mutations | `UnsupportedPlan` pending V2 commands |
 | alter/drop/schema/producer/consumer/job commands | `UnsupportedPlan` |
-| legacy primary + SQLite shadow fan-out | bounded Gateway comparison worker is connected in `sqlite_shadow`; Master exposes a typed immutable file projection, and Server V2 planning/import plus pinned scan ordering are wired; complete authority cutover and its diff gates remain pending |
+| legacy primary + SQLite shadow fan-out | startup import, exact mapping, and the existing-table online reconcile primitive are implemented; runtime create-with-full-view for a newly registered nonempty table, complete authority continuity gates, and authority cutover remain pending |
 | SQLite read or write authority | disabled |
 
 Raw exact snapshots keep the frozen canonical `file_id` ordering contract. A
@@ -177,6 +193,10 @@ The frozen V2 `Import` snapshot is stricter: it must be snapshot 2 with parent 1
 contain only schema-v1 external legacy files with unknown offsets, and preserve a
 complete unique discovery range `0..file_count`. Any partial, mixed, or drifted
 manifest fails the entire snapshot read as Catalog corruption.
+Later V3 reconcile snapshots also use `Import`, but require the immediately previous parent,
+strict reconcile summary, a complete snapshot-local external-legacy order, and an exact explicit
+revision mapping. An empty authoritative target is valid. They do not masquerade as native persist
+or compaction commits.
 
 The V1 manifest commands are deliberately narrow Catalog primitives, not public
 ingest or maintenance-worker protocols. They carry no producer identity, epoch,
@@ -216,6 +236,12 @@ must also replace authority-side access to raw location-bearing snapshots with a
 capability API, so query planning and physical open cannot bypass the pin owner or retain a pathname
 after its lease/capability is gone. The current reliable `close` may wait indefinitely for a worker
 already executing work; dropping the handle invokes the same shutdown path.
+
+The V3 reconcile primitive only updates a table that already exists with strict migration
+provenance. It deliberately does not solve the runtime race where `RegisterStream` and
+`RegisterSource` publish files before an empty V1 table can be mirrored. Complete shadow authority
+still requires a trusted online create-with-full-view transaction, or a fail-closed unsupported
+gate for that race.
 
 The integrity timeout bounds SQLite VM progress-handler checks, not all wall
 time spent opening files, waiting in filesystem I/O, or running migrations.

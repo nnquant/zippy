@@ -45,7 +45,7 @@ impl<'a> From<&'a LegacyCatalogImportEnvelopeV2> for FingerprintInputRefV2<'a> {
 }
 
 #[derive(Serialize)]
-struct ActorRefV2<'a> {
+pub(super) struct ActorRefV2<'a> {
     kind: &'static str,
     principal: &'a str,
 }
@@ -117,7 +117,7 @@ impl Serialize for StringMapRefV2<'_> {
     }
 }
 
-struct LegacyImportFilesRefV2<'a>(&'a [super::LegacyCatalogImportFileV2]);
+pub(super) struct LegacyImportFilesRefV2<'a>(pub(super) &'a [super::LegacyCatalogImportFileV2]);
 
 impl Serialize for LegacyImportFilesRefV2<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>

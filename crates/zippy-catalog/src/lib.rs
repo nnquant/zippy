@@ -17,6 +17,7 @@ mod file_domain;
 mod gc_domain;
 mod lease_domain;
 mod legacy_import_domain;
+mod legacy_reconcile_domain;
 mod manifest_domain;
 mod migration;
 mod pinned_snapshot;
@@ -31,7 +32,10 @@ pub use pinned_snapshot::{
     SqliteCatalogPinnedQuerySnapshot,
 };
 pub use runtime_pins::{SqliteCatalogRuntimeSnapshotPin, SqliteCatalogRuntimeSnapshotPinStatus};
-pub use service::{SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogReadHandle};
+pub use service::{
+    SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogLegacyReconcileHandle,
+    SqliteCatalogReadHandle,
+};
 pub use snapshot_domain::SqliteCatalogSnapshotReadLimits;
 pub use storage_codec::{
     canonical_schema_hash, canonical_schema_hash_from_ipc, decode_persisted_schema,
@@ -49,7 +53,7 @@ use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 5;
+pub const CATALOG_SCHEMA_VERSION: u32 = 6;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;

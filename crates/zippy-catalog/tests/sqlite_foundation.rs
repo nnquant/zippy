@@ -15,7 +15,7 @@ use zippy_core::{
 };
 use zippy_types::ErrorCode;
 
-const EXPECTED_TABLES: [&str; 15] = [
+const EXPECTED_TABLES: [&str; 17] = [
     "catalog_meta",
     "catalog_migrations",
     "data_file_sources",
@@ -23,7 +23,9 @@ const EXPECTED_TABLES: [&str; 15] = [
     "durable_consumer_offsets",
     "durable_consumers",
     "idempotent_requests",
+    "legacy_file_view_mappings",
     "legacy_import_requests",
+    "legacy_reconcile_snapshot_files",
     "maintenance_jobs",
     "namespaces",
     "producers",
@@ -316,6 +318,12 @@ fn initialize_catalog_at_physical_version(
 
     let connection =
         Connection::open(catalog_path(data_directory)).expect("open catalog fixture for downgrade");
+    connection
+        .execute_batch(
+            "DROP TABLE legacy_reconcile_snapshot_files;
+             DROP TABLE legacy_file_view_mappings;",
+        )
+        .expect("remove physical v6 legacy mapping tables");
     if physical_version <= 4 {
         connection
             .execute_batch("DROP TABLE legacy_import_requests;")
@@ -379,6 +387,15 @@ fn initialize_catalog_at_physical_version(
                  PRAGMA user_version = 4;",
             )
             .expect("construct exact physical v4 fixture"),
+        5 => connection
+            .execute_batch(
+                "DELETE FROM catalog_migrations WHERE schema_version > 5;
+                 UPDATE catalog_meta
+                    SET value = X'0000000000000005'
+                  WHERE key = 'schema_version';
+                 PRAGMA user_version = 5;",
+            )
+            .expect("construct exact physical v5 fixture"),
         unsupported => panic!("unsupported physical catalog fixture version [{unsupported}]"),
     }
 }
@@ -480,7 +497,7 @@ fn migration_is_idempotent_and_creates_the_current_domain_schema() {
         .expect("query migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -489,7 +506,7 @@ fn migration_is_idempotent_and_creates_the_current_domain_schema() {
 fn concurrent_opens_migrate_supported_catalogs_exactly_once() {
     const ACTOR_COUNT: usize = 8;
 
-    for physical_version in [0, 1, 2, 3, 4] {
+    for physical_version in [0, 1, 2, 3, 4, 5] {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
         initialize_catalog_at_physical_version(&data_directory, physical_version);
@@ -535,7 +552,7 @@ fn concurrent_opens_migrate_supported_catalogs_exactly_once() {
             .expect("collect concurrent migration versions");
         assert_eq!(
             migration_versions,
-            vec![1, 2, 3, 4, 5],
+            vec![1, 2, 3, 4, 5, 6],
             "each migration must be recorded exactly once from physical version \
              [{physical_version}]"
         );
@@ -557,6 +574,8 @@ fn upgrades_an_existing_physical_v1_catalog_to_current_and_reopens() {
     let raw = Connection::open(&path).expect("open catalog for v1 fixture downgrade");
     raw.execute_batch(
         "PRAGMA foreign_keys = OFF;
+         DROP TABLE legacy_reconcile_snapshot_files;
+         DROP TABLE legacy_file_view_mappings;
          DROP TABLE legacy_import_requests;
          DROP TABLE idempotent_requests;
          DROP TABLE maintenance_jobs;
@@ -620,7 +639,7 @@ fn upgrades_an_existing_physical_v1_catalog_to_current_and_reopens() {
             row.get(0)
         })
         .expect("count upgraded migration audit");
-    assert_eq!(migration_count, 5);
+    assert_eq!(migration_count, 6);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -637,7 +656,9 @@ fn upgrades_an_existing_physical_v2_catalog_to_current_and_reopens() {
 
     let raw = Connection::open(&path).expect("open catalog for v2 fixture downgrade");
     raw.execute_batch(
-        "DROP TABLE legacy_import_requests;
+        "DROP TABLE legacy_reconcile_snapshot_files;
+         DROP TABLE legacy_file_view_mappings;
+         DROP TABLE legacy_import_requests;
          DROP INDEX tables_by_state_id;
          DROP INDEX tables_by_namespace_state_id;
          DROP INDEX data_files_gc_retry_by_table;
@@ -677,7 +698,7 @@ fn upgrades_an_existing_physical_v2_catalog_to_current_and_reopens() {
         .expect("query upgraded migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect upgraded migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -713,7 +734,7 @@ fn upgrades_an_existing_physical_v3_catalog_to_current_and_reopens() {
         .expect("query upgraded migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect upgraded migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -1915,7 +1936,7 @@ fn inspect_rejects_tampered_catalog_format_metadata() {
 #[test]
 fn inspect_rejects_tampered_schema_metadata() {
     assert_live_tamper_rejected(
-        "UPDATE catalog_meta SET value = X'0000000000000006' \
+        "UPDATE catalog_meta SET value = X'0000000000000005' \
          WHERE key = 'schema_version'",
     );
 }
@@ -1993,7 +2014,7 @@ fn inspect_rejects_an_extra_migration_audit_record() {
     assert_live_tamper_rejected(
         "INSERT INTO catalog_migrations( \
              schema_version, migration_name, migration_checksum, applied_at_ns \
-         ) VALUES (6, 'unexpected', zeroblob(32), zeroblob(8))",
+         ) VALUES (7, 'unexpected', zeroblob(32), zeroblob(8))",
     );
 }
 

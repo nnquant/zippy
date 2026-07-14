@@ -25,7 +25,7 @@ use crate::storage_codec::{
 const IMPORT_SNAPSHOT_VERSION: u64 = 2;
 const INITIAL_SNAPSHOT_VERSION: u64 = 1;
 const INITIAL_SCHEMA_VERSION: u64 = 1;
-const MAX_IMPORT_FILES: usize = 4_096;
+pub(crate) const MAX_IMPORT_FILES: usize = 4_096;
 const SQLITE_IDENTITY_QUERY_CHUNK: usize = 256;
 const MAX_LEGACY_IMPORT_COMMAND_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LEGACY_IMPORT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -46,11 +46,11 @@ pub(crate) struct PreparedLegacyCatalogImportV2 {
     summary: MetadataMap,
 }
 
-struct PreparedLegacyFile {
-    file: zippy_types::catalog::LegacyCatalogImportFileV2,
-    partition_blob: Vec<u8>,
-    statistics_blob: Vec<u8>,
-    metadata_blob: Vec<u8>,
+pub(crate) struct PreparedLegacyFile {
+    pub(crate) file: zippy_types::catalog::LegacyCatalogImportFileV2,
+    pub(crate) partition_blob: Vec<u8>,
+    pub(crate) statistics_blob: Vec<u8>,
+    pub(crate) metadata_blob: Vec<u8>,
 }
 
 pub(crate) async fn legacy_import_preflight_bytes(
@@ -183,7 +183,14 @@ pub(crate) fn prepare_legacy_catalog_import_v2(
         .with_retryable(false));
     }
 
-    let files = prepare_files(request_id, &envelope.command)?;
+    let files = prepare_verified_files(
+        request_id,
+        envelope.command.table_id,
+        INITIAL_SCHEMA_VERSION,
+        &envelope.command.canonical_schema_hash,
+        &envelope.command.files,
+        false,
+    )?;
     let summary = import_summary(&envelope.command)?;
     let summary_blob = encode_snapshot_summary_blob(&summary)
         .map_err(|error| error.with_request_id(request_id))?;
@@ -196,14 +203,34 @@ pub(crate) fn prepare_legacy_catalog_import_v2(
     })
 }
 
-fn prepare_files(
+pub(crate) fn prepare_verified_files(
     request_id: RequestId,
-    command: &LegacyCatalogImportCommandV2,
+    table_id: zippy_types::TableId,
+    schema_version: u64,
+    schema_hash: &str,
+    files: &[zippy_types::catalog::LegacyCatalogImportFileV2],
+    allow_empty: bool,
 ) -> Result<Vec<PreparedLegacyFile>> {
+    if files.is_empty() && !allow_empty {
+        return Err(invalid(
+            request_id,
+            "legacy file view requires at least one verified file",
+        ));
+    }
+    if files.len() > MAX_IMPORT_FILES {
+        return Err(ServerError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "legacy file count exceeds maximum actual=[{}] maximum=[{MAX_IMPORT_FILES}]",
+                files.len()
+            ),
+        )
+        .with_request_id(request_id));
+    }
     let mut paths = BTreeSet::new();
     let mut file_ids = BTreeSet::new();
-    let mut prepared = Vec::with_capacity(command.files.len());
-    for (index, import) in command.files.iter().enumerate() {
+    let mut prepared = Vec::with_capacity(files.len());
+    for (index, import) in files.iter().enumerate() {
         let expected_order = u64::try_from(index).map_err(|_| {
             ServerError::new(
                 ErrorCode::ResourceExhausted,
@@ -227,7 +254,7 @@ fn prepare_files(
                 "legacy import contains a duplicate file id",
             ));
         }
-        if file.table_id != command.table_id || file.schema_version != 1 {
+        if file.table_id != table_id || file.schema_version != schema_version {
             return Err(invalid(
                 request_id,
                 "legacy file table identity or schema version does not match its import",
@@ -265,14 +292,14 @@ fn prepare_files(
         }
         match file.metadata.get(LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY) {
             Some(MetadataScalar::String(verified_schema_hash))
-                if verified_schema_hash == &command.canonical_schema_hash => {}
+                if verified_schema_hash == schema_hash => {}
             _ => {
                 return Err(ServerError::new(
                     ErrorCode::SchemaMismatch,
                     "legacy file verifier Schema proof does not match the imported table Schema",
                 )
                 .with_request_id(request_id)
-                .with_table_id(command.table_id)
+                .with_table_id(table_id)
                 .with_retryable(false));
             }
         }
@@ -293,7 +320,7 @@ fn prepare_files(
     Ok(prepared)
 }
 
-fn validate_source_snapshot_hash(request_id: RequestId, value: &str) -> Result<()> {
+pub(crate) fn validate_source_snapshot_hash(request_id: RequestId, value: &str) -> Result<()> {
     let Some(digest) = value.strip_prefix("sha256-v1:") else {
         return Err(invalid(
             request_id,
@@ -313,7 +340,7 @@ fn validate_source_snapshot_hash(request_id: RequestId, value: &str) -> Result<(
     Ok(())
 }
 
-fn validate_sha256_checksum(request_id: RequestId, checksum: &str) -> Result<()> {
+pub(crate) fn validate_sha256_checksum(request_id: RequestId, checksum: &str) -> Result<()> {
     let Some(digest) = checksum.strip_prefix("sha256-v1:") else {
         return Err(invalid(
             request_id,
@@ -379,6 +406,12 @@ pub(crate) fn commit_legacy_catalog_import_v2(
                 .with_request_id(request_id)
         })?;
     if let Some(response) = replay(&transaction, &prepared.envelope)? {
+        ensure_import_mapping_and_order(
+            &transaction,
+            &prepared.envelope,
+            &prepared.files,
+            &response,
+        )?;
         transaction.commit().map_err(|error| {
             crate::map_sqlite_error("commit legacy Catalog V2 replay", error)
                 .with_request_id(request_id)
@@ -444,6 +477,7 @@ pub(crate) fn commit_legacy_catalog_import_v2(
         table,
         snapshot,
     };
+    ensure_import_mapping_and_order(&transaction, &prepared.envelope, &prepared.files, &response)?;
     let response_blob =
         LegacyCatalogImportCodecV2::encode_response(&response).map_err(|error| {
             ServerError::new(
@@ -488,6 +522,136 @@ pub(crate) fn commit_legacy_catalog_import_v2(
             .with_request_id(request_id)
     })?;
     Ok(response)
+}
+
+fn ensure_import_mapping_and_order(
+    connection: &Connection,
+    envelope: &LegacyCatalogImportEnvelopeV2,
+    files: &[PreparedLegacyFile],
+    response: &LegacyCatalogImportResponseV2,
+) -> Result<()> {
+    let request_id = envelope.request_id;
+    let table_id = envelope.command.table_id.into_bytes();
+    let legacy_revision = encode_u64(envelope.command.legacy_files_revision);
+    let snapshot_version = encode_u64(IMPORT_SNAPSHOT_VERSION);
+    let catalog_revision = encode_u64(response.catalog_revision);
+    let committed_at_ns = encode_u64(response.snapshot.created_at_ns);
+    let fingerprint = envelope.canonical_fingerprint.into_bytes();
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO legacy_file_view_mappings(\
+                 table_id, legacy_files_revision, native_snapshot_version, request_id, \
+                 format_version, fingerprint, previous_legacy_files_revision, \
+                 source_catalog_revision, source_snapshot_hash, catalog_revision, continuity, \
+                 committed_at_ns\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?2, ?7, ?8, ?9, 'base', ?10)",
+            params![
+                table_id.as_slice(),
+                legacy_revision.as_slice(),
+                snapshot_version.as_slice(),
+                request_id.into_bytes().as_slice(),
+                i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2),
+                fingerprint.as_slice(),
+                encode_u64(envelope.source_catalog_revision).as_slice(),
+                envelope.source_snapshot_hash.as_str(),
+                catalog_revision.as_slice(),
+                committed_at_ns.as_slice(),
+            ],
+        )
+        .map_err(|error| {
+            crate::map_sqlite_error("insert legacy import base mapping", error)
+                .with_request_id(request_id)
+        })?;
+    let mapping_matches = connection
+        .query_row(
+            "SELECT 1 FROM legacy_file_view_mappings \
+              WHERE table_id = ?1 AND legacy_files_revision = ?2 \
+                AND native_snapshot_version = ?3 AND request_id = ?4 \
+                AND format_version = ?5 AND fingerprint = ?6 \
+                AND previous_legacy_files_revision = ?2 \
+                AND source_catalog_revision = ?7 AND source_snapshot_hash = ?8 \
+                AND catalog_revision = ?9 AND continuity = 'base' AND committed_at_ns = ?10",
+            params![
+                table_id.as_slice(),
+                legacy_revision.as_slice(),
+                snapshot_version.as_slice(),
+                request_id.into_bytes().as_slice(),
+                i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2),
+                fingerprint.as_slice(),
+                encode_u64(envelope.source_catalog_revision).as_slice(),
+                envelope.source_snapshot_hash.as_str(),
+                catalog_revision.as_slice(),
+                committed_at_ns.as_slice(),
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            crate::map_sqlite_error("validate legacy import base mapping", error)
+                .with_request_id(request_id)
+        })?
+        .is_some();
+    if !mapping_matches {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy import base mapping conflicts with its permanent V2 response",
+        )
+        .with_request_id(request_id));
+    }
+
+    let mut insert = connection
+        .prepare_cached(
+            "INSERT OR IGNORE INTO legacy_reconcile_snapshot_files(\
+                 table_id, snapshot_version, file_id, discovery_order\
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|error| crate::map_sqlite_error("prepare legacy import order insert", error))?;
+    for prepared in files {
+        insert
+            .execute(params![
+                table_id.as_slice(),
+                snapshot_version.as_slice(),
+                prepared.file.file.file_id.into_bytes().as_slice(),
+                encode_u64(prepared.file.discovery_order).as_slice(),
+            ])
+            .map_err(|error| {
+                crate::map_sqlite_error("insert legacy import snapshot order", error)
+                    .with_request_id(request_id)
+            })?;
+    }
+    drop(insert);
+    let mut query = connection
+        .prepare_cached(
+            "SELECT file_id, discovery_order FROM legacy_reconcile_snapshot_files \
+              WHERE table_id = ?1 AND snapshot_version = ?2 ORDER BY discovery_order",
+        )
+        .map_err(|error| {
+            crate::map_sqlite_error("prepare legacy import order validation", error)
+        })?;
+    let actual = query
+        .query_map(
+            params![table_id.as_slice(), snapshot_version.as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .map_err(|error| crate::map_sqlite_error("query legacy import snapshot order", error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| crate::map_sqlite_error("read legacy import snapshot order", error))?;
+    let exact = actual.len() == files.len()
+        && actual
+            .iter()
+            .zip(files)
+            .all(|((file_id, order), expected)| {
+                file_id.as_slice() == expected.file.file.file_id.into_bytes()
+                    && decode_u64(order).ok() == Some(expected.file.discovery_order)
+            });
+    if !exact {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy import snapshot order conflicts with its verified V2 file view",
+        )
+        .with_request_id(request_id));
+    }
+    Ok(())
 }
 
 fn replay(
@@ -795,6 +959,27 @@ fn reject_v1_request_id(connection: &Connection, request_id: RequestId) -> Resul
         return Err(ServerError::new(
             ErrorCode::Conflict,
             "catalog request id is already committed in the V1 command namespace",
+        )
+        .with_request_id(request_id)
+        .with_retryable(false));
+    }
+    let reconcile_exists = connection
+        .query_row(
+            "SELECT 1 FROM legacy_file_view_mappings \
+              WHERE request_id = ?1 AND format_version = 3",
+            [request_id.into_bytes().as_slice()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| {
+            crate::map_sqlite_error("check V3 request-id conflict", error)
+                .with_request_id(request_id)
+        })?
+        .is_some();
+    if reconcile_exists {
+        return Err(ServerError::new(
+            ErrorCode::Conflict,
+            "catalog request id is already committed in the V3 reconcile namespace",
         )
         .with_request_id(request_id)
         .with_retryable(false));
