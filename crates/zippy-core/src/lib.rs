@@ -2,6 +2,7 @@ pub mod bus_protocol;
 pub mod config;
 pub mod control_transport;
 pub mod data_directory;
+pub mod durable_file;
 pub mod endpoint;
 pub mod engine;
 pub mod error;
@@ -45,6 +46,7 @@ pub use data_directory::{
     DataDirectory, DataDirectoryError, ManagedDataDirectory, DATA_FORMAT_VERSION,
     DATA_FORMAT_VERSION_FILE,
 };
+pub use durable_file::{DurableFileTransaction, DurablePublishedFile};
 pub use endpoint::{
     default_control_endpoint, default_control_endpoint_path, resolve_control_endpoint,
     resolve_control_endpoint_uri, resolve_control_endpoint_with_home, ControlEndpoint,

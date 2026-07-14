@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use zippy_types::table::ManagedDataPath;
 
 /// Current on-disk format understood by this Zippy binary.
 pub const DATA_FORMAT_VERSION: u32 = 1;
@@ -66,6 +67,10 @@ pub enum DataDirectoryError {
     NotRegularFile { path: PathBuf },
     #[error("data root must not be a symbolic link path=[{path}]")]
     SymbolicLink { path: PathBuf },
+    #[error("managed data path is invalid path=[{path}]")]
+    InvalidManagedPath { path: PathBuf },
+    #[error("durable data file already exists path=[{path}]")]
+    AlreadyExists { path: PathBuf },
     #[error("unversioned data root is not empty path=[{path}]")]
     UnversionedNonEmpty { path: PathBuf },
     #[error("invalid data format version path=[{path}] value=[{value}]")]
@@ -237,19 +242,13 @@ fn write_format_version(
     path: &Path,
     expected_version: u32,
 ) -> Result<(), DataDirectoryError> {
-    let mut temporary = tempfile::Builder::new()
-        .prefix(DATA_FORMAT_VERSION_TEMP_PREFIX)
-        .tempfile_in(root)
-        .map_err(|error| io_error(path, error))?;
+    let managed_path = ManagedDataPath::new(DATA_FORMAT_VERSION_FILE)
+        .expect("the fixed format marker is a valid managed path");
+    let mut temporary = crate::durable_file::begin_durable_file(root, &managed_path)?;
     writeln!(temporary, "{expected_version}").map_err(|error| io_error(path, error))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| io_error(path, error))?;
-    match temporary.persist_noclobber(path) {
+    match temporary.publish_noclobber() {
         Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            drop(error.file);
+        Err(DataDirectoryError::AlreadyExists { .. }) => {
             require_regular_file(path)?;
             require_owner_permissions(path)?;
             let found = read_format_version(path)?;
@@ -260,9 +259,8 @@ fn write_format_version(
                 });
             }
         }
-        Err(error) => return Err(io_error(path, error.error)),
+        Err(error) => return Err(error),
     }
-    sync_directory_io(root).map_err(|error| io_error(root, error))?;
     Ok(())
 }
 
@@ -287,7 +285,7 @@ fn ensure_managed_directories(root: &Path) -> Result<(), DataDirectoryError> {
 }
 
 #[cfg(unix)]
-fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
+pub(crate) fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
     use std::os::unix::fs::DirBuilderExt;
 
     let mut builder = fs::DirBuilder::new();
@@ -296,7 +294,7 @@ fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
 }
 
 #[cfg(not(unix))]
-fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
+pub(crate) fn create_owner_directory(path: &Path) -> Result<(), DataDirectoryError> {
     fs::create_dir(path).map_err(|error| io_error(path, error))
 }
 
@@ -314,7 +312,7 @@ fn restrict_owner_permissions(_path: &Path) -> Result<(), DataDirectoryError> {
 }
 
 #[cfg(unix)]
-fn require_owner_permissions(path: &Path) -> Result<(), DataDirectoryError> {
+pub(crate) fn require_owner_permissions(path: &Path) -> Result<(), DataDirectoryError> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = fs::metadata(path)
@@ -333,17 +331,17 @@ fn require_owner_permissions(path: &Path) -> Result<(), DataDirectoryError> {
 }
 
 #[cfg(not(unix))]
-fn require_owner_permissions(_path: &Path) -> Result<(), DataDirectoryError> {
+pub(crate) fn require_owner_permissions(_path: &Path) -> Result<(), DataDirectoryError> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn sync_directory_io(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory_io(path: &Path) -> std::io::Result<()> {
     File::open(path).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]
-fn sync_directory_io(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory_io(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -357,7 +355,7 @@ fn require_supported_platform() -> Result<(), DataDirectoryError> {
     Err(DataDirectoryError::UnsupportedPlatformSecurity)
 }
 
-fn io_error(path: &Path, error: std::io::Error) -> DataDirectoryError {
+pub(crate) fn io_error(path: &Path, error: std::io::Error) -> DataDirectoryError {
     DataDirectoryError::Io {
         path: path.to_path_buf(),
         reason: error.to_string(),
