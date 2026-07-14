@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
-use zippy_core::{DataDirectory, ManagedDataDirectory};
+use zippy_core::{DataDirectoryError, ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
     CatalogOutcomeV1, CatalogRead, CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand,
@@ -27,12 +28,16 @@ type RawInitialSnapshotRow = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8
 
 const MAX_SQLITE_CATALOG_NAME_BYTES: usize = 1024;
 
-fn data_directory(directory: &TempDir) -> DataDirectory {
-    DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
+fn data_directory(directory: &TempDir) -> Arc<OwnedDataDirectory> {
+    Arc::new(
+        OwnedDataDirectory::acquire_or_initialize(directory.path().join("data"))
+            .expect("own data root"),
+    )
 }
 
-fn catalog_path(data_directory: &DataDirectory) -> std::path::PathBuf {
+fn catalog_path(data_directory: &Arc<OwnedDataDirectory>) -> std::path::PathBuf {
     data_directory
+        .directory()
         .path(ManagedDataDirectory::Catalog)
         .join("catalog.db")
 }
@@ -1541,4 +1546,43 @@ async fn snapshot_validation_precedes_enqueue_and_reads_do_not_share_writer_queu
         .expect("write ahead of cancelled read must commit");
     assert_eq!(catalog.revision().await, Ok(1));
     catalog.close().expect("close sqlite catalog");
+}
+
+#[test]
+fn writable_config_retains_data_directory_ownership() {
+    let directory = TempDir::new().expect("create temp directory");
+    let ownership = data_directory(&directory);
+    let read_view = ownership.directory().clone();
+    let config = SqliteCatalogConfig::new(&ownership);
+    drop(ownership);
+
+    assert!(matches!(
+        read_view.clone().acquire_process_ownership(),
+        Err(DataDirectoryError::OwnershipHeld { .. })
+    ));
+
+    drop(config);
+    read_view
+        .acquire_process_ownership()
+        .expect("dropping the final writable config must release ownership");
+}
+
+#[test]
+fn catalog_workers_hold_ownership_until_they_are_closed() {
+    let directory = TempDir::new().expect("create temp directory");
+    let ownership = data_directory(&directory);
+    let read_view = ownership.directory().clone();
+    let catalog =
+        SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).expect("open sqlite catalog");
+    drop(ownership);
+
+    assert!(matches!(
+        read_view.clone().acquire_process_ownership(),
+        Err(DataDirectoryError::OwnershipHeld { .. })
+    ));
+
+    catalog.close().expect("close sqlite catalog workers");
+    read_view
+        .acquire_process_ownership()
+        .expect("worker shutdown must release its final ownership capability");
 }

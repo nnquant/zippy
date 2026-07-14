@@ -9,7 +9,7 @@ use zippy_catalog::{
     CatalogAuthorityState, CatalogIntegrity, SqliteCatalogConfig, SqliteCatalogFoundation,
     CATALOG_FORMAT, CATALOG_SCHEMA_VERSION,
 };
-use zippy_core::{DataDirectory, ManagedDataDirectory};
+use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::ErrorCode;
 
 const EXPECTED_TABLES: [&str; 14] = [
@@ -32,12 +32,16 @@ const EXPECTED_TABLES: [&str; 14] = [
 const EXPECTED_ACTIVE_TABLE_CURSOR_INDEXES: [&str; 2] =
     ["tables_by_namespace_state_id", "tables_by_state_id"];
 
-fn data_directory(directory: &TempDir) -> DataDirectory {
-    DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
+fn data_directory(directory: &TempDir) -> Arc<OwnedDataDirectory> {
+    Arc::new(
+        OwnedDataDirectory::acquire_or_initialize(directory.path().join("data"))
+            .expect("own data root"),
+    )
 }
 
-fn catalog_path(data_directory: &DataDirectory) -> std::path::PathBuf {
+fn catalog_path(data_directory: &Arc<OwnedDataDirectory>) -> std::path::PathBuf {
     data_directory
+        .directory()
         .path(ManagedDataDirectory::Catalog)
         .join("catalog.db")
 }
@@ -234,7 +238,10 @@ fn assert_active_table_cursor_indexes(connection: &Connection) {
     );
 }
 
-fn initialize_catalog_at_physical_version(data_directory: &DataDirectory, physical_version: u32) {
+fn initialize_catalog_at_physical_version(
+    data_directory: &Arc<OwnedDataDirectory>,
+    physical_version: u32,
+) {
     if physical_version == 0 {
         return;
     }

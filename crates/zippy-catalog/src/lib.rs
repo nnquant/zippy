@@ -24,11 +24,12 @@ pub use service::SqliteCatalog;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, Error as SqliteError, OpenFlags};
-use zippy_core::{DataDirectory, ManagedDataDirectory};
+use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
@@ -71,8 +72,9 @@ impl CatalogAuthorityState {
 }
 
 /// Configuration for opening the non-authoritative SQLite Catalog foundation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SqliteCatalogConfig {
+    ownership: Arc<OwnedDataDirectory>,
     data_root: PathBuf,
     catalog_directory: PathBuf,
     path: PathBuf,
@@ -85,16 +87,18 @@ pub struct SqliteCatalogConfig {
 }
 
 impl SqliteCatalogConfig {
-    /// Creates a configuration under a validated managed Zippy data root.
+    /// Creates a writable configuration under an exclusively owned data root.
     ///
     /// The configured path is always `<data_root>/catalog/catalog.db`. The actor
-    /// revalidates the managed directories and opens the final file with
-    /// `SQLITE_OPEN_NOFOLLOW`; directory-handle pinning and network-filesystem
-    /// detection remain pre-authority requirements.
+    /// retains a clone of the ownership capability, revalidates the managed
+    /// directories, and opens the final file with `SQLITE_OPEN_NOFOLLOW`.
+    /// Network-filesystem detection remains a pre-authority requirement.
     #[must_use]
-    pub fn new(data_directory: &DataDirectory) -> Self {
+    pub fn new(ownership: &Arc<OwnedDataDirectory>) -> Self {
+        let data_directory = ownership.directory();
         let catalog_directory = data_directory.path(ManagedDataDirectory::Catalog);
         Self {
+            ownership: Arc::clone(ownership),
             data_root: data_directory.root().to_path_buf(),
             path: catalog_directory.join("catalog.db"),
             catalog_directory,
@@ -156,6 +160,12 @@ impl SqliteCatalogConfig {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Borrows the process ownership retained for writable Catalog workers.
+    #[must_use]
+    pub fn ownership(&self) -> &Arc<OwnedDataDirectory> {
+        &self.ownership
     }
 }
 

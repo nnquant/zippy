@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use rusqlite::Connection;
 use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
-use zippy_core::{DataDirectory, ManagedDataDirectory};
+use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandFormatVersion,
     CatalogCommandV1, CatalogOutcomeV1, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
@@ -27,12 +28,16 @@ use zippy_types::{
 const NAMESPACE: u128 = 1;
 const TABLE: u128 = 10;
 
-fn data_directory(directory: &TempDir) -> DataDirectory {
-    DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
+fn data_directory(directory: &TempDir) -> Arc<OwnedDataDirectory> {
+    Arc::new(
+        OwnedDataDirectory::acquire_or_initialize(directory.path().join("data"))
+            .expect("own data root"),
+    )
 }
 
-fn catalog_path(data_directory: &DataDirectory) -> std::path::PathBuf {
+fn catalog_path(data_directory: &Arc<OwnedDataDirectory>) -> std::path::PathBuf {
     data_directory
+        .directory()
         .path(ManagedDataDirectory::Catalog)
         .join("catalog.db")
 }

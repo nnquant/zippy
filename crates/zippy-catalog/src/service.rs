@@ -1216,7 +1216,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use tempfile::TempDir;
-    use zippy_core::DataDirectory;
+    use zippy_core::OwnedDataDirectory;
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
         CatalogSnapshotSelector, CatalogWrite, CommitDataFilesCommand, CreateNamespaceCommand,
@@ -1315,8 +1315,11 @@ mod tests {
         }
     }
 
-    fn data_directory(directory: &TempDir) -> DataDirectory {
-        DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
+    fn data_directory(directory: &TempDir) -> Arc<OwnedDataDirectory> {
+        Arc::new(
+            OwnedDataDirectory::acquire_or_initialize(directory.path().join("data"))
+                .expect("own data root"),
+        )
     }
 
     fn request_id(value: u128) -> RequestId {
