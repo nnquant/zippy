@@ -1845,10 +1845,12 @@ SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立
 通用 durable file primitive 已实现同目录临时 inode、file fsync、no-clobber publish、directory
 fsync、取消清理和 symlink 拒绝。legacy registry snapshot 已迁入 data root 的 `catalog/`；默认
 数据根发现旧 endpoint snapshot 时会 fail closed，只有显式声明离线导入并确认旧 endpoint 不活跃
-后才迁移，显式数据根不会继承 endpoint 状态。Parquet
-candidate writer、checksum/metadata contract、Catalog
-commit coordinator、orphan reconciliation、snapshot lease 和 GC 尚未完成，因此 legacy metadata
-仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。
+后才迁移，显式数据根不会继承 endpoint 状态。Parquet candidate writer 已固定 UUID 路径、
+Parquet profile、footer provenance、`sha256-v1`、no-clobber publication 和 schema 预检。
+Catalog commit coordinator 已实现单 worker FIFO、64 条/128 MiB command/8 GiB candidate 默认预算、
+durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、取消安全和启动前恢复。
+orphan reconciliation、snapshot lease、logical drop、safe GC 以及权威 server table actor 接线尚未完成，
+因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。
 
 任务：
 

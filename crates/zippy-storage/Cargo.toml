@@ -9,11 +9,14 @@ parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 zippy-core = { path = "../zippy-core" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
 tempfile = "3"
+zippy-catalog = { path = "../zippy-catalog" }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

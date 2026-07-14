@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::{arrow_to_parquet_schema, ArrowWriter};
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
@@ -432,6 +433,13 @@ fn build_candidate(
 }
 
 fn inspect_existing_candidate(table_id: TableId, path: &Path) -> Result<(u64, String)> {
+    let (file, size) = open_existing_candidate(table_id, path)?;
+    let checksum = sha256_v1_reader(file)
+        .map_err(|error| io_error(table_id, "checksum existing candidate", path, error))?;
+    Ok((size, checksum))
+}
+
+fn open_existing_candidate(table_id: TableId, path: &Path) -> Result<(File, u64)> {
     let path_metadata = fs::symlink_metadata(path)
         .map_err(|error| io_error(table_id, "inspect existing candidate", path, error))?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
@@ -457,10 +465,126 @@ fn inspect_existing_candidate(table_id: TableId, path: &Path) -> Result<(u64, St
         )
     })?;
     validate_same_file_identity(table_id, path, &path_metadata, &descriptor_metadata)?;
-    let size = descriptor_metadata.len();
-    let checksum = sha256_v1_reader(file)
-        .map_err(|error| io_error(table_id, "checksum existing candidate", path, error))?;
-    Ok((size, checksum))
+    Ok((file, descriptor_metadata.len()))
+}
+
+pub(crate) fn verify_pending_candidate(
+    data_directory: &OwnedDataDirectory,
+    pending: &PendingDataFile,
+) -> Result<()> {
+    let DataFileLocation::Managed(managed_path) = &pending.location else {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "native candidate verification requires a managed file location",
+        )
+        .with_table_id(pending.table_id));
+    };
+    let DataFileProvenance::Native(provenance) = &pending.provenance else {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "native candidate verification requires native provenance",
+        )
+        .with_table_id(pending.table_id));
+    };
+    let path = data_directory
+        .directory()
+        .root()
+        .join(managed_path.as_str());
+    let (actual_size, actual_checksum) = inspect_existing_candidate(pending.table_id, &path)?;
+    if actual_size != pending.file_size_bytes || actual_checksum != pending.checksum {
+        return Err(corruption_error(
+            pending.table_id,
+            &path,
+            Some(pending.checksum.clone()),
+            Some(actual_checksum),
+            "candidate no longer matches its pending descriptor",
+        ));
+    }
+
+    let (footer_file, _) = open_existing_candidate(pending.table_id, &path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(footer_file).map_err(|error| {
+        corruption_error(
+            pending.table_id,
+            &path,
+            Some(pending.checksum.clone()),
+            Some(pending.checksum.clone()),
+            &format!("candidate Parquet footer is invalid error=[{error}]"),
+        )
+    })?;
+    let metadata = builder.metadata();
+    let actual_rows = u64::try_from(metadata.file_metadata().num_rows()).map_err(|_| {
+        corruption_error(
+            pending.table_id,
+            &path,
+            None,
+            None,
+            "candidate Parquet footer has a negative row count",
+        )
+    })?;
+    if actual_rows != pending.row_count.get() {
+        return Err(corruption_error(
+            pending.table_id,
+            &path,
+            None,
+            None,
+            "candidate Parquet row count does not match its pending descriptor",
+        ));
+    }
+    let footer_json = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.key == CANDIDATE_FOOTER_METADATA_KEY)
+        })
+        .and_then(|entry| entry.value.as_deref())
+        .ok_or_else(|| {
+            corruption_error(
+                pending.table_id,
+                &path,
+                None,
+                None,
+                "candidate Parquet footer is missing its Zippy metadata envelope",
+            )
+        })?;
+    let actual_footer =
+        serde_json::from_str::<serde_json::Value>(footer_json).map_err(|error| {
+            corruption_error(
+                pending.table_id,
+                &path,
+                None,
+                None,
+                &format!("candidate footer metadata is invalid error=[{error}]"),
+            )
+        })?;
+    let expected_footer = serde_json::to_value(StoredCandidateMetadataV1 {
+        format_version: PARQUET_CANDIDATE_FORMAT_VERSION,
+        file_id: pending.file_id,
+        table_id: pending.table_id,
+        schema_version: pending.schema_version,
+        provenance,
+        partition: &pending.partition,
+        metadata: &pending.metadata,
+        created_at_ns: pending.created_at_ns,
+    })
+    .map_err(|error| {
+        ServerError::new(
+            ErrorCode::Internal,
+            format!("serialize expected candidate footer metadata error=[{error}]"),
+        )
+        .with_table_id(pending.table_id)
+    })?;
+    if actual_footer != expected_footer {
+        return Err(corruption_error(
+            pending.table_id,
+            &path,
+            None,
+            None,
+            "candidate Parquet footer does not match its pending descriptor",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

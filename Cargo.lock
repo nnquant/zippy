@@ -2470,6 +2470,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tracing",
+ "zippy-catalog",
  "zippy-core",
  "zippy-types",
 ]
