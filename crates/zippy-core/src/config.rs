@@ -23,6 +23,8 @@ const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ZippyConfig {
     #[serde(default)]
+    pub server: ZippyServerConfig,
+    #[serde(default)]
     pub runtime: ZippyRuntimeConfig,
     #[serde(default)]
     pub master: ZippyMasterConfig,
@@ -32,6 +34,13 @@ pub struct ZippyConfig {
     pub gateway: ZippyGatewayConfig,
     #[serde(default)]
     pub query: ZippyQueryConfig,
+}
+
+/// Single-node server storage configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyServerConfig {
+    /// Managed database root. `None` derives an endpoint-scoped default.
+    pub data_dir: Option<PathBuf>,
 }
 
 /// Process-wide execution resource limits.
@@ -164,12 +173,18 @@ impl Default for ZippyGatewayConfig {
 
 #[derive(Debug, Deserialize)]
 struct PartialZippyConfig {
+    server: Option<PartialServerConfig>,
     runtime: Option<PartialRuntimeConfig>,
     master: Option<PartialMasterConfig>,
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
     gateway: Option<PartialGatewayConfig>,
     query: Option<PartialQueryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialServerConfig {
+    data_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +257,7 @@ struct PartialGatewayConfig {
 impl Default for ZippyConfig {
     fn default() -> Self {
         Self {
+            server: ZippyServerConfig::default(),
             runtime: ZippyRuntimeConfig::default(),
             master: ZippyMasterConfig::default(),
             log: ZippyLogConfig {
@@ -301,6 +317,12 @@ impl ZippyConfig {
     }
 
     fn apply_partial(&mut self, partial: PartialZippyConfig) -> Result<()> {
+        if let Some(server) = partial.server {
+            if let Some(data_dir) = server.data_dir {
+                let data_dir = non_empty(data_dir, "server.data_dir")?;
+                self.server.data_dir = Some(expand_home_config_path(&data_dir));
+            }
+        }
         if let Some(runtime) = partial.runtime {
             if let Some(max_parallelism) = runtime.max_parallelism {
                 self.runtime.max_parallelism = max_parallelism;
@@ -413,6 +435,10 @@ impl ZippyConfig {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if let Some(data_dir) = env_string("ZIPPY_SERVER_DATA_DIR") {
+            let data_dir = non_empty(data_dir, "ZIPPY_SERVER_DATA_DIR")?;
+            self.server.data_dir = Some(expand_home_config_path(&data_dir));
+        }
         if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
             self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;
         }
@@ -581,6 +607,17 @@ impl ZippyConfig {
                     })?;
         }
         Ok(())
+    }
+
+    /// Resolves the managed server data root.
+    ///
+    /// `default` should be stable for one control endpoint. It is used only
+    /// when neither `[server].data_dir` nor `ZIPPY_SERVER_DATA_DIR` is set.
+    pub fn server_data_dir(&self, default: impl AsRef<Path>) -> PathBuf {
+        self.server
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| default.as_ref().to_path_buf())
     }
 
     fn validate(&self) -> Result<()> {

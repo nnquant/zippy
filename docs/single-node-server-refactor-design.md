@@ -2,7 +2,7 @@
 
 日期：2026-07-13
 
-状态：实施中（Phase 0/1 已完成，Phase 2 P2.2 进行中）
+状态：实施中（Phase 0/1 已完成，Phase 2 P2.2 与 Phase 3 基础设施进行中）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
@@ -1835,6 +1835,17 @@ SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立
 ### Phase 3：Manifest Storage v2
 
 目标：建立数据文件和 Catalog 的原子可见边界。
+
+当前实施状态（2026-07-14）：managed data root 已实现 owner-only `server.lock`、非阻塞进程独占
+锁、UID/权限/硬链接/inode 校验、崩溃自动释放和只读 layout open；初始化只在取得锁后写
+`FORMAT_VERSION` 或补建 managed directories。`zippy server run` 和 legacy native master 入口会在
+日志、snapshot、listener 之前取得 `[server].data_dir` 所有权；不同 endpoint 指向同一 root 时第二
+实例 fail closed，干净 shutdown 最后释放，不完整 shutdown 保持 capability。可写
+`SqliteCatalogConfig` 必须持有 `Arc<OwnedDataDirectory>`，Catalog worker 退出前不会提前释放锁。
+通用 durable file primitive 已实现同目录临时 inode、file fsync、no-clobber publish、directory
+fsync、取消清理和 symlink 拒绝。Parquet candidate writer、checksum/metadata contract、Catalog
+commit coordinator、orphan reconciliation、snapshot lease 和 GC 尚未完成，因此 legacy metadata
+仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。
 
 任务：
 

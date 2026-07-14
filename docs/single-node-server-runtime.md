@@ -74,6 +74,39 @@ readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a re
 control probe, and only then opens service admission. With Gateway disabled it intentionally runs
 in catalog-only mode; it does not publish a query service that cannot execute.
 
+## Managed data root ownership
+
+The native runtime acquires `<data_root>/server.lock` before logging, loading the legacy snapshot,
+or binding a listener. Configure the root independently from the legacy Parquet directory:
+
+```toml
+[server]
+data_dir = "data/zippy"
+```
+
+`ZIPPY_SERVER_DATA_DIR` overrides the file setting. A leading `~/` is expanded while configuration
+is loaded, so later environment changes cannot redirect an already loaded configuration. When the
+setting is absent, the runtime uses `<control-endpoint-state-dir>/data`; this keeps the default
+stable for one endpoint while preventing unrelated endpoint profiles from sharing a root by
+accident.
+
+The data-root lock is separate from the detached launcher's endpoint lock under `~/.zippy/run`.
+The launcher lock protects one CLI-managed endpoint generation. The data-root lock protects the
+database itself, so two different endpoints configured with the same `[server].data_dir` still
+conflict before either listener is bound. `server.lock` is owner-only, never unlinked during normal
+cleanup, and contains diagnostic PID/version/acquisition metadata; the kernel advisory lock is the
+authority and is released after process exit, including abrupt exit.
+
+A clean server shutdown releases data-root ownership only after Gateway and Master/listener cleanup
+has completed. An incomplete shutdown retains the top-level capability, and a listener that has not
+joined retains its own capability clone. Ordinary `DataDirectory::open` remains a read-only layout
+validation operation and does not create missing directories. Writable SQLite Catalog
+configurations and durable file publication require an `OwnedDataDirectory` capability.
+
+This phase establishes process ownership and crash-safe publication primitives. The production
+runtime still uses the legacy metadata authority until Parquet candidate publication, Catalog
+manifest visibility, reconciliation, and authority cutover are completed.
+
 On shutdown the order is reversed: adapter admission closes first, Gateway releases its master
 lease and stops, then master performs its graceful shutdown and persists the catalog snapshot.
 Gateway, master process draining, and listener join share one absolute monotonic deadline from

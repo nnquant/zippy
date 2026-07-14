@@ -390,7 +390,7 @@ fn master_binary_exits_before_listening_when_sigint_arrives_during_startup_pause
 }
 
 #[test]
-fn master_binary_rejects_second_master_when_socket_is_active() {
+fn master_binary_rejects_second_master_before_rebinding_the_active_data_root() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("master.sock");
     let first_log_dir = temp.path().join("logs-first");
@@ -427,7 +427,8 @@ fn master_binary_rejects_second_master_when_socket_is_active() {
     assert!(!status.success());
 
     let stderr = read_stderr(&mut second);
-    assert!(stderr.contains("control endpoint socket is already active"));
+    assert!(stderr.contains("data directory is already owned by another process"));
+    assert!(!second_log_dir.exists());
     assert!(socket_path.exists());
 
     let status = unsafe { libc::kill(first.id() as i32, libc::SIGINT) };
@@ -457,6 +458,7 @@ fn master_binary_does_not_delete_new_socket_after_old_instance_exits() {
             &cleanup_ready_marker,
         )
         .env("ZIPPY_MASTER_TEST_PAUSE_BEFORE_CLEANUP", "1")
+        .env("ZIPPY_SERVER_DATA_DIR", temp.path().join("data-first"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -475,6 +477,7 @@ fn master_binary_does_not_delete_new_socket_after_old_instance_exits() {
         .arg("--log-level")
         .arg("info")
         .arg("--no-console-log")
+        .env("ZIPPY_SERVER_DATA_DIR", temp.path().join("data-second"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

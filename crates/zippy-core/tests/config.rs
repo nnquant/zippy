@@ -5,6 +5,7 @@ use zippy_core::{ZippyConfig, ZippyRuntimeConfig};
 
 const CONFIG_ENV_KEYS: &[&str] = &[
     "HOME",
+    "ZIPPY_SERVER_DATA_DIR",
     "ZIPPY_LOG_LEVEL",
     "ZIPPY_MAX_PARALLELISM",
     "ZIPPY_MAX_QUERY_BUFFER_BYTES",
@@ -42,6 +43,9 @@ fn zippy_config_loads_toml_and_env_overrides() {
     fs::write(
         &config_path,
         r#"
+[server]
+data_dir = "server-data-from-file"
+
 [log]
 level = "debug"
 
@@ -89,6 +93,7 @@ shutdown_timeout_ms = 3000
 
     with_env(
         &[
+            ("ZIPPY_SERVER_DATA_DIR", "server-data-from-env"),
             ("ZIPPY_LOG_LEVEL", "warn"),
             ("ZIPPY_MAX_PARALLELISM", "9"),
             ("ZIPPY_MAX_QUERY_BUFFER_BYTES", "805306368"),
@@ -117,6 +122,10 @@ shutdown_timeout_ms = 3000
         || {
             let config = ZippyConfig::load_from_path(Some(&config_path)).unwrap();
 
+            assert_eq!(
+                config.server.data_dir.as_deref(),
+                Some(std::path::Path::new("server-data-from-env"))
+            );
             assert_eq!(config.master.host.as_deref(), Some("0.0.0.0"));
             assert_eq!(config.master.port, Some(27690));
             assert_eq!(config.master.shutdown_timeout_ms, 7000);
@@ -173,6 +182,35 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     assert_eq!(config.query.max_buffered_bytes, None);
     assert_eq!(config.query_parallelism(), 4);
     assert_eq!(config.query_max_buffered_bytes(), 134217728);
+    assert_eq!(config.server.data_dir, None);
+    assert_eq!(
+        config.server_data_dir("endpoint-data"),
+        std::path::PathBuf::from("endpoint-data")
+    );
+}
+
+#[test]
+fn zippy_config_expands_explicit_server_data_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+data_dir = "~/.zippy/database"
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[("HOME", "/tmp/zippy-config-home")], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
+
+    assert_eq!(
+        config.server_data_dir("unused"),
+        std::path::PathBuf::from("/tmp/zippy-config-home/.zippy/database")
+    );
 }
 
 #[test]

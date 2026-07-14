@@ -19,7 +19,7 @@ use zippy_core::bus_protocol::GetConfigRequest;
 use zippy_core::{
     current_log_snapshot, python_dev_version, resolve_control_endpoint,
     send_control_line_request_with_timeout, ControlEndpoint, ControlRequest, ControlResponse,
-    Result as CoreResult, ZippyConfig, ZippyError,
+    OwnedDataDirectory, Result as CoreResult, ZippyConfig, ZippyError,
 };
 use zippy_gateway::{GatewayServer, GatewayShutdownOutcome};
 use zippy_master::daemon::{
@@ -660,6 +660,7 @@ pub struct LegacyServerRuntime {
     services: LegacyServiceSet,
     readiness: LegacyServerReadiness,
     shutdown_outcome: Option<LegacyServerShutdownOutcome>,
+    data_directory: Option<Arc<OwnedDataDirectory>>,
 }
 
 impl LegacyServerRuntime {
@@ -678,13 +679,15 @@ impl LegacyServerRuntime {
 
         let prepared = prepare_master_runtime(config.master)
             .map_err(|error| map_core_error("prepare master runtime", error))?;
-        let (control_endpoint, runtime_config, master, shutdown_timeout) = prepared.into_parts();
+        let (control_endpoint, runtime_config, master, shutdown_timeout, data_directory) =
+            prepared.into_parts();
         reject_ephemeral_master_endpoint(&control_endpoint)?;
 
         let mut master_listener = Some(start_master_listener(
             &master,
             &control_endpoint,
             startup_deadline,
+            Arc::clone(&data_directory),
         )?);
         if let Err(error) = remaining_before(startup_deadline, "start gateway") {
             let mut no_gateway = None;
@@ -849,6 +852,7 @@ impl LegacyServerRuntime {
             services,
             readiness,
             shutdown_outcome: None,
+            data_directory: Some(data_directory),
         })
     }
 
@@ -868,6 +872,12 @@ impl LegacyServerRuntime {
     #[must_use]
     pub fn runtime_config(&self) -> &ZippyConfig {
         &self.runtime_config
+    }
+
+    /// Returns the process-owned managed data directory while the runtime is active.
+    #[must_use]
+    pub fn data_directory(&self) -> Option<&Arc<OwnedDataDirectory>> {
+        self.data_directory.as_ref()
     }
 
     /// Returns the active compatibility mode.
@@ -988,6 +998,9 @@ impl LegacyServerRuntime {
             master_error = ?outcome.master_error,
             "zippy server runtime stopped"
         );
+        if outcome.is_clean() {
+            self.data_directory.take();
+        }
         self.shutdown_outcome = Some(outcome.clone());
         outcome
     }
@@ -1015,6 +1028,7 @@ fn start_master_listener(
     master: &MasterServer,
     endpoint: &ControlEndpoint,
     deadline: Instant,
+    data_directory: Arc<OwnedDataDirectory>,
 ) -> Result<MasterListenerRuntime, ServerError> {
     let startup_timeout = remaining_before(deadline, "start master listener")?;
     let listener_master = master.clone();
@@ -1024,6 +1038,7 @@ fn start_master_listener(
     let join_handle = thread::Builder::new()
         .name("zippy-master-listener".to_string())
         .spawn(move || {
+            let _data_directory = data_directory;
             let result =
                 listener_master.serve_endpoint_with_ready(&listener_endpoint, Some(ready_tx));
             listener_master.shutdown();

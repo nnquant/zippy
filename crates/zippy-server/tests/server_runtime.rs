@@ -7,7 +7,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use zippy_core::{ControlEndpoint, MasterClient};
+use zippy_core::{ControlEndpoint, DataDirectoryError, MasterClient};
 use zippy_master::daemon::MasterDaemonConfig;
 use zippy_server::{
     LegacyServerMode, LegacyServerRuntime, LegacyServerRuntimeConfig, ServiceHealth,
@@ -97,11 +97,48 @@ fn runtime_config_with_shutdown(
     LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
 }
 
+fn runtime_config_with_data_dir(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+) -> LegacyServerRuntimeConfig {
+    let config_path = temp.path().join("zippy-owned-data.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[server]\ndata_dir = {:?}\n\n[master]\nshutdown_timeout_ms = 1000\n",
+            data_dir.display().to_string()
+        ),
+    )
+    .unwrap();
+    let master =
+        MasterDaemonConfig::new(ControlEndpoint::Unix(temp.path().join("zippy-server.sock")))
+            .with_config_path(config_path)
+            .with_logging(
+                std::env::temp_dir().join(format!(
+                    "zippy-server-runtime-test-logs-{}",
+                    std::process::id()
+                )),
+                "info",
+                false,
+            );
+    LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
+}
+
 #[tokio::test]
 async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
     let temp = tempfile::tempdir().unwrap();
     let socket_path = temp.path().join("zippy-server.sock");
     let mut runtime = LegacyServerRuntime::start(runtime_config(&temp, None)).unwrap();
+    let data_directory = runtime
+        .data_directory()
+        .expect("running server owns its data directory")
+        .directory()
+        .clone();
+
+    assert!(matches!(
+        data_directory.clone().acquire_process_ownership(),
+        Err(DataDirectoryError::OwnershipHeld { .. })
+    ));
 
     assert_eq!(runtime.mode(), LegacyServerMode::CatalogOnly);
     assert_eq!(
@@ -138,7 +175,38 @@ async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
 
     let outcome = runtime.shutdown();
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    assert!(runtime.data_directory().is_none());
+    data_directory
+        .acquire_process_ownership()
+        .expect("clean server shutdown releases data ownership");
     assert!(!temp.path().join("zippy-server.sock").exists());
+}
+
+#[test]
+fn different_endpoints_cannot_own_the_same_data_root() {
+    let shared = tempfile::tempdir().unwrap();
+    let first_temp = tempfile::tempdir().unwrap();
+    let second_temp = tempfile::tempdir().unwrap();
+    let data_dir = shared.path().join("database");
+    let mut first =
+        LegacyServerRuntime::start(runtime_config_with_data_dir(&first_temp, &data_dir)).unwrap();
+
+    let error =
+        match LegacyServerRuntime::start(runtime_config_with_data_dir(&second_temp, &data_dir)) {
+            Ok(mut runtime) => {
+                let _ = runtime.shutdown();
+                panic!("second endpoint unexpectedly acquired an owned data root");
+            }
+            Err(error) => error,
+        };
+
+    assert!(error.message().contains("already owned by another process"));
+    assert!(!second_temp.path().join("zippy-server.sock").exists());
+    assert!(first.shutdown().is_clean());
+
+    let mut replacement =
+        LegacyServerRuntime::start(runtime_config_with_data_dir(&second_temp, &data_dir)).unwrap();
+    assert!(replacement.shutdown().is_clean());
 }
 
 #[test]
@@ -212,6 +280,11 @@ fn repeated_shutdown_preserves_the_first_timeout_outcome() {
     let temp = tempfile::tempdir().unwrap();
     let mut runtime = LegacyServerRuntime::start(runtime_config_with_shutdown(&temp, None, 30))
         .expect("catalog-only runtime should start");
+    let data_directory = runtime
+        .data_directory()
+        .expect("running server owns its data directory")
+        .directory()
+        .clone();
     let mut client = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
     let process = client
         .register_process("server_shutdown_timeout_probe")
@@ -225,6 +298,11 @@ fn repeated_shutdown_preserves_the_first_timeout_outcome() {
     assert_eq!(first, second);
     assert_eq!(first.timed_out_processes, vec![process]);
     assert!(!first.is_clean());
+    assert!(runtime.data_directory().is_some());
+    assert!(matches!(
+        data_directory.acquire_process_ownership(),
+        Err(DataDirectoryError::OwnershipHeld { .. })
+    ));
     assert!(
         elapsed < Duration::from_millis(250),
         "elapsed=[{elapsed:?}]"

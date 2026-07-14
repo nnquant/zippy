@@ -12,8 +12,8 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
 use zippy_core::{
-    default_control_endpoint, resolve_control_endpoint, ControlEndpoint, LogConfig, ZippyConfig,
-    ZippyError,
+    default_control_endpoint, resolve_control_endpoint, ControlEndpoint, LogConfig,
+    OwnedDataDirectory, ZippyConfig, ZippyError,
 };
 use zippy_gateway::{GatewayServer, GatewayServerConfig};
 
@@ -37,6 +37,7 @@ pub struct PreparedMasterRuntime {
     runtime_config: ZippyConfig,
     server: MasterServer,
     shutdown_timeout: Duration,
+    data_directory: Arc<OwnedDataDirectory>,
 }
 
 impl PreparedMasterRuntime {
@@ -60,13 +61,27 @@ impl PreparedMasterRuntime {
         self.shutdown_timeout
     }
 
+    /// Returns the process-owned managed server data directory.
+    pub fn data_directory(&self) -> &Arc<OwnedDataDirectory> {
+        &self.data_directory
+    }
+
     /// Consumes the prepared runtime into its owning components.
-    pub fn into_parts(self) -> (ControlEndpoint, ZippyConfig, MasterServer, Duration) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ControlEndpoint,
+        ZippyConfig,
+        MasterServer,
+        Duration,
+        Arc<OwnedDataDirectory>,
+    ) {
         (
             self.control_endpoint,
             self.runtime_config,
             self.server,
             self.shutdown_timeout,
+            self.data_directory,
         )
     }
 }
@@ -202,13 +217,26 @@ pub fn prepare_master_runtime(
     }
     let effective_log_level = runtime_config.log.level.clone();
 
-    if let Some(path) = control_endpoint.unix_path() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
-                reason: error.to_string(),
-            })?;
-        }
-    }
+    let snapshot_dir = control_endpoint.snapshot_dir();
+    std::fs::create_dir_all(&snapshot_dir).map_err(|error| ZippyError::Io {
+        reason: format!(
+            "create control endpoint state directory path=[{}] error=[{}]",
+            snapshot_dir.display(),
+            error
+        ),
+    })?;
+    let server_data_dir = runtime_config.server_data_dir(snapshot_dir.join("data"));
+    let data_directory = Arc::new(
+        OwnedDataDirectory::acquire_or_initialize(&server_data_dir).map_err(|error| {
+            ZippyError::Io {
+                reason: format!(
+                    "acquire managed server data directory path=[{}] error=[{}]",
+                    server_data_dir.display(),
+                    error
+                ),
+            }
+        })?,
+    );
     let control_endpoint_display = control_endpoint.display_string();
     let (control_host, control_port) = control_endpoint_host_port(&control_endpoint);
 
@@ -229,6 +257,8 @@ pub fn prepare_master_runtime(
         port = control_port.as_str(),
         log_dir = log_dir.display().to_string(),
         log_level = effective_log_level,
+        server_data_dir = data_directory.directory().root().display().to_string(),
+        server_data_owner_pid = data_directory.owner().pid(),
         table_row_capacity = runtime_config.table.row_capacity,
         table_persist_enabled = runtime_config.table.persist.enabled,
         table_persist_method = runtime_config.table.persist.method.as_str(),
@@ -243,10 +273,6 @@ pub fn prepare_master_runtime(
         "starting zippy master"
     );
 
-    let snapshot_dir = control_endpoint.snapshot_dir();
-    std::fs::create_dir_all(&snapshot_dir).map_err(|error| ZippyError::Io {
-        reason: error.to_string(),
-    })?;
     let snapshot_path = snapshot_dir.join("master-registry.json");
     let shutdown_timeout = Duration::from_millis(runtime_config.master.shutdown_timeout_ms);
 
@@ -294,6 +320,7 @@ pub fn prepare_master_runtime(
         runtime_config: server.runtime_config().clone(),
         server,
         shutdown_timeout,
+        data_directory,
     })
 }
 
