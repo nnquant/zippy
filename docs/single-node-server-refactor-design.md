@@ -1849,8 +1849,12 @@ fsync、取消清理和 symlink 拒绝。legacy registry snapshot 已迁入 data
 Parquet profile、footer provenance、`sha256-v1`、no-clobber publication 和 schema 预检。
 Catalog commit coordinator 已实现单 worker FIFO、64 条/128 MiB command/8 GiB candidate 默认预算、
 durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、取消安全和启动前恢复。
-orphan reconciliation、snapshot lease、logical drop、safe GC 以及权威 server table actor 接线尚未完成，
-因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。
+启动期 orphan reconciliation 已实现规范化物理扫描、durable intent 保护、`FileId + managed path`
+同事务双键 probe、全程 revision 稳定性检查以及只读分类报告；扫描、验证、intent 总字节和报告
+常驻元数据均有独立预算，多文件 intent 必须整体 exact 或整体 unreferenced。它刻意不删除文件，
+在线删除仍需 publication gate，普通历史文件删除还依赖 snapshot lease 和 Catalog GC 状态机。snapshot lease、
+logical drop、safe GC 以及权威 server table actor 接线尚未完成，因此 legacy metadata 仍是 server
+authority，不能把本段基础设施视为 Phase 3 验收完成。
 
 任务：
 

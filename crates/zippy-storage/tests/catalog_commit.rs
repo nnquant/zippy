@@ -534,6 +534,18 @@ async fn unpolled_and_oversized_requests_never_reach_the_worker() {
     let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
     let first = write_candidate(&writer, 20, 0, vec![100]);
     let second = write_candidate(&writer, 21, 1, vec![101]);
+    let oversized_template = write_candidate(&writer, 22, 2, vec![102]);
+    let error = CommitDataFilesIntent::new(
+        request_id(12),
+        table_id(TABLE),
+        1,
+        vec![oversized_template; 4_097],
+        OffsetWatermark::Known(LogOffset::new(2)),
+    )
+    .expect_err("more than 4,096 candidates must fail before journaling");
+    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+    assert!(intent_files(&root).is_empty());
+
     let catalog = Arc::new(FakeCatalog::new(FakeMode::Success));
     let coordinator = CatalogCommitCoordinator::start(
         CatalogCommitCoordinatorConfig::new().with_max_outstanding_command_bytes(1),

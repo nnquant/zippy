@@ -1,11 +1,14 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use zippy_core::{DataDirectoryError, DurableRemoveOutcome, OwnedDataDirectory};
 use zippy_types::catalog::{
     CatalogActorKind, CatalogCodec, CatalogCommandV1, VersionedCatalogCommand,
@@ -20,13 +23,79 @@ pub(crate) const COMMIT_INTENT_RECORD_VERSION: u32 = 1;
 const COMMIT_INTENT_DIRECTORY: &str = "wal/catalog-commit-intents";
 const MAX_PENDING_INTENT_FILES: usize = 65_536;
 const MAX_INTENT_RECORD_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_FILES_PER_COMMIT_INTENT: usize = 4_096;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredCommitIntentV1 {
+struct StoredCommitIntentV1<'a> {
     format_version: u32,
     sequence: u64,
-    command: serde_json::Value,
+    #[serde(borrow)]
+    command: &'a RawValue,
+}
+
+#[derive(Deserialize)]
+struct ReplayEnvelopePreflight<'a> {
+    #[serde(borrow)]
+    command: ReplayCommandPreflight<'a>,
+}
+
+#[derive(Deserialize)]
+struct ReplayCommandPreflight<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    command: CommitDataFilesPreflight,
+}
+
+#[derive(Deserialize)]
+struct CommitDataFilesPreflight {
+    files: PendingFilesPreflight,
+}
+
+struct PendingFilesPreflight {
+    count: usize,
+    serialized_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for PendingFilesPreflight {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(PendingFilesVisitor)
+    }
+}
+
+struct PendingFilesVisitor;
+
+impl<'de> Visitor<'de> for PendingFilesVisitor {
+    type Value = PendingFilesPreflight;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded sequence of pending data files")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut count = 0_usize;
+        let mut serialized_bytes = 0_u64;
+        while let Some(raw) = sequence.next_element::<&'de RawValue>()? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| de::Error::custom("pending file count overflow"))?;
+            let raw_bytes = u64::try_from(raw.get().len())
+                .map_err(|_| de::Error::custom("pending file JSON length is not addressable"))?;
+            serialized_bytes = serialized_bytes
+                .checked_add(raw_bytes)
+                .ok_or_else(|| de::Error::custom("pending file JSON byte count overflow"))?;
+        }
+        Ok(PendingFilesPreflight {
+            count,
+            serialized_bytes,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +109,9 @@ pub(crate) struct CommitIntentPath {
 pub(crate) struct DurableCommitIntent {
     pub(crate) path: CommitIntentPath,
     pub(crate) command: VersionedCatalogCommand,
+    pub(crate) record_size_bytes: u64,
+    pub(crate) pending_file_count: usize,
+    pub(crate) pending_file_serialized_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -53,6 +125,26 @@ impl CommitIntentJournal {
     }
 
     pub(crate) fn scan(&self) -> Result<(Vec<CommitIntentPath>, u64)> {
+        let (paths, next_sequence, _) =
+            self.scan_internal(true, MAX_PENDING_INTENT_FILES, usize::MAX)?;
+        Ok((paths, next_sequence))
+    }
+
+    pub(crate) fn scan_read_only(
+        &self,
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> Result<(Vec<CommitIntentPath>, Vec<ManagedDataPath>)> {
+        let (paths, _, temporary_paths) = self.scan_internal(false, max_entries, max_path_bytes)?;
+        Ok((paths, temporary_paths))
+    }
+
+    fn scan_internal(
+        &self,
+        remove_temporary_files: bool,
+        max_entries: usize,
+        max_path_bytes: usize,
+    ) -> Result<(Vec<CommitIntentPath>, u64, Vec<ManagedDataPath>)> {
         let directory = self
             .data_directory
             .directory()
@@ -61,7 +153,7 @@ impl CommitIntentJournal {
         match fs::symlink_metadata(&directory) {
             Ok(metadata) => validate_intent_directory(&directory, &metadata)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), 1));
+                return Ok((Vec::new(), 1, Vec::new()));
             }
             Err(error) => {
                 return Err(io_error(
@@ -77,9 +169,30 @@ impl CommitIntentJournal {
         };
 
         let mut paths = Vec::new();
+        let mut temporary_paths = Vec::new();
+        let mut entry_count = 0_usize;
+        let mut path_bytes = 0_usize;
         for entry in entries {
             let entry = entry
                 .map_err(|error| io_error("read catalog commit intent entry", &directory, error))?;
+            entry_count = entry_count.checked_add(1).ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "catalog commit intent entry count overflow",
+                )
+                .with_retryable(false)
+            })?;
+            let effective_max_entries = max_entries.min(MAX_PENDING_INTENT_FILES);
+            if entry_count > effective_max_entries {
+                return Err(ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "catalog commit intent entry count exceeds recovery limit maximum=[{}]",
+                        effective_max_entries
+                    ),
+                )
+                .with_retryable(false));
+            }
             let file_name = entry.file_name().into_string().map_err(|_| {
                 ServerError::new(
                     ErrorCode::DataCorruption,
@@ -88,22 +201,19 @@ impl CommitIntentJournal {
             })?;
             if is_temporary_intent(&file_name) {
                 let managed_path = managed_path_for_file(&file_name)?;
-                self.data_directory
-                    .remove_durable_file(&managed_path)
-                    .map_err(map_data_directory_error_for_intent)?;
+                charge_scan_path(&managed_path, &mut path_bytes, max_path_bytes)?;
+                if remove_temporary_files {
+                    self.data_directory
+                        .remove_durable_file(&managed_path)
+                        .map_err(map_data_directory_error_for_intent)?;
+                } else {
+                    temporary_paths.push(managed_path);
+                }
                 continue;
             }
-            if paths.len() >= MAX_PENDING_INTENT_FILES {
-                return Err(ServerError::new(
-                    ErrorCode::ResourceExhausted,
-                    format!(
-                        "catalog commit intent count exceeds recovery limit maximum=[{}]",
-                        MAX_PENDING_INTENT_FILES
-                    ),
-                )
-                .with_retryable(false));
-            }
-            paths.push(parse_intent_path(&file_name)?);
+            let path = parse_intent_path(&file_name)?;
+            charge_scan_path(&path.managed_path, &mut path_bytes, max_path_bytes)?;
+            paths.push(path);
         }
         paths.sort_unstable_by_key(|path| (path.sequence, path.request_id));
 
@@ -133,7 +243,8 @@ impl CommitIntentJournal {
                 .with_retryable(false)
             })
         })?;
-        Ok((paths, next_sequence))
+        temporary_paths.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok((paths, next_sequence, temporary_paths))
     }
 
     pub(crate) fn stage(
@@ -162,17 +273,18 @@ impl CommitIntentJournal {
             .with_request_id(request_id)
             .with_retryable(false)
         })?;
-        let command_value = serde_json::from_slice(&command_payload).map_err(|error| {
-            ServerError::new(
-                ErrorCode::Internal,
-                format!("decode freshly encoded catalog command JSON error=[{error}]"),
-            )
-            .with_request_id(request_id)
-        })?;
+        let command_value =
+            serde_json::from_slice::<Box<RawValue>>(&command_payload).map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    format!("decode freshly encoded catalog command JSON error=[{error}]"),
+                )
+                .with_request_id(request_id)
+            })?;
         let record = serde_json::to_vec(&StoredCommitIntentV1 {
             format_version: COMMIT_INTENT_RECORD_VERSION,
             sequence,
-            command: command_value,
+            command: &command_value,
         })
         .map_err(|error| {
             ServerError::new(
@@ -215,44 +327,85 @@ impl CommitIntentJournal {
     }
 
     pub(crate) fn load(&self, path: &CommitIntentPath) -> Result<DurableCommitIntent> {
+        self.load_with_limits(
+            path,
+            MAX_INTENT_RECORD_BYTES,
+            MAX_FILES_PER_COMMIT_INTENT,
+            u64::MAX,
+        )
+    }
+
+    pub(crate) fn load_with_limits(
+        &self,
+        path: &CommitIntentPath,
+        maximum_bytes: u64,
+        maximum_pending_files: usize,
+        maximum_pending_file_bytes: u64,
+    ) -> Result<DurableCommitIntent> {
         let absolute_path = self
             .data_directory
             .directory()
             .root()
             .join(path.managed_path.as_str());
-        let mut file = open_intent_file(&absolute_path)?;
+        let file = open_intent_file(&absolute_path)?;
         let metadata = file
             .metadata()
             .map_err(|error| io_error("inspect catalog commit intent", &absolute_path, error))?;
-        if metadata.len() > MAX_INTENT_RECORD_BYTES {
+        let effective_maximum = maximum_bytes.min(MAX_INTENT_RECORD_BYTES);
+        if metadata.len() > effective_maximum {
             return Err(ServerError::new(
                 ErrorCode::ResourceExhausted,
                 format!(
                     "catalog commit intent exceeds recovery byte limit actual=[{}] maximum=[{}]",
                     metadata.len(),
-                    MAX_INTENT_RECORD_BYTES
+                    effective_maximum
                 ),
             )
             .with_request_id(path.request_id)
             .with_retryable(false));
         }
-        let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        let capacity = usize::try_from(metadata.len().min(effective_maximum)).map_err(|_| {
             terminal_record_limit(
                 path.request_id,
                 "catalog commit intent length exceeds addressable memory",
             )
         })?;
         let mut bytes = Vec::with_capacity(capacity);
-        file.read_to_end(&mut bytes)
-            .map_err(|error| io_error("read catalog commit intent", &absolute_path, error))?;
-        let stored = serde_json::from_slice::<StoredCommitIntentV1>(&bytes).map_err(|error| {
-            corruption(format!(
-                "decode catalog commit intent failed path=[{}] error=[{}]",
-                absolute_path.display(),
-                error
-            ))
-            .with_request_id(path.request_id)
+        let read_limit = effective_maximum.checked_add(1).ok_or_else(|| {
+            terminal_record_limit(path.request_id, "catalog commit intent read limit overflow")
         })?;
+        file.take(read_limit)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("read catalog commit intent", &absolute_path, error))?;
+        let actual_record_bytes = u64::try_from(bytes.len()).map_err(|_| {
+            terminal_record_limit(
+                path.request_id,
+                "catalog commit intent bytes exceed addressable memory",
+            )
+        })?;
+        if actual_record_bytes > effective_maximum {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    concat!(
+                        "catalog commit intent grew beyond recovery byte limit ",
+                        "actual=[{}] maximum=[{}]"
+                    ),
+                    actual_record_bytes, effective_maximum
+                ),
+            )
+            .with_request_id(path.request_id)
+            .with_retryable(false));
+        }
+        let stored =
+            serde_json::from_slice::<StoredCommitIntentV1<'_>>(&bytes).map_err(|error| {
+                corruption(format!(
+                    "decode catalog commit intent failed path=[{}] error=[{}]",
+                    absolute_path.display(),
+                    error
+                ))
+                .with_request_id(path.request_id)
+            })?;
         if stored.format_version != COMMIT_INTENT_RECORD_VERSION || stored.sequence != path.sequence
         {
             return Err(corruption(format!(
@@ -261,22 +414,65 @@ impl CommitIntentJournal {
             ))
             .with_request_id(path.request_id));
         }
-        let command_payload = serde_json::to_vec(&stored.command).map_err(|error| {
-            corruption(format!(
-                "re-encode catalog commit intent command failed error=[{error}]"
-            ))
-            .with_request_id(path.request_id)
-        })?;
-        let command = CatalogCodec::decode_command(&command_payload).map_err(|error| {
+        let command_payload = stored.command.get().as_bytes();
+        let preflight = serde_json::from_slice::<ReplayEnvelopePreflight<'_>>(command_payload)
+            .map_err(|error| {
+                corruption(format!(
+                    "preflight frozen catalog commit intent failed error=[{error}]"
+                ))
+                .with_request_id(path.request_id)
+            })?;
+        if preflight.command.kind != "commit_data_files" {
+            return Err(
+                corruption("catalog commit intent contains a non-persist command")
+                    .with_request_id(path.request_id),
+            );
+        }
+        let effective_maximum_pending_files =
+            maximum_pending_files.min(MAX_FILES_PER_COMMIT_INTENT);
+        if preflight.command.command.files.count > effective_maximum_pending_files {
+            return Err(terminal_record_limit(
+                path.request_id,
+                format!(
+                    concat!(
+                        "catalog commit intent pending files exceed recovery limit ",
+                        "actual=[{}] maximum=[{}]"
+                    ),
+                    preflight.command.command.files.count, effective_maximum_pending_files
+                ),
+            ));
+        }
+        if preflight.command.command.files.serialized_bytes > maximum_pending_file_bytes {
+            return Err(terminal_record_limit(
+                path.request_id,
+                format!(
+                    concat!(
+                        "catalog commit intent pending file bytes exceed recovery limit ",
+                        "actual=[{}] maximum=[{}]"
+                    ),
+                    preflight.command.command.files.serialized_bytes, maximum_pending_file_bytes
+                ),
+            ));
+        }
+        let command = CatalogCodec::decode_command(command_payload).map_err(|error| {
             corruption(format!(
                 "decode frozen catalog commit intent command failed error=[{error}]"
             ))
             .with_request_id(path.request_id)
         })?;
         validate_replayable_command(path, &command)?;
+        if command_files(&command).len() != preflight.command.command.files.count {
+            return Err(corruption(
+                "catalog commit intent preflight and typed file counts do not match",
+            )
+            .with_request_id(path.request_id));
+        }
         Ok(DurableCommitIntent {
             path: path.clone(),
             command,
+            record_size_bytes: actual_record_bytes,
+            pending_file_count: preflight.command.command.files.count,
+            pending_file_serialized_bytes: preflight.command.command.files.serialized_bytes,
         })
     }
 
@@ -422,6 +618,27 @@ fn validate_replayable_command(
 fn command_request_id(command: &VersionedCatalogCommand) -> RequestId {
     let VersionedCatalogCommand::V1(envelope) = command;
     envelope.request_id
+}
+
+fn charge_scan_path(path: &ManagedDataPath, current: &mut usize, maximum: usize) -> Result<()> {
+    *current = current.checked_add(path.as_str().len()).ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "catalog commit intent path byte count overflow",
+        )
+        .with_retryable(false)
+    })?;
+    if *current > maximum {
+        return Err(ServerError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "catalog commit intent paths exceed recovery byte limit actual=[{}] maximum=[{}]",
+                *current, maximum
+            ),
+        )
+        .with_retryable(false));
+    }
+    Ok(())
 }
 
 pub(crate) fn command_files(

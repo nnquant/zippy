@@ -13,6 +13,7 @@ mod candidate;
 mod checksum;
 mod commit;
 mod commit_intent;
+mod reconcile;
 
 pub use candidate::{
     DurableParquetCandidate, ParquetCandidateSpec, ParquetCandidateWriter,
@@ -21,4 +22,8 @@ pub use candidate::{
 pub use commit::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,
     CommitDataFilesReceipt,
+};
+pub use reconcile::{
+    ReconciledFile, ReconciledFileDisposition, ReconciliationIssue, ReconciliationIssueKind,
+    StartupOrphanReconciler, StartupOrphanReconcilerConfig, StartupOrphanReconciliationReport,
 };

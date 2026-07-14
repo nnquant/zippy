@@ -1,5 +1,5 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use parquet::arrow::{arrow_to_parquet_schema, ArrowWriter};
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::format::KeyValue;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zippy_core::{DataDirectoryError, DurableFileTransaction, OwnedDataDirectory};
 use zippy_types::table::{
     DataFileLocation, DataFileProvenance, ManagedDataPath, MetadataMap, MetadataScalar,
@@ -35,6 +35,7 @@ const DICTIONARY_PAGE_SIZE_BYTES: usize = 1024 * 1024;
 const WRITE_BATCH_ROWS: usize = 1024;
 const METADATA_TRUNCATE_BYTES: usize = 64;
 const MAX_CANDIDATE_FOOTER_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_PARQUET_FOOTER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Immutable metadata fixed before writing one native Parquet candidate.
 #[derive(Debug, Clone)]
@@ -192,15 +193,16 @@ impl ParquetCandidateWriter {
     }
 }
 
-#[derive(Serialize)]
-struct StoredCandidateMetadataV1<'a> {
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCandidateMetadataV1 {
     format_version: u32,
     file_id: FileId,
     table_id: TableId,
     schema_version: u64,
-    provenance: &'a NativeDataFileProvenance,
-    partition: &'a MetadataMap,
-    metadata: &'a MetadataMap,
+    provenance: NativeDataFileProvenance,
+    partition: MetadataMap,
+    metadata: MetadataMap,
     created_at_ns: u64,
 }
 
@@ -221,9 +223,9 @@ fn encode_footer_metadata(spec: &ParquetCandidateSpec) -> Result<String> {
         file_id: spec.file_id,
         table_id: spec.table_id,
         schema_version: spec.schema_version,
-        provenance: &spec.provenance,
-        partition: &spec.partition,
-        metadata: &spec.metadata,
+        provenance: spec.provenance.clone(),
+        partition: spec.partition.clone(),
+        metadata: spec.metadata.clone(),
         created_at_ns: spec.created_at_ns,
     })
     .map_err(|error| {
@@ -439,7 +441,7 @@ fn inspect_existing_candidate(table_id: TableId, path: &Path) -> Result<(u64, St
     Ok((size, checksum))
 }
 
-fn open_existing_candidate(table_id: TableId, path: &Path) -> Result<(File, u64)> {
+pub(crate) fn open_existing_candidate(table_id: TableId, path: &Path) -> Result<(File, u64)> {
     let path_metadata = fs::symlink_metadata(path)
         .map_err(|error| io_error(table_id, "inspect existing candidate", path, error))?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
@@ -452,10 +454,7 @@ fn open_existing_candidate(table_id: TableId, path: &Path) -> Result<(File, u64)
         ));
     }
     validate_existing_file_security(table_id, path, &path_metadata)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|error| io_error(table_id, "open existing candidate", path, error))?;
+    let file = open_candidate_nofollow(table_id, path)?;
     let descriptor_metadata = file.metadata().map_err(|error| {
         io_error(
             table_id,
@@ -465,7 +464,162 @@ fn open_existing_candidate(table_id: TableId, path: &Path) -> Result<(File, u64)
         )
     })?;
     validate_same_file_identity(table_id, path, &path_metadata, &descriptor_metadata)?;
+    validate_existing_file_security(table_id, path, &descriptor_metadata)?;
     Ok((file, descriptor_metadata.len()))
+}
+
+#[cfg(unix)]
+fn open_candidate_nofollow(table_id: TableId, path: &Path) -> Result<File> {
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| {
+        io_error(
+            table_id,
+            "open existing candidate without following links",
+            path,
+            std::io::Error::from(error),
+        )
+    })?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_candidate_nofollow(table_id: TableId, path: &Path) -> Result<File> {
+    File::open(path).map_err(|error| io_error(table_id, "open existing candidate", path, error))
+}
+
+pub(crate) fn recover_parquet_candidate(
+    data_directory: &OwnedDataDirectory,
+    table_id: TableId,
+    file_id: FileId,
+    managed_path: ManagedDataPath,
+    expected_file_size_bytes: u64,
+) -> Result<DurableParquetCandidate> {
+    let path = data_directory
+        .directory()
+        .root()
+        .join(managed_path.as_str());
+    let (mut file, file_size_bytes) = open_existing_candidate(table_id, &path)?;
+    if file_size_bytes != expected_file_size_bytes {
+        return Err(corruption_error(
+            table_id,
+            &path,
+            None,
+            None,
+            "candidate size changed after the bounded startup scan",
+        ));
+    }
+    validate_parquet_footer_length(&mut file, file_size_bytes, table_id, &path)?;
+    let checksum = sha256_v1_reader(&mut file)
+        .map_err(|error| io_error(table_id, "checksum recovered candidate", &path, error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_error(table_id, "rewind recovered candidate", &path, error))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
+        corruption_error(
+            table_id,
+            &path,
+            None,
+            Some(checksum.clone()),
+            &format!("recovered candidate Parquet footer is invalid error=[{error}]"),
+        )
+    })?;
+    let parquet_metadata = builder.metadata();
+    if parquet_metadata.file_metadata().created_by() != Some(PARQUET_CREATED_BY) {
+        return Err(corruption_error(
+            table_id,
+            &path,
+            None,
+            Some(checksum),
+            "recovered candidate was not written by the frozen Zippy writer profile",
+        ));
+    }
+    let row_count = u64::try_from(parquet_metadata.file_metadata().num_rows())
+        .ok()
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| {
+            corruption_error(
+                table_id,
+                &path,
+                None,
+                Some(checksum.clone()),
+                "recovered candidate has an invalid row count",
+            )
+        })?;
+    let footer_json = parquet_metadata
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.key == CANDIDATE_FOOTER_METADATA_KEY)
+        })
+        .and_then(|entry| entry.value.as_deref())
+        .ok_or_else(|| {
+            corruption_error(
+                table_id,
+                &path,
+                None,
+                Some(checksum.clone()),
+                "recovered candidate is missing its Zippy footer envelope",
+            )
+        })?;
+    if footer_json.len() > MAX_CANDIDATE_FOOTER_METADATA_BYTES {
+        return Err(corruption_error(
+            table_id,
+            &path,
+            None,
+            Some(checksum),
+            "recovered candidate footer exceeds the metadata byte limit",
+        ));
+    }
+    let stored =
+        serde_json::from_str::<StoredCandidateMetadataV1>(footer_json).map_err(|error| {
+            corruption_error(
+                table_id,
+                &path,
+                None,
+                Some(checksum.clone()),
+                &format!("recovered candidate footer is invalid error=[{error}]"),
+            )
+        })?;
+    if stored.format_version != PARQUET_CANDIDATE_FORMAT_VERSION
+        || stored.file_id != file_id
+        || stored.table_id != table_id
+        || stored.schema_version == 0
+        || stored.provenance.offsets().len() != u128::from(row_count.get())
+    {
+        return Err(corruption_error(
+            table_id,
+            &path,
+            None,
+            Some(checksum),
+            "recovered candidate path, footer identity, schema, or offsets do not agree",
+        ));
+    }
+    let statistics = candidate_statistics(
+        parquet_metadata.num_row_groups(),
+        builder.schema().fields().len(),
+    )?;
+    Ok(DurableParquetCandidate {
+        pending: PendingDataFile {
+            file_id,
+            table_id,
+            schema_version: stored.schema_version,
+            location: DataFileLocation::Managed(managed_path),
+            file_size_bytes,
+            row_count,
+            provenance: DataFileProvenance::Native(stored.provenance),
+            partition: stored.partition,
+            statistics,
+            metadata: stored.metadata,
+            checksum,
+            created_at_ns: stored.created_at_ns,
+        },
+        path,
+    })
 }
 
 pub(crate) fn verify_pending_candidate(
@@ -490,8 +644,20 @@ pub(crate) fn verify_pending_candidate(
         .directory()
         .root()
         .join(managed_path.as_str());
-    let (actual_size, actual_checksum) = inspect_existing_candidate(pending.table_id, &path)?;
-    if actual_size != pending.file_size_bytes || actual_checksum != pending.checksum {
+    let (mut file, actual_size) = open_existing_candidate(pending.table_id, &path)?;
+    if actual_size != pending.file_size_bytes {
+        return Err(corruption_error(
+            pending.table_id,
+            &path,
+            Some(pending.checksum.clone()),
+            None,
+            "pending candidate size changed before verification",
+        ));
+    }
+    validate_parquet_footer_length(&mut file, actual_size, pending.table_id, &path)?;
+    let actual_checksum = sha256_v1_reader(&mut file)
+        .map_err(|error| io_error(pending.table_id, "checksum pending candidate", &path, error))?;
+    if actual_checksum != pending.checksum {
         return Err(corruption_error(
             pending.table_id,
             &path,
@@ -501,8 +667,9 @@ pub(crate) fn verify_pending_candidate(
         ));
     }
 
-    let (footer_file, _) = open_existing_candidate(pending.table_id, &path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(footer_file).map_err(|error| {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| io_error(pending.table_id, "rewind pending candidate", &path, error))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
         corruption_error(
             pending.table_id,
             &path,
@@ -563,9 +730,9 @@ pub(crate) fn verify_pending_candidate(
         file_id: pending.file_id,
         table_id: pending.table_id,
         schema_version: pending.schema_version,
-        provenance,
-        partition: &pending.partition,
-        metadata: &pending.metadata,
+        provenance: provenance.clone(),
+        partition: pending.partition.clone(),
+        metadata: pending.metadata.clone(),
         created_at_ns: pending.created_at_ns,
     })
     .map_err(|error| {
@@ -584,6 +751,62 @@ pub(crate) fn verify_pending_candidate(
             "candidate Parquet footer does not match its pending descriptor",
         ));
     }
+    Ok(())
+}
+
+fn validate_parquet_footer_length(
+    file: &mut File,
+    file_size_bytes: u64,
+    table_id: TableId,
+    path: &Path,
+) -> Result<()> {
+    if file_size_bytes < 8 {
+        return Err(corruption_error(
+            table_id,
+            path,
+            None,
+            None,
+            "candidate is shorter than the Parquet footer trailer",
+        ));
+    }
+    file.seek(SeekFrom::End(-8))
+        .map_err(|error| io_error(table_id, "seek candidate footer trailer", path, error))?;
+    let mut trailer = [0_u8; 8];
+    file.read_exact(&mut trailer)
+        .map_err(|error| io_error(table_id, "read candidate footer trailer", path, error))?;
+    if &trailer[4..] != b"PAR1" {
+        return Err(corruption_error(
+            table_id,
+            path,
+            None,
+            None,
+            "candidate lacks the canonical Parquet footer magic",
+        ));
+    }
+    let footer_bytes = u64::from(u32::from_le_bytes([
+        trailer[0], trailer[1], trailer[2], trailer[3],
+    ]));
+    let footer_exceeds_file = match footer_bytes.checked_add(8) {
+        Some(required) => required > file_size_bytes,
+        None => true,
+    };
+    if footer_bytes > MAX_PARQUET_FOOTER_BYTES || footer_exceeds_file {
+        return Err(corruption_error(
+            table_id,
+            path,
+            None,
+            None,
+            "candidate Parquet footer length is outside the recovery budget",
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        io_error(
+            table_id,
+            "rewind candidate after footer preflight",
+            path,
+            error,
+        )
+    })?;
     Ok(())
 }
 

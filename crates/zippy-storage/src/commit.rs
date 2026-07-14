@@ -13,7 +13,7 @@ use zippy_types::catalog::{
 use zippy_types::table::{SnapshotOperation, TableSnapshot};
 use zippy_types::{ErrorCode, OffsetWatermark, RequestId, Result, ServerError, TableId};
 
-use crate::commit_intent::{CommitIntentJournal, DurableCommitIntent};
+use crate::commit_intent::{CommitIntentJournal, DurableCommitIntent, MAX_FILES_PER_COMMIT_INTENT};
 use crate::DurableParquetCandidate;
 
 const DEFAULT_MAX_OUTSTANDING_COMMITS: usize = 64;
@@ -123,6 +123,18 @@ impl CommitDataFilesIntent {
                     .with_request_id(request_id)
                     .with_table_id(table_id),
             );
+        }
+        if candidates.len() > MAX_FILES_PER_COMMIT_INTENT {
+            return Err(terminal_resource(format!(
+                concat!(
+                    "catalog data-file commit candidate count exceeds maximum ",
+                    "actual=[{}] maximum=[{}]"
+                ),
+                candidates.len(),
+                MAX_FILES_PER_COMMIT_INTENT
+            ))
+            .with_request_id(request_id)
+            .with_table_id(table_id));
         }
         if !matches!(committed_log_offset, OffsetWatermark::Known(_)) {
             return Err(terminal_invalid(
