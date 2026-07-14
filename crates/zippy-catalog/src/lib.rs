@@ -22,6 +22,9 @@ mod storage_codec;
 mod table_domain;
 
 pub use service::SqliteCatalog;
+pub use storage_codec::{
+    decode_persisted_schema, decode_persisted_table_schema, DecodedPersistedTableSchema,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};

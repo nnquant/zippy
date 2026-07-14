@@ -2342,6 +2342,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zippy-ingest"
+version = "0.5.0"
+dependencies = [
+ "arrow",
+ "tokio",
+ "zippy-types",
+]
+
+[[package]]
 name = "zippy-io"
 version = "0.5.0"
 dependencies = [
@@ -2456,6 +2465,7 @@ dependencies = [
  "zippy-catalog",
  "zippy-core",
  "zippy-gateway",
+ "zippy-ingest",
  "zippy-master",
  "zippy-storage",
  "zippy-types",

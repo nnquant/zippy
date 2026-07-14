@@ -412,7 +412,10 @@ fn table_reference_bytes(table_ref: &TableRef) -> usize {
     }
 }
 
-fn validate_table_schema(schema: &SchemaRef, definition: &TableDefinition) -> Result<()> {
+pub(crate) fn validate_table_schema(
+    schema: &SchemaRef,
+    definition: &TableDefinition,
+) -> Result<()> {
     if schema.fields().len() > MAX_SCHEMA_FIELDS {
         return Err(ServerError::new(
             ErrorCode::ResourceExhausted,

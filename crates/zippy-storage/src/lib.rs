@@ -21,6 +21,7 @@ pub use candidate::{
     CANDIDATE_FOOTER_METADATA_KEY, PARQUET_CANDIDATE_FORMAT_VERSION,
 };
 pub use catalog_verify::{
+    StartupActiveTableBootstrapDescriptor, StartupCatalogBootstrap,
     StartupCatalogFileVerificationReport, StartupCatalogFileVerifier,
     StartupCatalogFileVerifierConfig,
 };

@@ -1,13 +1,18 @@
 //! Bounded startup verification of Catalog-visible managed Parquet files.
 
+use std::io::Write;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use serde::Serialize;
 use zippy_core::OwnedDataDirectory;
 use zippy_types::catalog::{
     CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, ListTablesRequest,
 };
-use zippy_types::table::DataFileLocation;
+use zippy_types::table::{
+    DataFileLocation, SchemaCompatibility, SchemaDescriptor, TableDescriptor, TableSnapshot,
+    TableState,
+};
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
 use crate::candidate::verify_catalog_visible_candidate;
@@ -17,11 +22,13 @@ const DEFAULT_TABLE_PAGE_SIZE: u32 = 512;
 const DEFAULT_SNAPSHOT_BATCH_SIZE: usize = 512;
 const DEFAULT_MAX_MANAGED_FILES: usize = 65_536;
 const DEFAULT_MAX_VERIFICATION_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_RUNTIME_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TABLES: usize = 1_000_000;
 const MAX_TABLE_PAGE_SIZE: u32 = 4_096;
 const MAX_SNAPSHOT_BATCH_SIZE: usize = 4_096;
 const MAX_MANAGED_FILES: usize = 1_000_000;
 const MAX_VERIFICATION_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
+const MAX_RUNTIME_METADATA_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Resource bounds for one Catalog-to-physical startup verification pass.
 #[derive(Debug, Clone)]
@@ -31,6 +38,7 @@ pub struct StartupCatalogFileVerifierConfig {
     snapshot_batch_size: usize,
     max_managed_files: usize,
     max_verification_bytes: u64,
+    max_runtime_metadata_bytes: u64,
 }
 
 impl Default for StartupCatalogFileVerifierConfig {
@@ -41,6 +49,7 @@ impl Default for StartupCatalogFileVerifierConfig {
             snapshot_batch_size: DEFAULT_SNAPSHOT_BATCH_SIZE,
             max_managed_files: DEFAULT_MAX_MANAGED_FILES,
             max_verification_bytes: DEFAULT_MAX_VERIFICATION_BYTES,
+            max_runtime_metadata_bytes: DEFAULT_MAX_RUNTIME_METADATA_BYTES,
         }
     }
 }
@@ -86,6 +95,23 @@ impl StartupCatalogFileVerifierConfig {
         self.max_verification_bytes = maximum;
         self
     }
+
+    /// Sets the aggregate retained runtime metadata and schema byte budget.
+    ///
+    /// The verifier charges retained descriptors and raw schema IPC. The server
+    /// uses the same validated limit when it adds each decoded Arrow schema's
+    /// conservative retained-memory charge before publishing table runtimes.
+    #[must_use]
+    pub const fn with_max_runtime_metadata_bytes(mut self, maximum: u64) -> Self {
+        self.max_runtime_metadata_bytes = maximum;
+        self
+    }
+
+    /// Returns the aggregate retained runtime metadata and schema byte budget.
+    #[must_use]
+    pub const fn max_runtime_metadata_bytes(&self) -> u64 {
+        self.max_runtime_metadata_bytes
+    }
 }
 
 /// Revision-stable evidence from one Catalog-to-physical startup verification.
@@ -99,6 +125,35 @@ pub struct StartupCatalogFileVerificationReport {
     pub managed_file_count: usize,
     /// Aggregate physical bytes checksummed and footer-validated.
     pub verified_bytes: u64,
+}
+
+/// Runtime metadata required to bootstrap one active table actor.
+///
+/// Visible data-file descriptors are deliberately excluded because startup
+/// file verification owns them only for the duration of its bounded batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupActiveTableBootstrapDescriptor {
+    /// The active persistent table descriptor.
+    pub table: TableDescriptor,
+    /// The exact current schema selected at the startup Catalog revision.
+    pub schema: SchemaDescriptor,
+    /// The exact current persisted snapshot selected at the same revision.
+    pub snapshot: TableSnapshot,
+}
+
+/// Atomic, revision-stable output of Catalog verification and runtime bootstrap loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupCatalogBootstrap {
+    /// Physical verification evidence for the same Catalog revision.
+    pub verification: StartupCatalogFileVerificationReport,
+    /// All active tables ordered by immutable table identifier.
+    pub active_tables: Vec<StartupActiveTableBootstrapDescriptor>,
+    /// Aggregate charged bytes retained directly by `active_tables`.
+    ///
+    /// Table, snapshot, and schema metadata use their JSON-encoded size while
+    /// schema IPC uses its raw byte length. The server adds decoded Arrow schema
+    /// charges against the same configured limit before runtime publication.
+    pub runtime_metadata_bytes: u64,
 }
 
 /// Verifies every current Catalog-visible managed file before read admission opens.
@@ -134,7 +189,17 @@ impl StartupCatalogFileVerifier {
     }
 
     /// Reads current snapshots and verifies every visible managed Parquet descriptor.
+    ///
+    /// This compatibility wrapper discards the bounded runtime bootstrap descriptors.
     pub async fn verify(&self) -> Result<StartupCatalogFileVerificationReport> {
+        Ok(self.verify_with_bootstrap().await?.verification)
+    }
+
+    /// Verifies visible files and atomically loads all active runtime table descriptors.
+    ///
+    /// The returned descriptors exclude visible files and are published only after
+    /// every page, snapshot batch, physical file, and the ending revision guard pass.
+    pub async fn verify_with_bootstrap(&self) -> Result<StartupCatalogBootstrap> {
         validate_config(&self.config)?;
         let page_limit = NonZeroU32::new(self.config.table_page_size)
             .expect("validated table page size is nonzero");
@@ -143,6 +208,8 @@ impl StartupCatalogFileVerifier {
         let mut table_count = 0_usize;
         let mut managed_file_count = 0_usize;
         let mut verified_bytes = 0_u64;
+        let mut runtime_metadata_bytes = 0_u64;
+        let mut active_tables = Vec::new();
 
         loop {
             let page = self
@@ -175,11 +242,19 @@ impl StartupCatalogFileVerifier {
                     schema_version: table.current_schema_version,
                 })
                 .collect::<Vec<_>>();
-            for batch in selectors.chunks(self.config.snapshot_batch_size) {
+            for (batch_index, batch) in selectors
+                .chunks(self.config.snapshot_batch_size)
+                .enumerate()
+            {
                 let snapshot = self.catalog.read_snapshot_at(batch).await?;
                 bind_revision(&mut catalog_revision, snapshot.catalog_revision())?;
-                validate_snapshot_response(batch, &snapshot)?;
+                let first_table = batch_index
+                    .checked_mul(self.config.snapshot_batch_size)
+                    .expect("validated bounded batch index cannot overflow");
+                let expected_tables = &page.tables[first_table..first_table + batch.len()];
+                validate_snapshot_response(batch, expected_tables, &snapshot)?;
                 let (batch_files, batch_bytes) = measure_managed_files(&snapshot)?;
+                let batch_runtime_metadata_bytes = measure_runtime_metadata(&snapshot)?;
                 let next_files = managed_file_count
                     .checked_add(batch_files)
                     .ok_or_else(|| resource("startup managed file count overflow"))?;
@@ -204,6 +279,28 @@ impl StartupCatalogFileVerifier {
                         next_bytes, self.config.max_verification_bytes
                     )));
                 }
+                let next_runtime_metadata_bytes = runtime_metadata_bytes
+                    .checked_add(batch_runtime_metadata_bytes)
+                    .ok_or_else(|| resource("startup runtime metadata byte count overflow"))?;
+                if next_runtime_metadata_bytes > self.config.max_runtime_metadata_bytes {
+                    return Err(resource(format!(
+                        concat!(
+                            "startup runtime metadata exceeds byte budget ",
+                            "actual=[{}] maximum=[{}]"
+                        ),
+                        next_runtime_metadata_bytes, self.config.max_runtime_metadata_bytes
+                    )));
+                }
+
+                let batch_active_tables = snapshot
+                    .tables()
+                    .iter()
+                    .map(|table| StartupActiveTableBootstrapDescriptor {
+                        table: table.table().clone(),
+                        schema: table.schema().clone(),
+                        snapshot: table.snapshot().clone(),
+                    })
+                    .collect::<Vec<_>>();
 
                 let data_directory = Arc::clone(&self.data_directory);
                 tokio::task::spawn_blocking(move || {
@@ -213,6 +310,8 @@ impl StartupCatalogFileVerifier {
                 .map_err(|error| join_error("verify Catalog-visible managed files", error))??;
                 managed_file_count = next_files;
                 verified_bytes = next_bytes;
+                runtime_metadata_bytes = next_runtime_metadata_bytes;
+                active_tables.extend(batch_active_tables);
             }
 
             match page.next_after {
@@ -227,11 +326,15 @@ impl StartupCatalogFileVerifier {
         if ending_revision != catalog_revision {
             return Err(revision_changed(catalog_revision, ending_revision));
         }
-        Ok(StartupCatalogFileVerificationReport {
-            catalog_revision,
-            table_count,
-            managed_file_count,
-            verified_bytes,
+        Ok(StartupCatalogBootstrap {
+            verification: StartupCatalogFileVerificationReport {
+                catalog_revision,
+                table_count,
+                managed_file_count,
+                verified_bytes,
+            },
+            active_tables,
+            runtime_metadata_bytes,
         })
     }
 }
@@ -267,6 +370,11 @@ fn validate_table_page(
             "catalog table page is not strictly ordered after its cursor",
         ));
     }
+    if tables.iter().any(|table| table.state != TableState::Active) {
+        return Err(corruption(
+            "catalog active table page contains a non-active descriptor",
+        ));
+    }
     if let Some(next_after) = next_after {
         if tables.last().map(|table| table.table_id) != Some(next_after) {
             return Err(corruption(
@@ -279,17 +387,24 @@ fn validate_table_page(
 
 fn validate_snapshot_response(
     selectors: &[CatalogSnapshotSelector],
+    expected_tables: &[TableDescriptor],
     snapshot: &CatalogQuerySnapshot,
 ) -> Result<()> {
     if selectors.len() != snapshot.tables().len()
+        || expected_tables.len() != snapshot.tables().len()
         || !selectors
             .iter()
             .zip(snapshot.tables())
             .all(|(selector, table)| selector == table.selector())
+        || !expected_tables
+            .iter()
+            .zip(snapshot.tables())
+            .all(|(expected, table)| expected == table.table())
     {
-        return Err(corruption(
-            "catalog current snapshot response is not dense or selector-aligned",
-        ));
+        return Err(corruption(concat!(
+            "catalog current snapshot response is not dense, selector-aligned, ",
+            "or table-descriptor-aligned"
+        )));
     }
     Ok(())
 }
@@ -310,6 +425,78 @@ fn measure_managed_files(snapshot: &CatalogQuerySnapshot) -> Result<(usize, u64)
         }
     }
     Ok((files, bytes))
+}
+
+#[derive(Serialize)]
+struct RuntimeSchemaMetadata<'a> {
+    table_id: TableId,
+    schema_version: u64,
+    schema_hash: &'a str,
+    compatibility: SchemaCompatibility,
+    created_at_ns: u64,
+}
+
+#[derive(Serialize)]
+struct RuntimeTableMetadata<'a> {
+    table: &'a TableDescriptor,
+    schema: RuntimeSchemaMetadata<'a>,
+    snapshot: &'a TableSnapshot,
+}
+
+#[derive(Default)]
+struct SerializedByteCounter {
+    bytes: u64,
+}
+
+impl Write for SerializedByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let additional = u64::try_from(buffer.len()).map_err(|_| {
+            std::io::Error::other("serialized runtime metadata chunk exceeds addressable bytes")
+        })?;
+        self.bytes = self
+            .bytes
+            .checked_add(additional)
+            .ok_or_else(|| std::io::Error::other("runtime metadata byte count overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_runtime_metadata(snapshot: &CatalogQuerySnapshot) -> Result<u64> {
+    let mut total = 0_u64;
+    for table in snapshot.tables() {
+        let schema = table.schema();
+        let metadata = RuntimeTableMetadata {
+            table: table.table(),
+            schema: RuntimeSchemaMetadata {
+                table_id: schema.table_id,
+                schema_version: schema.schema_version,
+                schema_hash: &schema.schema_hash,
+                compatibility: schema.compatibility,
+                created_at_ns: schema.created_at_ns,
+            },
+            snapshot: table.snapshot(),
+        };
+        let mut counter = SerializedByteCounter::default();
+        serde_json::to_writer(&mut counter, &metadata).map_err(|error| {
+            resource(format!(
+                "measure startup runtime metadata failed error=[{error}]"
+            ))
+        })?;
+        let schema_ipc_bytes = u64::try_from(schema.schema_ipc.as_bytes().len())
+            .map_err(|_| resource("startup schema IPC exceeds addressable bytes"))?;
+        let descriptor_bytes = counter
+            .bytes
+            .checked_add(schema_ipc_bytes)
+            .ok_or_else(|| resource("startup runtime metadata byte count overflow"))?;
+        total = total
+            .checked_add(descriptor_bytes)
+            .ok_or_else(|| resource("startup runtime metadata byte count overflow"))?;
+    }
+    Ok(total)
 }
 
 fn verify_snapshot_files(
@@ -362,6 +549,17 @@ fn validate_config(config: &StartupCatalogFileVerifierConfig) -> Result<()> {
                 "actual=[{}] maximum=[{}]"
             ),
             config.max_verification_bytes, MAX_VERIFICATION_BYTES
+        )));
+    }
+    if config.max_runtime_metadata_bytes == 0
+        || config.max_runtime_metadata_bytes > MAX_RUNTIME_METADATA_BYTES
+    {
+        return Err(invalid(format!(
+            concat!(
+                "startup runtime metadata budget is outside supported range ",
+                "actual=[{}] maximum=[{}]"
+            ),
+            config.max_runtime_metadata_bytes, MAX_RUNTIME_METADATA_BYTES
         )));
     }
     Ok(())

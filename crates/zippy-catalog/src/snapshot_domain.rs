@@ -17,8 +17,8 @@ use zippy_types::{ErrorCode, FileId, LogOffset, OffsetRange, Result, ServerError
 
 use crate::encoding::{decode_offset_watermark, decode_optional_u64, decode_u64};
 use crate::storage_codec::{
-    canonical_schema_hash, decode_data_file_metadata_blob, decode_data_file_partition_blob,
-    decode_data_file_statistics_blob, decode_schema_ipc_stream, decode_snapshot_summary_blob,
+    decode_data_file_metadata_blob, decode_data_file_partition_blob,
+    decode_data_file_statistics_blob, decode_persisted_schema, decode_snapshot_summary_blob,
 };
 
 const MAX_SNAPSHOT_SELECTORS: usize = 4_096;
@@ -411,32 +411,18 @@ fn read_schema(
             "catalog schema initial compatibility does not match its version",
         ));
     }
-    let decoded_schema = decode_schema_ipc_stream(&schema_ipc).map_err(|error| {
-        corruption(format!(
-            "persisted catalog schema IPC is invalid error=[{error}]"
-        ))
-    })?;
-    let actual_hash = canonical_schema_hash(&decoded_schema).map_err(|error| {
-        corruption(format!(
-            "persisted catalog schema cannot be hashed error=[{error}]"
-        ))
-    })?;
-    if actual_hash != schema_hash {
-        return Err(corruption(format!(
-            "catalog schema hash mismatch expected=[{}] actual=[{}]",
-            schema_hash, actual_hash
-        )));
-    }
     let schema_ipc = SchemaIpcPayload::new(schema_ipc)
         .map_err(|error| corruption(format!("catalog schema IPC is invalid error=[{error}]")))?;
-    Ok(SchemaDescriptor {
+    let descriptor = SchemaDescriptor {
         table_id: decoded_table_id,
         schema_version: decoded_version,
         schema_ipc,
         schema_hash,
         compatibility,
         created_at_ns: decode_u64(&created_at_ns)?,
-    })
+    };
+    decode_persisted_schema(&descriptor)?;
+    Ok(descriptor)
 }
 
 fn read_snapshot(

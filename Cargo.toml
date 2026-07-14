@@ -8,6 +8,7 @@ members = [
     "crates/zippy-engines",
     "crates/zippy-io",
     "crates/zippy-gateway",
+    "crates/zippy-ingest",
     "crates/zippy-python",
     "crates/zippy-perf",
     "crates/zippy-master",

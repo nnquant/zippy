@@ -5,17 +5,22 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+use zippy_catalog::{decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::OwnedDataDirectory;
+use zippy_ingest::{
+    TableActorAdmissionControl, TableActorHandle, TableActorRegistry, TableActorRegistryConfig,
+    TableActorRegistryHandle, TableRuntimeBootstrap, TableRuntimeRegistry,
+};
 use zippy_storage::{
-    CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, StartupCatalogFileVerificationReport,
-    StartupCatalogFileVerifier, StartupCatalogFileVerifierConfig, StartupOrphanReconciler,
-    StartupOrphanReconcilerConfig, StartupOrphanReconciliationReport,
+    CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, StartupCatalogBootstrap,
+    StartupCatalogFileVerificationReport, StartupCatalogFileVerifier,
+    StartupCatalogFileVerifierConfig, StartupOrphanReconciler, StartupOrphanReconcilerConfig,
+    StartupOrphanReconciliationReport,
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogFileRead, CatalogRead, CatalogWrite,
 };
-use zippy_types::{ErrorCode, Result, ServerError};
+use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
 const SUPERVISOR_THREAD_NAME: &str = "zippy-native-storage";
 const REAPER_THREAD_NAME: &str = "zippy-native-storage-reaper";
@@ -30,6 +35,7 @@ pub struct NativeStorageRuntimeConfig {
     coordinator: CatalogCommitCoordinatorConfig,
     reconciliation: StartupOrphanReconcilerConfig,
     catalog_file_verification: StartupCatalogFileVerifierConfig,
+    table_actors: TableActorRegistryConfig,
     actor: CatalogActor,
 }
 
@@ -43,6 +49,7 @@ impl NativeStorageRuntimeConfig {
             coordinator: CatalogCommitCoordinatorConfig::new(),
             reconciliation: StartupOrphanReconcilerConfig::new(),
             catalog_file_verification: StartupCatalogFileVerifierConfig::new(),
+            table_actors: TableActorRegistryConfig::new(),
             actor: CatalogActor {
                 kind: CatalogActorKind::Server,
                 principal: DEFAULT_SERVER_ACTOR_PRINCIPAL.to_owned(),
@@ -88,6 +95,13 @@ impl NativeStorageRuntimeConfig {
         self
     }
 
+    /// Replaces the bounded per-table actor admission policy.
+    #[must_use]
+    pub fn with_table_actor_config(mut self, table_actors: TableActorRegistryConfig) -> Self {
+        self.table_actors = table_actors;
+        self
+    }
+
     /// Replaces the audited server principal used for recovered Catalog commits.
     #[must_use]
     pub fn with_actor(mut self, actor: CatalogActor) -> Self {
@@ -106,6 +120,7 @@ impl NativeStorageRuntimeConfig {
                 "native storage commit recovery requires a server Catalog actor",
             ));
         }
+        self.table_actors.validate()?;
         Ok(())
     }
 }
@@ -262,6 +277,8 @@ impl NativeStorageStartup {
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
+            table_actors: ready.table_actors,
+            table_actor_admission: ready.table_actor_admission,
             shutdown: self.shutdown.take(),
             completion: self.completion.take(),
             supervisor: self.supervisor.take(),
@@ -309,6 +326,8 @@ impl NativeStorageShutdownOutcome {
 pub struct NativeStorageRuntime {
     report: StartupOrphanReconciliationReport,
     catalog_file_verification: StartupCatalogFileVerificationReport,
+    table_actors: TableActorRegistryHandle,
+    table_actor_admission: TableActorAdmissionControl,
     shutdown: Option<watch::Sender<bool>>,
     completion: Option<mpsc::Receiver<Result<()>>>,
     supervisor: Option<JoinHandle<()>>,
@@ -365,12 +384,30 @@ impl NativeStorageRuntime {
         &self.catalog_file_verification
     }
 
+    /// Returns the number of active native table runtimes recovered before readiness.
+    #[must_use]
+    pub fn table_runtime_count(&self) -> usize {
+        self.table_actors.len()
+    }
+
+    /// Returns the Catalog revision shared by every recovered native table runtime.
+    #[must_use]
+    pub const fn table_runtime_catalog_revision(&self) -> u64 {
+        self.table_actors.catalog_revision()
+    }
+
+    /// Resolves the server-owned serial actor for one active native table.
+    pub fn table_actor(&self, table_id: TableId) -> Result<TableActorHandle> {
+        self.table_actors.table(table_id)
+    }
+
     /// Irreversibly closes native work admission and requests ordered background cleanup.
     pub fn begin_shutdown(&mut self) {
         if self.shutdown_requested {
             return;
         }
         self.shutdown_requested = true;
+        self.table_actor_admission.close();
         signal_shutdown(self.shutdown.as_ref());
     }
 
@@ -450,6 +487,8 @@ impl Drop for NativeStorageRuntime {
 struct SupervisorReady {
     reconciliation: StartupOrphanReconciliationReport,
     catalog_file_verification: StartupCatalogFileVerificationReport,
+    table_actors: TableActorRegistryHandle,
+    table_actor_admission: TableActorAdmissionControl,
 }
 
 fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageStartup> {
@@ -525,14 +564,14 @@ async fn supervise_storage(
     if shutdown_requested(&shutdown) {
         return (
             false,
-            fail_startup(startup_cancelled(), None, catalog).await,
+            fail_startup(startup_cancelled(), None, None, catalog).await,
         );
     }
 
     let pre_replay =
         match reconcile_once(&config, Arc::clone(&catalog), &mut shutdown, "pre-replay").await {
             Ok(report) => report,
-            Err(error) => return (false, fail_startup(error, None, catalog).await),
+            Err(error) => return (false, fail_startup(error, None, None, catalog).await),
         };
     tracing::info!(
         component = "native_storage",
@@ -558,14 +597,17 @@ async fn supervise_storage(
     .await
     {
         Ok(coordinator) => coordinator,
-        Err(error) => return (false, fail_startup(error, None, catalog).await),
+        Err(error) => return (false, fail_startup(error, None, None, catalog).await),
     };
 
     let post_replay =
         match reconcile_once(&config, Arc::clone(&catalog), &mut shutdown, "post-replay").await {
             Ok(report) => report,
             Err(error) => {
-                return (false, fail_startup(error, Some(coordinator), catalog).await);
+                return (
+                    false,
+                    fail_startup(error, None, Some(coordinator), catalog).await,
+                );
             }
         };
     tracing::info!(
@@ -579,30 +621,105 @@ async fn supervise_storage(
         "native storage post-replay reconciliation completed"
     );
 
-    let catalog_file_verification =
+    let catalog_bootstrap =
         match verify_catalog_files_once(&config, Arc::clone(&catalog), &mut shutdown).await {
-            Ok(report) => report,
-            Err(error) => return (false, fail_startup(error, Some(coordinator), catalog).await),
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                return (
+                    false,
+                    fail_startup(error, None, Some(coordinator), catalog).await,
+                );
+            }
         };
+    let catalog_file_verification = catalog_bootstrap.verification.clone();
     if catalog_file_verification.catalog_revision != post_replay.catalog_revision {
         let error = ServerError::new(
             ErrorCode::Conflict,
             format!(
                 concat!(
-                    "Catalog revision changed between startup reconciliation and physical ",
+                    "catalog revision changed between startup reconciliation and physical ",
                     "verification reconciliation_revision=[{}] verification_revision=[{}]"
                 ),
                 post_replay.catalog_revision, catalog_file_verification.catalog_revision
             ),
         )
         .with_retryable(true);
-        return (false, fail_startup(error, Some(coordinator), catalog).await);
+        return (
+            false,
+            fail_startup(error, None, Some(coordinator), catalog).await,
+        );
+    }
+
+    let table_runtimes = match build_table_runtime_registry(
+        catalog_bootstrap,
+        config
+            .catalog_file_verification
+            .max_runtime_metadata_bytes(),
+    ) {
+        Ok(registry) => registry,
+        Err(error) => {
+            return (
+                false,
+                fail_startup(error, None, Some(coordinator), catalog).await,
+            );
+        }
+    };
+    let table_actors = match TableActorRegistry::start(config.table_actors.clone(), table_runtimes)
+    {
+        Ok(registry) => registry,
+        Err(error) => {
+            return (
+                false,
+                fail_startup(error, None, Some(coordinator), catalog).await,
+            );
+        }
+    };
+    if shutdown_requested(&shutdown) {
+        return (
+            false,
+            fail_startup(
+                startup_cancelled(),
+                Some(table_actors),
+                Some(coordinator),
+                catalog,
+            )
+            .await,
+        );
+    }
+    let table_actor_handle = table_actors.handle();
+    let table_actor_admission = table_actors.admission_control();
+    let final_revision = match wait_for_startup_stage(&mut shutdown, catalog.revision()).await {
+        Ok(revision) => revision,
+        Err(error) => {
+            return (
+                false,
+                fail_startup(error, Some(table_actors), Some(coordinator), catalog).await,
+            );
+        }
+    };
+    if final_revision != table_actor_handle.catalog_revision() {
+        let error = ServerError::new(
+            ErrorCode::Conflict,
+            format!(
+                concat!(
+                    "catalog revision changed while constructing table actors ",
+                    "expected=[{}] actual=[{}]"
+                ),
+                table_actor_handle.catalog_revision(),
+                final_revision
+            ),
+        )
+        .with_retryable(true);
+        return (
+            false,
+            fail_startup(error, Some(table_actors), Some(coordinator), catalog).await,
+        );
     }
     tracing::info!(
         component = "native_storage",
         event = "native_storage_ready",
-        catalog_revision = catalog_file_verification.catalog_revision,
-        tables = catalog_file_verification.table_count,
+        catalog_revision = table_actor_handle.catalog_revision(),
+        tables = table_actor_handle.len(),
         managed_files = catalog_file_verification.managed_file_count,
         verified_bytes = catalog_file_verification.verified_bytes,
         "native storage recovery and bidirectional verification completed"
@@ -612,14 +729,22 @@ async fn supervise_storage(
         .send(Ok(SupervisorReady {
             reconciliation: post_replay,
             catalog_file_verification,
+            table_actors: table_actor_handle,
+            table_actor_admission,
         }))
         .is_err()
     {
-        return (false, close_storage(Some(coordinator), catalog).await);
+        return (
+            false,
+            close_storage(Some(table_actors), Some(coordinator), catalog).await,
+        );
     }
 
     wait_for_shutdown(&mut shutdown).await;
-    (true, close_storage(Some(coordinator), catalog).await)
+    (
+        true,
+        close_storage(Some(table_actors), Some(coordinator), catalog).await,
+    )
 }
 
 async fn reconcile_once(
@@ -643,16 +768,61 @@ async fn verify_catalog_files_once(
     config: &NativeStorageRuntimeConfig,
     catalog: Arc<SqliteCatalog>,
     shutdown: &mut watch::Receiver<bool>,
-) -> Result<StartupCatalogFileVerificationReport> {
+) -> Result<StartupCatalogBootstrap> {
     let catalog_read: Arc<dyn CatalogRead> = catalog;
     let verifier = StartupCatalogFileVerifier::with_config(
         config.catalog_file_verification.clone(),
         Arc::clone(&config.data_directory),
         catalog_read,
     )?;
-    wait_for_startup_stage(shutdown, verifier.verify())
+    wait_for_startup_stage(shutdown, verifier.verify_with_bootstrap())
         .await
         .map_err(|error| with_stage("catalog-to-physical", error))
+}
+
+fn build_table_runtime_registry(
+    bootstrap: StartupCatalogBootstrap,
+    max_runtime_metadata_bytes: u64,
+) -> Result<TableRuntimeRegistry> {
+    let catalog_revision = bootstrap.verification.catalog_revision;
+    let mut tables = Vec::with_capacity(bootstrap.active_tables.len());
+    let mut retained_bytes = bootstrap.runtime_metadata_bytes;
+    for descriptor in bootstrap.active_tables {
+        let table_id = descriptor.table.table_id;
+        let decoded = decode_persisted_table_schema(&descriptor.table, &descriptor.schema)?;
+        let next_retained_bytes = retained_bytes
+            .checked_add(decoded.retained_charge_bytes())
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "startup runtime retained-memory byte charge overflow",
+                )
+                .with_table_id(table_id)
+                .with_retryable(false)
+            })?;
+        if next_retained_bytes > max_runtime_metadata_bytes {
+            return Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                format!(
+                    concat!(
+                        "startup runtime metadata and decoded schemas exceed byte budget ",
+                        "actual=[{}] maximum=[{}]"
+                    ),
+                    next_retained_bytes, max_runtime_metadata_bytes
+                ),
+            )
+            .with_table_id(table_id)
+            .with_retryable(false));
+        }
+        retained_bytes = next_retained_bytes;
+        tables.push(TableRuntimeBootstrap::new(
+            descriptor.table,
+            descriptor.schema,
+            decoded.into_schema(),
+            descriptor.snapshot,
+        )?);
+    }
+    TableRuntimeRegistry::from_bootstraps(catalog_revision, tables)
 }
 
 async fn wait_for_startup_stage<F, T>(shutdown: &mut watch::Receiver<bool>, future: F) -> Result<T>
@@ -674,10 +844,11 @@ where
 
 async fn fail_startup(
     error: ServerError,
+    table_actors: Option<TableActorRegistry>,
     coordinator: Option<CatalogCommitCoordinator>,
     catalog: Arc<SqliteCatalog>,
 ) -> Result<()> {
-    let cleanup = close_storage(coordinator, catalog).await;
+    let cleanup = close_storage(table_actors, coordinator, catalog).await;
     let surfaced = match cleanup {
         Ok(()) => error,
         Err(cleanup_error) => combine_errors(error, cleanup_error),
@@ -686,10 +857,15 @@ async fn fail_startup(
 }
 
 async fn close_storage(
+    table_actors: Option<TableActorRegistry>,
     coordinator: Option<CatalogCommitCoordinator>,
     catalog: Arc<SqliteCatalog>,
 ) -> Result<()> {
-    let drain_result = match coordinator {
+    let actor_result = match table_actors {
+        Some(table_actors) => table_actors.drain().await,
+        None => Ok(()),
+    };
+    let coordinator_result = match coordinator {
         Some(coordinator) => coordinator.drain().await,
         None => Ok(()),
     };
@@ -697,13 +873,21 @@ async fn close_storage(
         Ok(catalog) => catalog.close(),
         Err(_) => Err(ServerError::new(
             ErrorCode::Internal,
-            "native storage retained an unexpected SQLite Catalog reference during shutdown",
+            "native storage retained an unexpected SQLite catalog reference during shutdown",
         )),
     };
-    match (drain_result, catalog_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(drain_error), Err(catalog_error)) => Err(combine_errors(drain_error, catalog_error)),
+    let mut error = None;
+    for result in [actor_result, coordinator_result, catalog_result] {
+        if let Err(next) = result {
+            error = Some(match error {
+                Some(previous) => combine_errors(previous, next),
+                None => next,
+            });
+        }
+    }
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

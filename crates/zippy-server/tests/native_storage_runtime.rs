@@ -9,17 +9,19 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{DataDirectoryError, OwnedDataDirectory};
+use zippy_ingest::TableActorRegistryConfig;
 use zippy_server::{
     NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     NativeStorageStartOutcome,
 };
 use zippy_storage::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,
-    ParquetCandidateSpec, ParquetCandidateWriter,
+    ParquetCandidateSpec, ParquetCandidateWriter, StartupCatalogFileVerifier,
+    StartupCatalogFileVerifierConfig,
 };
 use zippy_types::catalog::{
-    CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
-    CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand,
+    CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
+    CatalogWrite, CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand,
 };
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance, SchemaIpcPayload,
@@ -171,6 +173,12 @@ async fn supervisor_starts_inside_an_existing_tokio_runtime_and_closes_cleanly()
         0
     );
     assert_eq!(runtime.catalog_file_verification_report().table_count, 0);
+    assert_eq!(runtime.table_runtime_count(), 0);
+    assert_eq!(runtime.table_runtime_catalog_revision(), 0);
+    assert_eq!(
+        runtime.table_actor(table_id()).unwrap_err().code(),
+        ErrorCode::NotFound
+    );
     assert_eq!(
         runtime
             .catalog_file_verification_report()
@@ -237,6 +245,72 @@ fn invalid_server_actor_fails_before_catalog_startup() {
             panic!("invalid Catalog actor unexpectedly reached supervisor startup");
         }
     }
+}
+
+#[test]
+fn invalid_table_actor_budget_fails_before_catalog_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("database");
+    let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(&root).unwrap());
+    let config = NativeStorageRuntimeConfig::new(&ownership).with_table_actor_config(
+        TableActorRegistryConfig::new().with_per_table_mailbox_capacity(0),
+    );
+
+    match NativeStorageRuntime::start_with_timeout(config, Duration::from_secs(1)) {
+        NativeStorageStartOutcome::Failed(error) => {
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+            assert!(!root.join("catalog/catalog.db").exists());
+        }
+        NativeStorageStartOutcome::Ready(mut runtime) => {
+            let _ = runtime.shutdown(Duration::from_secs(1));
+            panic!("invalid table actor budget unexpectedly started native storage");
+        }
+        NativeStorageStartOutcome::TimedOut(startup) => {
+            startup.cancel();
+            panic!("invalid table actor budget unexpectedly reached supervisor startup");
+        }
+    }
+}
+
+#[tokio::test]
+async fn decoded_schema_charge_uses_the_same_startup_metadata_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("database");
+    let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(&root).unwrap());
+    let catalog = Arc::new(SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap());
+    create_test_table(catalog.as_ref()).await;
+    let catalog_read: Arc<dyn CatalogRead> = catalog.clone();
+    let verifier = StartupCatalogFileVerifier::new(Arc::clone(&ownership), catalog_read);
+    let descriptor_only_charge = verifier
+        .verify_with_bootstrap()
+        .await
+        .unwrap()
+        .runtime_metadata_bytes;
+    drop(verifier);
+    Arc::try_unwrap(catalog)
+        .ok()
+        .expect("startup verifier released its Catalog reference")
+        .close()
+        .unwrap();
+
+    let config = NativeStorageRuntimeConfig::new(&ownership).with_catalog_file_verification_config(
+        StartupCatalogFileVerifierConfig::new()
+            .with_max_runtime_metadata_bytes(descriptor_only_charge),
+    );
+    let error = match NativeStorageRuntime::start(config) {
+        Ok(mut runtime) => {
+            let _ = runtime.shutdown(Duration::from_secs(1));
+            panic!("decoded schema unexpectedly bypassed the startup metadata budget");
+        }
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+    assert!(!error.retryable());
+    assert_eq!(error.table_id(), Some(table_id()));
+    assert!(error
+        .message()
+        .contains("decoded schemas exceed byte budget"));
 }
 
 #[test]
@@ -316,6 +390,16 @@ async fn startup_replays_retained_intent_before_publishing_final_reconciliation(
     assert_eq!(report.catalog_revision, 3);
     assert_eq!(report.files.len(), 1);
     assert!(report.has_no_observed_backlog());
+    assert_eq!(runtime.table_runtime_count(), 1);
+    assert_eq!(runtime.table_runtime_catalog_revision(), 3);
+    let actor = runtime.table_actor(table_id()).unwrap();
+    let actor_snapshot = actor.snapshot().await.unwrap();
+    assert_eq!(actor_snapshot.schema_version, 1);
+    assert_eq!(actor_snapshot.persisted_snapshot_version, 2);
+    assert_eq!(
+        actor_snapshot.committed_log_offset,
+        OffsetWatermark::Known(LogOffset::new(0))
+    );
     assert_eq!(
         fs::read_dir(root.join("wal/catalog-commit-intents"))
             .unwrap()
@@ -323,6 +407,11 @@ async fn startup_replays_retained_intent_before_publishing_final_reconciliation(
         0
     );
 
+    runtime.begin_shutdown();
+    assert_eq!(
+        actor.snapshot().await.unwrap_err().code(),
+        ErrorCode::Unavailable
+    );
     assert!(runtime.shutdown(Duration::from_secs(2)).is_complete());
 }
 

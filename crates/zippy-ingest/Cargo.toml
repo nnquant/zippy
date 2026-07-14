@@ -1,0 +1,14 @@
+[package]
+name = "zippy-ingest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arrow.workspace = true
+tokio.workspace = true
+zippy-types = { path = "../zippy-types" }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

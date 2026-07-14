@@ -1860,9 +1860,8 @@ durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、�
 通过 data-root/table directory fd 逐级 `openat(O_NOFOLLOW)`，有界核验每个当前可见 managed 文件的
 路径归属、大小、checksum、Parquet footer 和 row count；缺失、symlink 替换或内容损坏均 fail closed。
 该 gate 不声明历史 snapshot 可用，native historical query admission 仍关闭，历史文件深度审计属于
-maintenance。snapshot lease、
-logical drop、safe GC 以及权威 server table actor 接线尚未完成，因此 legacy metadata 仍是 server
-authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
+maintenance。snapshot lease、logical drop、safe GC、PersistController 和权威 Gateway 写入口接线尚未
+完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
 `[server].native_storage_enabled = true`（或 `ZIPPY_SERVER_NATIVE_STORAGE=true`）后，
 `NativeStorageRuntime` 会在任何 listener 绑定前依次执行 Catalog open、pre-replay reconciliation、
 durable intent replay、post-replay reconciliation 和 Catalog-to-physical current-snapshot verification；
@@ -1871,6 +1870,19 @@ durable intent replay、post-replay reconciliation 和 Catalog-to-physical curre
 handle 和 data-root lock 直到 Catalog cleanup 完成。shutdown timeout 不会取消已接受 commit 或提前释放
 data-root lock。该 gate
 默认关闭，启用后失败必须阻止启动，不允许静默降级到 legacy-only。
+
+当前 server 接线进展（2026-07-14）：Catalog-to-physical 验证现在会在同一轮固定 revision 分页中
+额外生成有界、原子发布的 active-table bootstrap；默认最多保留 128 MiB table/schema/snapshot
+metadata、schema IPC 与 decoded Arrow schema 常驻计费，可见 file descriptor 仍为批次局部。decoded
+schema 使用递归字段大小、root metadata、Arc/allocator 裕量形成保守逻辑 charge；server 每解码一张表
+就立即计入同一预算，超限会在创建 actor 前 fail closed。`zippy-ingest` 已建立独立 crate，启动期使用
+Catalog 的唯一受限 persisted-schema decoder 复核 schema hash、table definition 列引用、current
+version、writer epoch 和 committed log watermark，再一次性构建 server-owned table runtime registry。
+每张 active table 会在 ready 前创建串行 actor；默认 per-table mailbox 64、全局 outstanding command
+4096，均为立即有界 admission。shutdown 顺序为关闭 table actor admission、排空已接受 actor command、
+排空 Catalog commit coordinator、关闭 SQLite Catalog。当前 actor 仅开放内部状态观察，尚未接入
+RecordBatch append、segment rollover、PersistController 或 Gateway 权威写入口，因此 legacy Gateway
+仍是业务写 authority，不能据此宣称 native ingest 可用。
 
 任务：
 

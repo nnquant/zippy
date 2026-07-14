@@ -21,7 +21,7 @@ use zippy_types::catalog::{
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, DataFileLocation, ManagedDataPath, MetadataMap,
     NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload, SourceSegmentIdentity,
-    SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
+    SourceSegmentLineage, SourceSegmentLineages, TableDefinition, TableState,
 };
 use zippy_types::{
     ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
@@ -235,6 +235,127 @@ async fn verifies_current_visible_managed_candidate() {
     assert_eq!(report.table_count, 1);
     assert_eq!(report.managed_file_count, 1);
     assert_eq!(report.verified_bytes, expected_bytes);
+}
+
+#[tokio::test]
+async fn bootstrap_returns_current_runtime_descriptors_without_visible_files() {
+    let fixture = Fixture::new().await;
+    fixture.create_table(TABLE, 2, 1).await;
+    let candidate = fixture.write_candidate(TABLE, 20, 0, vec![100, 101]);
+    let expected_bytes = candidate.pending().file_size_bytes;
+    fixture
+        .commit_files(3, 2, TABLE, vec![candidate.into_pending()], 1)
+        .await;
+
+    let bootstrap = fixture
+        .verifier()
+        .verify_with_bootstrap()
+        .await
+        .expect("verify files and load runtime descriptors");
+
+    assert_eq!(bootstrap.verification.catalog_revision, 3);
+    assert_eq!(bootstrap.verification.table_count, 1);
+    assert_eq!(bootstrap.verification.managed_file_count, 1);
+    assert_eq!(bootstrap.verification.verified_bytes, expected_bytes);
+    assert_eq!(bootstrap.active_tables.len(), 1);
+    let descriptor = &bootstrap.active_tables[0];
+    assert_eq!(descriptor.table.table_id, table_id(TABLE));
+    assert_eq!(descriptor.table.state, TableState::Active);
+    assert_eq!(descriptor.table.current_schema_version, 1);
+    assert_eq!(descriptor.table.current_snapshot_version, 2);
+    assert_eq!(descriptor.schema.table_id, table_id(TABLE));
+    assert_eq!(descriptor.schema.schema_version, 1);
+    assert_eq!(descriptor.schema.schema_ipc, schema_ipc(schema().as_ref()));
+    assert_eq!(descriptor.snapshot.table_id, table_id(TABLE));
+    assert_eq!(descriptor.snapshot.snapshot_version, 2);
+    assert!(
+        bootstrap.runtime_metadata_bytes
+            > u64::try_from(descriptor.schema.schema_ipc.as_bytes().len())
+                .expect("schema IPC size fits u64")
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_is_complete_and_ordered_across_pages_and_snapshot_batches() {
+    let fixture = Fixture::new().await;
+    for index in 0_u128..3 {
+        fixture
+            .create_table(TABLE + index, 2 + index, 1 + index as u64)
+            .await;
+    }
+    let verifier = fixture.verifier_with(
+        StartupCatalogFileVerifierConfig::new()
+            .with_table_page_size(2)
+            .with_snapshot_batch_size(1),
+    );
+
+    let bootstrap = verifier
+        .verify_with_bootstrap()
+        .await
+        .expect("load all active tables across bounded reads");
+
+    assert_eq!(bootstrap.verification.catalog_revision, 4);
+    assert_eq!(bootstrap.verification.table_count, 3);
+    assert_eq!(bootstrap.verification.managed_file_count, 0);
+    assert_eq!(
+        bootstrap
+            .active_tables
+            .iter()
+            .map(|descriptor| descriptor.table.table_id)
+            .collect::<Vec<_>>(),
+        vec![table_id(TABLE), table_id(TABLE + 1), table_id(TABLE + 2)]
+    );
+}
+
+#[tokio::test]
+async fn aggregate_runtime_metadata_budget_fails_closed() {
+    let fixture = Fixture::new().await;
+    fixture.create_table(TABLE, 2, 1).await;
+    fixture.create_table(TABLE + 1, 3, 2).await;
+    let measured = fixture
+        .verifier()
+        .verify_with_bootstrap()
+        .await
+        .expect("measure default bootstrap metadata");
+    assert!(measured.runtime_metadata_bytes > 1);
+    let verifier = fixture.verifier_with(
+        StartupCatalogFileVerifierConfig::new()
+            .with_table_page_size(1)
+            .with_max_runtime_metadata_bytes(measured.runtime_metadata_bytes - 1),
+    );
+
+    let error = verifier
+        .verify_with_bootstrap()
+        .await
+        .expect_err("aggregate metadata must exceed the startup budget");
+
+    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+    assert!(!error.retryable());
+}
+
+#[tokio::test]
+async fn later_physical_failure_returns_no_partial_bootstrap() {
+    let fixture = Fixture::new().await;
+    fixture.create_table(TABLE, 2, 1).await;
+    fixture.create_table(TABLE + 1, 3, 2).await;
+    let candidate = fixture.write_candidate(TABLE + 1, 20, 0, vec![100]);
+    let path = candidate.path().to_path_buf();
+    fixture
+        .commit_files(4, 3, TABLE + 1, vec![candidate.into_pending()], 0)
+        .await;
+    fs::remove_file(path).expect("remove second-page committed candidate");
+    let verifier = fixture.verifier_with(
+        StartupCatalogFileVerifierConfig::new()
+            .with_table_page_size(1)
+            .with_snapshot_batch_size(1),
+    );
+
+    let error = verifier
+        .verify_with_bootstrap()
+        .await
+        .expect_err("a later physical failure must discard earlier descriptors");
+
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
 }
 
 #[tokio::test]

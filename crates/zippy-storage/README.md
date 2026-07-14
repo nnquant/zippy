@@ -73,9 +73,18 @@ opens each path relative to the retained data-root and table directory descripto
 `O_NOFOLLOW`, then reuses the candidate size, checksum, Parquet footer, and row-count invariants.
 Missing files, symlink substitutions, and corrupted content fail startup with
 `DataCorruption`. The default pass admits at most 65,536 active tables, 65,536 current managed
-files, and 8 GiB of checksummed content. External legacy paths and historical files removed from
-the current snapshot are outside this startup gate; maintenance verification remains responsible
-for historical/deep audits.
+files, 8 GiB of checksummed content, and 128 MiB of retained runtime metadata plus schema data.
+`verify_with_bootstrap()` returns one atomic result containing the verification report and every
+active table's `TableDescriptor`, current `SchemaDescriptor`, and current `TableSnapshot`, ordered
+by table ID. Its metadata budget charges JSON-encoded table/snapshot/schema fields plus raw schema
+IPC bytes. During server bootstrap, every decoded Arrow schema adds a conservative retained-memory
+charge against that same 128 MiB limit before its table runtime is published. Visible file
+descriptors remain batch-local and are not retained in the bootstrap result. Pagination, snapshot
+alignment, physical verification, decoded-schema charging, budget enforcement, or the final
+Catalog revision guard failing discards the entire result. The existing `verify()` API remains a
+compatibility wrapper that returns only the verification report. External legacy paths and
+historical files removed from the current snapshot are outside this startup gate; maintenance
+verification remains responsible for historical/deep audits.
 
-Logical drop, snapshot leases, safe GC, compaction, and integration with the authoritative server
-table actor remain later refactor steps.
+Logical drop, snapshot leases, safe GC, compaction, PersistController integration, and public
+native write admission remain later refactor steps.

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Write};
+use std::mem::{size_of, size_of_val};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use arrow::datatypes::{
@@ -15,7 +16,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zippy_types::table::{
     AppendTableDefinition, ColumnName, ColumnSet, FiniteMetadataFloat, FrameTableDefinition,
-    KeyValueTableDefinition, MetadataMap, MetadataScalar, TableDefinition,
+    KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaDescriptor, TableDefinition,
+    TableDescriptor,
 };
 use zippy_types::{ErrorCode, Result, ServerError};
 
@@ -27,6 +29,8 @@ const MAX_SCHEMA_TOTAL_FIELDS: usize = 4_096;
 const MAX_SCHEMA_NESTING_DEPTH: usize = 32;
 const MAX_SCHEMA_METADATA_ENTRIES: usize = 4_096;
 const MAX_SCHEMA_METADATA_BYTES: usize = 1024 * 1024;
+const DECODED_SCHEMA_CHARGE_MULTIPLIER: u64 = 2;
+const DECODED_SCHEMA_FIXED_OVERHEAD_BYTES: u64 = 1024;
 const MAX_TYPED_JSON_BYTES: usize = 1024 * 1024;
 const TYPED_JSON_CHUNK_BYTES: usize = 64 * 1024;
 const TYPED_JSON_MAGIC: &[u8; 3] = b"ZCJ";
@@ -44,6 +48,156 @@ const SNAPSHOT_SUMMARY_BLOB_KIND: &str = "snapshot_summary";
 const DATA_FILE_PARTITION_BLOB_KIND: &str = "data_file_partition";
 const DATA_FILE_STATISTICS_BLOB_KIND: &str = "data_file_statistics";
 const DATA_FILE_METADATA_BLOB_KIND: &str = "data_file_metadata";
+
+/// One verified table schema plus its conservative retained-memory charge.
+///
+/// The charge is a stable logical startup budget, not an exact allocator or RSS
+/// measurement. It includes Arrow's recursively reported field size, root
+/// metadata allocations, reference-counted allocation overhead, and a
+/// conservative multiplier and fixed allocator margin.
+#[derive(Debug)]
+pub struct DecodedPersistedTableSchema {
+    schema: SchemaRef,
+    retained_charge_bytes: u64,
+}
+
+impl DecodedPersistedTableSchema {
+    /// Borrows the decoded Arrow schema.
+    #[must_use]
+    pub const fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Returns the conservative bytes to charge while retaining this schema.
+    #[must_use]
+    pub const fn retained_charge_bytes(&self) -> u64 {
+        self.retained_charge_bytes
+    }
+
+    /// Consumes the charged result and returns the decoded Arrow schema.
+    #[must_use]
+    pub fn into_schema(self) -> SchemaRef {
+        self.schema
+    }
+}
+
+/// Decodes and verifies the Arrow schema stored in a persistent Catalog descriptor.
+///
+/// This is the only public persisted-schema decoder. It accepts exactly one
+/// bounded schema-only Arrow IPC stream and verifies that its canonical logical
+/// hash matches the descriptor. It does not validate the descriptor's placement
+/// in a table's schema history.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::DataCorruption`] when the persisted IPC payload is
+/// malformed, exceeds its decoding budgets, contains anything other than one
+/// schema, cannot be canonically hashed, or does not match `schema_hash`.
+pub fn decode_persisted_schema(descriptor: &SchemaDescriptor) -> Result<SchemaRef> {
+    let schema = decode_schema_ipc_stream(descriptor.schema_ipc.as_bytes()).map_err(|error| {
+        persisted_schema_corruption(
+            descriptor,
+            format!("persisted Catalog schema IPC is invalid error=[{error}]"),
+        )
+    })?;
+    let actual_hash = canonical_schema_hash(&schema).map_err(|error| {
+        persisted_schema_corruption(
+            descriptor,
+            format!("persisted Catalog schema cannot be hashed error=[{error}]"),
+        )
+    })?;
+    if actual_hash != descriptor.schema_hash {
+        return Err(persisted_schema_corruption(
+            descriptor,
+            format!(
+                "catalog schema hash mismatch expected=[{}] actual=[{}]",
+                descriptor.schema_hash, actual_hash
+            ),
+        ));
+    }
+    Ok(schema)
+}
+
+/// Decodes a persisted schema and validates it against its owning table definition.
+///
+/// This table-aware entry point is the startup/runtime boundary. In addition to
+/// [`decode_persisted_schema`], it verifies descriptor ownership and every
+/// definition column reference so a valid schema row cannot be paired with an
+/// incompatible table row.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::DataCorruption`] when the descriptors identify different
+/// tables or when the decoded schema violates the persisted table definition.
+pub fn decode_persisted_table_schema(
+    table: &TableDescriptor,
+    descriptor: &SchemaDescriptor,
+) -> Result<DecodedPersistedTableSchema> {
+    if table.table_id != descriptor.table_id {
+        return Err(persisted_schema_corruption(
+            descriptor,
+            format!(
+                "persisted catalog table and schema identities differ table_id=[{}]",
+                table.table_id
+            ),
+        ));
+    }
+    let schema = decode_persisted_schema(descriptor)?;
+    crate::table_domain::validate_table_schema(&schema, &table.definition).map_err(|error| {
+        persisted_schema_corruption(
+            descriptor,
+            format!("persisted catalog table schema is incompatible error=[{error}]"),
+        )
+    })?;
+    let retained_charge_bytes = decoded_schema_retained_charge(schema.as_ref()).map_err(|error| {
+        ServerError::new(
+            error.code(),
+            format!(
+                "persisted catalog schema retained-memory charge failed schema_version=[{}] error=[{error}]",
+                descriptor.schema_version
+            ),
+        )
+        .with_table_id(descriptor.table_id)
+        .with_retryable(false)
+    })?;
+    Ok(DecodedPersistedTableSchema {
+        schema,
+        retained_charge_bytes,
+    })
+}
+
+fn decoded_schema_retained_charge(schema: &Schema) -> Result<u64> {
+    let root_bytes = size_of_val(schema)
+        .checked_add(size_of::<SchemaRef>())
+        .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+        .ok_or_else(|| schema_budget_exhausted("decoded schema root byte charge overflow"))?;
+    let metadata_slots = schema
+        .metadata
+        .capacity()
+        .checked_mul(size_of::<(String, String)>())
+        .ok_or_else(|| schema_budget_exhausted("decoded schema metadata slot charge overflow"))?;
+    let metadata_strings = schema
+        .metadata
+        .iter()
+        .try_fold(0_usize, |bytes, (key, value)| {
+            bytes
+                .checked_add(key.capacity())
+                .and_then(|bytes| bytes.checked_add(value.capacity()))
+                .ok_or_else(|| {
+                    schema_budget_exhausted("decoded schema metadata string charge overflow")
+                })
+        })?;
+    let reported_bytes = root_bytes
+        .checked_add(schema.fields().size())
+        .and_then(|bytes| bytes.checked_add(metadata_slots))
+        .and_then(|bytes| bytes.checked_add(metadata_strings))
+        .ok_or_else(|| schema_budget_exhausted("decoded schema retained byte charge overflow"))?;
+    u64::try_from(reported_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_mul(DECODED_SCHEMA_CHARGE_MULTIPLIER))
+        .and_then(|bytes| bytes.checked_add(DECODED_SCHEMA_FIXED_OVERHEAD_BYTES))
+        .ok_or_else(|| schema_budget_exhausted("decoded schema retained byte charge overflow"))
+}
 
 /// Decodes exactly one schema-only Arrow IPC stream supplied by a command.
 pub(crate) fn decode_schema_ipc_stream(payload: &[u8]) -> Result<SchemaRef> {
@@ -454,6 +608,23 @@ fn read_ipc_i32(payload: &[u8], offset: &mut usize, context: &str) -> Result<i32
 
 fn invalid_schema_ipc(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::InvalidArgument, message)
+}
+
+fn persisted_schema_corruption(
+    descriptor: &SchemaDescriptor,
+    message: impl Into<String>,
+) -> ServerError {
+    ServerError::new(
+        ErrorCode::DataCorruption,
+        format!(
+            "{} table_id=[{}] schema_version=[{}]",
+            message.into(),
+            descriptor.table_id,
+            descriptor.schema_version
+        ),
+    )
+    .with_table_id(descriptor.table_id)
+    .with_retryable(false)
 }
 
 /// Computes the durable logical schema hash from the frozen V1 encoding.
@@ -1246,10 +1417,13 @@ mod tests {
     use arrow::ipc::convert::IpcSchemaEncoder;
     use arrow::ipc::writer::StreamWriter;
     use zippy_types::table::{
-        AppendTableDefinition, ColumnName, ColumnSet, FiniteMetadataFloat, KeyValueTableDefinition,
-        MetadataMap, MetadataScalar, TableDefinition,
+        AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FiniteMetadataFloat,
+        KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaCompatibility,
+        SchemaDescriptor, SchemaIpcPayload, TableDefinition, TableDescriptor, TableState,
     };
-    use zippy_types::ErrorCode;
+    use zippy_types::{ErrorCode, NamespaceId, TableId};
+
+    use crate::{decode_persisted_schema, decode_persisted_table_schema};
 
     use super::{
         canonical_schema_hash, decode_data_file_metadata_blob, decode_data_file_partition_blob,
@@ -1274,6 +1448,18 @@ mod tests {
         writer.finish().unwrap();
         drop(writer);
         payload
+    }
+
+    fn persisted_schema_descriptor(schema: &Schema) -> SchemaDescriptor {
+        let schema = Arc::new(schema.clone());
+        SchemaDescriptor {
+            table_id: TableId::from_u128(1).unwrap(),
+            schema_version: 1,
+            schema_ipc: SchemaIpcPayload::new(schema_payload(schema.as_ref(), false)).unwrap(),
+            schema_hash: canonical_schema_hash(&schema).unwrap(),
+            compatibility: SchemaCompatibility::Initial,
+            created_at_ns: 1,
+        }
     }
 
     fn first_message_end(payload: &[u8]) -> usize {
@@ -1679,6 +1865,73 @@ mod tests {
             decode_schema_ipc_stream(&nonzero_body).unwrap_err().code(),
             ErrorCode::InvalidArgument
         );
+    }
+
+    #[test]
+    fn public_persisted_schema_decoder_verifies_payload_and_hash() {
+        let schema = Schema::new(vec![Field::new("price", DataType::Float64, false)]);
+        let descriptor = persisted_schema_descriptor(&schema);
+        assert_eq!(
+            decode_persisted_schema(&descriptor).unwrap().as_ref(),
+            &schema
+        );
+
+        let mut wrong_hash = descriptor.clone();
+        wrong_hash.schema_hash = "sha256-v1:invalid".to_owned();
+        let error = decode_persisted_schema(&wrong_hash).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert!(!error.retryable());
+        assert_eq!(error.table_id(), Some(descriptor.table_id));
+    }
+
+    #[test]
+    fn public_persisted_schema_decoder_maps_untrusted_ipc_to_corruption() {
+        let schema = Schema::new(vec![Field::new("price", DataType::Float64, false)]);
+        let mut descriptor = persisted_schema_descriptor(&schema);
+        descriptor.schema_ipc = SchemaIpcPayload::new(schema_payload(&schema, true)).unwrap();
+
+        let error = decode_persisted_schema(&descriptor).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert!(!error.retryable());
+        assert_eq!(error.table_id(), Some(descriptor.table_id));
+    }
+
+    #[test]
+    fn decoded_schema_charge_accounts_for_shared_offset_expansion() {
+        let payload =
+            raw_null_field_schema_payload(MAX_SCHEMA_TOTAL_FIELDS, Some("reused"), true, true);
+        let schema = decode_schema_ipc_stream(&payload).unwrap();
+        let retained_charge = super::decoded_schema_retained_charge(schema.as_ref()).unwrap();
+
+        assert_eq!(schema.fields().len(), MAX_SCHEMA_TOTAL_FIELDS);
+        assert!(retained_charge > payload.len() as u64);
+    }
+
+    #[test]
+    fn table_aware_persisted_schema_decoder_rejects_definition_mismatch() {
+        let schema = Schema::new(vec![Field::new("price", DataType::Float64, false)]);
+        let descriptor = persisted_schema_descriptor(&schema);
+        let table = TableDescriptor {
+            table_id: descriptor.table_id,
+            namespace_id: NamespaceId::from_u128(1).unwrap(),
+            name: CatalogName::new("ticks").unwrap(),
+            definition: TableDefinition::Append(AppendTableDefinition {
+                event_time_column: Some(ColumnName::new("event_time").unwrap()),
+            }),
+            current_schema_version: 1,
+            current_snapshot_version: 1,
+            writer_epoch: 0,
+            state: TableState::Active,
+            config: BTreeMap::new(),
+            created_at_ns: 1,
+            updated_at_ns: 1,
+        };
+
+        let error = decode_persisted_table_schema(&table, &descriptor).unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert!(!error.retryable());
+        assert_eq!(error.table_id(), Some(table.table_id));
     }
 
     #[test]
