@@ -8,8 +8,8 @@ use tokio::sync::Semaphore;
 use zippy_core::OwnedDataDirectory;
 use zippy_storage::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, ParquetCandidateSpec,
-    ParquetCandidateWriter, PersistCandidateInput, PersistController, PersistControllerConfig,
-    PersistRequest,
+    ParquetCandidateWriter, PersistCandidateInput, PersistCompletionFailure, PersistController,
+    PersistControllerConfig, PersistRequest,
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandV1, CatalogOutcomeV1, CatalogResponseV1,
@@ -54,6 +54,14 @@ fn schema() -> SchemaRef {
 }
 
 fn provenance(first: u64, row_count: usize) -> NativeDataFileProvenance {
+    provenance_with_epoch(first, row_count, 0)
+}
+
+fn provenance_with_epoch(
+    first: u64,
+    row_count: usize,
+    writer_epoch: u64,
+) -> NativeDataFileProvenance {
     let last = first + u64::try_from(row_count).expect("small test row count") - 1;
     let offsets = OffsetRange::new(LogOffset::new(first), LogOffset::new(last))
         .expect("ordered test offsets");
@@ -63,7 +71,7 @@ fn provenance(first: u64, row_count: usize) -> NativeDataFileProvenance {
             source: SourceSegmentIdentity {
                 segment_id: first + 1,
                 generation: 1,
-                writer_epoch: 0,
+                writer_epoch,
             },
             offsets,
         }])
@@ -321,6 +329,61 @@ fn config_and_request_validation_rejects_work_before_startup() {
     )
     .expect_err("watermark beyond coverage must fail");
     assert_eq!(watermark.code(), ErrorCode::InvalidArgument);
+
+    let (mut second_schema_spec, second_schema_batches) = candidate_parts(TABLE, 23, 1, vec![2]);
+    second_schema_spec.schema_version = 2;
+    let mixed_schema = PersistRequest::new(
+        request_id(4),
+        table_id(TABLE),
+        1,
+        vec![
+            candidate_input(22, 0, vec![1]),
+            PersistCandidateInput::new(second_schema_spec, second_schema_batches).unwrap(),
+        ],
+        OffsetWatermark::Known(LogOffset::new(1)),
+    )
+    .expect_err("one persist request cannot mix schema versions");
+    assert_eq!(mixed_schema.code(), ErrorCode::SchemaMismatch);
+
+    let (mut second_epoch_spec, second_epoch_batches) = candidate_parts(TABLE, 24, 1, vec![2]);
+    second_epoch_spec.provenance = provenance_with_epoch(1, 1, 1);
+    let mixed_epoch = PersistRequest::new(
+        request_id(5),
+        table_id(TABLE),
+        1,
+        vec![
+            candidate_input(23, 0, vec![1]),
+            PersistCandidateInput::new(second_epoch_spec, second_epoch_batches).unwrap(),
+        ],
+        OffsetWatermark::Known(LogOffset::new(1)),
+    )
+    .expect_err("one persist request cannot mix writer epochs");
+    assert_eq!(mixed_epoch.code(), ErrorCode::InvalidArgument);
+
+    let (mut second_arrow_spec, _) = candidate_parts(TABLE, 25, 1, vec![2]);
+    let second_arrow_schema = Arc::new(Schema::new(vec![Field::new(
+        "volume",
+        DataType::Int64,
+        false,
+    )]));
+    second_arrow_spec.schema = Arc::clone(&second_arrow_schema);
+    let second_arrow_batches = vec![RecordBatch::try_new(
+        second_arrow_schema,
+        vec![Arc::new(Int64Array::from(vec![2]))],
+    )
+    .unwrap()];
+    let mixed_arrow_schema = PersistRequest::new(
+        request_id(6),
+        table_id(TABLE),
+        1,
+        vec![
+            candidate_input(24, 0, vec![1]),
+            PersistCandidateInput::new(second_arrow_spec, second_arrow_batches).unwrap(),
+        ],
+        OffsetWatermark::Known(LogOffset::new(1)),
+    )
+    .expect_err("one persist request cannot mix Arrow schemas under the same version");
+    assert_eq!(mixed_arrow_schema.code(), ErrorCode::SchemaMismatch);
 }
 
 #[test]
@@ -397,9 +460,12 @@ async fn admission_distinguishes_oversized_and_temporarily_exhausted_input() {
     let handle = controller.handle();
 
     let oversized = handle
-        .submit(persist_request(1, 20, 0, vec![1; 10_000], 1))
+        .submit_classified(persist_request(1, 20, 0, vec![1; 10_000], 1))
         .err()
         .expect("single oversized request must fail admission");
+    let PersistCompletionFailure::Rejected(oversized) = oversized else {
+        panic!("oversized input is a request-local admission rejection")
+    };
     assert_eq!(oversized.code(), ErrorCode::ResourceExhausted);
     assert!(!oversized.retryable());
     assert!(!candidate_path(&root, 20).exists());
@@ -408,9 +474,12 @@ async fn admission_distinguishes_oversized_and_temporarily_exhausted_input() {
         .submit(persist_request(2, 21, 0, vec![1], 1))
         .expect("first request fits one accounting unit");
     let exhausted = handle
-        .submit(persist_request_for_table(TABLE + 1, 3, 22, 0, vec![2], 1))
+        .submit_classified(persist_request_for_table(TABLE + 1, 3, 22, 0, vec![2], 1))
         .err()
         .expect("second request must see temporary input pressure");
+    let PersistCompletionFailure::Rejected(exhausted) = exhausted else {
+        panic!("temporary input pressure is a request-local rejection")
+    };
     assert_eq!(exhausted.code(), ErrorCode::ResourceExhausted);
     assert!(exhausted.retryable());
 
@@ -544,13 +613,22 @@ async fn dropped_ticket_does_not_cancel_and_drain_closes_admission() {
     let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let error = handle
-                .submit(persist_request(31, 51, 1, vec![2], 2))
+                .submit_classified(persist_request(31, 51, 1, vec![2], 2))
                 .err()
                 .expect("active request keeps new work from admission");
-            if error.code() == ErrorCode::Unavailable {
-                break error;
+            match error {
+                PersistCompletionFailure::Fatal(error)
+                    if error.code() == ErrorCode::Unavailable =>
+                {
+                    break error;
+                }
+                PersistCompletionFailure::Rejected(error) => {
+                    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+                }
+                PersistCompletionFailure::Fatal(error) => {
+                    panic!("unexpected fatal admission error: {error}");
+                }
             }
-            assert_eq!(error.code(), ErrorCode::ResourceExhausted);
             tokio::task::yield_now().await;
         }
     })
@@ -587,6 +665,7 @@ async fn first_writer_error_closes_admission_but_drains_already_accepted_jobs() 
             .with_max_parallel_writers(1),
     )
     .await;
+    let mut failure_monitor = controller.failure_monitor();
     let handle = controller.handle();
     let failed = handle
         .submit(persist_request(40, 60, 0, vec![2], 1))
@@ -597,6 +676,13 @@ async fn first_writer_error_closes_admission_but_drains_already_accepted_jobs() 
 
     let error = failed.wait().await.expect_err("conflicting file must fail");
     assert_eq!(error.code(), ErrorCode::DataCorruption);
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        failure_monitor.wait_for_failure(),
+    )
+    .await
+    .expect("controller failure monitor must resolve before shutdown");
+    assert_eq!(observed.code(), ErrorCode::DataCorruption);
     let closed = handle
         .submit(persist_request(42, 62, 2, vec![4], 3))
         .err()

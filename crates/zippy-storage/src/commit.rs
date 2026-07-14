@@ -256,6 +256,36 @@ pub struct CatalogCommitCoordinator {
     catalog_actor: CatalogActor,
 }
 
+/// Internal failure disposition for one coordinator request.
+///
+/// A definitive rejection is returned only after the Catalog proved that the
+/// command did not commit and the corresponding durable intent was removed.
+/// Callers may fail that request without degrading the coordinator. Every
+/// other failure is fatal because commit state or durable recovery is not
+/// safely resolved.
+#[derive(Debug)]
+pub(crate) enum CatalogCommitFailure {
+    DefinitiveRejection(ServerError),
+    Fatal(ServerError),
+}
+
+impl CatalogCommitFailure {
+    pub(crate) fn into_error(self) -> ServerError {
+        match self {
+            Self::DefinitiveRejection(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+impl From<ServerError> for CatalogCommitFailure {
+    fn from(error: ServerError) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+pub(crate) type ClassifiedCommitResult =
+    std::result::Result<CommitDataFilesReceipt, CatalogCommitFailure>;
+
 impl CatalogCommitCoordinator {
     /// Starts the coordinator after replaying every durable pending intent.
     ///
@@ -276,11 +306,22 @@ impl CatalogCommitCoordinator {
             .map_err(|error| actor_join_error("scan durable commit intents", error))??;
 
         for path in pending {
+            let request_id = path.request_id;
             let recovery_journal = Arc::clone(&journal);
             let loaded = tokio::task::spawn_blocking(move || recovery_journal.load(&path))
                 .await
                 .map_err(|error| actor_join_error("load durable commit intent", error))??;
-            execute_intent(&journal, &catalog, &config, loaded).await?;
+            match execute_intent(&journal, &catalog, &config, loaded).await? {
+                IntentExecution::Committed(_) => {}
+                IntentExecution::DefinitiveRejection(error) => {
+                    tracing::warn!(
+                        request_id = %error.request_id().unwrap_or(request_id),
+                        code = %error.code(),
+                        error = %error,
+                        "discarded recovered durable intent after definitive Catalog rejection"
+                    );
+                }
+            }
         }
 
         let (sender, receiver) = mpsc::channel(config.max_outstanding_commits);
@@ -317,15 +358,38 @@ impl CatalogCommitCoordinator {
     /// the bounded worker queue, dropping the waiter does not cancel staging,
     /// Catalog replay, or intent cleanup.
     pub async fn commit(&self, intent: CommitDataFilesIntent) -> Result<CommitDataFilesReceipt> {
+        self.commit_classified(intent)
+            .await
+            .map_err(CatalogCommitFailure::into_error)
+    }
+
+    /// Commits one intent while preserving whether a failure is request-local.
+    ///
+    /// [`CatalogCommitFailure::DefinitiveRejection`] proves both that Catalog
+    /// did not commit the command and that its durable intent was removed.
+    /// This internal contract lets the persistence controller keep serving
+    /// later requests without inferring safety from a bare error code.
+    pub(crate) async fn commit_classified(
+        &self,
+        intent: CommitDataFilesIntent,
+    ) -> ClassifiedCommitResult {
         if !self.accepting.load(Ordering::Acquire) {
-            return Err(coordinator_closed());
+            return Err(coordinator_closed().into());
         }
-        let prepared = intent.into_prepared(self.catalog_actor.clone())?;
-        self.validate_single_job_budget(&prepared)?;
+        let prepared = intent
+            .into_prepared(self.catalog_actor.clone())
+            .map_err(CatalogCommitFailure::Fatal)?;
+        self.validate_single_job_budget(&prepared)
+            .map_err(CatalogCommitFailure::Fatal)?;
         let request_id = prepared.request_id;
-        let permits = self.acquire_permits(&prepared).await?;
+        let permits = self
+            .acquire_permits(&prepared)
+            .await
+            .map_err(CatalogCommitFailure::Fatal)?;
         if !self.accepting.load(Ordering::Acquire) {
-            return Err(coordinator_closed().with_request_id(request_id));
+            return Err(CatalogCommitFailure::Fatal(
+                coordinator_closed().with_request_id(request_id),
+            ));
         }
         let (response_sender, response_receiver) = oneshot::channel();
         let job = CommitJob {
@@ -335,16 +399,20 @@ impl CatalogCommitCoordinator {
         };
         self.sender
             .as_ref()
-            .ok_or_else(coordinator_closed)?
+            .ok_or_else(|| CatalogCommitFailure::Fatal(coordinator_closed()))?
             .send(job)
             .await
-            .map_err(|_| coordinator_closed().with_request_id(request_id))?;
+            .map_err(|_| {
+                CatalogCommitFailure::Fatal(coordinator_closed().with_request_id(request_id))
+            })?;
         response_receiver.await.map_err(|_| {
-            ServerError::new(
-                ErrorCode::Unavailable,
-                "catalog commit coordinator stopped after accepting the request",
+            CatalogCommitFailure::Fatal(
+                ServerError::new(
+                    ErrorCode::Unavailable,
+                    "catalog commit coordinator stopped after accepting the request",
+                )
+                .with_request_id(request_id),
             )
-            .with_request_id(request_id)
         })?
     }
 
@@ -452,8 +520,13 @@ struct AdmissionPermits {
 
 struct CommitJob {
     prepared: PreparedCommit,
-    response: oneshot::Sender<Result<CommitDataFilesReceipt>>,
+    response: oneshot::Sender<ClassifiedCommitResult>,
     _permits: AdmissionPermits,
+}
+
+enum IntentExecution {
+    Committed(CommitDataFilesReceipt),
+    DefinitiveRejection(ServerError),
 }
 
 async fn run_worker(
@@ -478,16 +551,31 @@ async fn run_worker(
         let staged = match staged {
             Ok(staged) => staged,
             Err(error) => {
-                let _ = job.response.send(Err(error.clone()));
+                let _ = job
+                    .response
+                    .send(Err(CatalogCommitFailure::Fatal(error.clone())));
                 return Err(error);
             }
         };
         match execute_intent(&journal, &catalog, &config, staged).await {
-            Ok(receipt) => {
+            Ok(IntentExecution::Committed(receipt)) => {
                 let _ = job.response.send(Ok(receipt));
             }
+            Ok(IntentExecution::DefinitiveRejection(error)) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    code = %error.code(),
+                    error = %error,
+                    "Catalog definitively rejected commit; removed durable intent and continuing"
+                );
+                let _ = job
+                    .response
+                    .send(Err(CatalogCommitFailure::DefinitiveRejection(error)));
+            }
             Err(error) => {
-                let _ = job.response.send(Err(error.clone()));
+                let _ = job
+                    .response
+                    .send(Err(CatalogCommitFailure::Fatal(error.clone())));
                 tracing::error!(
                     request_id = %request_id,
                     error = %error,
@@ -505,7 +593,7 @@ async fn execute_intent(
     catalog: &Arc<dyn CatalogWrite>,
     config: &CatalogCommitCoordinatorConfig,
     intent: DurableCommitIntent,
-) -> Result<CommitDataFilesReceipt> {
+) -> Result<IntentExecution> {
     let verify_journal = Arc::clone(journal);
     let verify_intent = intent.clone();
     tokio::task::spawn_blocking(move || verify_journal.verify_candidates(&verify_intent))
@@ -541,6 +629,10 @@ async fn execute_intent(
                     .unwrap_or(config.retry_max_delay)
                     .min(config.retry_max_delay);
             }
+            Err(error) if is_definitive_catalog_rejection(&error) => {
+                remove_rejected_intent(journal, &intent).await?;
+                return Ok(IntentExecution::DefinitiveRejection(error));
+            }
             Err(error) => return Err(error),
         }
     };
@@ -566,7 +658,19 @@ async fn execute_intent(
             );
         }
     }
-    Ok(receipt)
+    Ok(IntentExecution::Committed(receipt))
+}
+
+async fn remove_rejected_intent(
+    journal: &Arc<CommitIntentJournal>,
+    intent: &DurableCommitIntent,
+) -> Result<()> {
+    let cleanup_journal = Arc::clone(journal);
+    let cleanup_path = intent.path.clone();
+    tokio::task::spawn_blocking(move || cleanup_journal.complete(&cleanup_path))
+        .await
+        .map_err(|error| actor_join_error("remove definitively rejected commit intent", error))??;
+    Ok(())
 }
 
 fn validate_response(
@@ -709,6 +813,26 @@ fn is_commit_unknown(error: &ServerError) -> bool {
         )
 }
 
+fn is_definitive_catalog_rejection(error: &ServerError) -> bool {
+    if is_commit_unknown(error) {
+        return false;
+    }
+    matches!(
+        error.code(),
+        ErrorCode::InvalidArgument
+            | ErrorCode::Unauthenticated
+            | ErrorCode::PermissionDenied
+            | ErrorCode::NotFound
+            | ErrorCode::AlreadyExists
+            | ErrorCode::Conflict
+            | ErrorCode::StaleProducerEpoch
+            | ErrorCode::SequenceGap
+            | ErrorCode::SchemaMismatch
+            | ErrorCode::OffsetExpired
+            | ErrorCode::UnsupportedPlan
+    )
+}
+
 fn coordinator_closed() -> ServerError {
     ServerError::new(
         ErrorCode::Unavailable,
@@ -736,4 +860,45 @@ fn actor_join_error(operation: &str, error: tokio::task::JoinError) -> ServerErr
         format!("{operation} task failed error=[{error}]"),
     )
     .with_retryable(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_error_disposition_is_conservative() {
+        for code in [
+            ErrorCode::InvalidArgument,
+            ErrorCode::Unauthenticated,
+            ErrorCode::PermissionDenied,
+            ErrorCode::NotFound,
+            ErrorCode::AlreadyExists,
+            ErrorCode::Conflict,
+            ErrorCode::StaleProducerEpoch,
+            ErrorCode::SequenceGap,
+            ErrorCode::SchemaMismatch,
+            ErrorCode::OffsetExpired,
+            ErrorCode::UnsupportedPlan,
+        ] {
+            let error = ServerError::new(code, "definitive rejection").with_retryable(false);
+            assert!(is_definitive_catalog_rejection(&error), "code=[{code}]");
+        }
+
+        for code in [
+            ErrorCode::ResourceExhausted,
+            ErrorCode::Unavailable,
+            ErrorCode::Cancelled,
+            ErrorCode::DeadlineExceeded,
+            ErrorCode::DataCorruption,
+            ErrorCode::Internal,
+        ] {
+            let error = ServerError::new(code, "not definitive").with_retryable(false);
+            assert!(!is_definitive_catalog_rejection(&error), "code=[{code}]");
+        }
+
+        let retryable_conflict =
+            ServerError::new(ErrorCode::Conflict, "commit state unknown").with_retryable(true);
+        assert!(!is_definitive_catalog_rejection(&retryable_conflict));
+    }
 }

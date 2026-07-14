@@ -87,10 +87,16 @@ checks SQLite, runs pre-replay reconciliation, replays durable Catalog intents, 
 reconciliation. The storage supervisor then starts a bounded `PersistController`, which exclusively
 owns native Parquet writer jobs and the durable Catalog commit coordinator. Writer concurrency uses
 `runtime.max_parallelism` (or `ZIPPY_MAX_PARALLELISM`) with a storage safety ceiling of 64; the
-controller defaults retain at most 64 accepted jobs and 512 MiB of complete request input. It then reads the
-current Catalog snapshots at one stable revision and verifies
-every visible managed Parquet path, size, checksum, footer, and row count before binding any
-listener. It then binds the master listener, waits for its
+controller defaults retain at most 64 accepted jobs and 512 MiB of complete request input. It then
+reads the current Catalog snapshots at one stable revision and verifies every visible managed
+Parquet path, size, checksum, footer, and row count before binding any listener. One serial
+`TableActor` is then started for each active table. The actor revalidates the current snapshot,
+exact Arrow schema, writer epoch, and contiguous logical offset before using the controller; it
+advances local state only after validating the durable Catalog receipt. A terminal controller error
+or abnormal actor exit closes native admission, revokes dynamic server readiness, and starts
+ordered actor/controller/Catalog cleanup. Definitive Catalog rejections remain request-local, and
+an exact retained request ID can replay its original receipt after restart without rolling a newer
+actor snapshot backward. It then binds the master listener, waits for its
 readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master
 control probe, and only then opens service admission. With Gateway disabled it intentionally runs
 in catalog-only mode; it does not publish a query service that cannot execute.
@@ -160,9 +166,11 @@ cleanup actually completes. If the process cannot create the reaper because of O
 exhaustion, startup still returns on time and logs a detached-cleanup error; the original supervisor
 continues to retain the Catalog and data-root capability until it exits.
 
-This phase establishes process ownership, crash-safe publication, and gated recovery. The
-production runtime still uses the legacy metadata authority until the server-owned table actor,
-query mirror, shadow comparison, and authority cutover are completed.
+This phase establishes process ownership, crash-safe publication, gated recovery, and the internal
+native table persistence state machine. The production runtime still uses the legacy metadata and
+Gateway authorities until the native path is wired into public ingest, conflicting replay cannot
+leave unpublished candidates, daemon status follows runtime storage failures, query mirroring and
+shadow comparison pass, and authority cutover is completed.
 
 On shutdown the order is reversed: adapter and native admission close first, Gateway releases its
 master lease and stops, the native coordinator drains and closes SQLite, then master performs its

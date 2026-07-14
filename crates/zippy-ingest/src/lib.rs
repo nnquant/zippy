@@ -11,7 +11,9 @@ mod actor;
 mod registry;
 
 pub use actor::{
-    TableActorAdmissionControl, TableActorHandle, TableActorRegistry, TableActorRegistryConfig,
+    TableActorAdmissionControl, TableActorFailureMonitor, TableActorHandle,
+    TableActorPersistRequest, TableActorRegistry, TableActorRegistryConfig,
     TableActorRegistryHandle, TableActorSnapshot, TableActorSnapshotRequest,
+    TablePersistenceStatus,
 };
 pub use registry::{TableRuntime, TableRuntimeBootstrap, TableRuntimeRegistry};

@@ -177,7 +177,7 @@ impl CatalogWrite for TerminalCatalog {
     ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
         Box::pin(async {
             Err(ServerError::new(
-                ErrorCode::InvalidArgument,
+                ErrorCode::DataCorruption,
                 "terminal catalog failure for reconciliation test",
             )
             .with_retryable(false))
@@ -409,7 +409,7 @@ async fn retained_terminal_intent_protects_uncommitted_candidate() {
         )
         .await
         .expect_err("terminal Catalog error must retain intent");
-    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
     assert!(coordinator.drain().await.is_err());
 
     let report = StartupOrphanReconciler::new(Arc::clone(&owned), catalog.clone())

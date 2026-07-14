@@ -1011,6 +1011,12 @@ impl LegacyServerRuntime {
             .master_listener
             .as_ref()
             .is_some_and(|listener| !listener.is_finished());
+        apply_native_storage_runtime_health(
+            &mut readiness,
+            self.native_storage
+                .as_ref()
+                .map(NativeStorageRuntime::is_healthy),
+        );
         let mut services = self.services.health(
             readiness.admission_open,
             self.master.is_running() && readiness.master_listener_ready,
@@ -1114,6 +1120,16 @@ impl LegacyServerRuntime {
         }
         self.shutdown_outcome = Some(outcome.clone());
         outcome
+    }
+}
+
+fn apply_native_storage_runtime_health(
+    readiness: &mut LegacyServerReadiness,
+    native_storage_healthy: Option<bool>,
+) {
+    if readiness.native_storage_configured && native_storage_healthy != Some(true) {
+        readiness.native_catalog_ready = false;
+        readiness.native_current_snapshot_files_ready = false;
     }
 }
 
@@ -1600,6 +1616,28 @@ mod tests {
         assert!(!readiness.is_ready());
         readiness.native_current_snapshot_files_ready = true;
         readiness.storage_reconciliation_complete = false;
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
+    fn runtime_native_failure_revokes_dynamic_readiness() {
+        let mut readiness = LegacyServerReadiness {
+            admission_open: true,
+            master_listener_ready: true,
+            gateway_configured: false,
+            gateway_listener_ready: false,
+            gateway_master_reachable: false,
+            native_storage_configured: true,
+            native_catalog_ready: true,
+            native_current_snapshot_files_ready: true,
+            storage_reconciliation_complete: true,
+            commit_recovery_complete: true,
+        };
+
+        apply_native_storage_runtime_health(&mut readiness, Some(false));
+
+        assert!(!readiness.native_catalog_ready);
+        assert!(!readiness.native_current_snapshot_files_ready);
         assert!(!readiness.is_ready());
     }
 

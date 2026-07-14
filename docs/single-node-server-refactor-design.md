@@ -1860,7 +1860,7 @@ durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、�
 通过 data-root/table directory fd 逐级 `openat(O_NOFOLLOW)`，有界核验每个当前可见 managed 文件的
 路径归属、大小、checksum、Parquet footer 和 row count；缺失、symlink 替换或内容损坏均 fail closed。
 该 gate 不声明历史 snapshot 可用，native historical query admission 仍关闭，历史文件深度审计属于
-maintenance。snapshot lease、logical drop、safe GC、TableActor persist 状态机和权威 Gateway 写入口
+maintenance。snapshot lease、logical drop、safe GC 和权威 Gateway 写入口
 接线尚未完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
 `[server].native_storage_enabled = true`（或 `ZIPPY_SERVER_NATIVE_STORAGE=true`）后，
 `NativeStorageRuntime` 会在任何 listener 绑定前依次执行 Catalog open、pre-replay reconciliation、
@@ -1884,9 +1884,17 @@ version、writer epoch 和 committed log watermark，再一次性构建 server-o
 并发取 process-wide `runtime.max_parallelism` 并受 64 路硬上限约束。同表只允许一个 accepted persist，
 不同表可以并行；footer 在准入前完成 1 MiB 有界流式编码，schema、provenance、metadata、容器和 Arrow
 buffer 都计入输入预算。shutdown 顺序为关闭 table actor admission、排空已接受 actor command、排空
-PersistController 的 writer 与 Catalog commit、关闭 SQLite Catalog。当前 actor 仅开放内部状态观察，
-尚未把 sealed RecordBatch 和 persist receipt 接入自身状态机，也未接入 Gateway 权威写入口，因此 legacy
-Gateway 仍是业务写 authority，不能据此宣称 native ingest 可用。
+PersistController 的 writer 与 Catalog commit、关闭 SQLite Catalog。actor 现在会逐请求复核 table、
+snapshot、精确 Arrow schema、writer epoch 和连续 offset；写盘与 Catalog commit 在 actor turn 外执行，
+receipt 回到同一 actor 后再校验 request/table/parent/version/operation/LSN/watermark 并推进本地快照。
+同表 persist single-flight，快照观察不被写盘阻塞。storage 到 actor 的 admission/completion 结果显式
+区分 request-local `Rejected` 与 runtime-terminal `Fatal`，不再根据错误码或 Advance/Replay 猜测；只有
+terminal failure 会在响应调用方前关闭全局 admission、拉低 native/server health，并按 actor、controller、
+Catalog 顺序清理。Catalog 持久 idempotency 记录存在期间，原 request ID 可在跨重启后返回原 receipt，
+actor 不会把较新 snapshot 回滚；同 ID 不同 fingerprint 返回 Conflict，且不会毒化后续写入。Gateway
+权威写入口仍未接入；冲突 replay 目前会先发布 candidate 再被 Catalog 拒绝，在线 orphan 回收又缺少
+publication gate；daemon 对外 status 也尚未跟随 native runtime 终态故障。因此 legacy Gateway 仍是业务
+写 authority，不能据此宣称 native ingest 已对外可用。
 
 任务：
 

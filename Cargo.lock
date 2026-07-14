@@ -2347,6 +2347,7 @@ version = "0.5.0"
 dependencies = [
  "arrow",
  "tokio",
+ "zippy-storage",
  "zippy-types",
 ]
 

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::ArrayRef;
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -12,9 +13,10 @@ use zippy_types::table::{
     MetadataMap, MetadataScalar, NativeDataFileProvenance, SourceSegmentLineage,
     SourceSegmentLineages,
 };
-use zippy_types::{ErrorCode, OffsetWatermark, RequestId, Result, ServerError, TableId};
+use zippy_types::{ErrorCode, LogOffset, OffsetWatermark, RequestId, Result, ServerError, TableId};
 
 use crate::candidate::PreparedParquetCandidateSpec;
+use crate::commit::CatalogCommitFailure;
 use crate::commit_intent::MAX_FILES_PER_COMMIT_INTENT;
 use crate::{
     CatalogCommitCoordinator, CommitDataFilesIntent, CommitDataFilesReceipt,
@@ -380,6 +382,10 @@ pub struct PersistRequest {
     request_id: RequestId,
     table_id: TableId,
     expected_snapshot_version: u64,
+    schema_version: u64,
+    schema: SchemaRef,
+    writer_epoch: u64,
+    first_log_offset: LogOffset,
     candidates: Vec<PersistCandidateInput>,
     committed_log_offset: OffsetWatermark,
     retained_input_bytes: usize,
@@ -432,6 +438,45 @@ impl PersistRequest {
                 .with_table_id(table_id));
             }
         }
+        let schema_version = candidates[0].spec().schema_version;
+        let schema = Arc::clone(&candidates[0].spec().schema);
+        let writer_epoch = candidates[0].spec().provenance.source_lineage().as_slice()[0]
+            .source
+            .writer_epoch;
+        for candidate in &candidates {
+            if candidate.spec().schema_version != schema_version {
+                return Err(ServerError::new(
+                    ErrorCode::SchemaMismatch,
+                    "persist request candidates must use one schema version",
+                )
+                .with_request_id(request_id)
+                .with_table_id(table_id)
+                .with_retryable(false));
+            }
+            if candidate.spec().schema.as_ref() != schema.as_ref() {
+                return Err(ServerError::new(
+                    ErrorCode::SchemaMismatch,
+                    "persist request candidates must use one Arrow schema",
+                )
+                .with_request_id(request_id)
+                .with_table_id(table_id)
+                .with_retryable(false));
+            }
+            if candidate
+                .spec()
+                .provenance
+                .source_lineage()
+                .as_slice()
+                .iter()
+                .any(|lineage| lineage.source.writer_epoch != writer_epoch)
+            {
+                return Err(terminal_invalid(
+                    "persist request candidates must use one writer epoch",
+                )
+                .with_request_id(request_id)
+                .with_table_id(table_id));
+            }
+        }
         candidates.sort_unstable_by_key(|candidate| candidate.spec().file_id);
         if candidates
             .windows(2)
@@ -473,6 +518,10 @@ impl PersistRequest {
             .last()
             .expect("nonempty persist candidates have offset coverage")
             .last();
+        let first_log_offset = coverage
+            .first()
+            .expect("nonempty persist candidates have offset coverage")
+            .first();
         if committed_log_offset_value != coverage_end {
             return Err(terminal_invalid(format!(
                 concat!(
@@ -514,6 +563,10 @@ impl PersistRequest {
             request_id,
             table_id,
             expected_snapshot_version,
+            schema_version,
+            schema,
+            writer_epoch,
+            first_log_offset,
             candidates,
             committed_log_offset,
             retained_input_bytes,
@@ -530,6 +583,42 @@ impl PersistRequest {
     #[must_use]
     pub const fn table_id(&self) -> TableId {
         self.table_id
+    }
+
+    /// Returns the current snapshot version this request must extend.
+    #[must_use]
+    pub const fn expected_snapshot_version(&self) -> u64 {
+        self.expected_snapshot_version
+    }
+
+    /// Returns the one schema version shared by every candidate.
+    #[must_use]
+    pub const fn schema_version(&self) -> u64 {
+        self.schema_version
+    }
+
+    /// Borrows the exact Arrow schema shared by every candidate batch.
+    #[must_use]
+    pub const fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Returns the one producer fencing epoch shared by every source lineage.
+    #[must_use]
+    pub const fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+
+    /// Returns the first logical offset covered by this atomic request.
+    #[must_use]
+    pub const fn first_log_offset(&self) -> LogOffset {
+        self.first_log_offset
+    }
+
+    /// Returns the durable logical boundary requested for the new snapshot.
+    #[must_use]
+    pub const fn committed_log_offset(&self) -> OffsetWatermark {
+        self.committed_log_offset
     }
 
     /// Returns the conservative retained persist-input charge in bytes.
@@ -561,56 +650,93 @@ impl PersistControllerHandle {
     /// slot before enqueueing.
     /// Dropping the returned ticket never cancels the accepted operation.
     pub fn submit(&self, request: PersistRequest) -> Result<PersistTicket> {
+        self.submit_classified(request)
+            .map_err(PersistCompletionFailure::into_error)
+    }
+
+    /// Immediately admits one request while preserving failure disposition.
+    ///
+    /// Backpressure and invalid request budgets are request-local rejections.
+    /// A closed controller, closed internal budget, or poisoned admission state
+    /// is fatal because the owning runtime can no longer accept native writes.
+    pub fn submit_classified(
+        &self,
+        request: PersistRequest,
+    ) -> std::result::Result<PersistTicket, PersistCompletionFailure> {
         let request_id = request.request_id;
         let table_id = request.table_id;
         if !self.accepting.load(Ordering::Acquire) {
-            return Err(controller_closed()
-                .with_request_id(request_id)
-                .with_table_id(table_id));
+            return Err(PersistCompletionFailure::Fatal(
+                controller_closed()
+                    .with_request_id(request_id)
+                    .with_table_id(table_id),
+            ));
         }
         let retained_input_bytes = u64::try_from(request.retained_input_bytes).map_err(|_| {
-            terminal_resource("persist request retained bytes exceed u64 accounting domain")
-                .with_request_id(request_id)
-                .with_table_id(table_id)
+            PersistCompletionFailure::Rejected(
+                terminal_resource("persist request retained bytes exceed u64 accounting domain")
+                    .with_request_id(request_id)
+                    .with_table_id(table_id),
+            )
         })?;
         if retained_input_bytes > self.max_input_bytes {
-            return Err(terminal_resource(format!(
-                concat!(
-                    "persist request exceeds retained input byte budget ",
-                    "requested=[{}] maximum=[{}]"
-                ),
-                retained_input_bytes, self.max_input_bytes
-            ))
-            .with_request_id(request_id)
-            .with_table_id(table_id));
+            return Err(PersistCompletionFailure::Rejected(
+                terminal_resource(format!(
+                    concat!(
+                        "persist request exceeds retained input byte budget ",
+                        "requested=[{}] maximum=[{}]"
+                    ),
+                    retained_input_bytes, self.max_input_bytes
+                ))
+                .with_request_id(request_id)
+                .with_table_id(table_id),
+            ));
         }
-        let table_permit =
-            TablePersistPermit::try_acquire(table_id, Arc::clone(&self.active_tables))
-                .map_err(|error| error.with_request_id(request_id).with_table_id(table_id))?;
+        let table_permit = TablePersistPermit::try_acquire(
+            table_id,
+            Arc::clone(&self.active_tables),
+        )
+        .map_err(|failure| {
+            failure.map_error(|error| error.with_request_id(request_id).with_table_id(table_id))
+        })?;
         let job_permit = Arc::clone(&self.job_budget)
             .try_acquire_owned()
-            .map_err(|error| map_admission_budget_error("outstanding_jobs", error))
-            .map_err(|error| error.with_request_id(request_id).with_table_id(table_id))?;
-        let input_permits = input_request_permits(retained_input_bytes)?;
+            .map_err(|error| classify_admission_budget_error("outstanding_jobs", error))
+            .map_err(|failure| {
+                failure.map_error(|error| error.with_request_id(request_id).with_table_id(table_id))
+            })?;
+        let input_permits = input_request_permits(retained_input_bytes).map_err(|error| {
+            PersistCompletionFailure::Rejected(
+                error.with_request_id(request_id).with_table_id(table_id),
+            )
+        })?;
         let input_permit = Arc::clone(&self.input_budget)
             .try_acquire_many_owned(input_permits)
-            .map_err(|error| map_admission_budget_error("inflight_input_bytes", error))
-            .map_err(|error| error.with_request_id(request_id).with_table_id(table_id))?;
+            .map_err(|error| classify_admission_budget_error("inflight_input_bytes", error))
+            .map_err(|failure| {
+                failure.map_error(|error| error.with_request_id(request_id).with_table_id(table_id))
+            })?;
         let queue_permit = self
             .sender
             .clone()
             .try_reserve_owned()
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
-                    temporary_resource("persist bounded queue has no immediately available slot")
+                mpsc::error::TrySendError::Full(_) => PersistCompletionFailure::Rejected(
+                    temporary_resource("persist bounded queue has no immediately available slot"),
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    PersistCompletionFailure::Fatal(controller_closed())
                 }
-                mpsc::error::TrySendError::Closed(_) => controller_closed(),
             })
-            .map_err(|error| error.with_request_id(request_id).with_table_id(table_id))?;
+            .map_err(|failure| {
+                failure.map_error(|error| error.with_request_id(request_id).with_table_id(table_id))
+            })?;
         if !self.accepting.load(Ordering::Acquire) {
-            return Err(controller_closed()
-                .with_request_id(request_id)
-                .with_table_id(table_id));
+            return Err(PersistCompletionFailure::Fatal(
+                controller_closed()
+                    .with_request_id(request_id)
+                    .with_table_id(table_id),
+            ));
         }
         let (response, receiver) = oneshot::channel();
         queue_permit.send(PersistJob {
@@ -632,7 +758,83 @@ impl PersistControllerHandle {
 /// Cancellation-safe waiter for one already accepted persist operation.
 pub struct PersistTicket {
     request_id: RequestId,
-    receiver: oneshot::Receiver<Result<CommitDataFilesReceipt>>,
+    receiver: oneshot::Receiver<PersistCompletionResult>,
+}
+
+/// Classified failure returned after a persist request has been accepted.
+///
+/// Request rejection proves that Catalog did not commit the operation and the
+/// durable intent was safely removed. Fatal failure means completion or
+/// recovery safety is no longer known, so the owning runtime must stop native
+/// write admission.
+#[derive(Clone, Debug)]
+pub enum PersistCompletionFailure {
+    /// One request was definitively rejected without degrading the controller.
+    Rejected(ServerError),
+    /// The controller encountered a terminal execution or durability failure.
+    Fatal(ServerError),
+}
+
+impl PersistCompletionFailure {
+    /// Returns the structured server error carried by this classification.
+    #[must_use]
+    pub const fn error(&self) -> &ServerError {
+        match self {
+            Self::Rejected(error) | Self::Fatal(error) => error,
+        }
+    }
+
+    /// Consumes the classification and returns its structured server error.
+    #[must_use]
+    pub fn into_error(self) -> ServerError {
+        match self {
+            Self::Rejected(error) | Self::Fatal(error) => error,
+        }
+    }
+
+    /// Returns whether the owning persistence runtime must stop admission.
+    #[must_use]
+    pub const fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal(_))
+    }
+
+    fn map_error(self, map: impl FnOnce(ServerError) -> ServerError) -> Self {
+        match self {
+            Self::Rejected(error) => Self::Rejected(map(error)),
+            Self::Fatal(error) => Self::Fatal(map(error)),
+        }
+    }
+}
+
+/// Completion result that preserves request-local versus terminal failure.
+pub type PersistCompletionResult =
+    std::result::Result<CommitDataFilesReceipt, PersistCompletionFailure>;
+
+/// One observer for the first terminal execution failure of a persist controller.
+///
+/// Normal backpressure never reaches this monitor. A returned error means the
+/// controller has permanently closed global admission and the owning server
+/// must fail or degrade native-storage readiness before accepting more work.
+pub struct PersistControllerFailureMonitor {
+    receiver: watch::Receiver<Option<ServerError>>,
+}
+
+impl PersistControllerFailureMonitor {
+    /// Waits until the controller reports a terminal failure or stops unexpectedly.
+    pub async fn wait_for_failure(&mut self) -> ServerError {
+        loop {
+            if let Some(error) = self.receiver.borrow().clone() {
+                return error;
+            }
+            if self.receiver.changed().await.is_err() {
+                return ServerError::new(
+                    ErrorCode::Internal,
+                    "persist controller stopped without publishing a terminal outcome",
+                )
+                .with_retryable(false);
+            }
+        }
+    }
 }
 
 impl PersistTicket {
@@ -647,13 +849,25 @@ impl PersistTicket {
     /// Dropping this future or the ticket abandons only the response channel;
     /// writing, commit replay, and cleanup continue under controller ownership.
     pub async fn wait(self) -> Result<CommitDataFilesReceipt> {
-        self.receiver.await.map_err(|_| {
-            ServerError::new(
-                ErrorCode::Unavailable,
-                "persist controller stopped after accepting the request",
-            )
-            .with_request_id(self.request_id)
-        })?
+        self.wait_classified()
+            .await
+            .map_err(PersistCompletionFailure::into_error)
+    }
+
+    /// Waits while preserving whether a failure is request-local or terminal.
+    ///
+    /// Runtime owners should keep serving after [`PersistCompletionFailure::Rejected`]
+    /// and fail closed after [`PersistCompletionFailure::Fatal`].
+    pub async fn wait_classified(self) -> PersistCompletionResult {
+        self.receiver.await.unwrap_or_else(|_| {
+            Err(PersistCompletionFailure::Fatal(
+                ServerError::new(
+                    ErrorCode::Unavailable,
+                    "persist controller stopped after accepting the request",
+                )
+                .with_request_id(self.request_id),
+            ))
+        })
     }
 }
 
@@ -667,6 +881,7 @@ pub struct PersistController {
     shutdown: watch::Sender<bool>,
     worker: Option<JoinHandle<Result<()>>>,
     handle: PersistControllerHandle,
+    failure: watch::Receiver<Option<ServerError>>,
 }
 
 impl PersistController {
@@ -708,6 +923,7 @@ impl PersistController {
             max_input_bytes: config.max_inflight_input_bytes,
         };
         let (shutdown, shutdown_receiver) = watch::channel(false);
+        let (failure, failure_receiver) = watch::channel(None);
         let worker_accepting = Arc::clone(&accepting);
         let worker = tokio::spawn(run_controller(
             receiver,
@@ -716,6 +932,7 @@ impl PersistController {
             coordinator,
             config.max_parallel_writers,
             worker_accepting,
+            failure,
         ));
         Ok(Self {
             sender: Some(sender),
@@ -723,6 +940,7 @@ impl PersistController {
             shutdown,
             worker: Some(worker),
             handle,
+            failure: failure_receiver,
         })
     }
 
@@ -730,6 +948,14 @@ impl PersistController {
     #[must_use]
     pub fn handle(&self) -> PersistControllerHandle {
         self.handle.clone()
+    }
+
+    /// Returns an independent observer for runtime-terminal controller failure.
+    #[must_use]
+    pub fn failure_monitor(&self) -> PersistControllerFailureMonitor {
+        PersistControllerFailureMonitor {
+            receiver: self.failure.clone(),
+        }
     }
 
     /// Closes admission and drains every accepted job without a deadline.
@@ -773,20 +999,25 @@ struct TablePersistPermit {
 }
 
 impl TablePersistPermit {
-    fn try_acquire(table_id: TableId, active_tables: Arc<Mutex<HashSet<TableId>>>) -> Result<Self> {
+    fn try_acquire(
+        table_id: TableId,
+        active_tables: Arc<Mutex<HashSet<TableId>>>,
+    ) -> std::result::Result<Self, PersistCompletionFailure> {
         let mut active = active_tables.lock().map_err(|_| {
-            ServerError::new(
-                ErrorCode::Internal,
-                "persist table admission state is poisoned",
+            PersistCompletionFailure::Fatal(
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "persist table admission state is poisoned",
+                )
+                .with_table_id(table_id)
+                .with_retryable(false),
             )
-            .with_table_id(table_id)
-            .with_retryable(false)
         })?;
         if !active.insert(table_id) {
-            return Err(
+            return Err(PersistCompletionFailure::Rejected(
                 temporary_resource("persist table already has an accepted operation")
                     .with_table_id(table_id),
-            );
+            ));
         }
         drop(active);
         Ok(Self {
@@ -808,7 +1039,7 @@ impl Drop for TablePersistPermit {
 
 struct PersistJob {
     request: PersistRequest,
-    response: oneshot::Sender<Result<CommitDataFilesReceipt>>,
+    response: oneshot::Sender<PersistCompletionResult>,
     _permits: AdmissionPermits,
 }
 
@@ -818,7 +1049,7 @@ struct WrittenPersistJob {
     expected_snapshot_version: u64,
     candidates: Result<Vec<DurableParquetCandidate>>,
     committed_log_offset: OffsetWatermark,
-    response: oneshot::Sender<Result<CommitDataFilesReceipt>>,
+    response: oneshot::Sender<PersistCompletionResult>,
     _permits: AdmissionPermits,
 }
 
@@ -829,6 +1060,7 @@ async fn run_controller(
     coordinator: CatalogCommitCoordinator,
     max_parallel_writers: usize,
     accepting: Arc<AtomicBool>,
+    failure: watch::Sender<Option<ServerError>>,
 ) -> Result<()> {
     let mut writers = JoinSet::new();
     let mut closing = false;
@@ -862,6 +1094,7 @@ async fn run_controller(
                             &mut first_error,
                             &accepting,
                             &mut receiver,
+                            &failure,
                         ).await;
                     }
                     Some(Err(error)) => {
@@ -870,6 +1103,7 @@ async fn run_controller(
                             &mut first_error,
                             &accepting,
                             &mut receiver,
+                            &failure,
                         );
                     }
                     None => {}
@@ -879,7 +1113,7 @@ async fn run_controller(
     }
 
     if let Err(error) = coordinator.drain().await {
-        record_first_error(error, &mut first_error);
+        publish_first_error(error, &mut first_error, &failure);
     }
     first_error.map_or(Ok(()), Err)
 }
@@ -894,6 +1128,10 @@ fn write_job(writer: &ParquetCandidateWriter, job: PersistJob) -> WrittenPersist
         request_id,
         table_id,
         expected_snapshot_version,
+        schema_version: _,
+        schema: _,
+        writer_epoch: _,
+        first_log_offset: _,
         candidates,
         committed_log_offset,
         retained_input_bytes: _,
@@ -920,6 +1158,7 @@ async fn complete_written_job(
     first_error: &mut Option<ServerError>,
     accepting: &Arc<AtomicBool>,
     receiver: &mut mpsc::Receiver<PersistJob>,
+    failure: &watch::Sender<Option<ServerError>>,
 ) {
     let WrittenPersistJob {
         request_id,
@@ -930,7 +1169,7 @@ async fn complete_written_job(
         response,
         _permits,
     } = job;
-    let result = match candidates {
+    let (result, fatal_error): (PersistCompletionResult, Option<ServerError>) = match candidates {
         Ok(candidates) => match CommitDataFilesIntent::new(
             request_id,
             table_id,
@@ -938,13 +1177,28 @@ async fn complete_written_job(
             candidates,
             committed_log_offset,
         ) {
-            Ok(intent) => coordinator.commit(intent).await,
-            Err(error) => Err(error),
+            Ok(intent) => match coordinator.commit_classified(intent).await {
+                Ok(receipt) => (Ok(receipt), None),
+                Err(CatalogCommitFailure::DefinitiveRejection(error)) => {
+                    (Err(PersistCompletionFailure::Rejected(error)), None)
+                }
+                Err(CatalogCommitFailure::Fatal(error)) => (
+                    Err(PersistCompletionFailure::Fatal(error.clone())),
+                    Some(error),
+                ),
+            },
+            Err(error) => (
+                Err(PersistCompletionFailure::Fatal(error.clone())),
+                Some(error),
+            ),
         },
-        Err(error) => Err(error),
+        Err(error) => (
+            Err(PersistCompletionFailure::Fatal(error.clone())),
+            Some(error),
+        ),
     };
-    if let Err(error) = &result {
-        record_controller_error(error.clone(), first_error, accepting, receiver);
+    if let Some(error) = fatal_error {
+        record_controller_error(error, first_error, accepting, receiver, failure);
     }
     drop(_permits);
     let _ = response.send(result);
@@ -955,9 +1209,21 @@ fn record_controller_error(
     first_error: &mut Option<ServerError>,
     accepting: &Arc<AtomicBool>,
     receiver: &mut mpsc::Receiver<PersistJob>,
+    failure: &watch::Sender<Option<ServerError>>,
 ) {
     accepting.store(false, Ordering::Release);
     receiver.close();
+    publish_first_error(error, first_error, failure);
+}
+
+fn publish_first_error(
+    error: ServerError,
+    first_error: &mut Option<ServerError>,
+    failure: &watch::Sender<Option<ServerError>>,
+) {
+    if first_error.is_none() {
+        failure.send_replace(Some(error.clone()));
+    }
     record_first_error(error, first_error);
 }
 
@@ -985,12 +1251,15 @@ fn input_request_permits(bytes: u64) -> Result<u32> {
         .map_err(|_| terminal_resource("persist input bytes exceed semaphore domain"))
 }
 
-fn map_admission_budget_error(resource: &str, error: TryAcquireError) -> ServerError {
+fn classify_admission_budget_error(
+    resource: &str,
+    error: TryAcquireError,
+) -> PersistCompletionFailure {
     match error {
-        TryAcquireError::NoPermits => temporary_resource(format!(
-            "persist {resource} budget is temporarily exhausted"
+        TryAcquireError::NoPermits => PersistCompletionFailure::Rejected(temporary_resource(
+            format!("persist {resource} budget is temporarily exhausted"),
         )),
-        TryAcquireError::Closed => controller_closed(),
+        TryAcquireError::Closed => PersistCompletionFailure::Fatal(controller_closed()),
     }
 }
 

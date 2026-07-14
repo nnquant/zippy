@@ -1,5 +1,6 @@
 //! Server-owned lifecycle for the SQLite Catalog and native manifest storage.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -293,6 +294,7 @@ impl NativeStorageStartup {
             catalog_file_verification: ready.catalog_file_verification,
             table_actors: ready.table_actors,
             table_actor_admission: ready.table_actor_admission,
+            healthy: ready.healthy,
             shutdown: self.shutdown.take(),
             completion: self.completion.take(),
             supervisor: self.supervisor.take(),
@@ -342,6 +344,7 @@ pub struct NativeStorageRuntime {
     catalog_file_verification: StartupCatalogFileVerificationReport,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
+    healthy: Arc<AtomicBool>,
     shutdown: Option<watch::Sender<bool>>,
     completion: Option<mpsc::Receiver<Result<()>>>,
     supervisor: Option<JoinHandle<()>>,
@@ -415,8 +418,21 @@ impl NativeStorageRuntime {
         self.table_actors.table(table_id)
     }
 
+    /// Returns whether the supervisor still owns a ready native storage stack.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+            && !self.shutdown_requested
+            && self.final_shutdown.is_none()
+            && self
+                .supervisor
+                .as_ref()
+                .is_some_and(|supervisor| !supervisor.is_finished())
+    }
+
     /// Irreversibly closes native work admission and requests ordered background cleanup.
     pub fn begin_shutdown(&mut self) {
+        self.healthy.store(false, Ordering::Release);
         if self.shutdown_requested {
             return;
         }
@@ -503,6 +519,7 @@ struct SupervisorReady {
     catalog_file_verification: StartupCatalogFileVerificationReport,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
+    healthy: Arc<AtomicBool>,
 }
 
 fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageStartup> {
@@ -578,14 +595,14 @@ async fn supervise_storage(
     if shutdown_requested(&shutdown) {
         return (
             false,
-            fail_startup(startup_cancelled(), None, None, catalog).await,
+            fail_storage(startup_cancelled(), None, None, catalog).await,
         );
     }
 
     let pre_replay =
         match reconcile_once(&config, Arc::clone(&catalog), &mut shutdown, "pre-replay").await {
             Ok(report) => report,
-            Err(error) => return (false, fail_startup(error, None, None, catalog).await),
+            Err(error) => return (false, fail_storage(error, None, None, catalog).await),
         };
     tracing::info!(
         component = "native_storage",
@@ -611,7 +628,7 @@ async fn supervise_storage(
     .await
     {
         Ok(coordinator) => coordinator,
-        Err(error) => return (false, fail_startup(error, None, None, catalog).await),
+        Err(error) => return (false, fail_storage(error, None, None, catalog).await),
     };
     let persist_controller = match PersistController::start(
         config.persist_controller.clone(),
@@ -621,7 +638,7 @@ async fn supervise_storage(
     .await
     {
         Ok(controller) => controller,
-        Err(error) => return (false, fail_startup(error, None, None, catalog).await),
+        Err(error) => return (false, fail_storage(error, None, None, catalog).await),
     };
 
     let post_replay =
@@ -630,7 +647,7 @@ async fn supervise_storage(
             Err(error) => {
                 return (
                     false,
-                    fail_startup(error, None, Some(persist_controller), catalog).await,
+                    fail_storage(error, None, Some(persist_controller), catalog).await,
                 );
             }
         };
@@ -651,7 +668,7 @@ async fn supervise_storage(
             Err(error) => {
                 return (
                     false,
-                    fail_startup(error, None, Some(persist_controller), catalog).await,
+                    fail_storage(error, None, Some(persist_controller), catalog).await,
                 );
             }
         };
@@ -670,7 +687,7 @@ async fn supervise_storage(
         .with_retryable(true);
         return (
             false,
-            fail_startup(error, None, Some(persist_controller), catalog).await,
+            fail_storage(error, None, Some(persist_controller), catalog).await,
         );
     }
 
@@ -684,24 +701,27 @@ async fn supervise_storage(
         Err(error) => {
             return (
                 false,
-                fail_startup(error, None, Some(persist_controller), catalog).await,
+                fail_storage(error, None, Some(persist_controller), catalog).await,
             );
         }
     };
-    let table_actors = match TableActorRegistry::start(config.table_actors.clone(), table_runtimes)
-    {
+    let mut table_actors = match TableActorRegistry::start_with_persistence(
+        config.table_actors.clone(),
+        table_runtimes,
+        persist_controller.handle(),
+    ) {
         Ok(registry) => registry,
         Err(error) => {
             return (
                 false,
-                fail_startup(error, None, Some(persist_controller), catalog).await,
+                fail_storage(error, None, Some(persist_controller), catalog).await,
             );
         }
     };
     if shutdown_requested(&shutdown) {
         return (
             false,
-            fail_startup(
+            fail_storage(
                 startup_cancelled(),
                 Some(table_actors),
                 Some(persist_controller),
@@ -717,7 +737,7 @@ async fn supervise_storage(
         Err(error) => {
             return (
                 false,
-                fail_startup(error, Some(table_actors), Some(persist_controller), catalog).await,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
             );
         }
     };
@@ -736,7 +756,7 @@ async fn supervise_storage(
         .with_retryable(true);
         return (
             false,
-            fail_startup(error, Some(table_actors), Some(persist_controller), catalog).await,
+            fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
     tracing::info!(
@@ -749,26 +769,47 @@ async fn supervise_storage(
         "native storage recovery and bidirectional verification completed"
     );
 
+    let healthy = Arc::new(AtomicBool::new(true));
+    let mut persist_failure = persist_controller.failure_monitor();
+    let mut table_actor_failure = table_actors.failure_monitor();
+
     if startup
         .send(Ok(SupervisorReady {
             reconciliation: post_replay,
             catalog_file_verification,
             table_actors: table_actor_handle,
             table_actor_admission,
+            healthy: Arc::clone(&healthy),
         }))
         .is_err()
     {
+        healthy.store(false, Ordering::Release);
         return (
             false,
             close_storage(Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
 
-    wait_for_shutdown(&mut shutdown).await;
-    (
-        true,
-        close_storage(Some(table_actors), Some(persist_controller), catalog).await,
-    )
+    let failure = tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => None,
+        error = persist_failure.wait_for_failure() => Some(error),
+        error = table_actor_failure.wait_for_failure() => Some(error),
+    };
+    healthy.store(false, Ordering::Release);
+    match failure {
+        Some(error) => {
+            table_actors.close_admission();
+            (
+                true,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
+            )
+        }
+        None => (
+            true,
+            close_storage(Some(table_actors), Some(persist_controller), catalog).await,
+        ),
+    }
 }
 
 async fn reconcile_once(
@@ -866,7 +907,7 @@ where
     }
 }
 
-async fn fail_startup(
+async fn fail_storage(
     error: ServerError,
     table_actors: Option<TableActorRegistry>,
     persist_controller: Option<PersistController>,

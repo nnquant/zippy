@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 arrow.workspace = true
 tokio.workspace = true
+zippy-storage = { path = "../zippy-storage" }
 zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]

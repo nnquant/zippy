@@ -31,7 +31,8 @@ pub use commit::{
     CommitDataFilesReceipt,
 };
 pub use persist::{
-    PersistCandidateInput, PersistController, PersistControllerConfig, PersistControllerHandle,
+    PersistCandidateInput, PersistCompletionFailure, PersistCompletionResult, PersistController,
+    PersistControllerConfig, PersistControllerFailureMonitor, PersistControllerHandle,
     PersistRequest, PersistTicket, MAX_PERSIST_PARALLEL_WRITERS,
 };
 pub use reconcile::{

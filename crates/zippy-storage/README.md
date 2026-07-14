@@ -26,11 +26,17 @@ mutations. For each accepted request it:
 3. verifies candidate size, checksum, Parquet row count, and footer identity;
 4. submits the Catalog command;
 5. replays the unchanged envelope on commit-unknown errors;
-6. validates the returned request, table, snapshot parent, operation, watermark, and commit LSN;
-7. durably removes the intent record.
+6. on a definitive Catalog business rejection, durably removes the intent and fails only that
+   request;
+7. validates a successful response's request, table, snapshot parent, operation, watermark, and
+   commit LSN;
+8. durably removes the committed intent record.
 
 Cancellation after queue admission abandons only the caller response. A retained intent is replayed
-before the coordinator accepts new work after restart.
+before the coordinator accepts new work after restart. Resource pressure, unavailability,
+cancel/deadline responses, internal failures, and data corruption are never inferred to be safe
+business rejections. Failure to remove a definitively rejected intent remains fatal and retains the
+recovery boundary.
 
 Default outstanding budgets are 64 commits, 128 MiB of frozen command bytes, and 8 GiB of
 uncommitted candidate bytes. Candidate-byte accounting rounds each request up to 64 KiB. These are
@@ -49,11 +55,17 @@ never relies on fragile buffer-identity deduplication.
 
 The defaults are 64 outstanding jobs, 512 MiB of retained request input, and four concurrent
 blocking Parquet writers. Hard limits are 4,096 jobs, 64 GiB, and 64 writers. `submit()` returns a
-`PersistTicket` only after the request is in the bounded queue. Dropping that ticket abandons only
-the response: candidate publication, Catalog commit replay, and cleanup continue. Any writer or
-commit error closes global admission, but the controller still drains every accepted queue item,
-joins all blocking writers, and finally drains its exclusively owned coordinator before returning
-the first error.
+`PersistTicket` only after the request is in the bounded queue. `submit_classified()` and
+`PersistTicket::wait_classified()` preserve request-local `Rejected` versus runtime-terminal
+`Fatal` outcomes for actor supervision; the original methods remain compatibility mappings to
+`ServerError`. Dropping a ticket abandons only the response: candidate publication, Catalog commit
+replay, and cleanup continue. A definitive Catalog business rejection removes its durable intent
+and leaves controller admission open. Writer, unresolved commit, cleanup, or internal durability
+failure closes global admission, but the controller still drains every accepted queue item, joins
+all blocking writers, and finally drains its exclusively owned coordinator before returning the
+first error. `PersistControllerFailureMonitor` publishes that first terminal error before the
+failed ticket wakes; the server supervisor consumes it to revoke native readiness and begin ordered
+cleanup instead of continuing with a permanently closed controller.
 
 ## Startup reconciliation
 
@@ -105,5 +117,7 @@ compatibility wrapper that returns only the verification report. External legacy
 historical files removed from the current snapshot are outside this startup gate; maintenance
 verification remains responsible for historical/deep audits.
 
-Logical drop, snapshot leases, safe GC, compaction, TableActor persist-state integration, and public
-native write admission remain later refactor steps.
+Logical drop, snapshot leases, safe GC, compaction, replay-only candidate cleanup, and public native
+write admission remain later refactor steps. Native `TableActor`s now own the per-table persist
+state machine and Catalog-backed receipt replay, but the legacy Gateway remains write authority
+until the explicit cutover.

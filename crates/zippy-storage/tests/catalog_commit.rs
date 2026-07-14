@@ -199,7 +199,9 @@ async fn create_append_table(catalog: &SqliteCatalog, schema: &Schema) {
 enum FakeMode {
     Success,
     UnavailableOnce,
+    ConflictOnce,
     BlockSuccess,
+    BlockConflict,
     TerminalLimit,
     MismatchedResponse,
 }
@@ -250,6 +252,12 @@ impl CatalogWrite for FakeCatalog {
                     "lost fake response",
                 )
                 .with_request_id(command_request_id(&command))),
+                FakeMode::ConflictOnce if call == 0 => Err(ServerError::new(
+                    ErrorCode::Conflict,
+                    "fake recovered request is definitively stale",
+                )
+                .with_request_id(command_request_id(&command))
+                .with_retryable(false)),
                 FakeMode::BlockSuccess => {
                     self.release
                         .acquire()
@@ -258,6 +266,18 @@ impl CatalogWrite for FakeCatalog {
                         .forget();
                     Ok(success_response(&command, false))
                 }
+                FakeMode::BlockConflict => {
+                    self.release
+                        .acquire()
+                        .await
+                        .expect("fake release semaphore")
+                        .forget();
+                    Err(
+                        ServerError::new(ErrorCode::Conflict, "fake definitive Catalog rejection")
+                            .with_request_id(command_request_id(&command))
+                            .with_retryable(false),
+                    )
+                }
                 FakeMode::TerminalLimit => Err(ServerError::new(
                     ErrorCode::ResourceExhausted,
                     "fake command permanently exceeds its limit",
@@ -265,7 +285,7 @@ impl CatalogWrite for FakeCatalog {
                 .with_request_id(command_request_id(&command))
                 .with_retryable(false)),
                 FakeMode::MismatchedResponse => Ok(success_response(&command, true)),
-                FakeMode::Success | FakeMode::UnavailableOnce => {
+                FakeMode::Success | FakeMode::UnavailableOnce | FakeMode::ConflictOnce => {
                     Ok(success_response(&command, false))
                 }
             }
@@ -347,6 +367,55 @@ async fn real_catalog_commit_publishes_one_exact_snapshot() {
         .await
         .expect("read committed snapshot");
     assert_eq!(snapshot.tables()[0].files().as_slice().len(), 1);
+
+    coordinator.drain().await.expect("drain coordinator");
+    Arc::try_unwrap(catalog)
+        .ok()
+        .expect("coordinator released catalog")
+        .close()
+        .expect("close catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_catalog_conflict_removes_intent_and_worker_continues() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let schema = schema();
+    let catalog = Arc::new(
+        SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
+    );
+    create_append_table(&catalog, &schema).await;
+    let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
+    let first = write_candidate(&writer, 20, 0, vec![100]);
+    let next = write_candidate(&writer, 21, 1, vec![101]);
+    let coordinator = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::new(),
+        Arc::clone(&owned),
+        Arc::clone(&catalog) as Arc<dyn CatalogWrite>,
+        server_actor(),
+    )
+    .await
+    .expect("start commit coordinator");
+
+    coordinator
+        .commit(commit_intent(10, 1, 0, vec![first]))
+        .await
+        .expect("commit first candidate");
+    let conflict = coordinator
+        .commit(commit_intent(10, 2, 1, vec![next.clone()]))
+        .await
+        .expect_err("request id reuse with another payload must conflict");
+
+    assert_eq!(conflict.code(), ErrorCode::Conflict);
+    assert_eq!(conflict.request_id(), Some(request_id(10)));
+    assert!(intent_files(&root).is_empty());
+
+    let receipt = coordinator
+        .commit(commit_intent(11, 2, 1, vec![next]))
+        .await
+        .expect("worker must accept a valid commit after definitive rejection");
+    assert_eq!(receipt.snapshot.snapshot_version, 3);
+    assert!(intent_files(&root).is_empty());
 
     coordinator.drain().await.expect("drain coordinator");
     Arc::try_unwrap(catalog)
@@ -477,6 +546,109 @@ async fn terminal_failure_retains_intent_and_next_startup_recovers_it() {
         .drain()
         .await
         .expect("drain recovered coordinator");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_discards_definitively_rejected_intent_and_accepts_new_work() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
+    let retained = write_candidate(&writer, 20, 0, vec![100]);
+    let failed_catalog = Arc::new(FakeCatalog::new(FakeMode::TerminalLimit));
+    let failed = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::new(),
+        Arc::clone(&owned),
+        Arc::clone(&failed_catalog) as Arc<dyn CatalogWrite>,
+        server_actor(),
+    )
+    .await
+    .expect("start first coordinator");
+    failed
+        .commit(commit_intent(10, 1, 0, vec![retained]))
+        .await
+        .expect_err("fatal failure must retain the durable intent");
+    assert!(failed.drain().await.is_err());
+    assert_eq!(intent_files(&root).len(), 1);
+
+    let recovered_catalog = Arc::new(FakeCatalog::new(FakeMode::ConflictOnce));
+    let recovered = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::new(),
+        Arc::clone(&owned),
+        Arc::clone(&recovered_catalog) as Arc<dyn CatalogWrite>,
+        server_actor(),
+    )
+    .await
+    .expect("definitively rejected recovery intent must not block startup");
+    assert_eq!(recovered_catalog.calls(), 1);
+    assert!(intent_files(&root).is_empty());
+
+    let next = write_candidate(&writer, 21, 1, vec![101]);
+    recovered
+        .commit(commit_intent(11, 1, 1, vec![next]))
+        .await
+        .expect("recovered worker must accept new work");
+    assert_eq!(recovered_catalog.calls(), 2);
+    assert!(intent_files(&root).is_empty());
+    recovered.drain().await.expect("drain recovered worker");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn definitive_rejection_cleanup_failure_is_fatal_and_retains_intent() {
+    let root = tempfile::TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
+    let candidate = write_candidate(&writer, 20, 0, vec![100]);
+    let catalog = Arc::new(FakeCatalog::new(FakeMode::BlockConflict));
+    let coordinator = Arc::new(
+        CatalogCommitCoordinator::start(
+            CatalogCommitCoordinatorConfig::new(),
+            Arc::clone(&owned),
+            Arc::clone(&catalog) as Arc<dyn CatalogWrite>,
+            server_actor(),
+        )
+        .await
+        .expect("start commit coordinator"),
+    );
+    let task_coordinator = Arc::clone(&coordinator);
+    let waiter = tokio::spawn(async move {
+        task_coordinator
+            .commit(commit_intent(10, 1, 0, vec![candidate]))
+            .await
+    });
+    catalog
+        .started
+        .acquire()
+        .await
+        .expect("wait for blocked Catalog call")
+        .forget();
+
+    let staged = intent_files(&root);
+    assert_eq!(staged.len(), 1);
+    let staged_path = staged[0].clone();
+    let backup_path = root.path().join("retained-intent-backup.json");
+    fs::rename(&staged_path, &backup_path).expect("temporarily move staged intent");
+    fs::create_dir(&staged_path).expect("replace intent with non-regular entry");
+    catalog.release.add_permits(1);
+
+    let error = waiter
+        .await
+        .expect("join commit waiter")
+        .expect_err("unsafe intent cleanup must replace the Catalog rejection");
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+    fs::remove_dir(&staged_path).expect("remove non-regular intent entry");
+    fs::rename(&backup_path, &staged_path).expect("restore retained durable intent");
+    assert_eq!(intent_files(&root), [staged_path]);
+
+    let coordinator = Arc::try_unwrap(coordinator)
+        .ok()
+        .expect("commit waiter released coordinator");
+    let drain_error = coordinator
+        .drain()
+        .await
+        .expect_err("cleanup failure must fail the coordinator");
+    assert_eq!(drain_error.code(), ErrorCode::DataCorruption);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
