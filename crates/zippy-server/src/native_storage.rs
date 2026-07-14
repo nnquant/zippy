@@ -1,12 +1,15 @@
 //! Server-owned lifecycle for the SQLite Catalog and native manifest storage.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use zippy_catalog::{decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig};
+use zippy_catalog::{
+    decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig, SqliteCatalogReadHandle,
+    SqliteCatalogRuntimeSnapshotPinStatus,
+};
 use zippy_core::OwnedDataDirectory;
 use zippy_ingest::{
     TableActorAdmissionControl, TableActorHandle, TableActorRegistry, TableActorRegistryConfig,
@@ -19,15 +22,20 @@ use zippy_storage::{
     StartupCatalogFileVerifierConfig, StartupOrphanReconciler, StartupOrphanReconcilerConfig,
     StartupOrphanReconciliationReport,
 };
-use zippy_types::catalog::{
-    CatalogActor, CatalogActorKind, CatalogFileRead, CatalogRead, CatalogWrite,
-};
+use zippy_types::catalog::{CatalogActor, CatalogActorKind, CatalogPersistence, CatalogRead};
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
+
+use crate::legacy_catalog_migration::{
+    execute_legacy_catalog_metadata_import, LegacyCatalogMigrationDegradation,
+    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationStartup,
+    LegacyCatalogMigrationStatus,
+};
 
 const SUPERVISOR_THREAD_NAME: &str = "zippy-native-storage";
 const REAPER_THREAD_NAME: &str = "zippy-native-storage-reaper";
 const DEFAULT_SERVER_ACTOR_PRINCIPAL: &str = "zippy-server";
 const STARTUP_CANCELLED_MESSAGE: &str = "native storage startup was cancelled before readiness";
+const CATALOG_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Configuration owned by one native storage supervisor.
 #[derive(Debug, Clone)]
@@ -40,6 +48,7 @@ pub struct NativeStorageRuntimeConfig {
     catalog_file_verification: StartupCatalogFileVerifierConfig,
     table_actors: TableActorRegistryConfig,
     actor: CatalogActor,
+    legacy_catalog_migration: LegacyCatalogMigrationStartup,
 }
 
 impl NativeStorageRuntimeConfig {
@@ -58,6 +67,7 @@ impl NativeStorageRuntimeConfig {
                 kind: CatalogActorKind::Server,
                 principal: DEFAULT_SERVER_ACTOR_PRINCIPAL.to_owned(),
             },
+            legacy_catalog_migration: LegacyCatalogMigrationStartup::Disabled,
         }
     }
 
@@ -123,6 +133,14 @@ impl NativeStorageRuntimeConfig {
         self
     }
 
+    pub(crate) fn with_legacy_catalog_migration(
+        mut self,
+        migration: LegacyCatalogMigrationStartup,
+    ) -> Self {
+        self.legacy_catalog_migration = migration;
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if !Arc::ptr_eq(&self.data_directory, self.catalog.ownership()) {
             return Err(terminal_invalid(
@@ -156,6 +174,7 @@ pub struct NativeStorageStartup {
     startup: mpsc::Receiver<Result<SupervisorReady>>,
     completion: Option<mpsc::Receiver<Result<()>>>,
     supervisor: Option<JoinHandle<()>>,
+    terminal_failure: Arc<Mutex<Option<ServerError>>>,
 }
 
 impl NativeStorageStartup {
@@ -267,21 +286,33 @@ impl NativeStorageStartup {
     }
 
     fn finish_failed_startup(mut self, announced_error: ServerError) -> ServerError {
-        match self.wait_for_completion_and_join() {
-            Ok(()) => announced_error,
-            Err(completion_error) => completion_error,
+        let completion_result = self.wait_for_completion();
+        let join_result = join_supervisor(&mut self.supervisor);
+        let surfaced = match completion_result {
+            Err(completion_error) if completion_error != announced_error => {
+                combine_errors(announced_error, completion_error)
+            }
+            Ok(()) | Err(_) => announced_error,
+        };
+        match join_result {
+            Ok(()) => surfaced,
+            Err(join_error) => combine_errors(surfaced, join_error),
         }
     }
 
     fn wait_for_completion_and_join(&mut self) -> Result<()> {
-        let completion_result = match self.completion.take() {
+        let completion_result = self.wait_for_completion();
+        let join_result = join_supervisor(&mut self.supervisor);
+        combine_results(completion_result, join_result)
+    }
+
+    fn wait_for_completion(&mut self) -> Result<()> {
+        match self.completion.take() {
             Some(completion) => completion
                 .recv()
                 .unwrap_or_else(|_| Err(supervisor_stopped())),
             None => Err(supervisor_stopped()),
-        };
-        let join_result = join_supervisor(&mut self.supervisor);
-        combine_results(completion_result, join_result)
+        }
     }
 
     fn into_runtime(mut self, ready: SupervisorReady) -> NativeStorageRuntime {
@@ -292,9 +323,12 @@ impl NativeStorageStartup {
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
+            legacy_catalog_migration: ready.legacy_catalog_migration,
+            catalog_read_handle: ready.catalog_read_handle,
             table_actors: ready.table_actors,
             table_actor_admission: ready.table_actor_admission,
             healthy: ready.healthy,
+            terminal_failure: Arc::clone(&self.terminal_failure),
             shutdown: self.shutdown.take(),
             completion: self.completion.take(),
             supervisor: self.supervisor.take(),
@@ -342,9 +376,12 @@ impl NativeStorageShutdownOutcome {
 pub struct NativeStorageRuntime {
     report: StartupOrphanReconciliationReport,
     catalog_file_verification: StartupCatalogFileVerificationReport,
+    legacy_catalog_migration: LegacyCatalogMigrationStatus,
+    catalog_read_handle: SqliteCatalogReadHandle,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
+    terminal_failure: Arc<Mutex<Option<ServerError>>>,
     shutdown: Option<watch::Sender<bool>>,
     completion: Option<mpsc::Receiver<Result<()>>>,
     supervisor: Option<JoinHandle<()>>,
@@ -401,6 +438,23 @@ impl NativeStorageRuntime {
         &self.catalog_file_verification
     }
 
+    /// Returns the observable startup legacy-to-SQLite Catalog migration result.
+    #[must_use]
+    pub const fn legacy_catalog_migration_status(&self) -> &LegacyCatalogMigrationStatus {
+        &self.legacy_catalog_migration
+    }
+
+    /// Returns a lifecycle-safe clone of the running SQLite Catalog read endpoint.
+    #[must_use]
+    pub fn catalog_read_handle(&self) -> SqliteCatalogReadHandle {
+        self.catalog_read_handle.clone()
+    }
+
+    /// Returns process-local query snapshot pin gauges, limits, and rejection counters.
+    pub fn runtime_snapshot_pin_status(&self) -> Result<SqliteCatalogRuntimeSnapshotPinStatus> {
+        self.catalog_read_handle.runtime_snapshot_pin_status()
+    }
+
     /// Returns the number of active native table runtimes recovered before readiness.
     #[must_use]
     pub fn table_runtime_count(&self) -> usize {
@@ -421,13 +475,20 @@ impl NativeStorageRuntime {
     /// Returns whether the supervisor still owns a ready native storage stack.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
+        self.terminal_failure().is_none()
+            && self.healthy.load(Ordering::Acquire)
             && !self.shutdown_requested
             && self.final_shutdown.is_none()
             && self
                 .supervisor
                 .as_ref()
                 .is_some_and(|supervisor| !supervisor.is_finished())
+    }
+
+    /// Returns the first terminal supervisor error observed after readiness.
+    #[must_use]
+    pub fn terminal_failure(&self) -> Option<ServerError> {
+        terminal_failure(&self.terminal_failure)
     }
 
     /// Irreversibly closes native work admission and requests ordered background cleanup.
@@ -517,6 +578,8 @@ impl Drop for NativeStorageRuntime {
 struct SupervisorReady {
     reconciliation: StartupOrphanReconciliationReport,
     catalog_file_verification: StartupCatalogFileVerificationReport,
+    legacy_catalog_migration: LegacyCatalogMigrationStatus,
+    catalog_read_handle: SqliteCatalogReadHandle,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
@@ -527,10 +590,18 @@ fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageS
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
     let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
     let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+    let terminal_failure = Arc::new(Mutex::new(None));
+    let supervisor_terminal_failure = Arc::clone(&terminal_failure);
     let supervisor = thread::Builder::new()
         .name(SUPERVISOR_THREAD_NAME.to_owned())
         .spawn(move || {
-            run_supervisor(config, shutdown_receiver, startup_sender, completion_sender);
+            run_supervisor(
+                config,
+                shutdown_receiver,
+                startup_sender,
+                completion_sender,
+                supervisor_terminal_failure,
+            );
         })
         .map_err(|error| {
             ServerError::new(
@@ -543,6 +614,7 @@ fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageS
         startup: startup_receiver,
         completion: Some(completion_receiver),
         supervisor: Some(supervisor),
+        terminal_failure,
     })
 }
 
@@ -551,6 +623,7 @@ fn run_supervisor(
     shutdown: watch::Receiver<bool>,
     startup: mpsc::SyncSender<Result<SupervisorReady>>,
     completion: mpsc::SyncSender<Result<()>>,
+    terminal_failure: Arc<Mutex<Option<ServerError>>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -562,13 +635,22 @@ fn run_supervisor(
                 ErrorCode::Unavailable,
                 format!("build native storage Tokio runtime error=[{error}]"),
             );
+            latch_terminal_failure(&terminal_failure, &error);
             let _ = startup.send(Err(error.clone()));
             let _ = completion.send(Err(error));
             return;
         }
     };
-    let (ready_sent, result) = runtime.block_on(supervise_storage(config, shutdown, &startup));
+    let (ready_sent, result) = runtime.block_on(supervise_storage(
+        config,
+        shutdown,
+        &startup,
+        &terminal_failure,
+    ));
     drop(runtime);
+    if let Err(error) = &result {
+        latch_terminal_failure(&terminal_failure, error);
+    }
     if !ready_sent {
         let startup_error = result
             .as_ref()
@@ -584,6 +666,7 @@ async fn supervise_storage(
     config: NativeStorageRuntimeConfig,
     mut shutdown: watch::Receiver<bool>,
     startup: &mpsc::SyncSender<Result<SupervisorReady>>,
+    terminal_failure: &Arc<Mutex<Option<ServerError>>>,
 ) -> (bool, Result<()>) {
     let catalog = match SqliteCatalog::open(config.catalog.clone()) {
         Ok(catalog) => Arc::new(catalog),
@@ -599,11 +682,29 @@ async fn supervise_storage(
         );
     }
 
-    let pre_replay =
-        match reconcile_once(&config, Arc::clone(&catalog), &mut shutdown, "pre-replay").await {
-            Ok(report) => report,
-            Err(error) => return (false, fail_storage(error, None, None, catalog).await),
-        };
+    let legacy_catalog_migration = match run_legacy_catalog_migration(
+        config.legacy_catalog_migration.clone(),
+        Arc::clone(&catalog),
+        &mut shutdown,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) => return (false, fail_storage(error, None, None, catalog).await),
+    };
+
+    let pre_replay = match reconcile_once(
+        &config,
+        Arc::clone(&catalog),
+        &mut shutdown,
+        "pre-replay",
+        false,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => return (false, fail_storage(error, None, None, catalog).await),
+    };
     tracing::info!(
         component = "native_storage",
         event = "native_storage_pre_replay_reconciled",
@@ -615,13 +716,13 @@ async fn supervise_storage(
         "native storage pre-replay reconciliation completed"
     );
 
-    let catalog_write: Arc<dyn CatalogWrite> = catalog.clone();
+    let catalog_persistence: Arc<dyn CatalogPersistence> = catalog.clone();
     let coordinator = match wait_for_startup_stage(
         &mut shutdown,
-        CatalogCommitCoordinator::start(
+        CatalogCommitCoordinator::start_with_persistence(
             config.coordinator.clone(),
             Arc::clone(&config.data_directory),
-            catalog_write,
+            catalog_persistence,
             config.actor.clone(),
         ),
     )
@@ -641,16 +742,23 @@ async fn supervise_storage(
         Err(error) => return (false, fail_storage(error, None, None, catalog).await),
     };
 
-    let post_replay =
-        match reconcile_once(&config, Arc::clone(&catalog), &mut shutdown, "post-replay").await {
-            Ok(report) => report,
-            Err(error) => {
-                return (
-                    false,
-                    fail_storage(error, None, Some(persist_controller), catalog).await,
-                );
-            }
-        };
+    let post_replay = match reconcile_once(
+        &config,
+        Arc::clone(&catalog),
+        &mut shutdown,
+        "post-replay",
+        true,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, None, Some(persist_controller), catalog).await,
+            );
+        }
+    };
     tracing::info!(
         component = "native_storage",
         event = "native_storage_post_replay_reconciled",
@@ -772,11 +880,22 @@ async fn supervise_storage(
     let healthy = Arc::new(AtomicBool::new(true));
     let mut persist_failure = persist_controller.failure_monitor();
     let mut table_actor_failure = table_actors.failure_monitor();
+    let catalog_read_handle = match catalog.read_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
+            );
+        }
+    };
 
     if startup
         .send(Ok(SupervisorReady {
             reconciliation: post_replay,
             catalog_file_verification,
+            legacy_catalog_migration,
+            catalog_read_handle,
             table_actors: table_actor_handle,
             table_actor_admission,
             healthy: Arc::clone(&healthy),
@@ -792,10 +911,14 @@ async fn supervise_storage(
 
     let failure = tokio::select! {
         biased;
-        _ = wait_for_shutdown(&mut shutdown) => None,
         error = persist_failure.wait_for_failure() => Some(error),
         error = table_actor_failure.wait_for_failure() => Some(error),
+        error = wait_for_catalog_failure(Arc::clone(&catalog)) => Some(error),
+        _ = wait_for_shutdown(&mut shutdown) => None,
     };
+    if let Some(error) = &failure {
+        latch_terminal_failure(terminal_failure, error);
+    }
     healthy.store(false, Ordering::Release);
     match failure {
         Some(error) => {
@@ -812,21 +935,104 @@ async fn supervise_storage(
     }
 }
 
+async fn run_legacy_catalog_migration(
+    startup: LegacyCatalogMigrationStartup,
+    catalog: Arc<SqliteCatalog>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<LegacyCatalogMigrationStatus> {
+    match startup {
+        LegacyCatalogMigrationStartup::Disabled => Ok(LegacyCatalogMigrationStatus::disabled()),
+        LegacyCatalogMigrationStartup::Degraded(degradation) => {
+            tracing::error!(
+                component = "legacy_catalog_migration",
+                event = "legacy_catalog_migration_preflight_degraded",
+                reason = ?degradation.reason,
+                error_code = degradation
+                    .error_code
+                    .map_or("NONE", ErrorCode::as_str),
+                retryable = degradation.retryable,
+                error = degradation.message.as_deref().unwrap_or("none"),
+                "legacy Catalog remains authoritative after migration preflight failure"
+            );
+            Ok(LegacyCatalogMigrationStatus::degraded_before_execution(
+                degradation,
+            ))
+        }
+        LegacyCatalogMigrationStartup::Planned(plan) => {
+            let result = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    return Err(startup_cancelled());
+                }
+                result = execute_legacy_catalog_metadata_import(&plan, catalog.as_ref()) => result,
+            };
+            match result {
+                Ok(report) => {
+                    let status = LegacyCatalogMigrationStatus::from_report(report);
+                    if let Some(degradation) = status.degradation.as_ref() {
+                        tracing::warn!(
+                            component = "legacy_catalog_migration",
+                            event = "legacy_catalog_migration_incomplete",
+                            reason = ?degradation.reason,
+                            blocked_tables = status
+                                .report
+                                .as_ref()
+                                .map_or(0, |report| report.blocked_table_count()),
+                            "legacy Catalog remains authoritative for tables blocked on V2 import"
+                        );
+                    }
+                    Ok(status)
+                }
+                Err(error) => Ok(LegacyCatalogMigrationStatus::degraded_before_execution(
+                    LegacyCatalogMigrationDegradation::from_error(
+                        LegacyCatalogMigrationDegradedReason::ExecutionFailed,
+                        &error,
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+fn latch_terminal_failure(terminal_failure: &Arc<Mutex<Option<ServerError>>>, error: &ServerError) {
+    let mut terminal = terminal_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if terminal.is_none() {
+        *terminal = Some(error.clone());
+    }
+}
+
+fn terminal_failure(terminal_failure: &Arc<Mutex<Option<ServerError>>>) -> Option<ServerError> {
+    terminal_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 async fn reconcile_once(
     config: &NativeStorageRuntimeConfig,
     catalog: Arc<SqliteCatalog>,
     shutdown: &mut watch::Receiver<bool>,
     stage: &'static str,
+    remove_orphans: bool,
 ) -> Result<StartupOrphanReconciliationReport> {
-    let catalog_read: Arc<dyn CatalogFileRead> = catalog;
-    let reconciler = StartupOrphanReconciler::with_config(
+    let reconciler = StartupOrphanReconciler::with_config_and_cleanup_control(
         config.reconciliation.clone(),
         Arc::clone(&config.data_directory),
-        catalog_read,
+        catalog,
     )?;
-    wait_for_startup_stage(shutdown, reconciler.reconcile())
+    let result = if remove_orphans {
+        wait_for_startup_stage(
+            shutdown,
+            reconciler.reconcile_and_remove_orphans_before_admission(),
+        )
         .await
-        .map_err(|error| with_stage(stage, error))
+    } else {
+        wait_for_startup_stage(shutdown, reconciler.reconcile()).await
+    };
+    result.map_err(|error| with_stage(stage, error))
 }
 
 async fn verify_catalog_files_once(
@@ -963,6 +1169,18 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.changed().await;
 }
 
+async fn wait_for_catalog_failure(catalog: Arc<SqliteCatalog>) -> ServerError {
+    let mut ticker = tokio::time::interval(CATALOG_HEALTH_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = catalog.check_runtime_health() {
+            let message = format!("native storage Catalog runtime failed error=[{error}]");
+            return error.with_message(message).with_retryable(false);
+        }
+    }
+}
+
 fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow()
 }
@@ -974,17 +1192,13 @@ fn signal_shutdown(shutdown: Option<&watch::Sender<bool>>) {
 }
 
 fn with_stage(stage: &str, error: ServerError) -> ServerError {
-    ServerError::new(
-        error.code(),
-        format!("native storage startup stage failed stage=[{stage}] error=[{error}]"),
-    )
+    let message = format!("native storage startup stage failed stage=[{stage}] error=[{error}]");
+    error.with_message(message)
 }
 
 fn combine_errors(primary: ServerError, cleanup: ServerError) -> ServerError {
-    ServerError::new(
-        primary.code(),
-        format!("{primary}; native storage cleanup failed error=[{cleanup}]"),
-    )
+    let message = format!("{primary}; native storage cleanup failed error=[{cleanup}]");
+    primary.with_message(message)
 }
 
 fn combine_results(primary: Result<()>, secondary: Result<()>) -> Result<()> {
@@ -1056,6 +1270,7 @@ mod tests {
             startup: startup_receiver,
             completion: Some(completion_receiver),
             supervisor: Some(supervisor),
+            terminal_failure: Arc::new(Mutex::new(None)),
         };
 
         startup
@@ -1063,6 +1278,37 @@ mod tests {
             .expect("expected startup cancellation is successful cleanup");
 
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn identical_startup_and_completion_error_is_not_labeled_as_cleanup_failure() {
+        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let failure = ServerError::new(
+            ErrorCode::DataCorruption,
+            "injected native storage startup failure",
+        )
+        .with_retryable(false);
+        startup_sender
+            .send(Err(failure.clone()))
+            .expect("startup receiver remains owned");
+        completion_sender
+            .send(Err(failure.clone()))
+            .expect("completion receiver remains owned");
+        let startup = NativeStorageStartup {
+            shutdown: None,
+            startup: startup_receiver,
+            completion: Some(completion_receiver),
+            supervisor: Some(thread::spawn(|| {})),
+            terminal_failure: Arc::new(Mutex::new(None)),
+        };
+
+        let surfaced = startup
+            .wait()
+            .err()
+            .expect("injected startup failure must be returned");
+        assert_eq!(surfaced, failure);
+        assert!(!surfaced.message().contains("cleanup failed"));
     }
 
     #[test]
@@ -1094,6 +1340,7 @@ mod tests {
             startup: startup_receiver,
             completion: Some(completion_receiver),
             supervisor: Some(supervisor),
+            terminal_failure: Arc::new(Mutex::new(None)),
         };
 
         startup

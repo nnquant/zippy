@@ -170,6 +170,9 @@ pub struct StreamInfo {
     pub sealed_segments: Vec<serde_json::Value>,
     #[serde(default)]
     pub persisted_files: Vec<serde_json::Value>,
+    /// Monotonic revision of the ordered persisted-file descriptor set.
+    #[serde(default)]
+    pub persisted_files_revision: u64,
     #[serde(default)]
     pub persist_events: Vec<serde_json::Value>,
     #[serde(default)]

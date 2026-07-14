@@ -65,11 +65,83 @@ const GET_VISIBLE_FILES_SQL: &str =
         AND added_snapshot_version <= ?2 \
         AND (removed_snapshot_version = X'000000000000000000' \
              OR removed_snapshot_version > ?3)";
+const GET_FILES_BY_IDS_SQL_PREFIX: &str =
+    "SELECT length(file_id), length(table_id), length(schema_version), \
+            length(CAST(location_kind AS BLOB)), length(CAST(file_path AS BLOB)), \
+            length(file_size_bytes), length(row_count), \
+            length(CAST(provenance_kind AS BLOB)), length(min_log_offset), \
+            length(max_log_offset), 1, length(legacy_discovery_order), \
+            length(partition_blob), length(statistics_blob), length(metadata_blob), \
+            length(CAST(checksum AS BLOB)), length(added_snapshot_version), \
+            length(removed_snapshot_version), length(CAST(state AS BLOB)), \
+            length(created_at_ns), file_id, table_id, schema_version, location_kind, \
+            file_path, file_size_bytes, row_count, provenance_kind, min_log_offset, \
+            max_log_offset, legacy_preserve_discovery_order, legacy_discovery_order, \
+            partition_blob, statistics_blob, metadata_blob, checksum, \
+            added_snapshot_version, removed_snapshot_version, state, created_at_ns \
+       FROM data_files";
+
+/// Per-request bounds applied while copying one exact SQLite snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteCatalogSnapshotReadLimits {
+    /// Maximum visible files returned across all selected tables.
+    pub max_visible_files: usize,
+    /// Maximum source-lineage rows decoded across all visible native files.
+    pub max_source_lineage_rows: usize,
+    /// Maximum raw SQLite bytes copied into the owned snapshot response.
+    pub max_raw_response_bytes: usize,
+}
+
+impl Default for SqliteCatalogSnapshotReadLimits {
+    fn default() -> Self {
+        Self {
+            max_visible_files: MAX_VISIBLE_FILES,
+            max_source_lineage_rows: MAX_SOURCE_LINEAGE_ROWS,
+            max_raw_response_bytes: MAX_SNAPSHOT_RAW_RESPONSE_BYTES,
+        }
+    }
+}
+
+impl SqliteCatalogSnapshotReadLimits {
+    /// Validates positive caller limits against the Catalog hard safety ceilings.
+    pub fn validate(self) -> Result<Self> {
+        for (name, value, maximum) in [
+            (
+                "max_visible_files",
+                self.max_visible_files,
+                MAX_VISIBLE_FILES,
+            ),
+            (
+                "max_source_lineage_rows",
+                self.max_source_lineage_rows,
+                MAX_SOURCE_LINEAGE_ROWS,
+            ),
+            (
+                "max_raw_response_bytes",
+                self.max_raw_response_bytes,
+                MAX_SNAPSHOT_RAW_RESPONSE_BYTES,
+            ),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "catalog snapshot read limit must be between 1 and hard maximum \
+                         name=[{name}] value=[{value}] maximum=[{maximum}]"
+                    ),
+                )
+                .with_retryable(false));
+            }
+        }
+        Ok(self)
+    }
+}
 
 struct SnapshotReadBudget {
     raw_bytes: usize,
     files: usize,
     lineage_rows: usize,
+    limits: SqliteCatalogSnapshotReadLimits,
 }
 
 impl SnapshotReadBudget {
@@ -77,10 +149,10 @@ impl SnapshotReadBudget {
         let actual = self.raw_bytes.checked_add(additional).ok_or_else(|| {
             resource_exhausted("catalog snapshot raw response byte count overflow")
         })?;
-        if actual > MAX_SNAPSHOT_RAW_RESPONSE_BYTES {
+        if actual > self.limits.max_raw_response_bytes {
             return Err(resource_exhausted(format!(
                 "catalog snapshot raw response exceeds byte budget actual=[{}] maximum=[{}]",
-                actual, MAX_SNAPSHOT_RAW_RESPONSE_BYTES
+                actual, self.limits.max_raw_response_bytes
             )));
         }
         self.raw_bytes = actual;
@@ -92,10 +164,10 @@ impl SnapshotReadBudget {
             .files
             .checked_add(1)
             .ok_or_else(|| resource_exhausted("catalog snapshot file count overflow"))?;
-        if self.files > MAX_VISIBLE_FILES {
+        if self.files > self.limits.max_visible_files {
             return Err(resource_exhausted(format!(
                 "catalog snapshot visible file count exceeds maximum actual=[{}] maximum=[{}]",
-                self.files, MAX_VISIBLE_FILES
+                self.files, self.limits.max_visible_files
             )));
         }
         self.charge_bytes(raw_bytes)
@@ -106,10 +178,10 @@ impl SnapshotReadBudget {
             .lineage_rows
             .checked_add(1)
             .ok_or_else(|| resource_exhausted("catalog snapshot lineage row count overflow"))?;
-        if self.lineage_rows > MAX_SOURCE_LINEAGE_ROWS {
+        if self.lineage_rows > self.limits.max_source_lineage_rows {
             return Err(resource_exhausted(format!(
                 "catalog snapshot lineage row count exceeds maximum actual=[{}] maximum=[{}]",
-                self.lineage_rows, MAX_SOURCE_LINEAGE_ROWS
+                self.lineage_rows, self.limits.max_source_lineage_rows
             )));
         }
         self.charge_bytes(raw_bytes)
@@ -198,11 +270,25 @@ pub(crate) fn validate_snapshot_selectors(selectors: &[CatalogSnapshotSelector])
 }
 
 /// Reads exact selector-bound Catalog state from one SQLite read transaction.
+#[cfg(test)]
 pub(crate) fn read_snapshot_at(
     connection: &mut Connection,
     selectors: &[CatalogSnapshotSelector],
 ) -> Result<CatalogQuerySnapshot> {
+    read_snapshot_at_with_limits(
+        connection,
+        selectors,
+        SqliteCatalogSnapshotReadLimits::default(),
+    )
+}
+
+pub(crate) fn read_snapshot_at_with_limits(
+    connection: &mut Connection,
+    selectors: &[CatalogSnapshotSelector],
+    limits: SqliteCatalogSnapshotReadLimits,
+) -> Result<CatalogQuerySnapshot> {
     validate_snapshot_selectors(selectors)?;
+    let limits = limits.validate()?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Deferred)
         .map_err(|error| crate::map_sqlite_error("begin catalog snapshot read", error))?;
@@ -211,6 +297,7 @@ pub(crate) fn read_snapshot_at(
         raw_bytes: 0,
         files: 0,
         lineage_rows: 0,
+        limits,
     };
     let mut pending_tables = Vec::with_capacity(selectors.len());
     let mut visible_file_ids = Vec::new();
@@ -220,6 +307,7 @@ pub(crate) fn read_snapshot_at(
         validate_selector_bounds(selector, &table)?;
         let schema = read_schema(&transaction, selector, &mut budget)?;
         let snapshot = read_snapshot(&transaction, selector, catalog_revision, &mut budget)?;
+        ensure_snapshot_files_readable(&transaction, selector)?;
         let files = read_visible_files(&transaction, selector, &mut budget)?;
         if snapshot.operation == SnapshotOperation::Create && !files.is_empty() {
             return Err(corruption(
@@ -425,6 +513,48 @@ fn read_schema(
     Ok(descriptor)
 }
 
+fn ensure_snapshot_files_readable(
+    connection: &Connection,
+    selector: &CatalogSnapshotSelector,
+) -> Result<()> {
+    let table_id = selector.table_id.into_bytes();
+    let snapshot_version = selector.snapshot_version.to_be_bytes();
+    let unavailable = connection
+        .query_row(
+            "SELECT file_id, state FROM data_files \
+              WHERE table_id = ?1 AND state IN ('deleting', 'deleted') \
+                AND added_snapshot_version <= ?2 \
+                AND removed_snapshot_version_value > ?2 \
+              ORDER BY file_id LIMIT 1",
+            [table_id.as_slice(), snapshot_version.as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            crate::map_sqlite_error("check exact snapshot file completeness", error)
+        })?;
+    let Some((file_id, state)) = unavailable else {
+        return Ok(());
+    };
+    let file_id = decode_file_id(file_id)?;
+    if state != "deleting" && state != "deleted" {
+        return Err(corruption(format!(
+            "snapshot completeness check returned invalid file state state=[{}]",
+            state
+        )));
+    }
+    Err(ServerError::new(
+        ErrorCode::Conflict,
+        format!(
+            "exact catalog snapshot is no longer readable because file cleanup has started \
+             snapshot_version=[{}] file_id=[{}] state=[{}]",
+            selector.snapshot_version, file_id, state
+        ),
+    )
+    .with_table_id(selector.table_id)
+    .with_retryable(false))
+}
+
 fn read_snapshot(
     connection: &Connection,
     selector: &CatalogSnapshotSelector,
@@ -529,7 +659,7 @@ fn read_visible_files(
         .map_err(|error| crate::map_sqlite_error("read visible catalog file", error))?
     {
         budget.charge_file(row_lengths(row, 0, 20, "data file")?)?;
-        let file = decode_visible_file_row(row)?;
+        let file = decode_file_row(row, DataFileState::Committed)?;
         if file.table_id != selector.table_id {
             return Err(corruption(
                 "visible catalog file table identity does not match selector",
@@ -540,7 +670,88 @@ fn read_visible_files(
     Ok(files)
 }
 
-fn decode_visible_file_row(row: &rusqlite::Row<'_>) -> Result<PendingVisibleFile> {
+/// Rebuilds complete deleting descriptors for an exact, strictly ordered set.
+pub(crate) fn read_deleting_file_descriptors(
+    connection: &Connection,
+    table_id: TableId,
+    file_ids: &[FileId],
+) -> Result<Vec<DataFileDescriptor>> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut budget = SnapshotReadBudget {
+        raw_bytes: 0,
+        files: 0,
+        lineage_rows: 0,
+        limits: SqliteCatalogSnapshotReadLimits::default(),
+    };
+    let encoded_table_id = table_id.into_bytes();
+    let mut pending = Vec::with_capacity(file_ids.len());
+    for chunk in file_ids.chunks(LINEAGE_QUERY_CHUNK_SIZE) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "{GET_FILES_BY_IDS_SQL_PREFIX} WHERE table_id = ? AND file_id IN ({placeholders}) ORDER BY file_id"
+        );
+        let encoded_ids = chunk
+            .iter()
+            .map(|file_id| file_id.into_bytes())
+            .collect::<Vec<_>>();
+        let parameters = std::iter::once(encoded_table_id.as_slice())
+            .chain(encoded_ids.iter().map(|file_id| file_id.as_slice()));
+        let mut statement = connection.prepare(&sql).map_err(|error| {
+            crate::map_sqlite_error("prepare deleting catalog file descriptors", error)
+        })?;
+        let mut rows = statement
+            .query(params_from_iter(parameters))
+            .map_err(|error| {
+                crate::map_sqlite_error("query deleting catalog file descriptors", error)
+            })?;
+        let chunk_start = pending.len();
+        while let Some(row) = rows.next().map_err(|error| {
+            crate::map_sqlite_error("read deleting catalog file descriptor", error)
+        })? {
+            budget.charge_file(row_lengths(row, 0, 20, "deleting data file")?)?;
+            let file = decode_file_row(row, DataFileState::Deleting)?;
+            if file.table_id != table_id {
+                return Err(corruption(
+                    "deleting catalog file table identity does not match request",
+                ));
+            }
+            pending.push(file);
+        }
+        let actual = &pending[chunk_start..];
+        if actual.len() != chunk.len()
+            || actual
+                .iter()
+                .zip(chunk)
+                .any(|(file, expected)| file.file_id != *expected)
+        {
+            return Err(corruption(
+                "deleting catalog file descriptor set does not match claimed identities",
+            ));
+        }
+    }
+
+    let mut lineage = read_source_lineage(connection, file_ids, &mut budget)?;
+    let mut descriptors = Vec::with_capacity(pending.len());
+    for file in pending {
+        let source_lineage = lineage.remove(&file.file_id).unwrap_or_default();
+        descriptors.push(file.into_descriptor(source_lineage)?);
+    }
+    if !lineage.is_empty() {
+        return Err(corruption(
+            "deleting catalog file lineage contains an unclaimed identity",
+        ));
+    }
+    Ok(descriptors)
+}
+
+fn decode_file_row(
+    row: &rusqlite::Row<'_>,
+    expected_state: DataFileState,
+) -> Result<PendingVisibleFile> {
     let file_id = decode_file_id(row_value(row, 20, "decode catalog file id")?)?;
     let table_id = decode_table_id(
         row_value(row, 21, "decode catalog file table id")?,
@@ -654,10 +865,10 @@ fn decode_visible_file_row(row: &rusqlite::Row<'_>) -> Result<PendingVisibleFile
             )));
         }
     };
-    if state != DataFileState::Committed {
-        return Err(corruption(
-            "visible catalog data file is not in committed state",
-        ));
+    if state != expected_state {
+        return Err(corruption(format!(
+            "catalog data file has unexpected lifecycle state expected=[{expected_state:?}] actual=[{state:?}]"
+        )));
     }
     let created_at_ns = decode_u64(&row_value::<Vec<u8>>(
         row,

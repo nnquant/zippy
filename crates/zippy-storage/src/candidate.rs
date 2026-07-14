@@ -12,7 +12,9 @@ use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::format::KeyValue;
 use serde::{Deserialize, Serialize};
-use zippy_core::{DataDirectoryError, DurableFileTransaction, OwnedDataDirectory};
+use zippy_core::{
+    DataDirectoryError, DurableFilePublicationState, DurableFileTransaction, OwnedDataDirectory,
+};
 use zippy_types::table::{
     DataFileLocation, DataFileProvenance, ManagedDataPath, MetadataMap, MetadataScalar,
     NativeDataFileProvenance, PendingDataFile,
@@ -121,6 +123,180 @@ impl DurableParquetCandidate {
     }
 }
 
+/// One published descriptor paired with its optional affine cleanup authority.
+#[derive(Debug)]
+pub(crate) struct PublishedParquetCandidate {
+    candidate: DurableParquetCandidate,
+    cleanup: Option<PublishedCandidateCleanup>,
+}
+
+impl PublishedParquetCandidate {
+    pub(crate) fn into_candidate(self) -> DurableParquetCandidate {
+        self.candidate
+    }
+
+    pub(crate) fn into_cleanup(self) -> Option<PublishedCandidateCleanup> {
+        self.cleanup
+    }
+}
+
+/// Exclusive authority to remove one controller-published candidate.
+///
+/// This token deliberately cannot be cloned. Consuming it is necessary but
+/// not sufficient for deletion: the commit coordinator must first prove via
+/// `CatalogFileRead` that neither the file identity nor its path is referenced.
+#[derive(Debug)]
+pub(crate) struct PublishedCandidateCleanup {
+    pending: PendingDataFile,
+}
+
+impl PublishedCandidateCleanup {
+    pub(crate) const fn file_id(&self) -> FileId {
+        self.pending.file_id
+    }
+
+    pub(crate) const fn table_id(&self) -> TableId {
+        self.pending.table_id
+    }
+
+    pub(crate) fn path(&self) -> &ManagedDataPath {
+        let DataFileLocation::Managed(path) = &self.pending.location else {
+            unreachable!("controller-published native candidate has a managed path")
+        };
+        path
+    }
+
+    pub(crate) const fn pending(&self) -> &PendingDataFile {
+        &self.pending
+    }
+}
+
+/// One fully written and checksummed candidate whose final path is unpublished.
+///
+/// Dropping this affine token removes the temporary file through
+/// `DurableFileTransaction`. Publication consumes it exactly once.
+#[derive(Debug)]
+pub(crate) struct StagedParquetCandidate {
+    pending: PendingDataFile,
+    transaction: DurableFileTransaction,
+    final_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct CandidatePublicationFailure {
+    error: ServerError,
+    cleanup: Option<PublishedCandidateCleanup>,
+}
+
+impl CandidatePublicationFailure {
+    pub(crate) fn into_parts(self) -> (ServerError, Option<PublishedCandidateCleanup>) {
+        (self.error, self.cleanup)
+    }
+}
+
+impl StagedParquetCandidate {
+    pub(crate) const fn pending(&self) -> &PendingDataFile {
+        &self.pending
+    }
+
+    pub(crate) fn publish(
+        self,
+    ) -> std::result::Result<PublishedParquetCandidate, CandidatePublicationFailure> {
+        let Self {
+            pending,
+            transaction,
+            final_path,
+        } = self;
+        let table_id = pending.table_id;
+        let expected_size = pending.file_size_bytes;
+        let expected_checksum = pending.checksum.clone();
+        let DataFileLocation::Managed(_) = &pending.location else {
+            return Err(CandidatePublicationFailure {
+                error: ServerError::new(
+                    ErrorCode::Internal,
+                    "staged native Parquet candidate has an external location",
+                )
+                .with_table_id(table_id)
+                .with_retryable(false),
+                cleanup: None,
+            });
+        };
+
+        match transaction.publish_noclobber() {
+            Ok(published) => {
+                let cleanup = PublishedCandidateCleanup {
+                    pending: pending.clone(),
+                };
+                if published.size_bytes() != expected_size {
+                    return Err(CandidatePublicationFailure {
+                        error: ServerError::new(
+                            ErrorCode::DataCorruption,
+                            format!(
+                                concat!(
+                                    "published candidate size changed path=[{}] ",
+                                    "expected=[{}] actual=[{}]"
+                                ),
+                                published.path().display(),
+                                expected_size,
+                                published.size_bytes()
+                            ),
+                        )
+                        .with_table_id(table_id),
+                        cleanup: Some(cleanup),
+                    });
+                }
+                Ok(PublishedParquetCandidate {
+                    cleanup: Some(cleanup),
+                    candidate: DurableParquetCandidate {
+                        pending,
+                        path: published.path().to_path_buf(),
+                    },
+                })
+            }
+            Err(failure) => {
+                let (error, publication_state) = failure.into_parts();
+                if matches!(&error, DataDirectoryError::AlreadyExists { .. }) {
+                    let (actual_size, actual_checksum) =
+                        inspect_existing_candidate(table_id, &final_path).map_err(|error| {
+                            CandidatePublicationFailure {
+                                error,
+                                cleanup: None,
+                            }
+                        })?;
+                    if actual_size != expected_size || actual_checksum != expected_checksum {
+                        return Err(CandidatePublicationFailure {
+                            error: corruption_error(
+                                table_id,
+                                &final_path,
+                                Some(expected_checksum),
+                                Some(actual_checksum),
+                                "file identity already exists with different content",
+                            ),
+                            cleanup: None,
+                        });
+                    }
+                    return Ok(PublishedParquetCandidate {
+                        candidate: DurableParquetCandidate {
+                            pending,
+                            path: final_path,
+                        },
+                        cleanup: None,
+                    });
+                }
+                let cleanup = (publication_state
+                    == DurableFilePublicationState::PublishedNotDurable)
+                    .then(|| PublishedCandidateCleanup {
+                        pending: pending.clone(),
+                    });
+                Err(CandidatePublicationFailure {
+                    error: map_data_directory_error(table_id, error),
+                    cleanup,
+                })
+            }
+        }
+    }
+}
+
 /// Writes immutable native Parquet candidates under one owned data root.
 #[derive(Debug)]
 pub struct ParquetCandidateWriter {
@@ -159,6 +335,20 @@ impl ParquetCandidateWriter {
     where
         I: IntoIterator<Item = RecordBatch>,
     {
+        self.stage_prepared_candidate(prepared, batches)?
+            .publish()
+            .map(PublishedParquetCandidate::into_candidate)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn stage_prepared_candidate<I>(
+        &self,
+        prepared: PreparedParquetCandidateSpec,
+        batches: I,
+    ) -> Result<StagedParquetCandidate>
+    where
+        I: IntoIterator<Item = RecordBatch>,
+    {
         let (spec, footer_metadata) = prepared.into_parts();
         let managed_path = candidate_managed_path(spec.table_id, spec.file_id)?;
         let final_path = self
@@ -180,55 +370,19 @@ impl ParquetCandidateWriter {
             .len();
         let expected_checksum = checksum_transaction(&mut transaction, spec.table_id)?;
         let statistics = candidate_statistics(row_group_count, spec.schema.fields().len())?;
-
-        match transaction.publish_noclobber() {
-            Ok(published) => {
-                if published.size_bytes() != expected_size {
-                    return Err(ServerError::new(
-                        ErrorCode::DataCorruption,
-                        format!(
-                            "published candidate size changed path=[{}] expected=[{}] actual=[{}]",
-                            published.path().display(),
-                            expected_size,
-                            published.size_bytes()
-                        ),
-                    )
-                    .with_table_id(spec.table_id));
-                }
-                build_candidate(
-                    spec,
-                    managed_path,
-                    published.path().to_path_buf(),
-                    expected_size,
-                    row_count,
-                    statistics,
-                    expected_checksum,
-                )
-            }
-            Err(DataDirectoryError::AlreadyExists { .. }) => {
-                let (actual_size, actual_checksum) =
-                    inspect_existing_candidate(spec.table_id, &final_path)?;
-                if actual_size != expected_size || actual_checksum != expected_checksum {
-                    return Err(corruption_error(
-                        spec.table_id,
-                        &final_path,
-                        Some(expected_checksum),
-                        Some(actual_checksum),
-                        "file identity already exists with different content",
-                    ));
-                }
-                build_candidate(
-                    spec,
-                    managed_path,
-                    final_path,
-                    actual_size,
-                    row_count,
-                    statistics,
-                    actual_checksum,
-                )
-            }
-            Err(error) => Err(map_data_directory_error(spec.table_id, error)),
-        }
+        let pending = build_pending_candidate(
+            spec,
+            managed_path,
+            expected_size,
+            row_count,
+            statistics,
+            expected_checksum,
+        );
+        Ok(StagedParquetCandidate {
+            pending,
+            transaction,
+            final_path,
+        })
     }
 }
 
@@ -569,32 +723,28 @@ fn candidate_statistics(row_groups: usize, columns: usize) -> Result<MetadataMap
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_candidate(
+fn build_pending_candidate(
     spec: ParquetCandidateSpec,
     managed_path: ManagedDataPath,
-    path: PathBuf,
     file_size_bytes: u64,
     row_count: NonZeroU64,
     statistics: MetadataMap,
     checksum: String,
-) -> Result<DurableParquetCandidate> {
-    Ok(DurableParquetCandidate {
-        pending: PendingDataFile {
-            file_id: spec.file_id,
-            table_id: spec.table_id,
-            schema_version: spec.schema_version,
-            location: DataFileLocation::Managed(managed_path),
-            file_size_bytes,
-            row_count,
-            provenance: DataFileProvenance::Native(spec.provenance),
-            partition: spec.partition,
-            statistics,
-            metadata: spec.metadata,
-            checksum,
-            created_at_ns: spec.created_at_ns,
-        },
-        path,
-    })
+) -> PendingDataFile {
+    PendingDataFile {
+        file_id: spec.file_id,
+        table_id: spec.table_id,
+        schema_version: spec.schema_version,
+        location: DataFileLocation::Managed(managed_path),
+        file_size_bytes,
+        row_count,
+        provenance: DataFileProvenance::Native(spec.provenance),
+        partition: spec.partition,
+        statistics,
+        metadata: spec.metadata,
+        checksum,
+        created_at_ns: spec.created_at_ns,
+    }
 }
 
 fn inspect_existing_candidate(table_id: TableId, path: &Path) -> Result<(u64, String)> {
@@ -1227,11 +1377,14 @@ fn validate_same_file_identity(
     Ok(())
 }
 
-fn map_data_directory_error(table_id: TableId, error: DataDirectoryError) -> ServerError {
+pub(crate) fn map_data_directory_error(
+    table_id: TableId,
+    error: DataDirectoryError,
+) -> ServerError {
     let code = match &error {
-        DataDirectoryError::OwnershipHeld { .. } | DataDirectoryError::AlreadyExists { .. } => {
-            ErrorCode::Conflict
-        }
+        DataDirectoryError::OwnershipHeld { .. }
+        | DataDirectoryError::CatalogRuntimeOwnershipHeld { .. }
+        | DataDirectoryError::AlreadyExists { .. } => ErrorCode::Conflict,
         DataDirectoryError::Io { .. } => ErrorCode::Unavailable,
         DataDirectoryError::InvalidManagedPath { .. } => ErrorCode::Internal,
         DataDirectoryError::NotDirectory { .. }

@@ -31,12 +31,21 @@ pub use bus_protocol::{
     CONTROL_PROTOCOL_VERSION,
 };
 pub use config::{
-    default_config_path, ZippyConfig, ZippyGatewayConfig, ZippyLogConfig, ZippyQueryConfig,
-    ZippyRuntimeConfig, ZippyTableConfig, ZippyTablePersistConfig,
-    ZippyTablePersistPartitionConfig, DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL,
-    DEFAULT_MAX_PARALLELISM, DEFAULT_MAX_QUERY_BUFFER_BYTES, DEFAULT_QUERY_MAX_BUFFERED_BYTES,
+    default_config_path, ZippyCatalogBackend, ZippyCatalogConfig,
+    ZippyCatalogRuntimeSnapshotPinConfig, ZippyCatalogShadowConfig, ZippyConfig,
+    ZippyGatewayConfig, ZippyLogConfig, ZippyQueryConfig, ZippyRuntimeConfig, ZippyTableConfig,
+    ZippyTablePersistConfig, ZippyTablePersistPartitionConfig,
+    DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS,
+    DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES,
+    DEFAULT_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS, DEFAULT_CATALOG_SHADOW_DEDUP_CAPACITY,
+    DEFAULT_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON,
+    DEFAULT_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON,
+    DEFAULT_CATALOG_SHADOW_METADATA_BUDGET_BYTES, DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY,
+    DEFAULT_CONFIG_PATH, DEFAULT_LOG_LEVEL, DEFAULT_MAX_PARALLELISM,
+    DEFAULT_MAX_QUERY_BUFFER_BYTES, DEFAULT_QUERY_MAX_BUFFERED_BYTES,
     DEFAULT_TABLE_PERSIST_DATA_DIR, DEFAULT_TABLE_PERSIST_METHOD, DEFAULT_TABLE_ROW_CAPACITY,
-    MAX_PARALLELISM, MAX_QUERY_BUFFER_BYTES,
+    MAX_CATALOG_RUNTIME_SNAPSHOT_PINS, MAX_CATALOG_RUNTIME_SNAPSHOT_PIN_TABLES, MAX_PARALLELISM,
+    MAX_QUERY_BUFFER_BYTES,
 };
 pub use control_transport::{
     connect_control_endpoint, control_response_result, send_control_line_request,
@@ -48,9 +57,12 @@ pub use data_directory::{
     DATA_FORMAT_VERSION_FILE,
 };
 pub use data_directory_ownership::{
-    DataDirectoryOwner, OwnedDataDirectory, DATA_DIRECTORY_LOCK_FILE,
+    CatalogRuntimeOwnership, DataDirectoryOwner, OwnedDataDirectory, DATA_DIRECTORY_LOCK_FILE,
 };
-pub use durable_file::{DurableFileTransaction, DurablePublishedFile, DurableRemoveOutcome};
+pub use durable_file::{
+    DurableFilePublicationState, DurableFilePublishError, DurableFileTransaction,
+    DurablePublishedFile, DurableRemoveOutcome,
+};
 pub use endpoint::{
     default_control_endpoint, default_control_endpoint_path, resolve_control_endpoint,
     resolve_control_endpoint_uri, resolve_control_endpoint_with_home, ControlEndpoint,

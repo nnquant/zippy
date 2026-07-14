@@ -32,6 +32,27 @@ if os.name == "posix":
 
 _STATE_SCHEMA_VERSION = 1
 _READY_SCHEMA_VERSION = 2
+_SERVER_ERROR_CODES = frozenset(
+    {
+        "INVALID_ARGUMENT",
+        "UNAUTHENTICATED",
+        "PERMISSION_DENIED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "CONFLICT",
+        "STALE_PRODUCER_EPOCH",
+        "SEQUENCE_GAP",
+        "SCHEMA_MISMATCH",
+        "OFFSET_EXPIRED",
+        "RESOURCE_EXHAUSTED",
+        "DEADLINE_EXCEEDED",
+        "CANCELLED",
+        "UNAVAILABLE",
+        "DATA_CORRUPTION",
+        "INTERNAL",
+        "UNSUPPORTED_PLAN",
+    }
+)
 _MAX_CONTROL_RESPONSE_BYTES = 4 * 1024 * 1024
 _PROCESS_POLL_INTERVAL_SEC = 0.05
 
@@ -304,6 +325,11 @@ def _publish_child_shutdown_outcome(*, clean: bool, error_code: str | None) -> N
     _atomic_write_json(Path(outcome_path), payload, launch_nonce)
 
 
+def _exception_error_code(error: BaseException) -> str:
+    code = getattr(error, "zippy_error_code", None)
+    return code if isinstance(code, str) and code in _SERVER_ERROR_CODES else "runtime_error"
+
+
 def _read_shutdown_outcome(
     outcome_file: Path,
     *,
@@ -321,6 +347,8 @@ def _read_shutdown_outcome(
     if not isinstance(outcome.get("clean"), bool):
         raise _ServerProcessError("server shutdown outcome has an invalid clean flag")
     error_code = outcome.get("error_code")
+    if error_code is not None and not isinstance(error_code, str):
+        raise _ServerProcessError("server shutdown outcome has an invalid error code")
     clean = outcome["clean"]
     valid_error_codes = (
         {None, "startup_aborted"}
@@ -329,6 +357,7 @@ def _read_shutdown_outcome(
             "runtime_error",
             "bootstrap_error",
         }
+        | _SERVER_ERROR_CODES
     )
     if error_code not in valid_error_codes:
         raise _ServerProcessError("server shutdown outcome has an unsupported error code")
@@ -1101,6 +1130,22 @@ def _server_status(
         return result
     if state.get("status") == "starting":
         return _compose_starting_payload(state)
+    if state.get("status") == "stopping":
+        result = _compose_starting_payload(state)
+        result["status"] = "stopping"
+        result["health_error"] = "server shutdown is in progress"
+        return result
+    if state.get("status") == "failed":
+        result = _compose_starting_payload(state)
+        error_code = state.get("error_code")
+        if not isinstance(error_code, str) or error_code not in _SERVER_ERROR_CODES:
+            result["status"] = "unknown"
+            result["health_error"] = "server failed state has an invalid error code"
+            return result
+        result["status"] = "failed"
+        result["error_code"] = error_code
+        result["health_error"] = f"server runtime failed error_code=[{error_code}]"
+        return result
     if state.get("status") != "ready":
         result = _compose_starting_payload(state)
         result["status"] = "unknown"
@@ -1180,7 +1225,7 @@ def _stop_server(
     launch_nonce = state.get("launch_nonce")
     if not isinstance(launch_nonce, str) or not launch_nonce:
         raise _ServerProcessError("refusing to stop process without a launch nonce")
-    was_ready = state.get("status") == "ready"
+    was_ready = state.get("status") in {"ready", "stopping", "failed"}
     outcome_file = paths.outcome_file
     if not _lock_is_held(paths.lock_file):
         if not _process_matches(pid, identity):

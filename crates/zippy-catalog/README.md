@@ -24,6 +24,8 @@ Implemented:
   leases, maintenance jobs, and idempotent responses;
 - physical v3 cursor indexes for global and namespace-scoped active-table
   discovery without table scans or temporary sorts;
+- physical v4 table-first partial indexes for bounded safe-GC retry/claim
+  scans and table-first snapshot-lease protection checks;
 - lossless big-endian BLOB encodings for stable IDs, every `u64`, optional
   values, and explicit empty/known/legacy-unknown watermarks;
 - a second single-connection actor implementing `CreateNamespace`,
@@ -53,6 +55,18 @@ Implemented:
   native lineage from one deferred transaction. Admission is capped at 4,096
   strictly ordered selectors; each all-or-nothing response is capped at 64 MiB,
   65,536 visible files, and 262,144 lineage rows before owned allocation;
+- lifecycle-safe read handles expose `read_pinned_snapshot_at` as the Catalog half of physical
+  query execution. It admits an in-process pin before reading exact metadata and returns an owner
+  that retains every table pin until drop. The metadata view remains cloneable for planning, so a
+  physical QueryService must retain the owner, or an opaque lease derived from it, through every
+  scan task instead of treating a cloned view as a lifetime capability. Pin admission is split
+  across 64 table-keyed shards. Its configurable defaults are 131,072 active pins and 16,384
+  active tables, with hard platform ceilings of 1,048,576 and 131,072 respectively, so unrelated
+  tables do not serialize on one mutex and abandoned queries cannot grow unbounded state.
+  `SqliteCatalog::runtime_snapshot_pin_status()` and the lifecycle-safe read handle return
+  lock-free active gauges, configured limits, and cumulative pin/table budget-exhaustion counters
+  without entering a SQLite lane. A retained guard makes shutdown observable as closed admission;
+  after the last guard drops, the read handle returns terminal unavailability;
 - server-internal frozen V1 manifest commits for native append tables:
   `CommitDataFiles` advances one contiguous persisted watermark, while
   `CommitCompaction` atomically replaces an exact visible input set with
@@ -71,12 +85,35 @@ Implemented:
   enqueue. The configurable aggregate queue budget defaults to 128 MiB, so the
   64-entry command queue cannot retain gigabytes of maximum-sized manifests.
   Actor principals are capped at 4 KiB before every command enters the queue
-  and are included in each manifest reservation.
+  and are included in each manifest reservation;
+- complete command replay probes use an independent bounded read lane and never
+  execute mutation preparation;
+- `CatalogPersistence` exposes shared publication permits and an exclusive
+  cleanup exclusion. Each permit includes bounded command admission and moves
+  into the writer actor, so cancellation cannot release it before an admitted
+  mutation terminates. The public wrapper is accepted only when its opaque
+  payload downcasts to the private capability type issued by that Catalog
+  instance; application-created lookalikes are rejected. Cleanup acquires every
+  permit before checking file references and retains the exclusion through
+  physical unlink;
+- `check_runtime_health()` locally verifies that the writer, control-read, and
+  snapshot-read threads remain live. A confirmed stopped worker is terminal for
+  that Catalog instance and is never classified as an indefinitely retryable
+  commit-unknown response;
+- `CatalogGarbageCollection` serializes safe-GC with every Catalog mutation.
+  Claim atomically checks unexpired durable leases plus the Catalog-owned
+  runtime minimum pin and transitions eligible managed historical files to
+  `deleting`. Existing retries and new claims have independent nonzero bounds,
+  so failed deletions cannot consume new-claim progress. Complete descriptors
+  are decoded after the write transaction commits. Exact finalize moves only
+  `deleting` files to `deleted`; interrupted deletion leaves durable `deleting`
+  rows that are returned again after restart.
 
 Physical SQLite schema versions and `CatalogCommand` wire versions are separate
 version spaces. Physical v1 remains the immutable migration foundation.
-Physical v2 is the complete first domain layout. Physical v3 only adds table
-discovery indexes; neither version implies that every V1 command is executable.
+Physical v2 is the complete first domain layout. Physical v3 adds table
+discovery indexes and physical v4 adds safe-GC indexes; neither changes typed
+domain encodings or implies that every V1 command is executable.
 
 Historical-manifest reads seek `data_files_visible_by_table` by table, committed
 state, and the half-open added/removed snapshot interval. SQLite returns bounded
@@ -93,12 +130,14 @@ Current typed capability matrix:
 | exact modern multi-table query snapshots | implemented transactionally |
 | server-internal native append `CommitDataFiles` | implemented transactionally with contiguous watermark and lineage validation |
 | server-internal append row-preserving `CommitCompaction` | implemented transactionally with exact input/output coverage |
+| durable `AcquireSnapshotLease` / `ReleaseSnapshotLease` | implemented transactionally; incomplete deleting/deleted historical snapshots reject new leases |
+| managed historical-file safe-GC claim/finalize | implemented transactionally with durable-lease and runtime-min-pin protection |
 | preserved legacy discovery-order snapshots | `UnsupportedPlan` pending V2 read DTO |
 | producer-fenced public ingest manifest protocol | not provided by V1 manifest commands |
 | maintenance lease-fenced compaction worker protocol | not provided by V1 manifest commands |
 | legacy, frame-aware, or key-value materializing manifest mutations | `UnsupportedPlan` pending V2 commands |
 | alter/drop/schema/producer/consumer/job commands | `UnsupportedPlan` |
-| legacy primary + SQLite shadow fan-out | not connected |
+| legacy primary + SQLite shadow fan-out | bounded Gateway comparison worker connected in `sqlite_shadow`; exact legacy manifest import/revision mapping remains pending for nonempty file sets |
 | SQLite read or write authority | disabled |
 
 The physical schema reserves `legacy_discovery_order`, but frozen V1 snapshot

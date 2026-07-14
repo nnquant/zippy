@@ -2,6 +2,7 @@
 
 mod wire_v1;
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
@@ -13,8 +14,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::table::{
-    CatalogName, DataFileLocation, DataFileState, DataFiles, NamespaceDescriptor, PendingDataFile,
-    SchemaDescriptor, SchemaIpcPayload, TableDefinition, TableDescriptor, TableRef, TableSnapshot,
+    CatalogName, DataFileDescriptor, DataFileLocation, DataFileState, DataFiles,
+    NamespaceDescriptor, PendingDataFile, SchemaDescriptor, SchemaIpcPayload, TableDefinition,
+    TableDescriptor, TableRef, TableSnapshot,
 };
 use crate::{
     BoxFuture, CommittedOffset, ConsumerOffsetAuthority, DurableConsumerId, FileId, JobId, LeaseId,
@@ -1293,6 +1295,94 @@ pub struct CatalogDataFileReferenceSnapshot {
     pub results: Vec<CatalogDataFileProbeResult>,
 }
 
+/// Bounded request to claim managed historical files for physical deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimGarbageCollectionFilesRequest {
+    /// The table whose removed files are being maintained.
+    pub table_id: TableId,
+    /// Maximum existing `deleting` files returned for physical-deletion retry.
+    pub retry_limit: u32,
+    /// Maximum `committed` files newly transitioned to `deleting`.
+    pub new_claim_limit: u32,
+}
+
+/// Query-admission exclusion retained through one garbage-collection claim transaction.
+///
+/// The server creates this value while holding exclusive local snapshot-pin admission and after
+/// sampling the lowest in-process pinned snapshot. Moving the value into Catalog claim admission
+/// prevents caller cancellation from releasing that exclusion before the single writer executes
+/// the transaction. Durable lease expiry is evaluated separately with the Catalog-owned clock.
+pub struct CatalogGarbageCollectionGuard {
+    guard: Box<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for CatalogGarbageCollectionGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogGarbageCollectionGuard")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogGarbageCollectionGuard {
+    /// Wraps a server-owned query-admission exclusion and its protected pin sample.
+    ///
+    /// Application code must obtain the opaque value from the server's snapshot lease registry;
+    /// this constructor exists so that registry can cross the Catalog crate boundary.
+    #[doc(hidden)]
+    pub fn from_opaque<T>(guard: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            guard: Box::new(guard),
+        }
+    }
+
+    /// Consumes and type-checks one implementation-owned exclusion token.
+    #[doc(hidden)]
+    pub fn try_into_opaque<T>(self) -> std::result::Result<T, Self>
+    where
+        T: Any + Send + Sync,
+    {
+        match self.guard.downcast::<T>() {
+            Ok(guard) => Ok(*guard),
+            Err(guard) => Err(Self { guard }),
+        }
+    }
+}
+
+/// One atomic garbage-collection claim result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedGarbageCollectionFiles {
+    /// Catalog revision after newly claimed files entered `deleting`.
+    pub catalog_revision: u64,
+    /// Complete deleting descriptors, with retries before newly claimed files.
+    ///
+    /// Each segment is in strict file-id order. The retry segment contains
+    /// previously claimed files whose physical deletion must resume after a
+    /// worker failure or process restart.
+    pub files: Vec<DataFileDescriptor>,
+}
+
+/// Exact managed-file set whose successful physical deletion is being finalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeGarbageCollectionFilesRequest {
+    /// The table owning every supplied file identity.
+    pub table_id: TableId,
+    /// Nonempty file identities in strict ascending order.
+    pub file_ids: Vec<FileId>,
+}
+
+/// Durable result of finalizing physical data-file deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedGarbageCollectionFiles {
+    /// Catalog revision after files transitioned from `deleting` to `deleted`.
+    pub catalog_revision: u64,
+    /// The exact finalized file identities in strict ascending order.
+    pub file_ids: Vec<FileId>,
+}
+
 /// Read-only outcome for one complete Catalog command idempotency probe.
 ///
 /// A missing record proves only that the supplied envelope has no retained
@@ -1307,6 +1397,88 @@ pub enum CatalogCommandReplayProbe {
         /// The original response committed atomically with the mutation.
         response: VersionedCatalogResponse,
     },
+}
+
+/// Shared authority held from physical publication through one Catalog mutation.
+///
+/// The token is opaque outside the Catalog implementation. Moving it into a
+/// mutation keeps publication excluded from concurrent physical cleanup even
+/// when the caller cancels its response future after actor admission.
+pub struct CatalogPublicationPermit {
+    permit: Box<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for CatalogPublicationPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogPublicationPermit")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogPublicationPermit {
+    /// Wraps one implementation-owned shared publication token.
+    ///
+    /// This constructor exists for Catalog implementations; application code
+    /// obtains tokens through [`CatalogPublicationControl`].
+    #[doc(hidden)]
+    pub fn from_opaque<T>(permit: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            permit: Box::new(permit),
+        }
+    }
+
+    /// Consumes and type-checks one implementation-owned publication token.
+    ///
+    /// Catalog implementations must use an unexported concrete token type and
+    /// reject a failed downcast. A caller can wrap an arbitrary value with
+    /// [`Self::from_opaque`], but cannot construct the implementation's private
+    /// capability type.
+    #[doc(hidden)]
+    pub fn try_into_opaque<T>(self) -> std::result::Result<T, Self>
+    where
+        T: Any + Send + Sync,
+    {
+        match self.permit.downcast::<T>() {
+            Ok(permit) => Ok(*permit),
+            Err(permit) => Err(Self { permit }),
+        }
+    }
+}
+
+/// Exclusive authority preventing Catalog file publication during physical cleanup.
+///
+/// Implementations issue this token only after every admitted shared
+/// publication permit has reached a terminal Catalog result.
+pub struct CatalogPublicationExclusion {
+    _permit: Box<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for CatalogPublicationExclusion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogPublicationExclusion")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogPublicationExclusion {
+    /// Wraps one implementation-owned exclusive publication token.
+    ///
+    /// This constructor exists for Catalog implementations; storage obtains
+    /// exclusions through [`CatalogPublicationControl`].
+    #[doc(hidden)]
+    pub fn from_opaque<T>(permit: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            _permit: Box::new(permit),
+        }
+    }
 }
 
 /// Read-only access to immutable persistent catalog state.
@@ -1375,6 +1547,38 @@ pub trait CatalogFileRead: CatalogRead {
     ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>>;
 }
 
+/// Server-internal durable lifecycle boundary for managed historical files.
+///
+/// Both operations run through the single Catalog writer. Once either future
+/// has been polled and admitted, cancelling its waiter does not cancel the
+/// mutation. Claim is replayable because existing `deleting` rows are returned;
+/// finalize is replayable for an exact set already in `deleted`.
+pub trait CatalogGarbageCollection: Send + Sync {
+    /// Claims eligible removed files and returns complete deleting descriptors.
+    ///
+    /// Implementations must evaluate durable leases, the supplied runtime pin,
+    /// candidate selection, and `committed -> deleting` transitions in one
+    /// write transaction. Existing `deleting` retries and newly claimed files
+    /// have independent nonzero bounds so neither class can consume the other
+    /// class's progress budget. Results return retries first, then newly claimed
+    /// files; each segment is strictly file-id ordered.
+    fn claim_garbage_collection_files(
+        &self,
+        guard: CatalogGarbageCollectionGuard,
+        request: ClaimGarbageCollectionFilesRequest,
+    ) -> BoxFuture<'_, Result<ClaimedGarbageCollectionFiles>>;
+
+    /// Finalizes an exact physically deleted set as durable `deleted` rows.
+    ///
+    /// Every identity must belong to the requested table and already be either
+    /// `deleting` or `deleted`; otherwise the complete operation fails without
+    /// partial state changes.
+    fn finalize_garbage_collection_files(
+        &self,
+        request: FinalizeGarbageCollectionFilesRequest,
+    ) -> BoxFuture<'_, Result<FinalizedGarbageCollectionFiles>>;
+}
+
 /// Read-only access to durable Catalog command idempotency records.
 ///
 /// Implementations must validate the complete versioned envelope and compare
@@ -1415,14 +1619,42 @@ pub trait CatalogWrite: Send + Sync {
     ) -> BoxFuture<'_, Result<VersionedCatalogResponse>>;
 }
 
+/// Coordinates physical file publication and deletion with Catalog mutations.
+///
+/// Every file-producing path must acquire a shared permit before publishing a
+/// final directory entry, then move that permit into the corresponding Catalog
+/// command. Cleanup acquires the exclusive token before its first reference
+/// probe and retains it through physical verification and unlink.
+pub trait CatalogPublicationControl: Send + Sync {
+    /// Acquires one shared permit for a file publication and Catalog mutation.
+    fn acquire_publication_permit(&self) -> BoxFuture<'_, Result<CatalogPublicationPermit>>;
+
+    /// Executes a mutation while transferring an acquired shared permit to the Catalog actor.
+    ///
+    /// Implementations must reject a permit issued by another Catalog instance.
+    /// Once admitted, the actor owns the permit until the mutation reaches a
+    /// terminal result, independently of response-future cancellation.
+    fn command_with_publication_permit(
+        &self,
+        permit: CatalogPublicationPermit,
+        command: VersionedCatalogCommand,
+    ) -> BoxFuture<'_, Result<VersionedCatalogResponse>>;
+
+    /// Acquires exclusive cleanup authority after all shared permits drain.
+    fn acquire_publication_exclusion(&self) -> BoxFuture<'_, Result<CatalogPublicationExclusion>>;
+}
+
 /// Native persistence Catalog capabilities required for safe file publication.
 ///
 /// The explicit composition keeps legacy adapters that cannot expose stable
 /// file identities or durable idempotency records out of native persistence.
-pub trait CatalogPersistence: CatalogFileRead + CatalogIdempotencyRead + CatalogWrite {}
+pub trait CatalogPersistence:
+    CatalogFileRead + CatalogIdempotencyRead + CatalogWrite + CatalogPublicationControl
+{
+}
 
 impl<T> CatalogPersistence for T where
-    T: CatalogFileRead + CatalogIdempotencyRead + CatalogWrite + ?Sized
+    T: CatalogFileRead + CatalogIdempotencyRead + CatalogWrite + CatalogPublicationControl + ?Sized
 {
 }
 
@@ -1444,14 +1676,14 @@ mod tests {
         AcquireProducerCommand, AcquireSnapshotLeaseCommand, AlterTableSchemaCommand, Catalog,
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCodecError, CatalogCommandEnvelopeV1,
         CatalogCommandFingerprintInputV1, CatalogCommandFormatVersion, CatalogCommandV1,
-        CatalogFileRead, CatalogFingerprintError, CatalogIdempotencyRead, CatalogOutcomeV1,
-        CatalogPersistence, CatalogQuerySnapshot, CatalogRead, CatalogResponseV1,
-        CatalogSnapshotSelector, CatalogTableSnapshot, CatalogWrite, CommitCompactionCommand,
-        CommitConsumerOffsetCommand, CommitDataFilesCommand, CreateMaintenanceJobCommand,
-        CreateNamespaceCommand, CreateTableCommand, DropTableCommand, MaintenanceJobDescriptor,
-        MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor, ReleaseSnapshotLeaseCommand,
-        SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand, VersionedCatalogCommand,
-        VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+        CatalogFileRead, CatalogFingerprintError, CatalogGarbageCollection, CatalogIdempotencyRead,
+        CatalogOutcomeV1, CatalogPersistence, CatalogPublicationControl, CatalogQuerySnapshot,
+        CatalogRead, CatalogResponseV1, CatalogSnapshotSelector, CatalogTableSnapshot,
+        CatalogWrite, CommitCompactionCommand, CommitConsumerOffsetCommand, CommitDataFilesCommand,
+        CreateMaintenanceJobCommand, CreateNamespaceCommand, CreateTableCommand, DropTableCommand,
+        MaintenanceJobDescriptor, MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor,
+        ReleaseSnapshotLeaseCommand, SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand,
+        VersionedCatalogCommand, VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
     };
     use crate::table::{
         AppendTableDefinition, CatalogName, ColumnName, ColumnSet, DataFileDescriptor,
@@ -1844,7 +2076,12 @@ mod tests {
     fn assert_catalog_is_object_safe(_: Option<&dyn Catalog>) {}
     fn assert_catalog_read_is_object_safe(_: Option<&dyn CatalogRead>) {}
     fn assert_catalog_file_read_is_object_safe(_: Option<&dyn CatalogFileRead>) {}
+    fn assert_catalog_garbage_collection_is_object_safe(_: Option<&dyn CatalogGarbageCollection>) {}
     fn assert_catalog_idempotency_read_is_object_safe(_: Option<&dyn CatalogIdempotencyRead>) {}
+    fn assert_catalog_publication_control_is_object_safe(
+        _: Option<&dyn CatalogPublicationControl>,
+    ) {
+    }
     fn assert_catalog_persistence_is_object_safe(_: Option<&dyn CatalogPersistence>) {}
     fn assert_catalog_write_is_object_safe(_: Option<&dyn CatalogWrite>) {}
 
@@ -1853,7 +2090,9 @@ mod tests {
         assert_catalog_is_object_safe(None);
         assert_catalog_read_is_object_safe(None);
         assert_catalog_file_read_is_object_safe(None);
+        assert_catalog_garbage_collection_is_object_safe(None);
         assert_catalog_idempotency_read_is_object_safe(None);
+        assert_catalog_publication_control_is_object_safe(None);
         assert_catalog_persistence_is_object_safe(None);
         assert_catalog_write_is_object_safe(None);
     }

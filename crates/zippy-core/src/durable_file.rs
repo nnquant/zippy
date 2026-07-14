@@ -1,5 +1,6 @@
 //! Crash-safe publication of files owned by one managed data directory.
 
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,36 +43,118 @@ impl DurableFileTransaction {
     }
 
     /// Synchronizes file contents, publishes without clobbering, and syncs the parent directory.
-    pub fn publish_noclobber(self) -> Result<DurablePublishedFile, DataDirectoryError> {
-        self.temporary
+    pub fn publish_noclobber(self) -> Result<DurablePublishedFile, DurableFilePublishError> {
+        self.publish_noclobber_with(sync_directory_io)
+    }
+
+    fn publish_noclobber_with<F>(
+        self,
+        sync_parent: F,
+    ) -> Result<DurablePublishedFile, DurableFilePublishError>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        self.temporary.as_file().sync_all().map_err(|error| {
+            DurableFilePublishError::unpublished(io_error(self.temporary.path(), error))
+        })?;
+        let size_bytes = self
+            .temporary
             .as_file()
-            .sync_all()
-            .map_err(|error| io_error(self.temporary.path(), error))?;
+            .metadata()
+            .map_err(|error| {
+                DurableFilePublishError::unpublished(io_error(self.temporary.path(), error))
+            })?
+            .len();
         let managed_path = self.managed_path;
         let final_path = self.final_path;
         let parent = self.parent;
-        let published = self
-            .temporary
+        self.temporary
             .persist_noclobber(&final_path)
             .map_err(|error| {
-                if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                    DataDirectoryError::AlreadyExists {
-                        path: final_path.clone(),
-                    }
-                } else {
-                    io_error(&final_path, error.error)
-                }
+                DurableFilePublishError::unpublished(
+                    if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                        DataDirectoryError::AlreadyExists {
+                            path: final_path.clone(),
+                        }
+                    } else {
+                        io_error(&final_path, error.error)
+                    },
+                )
             })?;
-        let size_bytes = published
-            .metadata()
-            .map_err(|error| io_error(&final_path, error))?
-            .len();
-        sync_directory_io(&parent).map_err(|error| io_error(&parent, error))?;
+        sync_parent(&parent).map_err(|error| {
+            DurableFilePublishError::published_not_durable(io_error(&parent, error))
+        })?;
         Ok(DurablePublishedFile {
             managed_path,
             path: final_path,
             size_bytes,
         })
+    }
+}
+
+/// Whether a failed durable-file publication created its final directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableFilePublicationState {
+    /// Publication failed before the final path was created by this transaction.
+    Unpublished,
+    /// The final path was created, but parent-directory durability was not confirmed.
+    PublishedNotDurable,
+}
+
+/// A durable-file publication failure with explicit final-entry ownership state.
+#[derive(Debug)]
+pub struct DurableFilePublishError {
+    error: DataDirectoryError,
+    state: DurableFilePublicationState,
+}
+
+impl DurableFilePublishError {
+    fn unpublished(error: DataDirectoryError) -> Self {
+        Self {
+            error,
+            state: DurableFilePublicationState::Unpublished,
+        }
+    }
+
+    fn published_not_durable(error: DataDirectoryError) -> Self {
+        Self {
+            error,
+            state: DurableFilePublicationState::PublishedNotDurable,
+        }
+    }
+
+    /// Returns whether this transaction created the final directory entry.
+    #[must_use]
+    pub const fn publication_state(&self) -> DurableFilePublicationState {
+        self.state
+    }
+
+    /// Returns the underlying managed-data-directory failure.
+    #[must_use]
+    pub const fn error(&self) -> &DataDirectoryError {
+        &self.error
+    }
+
+    /// Consumes the classified failure into its underlying error and publication state.
+    #[must_use]
+    pub fn into_parts(self) -> (DataDirectoryError, DurableFilePublicationState) {
+        (self.error, self.state)
+    }
+}
+
+impl fmt::Display for DurableFilePublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "durable file publication failed state=[{:?}] error=[{}]",
+            self.state, self.error
+        )
+    }
+}
+
+impl std::error::Error for DurableFilePublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -342,4 +425,39 @@ fn remove_file_from_parent(
     _file_name: &std::ffi::OsStr,
 ) -> Result<DurableRemoveOutcome, DataDirectoryError> {
     Err(DataDirectoryError::UnsupportedPlatformSecurity)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::TempDir;
+
+    use super::{begin_durable_file, DurableFilePublicationState};
+    use zippy_types::table::ManagedDataPath;
+
+    #[test]
+    fn directory_sync_failure_retains_published_entry_state() {
+        let directory = TempDir::new().expect("create temporary data root");
+        let managed_path =
+            ManagedDataPath::new("parquet/table/file.parquet").expect("construct managed path");
+        let mut transaction =
+            begin_durable_file(directory.path(), &managed_path).expect("begin durable publication");
+        transaction
+            .write_all(b"published but not confirmed durable")
+            .expect("write temporary payload");
+        let temporary_path = transaction.temporary_path().to_path_buf();
+        let final_path = transaction.final_path().to_path_buf();
+
+        let failure = transaction
+            .publish_noclobber_with(|_| Err(std::io::Error::other("injected sync failure")))
+            .expect_err("directory sync failure must be classified");
+
+        assert_eq!(
+            failure.publication_state(),
+            DurableFilePublicationState::PublishedNotDurable
+        );
+        assert!(!temporary_path.exists());
+        assert!(final_path.exists());
+    }
 }

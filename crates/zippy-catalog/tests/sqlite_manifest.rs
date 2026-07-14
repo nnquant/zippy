@@ -9,12 +9,14 @@ use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
-    CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandFormatVersion,
-    CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead, CatalogOutcomeV1,
-    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite, CommandFingerprint,
-    CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand,
-    ManagedDataFileProbe, VersionedCatalogCommand, VersionedCatalogResponse,
-    MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+    AcquireSnapshotLeaseCommand, CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1,
+    CatalogCommandFormatVersion, CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead,
+    CatalogGarbageCollection, CatalogGarbageCollectionGuard, CatalogOutcomeV1,
+    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
+    ClaimGarbageCollectionFilesRequest, CommandFingerprint, CommitCompactionCommand,
+    CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand,
+    FinalizeGarbageCollectionFilesRequest, ManagedDataFileProbe, ReleaseSnapshotLeaseCommand,
+    VersionedCatalogCommand, VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
 };
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, ColumnName, DataFileLocation, DataFileProvenance,
@@ -23,7 +25,8 @@ use zippy_types::table::{
     SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
 };
 use zippy_types::{
-    ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
+    ErrorCode, FileId, LeaseId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId,
+    TableId,
 };
 
 const NAMESPACE: u128 = 1;
@@ -64,6 +67,10 @@ fn table_id(value: u128) -> TableId {
 
 fn file_id(value: u128) -> FileId {
     FileId::from_u128(value).expect("test file id must be nonzero")
+}
+
+fn lease_id(value: u128) -> LeaseId {
+    LeaseId::from_u128(value).expect("test lease id must be nonzero")
 }
 
 fn schema_ipc(schema: &Schema) -> SchemaIpcPayload {
@@ -283,6 +290,42 @@ fn commit_compaction(
     )
 }
 
+fn acquire_snapshot_lease(
+    request: u128,
+    lease: u128,
+    snapshot_version: u64,
+    expires_at_ns: u64,
+) -> VersionedCatalogCommand {
+    command(
+        request,
+        None,
+        CatalogCommandV1::AcquireSnapshotLease(AcquireSnapshotLeaseCommand {
+            lease_id: lease_id(lease),
+            table_id: table_id(TABLE),
+            snapshot_version,
+            owner: format!("safe-gc-test-{lease}"),
+            expires_at_ns,
+        }),
+    )
+}
+
+fn release_snapshot_lease(request: u128, lease: u128) -> VersionedCatalogCommand {
+    command(
+        request,
+        None,
+        CatalogCommandV1::ReleaseSnapshotLease(ReleaseSnapshotLeaseCommand {
+            lease_id: lease_id(lease),
+            owner: format!("safe-gc-test-{lease}"),
+        }),
+    )
+}
+
+fn garbage_collection_guard(catalog: &SqliteCatalog) -> CatalogGarbageCollectionGuard {
+    catalog
+        .acquire_garbage_collection_guard(table_id(TABLE))
+        .expect("acquire table-bound garbage collection guard")
+}
+
 async fn persist_two_inputs(
     catalog: &SqliteCatalog,
 ) -> (PendingDataFile, PendingDataFile, VersionedCatalogResponse) {
@@ -471,6 +514,257 @@ async fn file_probe_resolves_both_keys_and_preserves_removed_identity() {
     assert_eq!(reference.removed_snapshot_version, Some(3));
     assert_eq!(reference.state, DataFileState::Committed);
     catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safe_gc_respects_protection_and_advances_retry_and_new_claim_after_restart() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    create_append_table(&catalog).await;
+    let (first, second, _) = persist_two_inputs(&catalog).await;
+    let compacted = compacted_file(40, 4);
+    catalog
+        .command(commit_compaction(
+            4,
+            3,
+            2,
+            vec![first.file_id, second.file_id],
+            vec![compacted.clone()],
+            OffsetWatermark::Known(LogOffset::new(3)),
+        ))
+        .await
+        .expect("commit compaction fixture");
+    catalog
+        .command(acquire_snapshot_lease(5, 100, 2, u64::MAX))
+        .await
+        .expect("protect historical snapshot with durable lease");
+
+    let active_lease = catalog
+        .claim_garbage_collection_files(
+            garbage_collection_guard(&catalog),
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(TABLE),
+                retry_limit: 2,
+                new_claim_limit: 2,
+            },
+        )
+        .await
+        .expect("evaluate active durable lease");
+    assert!(active_lease.files.is_empty());
+    assert_eq!(active_lease.catalog_revision, 5);
+
+    catalog
+        .command(release_snapshot_lease(6, 100))
+        .await
+        .expect("release durable lease before testing the runtime pin");
+
+    let pinned_snapshot = catalog
+        .pin_runtime_snapshot(table_id(TABLE), 2)
+        .expect("pin historical snapshot in the runtime registry");
+    let runtime_pin = catalog
+        .claim_garbage_collection_files(
+            garbage_collection_guard(&catalog),
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(TABLE),
+                retry_limit: 2,
+                new_claim_limit: 2,
+            },
+        )
+        .await
+        .expect("released durable lease must defer to runtime pin");
+    assert!(runtime_pin.files.is_empty());
+    assert_eq!(runtime_pin.catalog_revision, 6);
+    drop(pinned_snapshot);
+
+    let pinned_current = catalog
+        .pin_runtime_snapshot(table_id(TABLE), 3)
+        .expect("pin current snapshot while claiming older files");
+    let claimed = catalog
+        .claim_garbage_collection_files(
+            garbage_collection_guard(&catalog),
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(TABLE),
+                retry_limit: 2,
+                new_claim_limit: 2,
+            },
+        )
+        .await
+        .expect("claim files after every protecting boundary advanced");
+    assert_eq!(claimed.catalog_revision, 7);
+    drop(pinned_current);
+    assert_eq!(claimed.files.len(), 2);
+    assert_eq!(claimed.files[0].file, first);
+    assert_eq!(claimed.files[1].file, second);
+    assert!(claimed.files.iter().all(|file| {
+        file.state == DataFileState::Deleting && file.removed_snapshot_version == Some(3)
+    }));
+    let historical_selector = CatalogSnapshotSelector {
+        table_id: table_id(TABLE),
+        snapshot_version: 2,
+        schema_version: 1,
+    };
+    let deleting_read = catalog
+        .read_snapshot_at(std::slice::from_ref(&historical_selector))
+        .await
+        .expect_err("a deleting historical file must not become a partial successful snapshot");
+    assert_eq!(deleting_read.code(), ErrorCode::Conflict);
+    assert!(!deleting_read.retryable());
+    assert!(deleting_read.message().contains("state=[deleting]"));
+    let current = exact_snapshot(&catalog, 3).await;
+    assert_eq!(current.tables()[0].files().len(), 1);
+    assert_eq!(&current.tables()[0].files().as_slice()[0].file, &compacted);
+
+    for (request, lease) in [(7, 100), (8, 101)] {
+        let error = catalog
+            .command(acquire_snapshot_lease(request, lease, 2, u64::MAX))
+            .await
+            .expect_err("an incomplete historical snapshot must reject every new lease");
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert!(!error.retryable());
+    }
+    catalog
+        .command(acquire_snapshot_lease(9, 102, 3, u64::MAX))
+        .await
+        .expect("current complete snapshot remains leasable");
+    assert_eq!(catalog.revision().await, Ok(8));
+
+    let unsorted = catalog
+        .finalize_garbage_collection_files(FinalizeGarbageCollectionFilesRequest {
+            table_id: table_id(TABLE),
+            file_ids: vec![second.file_id, first.file_id],
+        })
+        .await
+        .expect_err("unsorted finalize set must fail before writer admission");
+    assert_eq!(unsorted.code(), ErrorCode::InvalidArgument);
+    assert_eq!(catalog.revision().await, Ok(8));
+
+    let still_committed = catalog
+        .finalize_garbage_collection_files(FinalizeGarbageCollectionFilesRequest {
+            table_id: table_id(TABLE),
+            file_ids: vec![compacted.file_id],
+        })
+        .await
+        .expect_err("current committed file must not finalize as physically deleted");
+    assert_eq!(still_committed.code(), ErrorCode::Conflict);
+    assert_eq!(catalog.revision().await, Ok(8));
+
+    let first_finalized = catalog
+        .finalize_garbage_collection_files(FinalizeGarbageCollectionFilesRequest {
+            table_id: table_id(TABLE),
+            file_ids: vec![first.file_id],
+        })
+        .await
+        .expect("finalize one physically deleted file");
+    assert_eq!(first_finalized.catalog_revision, 9);
+    let replayed_finalize = catalog
+        .finalize_garbage_collection_files(FinalizeGarbageCollectionFilesRequest {
+            table_id: table_id(TABLE),
+            file_ids: vec![first.file_id],
+        })
+        .await
+        .expect("replay exact finalized identity");
+    assert_eq!(replayed_finalize.catalog_revision, 9);
+    let partially_deleted_read = catalog
+        .read_snapshot_at(std::slice::from_ref(&historical_selector))
+        .await
+        .expect_err("a deleted historical file must not be silently omitted");
+    assert_eq!(partially_deleted_read.code(), ErrorCode::Conflict);
+    assert!(partially_deleted_read.message().contains("state=[deleted]"));
+
+    let fresh_input = native_file(15, TABLE, 1, 4, 4, 5, 0);
+    catalog
+        .command(commit_data_files(
+            10,
+            9,
+            3,
+            vec![fresh_input.clone()],
+            OffsetWatermark::Known(LogOffset::new(4)),
+        ))
+        .await
+        .expect("commit a new file while an older deletion remains interrupted");
+    let fresh_output =
+        native_file_with_lineage(60, TABLE, 1, 4, 4, vec![source_lineage(5, 1, 0, 4, 4)]);
+    catalog
+        .command(commit_compaction(
+            11,
+            10,
+            4,
+            vec![fresh_input.file_id],
+            vec![fresh_output],
+            OffsetWatermark::Known(LogOffset::new(4)),
+        ))
+        .await
+        .expect("make the new file independently eligible for garbage collection");
+    catalog.close().expect("close with one deleting file");
+
+    let reopened = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("reopen catalog with interrupted garbage collection");
+    let retry = reopened
+        .claim_garbage_collection_files(
+            garbage_collection_guard(&reopened),
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(TABLE),
+                retry_limit: 1,
+                new_claim_limit: 1,
+            },
+        )
+        .await
+        .expect("advance retry and new-claim work independently after restart");
+    assert_eq!(retry.catalog_revision, 12);
+    assert_eq!(retry.files.len(), 2);
+    assert_eq!(retry.files[0].file_id(), second.file_id);
+    assert_eq!(retry.files[1].file_id(), fresh_input.file_id);
+    assert!(
+        retry.files[1].file_id() < retry.files[0].file_id(),
+        "retry segment must precede the new-claim segment rather than globally sorting file IDs"
+    );
+    assert_eq!(retry.files[0].state, DataFileState::Deleting);
+    assert_eq!(retry.files[1].state, DataFileState::Deleting);
+
+    let second_finalized = reopened
+        .finalize_garbage_collection_files(FinalizeGarbageCollectionFilesRequest {
+            table_id: table_id(TABLE),
+            file_ids: vec![fresh_input.file_id, second.file_id],
+        })
+        .await
+        .expect("finalize retried and newly claimed physical deletions");
+    assert_eq!(second_finalized.catalog_revision, 13);
+    let exhausted = reopened
+        .claim_garbage_collection_files(
+            garbage_collection_guard(&reopened),
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(TABLE),
+                retry_limit: 2,
+                new_claim_limit: 2,
+            },
+        )
+        .await
+        .expect("observe exhausted garbage collection set");
+    assert!(exhausted.files.is_empty());
+    assert_eq!(exhausted.catalog_revision, 13);
+
+    let deleted = reopened
+        .inspect_data_file_references(&[
+            file_probe(10, TABLE, "tables/10/10.parquet"),
+            file_probe(15, TABLE, "tables/10/15.parquet"),
+            file_probe(20, TABLE, "tables/10/20.parquet"),
+        ])
+        .await
+        .expect("inspect finalized Catalog rows");
+    assert!(deleted.results.iter().all(|result| matches!(
+        &result.matched,
+        CatalogDataFileProbeMatch::Exact { reference }
+            if reference.state == DataFileState::Deleted
+    )));
+    let deleted_read = reopened
+        .read_snapshot_at(std::slice::from_ref(&historical_selector))
+        .await
+        .expect_err("a fully deleted historical snapshot must fail closed");
+    assert_eq!(deleted_read.code(), ErrorCode::Conflict);
+    assert!(deleted_read.message().contains("state=[deleted]"));
+    reopened.close().expect("close reopened sqlite catalog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

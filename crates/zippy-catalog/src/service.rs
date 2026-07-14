@@ -2,19 +2,22 @@
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::Connection;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use zippy_types::catalog::{
     CatalogCommandReplayProbe, CatalogDataFileReferenceSnapshot, CatalogFileRead,
-    CatalogIdempotencyRead, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
-    CatalogWrite, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
-    ListTablesResponse, ManagedDataFileProbe, NamespaceRef, VersionedCatalogCommand,
-    VersionedCatalogResponse,
+    CatalogGarbageCollection, CatalogGarbageCollectionGuard, CatalogIdempotencyRead,
+    CatalogPublicationControl, CatalogPublicationExclusion, CatalogPublicationPermit,
+    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
+    ClaimGarbageCollectionFilesRequest, ClaimedGarbageCollectionFiles,
+    FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles, ListNamespacesRequest,
+    ListNamespacesResponse, ListTablesRequest, ListTablesResponse, ManagedDataFileProbe,
+    NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
@@ -52,6 +55,40 @@ pub struct SqliteCatalog {
     command_budget: Arc<CommandBudget>,
     manifest_queue_budget: Arc<ManifestQueueBudget>,
     replay_probe_budget: Arc<ReplayProbeBudget>,
+    publication_gate: Arc<Semaphore>,
+    publication_gate_capacity: u32,
+    runtime_snapshot_pins: Arc<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
+}
+
+/// Cloneable read-only view over one running [`SqliteCatalog`].
+///
+/// The handle owns only bounded read-lane senders and shared admission state;
+/// it never owns or borrows the parent Catalog. Retaining a handle therefore
+/// cannot keep a Catalog owner alive or prevent `Arc::try_unwrap` during
+/// shutdown. Once the owner closes read admission or a read worker stops, all
+/// subsequent calls fail with a terminal `Unavailable` error.
+#[derive(Clone)]
+pub struct SqliteCatalogReadHandle {
+    endpoint: Arc<CatalogReadEndpoint>,
+    runtime_snapshot_pins: Weak<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
+}
+
+/// Exact Catalog metadata retained together with its in-process GC pins.
+///
+/// Query execution must keep this value alive until every physical file read has completed.
+/// Dropping it releases all table pins atomically from the caller's ownership perspective.
+#[derive(Debug)]
+pub struct SqliteCatalogPinnedQuerySnapshot {
+    snapshot: CatalogQuerySnapshot,
+    _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
+}
+
+impl SqliteCatalogPinnedQuerySnapshot {
+    /// Borrows the revision-consistent Catalog snapshot protected by this guard.
+    #[must_use]
+    pub const fn snapshot(&self) -> &CatalogQuerySnapshot {
+        &self.snapshot
+    }
 }
 
 impl SqliteCatalog {
@@ -82,6 +119,15 @@ impl SqliteCatalog {
         read_backend: Arc<dyn CatalogReadBackend>,
     ) -> Result<Self> {
         crate::validate_config(&config)?;
+        let runtime_ownership = config
+            .ownership
+            .acquire_catalog_runtime_ownership()
+            .map_err(|error| match error {
+                zippy_core::DataDirectoryError::CatalogRuntimeOwnershipHeld { .. } => {
+                    ServerError::new(ErrorCode::Conflict, error.to_string()).with_retryable(false)
+                }
+                _ => ServerError::new(ErrorCode::Internal, error.to_string()).with_retryable(false),
+            })?;
         let (sender, receiver) = crossbeam_channel::bounded(config.command_capacity);
         let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
         let command_budget = Arc::new(CommandBudget::new(config.command_capacity));
@@ -89,6 +135,14 @@ impl SqliteCatalog {
             config.manifest_queue_capacity_bytes,
         ));
         let replay_probe_budget = Arc::new(ReplayProbeBudget::new(REPLAY_PROBE_CAPACITY));
+        let publication_gate_capacity =
+            u32::try_from(config.command_capacity).expect("validated Catalog command capacity");
+        let publication_gate = Arc::new(Semaphore::new(config.command_capacity));
+        let runtime_snapshot_pins = crate::runtime_pins::RuntimeSnapshotPinRegistry::new(
+            runtime_ownership,
+            config.runtime_snapshot_pin_max_active_pins,
+            config.runtime_snapshot_pin_max_active_tables,
+        );
         let actor_config = config.clone();
         let actor = thread::Builder::new()
             .name(SERVICE_ACTOR_THREAD_NAME.to_owned())
@@ -110,6 +164,9 @@ impl SqliteCatalog {
                     command_budget,
                     manifest_queue_budget,
                     replay_probe_budget,
+                    publication_gate,
+                    publication_gate_capacity,
+                    runtime_snapshot_pins,
                 };
                 match CatalogReadPool::start(&config, read_backend) {
                     Ok(read_pool) => {
@@ -146,6 +203,57 @@ impl SqliteCatalog {
         self.shutdown()
     }
 
+    /// Creates a lifecycle-safe read-only handle for query and file snapshots.
+    ///
+    /// The returned handle does not extend this Catalog's owner lifetime. It
+    /// remains valid only while the Catalog read workers are running; reads
+    /// attempted after shutdown fail terminally instead of reopening SQLite or
+    /// silently falling back to another metadata authority.
+    pub fn read_handle(&self) -> Result<SqliteCatalogReadHandle> {
+        let read_pool = self.read_pool()?;
+        read_pool.check_runtime_health()?;
+        Ok(SqliteCatalogReadHandle {
+            endpoint: Arc::clone(&read_pool.endpoint),
+            runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
+        })
+    }
+
+    /// Pins one exact in-process table snapshot against safe garbage collection.
+    ///
+    /// Pin admission fails while a claim for the same table owns its exclusion. The returned
+    /// guard must remain alive through all physical reads that use the selected snapshot.
+    pub fn pin_runtime_snapshot(
+        &self,
+        table_id: zippy_types::TableId,
+        snapshot_version: u64,
+    ) -> Result<crate::SqliteCatalogRuntimeSnapshotPin> {
+        self.check_runtime_health()?;
+        self.runtime_snapshot_pins.pin(table_id, snapshot_version)
+    }
+
+    /// Returns process-local query snapshot pin gauges, limits, and cumulative rejections.
+    ///
+    /// The snapshot is lock-free and does not enqueue Catalog or SQLite work.
+    #[must_use]
+    pub fn runtime_snapshot_pin_status(&self) -> crate::SqliteCatalogRuntimeSnapshotPinStatus {
+        self.runtime_snapshot_pins.status()
+    }
+
+    /// Excludes new runtime pins for one table and captures its current minimum pin.
+    ///
+    /// The returned opaque capability is bound to this Catalog and table. It must be moved into
+    /// [`CatalogGarbageCollection::claim_garbage_collection_files`]; forged, cross-Catalog, or
+    /// cross-table capabilities are rejected before writer admission.
+    pub fn acquire_garbage_collection_guard(
+        &self,
+        table_id: zippy_types::TableId,
+    ) -> Result<CatalogGarbageCollectionGuard> {
+        self.check_runtime_health()?;
+        self.runtime_snapshot_pins
+            .exclude_garbage_collection(table_id)
+            .map(CatalogGarbageCollectionGuard::from_opaque)
+    }
+
     fn writer_request<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<T>>) -> ServiceMessage,
@@ -169,7 +277,89 @@ impl SqliteCatalog {
         self.read_pool.as_ref().ok_or_else(read_pool_stopped)
     }
 
+    /// Checks that every thread owned by this Catalog instance is still running.
+    ///
+    /// This is a local liveness check and does not enqueue SQLite work. A
+    /// stopped writer or read worker is terminal for this instance; callers
+    /// must close admission and reopen the Catalog instead of retrying forever.
+    pub fn check_runtime_health(&self) -> Result<()> {
+        if self.sender.is_none()
+            || self
+                .actor
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            return Err(actor_stopped());
+        }
+        self.read_pool()
+            .and_then(CatalogReadPool::check_runtime_health)
+    }
+
+    fn publication_owner_id(&self) -> usize {
+        Arc::as_ptr(&self.publication_gate) as usize
+    }
+
+    async fn acquire_shared_publication_permit(&self) -> Result<CatalogPublicationPermit> {
+        let command_permit = self.command_budget.reserve()?;
+        let publication_permit = Arc::clone(&self.publication_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| publication_gate_stopped())?;
+        Ok(CatalogPublicationPermit::from_opaque(
+            SqlitePublicationPermit {
+                owner_id: self.publication_owner_id(),
+                _command_permit: command_permit,
+                _publication_permit: publication_permit,
+            },
+        ))
+    }
+
+    async fn submit_command_with_publication_permit(
+        &self,
+        command: VersionedCatalogCommand,
+        publication_permit: CatalogPublicationPermit,
+    ) -> Result<VersionedCatalogResponse> {
+        let VersionedCatalogCommand::V1(envelope) = &command;
+        let request_id = envelope.request_id;
+        let publication_permit = publication_permit
+            .try_into_opaque::<SqlitePublicationPermit>()
+            .map_err(|_| {
+                ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "catalog publication permit has an invalid capability type",
+                )
+                .with_request_id(request_id)
+                .with_retryable(false)
+            })?;
+        if publication_permit.owner_id != self.publication_owner_id() {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "catalog publication permit belongs to another Catalog instance",
+            )
+            .with_request_id(request_id)
+            .with_retryable(false));
+        }
+        let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command).await?;
+        let manifest_permit = self
+            .manifest_queue_budget
+            .reserve(queued_bytes)
+            .map_err(|error| error.with_request_id(request_id))?;
+        await_response(self.writer_request(|response| {
+            ServiceMessage::Command(CommandRequest {
+                command,
+                state: CommandRequestState {
+                    request_id,
+                    response,
+                    _manifest_permit: manifest_permit,
+                    _publication_permit: publication_permit,
+                },
+            })
+        }))
+        .await
+    }
+
     fn shutdown(&mut self) -> Result<()> {
+        self.runtime_snapshot_pins.close();
         let read_result = match self.read_pool.take() {
             Some(mut read_pool) => read_pool.shutdown(),
             None => Ok(()),
@@ -282,7 +472,13 @@ impl CatalogRead for SqliteCatalog {
             snapshot_domain::validate_snapshot_selectors(selectors)?;
             let selectors = selectors.to_vec();
             await_response(self.read_pool().and_then(|pool| {
-                pool.snapshot_request(|sender| SnapshotReadMessage::Read(selectors, sender))
+                pool.snapshot_request(|response| {
+                    SnapshotReadMessage::Read(SnapshotReadRequest {
+                        selectors,
+                        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                        response,
+                    })
+                })
             }))
             .await
         })
@@ -300,6 +496,185 @@ impl CatalogFileRead for SqliteCatalog {
             await_response(self.read_pool().and_then(|pool| {
                 pool.control_request(|sender| ControlReadMessage::InspectFiles(probes, sender))
             }))
+            .await
+        })
+    }
+}
+
+impl SqliteCatalogReadHandle {
+    /// Returns query snapshot pin gauges, limits, and cumulative rejections.
+    ///
+    /// A Catalog that has begun shutdown but still has retained pin guards returns a status with
+    /// `admission_open=false`. Once the registry and its final guard have been dropped, this method
+    /// returns a terminal `Unavailable` error.
+    pub fn runtime_snapshot_pin_status(
+        &self,
+    ) -> Result<crate::SqliteCatalogRuntimeSnapshotPinStatus> {
+        self.runtime_snapshot_pin_registry()
+            .map(|registry| registry.status())
+    }
+
+    /// Reads exact metadata only after pinning every selected table against physical GC.
+    ///
+    /// Pin admission precedes the Catalog read. If any table is currently excluded by a GC claim,
+    /// or if the read fails, all pins already acquired by this call are released before the error
+    /// is returned. The successful result must remain alive through physical file execution.
+    pub async fn read_pinned_snapshot_at(
+        &self,
+        selectors: &[CatalogSnapshotSelector],
+    ) -> Result<SqliteCatalogPinnedQuerySnapshot> {
+        self.read_pinned_snapshot_at_with_limits(
+            selectors,
+            snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+        )
+        .await
+    }
+
+    /// Reads and pins an exact snapshot under stricter caller-selected SQLite copy limits.
+    pub async fn read_pinned_snapshot_at_with_limits(
+        &self,
+        selectors: &[CatalogSnapshotSelector],
+        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+    ) -> Result<SqliteCatalogPinnedQuerySnapshot> {
+        snapshot_domain::validate_snapshot_selectors(selectors)?;
+        let limits = limits.validate()?;
+        let runtime_snapshot_pins = self.runtime_snapshot_pin_registry()?;
+        let mut pins = Vec::with_capacity(selectors.len());
+        for selector in selectors {
+            pins.push(runtime_snapshot_pins.pin(selector.table_id, selector.snapshot_version)?);
+        }
+        let snapshot = self.read_snapshot_at_with_limits(selectors, limits).await?;
+        Ok(SqliteCatalogPinnedQuerySnapshot {
+            snapshot,
+            _pins: pins,
+        })
+    }
+
+    fn runtime_snapshot_pin_registry(
+        &self,
+    ) -> Result<Arc<crate::runtime_pins::RuntimeSnapshotPinRegistry>> {
+        self.runtime_snapshot_pins.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "sqlite catalog runtime snapshot pin registry is no longer available",
+            )
+            .with_retryable(false)
+        })
+    }
+
+    /// Reads exact metadata with a per-request bound below the Catalog hard limits.
+    ///
+    /// This method does not protect physical files after the SQLite transaction ends. It is for
+    /// metadata-only inspection such as asynchronous authority comparison; physical query plans
+    /// must use [`Self::read_pinned_snapshot_at_with_limits`].
+    pub async fn read_snapshot_at_with_limits(
+        &self,
+        selectors: &[CatalogSnapshotSelector],
+        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+    ) -> Result<CatalogQuerySnapshot> {
+        snapshot_domain::validate_snapshot_selectors(selectors)?;
+        let limits = limits.validate()?;
+        let selectors = selectors.to_vec();
+        await_response(self.endpoint.snapshot_request(|response| {
+            SnapshotReadMessage::Read(SnapshotReadRequest {
+                selectors,
+                limits,
+                response,
+            })
+        }))
+        .await
+    }
+}
+
+impl CatalogRead for SqliteCatalogReadHandle {
+    fn revision(&self) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            await_response(self.endpoint.control_request(ControlReadMessage::Revision)).await
+        })
+    }
+
+    fn get_namespace(&self, namespace: NamespaceRef) -> BoxFuture<'_, Result<NamespaceDescriptor>> {
+        Box::pin(async move {
+            await_response(
+                self.endpoint
+                    .control_request(|sender| ControlReadMessage::GetNamespace(namespace, sender)),
+            )
+            .await
+        })
+    }
+
+    fn list_namespaces(
+        &self,
+        request: ListNamespacesRequest,
+    ) -> BoxFuture<'_, Result<ListNamespacesResponse>> {
+        Box::pin(async move {
+            await_response(
+                self.endpoint
+                    .control_request(|sender| ControlReadMessage::ListNamespaces(request, sender)),
+            )
+            .await
+        })
+    }
+
+    fn get_table(&self, table: TableRef) -> BoxFuture<'_, Result<TableDescriptor>> {
+        Box::pin(async move {
+            await_response(
+                self.endpoint
+                    .control_request(|sender| ControlReadMessage::GetTable(table, sender)),
+            )
+            .await
+        })
+    }
+
+    fn list_tables(&self, request: ListTablesRequest) -> BoxFuture<'_, Result<ListTablesResponse>> {
+        Box::pin(async move {
+            await_response(
+                self.endpoint
+                    .control_request(|sender| ControlReadMessage::ListTables(request, sender)),
+            )
+            .await
+        })
+    }
+
+    fn resolve_tables<'a>(
+        &'a self,
+        tables: &'a [TableRef],
+    ) -> BoxFuture<'a, Result<Vec<TableDescriptor>>> {
+        Box::pin(async move {
+            table_domain::validate_table_resolution_request(tables)?;
+            await_response(self.endpoint.control_request(|sender| {
+                ControlReadMessage::ResolveTables(tables.to_vec(), sender)
+            }))
+            .await
+        })
+    }
+
+    fn read_snapshot_at<'a>(
+        &'a self,
+        selectors: &'a [CatalogSnapshotSelector],
+    ) -> BoxFuture<'a, Result<CatalogQuerySnapshot>> {
+        Box::pin(async move {
+            self.read_snapshot_at_with_limits(
+                selectors,
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+            )
+            .await
+        })
+    }
+}
+
+impl CatalogFileRead for SqliteCatalogReadHandle {
+    fn inspect_data_file_references<'a>(
+        &'a self,
+        probes: &'a [ManagedDataFileProbe],
+    ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>> {
+        Box::pin(async move {
+            file_domain::validate_file_probes(probes)?;
+            let probes = probes.to_vec();
+            await_response(
+                self.endpoint
+                    .control_request(|sender| ControlReadMessage::InspectFiles(probes, sender)),
+            )
             .await
         })
     }
@@ -347,24 +722,102 @@ impl CatalogWrite for SqliteCatalog {
         Box::pin(async move {
             let VersionedCatalogCommand::V1(envelope) = &command;
             let request_id = envelope.request_id;
-            let command_permit = self
-                .command_budget
-                .reserve()
-                .map_err(|error| error.with_request_id(request_id))?;
-            let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command).await?;
             let permit = self
-                .manifest_queue_budget
-                .reserve(queued_bytes)
+                .acquire_shared_publication_permit()
+                .await
                 .map_err(|error| error.with_request_id(request_id))?;
+            self.submit_command_with_publication_permit(command, permit)
+                .await
+        })
+    }
+}
+
+impl CatalogPublicationControl for SqliteCatalog {
+    fn acquire_publication_permit(&self) -> BoxFuture<'_, Result<CatalogPublicationPermit>> {
+        Box::pin(self.acquire_shared_publication_permit())
+    }
+
+    fn command_with_publication_permit(
+        &self,
+        permit: CatalogPublicationPermit,
+        command: VersionedCatalogCommand,
+    ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
+        Box::pin(self.submit_command_with_publication_permit(command, permit))
+    }
+
+    fn acquire_publication_exclusion(&self) -> BoxFuture<'_, Result<CatalogPublicationExclusion>> {
+        Box::pin(async move {
+            let permit = Arc::clone(&self.publication_gate)
+                .acquire_many_owned(self.publication_gate_capacity)
+                .await
+                .map_err(|_| publication_gate_stopped())?;
+            Ok(CatalogPublicationExclusion::from_opaque(permit))
+        })
+    }
+}
+
+impl CatalogGarbageCollection for SqliteCatalog {
+    fn claim_garbage_collection_files(
+        &self,
+        guard: CatalogGarbageCollectionGuard,
+        request: ClaimGarbageCollectionFilesRequest,
+    ) -> BoxFuture<'_, Result<ClaimedGarbageCollectionFiles>> {
+        Box::pin(async move {
+            let guard = guard
+                .try_into_opaque::<crate::runtime_pins::SqliteGarbageCollectionGuard>()
+                .map_err(|_| {
+                    ServerError::new(
+                        ErrorCode::InvalidArgument,
+                        "garbage collection guard has an invalid capability type",
+                    )
+                    .with_table_id(request.table_id)
+                    .with_retryable(false)
+                })?;
+            if guard.owner_id() != self.runtime_snapshot_pins.owner_id() {
+                return Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "garbage collection guard belongs to another Catalog instance",
+                )
+                .with_table_id(request.table_id)
+                .with_retryable(false));
+            }
+            if guard.table_id() != request.table_id {
+                return Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "garbage collection guard belongs to another table",
+                )
+                .with_table_id(request.table_id)
+                .with_retryable(false));
+            }
+            crate::gc_domain::validate_claim_request(
+                &request,
+                guard.runtime_min_pinned_snapshot(),
+            )?;
+            let command_permit = self.command_budget.reserve()?;
             await_response(self.writer_request(|response| {
-                ServiceMessage::Command(CommandRequest {
-                    command,
-                    state: CommandRequestState {
-                        request_id,
-                        response,
-                        _command_permit: command_permit,
-                        _manifest_permit: permit,
-                    },
+                ServiceMessage::ClaimGarbageCollection(GarbageCollectionClaimRequest {
+                    guard,
+                    request,
+                    response,
+                    _command_permit: command_permit,
+                })
+            }))
+            .await
+        })
+    }
+
+    fn finalize_garbage_collection_files(
+        &self,
+        request: FinalizeGarbageCollectionFilesRequest,
+    ) -> BoxFuture<'_, Result<FinalizedGarbageCollectionFiles>> {
+        Box::pin(async move {
+            crate::gc_domain::validate_finalize_request(&request)?;
+            let command_permit = self.command_budget.reserve()?;
+            await_response(self.writer_request(|response| {
+                ServiceMessage::FinalizeGarbageCollection(GarbageCollectionFinalizeRequest {
+                    request,
+                    response,
+                    _command_permit: command_permit,
                 })
             }))
             .await
@@ -416,6 +869,12 @@ impl CommandBudget {
 
 struct CommandPermit {
     budget: Arc<CommandBudget>,
+}
+
+struct SqlitePublicationPermit {
+    owner_id: usize,
+    _command_permit: CommandPermit,
+    _publication_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct ReplayProbeBudget {
@@ -598,8 +1057,9 @@ trait CatalogReadBackend: Send + Sync + 'static {
         &self,
         connection: &mut Connection,
         selectors: &[CatalogSnapshotSelector],
+        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
     ) -> Result<CatalogQuerySnapshot> {
-        snapshot_domain::read_snapshot_at(connection, selectors)
+        snapshot_domain::read_snapshot_at_with_limits(connection, selectors, limits)
     }
 
     fn inspect_data_file_references(
@@ -641,6 +1101,7 @@ enum ControlReadMessage {
         oneshot::Sender<Result<CatalogDataFileReferenceSnapshot>>,
     ),
     ProbeCommandReplay(CommandReplayProbeRequest),
+    Shutdown,
 }
 
 struct CommandReplayProbeRequest {
@@ -650,15 +1111,64 @@ struct CommandReplayProbeRequest {
 }
 
 enum SnapshotReadMessage {
-    Read(
-        Vec<CatalogSnapshotSelector>,
-        oneshot::Sender<Result<CatalogQuerySnapshot>>,
-    ),
+    Read(SnapshotReadRequest),
+    Shutdown,
+}
+
+struct SnapshotReadRequest {
+    selectors: Vec<CatalogSnapshotSelector>,
+    limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+    response: oneshot::Sender<Result<CatalogQuerySnapshot>>,
+}
+
+struct CatalogReadEndpoint {
+    accepting: AtomicBool,
+    control_sender: Sender<ControlReadMessage>,
+    snapshot_sender: Sender<SnapshotReadMessage>,
+}
+
+impl CatalogReadEndpoint {
+    fn control_request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> ControlReadMessage,
+    ) -> Result<oneshot::Receiver<Result<T>>>
+    where
+        T: Send + 'static,
+    {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(read_pool_stopped());
+        }
+        submit_read_request(
+            Some(&self.control_sender),
+            build,
+            "sqlite catalog control read queue is full",
+        )
+    }
+
+    fn snapshot_request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> SnapshotReadMessage,
+    ) -> Result<oneshot::Receiver<Result<T>>>
+    where
+        T: Send + 'static,
+    {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(read_pool_stopped());
+        }
+        submit_read_request(
+            Some(&self.snapshot_sender),
+            build,
+            "sqlite catalog snapshot read queue is full",
+        )
+    }
+
+    fn close_admission(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
 }
 
 struct CatalogReadPool {
-    control_sender: Option<Sender<ControlReadMessage>>,
-    snapshot_sender: Option<Sender<SnapshotReadMessage>>,
+    endpoint: Arc<CatalogReadEndpoint>,
     control_actor: Option<JoinHandle<Result<()>>>,
     snapshot_actor: Option<JoinHandle<Result<()>>>,
 }
@@ -698,8 +1208,11 @@ impl CatalogReadPool {
         };
 
         Ok(Self {
-            control_sender: Some(control_sender),
-            snapshot_sender: Some(snapshot_sender),
+            endpoint: Arc::new(CatalogReadEndpoint {
+                accepting: AtomicBool::new(true),
+                control_sender,
+                snapshot_sender,
+            }),
             control_actor: Some(control_actor),
             snapshot_actor: Some(snapshot_actor),
         })
@@ -712,11 +1225,7 @@ impl CatalogReadPool {
     where
         T: Send + 'static,
     {
-        submit_read_request(
-            self.control_sender.as_ref(),
-            build,
-            "sqlite catalog control read queue is full",
-        )
+        self.endpoint.control_request(build)
     }
 
     fn snapshot_request<T>(
@@ -726,16 +1235,38 @@ impl CatalogReadPool {
     where
         T: Send + 'static,
     {
-        submit_read_request(
-            self.snapshot_sender.as_ref(),
-            build,
-            "sqlite catalog snapshot read queue is full",
-        )
+        self.endpoint.snapshot_request(build)
+    }
+
+    fn check_runtime_health(&self) -> Result<()> {
+        if !self.endpoint.accepting.load(Ordering::Acquire)
+            || self
+                .control_actor
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            return Err(read_worker_stopped("control"));
+        }
+        if self
+            .snapshot_actor
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            return Err(read_worker_stopped("snapshot"));
+        }
+        Ok(())
     }
 
     fn shutdown(&mut self) -> Result<()> {
-        self.control_sender.take();
-        self.snapshot_sender.take();
+        self.endpoint.close_admission();
+        let _ = self
+            .endpoint
+            .control_sender
+            .send(ControlReadMessage::Shutdown);
+        let _ = self
+            .endpoint
+            .snapshot_sender
+            .send(SnapshotReadMessage::Shutdown);
         let control_result = match self.control_actor.take() {
             Some(actor) => join_read_worker(actor, "control read"),
             None => Ok(()),
@@ -872,6 +1403,7 @@ fn control_read_loop(
                 drop(probe_permit);
                 let _ = response.send(result);
             }
+            ControlReadMessage::Shutdown => break,
         }
     }
     connection
@@ -886,11 +1418,18 @@ fn snapshot_read_loop(
 ) -> Result<()> {
     while let Ok(message) = receiver.recv() {
         match message {
-            SnapshotReadMessage::Read(selectors, response) => {
+            SnapshotReadMessage::Read(request) => {
+                let SnapshotReadRequest {
+                    selectors,
+                    limits,
+                    response,
+                } = request;
                 if !response.is_closed() {
-                    let _ = response.send(backend.read_snapshot(&mut connection, &selectors));
+                    let _ =
+                        response.send(backend.read_snapshot(&mut connection, &selectors, limits));
                 }
             }
+            SnapshotReadMessage::Shutdown => break,
         }
     }
     connection
@@ -909,7 +1448,15 @@ fn join_read_worker(actor: JoinHandle<Result<()>>, role: &str) -> Result<()> {
 
 enum ServiceMessage {
     Command(CommandRequest),
+    ClaimGarbageCollection(GarbageCollectionClaimRequest),
+    FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
     Shutdown(Sender<Result<()>>),
+}
+
+enum WriterRequest {
+    Command(CommandRequest),
+    ClaimGarbageCollection(GarbageCollectionClaimRequest),
+    FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
 }
 
 struct CommandRequest {
@@ -920,12 +1467,56 @@ struct CommandRequest {
 struct CommandRequestState {
     request_id: RequestId,
     response: oneshot::Sender<Result<VersionedCatalogResponse>>,
-    _command_permit: CommandPermit,
     _manifest_permit: Option<ManifestQueuePermit>,
+    _publication_permit: SqlitePublicationPermit,
 }
 
 impl CommandRequestState {
     fn send(self, result: Result<VersionedCatalogResponse>) {
+        let _ = self.response.send(result);
+    }
+}
+
+struct GarbageCollectionClaimRequest {
+    guard: crate::runtime_pins::SqliteGarbageCollectionGuard,
+    request: ClaimGarbageCollectionFilesRequest,
+    response: oneshot::Sender<Result<ClaimedGarbageCollectionFiles>>,
+    _command_permit: CommandPermit,
+}
+
+impl GarbageCollectionClaimRequest {
+    fn execute(self, connection: &mut Connection) {
+        let Self {
+            guard,
+            request,
+            response,
+            _command_permit,
+        } = self;
+        let runtime_min_pinned_snapshot = guard.runtime_min_pinned_snapshot();
+        let committed = crate::gc_domain::commit_garbage_collection_claim(
+            connection,
+            request,
+            runtime_min_pinned_snapshot,
+        );
+        // Claim commit is the end of the pin-admission exclusion. Descriptor decoding is
+        // read-only and intentionally runs after releasing the table-local guard.
+        drop(guard);
+        let result = committed.and_then(|claim| {
+            crate::gc_domain::materialize_garbage_collection_claim(connection, claim)
+        });
+        let _ = response.send(result);
+    }
+}
+
+struct GarbageCollectionFinalizeRequest {
+    request: FinalizeGarbageCollectionFilesRequest,
+    response: oneshot::Sender<Result<FinalizedGarbageCollectionFiles>>,
+    _command_permit: CommandPermit,
+}
+
+impl GarbageCollectionFinalizeRequest {
+    fn execute(self, connection: &mut Connection) {
+        let result = crate::gc_domain::finalize_garbage_collection_files(connection, self.request);
         let _ = self.response.send(result);
     }
 }
@@ -1069,6 +1660,7 @@ fn manifest_worker_panicked(request_id: RequestId, stage: &str) -> ServerError {
         format!("sqlite catalog manifest preparation worker panicked stage=[{stage}]"),
     )
     .with_request_id(request_id)
+    .with_retryable(false)
 }
 
 fn command_request_id(command: &VersionedCatalogCommand) -> RequestId {
@@ -1118,18 +1710,18 @@ fn actor_loop(
     manifest_completions: Receiver<ManifestWorkerCompletion>,
 ) {
     let mut active_manifest = None;
-    let mut pending_commands = VecDeque::new();
+    let mut pending_requests = VecDeque::new();
     let mut draining = false;
     let mut shutdown_response = None;
 
     loop {
         if active_manifest.is_none() {
-            if let Some(command) = pending_commands.pop_front() {
-                start_command(
+            if let Some(request) = pending_requests.pop_front() {
+                start_writer_request(
                     &mut connection,
                     manifest_worker,
                     &mut active_manifest,
-                    command,
+                    request,
                 );
                 continue;
             }
@@ -1188,7 +1780,7 @@ fn actor_loop(
                             &mut connection,
                             manifest_worker,
                             &mut active_manifest,
-                            &mut pending_commands,
+                            &mut pending_requests,
                             &mut draining,
                             &mut shutdown_response,
                             message,
@@ -1203,7 +1795,7 @@ fn actor_loop(
                     &mut connection,
                     manifest_worker,
                     &mut active_manifest,
-                    &mut pending_commands,
+                    &mut pending_requests,
                     &mut draining,
                     &mut shutdown_response,
                     message,
@@ -1227,23 +1819,66 @@ fn handle_service_message(
     connection: &mut Connection,
     manifest_worker: &ManifestPreparationWorker,
     active_manifest: &mut Option<CommandRequestState>,
-    pending_commands: &mut VecDeque<CommandRequest>,
+    pending_requests: &mut VecDeque<WriterRequest>,
     draining: &mut bool,
     shutdown_response: &mut Option<Sender<Result<()>>>,
     message: ServiceMessage,
 ) {
     match message {
-        ServiceMessage::Command(command) => {
-            if active_manifest.is_some() || !pending_commands.is_empty() {
-                pending_commands.push_back(command);
-            } else {
-                start_command(connection, manifest_worker, active_manifest, command);
-            }
-        }
+        ServiceMessage::Command(command) => admit_writer_request(
+            connection,
+            manifest_worker,
+            active_manifest,
+            pending_requests,
+            WriterRequest::Command(command),
+        ),
+        ServiceMessage::ClaimGarbageCollection(request) => admit_writer_request(
+            connection,
+            manifest_worker,
+            active_manifest,
+            pending_requests,
+            WriterRequest::ClaimGarbageCollection(request),
+        ),
+        ServiceMessage::FinalizeGarbageCollection(request) => admit_writer_request(
+            connection,
+            manifest_worker,
+            active_manifest,
+            pending_requests,
+            WriterRequest::FinalizeGarbageCollection(request),
+        ),
         ServiceMessage::Shutdown(response) => {
             *draining = true;
             *shutdown_response = Some(response);
         }
+    }
+}
+
+fn admit_writer_request(
+    connection: &mut Connection,
+    manifest_worker: &ManifestPreparationWorker,
+    active_manifest: &mut Option<CommandRequestState>,
+    pending_requests: &mut VecDeque<WriterRequest>,
+    request: WriterRequest,
+) {
+    if active_manifest.is_some() || !pending_requests.is_empty() {
+        pending_requests.push_back(request);
+    } else {
+        start_writer_request(connection, manifest_worker, active_manifest, request);
+    }
+}
+
+fn start_writer_request(
+    connection: &mut Connection,
+    manifest_worker: &ManifestPreparationWorker,
+    active_manifest: &mut Option<CommandRequestState>,
+    request: WriterRequest,
+) {
+    match request {
+        WriterRequest::Command(command) => {
+            start_command(connection, manifest_worker, active_manifest, command);
+        }
+        WriterRequest::ClaimGarbageCollection(request) => request.execute(connection),
+        WriterRequest::FinalizeGarbageCollection(request) => request.execute(connection),
     }
 }
 
@@ -1318,7 +1953,8 @@ fn submit_manifest_job(
                 ErrorCode::Unavailable,
                 "sqlite catalog manifest preparation worker is not running",
             )
-            .with_request_id(request_id)));
+            .with_request_id(request_id)
+            .with_retryable(false)));
         }
     }
 }
@@ -1329,9 +1965,9 @@ fn fail_active_manifest_worker(
 ) {
     if let Some(state) = active_manifest.take() {
         let request_id = state.request_id;
-        state.send(Err(
-            ServerError::new(ErrorCode::Unavailable, message).with_request_id(request_id)
-        ));
+        state.send(Err(ServerError::new(ErrorCode::Unavailable, message)
+            .with_request_id(request_id)
+            .with_retryable(false)));
     }
 }
 
@@ -1344,6 +1980,15 @@ fn actor_stopped() -> ServerError {
         ErrorCode::Unavailable,
         "sqlite catalog actor is not running",
     )
+    .with_retryable(false)
+}
+
+fn publication_gate_stopped() -> ServerError {
+    ServerError::new(
+        ErrorCode::Unavailable,
+        "sqlite catalog publication gate is not running",
+    )
+    .with_retryable(false)
 }
 
 fn replay_probe_verification_stopped(
@@ -1380,6 +2025,15 @@ fn read_pool_stopped() -> ServerError {
         ErrorCode::Unavailable,
         "sqlite catalog read pool is not running",
     )
+    .with_retryable(false)
+}
+
+fn read_worker_stopped(role: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::Unavailable,
+        format!("sqlite catalog {role} read worker is not running"),
+    )
+    .with_retryable(false)
 }
 
 fn join_startup_actor(actor: JoinHandle<()>) -> Result<()> {
@@ -1415,14 +2069,18 @@ mod tests {
     use zippy_core::OwnedDataDirectory;
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
-        CatalogCommandV1, CatalogIdempotencyRead, CatalogRead, CatalogSnapshotSelector,
-        CatalogWrite, CommandFingerprint, CommitDataFilesCommand, CreateNamespaceCommand,
-        CreateTableCommand, VersionedCatalogCommand, VersionedCatalogResponse,
+        CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
+        CatalogGarbageCollectionGuard, CatalogIdempotencyRead, CatalogPublicationControl,
+        CatalogPublicationPermit, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
+        ClaimGarbageCollectionFilesRequest, CommandFingerprint, CommitCompactionCommand,
+        CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand, ManagedDataFileProbe,
+        VersionedCatalogCommand, VersionedCatalogResponse,
     };
     use zippy_types::table::{
-        AppendTableDefinition, CatalogName, DataFileLocation, DataFileProvenance, ManagedDataPath,
-        MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload,
-        SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
+        AppendTableDefinition, CatalogName, DataFileLocation, DataFileProvenance, DataFileState,
+        ManagedDataPath, MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile,
+        SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
+        TableDefinition,
     };
     use zippy_types::{
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
@@ -1450,6 +2108,8 @@ mod tests {
         verify_calls: Arc<AtomicUsize>,
         prepare_calls: Arc<AtomicUsize>,
     }
+
+    struct PanickingControlReadBackend;
 
     struct CountingReplayReadBackend {
         probe_calls: Arc<AtomicUsize>,
@@ -1537,6 +2197,7 @@ mod tests {
             &self,
             connection: &mut rusqlite::Connection,
             selectors: &[CatalogSnapshotSelector],
+            limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
         ) -> zippy_types::Result<zippy_types::catalog::CatalogQuerySnapshot> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             if self.block_once.swap(false, Ordering::AcqRel) {
@@ -1547,7 +2208,13 @@ mod tests {
                     .recv()
                     .expect("test snapshot release must be signalled");
             }
-            snapshot_domain::read_snapshot_at(connection, selectors)
+            snapshot_domain::read_snapshot_at_with_limits(connection, selectors, limits)
+        }
+    }
+
+    impl CatalogReadBackend for PanickingControlReadBackend {
+        fn revision(&self, _: &rusqlite::Connection) -> zippy_types::Result<u64> {
+            panic!("injected control read worker panic");
         }
     }
 
@@ -1678,6 +2345,27 @@ mod tests {
         )
     }
 
+    fn compact_data_file(
+        request: u128,
+        expected_revision: u64,
+        expected_snapshot_version: u64,
+        input_file: u128,
+        output_file: u128,
+        offset: u64,
+    ) -> VersionedCatalogCommand {
+        command(
+            request,
+            Some(expected_revision),
+            CatalogCommandV1::CommitCompaction(CommitCompactionCommand {
+                table_id: table_id(),
+                expected_snapshot_version,
+                input_file_ids: vec![FileId::from_u128(input_file).expect("nonzero input file id")],
+                output_files: vec![pending_file(output_file, offset)],
+                committed_log_offset: OffsetWatermark::Known(LogOffset::new(offset)),
+            }),
+        )
+    }
+
     fn commit_data_file_with_metadata(request: u128, entries: usize) -> VersionedCatalogCommand {
         let mut file = pending_file(10, 0);
         for index in 0..entries {
@@ -1765,6 +2453,217 @@ mod tests {
             .reserve(8)
             .expect("released byte budget can be reserved again")
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_handle_does_not_retain_owner_and_fails_terminally_after_close() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog = Arc::new(
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog"),
+        );
+        create_append_table(&catalog).await;
+        catalog
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .expect("commit file fixture");
+
+        let handle = catalog.read_handle().expect("create read handle");
+        assert_eq!(handle.revision().await, Ok(3));
+        let snapshot = handle
+            .read_snapshot_at(&[CatalogSnapshotSelector {
+                table_id: table_id(),
+                snapshot_version: 2,
+                schema_version: 1,
+            }])
+            .await
+            .expect("read exact table snapshot through handle");
+        assert_eq!(snapshot.catalog_revision(), 3);
+        assert_eq!(snapshot.tables()[0].files().as_slice().len(), 1);
+
+        let file_snapshot = handle
+            .inspect_data_file_references(&[ManagedDataFileProbe {
+                file_id: FileId::from_u128(10).expect("nonzero file id"),
+                table_id: table_id(),
+                path: ManagedDataPath::new("tables/ticks/10.parquet").expect("valid managed path"),
+            }])
+            .await
+            .expect("inspect file identity through handle");
+        assert_eq!(file_snapshot.catalog_revision, 3);
+        assert!(matches!(
+            file_snapshot.results[0].matched,
+            CatalogDataFileProbeMatch::Exact { .. }
+        ));
+
+        let weak_owner = Arc::downgrade(&catalog);
+        let catalog = Arc::try_unwrap(catalog)
+            .unwrap_or_else(|_| panic!("read handle must not retain Catalog owner"));
+        assert!(weak_owner.upgrade().is_none());
+        let cold_revision = handle.revision();
+        catalog.close().expect("close Catalog with retained handle");
+
+        let error = cold_revision
+            .await
+            .expect_err("unpolled handle read must observe Catalog shutdown");
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert!(!error.retryable());
+
+        let snapshot_error = handle
+            .read_snapshot_at(&[])
+            .await
+            .expect_err("closed Catalog handle must reject snapshot reads");
+        assert_eq!(snapshot_error.code(), ErrorCode::Unavailable);
+        assert!(!snapshot_error.retryable());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_read_handle_snapshot_protects_physical_files_until_drop() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+        catalog
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .expect("commit historical file");
+        catalog
+            .command(compact_data_file(4, 3, 2, 10, 11, 0))
+            .await
+            .expect("replace historical file");
+
+        let handle = catalog.read_handle().expect("create read handle");
+        let pinned = handle
+            .read_pinned_snapshot_at(&[CatalogSnapshotSelector {
+                table_id: table_id(),
+                snapshot_version: 2,
+                schema_version: 1,
+            }])
+            .await
+            .expect("read and pin historical snapshot");
+        assert_eq!(pinned.snapshot().tables()[0].files().as_slice().len(), 1);
+
+        let protected = catalog
+            .claim_garbage_collection_files(
+                catalog
+                    .acquire_garbage_collection_guard(table_id())
+                    .expect("exclude new pins"),
+                ClaimGarbageCollectionFilesRequest {
+                    table_id: table_id(),
+                    retry_limit: 1,
+                    new_claim_limit: 1,
+                },
+            )
+            .await
+            .expect("claim while historical snapshot is pinned");
+        assert!(protected.files.is_empty());
+
+        drop(pinned);
+        let claimed = catalog
+            .claim_garbage_collection_files(
+                catalog
+                    .acquire_garbage_collection_guard(table_id())
+                    .expect("exclude pins after query completion"),
+                ClaimGarbageCollectionFilesRequest {
+                    table_id: table_id(),
+                    retry_limit: 1,
+                    new_claim_limit: 1,
+                },
+            )
+            .await
+            .expect("claim after pinned read completes");
+        assert_eq!(claimed.files.len(), 1);
+        assert_eq!(claimed.files[0].file_id(), FileId::from_u128(10).unwrap());
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_pinned_snapshot_retains_catalog_epoch_across_owner_close() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let catalog = SqliteCatalog::open(config.clone()).expect("open catalog");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let selectors = [CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        }];
+        let pinned = handle
+            .read_pinned_snapshot_at(&selectors)
+            .await
+            .expect("pin initial snapshot");
+
+        catalog
+            .close()
+            .expect("close Catalog owner with active pin");
+        let conflict = match SqliteCatalog::open(config.clone()) {
+            Ok(reopened) => {
+                reopened.close().expect("close unexpected reopened Catalog");
+                panic!("active pin unexpectedly released Catalog runtime epoch");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(conflict.code(), ErrorCode::Conflict);
+        let stale_handle = handle
+            .read_pinned_snapshot_at(&selectors)
+            .await
+            .expect_err("closed epoch rejects new pin admission");
+        assert_eq!(stale_handle.code(), ErrorCode::Unavailable);
+
+        drop(pinned);
+        let reopened = SqliteCatalog::open(config).expect("reopen after final active pin drops");
+        assert_eq!(reopened.revision().await, Ok(2));
+        reopened.close().expect("close reopened Catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_handle_applies_per_request_snapshot_limits_inside_sqlite_lane() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+        catalog
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .expect("commit first file");
+        catalog
+            .command(commit_data_file(4, 11, 3, 2, 1))
+            .await
+            .expect("commit second file");
+        let handle = catalog.read_handle().expect("create read handle");
+        let selectors = [CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 3,
+            schema_version: 1,
+        }];
+
+        let file_limit = handle
+            .read_snapshot_at_with_limits(
+                &selectors,
+                snapshot_domain::SqliteCatalogSnapshotReadLimits {
+                    max_visible_files: 1,
+                    ..snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+                },
+            )
+            .await
+            .expect_err("SQLite lane must stop before returning a second file");
+        assert_eq!(file_limit.code(), ErrorCode::ResourceExhausted);
+
+        let byte_limit = handle
+            .read_snapshot_at_with_limits(
+                &selectors,
+                snapshot_domain::SqliteCatalogSnapshotReadLimits {
+                    max_raw_response_bytes: 1,
+                    ..snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+                },
+            )
+            .await
+            .expect_err("SQLite lane must enforce raw response bytes while decoding");
+        assert_eq!(byte_limit.code(), ErrorCode::ResourceExhausted);
+        catalog.close().expect("close Catalog");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2203,6 +3102,263 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_admitted_gc_claim_executes_in_writer_fifo_order() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let setup = SqliteCatalog::open(config.clone()).expect("open setup catalog");
+        create_append_table(&setup).await;
+        setup
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .expect("commit garbage collection input");
+        setup
+            .command(compact_data_file(4, 3, 2, 10, 11, 0))
+            .await
+            .expect("remove garbage collection input");
+        setup.close().expect("close setup catalog");
+
+        let (backend, started, release) = blocking_backend();
+        let catalog = SqliteCatalog::open_with_manifest_backend(config, backend)
+            .expect("reopen with blocking manifest backend");
+        let mut blocker = Box::pin(catalog.command(commit_data_file(5, 12, 4, 3, 1)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(blocker.as_mut().poll(&mut context), Poll::Pending));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("manifest command must block preparation");
+
+        let guard = catalog
+            .acquire_garbage_collection_guard(table_id())
+            .expect("acquire genuine table-bound garbage collection guard");
+        let mut claim = Box::pin(catalog.claim_garbage_collection_files(
+            guard,
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(),
+                retry_limit: 1,
+                new_claim_limit: 1,
+            },
+        ));
+        assert!(matches!(claim.as_mut().poll(&mut context), Poll::Pending));
+        drop(claim);
+        let excluded = catalog
+            .pin_runtime_snapshot(table_id(), 2)
+            .expect_err("cancelled waiter must retain query-pin exclusion until transaction");
+        assert_eq!(excluded.code(), ErrorCode::Conflict);
+
+        release.send(()).expect("release manifest preparation");
+        blocker.await.expect("finish preceding manifest command");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if catalog.revision().await == Ok(6)
+                    && catalog.command_budget.used.load(Ordering::Acquire) == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled claim must execute after preceding writer request");
+        let pin = catalog
+            .pin_runtime_snapshot(table_id(), 2)
+            .expect("query-pin exclusion must release after claim transaction");
+        drop(pin);
+        assert_eq!(catalog.command_budget.used.load(Ordering::Acquire), 0);
+
+        let state = catalog
+            .inspect_data_file_references(&[ManagedDataFileProbe {
+                file_id: FileId::from_u128(10).expect("nonzero file id"),
+                table_id: table_id(),
+                path: ManagedDataPath::new("tables/ticks/10.parquet").expect("valid managed path"),
+            }])
+            .await
+            .expect("inspect cancelled claim result");
+        let CatalogDataFileProbeMatch::Exact { reference } = &state.results[0].matched else {
+            panic!("claimed file identity must remain exact");
+        };
+        assert_eq!(reference.state, DataFileState::Deleting);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gc_claim_rejects_forged_cross_table_and_cross_catalog_guards() {
+        fn request() -> ClaimGarbageCollectionFilesRequest {
+            ClaimGarbageCollectionFilesRequest {
+                table_id: table_id(),
+                retry_limit: 1,
+                new_claim_limit: 1,
+            }
+        }
+
+        let first_directory = TempDir::new().expect("create first temp directory");
+        let first_data_directory = data_directory(&first_directory);
+        let first = SqliteCatalog::open(SqliteCatalogConfig::new(&first_data_directory))
+            .expect("open first Catalog");
+
+        let forged = CatalogGarbageCollectionGuard::from_opaque(());
+        let forged_error = first
+            .claim_garbage_collection_files(forged, request())
+            .await
+            .expect_err("arbitrary opaque value must not authorize garbage collection");
+        assert_eq!(forged_error.code(), ErrorCode::InvalidArgument);
+
+        let other_table = TableId::from_u128(999).expect("nonzero table id");
+        let cross_table = first
+            .acquire_garbage_collection_guard(other_table)
+            .expect("acquire guard for another table");
+        let cross_table_error = first
+            .claim_garbage_collection_files(cross_table, request())
+            .await
+            .expect_err("table-bound guard must not authorize another table");
+        assert_eq!(cross_table_error.code(), ErrorCode::InvalidArgument);
+
+        let second_directory = TempDir::new().expect("create second temp directory");
+        let second_data_directory = data_directory(&second_directory);
+        let second = SqliteCatalog::open(SqliteCatalogConfig::new(&second_data_directory))
+            .expect("open second Catalog");
+        let cross_catalog = second
+            .acquire_garbage_collection_guard(table_id())
+            .expect("acquire guard from another Catalog");
+        let cross_catalog_error = first
+            .claim_garbage_collection_files(cross_catalog, request())
+            .await
+            .expect_err("Catalog-bound guard must not authorize another Catalog");
+        assert_eq!(cross_catalog_error.code(), ErrorCode::InvalidArgument);
+
+        second.close().expect("close second Catalog");
+        first.close().expect("close first Catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_exclusion_waits_for_cancelled_admitted_mutation() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (backend, started, release) = blocking_backend();
+        let catalog = Arc::new(
+            SqliteCatalog::open_with_manifest_backend(
+                SqliteCatalogConfig::new(&data_directory),
+                backend,
+            )
+            .expect("open catalog with blocking manifest backend"),
+        );
+        create_append_table(&catalog).await;
+
+        let task_catalog = Arc::clone(&catalog);
+        let command =
+            tokio::spawn(
+                async move { task_catalog.command(commit_data_file(3, 10, 2, 1, 0)).await },
+            );
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("manifest must reach semantic preparation");
+        command.abort();
+        assert!(command
+            .await
+            .expect_err("command waiter must cancel")
+            .is_cancelled());
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                catalog.acquire_publication_exclusion(),
+            )
+            .await
+            .is_err(),
+            "admitted mutation must retain its shared publication permit"
+        );
+
+        release.send(()).expect("release manifest preparation");
+        let exclusion = tokio::time::timeout(
+            Duration::from_secs(2),
+            catalog.acquire_publication_exclusion(),
+        )
+        .await
+        .expect("exclusive cleanup admission must unblock")
+        .expect("acquire exclusive cleanup authority");
+        assert_eq!(catalog.revision().await, Ok(3));
+        drop(exclusion);
+
+        let catalog = Arc::try_unwrap(catalog)
+            .unwrap_or_else(|_| panic!("publication guard test must release Catalog Arc"));
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forged_publication_permit_cannot_mutate_under_exclusion() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+
+        let exclusion = catalog
+            .acquire_publication_exclusion()
+            .await
+            .expect("acquire exclusive cleanup authority");
+        let forged = CatalogPublicationPermit::from_opaque(());
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            catalog.command_with_publication_permit(forged, commit_data_file(3, 10, 2, 1, 0)),
+        )
+        .await
+        .expect("forged capability must be rejected without waiting for exclusion")
+        .expect_err("forged capability must not reach the Catalog actor");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(!error.retryable());
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        drop(exclusion);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_handle_and_runtime_health_report_a_stopped_worker_as_terminal() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open_with_backends(
+            SqliteCatalogConfig::new(&data_directory),
+            Arc::new(DomainManifestPreparationBackend),
+            Arc::new(PanickingControlReadBackend),
+        )
+        .expect("open catalog with panicking control read backend");
+        let handle = catalog.read_handle().expect("create read handle");
+
+        let request_error = handle
+            .revision()
+            .await
+            .expect_err("panicked read worker must drop its response");
+        assert_eq!(request_error.code(), ErrorCode::Unavailable);
+        assert!(!request_error.retryable());
+
+        let health_error = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match catalog.check_runtime_health() {
+                    Ok(()) => tokio::task::yield_now().await,
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .expect("runtime health must observe the stopped worker");
+        assert_eq!(health_error.code(), ErrorCode::Unavailable);
+        assert!(!health_error.retryable());
+        assert!(health_error.message().contains("control read worker"));
+
+        let subsequent_error = handle
+            .revision()
+            .await
+            .expect_err("stopped worker must reject subsequent handle reads");
+        assert_eq!(subsequent_error.code(), ErrorCode::Unavailable);
+        assert!(!subsequent_error.retryable());
+
+        let close_error = catalog
+            .close()
+            .expect_err("joining the panicked read worker must fail");
+        assert_eq!(close_error.code(), ErrorCode::Internal);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn blocked_manifest_preserves_pending_mutation_fifo() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
@@ -2277,7 +3433,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_idempotency_commit_overrides_a_preparation_error() {
+    async fn catalog_runtime_ownership_survives_preparation_and_reopen_replays_exactly() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
         let config = SqliteCatalogConfig::new(&data_directory);
@@ -2287,33 +3443,33 @@ mod tests {
                 .expect("open first catalog actor"),
         );
         create_append_table(&first).await;
-        let second = SqliteCatalog::open_with_manifest_backend(
-            config,
-            Arc::new(DomainManifestPreparationBackend),
-        )
-        .expect("open concurrent catalog actor");
 
         let first_catalog = Arc::clone(&first);
-        let first_command = tokio::spawn(async move {
-            first_catalog
-                .command(commit_data_file(3, 11, 2, 1, 1))
-                .await
-        });
+        let persisted = commit_data_file(3, 10, 2, 1, 0);
+        let first_persisted = persisted.clone();
+        let first_command =
+            tokio::spawn(async move { first_catalog.command(first_persisted).await });
         started
             .recv_timeout(Duration::from_secs(2))
-            .expect("invalid command must pass the initial idempotency probe");
+            .expect("command must reach manifest preparation");
 
-        second
-            .command(commit_data_file(3, 10, 2, 1, 0))
-            .await
-            .expect("concurrent actor commits the request id first");
-        release.send(()).expect("release invalid preparation");
-        let error = first_command
+        let ownership_error = match SqliteCatalog::open_with_manifest_backend(
+            config.clone(),
+            Arc::new(DomainManifestPreparationBackend),
+        ) {
+            Ok(catalog) => {
+                catalog.close().expect("close unexpected second actor");
+                panic!("second typed Catalog actor unexpectedly acquired ownership");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(ownership_error.code(), ErrorCode::Conflict);
+
+        release.send(()).expect("release manifest preparation");
+        let committed = first_command
             .await
             .expect("join first catalog command")
-            .expect_err("different fingerprint must conflict");
-        assert_eq!(error.code(), ErrorCode::Conflict);
-        assert_eq!(error.request_id(), Some(request_id(3)));
+            .expect("first actor commits after preparation");
         assert_eq!(first.revision().await, Ok(3));
 
         let first = match Arc::try_unwrap(first) {
@@ -2321,6 +3477,15 @@ mod tests {
             Err(_) => panic!("manifest task must release the first catalog Arc"),
         };
         first.close().expect("close first catalog actor");
-        second.close().expect("close second catalog actor");
+
+        let reopened = SqliteCatalog::open(config).expect("reopen Catalog after owner release");
+        assert_eq!(
+            reopened
+                .command(persisted)
+                .await
+                .expect("replay exact persisted command"),
+            committed
+        );
+        reopened.close().expect("close reopened Catalog actor");
     }
 }

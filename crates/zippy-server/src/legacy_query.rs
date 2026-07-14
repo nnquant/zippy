@@ -1842,6 +1842,7 @@ mod tests {
                 "source_segment_id": 1,
                 "source_generation": 0
             })],
+            persisted_files_revision: 1,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,

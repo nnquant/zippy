@@ -5,16 +5,23 @@ mod support;
 
 use std::fs;
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::Duration;
 
-use zippy_core::{ControlEndpoint, DataDirectoryError, MasterClient};
+use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+use zippy_core::{ControlEndpoint, DataDirectoryError, MasterClient, OwnedDataDirectory};
 use zippy_master::daemon::MasterDaemonConfig;
 use zippy_server::{
-    LegacyServerMode, LegacyServerRuntime, LegacyServerRuntimeConfig, ServiceHealth,
+    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationState, LegacyServerMode,
+    LegacyServerRuntime, LegacyServerRuntimeConfig, ServiceHealth,
 };
-use zippy_types::catalog::CatalogRead;
+use zippy_types::catalog::{
+    CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
+    CatalogWrite, CreateNamespaceCommand,
+};
 use zippy_types::runtime::RuntimeRegistry;
-use zippy_types::ErrorCode;
+use zippy_types::table::CatalogName;
+use zippy_types::{ErrorCode, NamespaceId, RequestId};
 
 use support::{reserve_tcp_addr, wait_until_bindable};
 
@@ -196,6 +203,79 @@ fn runtime_config_with_native_storage_and_gateway(
     LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
 }
 
+fn runtime_config_with_shadow_catalog(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+    gateway_endpoint: std::net::SocketAddr,
+) -> LegacyServerRuntimeConfig {
+    let config_path = temp.path().join("zippy-shadow-catalog.toml");
+    fs::write(
+        &config_path,
+        format!(
+            concat!(
+                "[server]\n",
+                "data_dir = {:?}\n",
+                "native_storage_enabled = true\n\n",
+                "[catalog]\n",
+                "backend = \"sqlite_shadow\"\n\n",
+                "[catalog.runtime_snapshot_pins]\n",
+                "max_active_pins = 7\n",
+                "max_active_tables = 5\n\n",
+                "[catalog.shadow]\n",
+                "queue_capacity = 3\n",
+                "metadata_budget_bytes = 4096\n",
+                "max_files_per_comparison = 8\n",
+                "max_metadata_bytes_per_comparison = 1024\n",
+                "comparison_timeout_ms = 250\n",
+                "dedup_capacity = 5\n\n",
+                "[master]\n",
+                "shutdown_timeout_ms = 1000\n\n",
+                "[gateway]\n",
+                "enabled = true\n",
+                "endpoint = {:?}\n",
+                "token = \"shadow-catalog-test\"\n"
+            ),
+            data_dir.display().to_string(),
+            gateway_endpoint.to_string()
+        ),
+    )
+    .unwrap();
+    let master =
+        MasterDaemonConfig::new(ControlEndpoint::Unix(temp.path().join("zippy-server.sock")))
+            .with_config_path(config_path)
+            .with_logging(
+                std::env::temp_dir().join(format!(
+                    "zippy-server-runtime-test-logs-{}",
+                    std::process::id()
+                )),
+                "info",
+                false,
+            );
+    LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
+}
+
+async fn seed_incompatible_native_catalog_revision(data_dir: &std::path::Path) {
+    let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(data_dir).unwrap());
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+    let command = CatalogCommandEnvelopeV1::new(
+        RequestId::from_u128(701).unwrap(),
+        Some(0),
+        CatalogActor {
+            kind: CatalogActorKind::Server,
+            principal: "server-migration-incompatibility-test".to_owned(),
+        },
+        CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+            namespace_id: NamespaceId::from_u128(702).unwrap(),
+            name: CatalogName::new("unrelated").unwrap(),
+        }),
+    )
+    .unwrap()
+    .into();
+    catalog.command(command).await.unwrap();
+    catalog.close().unwrap();
+    drop(ownership);
+}
+
 #[tokio::test]
 async fn catalog_only_runtime_is_ready_without_fabricating_query_service() {
     let temp = tempfile::tempdir().unwrap();
@@ -374,6 +454,120 @@ fn full_runtime_opens_admission_only_after_gateway_master_probe() {
 
     let outcome = runtime.shutdown();
     assert!(outcome.is_clean(), "shutdown outcome: {outcome:?}");
+    wait_until_bindable(gateway_addr);
+}
+
+#[test]
+fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let gateway_addr = reserve_tcp_addr();
+    let mut runtime = LegacyServerRuntime::start(runtime_config_with_shadow_catalog(
+        &temp,
+        &data_dir,
+        gateway_addr,
+    ))
+    .expect("start server with SQLite Catalog shadow");
+
+    let metrics = runtime
+        .gateway_metrics()
+        .expect("enabled Gateway must expose metrics");
+    let shadow = metrics
+        .get("persisted_read_shadow")
+        .expect("shadow mode must install comparison metrics");
+    assert_eq!(shadow["worker_running"], true);
+    assert_eq!(shadow["queue_depth"], 0);
+    assert_eq!(shadow["config"]["queue_capacity"], 3);
+    assert_eq!(shadow["config"]["metadata_budget_bytes"], 4096);
+    assert_eq!(shadow["config"]["comparison_timeout_ms"], 250);
+
+    let migration = runtime.legacy_catalog_migration_status();
+    assert_eq!(migration.state, LegacyCatalogMigrationState::Complete);
+    let pin_status = runtime
+        .health()
+        .catalog_runtime_snapshot_pins
+        .expect("native Catalog pin status must be observable through server health");
+    assert!(pin_status.admission_open);
+    assert_eq!(pin_status.active_pins, 0);
+    assert_eq!(pin_status.active_tables, 0);
+    assert_eq!(pin_status.max_active_pins, 7);
+    assert_eq!(pin_status.max_active_tables, 5);
+    assert_eq!(pin_status.pin_budget_exhaustions_total, 0);
+    assert_eq!(pin_status.table_budget_exhaustions_total, 0);
+    let report = migration
+        .report
+        .as_ref()
+        .expect("shadow startup must expose an auditable migration report");
+    assert_eq!(report.submitted_commands, 1);
+    assert_eq!(report.replayed_commands, 0);
+    assert_eq!(report.target_revision_after, 1);
+    assert_eq!(runtime.health().legacy_catalog_migration, migration.clone());
+    let migration_metrics = runtime.legacy_catalog_migration_metrics();
+    assert_eq!(migration_metrics["configured"], true);
+    assert_eq!(migration_metrics["state"], "complete");
+    assert_eq!(migration_metrics["submitted_commands"], 1);
+
+    assert!(runtime.shutdown().is_clean());
+    wait_until_bindable(gateway_addr);
+
+    let mut restarted = LegacyServerRuntime::start(runtime_config_with_shadow_catalog(
+        &temp,
+        &data_dir,
+        gateway_addr,
+    ))
+    .expect("restart server with the same SQLite Catalog shadow");
+    let replay = restarted
+        .legacy_catalog_migration_status()
+        .report
+        .as_ref()
+        .expect("restart must retain migration replay evidence");
+    assert_eq!(replay.submitted_commands, 0);
+    assert_eq!(replay.replayed_commands, 1);
+    assert_eq!(replay.target_revision_before, 1);
+    assert_eq!(replay.target_revision_after, 1);
+    assert!(restarted.shutdown().is_clean());
+    wait_until_bindable(gateway_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_shadow_migration_failure_is_degraded_without_closing_legacy_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let gateway_addr = reserve_tcp_addr();
+    seed_incompatible_native_catalog_revision(&data_dir).await;
+
+    let mut runtime = LegacyServerRuntime::start(runtime_config_with_shadow_catalog(
+        &temp,
+        &data_dir,
+        gateway_addr,
+    ))
+    .expect("incompatible shadow migration must not prevent Legacy startup");
+
+    assert!(runtime.health().readiness.is_ready());
+    assert_eq!(runtime.catalog().revision().await.unwrap(), 0);
+    assert!(runtime.query().is_some());
+    let migration = runtime.legacy_catalog_migration_status();
+    assert_eq!(migration.state, LegacyCatalogMigrationState::Degraded);
+    assert!(migration.report.is_none());
+    let degradation = migration
+        .degradation
+        .as_ref()
+        .expect("failed execution must retain structured degradation");
+    assert_eq!(
+        degradation.reason,
+        LegacyCatalogMigrationDegradedReason::ExecutionFailed
+    );
+    assert_eq!(degradation.error_code, Some(ErrorCode::Conflict));
+    assert!(degradation
+        .message
+        .as_deref()
+        .is_some_and(|message| { message.contains("target revision does not match") }));
+    let metrics = runtime.legacy_catalog_migration_metrics();
+    assert_eq!(metrics["state"], "degraded");
+    assert_eq!(metrics["degraded_reason"], "execution_failed");
+    assert_eq!(metrics["error_code"], "CONFLICT");
+
+    assert!(runtime.shutdown().is_clean());
     wait_until_bindable(gateway_addr);
 }
 

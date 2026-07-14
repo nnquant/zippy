@@ -37,6 +37,8 @@ enum PreparedCommand {
     CreateTable(crate::table_domain::PreparedCreateTable),
     CommitDataFiles(crate::manifest_domain::PreparedCommitDataFiles),
     CommitCompaction(crate::manifest_domain::PreparedCommitCompaction),
+    AcquireSnapshotLease(crate::lease_domain::PreparedAcquireSnapshotLease),
+    ReleaseSnapshotLease(crate::lease_domain::PreparedReleaseSnapshotLease),
 }
 
 #[derive(Clone)]
@@ -273,6 +275,18 @@ fn prepare_command(
             crate::manifest_domain::prepare_commit_compaction(actor_kind, commit)
                 .map_err(|error| error.with_request_id(request_id))?,
         )),
+        CatalogCommandV1::AcquireSnapshotLease(acquire) => {
+            Ok(PreparedCommand::AcquireSnapshotLease(
+                crate::lease_domain::prepare_acquire_snapshot_lease(acquire)
+                    .map_err(|error| error.with_request_id(request_id))?,
+            ))
+        }
+        CatalogCommandV1::ReleaseSnapshotLease(release) => {
+            Ok(PreparedCommand::ReleaseSnapshotLease(
+                crate::lease_domain::prepare_release_snapshot_lease(release)
+                    .map_err(|error| error.with_request_id(request_id))?,
+            ))
+        }
         ref unsupported => Err(unsupported_command(unsupported).with_request_id(request_id)),
     }
 }
@@ -353,6 +367,14 @@ fn commit_prepared_command(
             )
             .map_err(|error| error.with_request_id(request_id))?,
         ),
+        PreparedCommand::AcquireSnapshotLease(acquire) => CatalogOutcomeV1::SnapshotLease(
+            crate::lease_domain::acquire_snapshot_lease(&transaction, acquire, committed_at_ns)
+                .map_err(|error| error.with_request_id(request_id))?,
+        ),
+        PreparedCommand::ReleaseSnapshotLease(release) => CatalogOutcomeV1::SnapshotLeaseReleased {
+            lease_id: crate::lease_domain::release_snapshot_lease(&transaction, release)
+                .map_err(|error| error.with_request_id(request_id))?,
+        },
     };
 
     let response = VersionedCatalogResponse::V1(CatalogResponseV1 {
@@ -680,7 +702,7 @@ fn response_matches_operation(outcome: &CatalogOutcomeV1, operation: &str) -> bo
     )
 }
 
-fn update_revision(connection: &Connection, next_revision: u64) -> Result<()> {
+pub(crate) fn update_revision(connection: &Connection, next_revision: u64) -> Result<()> {
     let encoded = encode_u64(next_revision);
     let updated = connection
         .execute(
@@ -787,7 +809,7 @@ fn namespace_not_found() -> ServerError {
     ServerError::new(ErrorCode::NotFound, "catalog namespace was not found")
 }
 
-fn unix_time_ns() -> Result<u64> {
+pub(crate) fn unix_time_ns() -> Result<u64> {
     let nanoseconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {

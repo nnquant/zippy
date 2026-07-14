@@ -21,6 +21,7 @@ from .cli_master import _endpoint_host_port
 from .server_process import (
     _ServerProcessError,
     _cleanup_child_state_from_environment,
+    _exception_error_code,
     _format_server_summary,
     _launch_server,
     _publish_child_shutdown_outcome,
@@ -356,11 +357,11 @@ def _run_foreground_server(
             arguments["startup_timeout_sec"] = _remaining_child_startup_timeout(startup_timeout_sec)
         native_runner: Callable[..., None] = zippy.run_server_daemon
         native_runner(control_endpoint, **arguments)
-    except BaseException:
+    except BaseException as error:
         if detached_child:
             _publish_child_shutdown_outcome(
                 clean=False,
-                error_code="runtime_error",
+                error_code=_exception_error_code(error),
             )
         raise
     else:

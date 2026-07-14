@@ -19,7 +19,10 @@ use zippy_core::{
     default_control_endpoint, resolve_control_endpoint, ControlEndpoint, LogConfig,
     ManagedDataDirectory, OwnedDataDirectory, ZippyConfig, ZippyError,
 };
-use zippy_gateway::{GatewayServer, GatewayServerConfig};
+use zippy_gateway::{
+    GatewayServer, GatewayServerConfig, LegacyPersistedReadSnapshotSource,
+    PersistedReadSnapshotSource,
+};
 
 use crate::server::MasterServer;
 use crate::snapshot::SnapshotStore;
@@ -530,6 +533,22 @@ pub fn start_legacy_gateway_if_enabled(
     runtime_config: &ZippyConfig,
     control_endpoint: &ControlEndpoint,
 ) -> zippy_core::Result<Option<GatewayServer>> {
+    start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
+        runtime_config,
+        control_endpoint,
+        Arc::new(LegacyPersistedReadSnapshotSource),
+    )
+}
+
+/// Starts the compatibility Gateway with an explicit persisted-read authority when enabled.
+///
+/// The unified server uses this boundary to install migration shadow observation without changing
+/// the standalone legacy master or the primary query result.
+pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
+    runtime_config: &ZippyConfig,
+    control_endpoint: &ControlEndpoint,
+    persisted_read_snapshot_source: Arc<dyn PersistedReadSnapshotSource>,
+) -> zippy_core::Result<Option<GatewayServer>> {
     if !runtime_config.gateway.enabled {
         return Ok(None);
     }
@@ -541,7 +560,7 @@ pub fn start_legacy_gateway_if_enabled(
             .ok_or_else(|| ZippyError::InvalidConfig {
                 reason: "gateway endpoint is required when gateway is enabled".to_string(),
             })?;
-    let gateway = GatewayServer::new_with_query_limits(
+    let gateway = GatewayServer::new_with_query_limits_and_persisted_read_snapshot_source(
         GatewayServerConfig {
             endpoint,
             master_endpoint: control_endpoint.clone(),
@@ -556,6 +575,7 @@ pub fn start_legacy_gateway_if_enabled(
         runtime_config.query_parallelism(),
         runtime_config.runtime.max_query_buffer_bytes,
         runtime_config.query_max_buffered_bytes(),
+        persisted_read_snapshot_source,
     )?
     .start()?;
     let (host, port) = gateway_endpoint_host_port(gateway.endpoint());

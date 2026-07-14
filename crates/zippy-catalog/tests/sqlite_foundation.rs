@@ -9,7 +9,10 @@ use zippy_catalog::{
     CatalogAuthorityState, CatalogIntegrity, SqliteCatalogConfig, SqliteCatalogFoundation,
     CATALOG_FORMAT, CATALOG_SCHEMA_VERSION,
 };
-use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
+use zippy_core::{
+    ManagedDataDirectory, OwnedDataDirectory, MAX_CATALOG_RUNTIME_SNAPSHOT_PINS,
+    MAX_CATALOG_RUNTIME_SNAPSHOT_PIN_TABLES,
+};
 use zippy_types::ErrorCode;
 
 const EXPECTED_TABLES: [&str; 14] = [
@@ -31,6 +34,11 @@ const EXPECTED_TABLES: [&str; 14] = [
 
 const EXPECTED_ACTIVE_TABLE_CURSOR_INDEXES: [&str; 2] =
     ["tables_by_namespace_state_id", "tables_by_state_id"];
+const EXPECTED_SAFE_GC_INDEXES: [&str; 3] = [
+    "data_files_gc_claim_by_table",
+    "data_files_gc_retry_by_table",
+    "snapshot_leases_gc_by_table",
+];
 
 fn data_directory(directory: &TempDir) -> Arc<OwnedDataDirectory> {
     Arc::new(
@@ -238,6 +246,31 @@ fn assert_active_table_cursor_indexes(connection: &Connection) {
     );
 }
 
+fn assert_safe_gc_indexes(connection: &Connection) {
+    let safe_gc_indexes = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+              WHERE type = 'index'
+                AND name IN (
+                    'data_files_gc_claim_by_table',
+                    'data_files_gc_retry_by_table',
+                    'snapshot_leases_gc_by_table'
+                )",
+        )
+        .expect("prepare safe-GC index inventory")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query safe-GC index inventory")
+        .collect::<rusqlite::Result<BTreeSet<_>>>()
+        .expect("collect safe-GC index inventory");
+    assert_eq!(
+        safe_gc_indexes,
+        EXPECTED_SAFE_GC_INDEXES
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+    );
+}
+
 fn initialize_catalog_at_physical_version(
     data_directory: &Arc<OwnedDataDirectory>,
     physical_version: u32,
@@ -279,6 +312,9 @@ fn initialize_catalog_at_physical_version(
             .execute_batch(
                 "DROP INDEX tables_by_state_id;
                  DROP INDEX tables_by_namespace_state_id;
+                 DROP INDEX data_files_gc_retry_by_table;
+                 DROP INDEX data_files_gc_claim_by_table;
+                 DROP INDEX snapshot_leases_gc_by_table;
                  DELETE FROM catalog_migrations WHERE schema_version > 2;
                  UPDATE catalog_meta
                     SET value = X'0000000000000002'
@@ -286,6 +322,18 @@ fn initialize_catalog_at_physical_version(
                  PRAGMA user_version = 2;",
             )
             .expect("construct exact physical v2 fixture"),
+        3 => connection
+            .execute_batch(
+                "DROP INDEX data_files_gc_retry_by_table;
+                 DROP INDEX data_files_gc_claim_by_table;
+                 DROP INDEX snapshot_leases_gc_by_table;
+                 DELETE FROM catalog_migrations WHERE schema_version > 3;
+                 UPDATE catalog_meta
+                    SET value = X'0000000000000003'
+                  WHERE key = 'schema_version';
+                 PRAGMA user_version = 3;",
+            )
+            .expect("construct exact physical v3 fixture"),
         unsupported => panic!("unsupported physical catalog fixture version [{unsupported}]"),
     }
 }
@@ -387,14 +435,16 @@ fn migration_is_idempotent_and_creates_the_current_domain_schema() {
         .expect("query migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4]);
+    assert_active_table_cursor_indexes(&raw);
+    assert_safe_gc_indexes(&raw);
 }
 
 #[test]
-fn concurrent_opens_migrate_fresh_v1_and_v2_catalogs_exactly_once() {
+fn concurrent_opens_migrate_fresh_v1_v2_and_v3_catalogs_exactly_once() {
     const ACTOR_COUNT: usize = 8;
 
-    for physical_version in [0, 1, 2] {
+    for physical_version in [0, 1, 2, 3] {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
         initialize_catalog_at_physical_version(&data_directory, physical_version);
@@ -440,16 +490,17 @@ fn concurrent_opens_migrate_fresh_v1_and_v2_catalogs_exactly_once() {
             .expect("collect concurrent migration versions");
         assert_eq!(
             migration_versions,
-            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
             "each migration must be recorded exactly once from physical version \
              [{physical_version}]"
         );
         assert_active_table_cursor_indexes(&raw);
+        assert_safe_gc_indexes(&raw);
     }
 }
 
 #[test]
-fn upgrades_an_existing_physical_v1_catalog_to_v3_and_reopens() {
+fn upgrades_an_existing_physical_v1_catalog_to_v4_and_reopens() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
@@ -523,12 +574,13 @@ fn upgrades_an_existing_physical_v1_catalog_to_v3_and_reopens() {
             row.get(0)
         })
         .expect("count upgraded migration audit");
-    assert_eq!(migration_count, 3);
+    assert_eq!(migration_count, 4);
     assert_active_table_cursor_indexes(&raw);
+    assert_safe_gc_indexes(&raw);
 }
 
 #[test]
-fn upgrades_an_existing_physical_v2_catalog_to_v3_and_reopens() {
+fn upgrades_an_existing_physical_v2_catalog_to_v4_and_reopens() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
@@ -541,7 +593,10 @@ fn upgrades_an_existing_physical_v2_catalog_to_v3_and_reopens() {
     raw.execute_batch(
         "DROP INDEX tables_by_state_id;
          DROP INDEX tables_by_namespace_state_id;
-         DELETE FROM catalog_migrations WHERE schema_version = 3;
+         DROP INDEX data_files_gc_retry_by_table;
+         DROP INDEX data_files_gc_claim_by_table;
+         DROP INDEX snapshot_leases_gc_by_table;
+         DELETE FROM catalog_migrations WHERE schema_version > 2;
          UPDATE catalog_meta
             SET value = X'0000000000000002'
           WHERE key = 'schema_version';
@@ -575,8 +630,45 @@ fn upgrades_an_existing_physical_v2_catalog_to_v3_and_reopens() {
         .expect("query upgraded migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect upgraded migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4]);
     assert_active_table_cursor_indexes(&raw);
+    assert_safe_gc_indexes(&raw);
+}
+
+#[test]
+fn upgrades_an_existing_physical_v3_catalog_to_v4_and_reopens() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    initialize_catalog_at_physical_version(&data_directory, 3);
+
+    let upgraded = SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("upgrade physical v3 catalog");
+    assert_eq!(
+        upgraded
+            .inspect()
+            .expect("inspect upgraded catalog")
+            .metadata
+            .schema_version,
+        CATALOG_SCHEMA_VERSION
+    );
+    upgraded.close().expect("close upgraded catalog");
+
+    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("reopen upgraded catalog")
+        .close()
+        .expect("close reopened catalog");
+
+    let raw = Connection::open(catalog_path(&data_directory)).expect("inspect upgraded schema");
+    let migration_versions = raw
+        .prepare("SELECT schema_version FROM catalog_migrations ORDER BY schema_version")
+        .expect("prepare upgraded migration audit query")
+        .query_map([], |row| row.get::<_, u32>(0))
+        .expect("query upgraded migration audit")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect upgraded migration versions");
+    assert_eq!(migration_versions, vec![1, 2, 3, 4]);
+    assert_active_table_cursor_indexes(&raw);
+    assert_safe_gc_indexes(&raw);
 }
 
 #[test]
@@ -759,6 +851,170 @@ fn current_manifest_query_uses_a_covering_manifest_index() {
             .all(|detail| !detail.contains("USE TEMP B-TREE")),
         "current manifest plan must preserve file-id order in-index plan=[{plan:?}]"
     );
+}
+
+#[test]
+fn safe_gc_queries_use_table_first_indexes_and_bound_a_large_candidate_set() {
+    const DELETING_FILES: u128 = 2_000;
+    const COMMITTED_FILES: u128 = 8_000;
+    const EXPIRED_LEASES: u128 = 2_000;
+    const RETRY_LIMIT: u32 = 37;
+    const NEW_CLAIM_LIMIT: u32 = 41;
+
+    let directory = TempDir::new().expect("create temp directory");
+    let mut raw = initialized_raw_catalog(&directory);
+    let zero = 0_u64.to_be_bytes();
+    let one = 1_u64.to_be_bytes();
+    let none = [0_u8; 9];
+    let parent_zero = tagged_some(0);
+    let removed_at_one = tagged_some(1);
+    let fixture = raw
+        .transaction()
+        .expect("begin safe-GC fixture transaction");
+    insert_test_namespace_and_table(&fixture, &zero, &one);
+    insert_test_schema(&fixture, &zero);
+    insert_test_snapshot(&fixture, &zero, &none, "create");
+    insert_test_snapshot(&fixture, &one, &parent_zero, "persist");
+
+    for ordinal in 1..=DELETING_FILES + COMMITTED_FILES {
+        let file_id = (1_u128 << 120 | ordinal).to_be_bytes();
+        let state = if ordinal <= DELETING_FILES {
+            "deleting"
+        } else {
+            "committed"
+        };
+        insert_test_data_file(
+            &fixture,
+            &file_id,
+            &format!("safe-gc/{ordinal:05}.parquet"),
+            &removed_at_one,
+            state,
+        );
+    }
+    for ordinal in 1..=EXPIRED_LEASES {
+        let lease_id = (2_u128 << 120 | ordinal).to_be_bytes();
+        fixture
+            .execute(
+                "INSERT INTO snapshot_leases(
+                     lease_id, table_id, snapshot_version, owner, expires_at_ns
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    lease_id.as_slice(),
+                    stable_id_bytes(2).as_slice(),
+                    zero.as_slice(),
+                    format!("expired-{ordinal}"),
+                    zero.as_slice(),
+                ],
+            )
+            .expect("insert expired snapshot lease");
+    }
+    fixture.commit().expect("commit safe-GC fixture");
+    raw.execute_batch("ANALYZE")
+        .expect("analyze safe-GC candidate distribution");
+
+    let retry_sql = "SELECT file_id FROM data_files
+          WHERE table_id = ?1
+            AND state = 'deleting'
+            AND location_kind = 'managed'
+            AND removed_snapshot_version_value IS NOT NULL
+          ORDER BY file_id
+          LIMIT ?2";
+    let retry_plan = raw
+        .prepare(&format!("EXPLAIN QUERY PLAN {retry_sql}"))
+        .expect("prepare safe-GC retry query plan")
+        .query_map(params![stable_id_bytes(2).as_slice(), RETRY_LIMIT], |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("query safe-GC retry plan")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect safe-GC retry plan");
+    assert!(
+        retry_plan
+            .iter()
+            .any(|detail| detail.contains("data_files_gc_retry_by_table")),
+        "safe-GC retry must use its table-first partial index plan=[{retry_plan:?}]"
+    );
+    assert!(
+        retry_plan
+            .iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "safe-GC retry order must be satisfied by the index plan=[{retry_plan:?}]"
+    );
+    let retry_count = raw
+        .prepare(retry_sql)
+        .expect("prepare bounded safe-GC retry query")
+        .query_map(params![stable_id_bytes(2).as_slice(), RETRY_LIMIT], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .expect("query bounded safe-GC retries")
+        .count();
+    assert_eq!(retry_count, RETRY_LIMIT as usize);
+
+    let claim_sql = "SELECT files.file_id
+           FROM data_files AS files
+          WHERE files.table_id = ?1
+            AND files.state = 'committed'
+            AND files.location_kind = 'managed'
+            AND files.removed_snapshot_version_value IS NOT NULL
+            AND files.removed_snapshot_version_value <= ?3
+            AND NOT EXISTS (
+                SELECT 1 FROM snapshot_leases AS leases
+                    INDEXED BY snapshot_leases_gc_by_table
+                 WHERE leases.table_id = files.table_id
+                   AND leases.snapshot_version >= files.added_snapshot_version
+                   AND leases.snapshot_version < files.removed_snapshot_version_value
+                   AND leases.expires_at_ns > ?2
+            )
+          ORDER BY files.removed_snapshot_version_value, files.file_id
+          LIMIT ?4";
+    let claim_plan = raw
+        .prepare(&format!("EXPLAIN QUERY PLAN {claim_sql}"))
+        .expect("prepare safe-GC new-claim query plan")
+        .query_map(
+            params![
+                stable_id_bytes(2).as_slice(),
+                one.as_slice(),
+                one.as_slice(),
+                NEW_CLAIM_LIMIT,
+            ],
+            |row| row.get::<_, String>(3),
+        )
+        .expect("query safe-GC new-claim plan")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect safe-GC new-claim plan");
+    assert!(
+        claim_plan
+            .iter()
+            .any(|detail| detail.contains("data_files_gc_claim_by_table")),
+        "safe-GC claim must use its table-first partial index plan=[{claim_plan:?}]"
+    );
+    assert!(
+        claim_plan
+            .iter()
+            .any(|detail| detail.contains("snapshot_leases_gc_by_table")),
+        "safe-GC protection must use the table-first lease index plan=[{claim_plan:?}]"
+    );
+    assert!(
+        claim_plan
+            .iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "safe-GC claim order must be satisfied by the index plan=[{claim_plan:?}]"
+    );
+    let claim_count = raw
+        .prepare(claim_sql)
+        .expect("prepare bounded safe-GC new-claim query")
+        .query_map(
+            params![
+                stable_id_bytes(2).as_slice(),
+                one.as_slice(),
+                one.as_slice(),
+                NEW_CLAIM_LIMIT,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .expect("query bounded safe-GC new claims")
+        .count();
+    assert_eq!(claim_count, NEW_CLAIM_LIMIT as usize);
 }
 
 #[test]
@@ -1358,6 +1614,25 @@ fn rejects_read_lane_capacities_outside_allocation_limits() {
 }
 
 #[test]
+fn rejects_runtime_snapshot_pin_limits_outside_allocation_bounds() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    for config in [
+        SqliteCatalogConfig::new(&data_directory).with_runtime_snapshot_pin_limits(0, 1),
+        SqliteCatalogConfig::new(&data_directory).with_runtime_snapshot_pin_limits(1, 0),
+        SqliteCatalogConfig::new(&data_directory)
+            .with_runtime_snapshot_pin_limits(MAX_CATALOG_RUNTIME_SNAPSHOT_PINS + 1, 1),
+        SqliteCatalogConfig::new(&data_directory)
+            .with_runtime_snapshot_pin_limits(1, MAX_CATALOG_RUNTIME_SNAPSHOT_PIN_TABLES + 1),
+    ] {
+        let error = SqliteCatalogFoundation::open(config)
+            .err()
+            .expect("invalid runtime snapshot pin limit must be rejected");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
 fn inspect_rejects_tampered_catalog_format_metadata() {
     assert_live_tamper_rejected(
         "UPDATE catalog_meta SET value = CAST('other-format' AS BLOB) \
@@ -1368,7 +1643,7 @@ fn inspect_rejects_tampered_catalog_format_metadata() {
 #[test]
 fn inspect_rejects_tampered_schema_metadata() {
     assert_live_tamper_rejected(
-        "UPDATE catalog_meta SET value = X'0000000000000004' \
+        "UPDATE catalog_meta SET value = X'0000000000000005' \
          WHERE key = 'schema_version'",
     );
 }
@@ -1446,7 +1721,7 @@ fn inspect_rejects_an_extra_migration_audit_record() {
     assert_live_tamper_rejected(
         "INSERT INTO catalog_migrations( \
              schema_version, migration_name, migration_checksum, applied_at_ns \
-         ) VALUES (4, 'unexpected', zeroblob(32), zeroblob(8))",
+         ) VALUES (5, 'unexpected', zeroblob(32), zeroblob(8))",
     );
 }
 
@@ -1478,6 +1753,21 @@ fn inspect_rejects_global_table_cursor_index_drift() {
 #[test]
 fn inspect_rejects_namespace_table_cursor_index_drift() {
     assert_live_tamper_rejected("DROP INDEX tables_by_namespace_state_id");
+}
+
+#[test]
+fn inspect_rejects_safe_gc_claim_index_drift() {
+    assert_live_tamper_rejected("DROP INDEX data_files_gc_claim_by_table");
+}
+
+#[test]
+fn inspect_rejects_safe_gc_retry_index_drift() {
+    assert_live_tamper_rejected("DROP INDEX data_files_gc_retry_by_table");
+}
+
+#[test]
+fn inspect_rejects_safe_gc_lease_index_drift() {
+    assert_live_tamper_rejected("DROP INDEX snapshot_leases_gc_by_table");
 }
 
 #[test]

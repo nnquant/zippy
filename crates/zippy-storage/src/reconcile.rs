@@ -8,16 +8,17 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use serde::Serialize;
-use zippy_core::OwnedDataDirectory;
+use zippy_core::{DataDirectoryError, OwnedDataDirectory};
 use zippy_types::catalog::{
-    CatalogDataFileProbeMatch, CatalogDataFileProbeResult, CatalogFileRead, ManagedDataFileProbe,
-    VersionedCatalogCommand,
+    CatalogDataFileProbeMatch, CatalogDataFileProbeResult, CatalogFileRead,
+    CatalogPublicationControl, ManagedDataFileProbe, VersionedCatalogCommand,
 };
 use zippy_types::table::{DataFileLocation, DataFileState, ManagedDataPath, PendingDataFile};
 use zippy_types::{ErrorCode, FileId, RequestId, Result, ServerError, TableId};
 
 use crate::candidate::{
-    open_existing_candidate, recover_parquet_candidate, verify_pending_candidate,
+    map_data_directory_error, open_existing_candidate, recover_parquet_candidate,
+    verify_pending_candidate,
 };
 use crate::commit_intent::{command_files, CommitIntentJournal};
 
@@ -227,12 +228,17 @@ impl StartupOrphanReconciliationReport {
 /// Data-root ownership excludes other processes, but the composition root must
 /// also keep candidate publication and commit admission private until this pass
 /// returns. The resulting `Unreferenced` observation is deliberately not a
-/// deletion capability. Online deletion requires the later publication gate,
-/// snapshot leases, Catalog lifecycle transition, and durable GC protocol.
+/// deletion capability. Rejected-candidate cleanup additionally requires its
+/// affine token and exclusive publication authority; ordinary historical-file
+/// deletion requires snapshot leases, a Catalog lifecycle transition, and the
+/// durable GC protocol.
 pub struct StartupOrphanReconciler {
     config: StartupOrphanReconcilerConfig,
     data_directory: Arc<OwnedDataDirectory>,
     catalog: Arc<dyn CatalogFileRead>,
+    publication_control: Option<Arc<dyn CatalogPublicationControl>>,
+    #[cfg(test)]
+    before_cleanup_unlink: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl StartupOrphanReconciler {
@@ -243,6 +249,33 @@ impl StartupOrphanReconciler {
             config: StartupOrphanReconcilerConfig::default(),
             data_directory,
             catalog,
+            publication_control: None,
+            #[cfg(test)]
+            before_cleanup_unlink: None,
+        }
+    }
+
+    /// Creates a startup reconciler authorized to remove verified orphans.
+    ///
+    /// The same concrete Catalog object supplies file-reference reads and
+    /// publication exclusion, preventing accidental cleanup against a gate
+    /// owned by another Catalog instance.
+    pub fn new_with_cleanup_control<C>(
+        data_directory: Arc<OwnedDataDirectory>,
+        catalog: Arc<C>,
+    ) -> Self
+    where
+        C: CatalogFileRead + CatalogPublicationControl + 'static,
+    {
+        let file_catalog: Arc<dyn CatalogFileRead> = catalog.clone();
+        let publication_control: Arc<dyn CatalogPublicationControl> = catalog;
+        Self {
+            config: StartupOrphanReconcilerConfig::default(),
+            data_directory,
+            catalog: file_catalog,
+            publication_control: Some(publication_control),
+            #[cfg(test)]
+            before_cleanup_unlink: None,
         }
     }
 
@@ -257,7 +290,38 @@ impl StartupOrphanReconciler {
             config,
             data_directory,
             catalog,
+            publication_control: None,
+            #[cfg(test)]
+            before_cleanup_unlink: None,
         })
+    }
+
+    /// Creates an orphan-cleanup reconciler with explicit resource budgets.
+    pub fn with_config_and_cleanup_control<C>(
+        config: StartupOrphanReconcilerConfig,
+        data_directory: Arc<OwnedDataDirectory>,
+        catalog: Arc<C>,
+    ) -> Result<Self>
+    where
+        C: CatalogFileRead + CatalogPublicationControl + 'static,
+    {
+        validate_config(&config)?;
+        let file_catalog: Arc<dyn CatalogFileRead> = catalog.clone();
+        let publication_control: Arc<dyn CatalogPublicationControl> = catalog;
+        Ok(Self {
+            config,
+            data_directory,
+            catalog: file_catalog,
+            publication_control: Some(publication_control),
+            #[cfg(test)]
+            before_cleanup_unlink: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_before_cleanup_unlink(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.before_cleanup_unlink = Some(hook);
+        self
     }
 
     /// Scans physical candidates and returns a revision-stable read-only report.
@@ -330,6 +394,89 @@ impl StartupOrphanReconciler {
         })
         .await
         .map_err(|error| join_error("classify startup storage state", error))?
+    }
+
+    /// Removes temporary files and verified orphans while admission is private.
+    ///
+    /// The reconciler must have been created with cleanup control. This method
+    /// takes the Catalog's exclusive publication exclusion before its first
+    /// scan and retains it through unlink and the second reconciliation pass.
+    /// It rechecks the Catalog revision before unlinking, durably removes
+    /// scanned candidate and intent `.tmp-*` files plus checksum- and
+    /// footer-verified `Orphan` files, then performs a second full pass.
+    /// Catalog-referenced and pending-intent files are never removed. The
+    /// composition root must still call it before public table admission.
+    pub async fn reconcile_and_remove_orphans_before_admission(
+        &self,
+    ) -> Result<StartupOrphanReconciliationReport> {
+        let publication_control = self.publication_control.as_ref().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "startup orphan cleanup requires Catalog publication control",
+            )
+            .with_retryable(false)
+        })?;
+        let publication_exclusion = publication_control.acquire_publication_exclusion().await?;
+        let report = self.reconcile().await?;
+        reject_invalid_unreferenced_candidates(&report)?;
+        let orphans = report
+            .files
+            .iter()
+            .filter(|file| file.disposition == ReconciledFileDisposition::Orphan)
+            .map(|file| {
+                let pending = file.verified_candidate.clone().ok_or_else(|| {
+                    corruption(format!(
+                        "startup orphan lacks verified candidate file_id=[{}]",
+                        file.file_id
+                    ))
+                })?;
+                Ok((pending, file.path.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let temporary_files = report.temporary_files.clone();
+        if orphans.is_empty() && temporary_files.is_empty() {
+            return Ok(report);
+        }
+
+        let current_revision = self.catalog.revision().await?;
+        if current_revision != report.catalog_revision {
+            return Err(revision_changed(report.catalog_revision, current_revision));
+        }
+        let removed_orphans = orphans.len();
+        let removed_temporary_files = temporary_files.len();
+        let data_directory = Arc::clone(&self.data_directory);
+        #[cfg(test)]
+        let before_cleanup_unlink = self.before_cleanup_unlink.clone();
+        let publication_exclusion = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = before_cleanup_unlink {
+                hook();
+            }
+            for path in temporary_files {
+                data_directory
+                    .remove_durable_file(&path)
+                    .map_err(|error| startup_temporary_cleanup_error(&path, error))?;
+            }
+            for (pending, path) in orphans {
+                verify_pending_candidate(&data_directory, &pending)?;
+                data_directory
+                    .remove_durable_file(&path)
+                    .map_err(|error| map_data_directory_error(pending.table_id, error))?;
+            }
+            Ok::<_, ServerError>(publication_exclusion)
+        })
+        .await
+        .map_err(|error| join_error("remove verified startup orphans", error))??;
+        tracing::info!(
+            catalog_revision = report.catalog_revision,
+            removed_orphans,
+            removed_temporary_files,
+            "removed temporary files and verified orphans before publication admission"
+        );
+        let reconciled = self.reconcile().await?;
+        reject_invalid_unreferenced_candidates(&reconciled)?;
+        drop(publication_exclusion);
+        Ok(reconciled)
     }
 }
 
@@ -960,6 +1107,101 @@ fn is_candidate_temporary(file_name: &str) -> bool {
     file_name.starts_with('.') && file_name.contains(".parquet.tmp-")
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+    use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+    use zippy_types::catalog::CatalogPublicationControl;
+
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_cleanup_retains_exclusion_until_blocking_unlink_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("create test root");
+        let data_directory = Arc::new(
+            OwnedDataDirectory::acquire_or_initialize(root.path().join("data"))
+                .expect("own test data root"),
+        );
+        let catalog = Arc::new(
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+                .expect("open test Catalog"),
+        );
+        let target =
+            ManagedDataPath::new("wal/catalog-commit-intents/00000000000000000001-test.json")
+                .expect("valid test intent path");
+        let transaction = data_directory
+            .begin_durable_file(&target)
+            .expect("create temporary test intent");
+        let temporary_path = transaction.temporary_path().to_path_buf();
+        drop(transaction);
+        fs::write(&temporary_path, b"crash residue").expect("restore closed temporary intent");
+        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o600))
+            .expect("secure temporary intent permissions");
+
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let started_sender = Arc::new(Mutex::new(Some(started_sender)));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let hook_sender = Arc::clone(&started_sender);
+        let hook_release = Arc::clone(&release);
+        let hook = Arc::new(move || {
+            if let Some(sender) = hook_sender.lock().expect("lock start signal").take() {
+                let _ = sender.send(());
+            }
+            let (released, condition) = &*hook_release;
+            let mut released = released.lock().expect("lock cleanup release");
+            while !*released {
+                released = condition.wait(released).expect("wait for cleanup release");
+            }
+        });
+        let reconciler = StartupOrphanReconciler::new_with_cleanup_control(
+            Arc::clone(&data_directory),
+            Arc::clone(&catalog),
+        )
+        .with_before_cleanup_unlink(hook);
+        let cleanup = tokio::spawn(async move {
+            reconciler
+                .reconcile_and_remove_orphans_before_admission()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_receiver)
+            .await
+            .expect("cleanup must reach the blocking unlink task")
+            .expect("cleanup start signal must be delivered");
+
+        cleanup.abort();
+        assert!(cleanup
+            .await
+            .expect_err("outer cleanup future must be cancelled")
+            .is_cancelled());
+        let permit_catalog = Arc::clone(&catalog);
+        let mut permit =
+            tokio::spawn(async move { permit_catalog.acquire_publication_permit().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut permit)
+                .await
+                .is_err(),
+            "publication must remain excluded while detached unlink is blocked"
+        );
+
+        let (released, condition) = &*release;
+        *released.lock().expect("lock cleanup release") = true;
+        condition.notify_all();
+        let acquired = tokio::time::timeout(Duration::from_secs(2), &mut permit)
+            .await
+            .expect("publication resumes after unlink finishes")
+            .expect("join publication permit task")
+            .expect("acquire publication permit");
+        drop(acquired);
+        assert!(!temporary_path.exists());
+    }
+}
+
 fn charge_entry(config: &StartupOrphanReconcilerConfig, count: &mut usize) -> Result<()> {
     *count = count
         .checked_add(1)
@@ -1157,6 +1399,38 @@ fn revision_changed(expected: u64, actual: u64) -> ServerError {
         ),
     )
     .with_retryable(true)
+}
+
+fn startup_temporary_cleanup_error(
+    path: &ManagedDataPath,
+    error: DataDirectoryError,
+) -> ServerError {
+    ServerError::new(
+        ErrorCode::Internal,
+        format!(
+            "remove startup temporary file failed path=[{}] error=[{}]",
+            path.as_str(),
+            error
+        ),
+    )
+    .with_retryable(false)
+}
+
+fn reject_invalid_unreferenced_candidates(
+    report: &StartupOrphanReconciliationReport,
+) -> Result<()> {
+    if let Some(issue) = report
+        .issues
+        .iter()
+        .find(|issue| issue.kind == ReconciliationIssueKind::InvalidUnreferencedCandidate)
+    {
+        return Err(corruption(format!(
+            "invalid unreferenced candidate blocks startup cleanup path=[{}] reason=[{}]",
+            issue.path.as_str(),
+            issue.reason
+        )));
+    }
+    Ok(())
 }
 
 fn io_error(operation: &str, path: &Path, error: std::io::Error) -> ServerError {

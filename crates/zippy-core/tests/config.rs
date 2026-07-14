@@ -1,13 +1,26 @@
 use std::fs;
 use std::sync::{Mutex, OnceLock};
 
-use zippy_core::{ZippyConfig, ZippyRuntimeConfig};
+use zippy_core::{
+    ZippyCatalogBackend, ZippyConfig, ZippyRuntimeConfig,
+    DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS,
+    DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES, MAX_CATALOG_RUNTIME_SNAPSHOT_PINS,
+};
 
 const CONFIG_ENV_KEYS: &[&str] = &[
     "HOME",
     "ZIPPY_SERVER_DATA_DIR",
     "ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT",
     "ZIPPY_SERVER_NATIVE_STORAGE",
+    "ZIPPY_CATALOG_BACKEND",
+    "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_PINS",
+    "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_TABLES",
+    "ZIPPY_CATALOG_SHADOW_QUEUE_CAPACITY",
+    "ZIPPY_CATALOG_SHADOW_METADATA_BUDGET_BYTES",
+    "ZIPPY_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON",
+    "ZIPPY_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON",
+    "ZIPPY_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS",
+    "ZIPPY_CATALOG_SHADOW_DEDUP_CAPACITY",
     "ZIPPY_LOG_LEVEL",
     "ZIPPY_MAX_PARALLELISM",
     "ZIPPY_MAX_QUERY_BUFFER_BYTES",
@@ -190,10 +203,237 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     assert_eq!(config.server.data_dir, None);
     assert!(!config.server.import_legacy_endpoint_snapshot);
     assert!(!config.server.native_storage_enabled);
+    assert_eq!(config.catalog.backend, ZippyCatalogBackend::Legacy);
+    assert_eq!(
+        config.catalog.runtime_snapshot_pins.max_active_pins,
+        DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS
+    );
+    assert_eq!(
+        config.catalog.runtime_snapshot_pins.max_active_tables,
+        DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES
+    );
     assert_eq!(
         config.server_data_dir("endpoint-data"),
         std::path::PathBuf::from("endpoint-data")
     );
+}
+
+#[test]
+fn zippy_config_loads_and_validates_runtime_snapshot_pin_limits() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[catalog.runtime_snapshot_pins]
+max_active_pins = 4096
+max_active_tables = 1024
+"#,
+    )
+    .unwrap();
+
+    let from_toml = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+    assert_eq!(
+        from_toml.catalog.runtime_snapshot_pins.max_active_pins,
+        4_096
+    );
+    assert_eq!(
+        from_toml.catalog.runtime_snapshot_pins.max_active_tables,
+        1_024
+    );
+
+    let from_env = with_env(
+        &[
+            (
+                "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_PINS",
+                "8192",
+            ),
+            (
+                "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_TABLES",
+                "2048",
+            ),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap();
+    assert_eq!(
+        from_env.catalog.runtime_snapshot_pins.max_active_pins,
+        8_192
+    );
+    assert_eq!(
+        from_env.catalog.runtime_snapshot_pins.max_active_tables,
+        2_048
+    );
+
+    let zero_error = with_env(
+        &[("ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_PINS", "0")],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .expect_err("zero runtime snapshot pin limit must be rejected");
+    assert!(zero_error
+        .to_string()
+        .contains("catalog.runtime_snapshot_pins.max_active_pins must be between 1"));
+
+    let oversized = (MAX_CATALOG_RUNTIME_SNAPSHOT_PINS + 1).to_string();
+    let oversized_error = with_env(
+        &[(
+            "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_PINS",
+            oversized.as_str(),
+        )],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .expect_err("oversized runtime snapshot pin limit must be rejected");
+    assert!(oversized_error
+        .to_string()
+        .contains("catalog.runtime_snapshot_pins.max_active_pins must be between 1"));
+}
+
+#[test]
+fn zippy_config_loads_sqlite_shadow_backend_from_toml_and_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "legacy"
+"#,
+    )
+    .unwrap();
+
+    let from_toml = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+    assert_eq!(from_toml.catalog.backend, ZippyCatalogBackend::Legacy);
+
+    let from_env = with_env(&[("ZIPPY_CATALOG_BACKEND", "sqlite_shadow")], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
+    assert_eq!(from_env.catalog.backend, ZippyCatalogBackend::SqliteShadow);
+}
+
+#[test]
+fn zippy_config_loads_and_validates_bounded_catalog_shadow_resources() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+native_storage_enabled = true
+
+[catalog]
+backend = "sqlite_shadow"
+
+[catalog.shadow]
+queue_capacity = 12
+metadata_budget_bytes = 33554432
+max_files_per_comparison = 2048
+max_metadata_bytes_per_comparison = 4194304
+comparison_timeout_ms = 2500
+dedup_capacity = 256
+"#,
+    )
+    .unwrap();
+
+    let from_toml = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+    assert_eq!(from_toml.catalog.shadow.queue_capacity, 12);
+    assert_eq!(from_toml.catalog.shadow.metadata_budget_bytes, 33_554_432);
+    assert_eq!(from_toml.catalog.shadow.max_files_per_comparison, 2_048);
+    assert_eq!(
+        from_toml.catalog.shadow.max_metadata_bytes_per_comparison,
+        4_194_304
+    );
+    assert_eq!(from_toml.catalog.shadow.comparison_timeout_ms, 2_500);
+    assert_eq!(from_toml.catalog.shadow.dedup_capacity, 256);
+
+    let from_env = with_env(
+        &[
+            ("ZIPPY_CATALOG_SHADOW_QUEUE_CAPACITY", "24"),
+            ("ZIPPY_CATALOG_SHADOW_METADATA_BUDGET_BYTES", "67108864"),
+            ("ZIPPY_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON", "4096"),
+            (
+                "ZIPPY_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON",
+                "8388608",
+            ),
+            ("ZIPPY_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS", "7500"),
+            ("ZIPPY_CATALOG_SHADOW_DEDUP_CAPACITY", "512"),
+        ],
+        || ZippyConfig::load_from_path(Some(&config_path)),
+    )
+    .unwrap();
+    assert_eq!(from_env.catalog.shadow.queue_capacity, 24);
+    assert_eq!(from_env.catalog.shadow.metadata_budget_bytes, 67_108_864);
+    assert_eq!(from_env.catalog.shadow.max_files_per_comparison, 4_096);
+    assert_eq!(
+        from_env.catalog.shadow.max_metadata_bytes_per_comparison,
+        8_388_608
+    );
+    assert_eq!(from_env.catalog.shadow.comparison_timeout_ms, 7_500);
+    assert_eq!(from_env.catalog.shadow.dedup_capacity, 512);
+
+    let error = with_env(
+        &[
+            ("ZIPPY_CATALOG_SHADOW_METADATA_BUDGET_BYTES", "1024"),
+            (
+                "ZIPPY_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON",
+                "2048",
+            ),
+        ],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .expect_err("per-comparison shadow budget must fit the total budget");
+    assert!(error
+        .to_string()
+        .contains("per-comparison metadata budget must not exceed total budget"));
+}
+
+#[test]
+fn zippy_config_rejects_sqlite_shadow_without_native_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[catalog]
+backend = "sqlite_shadow"
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path)))
+        .expect_err("shadow mode must not run without native storage");
+    assert!(error
+        .to_string()
+        .contains("sqlite_shadow backend requires server native_storage_enabled"));
+}
+
+#[test]
+fn zippy_config_rejects_sqlite_authority_before_cutover() {
+    let error = with_env(
+        &[
+            ("ZIPPY_SERVER_NATIVE_STORAGE", "true"),
+            ("ZIPPY_CATALOG_BACKEND", "sqlite"),
+        ],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .expect_err("sqlite authority must remain closed until cutover");
+    assert!(error
+        .to_string()
+        .contains("sqlite authority is not available before explicit cutover"));
+}
+
+#[test]
+fn zippy_config_rejects_unknown_catalog_backend_environment_value() {
+    let error = with_env(&[("ZIPPY_CATALOG_BACKEND", "dual")], || {
+        ZippyConfig::load_from_path(None::<&std::path::Path>)
+    })
+    .expect_err("unknown Catalog backend must be rejected");
+    assert!(error
+        .to_string()
+        .contains("name=[ZIPPY_CATALOG_BACKEND] value=[dual]"));
 }
 
 #[test]

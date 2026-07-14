@@ -33,8 +33,11 @@ are also reported during shutdown; retryable backpressure remains request-local.
 Catalog-backed request identity is authoritative across restart while its durable idempotency row
 is retained. An exact historical request returns the original receipt without rolling the actor's
 newer snapshot backward; the same request ID with a different fingerprint returns `Conflict` and
-does not poison later writes. This path still writes a candidate before Catalog can reject a
-different replay fingerprint, so replay-only publication cleanup is an authority-cutover gate.
+does not poison later writes. The actor passes `Advance` or `HistoricalReplay` explicitly to
+storage. Both modes may build Parquet bytes in parallel temporary files, but storage probes the
+complete Catalog envelope first: exact, conflicting, and missing historical replays drop those
+temporary files without publishing; only a missing advance may cross the final publication
+boundary.
 
 RecordBatch append, segment rollover, query snapshot leases, producer-session fencing, and ingest
 WAL remain subsequent implementation stages. Until the later authority cutover is complete, the

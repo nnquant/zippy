@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use zippy_storage::{
     CommitDataFilesReceipt, PersistCompletionFailure, PersistCompletionResult,
-    PersistControllerHandle, PersistRequest, PersistTicket,
+    PersistControllerHandle, PersistMode, PersistRequest, PersistTicket,
 };
 use zippy_types::table::{SnapshotOperation, TableSnapshot};
 use zippy_types::{
@@ -540,12 +540,12 @@ type PersistCompletion = Pin<Box<dyn Future<Output = PersistCompletionResult> + 
 type PersistSubmissionResult = std::result::Result<PersistCompletion, PersistCompletionFailure>;
 
 trait PersistSubmitter: Send + Sync {
-    fn submit(&self, request: PersistRequest) -> PersistSubmissionResult;
+    fn submit(&self, request: PersistRequest, mode: PersistMode) -> PersistSubmissionResult;
 }
 
 impl PersistSubmitter for PersistControllerHandle {
-    fn submit(&self, request: PersistRequest) -> PersistSubmissionResult {
-        let ticket = PersistControllerHandle::submit_classified(self, request)?;
+    fn submit(&self, request: PersistRequest, mode: PersistMode) -> PersistSubmissionResult {
+        let ticket = PersistControllerHandle::submit_classified_with_mode(self, request, mode)?;
         Ok(persist_ticket_completion(ticket))
     }
 }
@@ -558,6 +558,15 @@ fn persist_ticket_completion(ticket: PersistTicket) -> PersistCompletion {
 enum PersistDisposition {
     Advance,
     Replay,
+}
+
+impl PersistDisposition {
+    const fn persist_mode(self) -> PersistMode {
+        match self {
+            Self::Advance => PersistMode::Advance,
+            Self::Replay => PersistMode::HistoricalReplay,
+        }
+    }
 }
 
 struct InFlightPersist {
@@ -859,7 +868,7 @@ fn process_command(
             let result = match validated {
                 Ok(disposition) => match persistence {
                     Some(submitter) => submitter
-                        .submit(request)
+                        .submit(request, disposition.persist_mode())
                         .map(|completion| (completion, disposition)),
                     None => Err(PersistCompletionFailure::Rejected(persistence_disabled(
                         state.table_id,
@@ -1339,7 +1348,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use zippy_storage::{
         CommitDataFilesReceipt, ParquetCandidateSpec, PersistCandidateInput,
-        PersistCompletionFailure, PersistCompletionResult, PersistRequest,
+        PersistCompletionFailure, PersistCompletionResult, PersistMode, PersistRequest,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance,
@@ -1480,6 +1489,7 @@ mod tests {
 
     struct FakeSubmission {
         request_id: RequestId,
+        mode: PersistMode,
         response: oneshot::Sender<PersistCompletionResult>,
     }
 
@@ -1488,12 +1498,13 @@ mod tests {
     }
 
     impl PersistSubmitter for FakePersistSubmitter {
-        fn submit(&self, request: PersistRequest) -> PersistSubmissionResult {
+        fn submit(&self, request: PersistRequest, mode: PersistMode) -> PersistSubmissionResult {
             let request_id = request.request_id();
             let (response, completion) = oneshot::channel();
             self.submissions
                 .send(FakeSubmission {
                     request_id,
+                    mode,
                     response,
                 })
                 .map_err(|_| {
@@ -1533,7 +1544,7 @@ mod tests {
     }
 
     impl PersistSubmitter for ImmediateErrorSubmitter {
-        fn submit(&self, request: PersistRequest) -> PersistSubmissionResult {
+        fn submit(&self, request: PersistRequest, _mode: PersistMode) -> PersistSubmissionResult {
             let error = ServerError::new(self.code, "fake persist submitter rejected the request")
                 .with_request_id(request.request_id())
                 .with_table_id(request.table_id());
@@ -1721,6 +1732,7 @@ mod tests {
             .unwrap();
         let first_submission = submissions.recv().await.unwrap();
         assert_eq!(first_submission.request_id, request_id(10));
+        assert_eq!(first_submission.mode, PersistMode::Advance);
         let duplicate = actor
             .try_persist(persist_request(11, 10, 1, 1, 7, 0, vec![3]))
             .unwrap_err();
@@ -1851,6 +1863,7 @@ mod tests {
             .expect("a stale parent is a Catalog idempotency candidate");
         let replay_submission = submissions.recv().await.unwrap();
         assert_eq!(replay_submission.request_id, request_id(60));
+        assert_eq!(replay_submission.mode, PersistMode::HistoricalReplay);
         replay_submission
             .response
             .send(Ok(successful_receipt(

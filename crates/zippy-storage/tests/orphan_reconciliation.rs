@@ -16,7 +16,8 @@ use zippy_storage::{
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1,
-    CatalogDataFileReferenceSnapshot, CatalogFileRead, CatalogQuerySnapshot, CatalogRead,
+    CatalogDataFileReferenceSnapshot, CatalogFileRead, CatalogPublicationControl,
+    CatalogPublicationExclusion, CatalogPublicationPermit, CatalogQuerySnapshot, CatalogRead,
     CatalogSnapshotSelector, CatalogWrite, CommitDataFilesCommand, CreateNamespaceCommand,
     CreateTableCommand, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
     ListTablesResponse, ManagedDataFileProbe, NamespaceRef, VersionedCatalogCommand,
@@ -194,6 +195,12 @@ struct ShortProbeCatalog {
     inner: Arc<SqliteCatalog>,
 }
 
+struct ReplacingCatalog {
+    inner: Arc<SqliteCatalog>,
+    revision_calls: AtomicUsize,
+    candidate_path: std::path::PathBuf,
+}
+
 impl CatalogRead for RevisionDriftCatalog {
     fn revision(&self) -> BoxFuture<'_, Result<u64>> {
         Box::pin(async move {
@@ -243,6 +250,79 @@ impl CatalogFileRead for RevisionDriftCatalog {
         probes: &'a [ManagedDataFileProbe],
     ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>> {
         self.inner.inspect_data_file_references(probes)
+    }
+}
+
+impl CatalogRead for ReplacingCatalog {
+    fn revision(&self) -> BoxFuture<'_, Result<u64>> {
+        Box::pin(async move {
+            let revision = self.inner.revision().await?;
+            if self.revision_calls.fetch_add(1, Ordering::AcqRel) == 2 {
+                std::fs::write(&self.candidate_path, b"replacement bytes")
+                    .expect("replace orphan after its initial verification");
+            }
+            Ok(revision)
+        })
+    }
+
+    fn get_namespace(&self, namespace: NamespaceRef) -> BoxFuture<'_, Result<NamespaceDescriptor>> {
+        self.inner.get_namespace(namespace)
+    }
+
+    fn list_namespaces(
+        &self,
+        request: ListNamespacesRequest,
+    ) -> BoxFuture<'_, Result<ListNamespacesResponse>> {
+        self.inner.list_namespaces(request)
+    }
+
+    fn get_table(&self, table: TableRef) -> BoxFuture<'_, Result<TableDescriptor>> {
+        self.inner.get_table(table)
+    }
+
+    fn list_tables(&self, request: ListTablesRequest) -> BoxFuture<'_, Result<ListTablesResponse>> {
+        self.inner.list_tables(request)
+    }
+
+    fn resolve_tables<'a>(
+        &'a self,
+        tables: &'a [TableRef],
+    ) -> BoxFuture<'a, Result<Vec<TableDescriptor>>> {
+        self.inner.resolve_tables(tables)
+    }
+
+    fn read_snapshot_at<'a>(
+        &'a self,
+        selectors: &'a [CatalogSnapshotSelector],
+    ) -> BoxFuture<'a, Result<CatalogQuerySnapshot>> {
+        self.inner.read_snapshot_at(selectors)
+    }
+}
+
+impl CatalogFileRead for ReplacingCatalog {
+    fn inspect_data_file_references<'a>(
+        &'a self,
+        probes: &'a [ManagedDataFileProbe],
+    ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>> {
+        self.inner.inspect_data_file_references(probes)
+    }
+}
+
+impl CatalogPublicationControl for ReplacingCatalog {
+    fn acquire_publication_permit(&self) -> BoxFuture<'_, Result<CatalogPublicationPermit>> {
+        self.inner.acquire_publication_permit()
+    }
+
+    fn command_with_publication_permit(
+        &self,
+        permit: CatalogPublicationPermit,
+        command: VersionedCatalogCommand,
+    ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
+        self.inner.command_with_publication_permit(permit, command)
+    }
+
+    fn acquire_publication_exclusion(&self) -> BoxFuture<'_, Result<CatalogPublicationExclusion>> {
+        self.inner.acquire_publication_exclusion()
     }
 }
 
@@ -372,6 +452,130 @@ async fn reports_verified_orphan_then_exact_catalog_reference_without_deleting()
         }
     ));
     assert!(candidate_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_cleanup_removes_only_verified_orphans_before_admission() {
+    let root = TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let catalog = Arc::new(
+        SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
+    );
+    let schema = schema();
+    create_append_table(&catalog, &schema).await;
+    let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
+    let committed = write_candidate(&writer, 20, 0, vec![100]);
+    let committed_path = committed.path().to_path_buf();
+    let coordinator = CatalogCommitCoordinator::start(
+        CatalogCommitCoordinatorConfig::default(),
+        Arc::clone(&owned),
+        catalog.clone(),
+        server_actor(),
+    )
+    .await
+    .expect("start commit coordinator");
+    coordinator
+        .commit(
+            CommitDataFilesIntent::new(
+                request_id(3),
+                table_id(TABLE),
+                1,
+                vec![committed],
+                OffsetWatermark::Known(LogOffset::new(0)),
+            )
+            .expect("valid committed intent"),
+        )
+        .await
+        .expect("commit protected candidate");
+    coordinator.drain().await.expect("drain coordinator");
+
+    let orphan = write_candidate(&writer, 21, 1, vec![101]);
+    let orphan_path = orphan.path().to_path_buf();
+    let temporary_target = ManagedDataPath::new(format!(
+        "parquet/{}/{}.parquet",
+        table_id(TABLE),
+        file_id(22)
+    ))
+    .expect("valid temporary candidate target");
+    let mut temporary = owned
+        .begin_durable_file(&temporary_target)
+        .expect("create abandoned candidate temp");
+    temporary
+        .write_all(b"abandoned")
+        .expect("write abandoned candidate temp");
+    let temporary_path = temporary.temporary_path().to_path_buf();
+    let reconciler =
+        StartupOrphanReconciler::new_with_cleanup_control(Arc::clone(&owned), catalog.clone());
+    let report = reconciler
+        .reconcile_and_remove_orphans_before_admission()
+        .await
+        .expect("remove verified orphan under private startup admission");
+
+    assert_eq!(report.catalog_revision, 3);
+    assert_eq!(report.orphan_count(), 0);
+    assert_eq!(report.files.len(), 1);
+    assert!(committed_path.exists());
+    assert!(!orphan_path.exists());
+    assert!(!temporary_path.exists());
+    assert!(report.temporary_files.is_empty());
+    assert!(matches!(
+        report.files[0].disposition,
+        ReconciledFileDisposition::CatalogReferenced { .. }
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_only_reconciler_cannot_enter_physical_cleanup() {
+    let root = TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let catalog = Arc::new(
+        SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
+    );
+    let catalog_read: Arc<dyn CatalogFileRead> = catalog;
+    let reconciler = StartupOrphanReconciler::new(owned, catalog_read);
+
+    let error = reconciler
+        .reconcile_and_remove_orphans_before_admission()
+        .await
+        .expect_err("read-only reconciliation cannot authorize unlink");
+    assert_eq!(error.code(), ErrorCode::UnsupportedPlan);
+    assert!(!error.retryable());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_cleanup_reverifies_orphan_immediately_before_unlink() {
+    let root = TempDir::new().expect("create test root");
+    let owned = owned_directory(&root);
+    let catalog = Arc::new(
+        SqliteCatalog::open(SqliteCatalogConfig::new(&owned)).expect("open sqlite catalog"),
+    );
+    create_append_table(&catalog, schema().as_ref()).await;
+    let orphan = write_candidate(
+        &ParquetCandidateWriter::new(Arc::clone(&owned)),
+        20,
+        0,
+        vec![100],
+    );
+    let orphan_path = orphan.path().to_path_buf();
+    let replacing = Arc::new(ReplacingCatalog {
+        inner: catalog,
+        revision_calls: AtomicUsize::new(0),
+        candidate_path: orphan_path.clone(),
+    });
+
+    let reconciler = StartupOrphanReconciler::new_with_cleanup_control(owned, replacing);
+    let error = reconciler
+        .reconcile_and_remove_orphans_before_admission()
+        .await
+        .expect_err("replaced orphan must not be unlinked from stale evidence");
+
+    assert_eq!(error.code(), ErrorCode::DataCorruption);
+    assert!(orphan_path.exists());
+    let repeated = reconciler
+        .reconcile_and_remove_orphans_before_admission()
+        .await
+        .expect_err("invalid unreferenced replacement must block every later startup");
+    assert_eq!(repeated.code(), ErrorCode::DataCorruption);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

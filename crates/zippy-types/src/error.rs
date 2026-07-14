@@ -291,6 +291,13 @@ impl ServerError {
         self
     }
 
+    /// Replaces the human-readable message while preserving structured context.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
     /// Attaches one stable machine-readable detail payload.
     pub fn with_details(
         mut self,
@@ -362,6 +369,14 @@ mod tests {
         assert_eq!(decoded.code().to_string(), "CONFLICT");
         assert!(!decoded.retryable());
         assert!(encoded.contains(r#""type":"revision_conflict""#));
+
+        let contextualized = error.clone().with_message("startup cleanup also failed");
+        assert_eq!(contextualized.code(), error.code());
+        assert_eq!(contextualized.retryable(), error.retryable());
+        assert_eq!(contextualized.request_id(), error.request_id());
+        assert_eq!(contextualized.table_id(), error.table_id());
+        assert_eq!(contextualized.details(), error.details());
+        assert_eq!(contextualized.message(), "startup cleanup also failed");
     }
 
     #[test]

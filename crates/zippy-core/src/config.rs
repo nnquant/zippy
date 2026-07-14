@@ -17,6 +17,20 @@ pub const MAX_PARALLELISM: usize = 256;
 pub const DEFAULT_MAX_QUERY_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 pub const DEFAULT_QUERY_MAX_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_QUERY_BUFFER_BYTES: usize = u32::MAX as usize;
+pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
+pub const DEFAULT_CATALOG_SHADOW_METADATA_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON: usize = 4_096;
+pub const DEFAULT_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON: usize = 8 * 1024 * 1024;
+pub const DEFAULT_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_CATALOG_SHADOW_DEDUP_CAPACITY: usize = 1_024;
+/// Default process-local query snapshot pin budget.
+pub const DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS: usize = 131_072;
+/// Default number of table entries retained by query pins and GC exclusion.
+pub const DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES: usize = 16_384;
+/// Platform configuration ceiling for process-local query snapshot pins.
+pub const MAX_CATALOG_RUNTIME_SNAPSHOT_PINS: usize = 1_048_576;
+/// Platform configuration ceiling for table entries retained by pin coordination.
+pub const MAX_CATALOG_RUNTIME_SNAPSHOT_PIN_TABLES: usize = 131_072;
 const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%m%d%H"];
 
 /// Process-wide Zippy runtime configuration.
@@ -24,6 +38,8 @@ const SUPPORTED_TABLE_PERSIST_DT_PARTS: &[&str] = &["%Y", "%Y%m", "%Y%m%d", "%Y%
 pub struct ZippyConfig {
     #[serde(default)]
     pub server: ZippyServerConfig,
+    #[serde(default)]
+    pub catalog: ZippyCatalogConfig,
     #[serde(default)]
     pub runtime: ZippyRuntimeConfig,
     #[serde(default)]
@@ -34,6 +50,76 @@ pub struct ZippyConfig {
     pub gateway: ZippyGatewayConfig,
     #[serde(default)]
     pub query: ZippyQueryConfig,
+}
+
+/// Catalog metadata authority selected during the SQLite migration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZippyCatalogBackend {
+    /// The legacy registry remains the read and write authority.
+    #[default]
+    Legacy,
+    /// Legacy remains authoritative while SQLite is compared asynchronously.
+    SqliteShadow,
+    /// SQLite is authoritative. This mode is reserved until cutover is complete.
+    Sqlite,
+}
+
+/// Catalog migration configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyCatalogConfig {
+    /// Metadata authority and migration mode.
+    #[serde(default)]
+    pub backend: ZippyCatalogBackend,
+    /// Process-local query snapshot pin admission limits.
+    #[serde(default)]
+    pub runtime_snapshot_pins: ZippyCatalogRuntimeSnapshotPinConfig,
+    /// Bounded best-effort comparison resources used only in shadow mode.
+    #[serde(default)]
+    pub shadow: ZippyCatalogShadowConfig,
+}
+
+/// Resource limits for process-local query snapshot pins retained against safe GC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyCatalogRuntimeSnapshotPinConfig {
+    /// Maximum number of simultaneously retained table snapshot pins.
+    pub max_active_pins: usize,
+    /// Maximum number of table entries retained by pin and GC coordination.
+    pub max_active_tables: usize,
+}
+
+impl Default for ZippyCatalogRuntimeSnapshotPinConfig {
+    fn default() -> Self {
+        Self {
+            max_active_pins: DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS,
+            max_active_tables: DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES,
+        }
+    }
+}
+
+/// Resource limits for asynchronous legacy-versus-SQLite metadata comparisons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyCatalogShadowConfig {
+    pub queue_capacity: usize,
+    pub metadata_budget_bytes: usize,
+    pub max_files_per_comparison: usize,
+    pub max_metadata_bytes_per_comparison: usize,
+    pub comparison_timeout_ms: u64,
+    pub dedup_capacity: usize,
+}
+
+impl Default for ZippyCatalogShadowConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY,
+            metadata_budget_bytes: DEFAULT_CATALOG_SHADOW_METADATA_BUDGET_BYTES,
+            max_files_per_comparison: DEFAULT_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON,
+            max_metadata_bytes_per_comparison:
+                DEFAULT_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON,
+            comparison_timeout_ms: DEFAULT_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS,
+            dedup_capacity: DEFAULT_CATALOG_SHADOW_DEDUP_CAPACITY,
+        }
+    }
 }
 
 /// Single-node server storage configuration.
@@ -179,12 +265,36 @@ impl Default for ZippyGatewayConfig {
 #[derive(Debug, Deserialize)]
 struct PartialZippyConfig {
     server: Option<PartialServerConfig>,
+    catalog: Option<PartialCatalogConfig>,
     runtime: Option<PartialRuntimeConfig>,
     master: Option<PartialMasterConfig>,
     log: Option<PartialLogConfig>,
     table: Option<PartialTableConfig>,
     gateway: Option<PartialGatewayConfig>,
     query: Option<PartialQueryConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialCatalogConfig {
+    backend: Option<ZippyCatalogBackend>,
+    runtime_snapshot_pins: Option<PartialCatalogRuntimeSnapshotPinConfig>,
+    shadow: Option<PartialCatalogShadowConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialCatalogRuntimeSnapshotPinConfig {
+    max_active_pins: Option<usize>,
+    max_active_tables: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialCatalogShadowConfig {
+    queue_capacity: Option<usize>,
+    metadata_budget_bytes: Option<usize>,
+    max_files_per_comparison: Option<usize>,
+    max_metadata_bytes_per_comparison: Option<usize>,
+    comparison_timeout_ms: Option<u64>,
+    dedup_capacity: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +375,7 @@ impl Default for ZippyConfig {
     fn default() -> Self {
         Self {
             server: ZippyServerConfig::default(),
+            catalog: ZippyCatalogConfig::default(),
             runtime: ZippyRuntimeConfig::default(),
             master: ZippyMasterConfig::default(),
             log: ZippyLogConfig {
@@ -335,6 +446,39 @@ impl ZippyConfig {
             }
             if let Some(enabled) = server.native_storage_enabled {
                 self.server.native_storage_enabled = enabled;
+            }
+        }
+        if let Some(catalog) = partial.catalog {
+            if let Some(backend) = catalog.backend {
+                self.catalog.backend = backend;
+            }
+            if let Some(runtime_snapshot_pins) = catalog.runtime_snapshot_pins {
+                if let Some(value) = runtime_snapshot_pins.max_active_pins {
+                    self.catalog.runtime_snapshot_pins.max_active_pins = value;
+                }
+                if let Some(value) = runtime_snapshot_pins.max_active_tables {
+                    self.catalog.runtime_snapshot_pins.max_active_tables = value;
+                }
+            }
+            if let Some(shadow) = catalog.shadow {
+                if let Some(value) = shadow.queue_capacity {
+                    self.catalog.shadow.queue_capacity = value;
+                }
+                if let Some(value) = shadow.metadata_budget_bytes {
+                    self.catalog.shadow.metadata_budget_bytes = value;
+                }
+                if let Some(value) = shadow.max_files_per_comparison {
+                    self.catalog.shadow.max_files_per_comparison = value;
+                }
+                if let Some(value) = shadow.max_metadata_bytes_per_comparison {
+                    self.catalog.shadow.max_metadata_bytes_per_comparison = value;
+                }
+                if let Some(value) = shadow.comparison_timeout_ms {
+                    self.catalog.shadow.comparison_timeout_ms = value;
+                }
+                if let Some(value) = shadow.dedup_capacity {
+                    self.catalog.shadow.dedup_capacity = value;
+                }
             }
         }
         if let Some(runtime) = partial.runtime {
@@ -470,6 +614,47 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_SERVER_NATIVE_STORAGE") {
             self.server.native_storage_enabled =
                 parse_bool_env("ZIPPY_SERVER_NATIVE_STORAGE", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_BACKEND") {
+            self.catalog.backend = parse_catalog_backend_env(&value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_PINS") {
+            self.catalog.runtime_snapshot_pins.max_active_pins = parse_usize_env(
+                "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_PINS",
+                &value,
+            )?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_TABLES") {
+            self.catalog.runtime_snapshot_pins.max_active_tables = parse_usize_env(
+                "ZIPPY_CATALOG_RUNTIME_SNAPSHOT_PINS_MAX_ACTIVE_TABLES",
+                &value,
+            )?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_SHADOW_QUEUE_CAPACITY") {
+            self.catalog.shadow.queue_capacity =
+                parse_usize_env("ZIPPY_CATALOG_SHADOW_QUEUE_CAPACITY", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_SHADOW_METADATA_BUDGET_BYTES") {
+            self.catalog.shadow.metadata_budget_bytes =
+                parse_usize_env("ZIPPY_CATALOG_SHADOW_METADATA_BUDGET_BYTES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON") {
+            self.catalog.shadow.max_files_per_comparison =
+                parse_usize_env("ZIPPY_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON") {
+            self.catalog.shadow.max_metadata_bytes_per_comparison = parse_usize_env(
+                "ZIPPY_CATALOG_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON",
+                &value,
+            )?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS") {
+            self.catalog.shadow.comparison_timeout_ms =
+                parse_u64_env("ZIPPY_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_CATALOG_SHADOW_DEDUP_CAPACITY") {
+            self.catalog.shadow.dedup_capacity =
+                parse_usize_env("ZIPPY_CATALOG_SHADOW_DEDUP_CAPACITY", &value)?;
         }
         if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
             self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;
@@ -653,6 +838,89 @@ impl ZippyConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        for (name, value, maximum) in [
+            (
+                "catalog.runtime_snapshot_pins.max_active_pins",
+                self.catalog.runtime_snapshot_pins.max_active_pins,
+                MAX_CATALOG_RUNTIME_SNAPSHOT_PINS,
+            ),
+            (
+                "catalog.runtime_snapshot_pins.max_active_tables",
+                self.catalog.runtime_snapshot_pins.max_active_tables,
+                MAX_CATALOG_RUNTIME_SNAPSHOT_PIN_TABLES,
+            ),
+        ] {
+            if !(1..=maximum).contains(&value) {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!(
+                        "{} must be between 1 and {} value=[{}]",
+                        name, maximum, value
+                    ),
+                });
+            }
+        }
+        for (name, value) in [
+            (
+                "catalog.shadow.queue_capacity",
+                self.catalog.shadow.queue_capacity,
+            ),
+            (
+                "catalog.shadow.metadata_budget_bytes",
+                self.catalog.shadow.metadata_budget_bytes,
+            ),
+            (
+                "catalog.shadow.max_files_per_comparison",
+                self.catalog.shadow.max_files_per_comparison,
+            ),
+            (
+                "catalog.shadow.max_metadata_bytes_per_comparison",
+                self.catalog.shadow.max_metadata_bytes_per_comparison,
+            ),
+            (
+                "catalog.shadow.dedup_capacity",
+                self.catalog.shadow.dedup_capacity,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ZippyError::InvalidConfig {
+                    reason: format!("{} must be greater than zero", name),
+                });
+            }
+        }
+        if self.catalog.shadow.max_metadata_bytes_per_comparison
+            > self.catalog.shadow.metadata_budget_bytes
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "catalog shadow per-comparison metadata budget must not exceed total budget \
+                     per_comparison=[{}] total=[{}]",
+                    self.catalog.shadow.max_metadata_bytes_per_comparison,
+                    self.catalog.shadow.metadata_budget_bytes
+                ),
+            });
+        }
+        if self.catalog.shadow.comparison_timeout_ms == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "catalog.shadow.comparison_timeout_ms must be greater than zero"
+                    .to_string(),
+            });
+        }
+        match self.catalog.backend {
+            ZippyCatalogBackend::Legacy => {}
+            ZippyCatalogBackend::SqliteShadow if !self.server.native_storage_enabled => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "catalog sqlite_shadow backend requires server native_storage_enabled"
+                        .to_string(),
+                });
+            }
+            ZippyCatalogBackend::SqliteShadow => {}
+            ZippyCatalogBackend::Sqlite => {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "catalog sqlite authority is not available before explicit cutover"
+                        .to_string(),
+                });
+            }
+        }
         if self.runtime.max_parallelism == 0 || self.runtime.max_parallelism > MAX_PARALLELISM {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
@@ -803,6 +1071,23 @@ fn parse_bool_env(key: &str, value: &str) -> Result<bool> {
     }
 }
 
+fn parse_catalog_backend_env(value: &str) -> Result<ZippyCatalogBackend> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "legacy" => Ok(ZippyCatalogBackend::Legacy),
+        "sqlite_shadow" => Ok(ZippyCatalogBackend::SqliteShadow),
+        "sqlite" => Ok(ZippyCatalogBackend::Sqlite),
+        _ => Err(ZippyError::InvalidConfig {
+            reason: format!(
+                concat!(
+                    "env var must be one of legacy, sqlite_shadow, or sqlite ",
+                    "name=[ZIPPY_CATALOG_BACKEND] value=[{}]"
+                ),
+                value
+            ),
+        }),
+    }
+}
+
 fn parse_usize_env(key: &str, value: &str) -> Result<usize> {
     value
         .parse::<usize>()
@@ -811,6 +1096,14 @@ fn parse_usize_env(key: &str, value: &str) -> Result<usize> {
                 "env var must parse as usize name=[{}] error=[{}]",
                 key, error
             ),
+        })
+}
+
+fn parse_u64_env(key: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|error| ZippyError::InvalidConfig {
+            reason: format!("env var must parse as u64 name=[{}] error=[{}]", key, error),
         })
 }
 

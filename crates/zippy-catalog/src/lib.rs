@@ -14,14 +14,19 @@
 mod domain;
 mod encoding;
 mod file_domain;
+mod gc_domain;
+mod lease_domain;
 mod manifest_domain;
 mod migration;
+mod runtime_pins;
 mod service;
 mod snapshot_domain;
 mod storage_codec;
 mod table_domain;
 
-pub use service::SqliteCatalog;
+pub use runtime_pins::{SqliteCatalogRuntimeSnapshotPin, SqliteCatalogRuntimeSnapshotPinStatus};
+pub use service::{SqliteCatalog, SqliteCatalogPinnedQuerySnapshot, SqliteCatalogReadHandle};
+pub use snapshot_domain::SqliteCatalogSnapshotReadLimits;
 pub use storage_codec::{
     decode_persisted_schema, decode_persisted_table_schema, DecodedPersistedTableSchema,
 };
@@ -37,7 +42,7 @@ use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 3;
+pub const CATALOG_SCHEMA_VERSION: u32 = 4;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;
@@ -88,6 +93,8 @@ pub struct SqliteCatalogConfig {
     control_read_capacity: usize,
     snapshot_read_capacity: usize,
     manifest_queue_capacity_bytes: usize,
+    runtime_snapshot_pin_max_active_pins: usize,
+    runtime_snapshot_pin_max_active_tables: usize,
 }
 
 impl SqliteCatalogConfig {
@@ -112,6 +119,10 @@ impl SqliteCatalogConfig {
             control_read_capacity: DEFAULT_CONTROL_READ_CAPACITY,
             snapshot_read_capacity: DEFAULT_SNAPSHOT_READ_CAPACITY,
             manifest_queue_capacity_bytes: DEFAULT_MANIFEST_QUEUE_CAPACITY_BYTES,
+            runtime_snapshot_pin_max_active_pins:
+                zippy_core::DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS,
+            runtime_snapshot_pin_max_active_tables:
+                zippy_core::DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES,
         }
     }
 
@@ -157,6 +168,22 @@ impl SqliteCatalogConfig {
         manifest_queue_capacity_bytes: usize,
     ) -> Self {
         self.manifest_queue_capacity_bytes = manifest_queue_capacity_bytes;
+        self
+    }
+
+    /// Overrides process-local query snapshot pin admission limits.
+    ///
+    /// `max_active_pins` bounds retained table-snapshot guards. `max_active_tables` bounds table
+    /// entries shared by query pins and garbage-collection exclusion. Values are validated when
+    /// the Catalog is opened.
+    #[must_use]
+    pub const fn with_runtime_snapshot_pin_limits(
+        mut self,
+        max_active_pins: usize,
+        max_active_tables: usize,
+    ) -> Self {
+        self.runtime_snapshot_pin_max_active_pins = max_active_pins;
+        self.runtime_snapshot_pin_max_active_tables = max_active_tables;
         self
     }
 
@@ -719,6 +746,31 @@ fn validate_config(config: &SqliteCatalogConfig) -> Result<()> {
                 MAX_MANIFEST_QUEUE_CAPACITY_BYTES, config.manifest_queue_capacity_bytes
             ),
         ));
+    }
+    for (name, value, maximum) in [
+        (
+            "active pins",
+            config.runtime_snapshot_pin_max_active_pins,
+            zippy_core::MAX_CATALOG_RUNTIME_SNAPSHOT_PINS,
+        ),
+        (
+            "active tables",
+            config.runtime_snapshot_pin_max_active_tables,
+            zippy_core::MAX_CATALOG_RUNTIME_SNAPSHOT_PIN_TABLES,
+        ),
+    ] {
+        if !(1..=maximum).contains(&value) {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    concat!(
+                        "catalog runtime snapshot pin {} limit is outside bounds ",
+                        "min=[1] max=[{}] actual=[{}]"
+                    ),
+                    name, maximum, value
+                ),
+            ));
+        }
     }
     if config.busy_timeout.as_millis() > MAX_BUSY_TIMEOUT_MILLIS {
         return Err(ServerError::new(

@@ -11,32 +11,50 @@
 parquet/<table_id>/<file_id>.parquet
 ```
 
-The writer freezes Parquet settings, embeds typed provenance in the footer, computes a
-`sha256-v1` checksum, fsyncs the file, publishes without overwrite, and fsyncs the parent
-directory. Its result is a `PendingDataFile`; only the Catalog may create committed visibility.
+The writer freezes Parquet settings, embeds typed provenance in the footer, and computes a
+`sha256-v1` checksum. The controller's parallel writer stage retains each file as an affine
+temporary-file token. Final no-clobber publication and parent-directory fsync happen only after the
+Catalog idempotency probe authorizes a new advance and the FIFO coordinator owns a shared Catalog
+publication permit. A post-rename directory-sync failure is classified separately from an
+unpublished failure, so the controller retains cleanup authority for the final directory entry.
+The public `write_candidate()` compatibility API still publishes directly, but does not transfer
+controller cleanup authority. Only the Catalog may create committed visibility.
 
 ## Commit protocol
 
 `CatalogCommitCoordinator` is a single FIFO worker because the SQLite Catalog serializes manifest
-mutations. For each accepted request it:
+mutations. For each accepted native persist request it:
 
 1. builds one frozen `CommitDataFiles` envelope with `expected_revision=None` and a table-scoped
    `expected_snapshot_version` CAS;
-2. writes the exact envelope to `wal/catalog-commit-intents/` and fsyncs it;
-3. verifies candidate size, checksum, Parquet row count, and footer identity;
-4. submits the Catalog command;
-5. replays the unchanged envelope on commit-unknown errors;
-6. on a definitive Catalog business rejection, durably removes the intent and fails only that
-   request;
-7. validates a successful response's request, table, snapshot parent, operation, watermark, and
+2. probes the complete envelope through `CatalogIdempotencyRead` before final publication;
+3. returns the original receipt for an exact replay, rejects a fingerprint conflict, and rejects a
+   missing historical replay while dropping every staged temporary file;
+4. only for a missing `Advance`, publishes candidates and writes the exact envelope to
+   `wal/catalog-commit-intents/`;
+5. verifies candidate size, checksum, Parquet row count, and footer identity;
+6. submits the Catalog command and replays it unchanged on commit-unknown errors;
+7. on a definitive Catalog rejection, durably removes the intent, then consumes non-cloneable
+   cleanup tokens under an exclusive Catalog publication guard, only after revision-stable Catalog
+   and complete physical identity rechecks authorize deletion;
+8. validates a successful response's request, table, snapshot parent, operation, watermark, and
    commit LSN;
-8. durably removes the committed intent record.
+9. durably removes the committed intent record.
 
 Cancellation after queue admission abandons only the caller response. A retained intent is replayed
 before the coordinator accepts new work after restart. Resource pressure, unavailability,
 cancel/deadline responses, internal failures, and data corruption are never inferred to be safe
 business rejections. Failure to remove a definitively rejected intent remains fatal and retains the
 recovery boundary.
+
+`PersistController` accepts only a coordinator created with `start_with_persistence()`. Publication
+permits are acquired by the single FIFO worker only after it dequeues the current staged candidate
+set, immediately before physical publication. Later queued jobs hold only affine temporary-file
+tokens, so they cannot deadlock an earlier rejected job's exclusive cleanup. The current permit then
+moves into the Catalog actor, so cancelling a waiter cannot expose an unowned final file or release
+cleanup exclusion while an admitted mutation is still running. Catalog cleanup takes every
+publication permit before its first reference read and holds them through checksum/footer
+revalidation and durable unlink.
 
 Default outstanding budgets are 64 commits, 128 MiB of frozen command bytes, and 8 GiB of
 uncommitted candidate bytes. Candidate-byte accounting rounds each request up to 64 KiB. These are
@@ -58,7 +76,9 @@ blocking Parquet writers. Hard limits are 4,096 jobs, 64 GiB, and 64 writers. `s
 `PersistTicket` only after the request is in the bounded queue. `submit_classified()` and
 `PersistTicket::wait_classified()` preserve request-local `Rejected` versus runtime-terminal
 `Fatal` outcomes for actor supervision; the original methods remain compatibility mappings to
-`ServerError`. Dropping a ticket abandons only the response: candidate publication, Catalog commit
+`ServerError`. `submit_with_mode()` carries an explicit `Advance` or `HistoricalReplay`; the
+compatibility `submit()` defaults to `Advance`. Dropping a ticket abandons only the response:
+candidate publication, Catalog commit
 replay, and cleanup continue. A definitive Catalog business rejection removes its durable intent
 and leaves controller admission open. Writer, unresolved commit, cleanup, or internal durability
 failure closes global admission, but the controller still drains every accepted queue item, joins
@@ -90,12 +110,17 @@ is streaming, so rejected excess entries are not first collected in memory. A re
 intent remains one atomic group: every file must be either an exact Catalog reference or
 unreferenced; a partial Catalog representation is corruption.
 
-The reconciliation report is read-only. In particular, a Catalog `Unreferenced` result is not
-permission to unlink a file because publication could begin after the read transaction. Online orphan removal requires a
-publication gate; ordinary file removal additionally requires snapshot leases and the safe-GC
-lifecycle. Read-only intent enumeration reports temporary WAL entries rather than cleaning them;
-only coordinator recovery performs that cleanup under startup ownership. This pass scans physical
-files toward the Catalog.
+The plain reconciliation report is read-only. Under the explicit pre-admission startup method, the
+server may remove scanned candidate/intent `.tmp-*` files and verified orphans only when the
+reconciler was constructed from one Catalog object that supplies both file-reference reads and
+publication control. Cleanup acquires that Catalog's exclusive publication exclusion before the
+first scan and holds it through revision checks, unlink, and the second full reconciliation pass. It
+verifies each orphan's complete `PendingDataFile` again immediately before unlink and rejects every
+invalid unreferenced candidate as startup corruption. A read-only reconciler cannot enter cleanup,
+and a Catalog `Unreferenced` result alone is not deletion authority. The coordinator may remove only
+its own rejected affine candidates while holding exclusive publication authority. Ordinary
+historical-file removal additionally requires snapshot leases and the safe-GC lifecycle. This pass
+scans physical files toward the Catalog.
 
 After replay and final reconciliation, `StartupCatalogFileVerifier` performs the reverse startup
 gate. It lists active tables in 512-table pages, reads current snapshots in batches of 512 at one
@@ -117,7 +142,7 @@ compatibility wrapper that returns only the verification report. External legacy
 historical files removed from the current snapshot are outside this startup gate; maintenance
 verification remains responsible for historical/deep audits.
 
-Logical drop, snapshot leases, safe GC, compaction, replay-only candidate cleanup, and public native
-write admission remain later refactor steps. Native `TableActor`s now own the per-table persist
+Logical drop, snapshot leases, safe GC, compaction, and public native write admission remain later
+refactor steps. Native `TableActor`s now own the per-table persist
 state machine and Catalog-backed receipt replay, but the legacy Gateway remains write authority
 until the explicit cutover.

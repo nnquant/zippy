@@ -15,15 +15,20 @@ use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
+use zippy_catalog::{SqliteCatalogConfig, SqliteCatalogRuntimeSnapshotPinStatus};
 use zippy_core::bus_protocol::GetConfigRequest;
 use zippy_core::{
     current_log_snapshot, python_dev_version, resolve_control_endpoint,
     send_control_line_request_with_timeout, ControlEndpoint, ControlRequest, ControlResponse,
-    OwnedDataDirectory, Result as CoreResult, ZippyConfig, ZippyError,
+    OwnedDataDirectory, Result as CoreResult, ZippyCatalogBackend, ZippyConfig, ZippyError,
 };
-use zippy_gateway::{GatewayServer, GatewayShutdownOutcome};
+use zippy_gateway::{
+    GatewayServer, GatewayShutdownOutcome, LegacyPersistedReadSnapshotSource,
+    PersistedReadShadowConfig, PersistedReadSnapshotSource, ShadowPersistedReadSnapshotSource,
+};
 use zippy_master::daemon::{
-    prepare_master_runtime, start_legacy_gateway_if_enabled, MasterDaemonConfig,
+    prepare_master_runtime, start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled,
+    MasterDaemonConfig,
 };
 use zippy_master::legacy_catalog::LegacyCatalogAdapter;
 use zippy_master::legacy_runtime::LegacyRuntimeRegistryAdapter;
@@ -31,19 +36,27 @@ use zippy_master::server::MasterServer;
 use zippy_storage::{PersistControllerConfig, MAX_PERSIST_PARALLEL_WRITERS};
 use zippy_types::{ErrorCode, ServerError};
 
+use crate::legacy_catalog_migration::{
+    plan_legacy_catalog_metadata_import, LegacyCatalogMigrationStartup,
+};
 use crate::{
-    LegacyQueryEngineAdapter, LegacyServerHealth, LegacyServerServices, NativeStorageRuntime,
-    NativeStorageRuntimeConfig, NativeStorageShutdownOutcome, NativeStorageStartOutcome,
+    catalog_shadow::SqliteCatalogPersistedReadShadowSource, LegacyCatalogMigrationDegradation,
+    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationStatus, LegacyQueryEngineAdapter,
+    LegacyServerHealth, LegacyServerServices, NativeStorageRuntime, NativeStorageRuntimeConfig,
+    NativeStorageShutdownOutcome, NativeStorageStartOutcome,
 };
 
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const SERVER_LIFECYCLE_SCHEMA_VERSION: u8 = 1;
 const SERVER_READY_SCHEMA_VERSION: u8 = 2;
 
-/// Runs the server-owned legacy runtime until the process receives a shutdown signal.
+/// Runs the server-owned legacy runtime until shutdown or dynamic readiness loss.
 ///
 /// On Unix, this function installs and owns the `SIGINT` and `SIGTERM` subscriptions before any
-/// listener is started. After the first signal it closes adapter admission, stops Gateway before
-/// master, and returns an error if any component fails to stop cleanly.
+/// listener is started. After the first signal it closes adapter admission and stops Gateway
+/// before master. A running component that loses readiness triggers the same ordered shutdown and
+/// returns an error so detached launchers cannot keep reporting a stale ready record.
 ///
 /// # Errors
 ///
@@ -57,31 +70,72 @@ pub fn run_server_daemon(config: LegacyServerRuntimeConfig) -> Result<(), Server
                 format!("install server signal handlers: {error}"),
             )
         })?;
-        run_server_daemon_with_waiter(config, move |_| {
-            signals.forever().next().map(signal_name).ok_or_else(|| {
-                ServerError::new(
-                    ErrorCode::Unavailable,
-                    "server signal iterator closed before shutdown",
-                )
+        run_server_daemon_with_waiter(config, move |runtime| {
+            wait_for_shutdown_or_runtime_failure(runtime, || {
+                signals.pending().next().map(signal_name)
             })
         })
     }
 
     #[cfg(not(unix))]
     {
-        run_server_daemon_with_waiter(config, |_| {
-            let (sender, receiver) = mpsc::channel::<()>();
-            let result = receiver.recv();
-            drop(sender);
-            result.map_err(|error| {
-                ServerError::new(
-                    ErrorCode::Unavailable,
-                    format!("wait for server shutdown: {error}"),
-                )
-            })?;
-            Ok("external")
+        let (sender, receiver) = mpsc::channel::<()>();
+        run_server_daemon_with_waiter(config, move |runtime| {
+            let _sender = sender;
+            wait_for_shutdown_or_runtime_failure(runtime, || {
+                receiver.try_recv().ok().map(|()| "external")
+            })
         })
     }
+}
+
+fn wait_for_shutdown_or_runtime_failure<F>(
+    runtime: &LegacyServerRuntime,
+    mut poll_shutdown: F,
+) -> Result<&'static str, ServerError>
+where
+    F: FnMut() -> Option<&'static str>,
+{
+    loop {
+        if let Some(error) = runtime_failure(runtime) {
+            return Err(error);
+        }
+        if let Some(signal) = poll_shutdown() {
+            if let Some(error) = runtime_failure(runtime) {
+                return Err(error);
+            }
+            return Ok(signal);
+        }
+        thread::sleep(DAEMON_HEALTH_POLL_INTERVAL);
+    }
+}
+
+fn runtime_failure(runtime: &LegacyServerRuntime) -> Option<ServerError> {
+    if let Some(error) = runtime.terminal_failure() {
+        return Some(error);
+    }
+    let health = runtime.health();
+    if health.readiness.is_ready() {
+        return None;
+    }
+    Some(ServerError::new(
+        ErrorCode::Unavailable,
+        format!(
+            "server runtime lost readiness admission_open=[{}] \
+             master_listener_ready=[{}] gateway_configured=[{}] \
+             gateway_listener_ready=[{}] gateway_master_reachable=[{}] \
+             native_storage_configured=[{}] native_catalog_ready=[{}] \
+             native_current_snapshot_files_ready=[{}]",
+            health.readiness.admission_open,
+            health.readiness.master_listener_ready,
+            health.readiness.gateway_configured,
+            health.readiness.gateway_listener_ready,
+            health.readiness.gateway_master_reachable,
+            health.readiness.native_storage_configured,
+            health.readiness.native_catalog_ready,
+            health.readiness.native_current_snapshot_files_ready,
+        ),
+    ))
 }
 
 fn run_server_daemon_with_waiter<F>(
@@ -89,7 +143,7 @@ fn run_server_daemon_with_waiter<F>(
     wait_for_shutdown: F,
 ) -> Result<(), ServerError>
 where
-    F: FnOnce(&LegacyServerRuntime) -> Result<&'static str, ServerError>,
+    F: FnOnce(&mut LegacyServerRuntime) -> Result<&'static str, ServerError>,
 {
     let launcher_state = validate_ready_configuration(&config)?;
     let ready_file = config.ready_file.clone();
@@ -104,27 +158,30 @@ where
         ) {
             runtime.begin_shutdown();
             let outcome = runtime.shutdown();
-            return match shutdown_outcome_error(&outcome) {
-                Some(shutdown_error) => Err(ServerError::new(
-                    ErrorCode::Unavailable,
-                    format!("{ready_error}; {shutdown_error}"),
-                )),
-                None => Err(ready_error),
-            };
+            return Err(combine_daemon_failure(
+                ready_error,
+                None,
+                shutdown_outcome_error(&outcome),
+            ));
         }
     }
-    let shutdown_signal = match wait_for_shutdown(&runtime) {
+    let shutdown_signal = match wait_for_shutdown(&mut runtime) {
         Ok(signal) => signal,
         Err(wait_error) => {
+            let state_transition_error = transition_daemon_state(
+                ready_file.as_deref(),
+                launch_nonce.as_deref(),
+                launcher_state.as_ref(),
+                "failed",
+                Some(wait_error.code()),
+            );
             runtime.begin_shutdown();
             let outcome = runtime.shutdown();
-            return match shutdown_outcome_error(&outcome) {
-                Some(shutdown_error) => Err(ServerError::new(
-                    ErrorCode::Unavailable,
-                    format!("{wait_error}; {shutdown_error}"),
-                )),
-                None => Err(wait_error),
-            };
+            return Err(combine_daemon_failure(
+                wait_error,
+                state_transition_error,
+                shutdown_outcome_error(&outcome),
+            ));
         }
     };
 
@@ -137,12 +194,218 @@ where
         "received server shutdown signal"
     );
 
+    let stopping_transition_error = transition_daemon_state(
+        ready_file.as_deref(),
+        launch_nonce.as_deref(),
+        launcher_state.as_ref(),
+        "stopping",
+        None,
+    );
     runtime.begin_shutdown();
     let outcome = runtime.shutdown();
-    match shutdown_outcome_error(&outcome) {
+    let shutdown_error = shutdown_outcome_error(&outcome);
+    if let Some(terminal_error) = runtime.terminal_failure() {
+        let failed_transition_error = transition_daemon_state(
+            ready_file.as_deref(),
+            launch_nonce.as_deref(),
+            launcher_state.as_ref(),
+            "failed",
+            Some(terminal_error.code()),
+        );
+        return Err(combine_daemon_failure(
+            terminal_error,
+            combine_optional_errors(stopping_transition_error, failed_transition_error),
+            shutdown_error,
+        ));
+    }
+    if let Some(shutdown_error) = shutdown_error {
+        let failed_transition_error = transition_daemon_state(
+            ready_file.as_deref(),
+            launch_nonce.as_deref(),
+            launcher_state.as_ref(),
+            "failed",
+            Some(shutdown_error.code()),
+        );
+        return Err(combine_daemon_failure(
+            shutdown_error,
+            combine_optional_errors(stopping_transition_error, failed_transition_error),
+            None,
+        ));
+    }
+    match stopping_transition_error {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+fn invalidate_ready_record(path: &Path) -> Result<(), ServerError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ready_io_error("invalidate", path, error)),
+    }
+}
+
+fn transition_daemon_state(
+    ready_file: Option<&Path>,
+    launch_nonce: Option<&str>,
+    launcher_state: Option<&ServerLauncherState>,
+    status: &'static str,
+    error_code: Option<ErrorCode>,
+) -> Option<ServerError> {
+    let ready_file = ready_file?;
+    let transition =
+        publish_daemon_transition(ready_file, launch_nonce, launcher_state, status, error_code);
+    match transition {
+        Ok(()) => None,
+        Err(transition_error) => match invalidate_ready_record(ready_file) {
+            Ok(()) => Some(transition_error),
+            Err(invalidation_error) => Some(append_secondary_error(
+                transition_error,
+                &invalidation_error,
+            )),
+        },
+    }
+}
+
+fn publish_daemon_transition(
+    ready_file: &Path,
+    launch_nonce: Option<&str>,
+    launcher_state: Option<&ServerLauncherState>,
+    status: &'static str,
+    error_code: Option<ErrorCode>,
+) -> Result<(), ServerError> {
+    if !matches!(status, "stopping" | "failed") || (status == "failed") != error_code.is_some() {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server daemon transition requires stopping or failed state with a matching code",
+        ));
+    }
+    let launch_nonce = launch_nonce
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "server daemon transition requires a non-empty launch nonce",
+            )
+        })?;
+    let launcher_state = launcher_state.ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::InvalidArgument,
+            "server daemon transition requires launcher state",
+        )
+    })?;
+    let record = ServerTransitionRecord {
+        schema_version: SERVER_LIFECYCLE_SCHEMA_VERSION,
+        status,
+        launch_nonce,
+        pid: std::process::id(),
+        error_code: error_code.map(ErrorCode::as_str),
+        launcher: launcher_state,
+    };
+    let payload = serde_json::to_vec_pretty(&record).map_err(|error| {
+        ServerError::new(
+            ErrorCode::Internal,
+            format!("serialize server daemon transition: {error}"),
+        )
+    })?;
+    write_owner_only_transition(ready_file, status, &payload)
+}
+
+fn write_owner_only_transition(
+    ready_file: &Path,
+    status: &str,
+    payload: &[u8],
+) -> Result<(), ServerError> {
+    let parent = ready_file.parent().ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "server ready file has no parent path=[{}]",
+                ready_file.display()
+            ),
+        )
+    })?;
+    let temporary = ready_file.with_extension(format!("{}.{}.tmp", std::process::id(), status));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let write_result = (|| {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| ready_io_error("create transition file", &temporary, error))?;
+        file.write_all(payload)
+            .map_err(|error| ready_io_error("write transition file", &temporary, error))?;
+        file.sync_all()
+            .map_err(|error| ready_io_error("sync transition file", &temporary, error))?;
+        fs::rename(&temporary, ready_file)
+            .map_err(|error| ready_io_error("publish transition", ready_file, error))?;
+        #[cfg(unix)]
+        OpenOptions::new()
+            .read(true)
+            .open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| ready_io_error("sync transition parent", parent, error))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn combine_daemon_failure(
+    primary: ServerError,
+    state_transition: Option<ServerError>,
+    shutdown: Option<ServerError>,
+) -> ServerError {
+    let mut combined = primary;
+    if let Some(state_error) = state_transition {
+        combined = append_secondary_error(combined, &state_error);
+    }
+    if let Some(shutdown_error) = shutdown {
+        combined = append_secondary_error(combined, &shutdown_error);
+    }
+    combined
+}
+
+fn combine_optional_errors(
+    primary: Option<ServerError>,
+    secondary: Option<ServerError>,
+) -> Option<ServerError> {
+    match (primary, secondary) {
+        (Some(primary), Some(secondary)) => Some(append_secondary_error(primary, &secondary)),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
+    }
+}
+
+fn append_secondary_error(primary: ServerError, secondary: &ServerError) -> ServerError {
+    let request_id = primary.request_id();
+    let query_id = primary.query_id();
+    let table_id = primary.table_id();
+    let details = primary.details().cloned();
+    let mut combined = ServerError::new(
+        primary.code(),
+        format!("{primary}; secondary daemon failure=[{secondary}]"),
+    )
+    .with_retryable(primary.retryable());
+    if let Some(request_id) = request_id {
+        combined = combined.with_request_id(request_id);
+    }
+    if let Some(query_id) = query_id {
+        combined = combined.with_query_id(query_id);
+    }
+    if let Some(table_id) = table_id {
+        combined = combined.with_table_id(table_id);
+    }
+    if let Some(details) = details {
+        if let Ok(with_details) = combined.clone().with_details(details) {
+            combined = with_details;
+        }
+    }
+    combined
 }
 
 fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<ServerError> {
@@ -334,6 +597,17 @@ struct ServerReadyRecord<'a> {
     launcher: Option<&'a ServerLauncherState>,
 }
 
+#[derive(Serialize)]
+struct ServerTransitionRecord<'a> {
+    schema_version: u8,
+    status: &'static str,
+    launch_nonce: &'a str,
+    pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
+    launcher: &'a ServerLauncherState,
+}
+
 fn validate_ready_configuration(
     config: &LegacyServerRuntimeConfig,
 ) -> Result<Option<ServerLauncherState>, ServerError> {
@@ -374,7 +648,7 @@ fn load_launcher_state(
             "server starting record does not match the typed schema",
         )
     })?;
-    if record.schema_version != 1
+    if record.schema_version != SERVER_LIFECYCLE_SCHEMA_VERSION
         || record.status != "starting"
         || record.launch_nonce != launch_nonce
         || record.pid != std::process::id()
@@ -586,6 +860,10 @@ pub struct LegacyServerRuntimeHealth {
     pub readiness: LegacyServerReadiness,
     /// Capability-aware catalog and query health.
     pub services: LegacyServerHealth,
+    /// Shadow migration status; degradation does not close Legacy authority admission.
+    pub legacy_catalog_migration: LegacyCatalogMigrationStatus,
+    /// Process-local snapshot pin admission state when native storage is configured.
+    pub catalog_runtime_snapshot_pins: Option<SqliteCatalogRuntimeSnapshotPinStatus>,
 }
 
 /// Complete result of a server-owned shutdown attempt.
@@ -703,6 +981,7 @@ pub struct LegacyServerRuntime {
     readiness: LegacyServerReadiness,
     shutdown_outcome: Option<LegacyServerShutdownOutcome>,
     native_storage: Option<NativeStorageRuntime>,
+    legacy_catalog_migration: LegacyCatalogMigrationStatus,
     data_directory: Option<Arc<OwnedDataDirectory>>,
 }
 
@@ -727,8 +1006,13 @@ impl LegacyServerRuntime {
         reject_ephemeral_master_endpoint(&control_endpoint)?;
 
         let native_storage_configured = runtime_config.server.native_storage_enabled;
-        let mut native_storage =
-            start_native_storage_if_enabled(&runtime_config, &data_directory, startup_deadline)?;
+        let legacy_catalog_migration = prepare_legacy_catalog_migration(&runtime_config, &master);
+        let mut native_storage = start_native_storage_if_enabled(
+            &runtime_config,
+            &data_directory,
+            startup_deadline,
+            legacy_catalog_migration,
+        )?;
         let mut master_listener = match start_master_listener(
             &master,
             &control_endpoint,
@@ -762,8 +1046,29 @@ impl LegacyServerRuntime {
             );
             return Err(with_startup_rollback(error, rollback));
         }
-        let mut gateway = match start_legacy_gateway_if_enabled(&runtime_config, &control_endpoint)
-        {
+        let persisted_read_snapshot_source = match gateway_persisted_read_snapshot_source(
+            &runtime_config,
+            native_storage.as_ref(),
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                let mut no_gateway = None;
+                let rollback = rollback_startup(
+                    &master,
+                    &mut master_listener,
+                    &mut no_gateway,
+                    &mut native_storage,
+                    None,
+                    shutdown_timeout,
+                );
+                return Err(with_startup_rollback(error, rollback));
+            }
+        };
+        let mut gateway = match start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
+            &runtime_config,
+            &control_endpoint,
+            persisted_read_snapshot_source,
+        ) {
             Ok(gateway) => gateway,
             Err(error) => {
                 let mut no_gateway = None;
@@ -914,6 +1219,11 @@ impl LegacyServerRuntime {
             },
             "zippy server runtime is ready"
         );
+        let legacy_catalog_migration = native_storage
+            .as_ref()
+            .map(NativeStorageRuntime::legacy_catalog_migration_status)
+            .cloned()
+            .unwrap_or_else(LegacyCatalogMigrationStatus::disabled);
 
         Ok(Self {
             control_endpoint,
@@ -927,6 +1237,7 @@ impl LegacyServerRuntime {
             readiness,
             shutdown_outcome: None,
             native_storage,
+            legacy_catalog_migration,
             data_directory: Some(data_directory),
         })
     }
@@ -941,6 +1252,27 @@ impl LegacyServerRuntime {
     #[must_use]
     pub fn gateway_endpoint(&self) -> Option<&str> {
         self.gateway_endpoint.as_deref()
+    }
+
+    /// Returns a point-in-time Gateway metrics snapshot when the listener is enabled.
+    ///
+    /// In `sqlite_shadow` mode this includes bounded persisted-read comparison counters and the
+    /// worker lifecycle state used by readiness diagnostics and the operations UI.
+    #[must_use]
+    pub fn gateway_metrics(&self) -> Option<serde_json::Value> {
+        self.gateway.as_ref().map(GatewayServer::metrics)
+    }
+
+    /// Returns the structured legacy-to-SQLite Catalog startup migration status.
+    #[must_use]
+    pub const fn legacy_catalog_migration_status(&self) -> &LegacyCatalogMigrationStatus {
+        &self.legacy_catalog_migration
+    }
+
+    /// Returns bounded migration counters suitable for status and metrics endpoints.
+    #[must_use]
+    pub fn legacy_catalog_migration_metrics(&self) -> serde_json::Value {
+        self.legacy_catalog_migration.metrics()
     }
 
     /// Returns the validated runtime configuration shared by master and Gateway.
@@ -1030,7 +1362,18 @@ impl LegacyServerRuntime {
             mode: self.mode(),
             readiness,
             services,
+            legacy_catalog_migration: self.legacy_catalog_migration.clone(),
+            catalog_runtime_snapshot_pins: self
+                .native_storage
+                .as_ref()
+                .and_then(|storage| storage.runtime_snapshot_pin_status().ok()),
         }
+    }
+
+    fn terminal_failure(&self) -> Option<ServerError> {
+        self.native_storage
+            .as_ref()
+            .and_then(NativeStorageRuntime::terminal_failure)
     }
 
     /// Irreversibly closes adapter admission before component shutdown begins.
@@ -1156,6 +1499,7 @@ fn start_native_storage_if_enabled(
     runtime_config: &ZippyConfig,
     data_directory: &Arc<OwnedDataDirectory>,
     startup_deadline: Instant,
+    legacy_catalog_migration: LegacyCatalogMigrationStartup,
 ) -> Result<Option<NativeStorageRuntime>, ServerError> {
     if !runtime_config.server.native_storage_enabled {
         return Ok(None);
@@ -1167,11 +1511,16 @@ fn start_native_storage_if_enabled(
             .max_parallelism
             .min(MAX_PERSIST_PARALLEL_WRITERS),
     );
-    match NativeStorageRuntime::start_until(
-        NativeStorageRuntimeConfig::new(data_directory)
-            .with_persist_controller_config(persist_controller),
-        startup_deadline,
-    ) {
+    let runtime_snapshot_pins = runtime_config.catalog.runtime_snapshot_pins;
+    let catalog = SqliteCatalogConfig::new(data_directory).with_runtime_snapshot_pin_limits(
+        runtime_snapshot_pins.max_active_pins,
+        runtime_snapshot_pins.max_active_tables,
+    );
+    let native_storage = NativeStorageRuntimeConfig::new(data_directory)
+        .with_catalog_config(catalog)?
+        .with_persist_controller_config(persist_controller)
+        .with_legacy_catalog_migration(legacy_catalog_migration);
+    match NativeStorageRuntime::start_until(native_storage, startup_deadline) {
         NativeStorageStartOutcome::Ready(runtime) => Ok(Some(runtime)),
         NativeStorageStartOutcome::TimedOut(startup) => {
             let deadline_error = ServerError::new(
@@ -1191,6 +1540,89 @@ fn start_native_storage_if_enabled(
             }
         }
         NativeStorageStartOutcome::Failed(error) => Err(with_stage("start native storage", error)),
+    }
+}
+
+fn prepare_legacy_catalog_migration(
+    runtime_config: &ZippyConfig,
+    master: &MasterServer,
+) -> LegacyCatalogMigrationStartup {
+    if !runtime_config.server.native_storage_enabled
+        || runtime_config.catalog.backend != ZippyCatalogBackend::SqliteShadow
+    {
+        return LegacyCatalogMigrationStartup::Disabled;
+    }
+
+    let snapshot = match master.legacy_catalog_adapter().capture_migration_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return LegacyCatalogMigrationStartup::Degraded(
+                LegacyCatalogMigrationDegradation::from_error(
+                    LegacyCatalogMigrationDegradedReason::CaptureFailed,
+                    &error,
+                ),
+            );
+        }
+    };
+    match plan_legacy_catalog_metadata_import(&snapshot) {
+        Ok(plan) => LegacyCatalogMigrationStartup::Planned(plan),
+        Err(error) => {
+            LegacyCatalogMigrationStartup::Degraded(LegacyCatalogMigrationDegradation::from_error(
+                LegacyCatalogMigrationDegradedReason::PlanningFailed,
+                &error,
+            ))
+        }
+    }
+}
+
+fn gateway_persisted_read_snapshot_source(
+    runtime_config: &ZippyConfig,
+    native_storage: Option<&NativeStorageRuntime>,
+) -> Result<Arc<dyn PersistedReadSnapshotSource>, ServerError> {
+    let legacy: Arc<dyn PersistedReadSnapshotSource> = Arc::new(LegacyPersistedReadSnapshotSource);
+    if !runtime_config.gateway.enabled
+        || runtime_config.catalog.backend == ZippyCatalogBackend::Legacy
+    {
+        return Ok(legacy);
+    }
+
+    match runtime_config.catalog.backend {
+        ZippyCatalogBackend::Legacy => Ok(legacy),
+        ZippyCatalogBackend::SqliteShadow => {
+            let native_storage = native_storage.ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "catalog sqlite_shadow requires a running native storage runtime",
+                )
+            })?;
+            let configured = &runtime_config.catalog.shadow;
+            let shadow = Arc::new(
+                SqliteCatalogPersistedReadShadowSource::new(
+                    native_storage.catalog_read_handle(),
+                    configured.max_files_per_comparison,
+                    configured.max_metadata_bytes_per_comparison,
+                )
+                .map_err(|error| map_core_error("configure SQLite Catalog shadow source", error))?,
+            );
+            let source = ShadowPersistedReadSnapshotSource::new(
+                legacy,
+                shadow,
+                PersistedReadShadowConfig {
+                    queue_capacity: configured.queue_capacity,
+                    metadata_budget_bytes: configured.metadata_budget_bytes,
+                    max_files_per_comparison: configured.max_files_per_comparison,
+                    max_metadata_bytes_per_comparison: configured.max_metadata_bytes_per_comparison,
+                    comparison_timeout_ms: configured.comparison_timeout_ms,
+                    dedup_capacity: configured.dedup_capacity,
+                },
+            )
+            .map_err(|error| map_core_error("configure gateway persisted-read shadow", error))?;
+            Ok(Arc::new(source))
+        }
+        ZippyCatalogBackend::Sqlite => Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "catalog sqlite authority is unavailable before migration cutover",
+        )),
     }
 }
 
@@ -1495,19 +1927,169 @@ fn map_core_error(stage: &str, error: ZippyError) -> ServerError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+    use zippy_core::OwnedDataDirectory;
+    use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
+    use zippy_types::catalog::{
+        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
+        CreateNamespaceCommand, CreateTableCommand, VersionedCatalogCommand,
+    };
+    use zippy_types::table::{
+        AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance,
+        SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
+        TableDefinition,
+    };
+    use zippy_types::{
+        FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
+    };
+
     use super::*;
+
+    const DAEMON_TEST_NAMESPACE_ID: u128 = 91;
+    const DAEMON_TEST_TABLE_ID: u128 = 92;
 
     fn runtime_test_log_dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "zippy-server-runtime-unit-test-logs-{}",
             std::process::id()
         ))
+    }
+
+    fn daemon_test_namespace_id() -> NamespaceId {
+        NamespaceId::from_u128(DAEMON_TEST_NAMESPACE_ID).unwrap()
+    }
+
+    fn daemon_test_table_id() -> TableId {
+        TableId::from_u128(DAEMON_TEST_TABLE_ID).unwrap()
+    }
+
+    fn daemon_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Int64,
+            false,
+        )]))
+    }
+
+    fn daemon_test_schema_ipc(schema: &Schema) -> SchemaIpcPayload {
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, schema).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        SchemaIpcPayload::new(bytes).unwrap()
+    }
+
+    fn daemon_catalog_command(
+        request_id: u128,
+        expected_revision: u64,
+        command: CatalogCommandV1,
+    ) -> VersionedCatalogCommand {
+        CatalogCommandEnvelopeV1::new(
+            RequestId::from_u128(request_id).unwrap(),
+            Some(expected_revision),
+            CatalogActor {
+                kind: CatalogActorKind::Server,
+                principal: "daemon-runtime-test".to_owned(),
+            },
+            command,
+        )
+        .unwrap()
+        .into()
+    }
+
+    fn prepare_daemon_native_table(data_path: &Path) {
+        let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(data_path).unwrap());
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+        let async_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        async_runtime.block_on(async {
+            catalog
+                .command(daemon_catalog_command(
+                    1,
+                    0,
+                    CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                        namespace_id: daemon_test_namespace_id(),
+                        name: CatalogName::new("market").unwrap(),
+                    }),
+                ))
+                .await
+                .unwrap();
+            catalog
+                .command(daemon_catalog_command(
+                    2,
+                    1,
+                    CatalogCommandV1::CreateTable(CreateTableCommand {
+                        table_id: daemon_test_table_id(),
+                        namespace_id: daemon_test_namespace_id(),
+                        name: CatalogName::new("ticks").unwrap(),
+                        definition: TableDefinition::Append(AppendTableDefinition::default()),
+                        schema_ipc: daemon_test_schema_ipc(daemon_test_schema().as_ref()),
+                        config: BTreeMap::new(),
+                    }),
+                ))
+                .await
+                .unwrap();
+        });
+        catalog.close().unwrap();
+    }
+
+    fn daemon_test_persist_request(file_id: FileId) -> PersistRequest {
+        let offsets = OffsetRange::new(LogOffset::new(0), LogOffset::new(0)).unwrap();
+        let provenance = NativeDataFileProvenance::new(
+            offsets,
+            SourceSegmentLineages::new(vec![SourceSegmentLineage {
+                source: SourceSegmentIdentity {
+                    segment_id: 1,
+                    generation: 1,
+                    writer_epoch: 0,
+                },
+                offsets,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let schema = daemon_test_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .unwrap();
+        let candidate = PersistCandidateInput::new(
+            ParquetCandidateSpec {
+                file_id,
+                table_id: daemon_test_table_id(),
+                schema_version: 1,
+                schema,
+                provenance,
+                partition: MetadataMap::new(),
+                metadata: MetadataMap::new(),
+                created_at_ns: 1_752_492_600_000_000_000,
+            },
+            vec![batch],
+        )
+        .unwrap();
+        PersistRequest::new(
+            RequestId::from_u128(93).unwrap(),
+            daemon_test_table_id(),
+            1,
+            vec![candidate],
+            OffsetWatermark::Known(LogOffset::new(0)),
+        )
+        .unwrap()
     }
 
     fn test_starting_record(
@@ -1718,6 +2300,102 @@ token = "must-not-appear-in-ready-record"
             Ok("TEST")
         })
         .unwrap();
+
+        let stopping: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ready_path).unwrap()).unwrap();
+        assert_eq!(stopping["schema_version"], SERVER_LIFECYCLE_SCHEMA_VERSION);
+        assert_eq!(stopping["status"], "stopping");
+        assert!(stopping.get("error_code").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_fails_fast_and_transitions_state_after_native_health_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("failed-native-daemon.sock");
+        let ready_path = temp.path().join("server-ready.json");
+        let data_path = temp.path().join("database");
+        let config_path = temp.path().join("zippy.toml");
+        prepare_daemon_native_table(&data_path);
+        fs::write(
+            &config_path,
+            format!(
+                concat!(
+                    "[server]\n",
+                    "data_dir = {:?}\n",
+                    "native_storage_enabled = true\n\n",
+                    "[master]\n",
+                    "shutdown_timeout_ms = 1000\n"
+                ),
+                data_path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let control_endpoint = ControlEndpoint::Unix(socket_path.clone());
+        write_test_starting_record(
+            &ready_path,
+            &control_endpoint,
+            "launch-nonce-native-failure",
+        );
+        let master = MasterDaemonConfig::new(control_endpoint)
+            .with_config_path(config_path)
+            .with_logging(runtime_test_log_dir(), "info", false);
+        let config = LegacyServerRuntimeConfig::new(master)
+            .with_ready_file(&ready_path, "launch-nonce-native-failure");
+
+        let error = run_server_daemon_with_waiter(config, |runtime| {
+            assert!(runtime.health().readiness.is_ready());
+            assert!(ready_path.is_file());
+            let actor = runtime
+                .native_storage
+                .as_ref()
+                .expect("native storage is configured")
+                .table_actor(daemon_test_table_id())
+                .unwrap();
+            let file_id = FileId::from_u128(94).unwrap();
+            let table_directory = data_path
+                .join("parquet")
+                .join(daemon_test_table_id().to_string());
+            fs::create_dir(&table_directory).unwrap();
+            fs::set_permissions(&table_directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let conflicting_path = table_directory.join(format!("{file_id}.parquet"));
+            fs::write(&conflicting_path, b"injected conflicting parquet identity").unwrap();
+            fs::set_permissions(&conflicting_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let async_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut failure_injected = false;
+            wait_for_shutdown_or_runtime_failure(runtime, || {
+                if !failure_injected {
+                    failure_injected = true;
+                    let persist_error = async_runtime
+                        .block_on(actor.persist(daemon_test_persist_request(file_id)))
+                        .unwrap_err();
+                    assert_eq!(persist_error.code(), ErrorCode::DataCorruption);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while runtime.terminal_failure().is_none() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(runtime.terminal_failure().is_some());
+                }
+                Some("SIGTERM")
+            })
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        let failed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ready_path).unwrap()).unwrap();
+        assert_eq!(failed["schema_version"], SERVER_LIFECYCLE_SCHEMA_VERSION);
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error_code"], "DATA_CORRUPTION");
+        assert_eq!(
+            fs::metadata(&ready_path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert!(!socket_path.exists());
+        assert!(!socket_path.with_extension("sock.owner").exists());
     }
 
     #[cfg(unix)]
@@ -1780,6 +2458,27 @@ token = "must-not-appear-in-ready-record"
 
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
         assert!(error.message().contains("process-1"));
+    }
+
+    #[test]
+    fn daemon_cleanup_failures_do_not_replace_the_terminal_error_code() {
+        let primary = ServerError::new(ErrorCode::DataCorruption, "native storage failed")
+            .with_table_id(daemon_test_table_id())
+            .with_retryable(false);
+        let transition = ServerError::new(ErrorCode::Unavailable, "state transition failed");
+        let shutdown = shutdown_outcome_error(&LegacyServerShutdownOutcome {
+            native_storage_outcome: Some(NativeStorageShutdownOutcome::TimedOut),
+            ..LegacyServerShutdownOutcome::default()
+        })
+        .unwrap();
+
+        let error = combine_daemon_failure(primary, Some(transition), Some(shutdown));
+
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error.table_id(), Some(daemon_test_table_id()));
+        assert!(!error.retryable());
+        assert!(error.message().contains("state transition failed"));
+        assert!(error.message().contains("server shutdown incomplete"));
     }
 
     #[test]

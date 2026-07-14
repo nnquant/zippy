@@ -1854,8 +1854,11 @@ Catalog commit coordinator 已实现单 worker FIFO、64 条/128 MiB command/8 G
 durable intent sidecar、commit-unknown 原 request ID 重放、响应复核、取消安全和启动前恢复。
 启动期 orphan reconciliation 已实现规范化物理扫描、durable intent 保护、`FileId + managed path`
 同事务双键 probe、全程 revision 稳定性检查以及只读分类报告；扫描、验证、intent 总字节和报告
-常驻元数据均有独立预算，多文件 intent 必须整体 exact 或整体 unreferenced。它刻意不删除文件，
-在线删除仍需 publication gate，普通历史文件删除还依赖 snapshot lease 和 Catalog GC 状态机。反向
+常驻元数据均有独立预算，多文件 intent 必须整体 exact 或整体 unreferenced。只读 report 方法刻意不删除文件，
+但 server 在 admission 仍关闭的私有启动阶段会删除 candidate/intent 临时文件和完整复核后的 orphan，
+随后再执行一次完整 reconciliation。在线 definitive rejection 只消费 coordinator 创建的不可复制
+cleanup token，并在 Catalog publication exclusion 内完成 revision、引用、物理身份复核和 unlink；
+普通历史文件删除仍依赖 snapshot lease 和 Catalog GC 状态机。反向
 `StartupCatalogFileVerifier` 已按固定 revision 分页读取 active table/current snapshot，并在 ready 前
 通过 data-root/table directory fd 逐级 `openat(O_NOFOLLOW)`，有界核验每个当前可见 managed 文件的
 路径归属、大小、checksum、Parquet footer 和 row count；缺失、symlink 替换或内容损坏均 fail closed。
@@ -1892,9 +1895,18 @@ receipt 回到同一 actor 后再校验 request/table/parent/version/operation/L
 terminal failure 会在响应调用方前关闭全局 admission、拉低 native/server health，并按 actor、controller、
 Catalog 顺序清理。Catalog 持久 idempotency 记录存在期间，原 request ID 可在跨重启后返回原 receipt，
 actor 不会把较新 snapshot 回滚；同 ID 不同 fingerprint 返回 Conflict，且不会毒化后续写入。Gateway
-权威写入口仍未接入；冲突 replay 目前会先发布 candidate 再被 Catalog 拒绝，在线 orphan 回收又缺少
-publication gate；daemon 对外 status 也尚未跟随 native runtime 终态故障。因此 legacy Gateway 仍是业务
-写 authority，不能据此宣称 native ingest 已对外可用。
+权威写入口仍未接入。并行 writer 只生成 affine 临时 candidate；完整 envelope replay probe 发生在
+最终发布前，exact、fingerprint conflict 和 missing historical replay 都只删除临时文件，只有 missing
+advance 才能进入 publication gate。共享发布许可从 no-clobber publish 一直转移到 Catalog actor 的
+terminal result；拒绝清理取得独占许可，因此并发 Catalog mutation 不能穿过最后一次引用检查与 unlink。
+底层 durable-file 错误还会区分未发布与“最终目录项已创建但目录 fsync 未确认”，后者仍携带 cleanup
+authority。daemon 已每 50 ms 检查动态 readiness，并以共享 latch 保留首个 native 终态错误；每轮
+先查故障再查信号，收到信号后还会复核。native runtime 终态故障后会把同 generation 的 ready record
+原子迁移为带稳定 ErrorCode 的 failed，再关闭 server admission、执行有界清理并非零退出；cleanup 错误
+或超时只作为附加诊断，不覆盖首因。正常信号清理前迁移为 stopping，清理中 status 不再从旧 ready
+记录报告 healthy。detached outcome 同样保留稳定 ErrorCode，不再统一降级为 runtime_error。
+但由于 Gateway authority、snapshot lease 和普通历史文件 safe GC 仍未完成，legacy Gateway 仍是业务写 authority，不能据此
+宣称 native ingest 已对外可用。
 
 任务：
 

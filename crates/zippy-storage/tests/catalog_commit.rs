@@ -15,8 +15,8 @@ use zippy_storage::{
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogOutcomeV1,
-    CatalogRead, CatalogResponseV1, CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand,
-    CreateTableCommand, VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogPersistence, CatalogRead, CatalogResponseV1, CatalogSnapshotSelector, CatalogWrite,
+    CreateNamespaceCommand, CreateTableCommand, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance, SchemaIpcPayload,
@@ -339,10 +339,10 @@ async fn real_catalog_commit_publishes_one_exact_snapshot() {
     create_append_table(&catalog, &schema).await;
     let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
     let candidate = write_candidate(&writer, 20, 0, vec![100, 101]);
-    let coordinator = CatalogCommitCoordinator::start(
+    let coordinator = CatalogCommitCoordinator::start_with_persistence(
         CatalogCommitCoordinatorConfig::new(),
         Arc::clone(&owned),
-        Arc::clone(&catalog) as Arc<dyn CatalogWrite>,
+        Arc::clone(&catalog) as Arc<dyn CatalogPersistence>,
         server_actor(),
     )
     .await
@@ -388,10 +388,11 @@ async fn definitive_catalog_conflict_removes_intent_and_worker_continues() {
     let writer = ParquetCandidateWriter::new(Arc::clone(&owned));
     let first = write_candidate(&writer, 20, 0, vec![100]);
     let next = write_candidate(&writer, 21, 1, vec![101]);
-    let coordinator = CatalogCommitCoordinator::start(
+    let rejected_path = next.path().to_path_buf();
+    let coordinator = CatalogCommitCoordinator::start_with_persistence(
         CatalogCommitCoordinatorConfig::new(),
         Arc::clone(&owned),
-        Arc::clone(&catalog) as Arc<dyn CatalogWrite>,
+        Arc::clone(&catalog) as Arc<dyn CatalogPersistence>,
         server_actor(),
     )
     .await
@@ -402,14 +403,16 @@ async fn definitive_catalog_conflict_removes_intent_and_worker_continues() {
         .await
         .expect("commit first candidate");
     let conflict = coordinator
-        .commit(commit_intent(10, 2, 1, vec![next.clone()]))
+        .commit(commit_intent(10, 2, 1, vec![next]))
         .await
         .expect_err("request id reuse with another payload must conflict");
 
     assert_eq!(conflict.code(), ErrorCode::Conflict);
     assert_eq!(conflict.request_id(), Some(request_id(10)));
     assert!(intent_files(&root).is_empty());
+    assert!(rejected_path.exists());
 
+    let next = write_candidate(&writer, 21, 1, vec![101]);
     let receipt = coordinator
         .commit(commit_intent(11, 2, 1, vec![next]))
         .await

@@ -1,10 +1,11 @@
 //! Durable Parquet, manifest, WAL, and live-snapshot storage for one Zippy server.
 //!
-//! Immutable Parquet candidates are fully written, checksummed, fsynced, and
-//! published before Catalog admission. A bounded single-worker coordinator
-//! then journals the frozen Catalog envelope, retries commit-unknown responses
-//! with the same request ID, and removes the intent only after the atomic
-//! snapshot response is validated.
+//! Native persistence first writes immutable Parquet candidates to affine
+//! temporary-file tokens. The complete Catalog envelope is probed for durable
+//! idempotency before publication; only a missing current-snapshot advance may
+//! publish, journal, and commit. Commit-unknown responses replay the unchanged
+//! envelope, and rejected publications are removed only with exclusive cleanup
+//! authority plus fresh Catalog and physical-identity verification.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -32,7 +33,7 @@ pub use commit::{
 };
 pub use persist::{
     PersistCandidateInput, PersistCompletionFailure, PersistCompletionResult, PersistController,
-    PersistControllerConfig, PersistControllerFailureMonitor, PersistControllerHandle,
+    PersistControllerConfig, PersistControllerFailureMonitor, PersistControllerHandle, PersistMode,
     PersistRequest, PersistTicket, MAX_PERSIST_PARALLEL_WRITERS,
 };
 pub use reconcile::{

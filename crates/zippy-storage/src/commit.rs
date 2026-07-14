@@ -6,15 +6,19 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use zippy_core::OwnedDataDirectory;
 use zippy_types::catalog::{
-    CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
-    CatalogOutcomeV1, CatalogWrite, CommitDataFilesCommand, VersionedCatalogCommand,
-    VersionedCatalogResponse, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+    CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1,
+    CatalogCommandReplayProbe, CatalogCommandV1, CatalogDataFileProbeMatch, CatalogOutcomeV1,
+    CatalogPersistence, CatalogPublicationPermit, CatalogWrite, CommitDataFilesCommand,
+    ManagedDataFileProbe, VersionedCatalogCommand, VersionedCatalogResponse,
+    MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
 };
 use zippy_types::table::{SnapshotOperation, TableSnapshot};
 use zippy_types::{ErrorCode, OffsetWatermark, RequestId, Result, ServerError, TableId};
 
+use crate::candidate::{map_data_directory_error, verify_pending_candidate};
+use crate::candidate::{PublishedCandidateCleanup, StagedParquetCandidate};
 use crate::commit_intent::{CommitIntentJournal, DurableCommitIntent, MAX_FILES_PER_COMMIT_INTENT};
-use crate::DurableParquetCandidate;
+use crate::{DurableParquetCandidate, PersistMode};
 
 const DEFAULT_MAX_OUTSTANDING_COMMITS: usize = 64;
 const DEFAULT_MAX_OUTSTANDING_COMMAND_BYTES: usize = 128 * 1024 * 1024;
@@ -22,6 +26,7 @@ const DEFAULT_MAX_UNCOMMITTED_FILE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const DEFAULT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const CANDIDATE_BUDGET_UNIT_BYTES: u64 = 64 * 1024;
+const CLEANUP_PROBE_BATCH_SIZE: usize = 512;
 
 /// Bounded resource and retry policy for serialized Catalog file commits.
 #[derive(Debug, Clone)]
@@ -192,41 +197,16 @@ impl CommitDataFilesIntent {
             .into_iter()
             .map(DurableParquetCandidate::into_pending)
             .collect();
-        let envelope = CatalogCommandEnvelopeV1::new(
+        prepare_commit(
             self.request_id,
-            None,
+            self.table_id,
+            self.expected_snapshot_version,
+            self.committed_log_offset,
             actor,
-            CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
-                table_id: self.table_id,
-                expected_snapshot_version: self.expected_snapshot_version,
-                files,
-                committed_log_offset: self.committed_log_offset,
-            }),
-        )
-        .map_err(|error| {
-            terminal_invalid(format!(
-                "construct catalog data-file commit envelope error=[{error}]"
-            ))
-            .with_request_id(self.request_id)
-            .with_table_id(self.table_id)
-        })?;
-        let command: VersionedCatalogCommand = envelope.into();
-        let command_bytes = CatalogCodec::encode_command(&command)
-            .map_err(|error| {
-                terminal_invalid(format!(
-                    "encode catalog data-file commit envelope error=[{error}]"
-                ))
-                .with_request_id(self.request_id)
-                .with_table_id(self.table_id)
-            })?
-            .len();
-        Ok(PreparedCommit {
-            request_id: self.request_id,
-            table_id: self.table_id,
-            command,
-            command_bytes,
+            files,
             candidate_bytes,
-        })
+            Vec::new(),
+        )
     }
 }
 
@@ -254,6 +234,7 @@ pub struct CatalogCommitCoordinator {
     max_candidate_bytes: Option<u64>,
     actor: Option<JoinHandle<Result<()>>>,
     catalog_actor: CatalogActor,
+    persistence_catalog: Option<Arc<dyn CatalogPersistence>>,
 }
 
 /// Internal failure disposition for one coordinator request.
@@ -286,6 +267,68 @@ impl From<ServerError> for CatalogCommitFailure {
 pub(crate) type ClassifiedCommitResult =
     std::result::Result<CommitDataFilesReceipt, CatalogCommitFailure>;
 
+struct PersistenceCatalogWriter {
+    catalog: Arc<dyn CatalogPersistence>,
+}
+
+impl CatalogWrite for PersistenceCatalogWriter {
+    fn command(
+        &self,
+        command: VersionedCatalogCommand,
+    ) -> zippy_types::BoxFuture<'_, Result<VersionedCatalogResponse>> {
+        self.catalog.command(command)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_commit(
+    request_id: RequestId,
+    table_id: TableId,
+    expected_snapshot_version: u64,
+    committed_log_offset: OffsetWatermark,
+    actor: CatalogActor,
+    files: Vec<zippy_types::table::PendingDataFile>,
+    candidate_bytes: u64,
+    cleanup_tokens: Vec<PublishedCandidateCleanup>,
+) -> Result<PreparedCommit> {
+    let envelope = CatalogCommandEnvelopeV1::new(
+        request_id,
+        None,
+        actor,
+        CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
+            table_id,
+            expected_snapshot_version,
+            files,
+            committed_log_offset,
+        }),
+    )
+    .map_err(|error| {
+        terminal_invalid(format!(
+            "construct catalog data-file commit envelope error=[{error}]"
+        ))
+        .with_request_id(request_id)
+        .with_table_id(table_id)
+    })?;
+    let command: VersionedCatalogCommand = envelope.into();
+    let command_bytes = CatalogCodec::encode_command(&command)
+        .map_err(|error| {
+            terminal_invalid(format!(
+                "encode catalog data-file commit envelope error=[{error}]"
+            ))
+            .with_request_id(request_id)
+            .with_table_id(table_id)
+        })?
+        .len();
+    Ok(PreparedCommit {
+        request_id,
+        table_id,
+        command,
+        command_bytes,
+        candidate_bytes,
+        cleanup_tokens,
+    })
+}
+
 impl CatalogCommitCoordinator {
     /// Starts the coordinator after replaying every durable pending intent.
     ///
@@ -297,9 +340,37 @@ impl CatalogCommitCoordinator {
         catalog: Arc<dyn CatalogWrite>,
         actor: CatalogActor,
     ) -> Result<Self> {
+        Self::start_inner(config, data_directory, catalog, None, actor).await
+    }
+
+    /// Starts a native persistence coordinator with read-before-publish support.
+    ///
+    /// This is the production constructor for [`crate::PersistController`]. It
+    /// requires durable idempotency probing and exact file-reference reads so
+    /// historical replay never publishes and rejected publications can be
+    /// removed only after Catalog proves them unreferenced.
+    pub async fn start_with_persistence(
+        config: CatalogCommitCoordinatorConfig,
+        data_directory: Arc<OwnedDataDirectory>,
+        catalog: Arc<dyn CatalogPersistence>,
+        actor: CatalogActor,
+    ) -> Result<Self> {
+        let writer: Arc<dyn CatalogWrite> = Arc::new(PersistenceCatalogWriter {
+            catalog: Arc::clone(&catalog),
+        });
+        Self::start_inner(config, data_directory, writer, Some(catalog), actor).await
+    }
+
+    async fn start_inner(
+        config: CatalogCommitCoordinatorConfig,
+        data_directory: Arc<OwnedDataDirectory>,
+        catalog: Arc<dyn CatalogWrite>,
+        persistence_catalog: Option<Arc<dyn CatalogPersistence>>,
+        actor: CatalogActor,
+    ) -> Result<Self> {
         validate_config(&config)?;
         validate_actor(&actor)?;
-        let journal = Arc::new(CommitIntentJournal::new(data_directory));
+        let journal = Arc::new(CommitIntentJournal::new(Arc::clone(&data_directory)));
         let recovery_journal = Arc::clone(&journal);
         let (pending, next_sequence) = tokio::task::spawn_blocking(move || recovery_journal.scan())
             .await
@@ -311,14 +382,27 @@ impl CatalogCommitCoordinator {
             let loaded = tokio::task::spawn_blocking(move || recovery_journal.load(&path))
                 .await
                 .map_err(|error| actor_join_error("load durable commit intent", error))??;
-            match execute_intent(&journal, &catalog, &config, loaded).await? {
+            match execute_intent(
+                &journal,
+                &catalog,
+                persistence_catalog.as_deref(),
+                &config,
+                loaded,
+                None,
+            )
+            .await?
+            {
                 IntentExecution::Committed(_) => {}
-                IntentExecution::DefinitiveRejection(error) => {
+                IntentExecution::DefinitiveRejection { error, intent } => {
+                    remove_rejected_intent(&journal, &intent).await?;
                     tracing::warn!(
                         request_id = %error.request_id().unwrap_or(request_id),
                         code = %error.code(),
                         error = %error,
-                        "discarded recovered durable intent after definitive Catalog rejection"
+                        concat!(
+                            "discarded recovered durable intent after definitive Catalog ",
+                            "rejection; startup reconciliation owns any resulting orphan"
+                        )
                     );
                 }
             }
@@ -329,7 +413,9 @@ impl CatalogCommitCoordinator {
             receiver,
             next_sequence,
             journal,
+            Arc::clone(&data_directory),
             catalog,
+            persistence_catalog.clone(),
             config.clone(),
         ));
         let count_budget = Arc::new(Semaphore::new(config.max_outstanding_commits));
@@ -349,6 +435,7 @@ impl CatalogCommitCoordinator {
             max_candidate_bytes: config.max_uncommitted_file_bytes,
             actor: Some(worker),
             catalog_actor: actor,
+            persistence_catalog,
         })
     }
 
@@ -379,6 +466,117 @@ impl CatalogCommitCoordinator {
         let prepared = intent
             .into_prepared(self.catalog_actor.clone())
             .map_err(CatalogCommitFailure::Fatal)?;
+        self.commit_prepared_classified(prepared).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_staged_classified(
+        &self,
+        mode: PersistMode,
+        request_id: RequestId,
+        table_id: TableId,
+        expected_snapshot_version: u64,
+        candidates: Vec<StagedParquetCandidate>,
+        committed_log_offset: OffsetWatermark,
+    ) -> ClassifiedCommitResult {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(CatalogCommitFailure::Fatal(
+                coordinator_closed()
+                    .with_request_id(request_id)
+                    .with_table_id(table_id),
+            ));
+        }
+        let candidate_bytes = candidates
+            .iter()
+            .try_fold(0_u64, |total, candidate| {
+                if candidate.pending().table_id != table_id {
+                    return Err(terminal_invalid(
+                        "staged persist candidate belongs to another table",
+                    )
+                    .with_request_id(request_id)
+                    .with_table_id(table_id));
+                }
+                total
+                    .checked_add(candidate.pending().file_size_bytes)
+                    .ok_or_else(|| {
+                        terminal_resource("staged persist candidate byte total overflow")
+                            .with_request_id(request_id)
+                            .with_table_id(table_id)
+                    })
+            })
+            .map_err(CatalogCommitFailure::Fatal)?;
+        let files = candidates
+            .iter()
+            .map(|candidate| candidate.pending().clone())
+            .collect();
+        let prepared = prepare_commit(
+            request_id,
+            table_id,
+            expected_snapshot_version,
+            committed_log_offset,
+            self.catalog_actor.clone(),
+            files,
+            candidate_bytes,
+            Vec::new(),
+        )
+        .map_err(CatalogCommitFailure::Fatal)?;
+        match &self.persistence_catalog {
+            Some(catalog) => match catalog.probe_command_replay(&prepared.command).await {
+                Ok(CatalogCommandReplayProbe::Exact { response }) => {
+                    drop(candidates);
+                    return validate_response(&prepared.command, response)
+                        .map_err(CatalogCommitFailure::Fatal);
+                }
+                Ok(CatalogCommandReplayProbe::Missing) => {
+                    if mode == PersistMode::HistoricalReplay {
+                        drop(candidates);
+                        return Err(CatalogCommitFailure::DefinitiveRejection(
+                            historical_replay_missing(request_id, table_id),
+                        ));
+                    }
+                }
+                Err(error) if error.code() == ErrorCode::Conflict && !error.retryable() => {
+                    drop(candidates);
+                    return Err(CatalogCommitFailure::DefinitiveRejection(
+                        error.with_request_id(request_id).with_table_id(table_id),
+                    ));
+                }
+                Err(error) => {
+                    drop(candidates);
+                    return Err(CatalogCommitFailure::Fatal(
+                        error.with_request_id(request_id).with_table_id(table_id),
+                    ));
+                }
+            },
+            None => {
+                drop(candidates);
+                return Err(CatalogCommitFailure::Fatal(
+                    ServerError::new(
+                        ErrorCode::UnsupportedPlan,
+                        "staged persistence requires Catalog publication control",
+                    )
+                    .with_request_id(request_id)
+                    .with_table_id(table_id)
+                    .with_retryable(false),
+                ));
+            }
+        }
+
+        self.validate_single_job_budget(&prepared)
+            .map_err(CatalogCommitFailure::Fatal)?;
+        self.enqueue_prepared_classified(prepared, Some(candidates))
+            .await
+    }
+
+    async fn commit_prepared_classified(&self, prepared: PreparedCommit) -> ClassifiedCommitResult {
+        self.enqueue_prepared_classified(prepared, None).await
+    }
+
+    async fn enqueue_prepared_classified(
+        &self,
+        prepared: PreparedCommit,
+        staged_candidates: Option<Vec<StagedParquetCandidate>>,
+    ) -> ClassifiedCommitResult {
         self.validate_single_job_budget(&prepared)
             .map_err(CatalogCommitFailure::Fatal)?;
         let request_id = prepared.request_id;
@@ -391,9 +589,16 @@ impl CatalogCommitCoordinator {
                 coordinator_closed().with_request_id(request_id),
             ));
         }
+        let staged = staged_candidates.map(|candidates| StagedCommit { candidates });
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(CatalogCommitFailure::Fatal(
+                coordinator_closed().with_request_id(request_id),
+            ));
+        }
         let (response_sender, response_receiver) = oneshot::channel();
         let job = CommitJob {
             prepared,
+            staged,
             response: response_sender,
             _permits: permits,
         };
@@ -419,6 +624,10 @@ impl CatalogCommitCoordinator {
     /// Stops admission while allowing already accepted jobs to finish.
     pub fn close_admission(&self) {
         self.accepting.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn supports_staged_persistence(&self) -> bool {
+        self.persistence_catalog.is_some()
     }
 
     /// Closes admission and reliably drains all accepted jobs without a deadline.
@@ -510,6 +719,34 @@ struct PreparedCommit {
     command: VersionedCatalogCommand,
     command_bytes: usize,
     candidate_bytes: u64,
+    cleanup_tokens: Vec<PublishedCandidateCleanup>,
+}
+
+struct StagedPublicationFailure {
+    error: ServerError,
+    cleanup_tokens: Vec<PublishedCandidateCleanup>,
+}
+
+fn publish_staged(
+    candidates: Vec<StagedParquetCandidate>,
+) -> std::result::Result<Vec<PublishedCandidateCleanup>, Box<StagedPublicationFailure>> {
+    let mut cleanup_tokens = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        match candidate.publish() {
+            Ok(candidate) => {
+                cleanup_tokens.extend(candidate.into_cleanup());
+            }
+            Err(failure) => {
+                let (error, cleanup) = failure.into_parts();
+                cleanup_tokens.extend(cleanup);
+                return Err(Box::new(StagedPublicationFailure {
+                    error,
+                    cleanup_tokens,
+                }));
+            }
+        }
+    }
+    Ok(cleanup_tokens)
 }
 
 struct AdmissionPermits {
@@ -520,30 +757,116 @@ struct AdmissionPermits {
 
 struct CommitJob {
     prepared: PreparedCommit,
+    staged: Option<StagedCommit>,
     response: oneshot::Sender<ClassifiedCommitResult>,
     _permits: AdmissionPermits,
 }
 
+struct StagedCommit {
+    candidates: Vec<StagedParquetCandidate>,
+}
+
 enum IntentExecution {
     Committed(CommitDataFilesReceipt),
-    DefinitiveRejection(ServerError),
+    DefinitiveRejection {
+        error: ServerError,
+        intent: DurableCommitIntent,
+    },
 }
 
 async fn run_worker(
     mut receiver: mpsc::Receiver<CommitJob>,
     mut next_sequence: u64,
     journal: Arc<CommitIntentJournal>,
+    data_directory: Arc<OwnedDataDirectory>,
     catalog: Arc<dyn CatalogWrite>,
+    persistence_catalog: Option<Arc<dyn CatalogPersistence>>,
     config: CatalogCommitCoordinatorConfig,
 ) -> Result<()> {
-    while let Some(job) = receiver.recv().await {
+    'worker: while let Some(job) = receiver.recv().await {
+        let CommitJob {
+            mut prepared,
+            staged,
+            response,
+            _permits,
+        } = job;
         let sequence = next_sequence;
         next_sequence = next_sequence
             .checked_add(1)
             .ok_or_else(|| terminal_resource("catalog commit intent sequence exhausted u64"))?;
-        let request_id = job.prepared.request_id;
+        let request_id = prepared.request_id;
+        let table_id = prepared.table_id;
+        let initial_publication_permit = match staged {
+            Some(staged) => {
+                let StagedCommit { candidates } = staged;
+                let publication_catalog = persistence_catalog.as_deref().ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::Internal,
+                        "queued staged commit lost Catalog publication control",
+                    )
+                    .with_request_id(request_id)
+                    .with_table_id(table_id)
+                    .with_retryable(false)
+                })?;
+                let publication_permit =
+                    match publication_catalog.acquire_publication_permit().await {
+                        Ok(permit) => permit,
+                        Err(error) => {
+                            let error = error.with_request_id(request_id).with_table_id(table_id);
+                            let _ = response.send(Err(CatalogCommitFailure::Fatal(error.clone())));
+                            return Err(error);
+                        }
+                    };
+                let published = tokio::task::spawn_blocking(move || publish_staged(candidates))
+                    .await
+                    .map_err(|error| actor_join_error("publish staged Parquet candidates", error));
+                match published {
+                    Ok(Ok(cleanup_tokens)) => {
+                        prepared.cleanup_tokens = cleanup_tokens;
+                        Some(publication_permit)
+                    }
+                    Ok(Err(failure)) => {
+                        let StagedPublicationFailure {
+                            error,
+                            cleanup_tokens,
+                        } = *failure;
+                        drop(publication_permit);
+                        if let Err(cleanup_error) = cleanup_rejected_candidates(
+                            Arc::clone(&data_directory),
+                            Some(publication_catalog),
+                            request_id,
+                            table_id,
+                            cleanup_tokens,
+                        )
+                        .await
+                        {
+                            let _ = response
+                                .send(Err(CatalogCommitFailure::Fatal(cleanup_error.clone())));
+                            return Err(cleanup_error);
+                        }
+                        let _ = response.send(Err(CatalogCommitFailure::Fatal(error.clone())));
+                        tracing::error!(
+                            request_id = %request_id,
+                            error = %error,
+                            concat!(
+                                "staged candidate publication failed; draining already accepted ",
+                                "Catalog commit jobs"
+                            )
+                        );
+                        continue 'worker;
+                    }
+                    Err(error) => {
+                        drop(publication_permit);
+                        let _ = response.send(Err(CatalogCommitFailure::Fatal(error.clone())));
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
+        let cleanup_tokens = prepared.cleanup_tokens;
         let stage_journal = Arc::clone(&journal);
-        let command = job.prepared.command;
+        let command = prepared.command;
         let staged = tokio::task::spawn_blocking(move || stage_journal.stage(sequence, command))
             .await
             .map_err(|error| actor_join_error("stage durable commit intent", error))
@@ -551,31 +874,50 @@ async fn run_worker(
         let staged = match staged {
             Ok(staged) => staged,
             Err(error) => {
-                let _ = job
-                    .response
-                    .send(Err(CatalogCommitFailure::Fatal(error.clone())));
+                let _ = response.send(Err(CatalogCommitFailure::Fatal(error.clone())));
                 return Err(error);
             }
         };
-        match execute_intent(&journal, &catalog, &config, staged).await {
+        match execute_intent(
+            &journal,
+            &catalog,
+            persistence_catalog.as_deref(),
+            &config,
+            staged,
+            initial_publication_permit,
+        )
+        .await
+        {
             Ok(IntentExecution::Committed(receipt)) => {
-                let _ = job.response.send(Ok(receipt));
+                let _ = response.send(Ok(receipt));
             }
-            Ok(IntentExecution::DefinitiveRejection(error)) => {
+            Ok(IntentExecution::DefinitiveRejection { error, intent }) => {
+                if let Err(cleanup_error) = remove_rejected_intent(&journal, &intent).await {
+                    let _ = response.send(Err(CatalogCommitFailure::Fatal(cleanup_error.clone())));
+                    return Err(cleanup_error);
+                }
+                if let Err(cleanup_error) = cleanup_rejected_candidates(
+                    Arc::clone(&data_directory),
+                    persistence_catalog.as_deref(),
+                    request_id,
+                    table_id,
+                    cleanup_tokens,
+                )
+                .await
+                {
+                    let _ = response.send(Err(CatalogCommitFailure::Fatal(cleanup_error.clone())));
+                    return Err(cleanup_error);
+                }
                 tracing::warn!(
                     request_id = %request_id,
                     code = %error.code(),
                     error = %error,
                     "Catalog definitively rejected commit; removed durable intent and continuing"
                 );
-                let _ = job
-                    .response
-                    .send(Err(CatalogCommitFailure::DefinitiveRejection(error)));
+                let _ = response.send(Err(CatalogCommitFailure::DefinitiveRejection(error)));
             }
             Err(error) => {
-                let _ = job
-                    .response
-                    .send(Err(CatalogCommitFailure::Fatal(error.clone())));
+                let _ = response.send(Err(CatalogCommitFailure::Fatal(error.clone())));
                 tracing::error!(
                     request_id = %request_id,
                     error = %error,
@@ -588,11 +930,106 @@ async fn run_worker(
     Ok(())
 }
 
+async fn cleanup_rejected_candidates(
+    data_directory: Arc<OwnedDataDirectory>,
+    catalog: Option<&dyn CatalogPersistence>,
+    request_id: RequestId,
+    table_id: TableId,
+    mut tokens: Vec<PublishedCandidateCleanup>,
+) -> Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let catalog = catalog.ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::Internal,
+            "candidate cleanup requires Catalog persistence reads",
+        )
+        .with_request_id(request_id)
+        .with_table_id(table_id)
+        .with_retryable(false)
+    })?;
+    tokens.sort_unstable_by_key(PublishedCandidateCleanup::file_id);
+    validate_cleanup_tokens(request_id, table_id, &tokens)?;
+    let probes = tokens
+        .iter()
+        .map(|token| ManagedDataFileProbe {
+            file_id: token.file_id(),
+            table_id: token.table_id(),
+            path: token.path().clone(),
+        })
+        .collect::<Vec<_>>();
+    let _publication_exclusion = catalog
+        .acquire_publication_exclusion()
+        .await
+        .map_err(|error| error.with_request_id(request_id).with_table_id(table_id))?;
+    let catalog_revision = catalog.revision().await?;
+    for chunk in probes.chunks(CLEANUP_PROBE_BATCH_SIZE) {
+        let inspected = catalog.inspect_data_file_references(chunk).await?;
+        if inspected.catalog_revision != catalog_revision {
+            return Err(cleanup_revision_changed(
+                request_id,
+                table_id,
+                catalog_revision,
+                inspected.catalog_revision,
+            ));
+        }
+        if inspected.results.len() != chunk.len()
+            || !inspected.results.iter().zip(chunk).all(|(result, probe)| {
+                result.probe == *probe && result.matched == CatalogDataFileProbeMatch::Unreferenced
+            })
+        {
+            return Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "Catalog did not prove every rejected candidate unreferenced",
+            )
+            .with_request_id(request_id)
+            .with_table_id(table_id)
+            .with_retryable(false));
+        }
+    }
+    let ending_revision = catalog.revision().await?;
+    if ending_revision != catalog_revision {
+        return Err(cleanup_revision_changed(
+            request_id,
+            table_id,
+            catalog_revision,
+            ending_revision,
+        ));
+    }
+    let removed = tokens.len();
+    tokio::task::spawn_blocking(move || {
+        for token in tokens {
+            verify_pending_candidate(&data_directory, token.pending())
+                .map_err(|error| error.with_request_id(request_id).with_table_id(table_id))?;
+            data_directory
+                .remove_durable_file(token.path())
+                .map_err(|error| {
+                    map_data_directory_error(table_id, error)
+                        .with_request_id(request_id)
+                        .with_table_id(table_id)
+                })?;
+        }
+        Ok::<(), ServerError>(())
+    })
+    .await
+    .map_err(|error| actor_join_error("remove definitively rejected candidates", error))??;
+    tracing::info!(
+        request_id = %request_id,
+        table_id = %table_id,
+        removed,
+        "removed controller-published candidates after Catalog rejection"
+    );
+    Ok(())
+}
+
 async fn execute_intent(
     journal: &Arc<CommitIntentJournal>,
     catalog: &Arc<dyn CatalogWrite>,
+    persistence_catalog: Option<&dyn CatalogPersistence>,
     config: &CatalogCommitCoordinatorConfig,
     intent: DurableCommitIntent,
+    mut initial_publication_permit: Option<CatalogPublicationPermit>,
 ) -> Result<IntentExecution> {
     let verify_journal = Arc::clone(journal);
     let verify_intent = intent.clone();
@@ -603,7 +1040,23 @@ async fn execute_intent(
     let mut delay = config.retry_initial_delay;
     let mut attempts = 0_u64;
     let response = loop {
-        match catalog.command(intent.command.clone()).await {
+        let result = match initial_publication_permit.take() {
+            Some(permit) => {
+                let persistence_catalog = persistence_catalog.ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::Internal,
+                        "staged commit lost Catalog publication control before mutation",
+                    )
+                    .with_request_id(intent.path.request_id)
+                    .with_retryable(false)
+                })?;
+                persistence_catalog
+                    .command_with_publication_permit(permit, intent.command.clone())
+                    .await
+            }
+            None => catalog.command(intent.command.clone()).await,
+        };
+        match result {
             Ok(response) => break response,
             Err(error) if is_commit_unknown(&error) => {
                 attempts = attempts.saturating_add(1);
@@ -630,8 +1083,7 @@ async fn execute_intent(
                     .min(config.retry_max_delay);
             }
             Err(error) if is_definitive_catalog_rejection(&error) => {
-                remove_rejected_intent(journal, &intent).await?;
-                return Ok(IntentExecution::DefinitiveRejection(error));
+                return Ok(IntentExecution::DefinitiveRejection { error, intent });
             }
             Err(error) => return Err(error),
         }
@@ -854,6 +1306,63 @@ fn response_corruption(request_id: RequestId, message: impl Into<String>) -> Ser
         .with_retryable(false)
 }
 
+fn historical_replay_missing(request_id: RequestId, table_id: TableId) -> ServerError {
+    ServerError::new(
+        ErrorCode::Conflict,
+        "historical persist replay has no retained Catalog idempotency record",
+    )
+    .with_request_id(request_id)
+    .with_table_id(table_id)
+    .with_retryable(false)
+}
+
+fn validate_cleanup_tokens(
+    request_id: RequestId,
+    table_id: TableId,
+    tokens: &[PublishedCandidateCleanup],
+) -> Result<()> {
+    for token in tokens {
+        if token.table_id() != table_id {
+            return Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "candidate cleanup token belongs to another table",
+            )
+            .with_request_id(request_id)
+            .with_table_id(table_id)
+            .with_retryable(false));
+        }
+    }
+    for pair in tokens.windows(2) {
+        if pair[0].file_id() == pair[1].file_id() || pair[0].path() == pair[1].path() {
+            return Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "candidate cleanup tokens contain duplicate identities or paths",
+            )
+            .with_request_id(request_id)
+            .with_table_id(table_id)
+            .with_retryable(false));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_revision_changed(
+    request_id: RequestId,
+    table_id: TableId,
+    expected: u64,
+    actual: u64,
+) -> ServerError {
+    ServerError::new(
+        ErrorCode::Conflict,
+        format!(
+            "Catalog revision changed during candidate cleanup expected=[{expected}] actual=[{actual}]"
+        ),
+    )
+    .with_request_id(request_id)
+    .with_table_id(table_id)
+    .with_retryable(false)
+}
+
 fn actor_join_error(operation: &str, error: tokio::task::JoinError) -> ServerError {
     ServerError::new(
         ErrorCode::Internal,
@@ -864,7 +1373,315 @@ fn actor_join_error(operation: &str, error: tokio::task::JoinError) -> ServerErr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use tempfile::TempDir;
+    use tokio::sync::Semaphore;
+    use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+    use zippy_types::catalog::{
+        CatalogDataFileReferenceSnapshot, CatalogFileRead, CatalogIdempotencyRead,
+        CatalogPublicationControl, CatalogPublicationExclusion, CatalogQuerySnapshot, CatalogRead,
+        CatalogSnapshotSelector, CreateNamespaceCommand, CreateTableCommand, ListNamespacesRequest,
+        ListNamespacesResponse, ListTablesRequest, ListTablesResponse, NamespaceRef,
+    };
+    use zippy_types::table::{
+        AppendTableDefinition, CatalogName, MetadataMap, NamespaceDescriptor,
+        NativeDataFileProvenance, SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage,
+        SourceSegmentLineages, TableDefinition, TableDescriptor, TableRef,
+    };
+    use zippy_types::{FileId, LogOffset, NamespaceId, OffsetRange};
+
+    use crate::candidate::{
+        ParquetCandidateSpec, ParquetCandidateWriter, PreparedParquetCandidateSpec,
+    };
+
     use super::*;
+
+    const TEST_NAMESPACE_ID: u128 = 1;
+    const TEST_TABLE_ID: u128 = 2;
+    const SECOND_REQUEST_ID: u128 = 21;
+
+    struct RejectFirstPublicationCatalog {
+        inner: Arc<SqliteCatalog>,
+        reject_next: AtomicBool,
+        acquire_error: Option<ServerError>,
+        first_command_started: Semaphore,
+        release_first_command: Semaphore,
+        publication_acquisitions: AtomicUsize,
+    }
+
+    impl RejectFirstPublicationCatalog {
+        fn new(inner: Arc<SqliteCatalog>) -> Self {
+            Self {
+                inner,
+                reject_next: AtomicBool::new(true),
+                acquire_error: None,
+                first_command_started: Semaphore::new(0),
+                release_first_command: Semaphore::new(0),
+                publication_acquisitions: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_acquire_error(inner: Arc<SqliteCatalog>, error: ServerError) -> Self {
+            Self {
+                inner,
+                reject_next: AtomicBool::new(false),
+                acquire_error: Some(error),
+                first_command_started: Semaphore::new(0),
+                release_first_command: Semaphore::new(0),
+                publication_acquisitions: AtomicUsize::new(0),
+            }
+        }
+
+        fn publication_acquisitions(&self) -> usize {
+            self.publication_acquisitions.load(Ordering::Acquire)
+        }
+    }
+
+    impl CatalogRead for RejectFirstPublicationCatalog {
+        fn revision(&self) -> zippy_types::BoxFuture<'_, Result<u64>> {
+            self.inner.revision()
+        }
+
+        fn get_namespace(
+            &self,
+            namespace: NamespaceRef,
+        ) -> zippy_types::BoxFuture<'_, Result<NamespaceDescriptor>> {
+            self.inner.get_namespace(namespace)
+        }
+
+        fn list_namespaces(
+            &self,
+            request: ListNamespacesRequest,
+        ) -> zippy_types::BoxFuture<'_, Result<ListNamespacesResponse>> {
+            self.inner.list_namespaces(request)
+        }
+
+        fn get_table(
+            &self,
+            table: TableRef,
+        ) -> zippy_types::BoxFuture<'_, Result<TableDescriptor>> {
+            self.inner.get_table(table)
+        }
+
+        fn list_tables(
+            &self,
+            request: ListTablesRequest,
+        ) -> zippy_types::BoxFuture<'_, Result<ListTablesResponse>> {
+            self.inner.list_tables(request)
+        }
+
+        fn resolve_tables<'a>(
+            &'a self,
+            tables: &'a [TableRef],
+        ) -> zippy_types::BoxFuture<'a, Result<Vec<TableDescriptor>>> {
+            self.inner.resolve_tables(tables)
+        }
+
+        fn read_snapshot_at<'a>(
+            &'a self,
+            selectors: &'a [CatalogSnapshotSelector],
+        ) -> zippy_types::BoxFuture<'a, Result<CatalogQuerySnapshot>> {
+            self.inner.read_snapshot_at(selectors)
+        }
+    }
+
+    impl CatalogFileRead for RejectFirstPublicationCatalog {
+        fn inspect_data_file_references<'a>(
+            &'a self,
+            probes: &'a [ManagedDataFileProbe],
+        ) -> zippy_types::BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>> {
+            self.inner.inspect_data_file_references(probes)
+        }
+    }
+
+    impl CatalogIdempotencyRead for RejectFirstPublicationCatalog {
+        fn probe_command_replay<'a>(
+            &'a self,
+            command: &'a VersionedCatalogCommand,
+        ) -> zippy_types::BoxFuture<'a, Result<CatalogCommandReplayProbe>> {
+            self.inner.probe_command_replay(command)
+        }
+    }
+
+    impl CatalogWrite for RejectFirstPublicationCatalog {
+        fn command(
+            &self,
+            command: VersionedCatalogCommand,
+        ) -> zippy_types::BoxFuture<'_, Result<VersionedCatalogResponse>> {
+            self.inner.command(command)
+        }
+    }
+
+    impl CatalogPublicationControl for RejectFirstPublicationCatalog {
+        fn acquire_publication_permit(
+            &self,
+        ) -> zippy_types::BoxFuture<'_, Result<CatalogPublicationPermit>> {
+            Box::pin(async move {
+                self.publication_acquisitions.fetch_add(1, Ordering::AcqRel);
+                if let Some(error) = &self.acquire_error {
+                    return Err(error.clone());
+                }
+                self.inner.acquire_publication_permit().await
+            })
+        }
+
+        fn command_with_publication_permit(
+            &self,
+            permit: CatalogPublicationPermit,
+            command: VersionedCatalogCommand,
+        ) -> zippy_types::BoxFuture<'_, Result<VersionedCatalogResponse>> {
+            Box::pin(async move {
+                if self.reject_next.swap(false, Ordering::AcqRel) {
+                    self.first_command_started.add_permits(1);
+                    self.release_first_command
+                        .acquire()
+                        .await
+                        .expect("release first Catalog command")
+                        .forget();
+                    drop(permit);
+                    let VersionedCatalogCommand::V1(envelope) = &command;
+                    return Err(ServerError::new(
+                        ErrorCode::Conflict,
+                        "injected first staged commit rejection",
+                    )
+                    .with_request_id(envelope.request_id)
+                    .with_retryable(false));
+                }
+                self.inner
+                    .command_with_publication_permit(permit, command)
+                    .await
+            })
+        }
+
+        fn acquire_publication_exclusion(
+            &self,
+        ) -> zippy_types::BoxFuture<'_, Result<CatalogPublicationExclusion>> {
+            self.inner.acquire_publication_exclusion()
+        }
+    }
+
+    fn test_request_id(value: u128) -> RequestId {
+        RequestId::from_u128(value).expect("test request id must be nonzero")
+    }
+
+    fn test_namespace_id() -> NamespaceId {
+        NamespaceId::from_u128(TEST_NAMESPACE_ID).expect("test namespace id must be nonzero")
+    }
+
+    fn test_table_id() -> TableId {
+        TableId::from_u128(TEST_TABLE_ID).expect("test table id must be nonzero")
+    }
+
+    fn test_file_id(value: u128) -> FileId {
+        FileId::from_u128(value).expect("test file id must be nonzero")
+    }
+
+    fn test_actor() -> CatalogActor {
+        CatalogActor {
+            kind: CatalogActorKind::Server,
+            principal: "zippy-storage-commit-test".to_owned(),
+        }
+    }
+
+    fn test_command(request: u128, command: CatalogCommandV1) -> VersionedCatalogCommand {
+        CatalogCommandEnvelopeV1::new(test_request_id(request), None, test_actor(), command)
+            .expect("construct test Catalog command")
+            .into()
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Int64,
+            false,
+        )]))
+    }
+
+    fn test_schema_ipc(schema: &Schema) -> SchemaIpcPayload {
+        let mut bytes = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut bytes, schema).expect("create test schema IPC writer");
+        writer.finish().expect("finish test schema IPC writer");
+        drop(writer);
+        SchemaIpcPayload::new(bytes).expect("nonempty test schema IPC")
+    }
+
+    async fn create_test_table(catalog: &SqliteCatalog) {
+        catalog
+            .command(test_command(
+                1,
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: test_namespace_id(),
+                    name: CatalogName::new("market").expect("valid test namespace"),
+                }),
+            ))
+            .await
+            .expect("create test namespace");
+        let schema = test_schema();
+        catalog
+            .command(test_command(
+                2,
+                CatalogCommandV1::CreateTable(CreateTableCommand {
+                    table_id: test_table_id(),
+                    namespace_id: test_namespace_id(),
+                    name: CatalogName::new("ticks").expect("valid test table"),
+                    definition: TableDefinition::Append(AppendTableDefinition::default()),
+                    schema_ipc: test_schema_ipc(schema.as_ref()),
+                    config: BTreeMap::new(),
+                }),
+            ))
+            .await
+            .expect("create test table");
+    }
+
+    fn stage_test_candidate(
+        writer: &ParquetCandidateWriter,
+        file: u128,
+        offset: u64,
+        value: i64,
+    ) -> StagedParquetCandidate {
+        let schema = test_schema();
+        let offsets = OffsetRange::new(LogOffset::new(offset), LogOffset::new(offset))
+            .expect("one-row test offset range");
+        let provenance = NativeDataFileProvenance::new(
+            offsets,
+            SourceSegmentLineages::new(vec![SourceSegmentLineage {
+                source: SourceSegmentIdentity {
+                    segment_id: offset + 1,
+                    generation: 1,
+                    writer_epoch: 0,
+                },
+                offsets,
+            }])
+            .expect("test source lineage"),
+        )
+        .expect("test file provenance");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![value]))],
+        )
+        .expect("one-row test batch");
+        let prepared = PreparedParquetCandidateSpec::new(ParquetCandidateSpec {
+            file_id: test_file_id(file),
+            table_id: test_table_id(),
+            schema_version: 1,
+            schema,
+            provenance,
+            partition: MetadataMap::new(),
+            metadata: MetadataMap::new(),
+            created_at_ns: 1_752_492_600_000_000_000 + file as u64,
+        })
+        .expect("prepare test candidate");
+        writer
+            .stage_prepared_candidate(prepared, vec![batch])
+            .expect("stage test candidate")
+    }
 
     #[test]
     fn catalog_error_disposition_is_conservative() {
@@ -900,5 +1717,167 @@ mod tests {
         let retryable_conflict =
             ServerError::new(ErrorCode::Conflict, "commit state unknown").with_retryable(true);
         assert!(!is_definitive_catalog_rejection(&retryable_conflict));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_staged_job_does_not_hold_publication_permit_during_rejection_cleanup() {
+        let root = TempDir::new().expect("create test root");
+        let data_directory = Arc::new(
+            OwnedDataDirectory::acquire_or_initialize(root.path().join("data"))
+                .expect("own test data root"),
+        );
+        let sqlite = Arc::new(
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+                .expect("open test Catalog"),
+        );
+        create_test_table(&sqlite).await;
+        let catalog = Arc::new(RejectFirstPublicationCatalog::new(Arc::clone(&sqlite)));
+        let persistence: Arc<dyn CatalogPersistence> = catalog.clone();
+        let coordinator = Arc::new(
+            CatalogCommitCoordinator::start_with_persistence(
+                CatalogCommitCoordinatorConfig::new().with_max_outstanding_commits(2),
+                Arc::clone(&data_directory),
+                persistence,
+                test_actor(),
+            )
+            .await
+            .expect("start test commit coordinator"),
+        );
+        let writer = ParquetCandidateWriter::new(Arc::clone(&data_directory));
+        let first_candidate = stage_test_candidate(&writer, 10, 0, 100);
+        let second_candidate = stage_test_candidate(&writer, 11, 0, 101);
+
+        let first_coordinator = Arc::clone(&coordinator);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .commit_staged_classified(
+                    PersistMode::Advance,
+                    test_request_id(20),
+                    test_table_id(),
+                    1,
+                    vec![first_candidate],
+                    OffsetWatermark::Known(LogOffset::new(0)),
+                )
+                .await
+        });
+        catalog
+            .first_command_started
+            .acquire()
+            .await
+            .expect("first staged command must reach Catalog")
+            .forget();
+        assert_eq!(catalog.publication_acquisitions(), 1);
+
+        let second_coordinator = Arc::clone(&coordinator);
+        let second = tokio::spawn(async move {
+            second_coordinator
+                .commit_staged_classified(
+                    PersistMode::Advance,
+                    test_request_id(SECOND_REQUEST_ID),
+                    test_table_id(),
+                    1,
+                    vec![second_candidate],
+                    OffsetWatermark::Known(LogOffset::new(0)),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let capacity = coordinator
+                    .sender
+                    .as_ref()
+                    .expect("coordinator remains open")
+                    .capacity();
+                if capacity == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second staged job must enter the FIFO queue");
+        assert_eq!(
+            catalog.publication_acquisitions(),
+            1,
+            "a queued staged job must not hold a publication permit"
+        );
+
+        catalog.release_first_command.add_permits(1);
+        let first_result = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first rejection cleanup must not deadlock")
+            .expect("join first staged commit");
+        assert!(matches!(
+            first_result,
+            Err(CatalogCommitFailure::DefinitiveRejection(ref error))
+                if error.code() == ErrorCode::Conflict
+        ));
+        let second_receipt = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second staged commit must run after cleanup")
+            .expect("join second staged commit")
+            .expect("second staged commit succeeds");
+        assert_eq!(second_receipt.snapshot.snapshot_version, 2);
+        assert_eq!(catalog.publication_acquisitions(), 2);
+
+        let coordinator = Arc::try_unwrap(coordinator)
+            .unwrap_or_else(|_| panic!("test tasks must release coordinator references"));
+        coordinator.drain().await.expect("drain test coordinator");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_permit_failure_reaches_the_current_commit_caller() {
+        let root = TempDir::new().expect("create test root");
+        let data_directory = Arc::new(
+            OwnedDataDirectory::acquire_or_initialize(root.path().join("data"))
+                .expect("own test data root"),
+        );
+        let sqlite = Arc::new(
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+                .expect("open test Catalog"),
+        );
+        create_test_table(&sqlite).await;
+        let injected = ServerError::new(
+            ErrorCode::DataCorruption,
+            "injected publication permit acquisition failure",
+        )
+        .with_retryable(false);
+        let catalog = Arc::new(RejectFirstPublicationCatalog::with_acquire_error(
+            Arc::clone(&sqlite),
+            injected.clone(),
+        ));
+        let persistence: Arc<dyn CatalogPersistence> = catalog;
+        let coordinator = CatalogCommitCoordinator::start_with_persistence(
+            CatalogCommitCoordinatorConfig::new(),
+            Arc::clone(&data_directory),
+            persistence,
+            test_actor(),
+        )
+        .await
+        .expect("start test commit coordinator");
+        let candidate =
+            stage_test_candidate(&ParquetCandidateWriter::new(data_directory), 10, 0, 100);
+        let expected = injected
+            .with_request_id(test_request_id(20))
+            .with_table_id(test_table_id());
+
+        let failure = coordinator
+            .commit_staged_classified(
+                PersistMode::Advance,
+                test_request_id(20),
+                test_table_id(),
+                1,
+                vec![candidate],
+                OffsetWatermark::Known(LogOffset::new(0)),
+            )
+            .await
+            .expect_err("permit acquisition failure must reject the current commit");
+        assert!(matches!(failure, CatalogCommitFailure::Fatal(error) if error == expected));
+
+        let drain_error = coordinator
+            .drain()
+            .await
+            .expect_err("terminal permit failure must stop the coordinator");
+        assert_eq!(drain_error, expected);
     }
 }

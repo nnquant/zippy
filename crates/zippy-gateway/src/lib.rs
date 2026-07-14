@@ -60,8 +60,19 @@ use zippy_segment_store::{
 };
 
 pub mod legacy_query;
+mod persisted_read_shadow;
 
 pub use legacy_query::{LegacyCollectCursor, LegacyCollectFacade, LegacyCollectRequest};
+pub use persisted_read_shadow::{
+    PersistedReadShadowConfig, PersistedReadShadowMetrics, PersistedReadShadowMismatch,
+    PersistedReadShadowMismatchKind, PersistedReadShadowSnapshot, PersistedReadShadowSource,
+    PersistedReadShadowStatus, ShadowPersistedReadSnapshotSource,
+    DEFAULT_PERSISTED_READ_SHADOW_COMPARISON_TIMEOUT_MS,
+    DEFAULT_PERSISTED_READ_SHADOW_DEDUP_CAPACITY, DEFAULT_PERSISTED_READ_SHADOW_MAX_FILES,
+    DEFAULT_PERSISTED_READ_SHADOW_MAX_METADATA_BYTES_PER_COMPARISON,
+    DEFAULT_PERSISTED_READ_SHADOW_METADATA_BUDGET_BYTES,
+    DEFAULT_PERSISTED_READ_SHADOW_QUEUE_CAPACITY,
+};
 
 const MAX_GATEWAY_HEADER_BYTES: usize = 64 * 1024;
 const MAX_GATEWAY_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -124,6 +135,11 @@ impl PersistedReadSnapshot {
 pub trait PersistedReadSnapshotSource: Send + Sync + 'static {
     /// Resolve the persisted-file view corresponding to `legacy_stream`.
     fn snapshot(&self, legacy_stream: &StreamInfo) -> Result<PersistedReadSnapshot>;
+
+    /// Return optional migration-shadow status exposed by Gateway metrics.
+    fn shadow_status(&self) -> Option<PersistedReadShadowStatus> {
+        None
+    }
 }
 
 /// Reads persisted file descriptors from the legacy Master `StreamInfo` response.
@@ -1991,6 +2007,9 @@ impl GatewayServer {
             "write_timeout_ms",
             self.state.write_timeout.as_millis() as u64,
         );
+        if let Some(status) = self.state.persisted_read_snapshot_source.shadow_status() {
+            insert_json_metric(fields, "persisted_read_shadow", status);
+        }
         insert_json_metric(
             fields,
             "snapshots_active",
@@ -3830,6 +3849,9 @@ impl GatewayState {
             "snapshots_active",
             self.snapshots.lock().unwrap().len(),
         );
+        if let Some(status) = self.persisted_read_snapshot_source.shadow_status() {
+            insert_json_metric(fields, "persisted_read_shadow", status);
+        }
         value
     }
 
@@ -9110,6 +9132,7 @@ mod tests {
             segment_row_capacity: Some(DEFAULT_STREAM_TABLE_ROW_CAPACITY),
             sealed_segments: Vec::new(),
             persisted_files: Vec::new(),
+            persisted_files_revision: 0,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,
@@ -9959,6 +9982,7 @@ mod tests {
                 "source_segment_id": 1,
                 "source_generation": 0
             })],
+            persisted_files_revision: 1,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,
@@ -10309,6 +10333,7 @@ mod tests {
                 "source_generation": 0,
                 "writer_epoch": 7
             })],
+            persisted_files_revision: 1,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,
@@ -10350,6 +10375,7 @@ mod tests {
                 "source_generation": 0,
                 "writer_epoch": 1
             })],
+            persisted_files_revision: 1,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,
@@ -10432,6 +10458,7 @@ mod tests {
                     "stats": {"dt": {"min": boundary + 1, "max": boundary + 1}}
                 }),
             ],
+            persisted_files_revision: 1,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,
@@ -10513,6 +10540,7 @@ mod tests {
                 "source_segment_id": 1,
                 "source_generation": 0
             })],
+            persisted_files_revision: 1,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,

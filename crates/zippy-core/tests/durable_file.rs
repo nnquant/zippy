@@ -69,9 +69,9 @@ fn durable_file_never_overwrites_an_existing_target() {
         .expect_err("competing publish must not replace the final file");
 
     assert!(matches!(
-        error,
+        error.error(),
         DataDirectoryError::AlreadyExists { path: existing }
-            if existing == data_directory.directory().root().join(path.as_str())
+            if *existing == data_directory.directory().root().join(path.as_str())
     ));
     assert!(!temporary_path.exists());
     assert_eq!(

@@ -13,6 +13,8 @@ const MIGRATION_V2_VERSION: u32 = 2;
 const MIGRATION_V2_NAME: &str = "catalog_domain_schema";
 const MIGRATION_V3_VERSION: u32 = 3;
 const MIGRATION_V3_NAME: &str = "active_tables_cursor_indexes";
+const MIGRATION_V4_VERSION: u32 = 4;
+const MIGRATION_V4_NAME: &str = "safe_gc_claim_indexes";
 
 // Physical SQLite schema versions are independent of CatalogCommand wire
 // versions. Physical v1 intentionally creates no domain tables: those must
@@ -627,6 +629,30 @@ define_v3_schema_additions! {
  ON tables(namespace_id, state, table_id)"#;
 }
 
+macro_rules! define_v4_schema_additions {
+    ($($name:ident = $sql:literal;)+) => {
+        $(const $name: &str = $sql;)+
+        const MIGRATION_V4: &str = concat!($($sql, ";\n",)+);
+    };
+}
+
+define_v4_schema_additions! {
+    DATA_FILES_GC_RETRY_BY_TABLE_SQL = r#"CREATE INDEX data_files_gc_retry_by_table
+ ON data_files(table_id, file_id)
+ WHERE state = 'deleting'
+   AND location_kind = 'managed'
+   AND removed_snapshot_version_value IS NOT NULL"#;
+
+    DATA_FILES_GC_CLAIM_BY_TABLE_SQL = r#"CREATE INDEX data_files_gc_claim_by_table
+ ON data_files(table_id, removed_snapshot_version_value, file_id, added_snapshot_version)
+ WHERE state = 'committed'
+   AND location_kind = 'managed'
+   AND removed_snapshot_version_value IS NOT NULL"#;
+
+    SNAPSHOT_LEASES_GC_BY_TABLE_SQL = r#"CREATE INDEX snapshot_leases_gc_by_table
+ ON snapshot_leases(table_id, snapshot_version, expires_at_ns)"#;
+}
+
 struct ExpectedSchemaObject {
     object_type: &'static str,
     name: &'static str,
@@ -949,6 +975,27 @@ const MIGRATION_V3_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 2] = [
     },
 ];
 
+const MIGRATION_V4_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 3] = [
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "data_files_gc_retry_by_table",
+        table_name: "data_files",
+        sql: Some(DATA_FILES_GC_RETRY_BY_TABLE_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "data_files_gc_claim_by_table",
+        table_name: "data_files",
+        sql: Some(DATA_FILES_GC_CLAIM_BY_TABLE_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "snapshot_leases_gc_by_table",
+        table_name: "snapshot_leases",
+        sql: Some(SNAPSHOT_LEASES_GC_BY_TABLE_SQL),
+    },
+];
+
 struct Migration {
     version: u32,
     name: &'static str,
@@ -957,7 +1004,7 @@ struct Migration {
     schema_additions: &'static [ExpectedSchemaObject],
 }
 
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     Migration {
         version: MIGRATION_V1_VERSION,
         name: MIGRATION_V1_NAME,
@@ -978,6 +1025,13 @@ const MIGRATIONS: [Migration; 3] = [
         sql: MIGRATION_V3,
         base_schema_version: Some(MIGRATION_V2_VERSION),
         schema_additions: &MIGRATION_V3_SCHEMA_ADDITIONS,
+    },
+    Migration {
+        version: MIGRATION_V4_VERSION,
+        name: MIGRATION_V4_NAME,
+        sql: MIGRATION_V4,
+        base_schema_version: Some(MIGRATION_V3_VERSION),
+        schema_additions: &MIGRATION_V4_SCHEMA_ADDITIONS,
     },
 ];
 

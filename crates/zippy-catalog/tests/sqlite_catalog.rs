@@ -12,9 +12,10 @@ use tempfile::TempDir;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{DataDirectoryError, ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
-    CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
-    CatalogOutcomeV1, CatalogRead, CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand,
-    CreateTableCommand, ListNamespacesRequest, ListTablesRequest, NamespaceRef,
+    AcquireSnapshotLeaseCommand, CatalogActor, CatalogActorKind, CatalogCodec,
+    CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogOutcomeV1, CatalogRead,
+    CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, CreateTableCommand,
+    ListNamespacesRequest, ListTablesRequest, NamespaceRef, ReleaseSnapshotLeaseCommand,
     VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{
@@ -22,7 +23,7 @@ use zippy_types::table::{
     KeyValueTableDefinition, SchemaCompatibility, SchemaIpcPayload, SnapshotOperation,
     TableDefinition, TableRef, TableState,
 };
-use zippy_types::{ErrorCode, FileId, NamespaceId, RequestId, TableId};
+use zippy_types::{ErrorCode, FileId, LeaseId, NamespaceId, RequestId, TableId};
 
 type RawInitialSnapshotRow = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
@@ -63,6 +64,16 @@ fn table_id(value: u128) -> TableId {
 
 fn file_id(value: u128) -> FileId {
     FileId::from_u128(value).expect("test file id must be nonzero")
+}
+
+fn lease_id(value: u128) -> LeaseId {
+    LeaseId::from_u128(value).expect("test lease id must be nonzero")
+}
+
+fn snapshot_lease_command(request: u128, command: CatalogCommandV1) -> VersionedCatalogCommand {
+    CatalogCommandEnvelopeV1::new(request_id(request), None, actor(), command)
+        .expect("create snapshot lease command envelope")
+        .into()
 }
 
 fn create_namespace(
@@ -1348,18 +1359,189 @@ async fn table_read_byte_budget_pages_lists_and_rejects_oversized_resolution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn independent_catalog_actors_revision_cas_allow_exactly_one_commit_and_replay() {
+async fn durable_snapshot_lease_acquire_release_and_replay_are_atomic() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    catalog
+        .command(create_namespace(1, 1, "market", Some(0)))
+        .await
+        .expect("create namespace");
+    catalog
+        .command(create_table(
+            2,
+            1,
+            1,
+            "ticks",
+            Some(1),
+            append_definition(),
+            schema_ipc(&table_schema()),
+        ))
+        .await
+        .expect("create table");
+
+    let acquire = snapshot_lease_command(
+        3,
+        CatalogCommandV1::AcquireSnapshotLease(AcquireSnapshotLeaseCommand {
+            lease_id: lease_id(1),
+            table_id: table_id(1),
+            snapshot_version: 1,
+            owner: "backup-job-1".to_string(),
+            expires_at_ns: u64::MAX,
+        }),
+    );
+    let acquired = catalog
+        .command(acquire.clone())
+        .await
+        .expect("acquire durable snapshot lease");
+    let VersionedCatalogResponse::V1(acquired_response) = &acquired;
+    assert_eq!(acquired_response.catalog_revision, 3);
+    assert!(matches!(
+        &acquired_response.outcome,
+        CatalogOutcomeV1::SnapshotLease(lease)
+            if lease.lease_id == lease_id(1)
+                && lease.table_id == table_id(1)
+                && lease.snapshot_version == 1
+                && lease.owner == "backup-job-1"
+    ));
+    assert_eq!(
+        catalog
+            .command(acquire)
+            .await
+            .expect("replay lease acquire"),
+        acquired
+    );
+
+    let conflicting_replay = snapshot_lease_command(
+        3,
+        CatalogCommandV1::AcquireSnapshotLease(AcquireSnapshotLeaseCommand {
+            lease_id: lease_id(1),
+            table_id: table_id(1),
+            snapshot_version: 1,
+            owner: "backup-job-1".to_string(),
+            expires_at_ns: u64::MAX - 1,
+        }),
+    );
+    assert_eq!(
+        catalog
+            .command(conflicting_replay)
+            .await
+            .expect_err("same request id with another lease fingerprint must conflict")
+            .code(),
+        ErrorCode::Conflict
+    );
+
+    let wrong_owner_release = snapshot_lease_command(
+        4,
+        CatalogCommandV1::ReleaseSnapshotLease(ReleaseSnapshotLeaseCommand {
+            lease_id: lease_id(1),
+            owner: "another-owner".to_string(),
+        }),
+    );
+    assert_eq!(
+        catalog
+            .command(wrong_owner_release)
+            .await
+            .expect_err("another owner must not release the lease")
+            .code(),
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(catalog.revision().await.expect("read revision"), 3);
+
+    let release = snapshot_lease_command(
+        5,
+        CatalogCommandV1::ReleaseSnapshotLease(ReleaseSnapshotLeaseCommand {
+            lease_id: lease_id(1),
+            owner: "backup-job-1".to_string(),
+        }),
+    );
+    let released = catalog
+        .command(release.clone())
+        .await
+        .expect("release durable snapshot lease");
+    let VersionedCatalogResponse::V1(released_response) = &released;
+    assert_eq!(released_response.catalog_revision, 4);
+    assert!(matches!(
+        released_response.outcome,
+        CatalogOutcomeV1::SnapshotLeaseReleased { lease_id: released }
+            if released == lease_id(1)
+    ));
+    assert_eq!(
+        catalog
+            .command(release)
+            .await
+            .expect("replay lease release"),
+        released
+    );
+
+    let expired = snapshot_lease_command(
+        6,
+        CatalogCommandV1::AcquireSnapshotLease(AcquireSnapshotLeaseCommand {
+            lease_id: lease_id(2),
+            table_id: table_id(1),
+            snapshot_version: 1,
+            owner: "expired-backup".to_string(),
+            expires_at_ns: 1,
+        }),
+    );
+    assert_eq!(
+        catalog
+            .command(expired)
+            .await
+            .expect_err("already expired lease must be rejected")
+            .code(),
+        ErrorCode::InvalidArgument
+    );
+    let missing_snapshot = snapshot_lease_command(
+        7,
+        CatalogCommandV1::AcquireSnapshotLease(AcquireSnapshotLeaseCommand {
+            lease_id: lease_id(3),
+            table_id: table_id(1),
+            snapshot_version: 99,
+            owner: "missing-snapshot".to_string(),
+            expires_at_ns: u64::MAX,
+        }),
+    );
+    assert_eq!(
+        catalog
+            .command(missing_snapshot)
+            .await
+            .expect_err("lease target snapshot must exist")
+            .code(),
+        ErrorCode::NotFound
+    );
+
+    let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
+    let remaining: i64 = raw
+        .query_row("SELECT COUNT(*) FROM snapshot_leases", [], |row| row.get(0))
+        .expect("count durable snapshot leases");
+    assert_eq!(remaining, 0);
+    drop(raw);
+    catalog.close().expect("close catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typed_catalog_runtime_is_single_owner_and_reopen_preserves_command_replay() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let first_catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
         .expect("open first sqlite catalog");
-    let second_catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
-        .expect("open second sqlite catalog");
+    let second_error = match SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)) {
+        Ok(catalog) => {
+            catalog.close().expect("close unexpected second catalog");
+            panic!("second typed Catalog actor unexpectedly acquired the same data root");
+        }
+        Err(error) => error,
+    };
+    assert_eq!(second_error.code(), ErrorCode::Conflict);
+    assert!(second_error.message().contains("already active"));
+
     first_catalog
         .command(create_namespace(1, 1, "market", Some(0)))
         .await
         .expect("create namespace");
-    let first = create_table(
+    let create = create_table(
         2,
         1,
         1,
@@ -1368,46 +1550,25 @@ async fn independent_catalog_actors_revision_cas_allow_exactly_one_commit_and_re
         append_definition(),
         schema_ipc(&table_schema()),
     );
-    let second = create_table(
-        3,
-        2,
-        1,
-        "two",
-        Some(1),
-        append_definition(),
-        schema_ipc(&table_schema()),
-    );
-    let (first_result, second_result) = tokio::join!(
-        first_catalog.command(first.clone()),
-        second_catalog.command(second.clone())
-    );
-    let winning_response = first_result
-        .as_ref()
-        .ok()
-        .or_else(|| second_result.as_ref().ok())
-        .expect("one independent actor must commit")
-        .clone();
-    let results = [&first_result, &second_result];
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    let conflicts = results
-        .iter()
-        .filter_map(|result| result.as_ref().err())
-        .collect::<Vec<_>>();
-    assert_eq!(conflicts.len(), 1);
-    assert_eq!(conflicts[0].code(), ErrorCode::Conflict);
+    let committed = first_catalog
+        .command(create.clone())
+        .await
+        .expect("commit table through the sole Catalog actor");
     assert_eq!(first_catalog.revision().await, Ok(2));
-    assert_eq!(second_catalog.revision().await, Ok(2));
-    let replay = if first_result.is_ok() {
-        second_catalog.command(first).await
-    } else {
-        first_catalog.command(second).await
-    }
-    .expect("replay winning command through the other actor");
+    first_catalog.close().expect("close first catalog");
+
+    let second_catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("reopen typed Catalog after ownership release");
+    let replay = second_catalog
+        .command(create)
+        .await
+        .expect("replay committed command after Catalog restart");
     assert_eq!(
         CatalogCodec::encode_response(&replay).expect("encode replay response"),
-        CatalogCodec::encode_response(&winning_response).expect("encode winning response")
+        CatalogCodec::encode_response(&committed).expect("encode committed response")
     );
-    let page = first_catalog
+    assert_eq!(second_catalog.revision().await, Ok(2));
+    let page = second_catalog
         .list_tables(ListTablesRequest {
             namespace_id: None,
             after: None,
@@ -1416,7 +1577,6 @@ async fn independent_catalog_actors_revision_cas_allow_exactly_one_commit_and_re
         .await
         .expect("list committed table");
     assert_eq!(page.tables.len(), 1);
-    first_catalog.close().expect("close first catalog");
     second_catalog.close().expect("close second catalog");
 }
 
@@ -1565,6 +1725,103 @@ fn writable_config_retains_data_directory_ownership() {
     read_view
         .acquire_process_ownership()
         .expect("dropping the final writable config must release ownership");
+}
+
+#[test]
+fn runtime_snapshot_pin_status_reports_limits_watermarks_and_rejections() {
+    let directory = TempDir::new().expect("create temp directory");
+    let ownership = data_directory(&directory);
+    let catalog = SqliteCatalog::open(
+        SqliteCatalogConfig::new(&ownership).with_runtime_snapshot_pin_limits(2, 1),
+    )
+    .expect("open sqlite catalog");
+
+    let initial = catalog.runtime_snapshot_pin_status();
+    assert!(initial.admission_open);
+    assert_eq!(initial.active_pins, 0);
+    assert_eq!(initial.active_tables, 0);
+    assert_eq!(initial.max_active_pins, 2);
+    assert_eq!(initial.max_active_tables, 1);
+    assert_eq!(initial.pin_budget_exhaustions_total, 0);
+    assert_eq!(initial.table_budget_exhaustions_total, 0);
+
+    let first = catalog
+        .pin_runtime_snapshot(table_id(1), 1)
+        .expect("pin first snapshot");
+    let second = catalog
+        .pin_runtime_snapshot(table_id(1), 2)
+        .expect("pin second snapshot");
+    assert_eq!(
+        catalog
+            .pin_runtime_snapshot(table_id(1), 3)
+            .expect_err("pin budget must reject excess admission")
+            .code(),
+        ErrorCode::ResourceExhausted
+    );
+    assert_eq!(
+        catalog
+            .pin_runtime_snapshot(table_id(2), 1)
+            .expect_err("table budget must reject excess admission")
+            .code(),
+        ErrorCode::ResourceExhausted
+    );
+
+    let exhausted = catalog.runtime_snapshot_pin_status();
+    assert_eq!(exhausted.active_pins, 2);
+    assert_eq!(exhausted.active_tables, 1);
+    assert_eq!(exhausted.pin_budget_exhaustions_total, 1);
+    assert_eq!(exhausted.table_budget_exhaustions_total, 1);
+    let encoded = serde_json::to_value(exhausted).expect("serialize runtime pin status");
+    assert_eq!(encoded["max_active_pins"], 2);
+    assert_eq!(encoded["table_budget_exhaustions_total"], 1);
+    let decoded: zippy_catalog::SqliteCatalogRuntimeSnapshotPinStatus =
+        serde_json::from_value(encoded).expect("deserialize runtime pin status");
+    assert_eq!(decoded, exhausted);
+
+    drop((first, second));
+    let released = catalog.runtime_snapshot_pin_status();
+    assert_eq!(released.active_pins, 0);
+    assert_eq!(released.active_tables, 0);
+    assert_eq!(released.pin_budget_exhaustions_total, 1);
+    assert_eq!(released.table_budget_exhaustions_total, 1);
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[test]
+fn read_handle_reports_closed_pin_registry_until_the_last_guard_drops() {
+    let directory = TempDir::new().expect("create temp directory");
+    let ownership = data_directory(&directory);
+    let catalog = SqliteCatalog::open(
+        SqliteCatalogConfig::new(&ownership).with_runtime_snapshot_pin_limits(2, 2),
+    )
+    .expect("open sqlite catalog");
+    let read_handle = catalog.read_handle().expect("create read handle");
+    assert!(
+        read_handle
+            .runtime_snapshot_pin_status()
+            .expect("read open registry status")
+            .admission_open
+    );
+    let retained = catalog
+        .pin_runtime_snapshot(table_id(1), 1)
+        .expect("retain one snapshot pin");
+
+    catalog.close().expect("close sqlite catalog");
+    let closed = read_handle
+        .runtime_snapshot_pin_status()
+        .expect("retained guard keeps closed registry observable");
+    assert!(!closed.admission_open);
+    assert_eq!(closed.active_pins, 1);
+    assert_eq!(closed.active_tables, 1);
+
+    drop(retained);
+    let unavailable = read_handle
+        .runtime_snapshot_pin_status()
+        .expect_err("dropped registry must be terminally unavailable");
+    assert_eq!(unavailable.code(), ErrorCode::Unavailable);
+    assert!(unavailable
+        .message()
+        .contains("runtime snapshot pin registry is no longer available"));
 }
 
 #[test]

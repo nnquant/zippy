@@ -308,19 +308,20 @@ impl CommitIntentJournal {
         })?;
         match transaction.publish_noclobber() {
             Ok(_) => self.load(&path),
-            Err(DataDirectoryError::AlreadyExists { .. }) => {
-                let existing = self.load(&path)?;
-                if existing.command != command {
-                    return Err(ServerError::new(
-                        ErrorCode::Conflict,
-                        "catalog commit intent sequence already names a different command",
-                    )
-                    .with_request_id(request_id)
-                    .with_retryable(false));
+            Err(failure) => {
+                let (error, _) = failure.into_parts();
+                if matches!(&error, DataDirectoryError::AlreadyExists { .. }) {
+                    let existing = self.load(&path)?;
+                    if existing.command != command {
+                        return Err(ServerError::new(
+                            ErrorCode::Conflict,
+                            "catalog commit intent sequence already names a different command",
+                        )
+                        .with_request_id(request_id)
+                        .with_retryable(false));
+                    }
+                    return Ok(existing);
                 }
-                Ok(existing)
-            }
-            Err(error) => {
                 Err(map_data_directory_error_for_intent(error).with_request_id(request_id))
             }
         }
@@ -755,9 +756,9 @@ fn open_intent_file_nofollow(path: &Path, _path_metadata: &fs::Metadata) -> Resu
 
 fn map_data_directory_error_for_intent(error: DataDirectoryError) -> ServerError {
     let code = match &error {
-        DataDirectoryError::OwnershipHeld { .. } | DataDirectoryError::AlreadyExists { .. } => {
-            ErrorCode::Conflict
-        }
+        DataDirectoryError::OwnershipHeld { .. }
+        | DataDirectoryError::CatalogRuntimeOwnershipHeld { .. }
+        | DataDirectoryError::AlreadyExists { .. } => ErrorCode::Conflict,
         DataDirectoryError::Io { .. } => ErrorCode::Unavailable,
         DataDirectoryError::InvalidManagedPath { .. } => ErrorCode::Internal,
         DataDirectoryError::NotDirectory { .. }

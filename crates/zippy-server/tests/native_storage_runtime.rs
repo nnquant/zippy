@@ -259,8 +259,16 @@ async fn supervisor_starts_inside_an_existing_tokio_runtime_and_closes_cleanly()
         directory.clone().acquire_process_ownership(),
         Err(DataDirectoryError::OwnershipHeld { .. })
     ));
+    let read_handle = runtime.catalog_read_handle();
+    assert_eq!(read_handle.revision().await.unwrap(), 0);
 
     assert!(runtime.shutdown(Duration::from_secs(2)).is_complete());
+    let closed_error = read_handle
+        .revision()
+        .await
+        .expect_err("retained read handle must fail after Catalog shutdown");
+    assert_eq!(closed_error.code(), ErrorCode::Unavailable);
+    assert!(!closed_error.retryable());
     drop(runtime);
     assert!(matches!(
         directory.clone().acquire_process_ownership(),
@@ -345,6 +353,13 @@ async fn actor_persist_is_recovered_as_the_same_snapshot_after_restart() {
         .expect_err("one request id cannot name a different durable manifest");
     assert_eq!(conflicting_replay.code(), ErrorCode::Conflict);
     assert!(restarted.is_healthy());
+    assert!(!root
+        .join(format!(
+            "parquet/{}/{}.parquet",
+            table_id(),
+            FileId::from_u128(101).unwrap()
+        ))
+        .exists());
 
     let advanced = restarted_actor
         .persist(test_persist_request(101, 102, 1, 44, 2))
@@ -358,6 +373,13 @@ async fn actor_persist_is_recovered_as_the_same_snapshot_after_restart() {
         .expect_err("a reused request id cannot name a new current-parent manifest");
     assert_eq!(current_parent_conflict.code(), ErrorCode::Conflict);
     assert!(restarted.is_healthy());
+    assert!(!root
+        .join(format!(
+            "parquet/{}/{}.parquet",
+            table_id(),
+            FileId::from_u128(103).unwrap()
+        ))
+        .exists());
 
     let continued = restarted_actor
         .persist(test_persist_request(102, 104, 2, 46, 3))
@@ -399,12 +421,12 @@ async fn terminal_persist_failure_revokes_health_and_fails_ordered_shutdown() {
         .expect("table setup released its Catalog references")
         .close()
         .unwrap();
-    write_test_candidate(&ownership, 200, 0, 1);
 
     let mut runtime = NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership))
-        .expect("an uncommitted candidate is reported but does not block startup");
+        .expect("native storage should become ready before fault injection");
     assert!(runtime.is_healthy());
     let actor = runtime.table_actor(table_id()).unwrap();
+    write_test_candidate(&ownership, 200, 0, 1);
     let error = actor
         .persist(test_persist_request(200, 200, 0, 2, 1))
         .await
@@ -666,6 +688,7 @@ async fn pre_replay_gate_rejects_partially_represented_multi_file_intent() {
     let root = temp.path().join("database");
     let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(&root).unwrap());
     let first = write_test_candidate(&ownership, 20, 0, 100);
+    let first_pending = first.pending().clone();
     let second = write_test_candidate(&ownership, 21, 1, 101);
 
     let terminal_catalog = Arc::new(TerminalCatalog);
@@ -681,7 +704,7 @@ async fn pre_replay_gate_rejects_partially_represented_multi_file_intent() {
         request_id(10),
         table_id(),
         1,
-        vec![first.clone(), second],
+        vec![first, second],
         OffsetWatermark::Known(LogOffset::new(1)),
     )
     .unwrap();
@@ -700,7 +723,7 @@ async fn pre_replay_gate_rejects_partially_represented_multi_file_intent() {
             CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
                 table_id: table_id(),
                 expected_snapshot_version: 1,
-                files: vec![first.pending().clone()],
+                files: vec![first_pending],
                 committed_log_offset: OffsetWatermark::Known(LogOffset::new(0)),
             }),
         ))
@@ -731,6 +754,7 @@ async fn catalog_visible_missing_parquet_prevents_native_storage_readiness() {
     let root = temp.path().join("database");
     let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(&root).unwrap());
     let candidate = write_test_candidate(&ownership, 20, 0, 100);
+    let candidate_path = candidate.path().to_path_buf();
 
     let catalog = Arc::new(SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap());
     create_test_table(catalog.as_ref()).await;
@@ -748,7 +772,7 @@ async fn catalog_visible_missing_parquet_prevents_native_storage_readiness() {
                 request_id(10),
                 table_id(),
                 1,
-                vec![candidate.clone()],
+                vec![candidate],
                 OffsetWatermark::Known(LogOffset::new(0)),
             )
             .unwrap(),
@@ -760,7 +784,7 @@ async fn catalog_visible_missing_parquet_prevents_native_storage_readiness() {
         .ok()
         .expect("coordinator released its Catalog reference");
     catalog.close().unwrap();
-    fs::remove_file(candidate.path()).unwrap();
+    fs::remove_file(candidate_path).unwrap();
 
     let error = match NativeStorageRuntime::start(NativeStorageRuntimeConfig::new(&ownership)) {
         Ok(mut runtime) => {

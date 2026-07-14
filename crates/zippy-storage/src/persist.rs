@@ -15,12 +15,11 @@ use zippy_types::table::{
 };
 use zippy_types::{ErrorCode, LogOffset, OffsetWatermark, RequestId, Result, ServerError, TableId};
 
-use crate::candidate::PreparedParquetCandidateSpec;
+use crate::candidate::{PreparedParquetCandidateSpec, StagedParquetCandidate};
 use crate::commit::CatalogCommitFailure;
 use crate::commit_intent::MAX_FILES_PER_COMMIT_INTENT;
 use crate::{
-    CatalogCommitCoordinator, CommitDataFilesIntent, CommitDataFilesReceipt,
-    DurableParquetCandidate, ParquetCandidateSpec, ParquetCandidateWriter,
+    CatalogCommitCoordinator, CommitDataFilesReceipt, ParquetCandidateSpec, ParquetCandidateWriter,
 };
 
 const DEFAULT_MAX_OUTSTANDING_JOBS: usize = 64;
@@ -32,6 +31,15 @@ const MAX_MAX_INFLIGHT_INPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_PERSIST_PARALLEL_WRITERS: usize = 64;
 const INPUT_BUDGET_UNIT_BYTES: u64 = 64 * 1024;
 const CONSERVATIVE_METADATA_ENTRY_BYTES: usize = 1024;
+
+/// Catalog publication policy selected by the table actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistMode {
+    /// Extend the actor-owned current snapshot when no idempotency record exists.
+    Advance,
+    /// Resolve only an already-committed historical request and never publish.
+    HistoricalReplay,
+}
 
 /// Bounded admission and Parquet execution policy for native persist jobs.
 #[derive(Debug, Clone)]
@@ -650,7 +658,16 @@ impl PersistControllerHandle {
     /// slot before enqueueing.
     /// Dropping the returned ticket never cancels the accepted operation.
     pub fn submit(&self, request: PersistRequest) -> Result<PersistTicket> {
-        self.submit_classified(request)
+        self.submit_with_mode(request, PersistMode::Advance)
+    }
+
+    /// Immediately admits one request using an explicit publication policy.
+    pub fn submit_with_mode(
+        &self,
+        request: PersistRequest,
+        mode: PersistMode,
+    ) -> Result<PersistTicket> {
+        self.submit_classified_with_mode(request, mode)
             .map_err(PersistCompletionFailure::into_error)
     }
 
@@ -662,6 +679,15 @@ impl PersistControllerHandle {
     pub fn submit_classified(
         &self,
         request: PersistRequest,
+    ) -> std::result::Result<PersistTicket, PersistCompletionFailure> {
+        self.submit_classified_with_mode(request, PersistMode::Advance)
+    }
+
+    /// Immediately admits one request while preserving mode and failure class.
+    pub fn submit_classified_with_mode(
+        &self,
+        request: PersistRequest,
+        mode: PersistMode,
     ) -> std::result::Result<PersistTicket, PersistCompletionFailure> {
         let request_id = request.request_id;
         let table_id = request.table_id;
@@ -741,6 +767,7 @@ impl PersistControllerHandle {
         let (response, receiver) = oneshot::channel();
         queue_permit.send(PersistJob {
             request,
+            mode,
             response,
             _permits: AdmissionPermits {
                 _table: table_permit,
@@ -894,6 +921,14 @@ impl PersistController {
         writer: ParquetCandidateWriter,
         coordinator: CatalogCommitCoordinator,
     ) -> Result<Self> {
+        if !coordinator.supports_staged_persistence() {
+            let error = ServerError::new(
+                ErrorCode::UnsupportedPlan,
+                "persist controller requires Catalog publication control",
+            )
+            .with_retryable(false);
+            return Err(drain_after_startup_failure(coordinator, error).await);
+        }
         if let Err(error) = config.validate() {
             return Err(drain_after_startup_failure(coordinator, error).await);
         }
@@ -1039,6 +1074,7 @@ impl Drop for TablePersistPermit {
 
 struct PersistJob {
     request: PersistRequest,
+    mode: PersistMode,
     response: oneshot::Sender<PersistCompletionResult>,
     _permits: AdmissionPermits,
 }
@@ -1047,7 +1083,8 @@ struct WrittenPersistJob {
     request_id: RequestId,
     table_id: TableId,
     expected_snapshot_version: u64,
-    candidates: Result<Vec<DurableParquetCandidate>>,
+    mode: PersistMode,
+    candidates: Result<Vec<StagedParquetCandidate>>,
     committed_log_offset: OffsetWatermark,
     response: oneshot::Sender<PersistCompletionResult>,
     _permits: AdmissionPermits,
@@ -1121,6 +1158,7 @@ async fn run_controller(
 fn write_job(writer: &ParquetCandidateWriter, job: PersistJob) -> WrittenPersistJob {
     let PersistJob {
         request,
+        mode,
         response,
         _permits,
     } = job;
@@ -1138,13 +1176,14 @@ fn write_job(writer: &ParquetCandidateWriter, job: PersistJob) -> WrittenPersist
     } = request;
     let mut durable = Vec::with_capacity(candidates.len());
     let candidates = candidates.into_iter().try_for_each(|candidate| {
-        durable.push(writer.write_prepared_candidate(candidate.prepared, candidate.batches)?);
+        durable.push(writer.stage_prepared_candidate(candidate.prepared, candidate.batches)?);
         Ok::<(), ServerError>(())
     });
     WrittenPersistJob {
         request_id,
         table_id,
         expected_snapshot_version,
+        mode,
         candidates: candidates.map(|()| durable),
         committed_log_offset,
         response,
@@ -1164,30 +1203,29 @@ async fn complete_written_job(
         request_id,
         table_id,
         expected_snapshot_version,
+        mode,
         candidates,
         committed_log_offset,
         response,
         _permits,
     } = job;
     let (result, fatal_error): (PersistCompletionResult, Option<ServerError>) = match candidates {
-        Ok(candidates) => match CommitDataFilesIntent::new(
-            request_id,
-            table_id,
-            expected_snapshot_version,
-            candidates,
-            committed_log_offset,
-        ) {
-            Ok(intent) => match coordinator.commit_classified(intent).await {
-                Ok(receipt) => (Ok(receipt), None),
-                Err(CatalogCommitFailure::DefinitiveRejection(error)) => {
-                    (Err(PersistCompletionFailure::Rejected(error)), None)
-                }
-                Err(CatalogCommitFailure::Fatal(error)) => (
-                    Err(PersistCompletionFailure::Fatal(error.clone())),
-                    Some(error),
-                ),
-            },
-            Err(error) => (
+        Ok(candidates) => match coordinator
+            .commit_staged_classified(
+                mode,
+                request_id,
+                table_id,
+                expected_snapshot_version,
+                candidates,
+                committed_log_offset,
+            )
+            .await
+        {
+            Ok(receipt) => (Ok(receipt), None),
+            Err(CatalogCommitFailure::DefinitiveRejection(error)) => {
+                (Err(PersistCompletionFailure::Rejected(error)), None)
+            }
+            Err(CatalogCommitFailure::Fatal(error)) => (
                 Err(PersistCompletionFailure::Fatal(error.clone())),
                 Some(error),
             ),

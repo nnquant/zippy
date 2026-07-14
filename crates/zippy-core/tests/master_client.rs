@@ -41,6 +41,7 @@ fn test_stream_info() -> StreamInfo {
         segment_row_capacity: None,
         sealed_segments: Vec::new(),
         persisted_files: Vec::new(),
+        persisted_files_revision: 0,
         persist_events: Vec::new(),
         segment_reader_leases: Vec::new(),
         buffer_size: 1024,
@@ -51,6 +52,23 @@ fn test_stream_info() -> StreamInfo {
         reader_count: 0,
         status: "registered".to_string(),
     }
+}
+
+#[test]
+fn stream_info_persisted_files_revision_is_backward_compatible() {
+    let mut legacy = serde_json::to_value(test_stream_info()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("persisted_files_revision");
+    let decoded = serde_json::from_value::<StreamInfo>(legacy).unwrap();
+    assert_eq!(decoded.persisted_files_revision, 0);
+
+    let mut current = test_stream_info();
+    current.persisted_files_revision = 7;
+    let decoded =
+        serde_json::from_value::<StreamInfo>(serde_json::to_value(&current).unwrap()).unwrap();
+    assert_eq!(decoded, current);
 }
 
 #[test]

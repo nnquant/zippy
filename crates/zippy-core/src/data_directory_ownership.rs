@@ -3,6 +3,8 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,7 @@ pub struct OwnedDataDirectory {
     lock_path: PathBuf,
     _lock_file: File,
     _root_directory: File,
+    catalog_runtime_owned: Arc<AtomicBool>,
 }
 
 impl OwnedDataDirectory {
@@ -78,6 +81,7 @@ impl OwnedDataDirectory {
             lock_path,
             _lock_file: lock_file,
             _root_directory: root_directory,
+            catalog_runtime_owned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -94,6 +98,24 @@ impl OwnedDataDirectory {
     /// Returns the stable lock-file path.
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
+    }
+
+    /// Acquires the process-local single typed-Catalog runtime capability.
+    ///
+    /// The kernel data-root lock prevents another process from opening the database. This second
+    /// capability prevents two Catalog writer actors inside the owning process from splitting
+    /// publication, runtime snapshot pins, and garbage-collection coordination.
+    pub fn acquire_catalog_runtime_ownership(
+        &self,
+    ) -> Result<CatalogRuntimeOwnership, DataDirectoryError> {
+        self.catalog_runtime_owned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| DataDirectoryError::CatalogRuntimeOwnershipHeld {
+                path: self.directory.root().to_path_buf(),
+            })?;
+        Ok(CatalogRuntimeOwnership {
+            owned: Arc::clone(&self.catalog_runtime_owned),
+        })
     }
 
     /// Duplicates the validated root directory descriptor for descriptor-relative I/O.
@@ -127,7 +149,20 @@ fn acquire_process_ownership(
         lock_path,
         _lock_file: lock_file,
         _root_directory: root_directory,
+        catalog_runtime_owned: Arc::new(AtomicBool::new(false)),
     })
+}
+
+/// RAII ownership of the single typed Catalog runtime under one managed data root.
+#[derive(Debug)]
+pub struct CatalogRuntimeOwnership {
+    owned: Arc<AtomicBool>,
+}
+
+impl Drop for CatalogRuntimeOwnership {
+    fn drop(&mut self) {
+        self.owned.store(false, Ordering::Release);
+    }
 }
 
 fn acquire_root_lock(

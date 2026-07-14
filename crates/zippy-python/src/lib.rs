@@ -108,6 +108,16 @@ fn py_runtime_error(message: impl Into<String>) -> PyErr {
     PyRuntimeError::new_err(message.into())
 }
 
+fn py_runtime_error_with_code(
+    py: Python<'_>,
+    message: impl Into<String>,
+    code: &str,
+) -> PyResult<PyErr> {
+    let error = py_runtime_error(message);
+    error.value_bound(py).setattr("zippy_error_code", code)?;
+    Ok(error)
+}
+
 fn reject_sharded_stream_table_option(enabled: bool, option: &str) -> PyResult<()> {
     if enabled {
         return Err(py_value_error(format!(
@@ -7940,8 +7950,13 @@ fn run_server_daemon_impl(py: Python<'_>, arguments: ServerDaemonArguments) -> P
             ));
         }
     }
-    py.allow_threads(move || run_rust_server_daemon(runtime_config))
-        .map_err(|error| py_runtime_error(error.to_string()))
+    match py.allow_threads(move || run_rust_server_daemon(runtime_config)) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let code = error.code().as_str();
+            Err(py_runtime_error_with_code(py, error.to_string(), code)?)
+        }
+    }
 }
 
 #[pyfunction]
@@ -9973,6 +9988,23 @@ mod tests {
     static PYTHON_SITE_PACKAGES: OnceLock<Vec<String>> = OnceLock::new();
 
     #[test]
+    fn server_runtime_error_exposes_stable_error_code() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let error =
+                py_runtime_error_with_code(py, "native storage failed", "DATA_CORRUPTION").unwrap();
+            let code = error
+                .value_bound(py)
+                .getattr("zippy_error_code")
+                .unwrap()
+                .extract::<String>()
+                .unwrap();
+
+            assert_eq!(code, "DATA_CORRUPTION");
+        });
+    }
+
+    #[test]
     fn callback_flush_deadline_rejects_unrepresentable_duration() {
         let error = deadline_from_delay(Some(Duration::MAX))
             .expect_err("unrepresentable callback flush deadline must be rejected");
@@ -9997,6 +10029,7 @@ mod tests {
             segment_row_capacity: None,
             sealed_segments: Vec::new(),
             persisted_files: Vec::new(),
+            persisted_files_revision: 0,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,
@@ -12484,6 +12517,7 @@ mod tests {
                 "generation": 1
             })],
             persisted_files: Vec::new(),
+            persisted_files_revision: 0,
             persist_events: Vec::new(),
             segment_reader_leases: Vec::new(),
             buffer_size: 64,

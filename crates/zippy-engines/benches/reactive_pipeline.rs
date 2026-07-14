@@ -85,10 +85,10 @@ fn bench_reactive_pipeline_multi_factor(c: &mut Criterion) {
                     ExpressionSpec::new("price + 1", "price_plus_one")
                         .build(schema.as_ref())
                         .unwrap(),
-                    ExpressionSpec::new("abs(price)", "price_abs")
+                    ExpressionSpec::new("ABS(price)", "price_abs")
                         .build(schema.as_ref())
                         .unwrap(),
-                    ExpressionSpec::new("clip(price, 10, 20)", "price_clip")
+                    ExpressionSpec::new("CLIP(price, 10, 20)", "price_clip")
                         .build(schema.as_ref())
                         .unwrap(),
                 ],

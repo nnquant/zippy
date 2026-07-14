@@ -1,9 +1,12 @@
 //! Read-only catalog compatibility over persistent legacy registry metadata.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::ipc::writer::StreamWriter;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zippy_types::catalog::{
     CatalogCommandV1, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
@@ -31,6 +34,105 @@ const LEGACY_LATEST_BY_FIELD: &str = "zippy_latest_by";
 const INTERNAL_TABLE_FIELD: &str = "zippy_internal";
 const SEGMENT_PER_BATCH_FRAME_MODE: &str = "segment_per_batch";
 const FRAME_PROTOCOL_VERSION: u64 = 1;
+const LEGACY_MIGRATION_SNAPSHOT_HASH_SCHEME: &str = "sha256-v1";
+
+/// One atomically captured, normalized view of the table-relevant legacy registry state.
+///
+/// The hash covers the normalized migration view rather than the byte layout of
+/// `master-registry.json`. Process, source, and engine liveness are deliberately excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCatalogMigrationSnapshot {
+    source_catalog_revision: u64,
+    source_snapshot_hash: String,
+    namespace: NamespaceDescriptor,
+    tables: Vec<LegacyCatalogMigrationTable>,
+}
+
+impl LegacyCatalogMigrationSnapshot {
+    /// Returns the legacy Catalog revision captured under the registry lock.
+    #[must_use]
+    pub const fn source_catalog_revision(&self) -> u64 {
+        self.source_catalog_revision
+    }
+
+    /// Returns the deterministic hash of the normalized migration view.
+    #[must_use]
+    pub fn source_snapshot_hash(&self) -> &str {
+        &self.source_snapshot_hash
+    }
+
+    /// Returns the stable default namespace represented by the legacy registry.
+    #[must_use]
+    pub const fn namespace(&self) -> &NamespaceDescriptor {
+        &self.namespace
+    }
+
+    /// Returns public legacy tables in strict stable-table-id order.
+    #[must_use]
+    pub fn tables(&self) -> &[LegacyCatalogMigrationTable] {
+        &self.tables
+    }
+}
+
+/// Complete migration input retained for one public legacy table.
+///
+/// `persisted_files` preserves legacy discovery order. Frozen V1 Catalog commands cannot import
+/// those files; the raw values are retained so a later typed V2 importer can validate paths,
+/// derive stable file identities, and preserve ordering without rereading a moving registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCatalogMigrationTable {
+    descriptor: TableDescriptor,
+    legacy_schema: serde_json::Value,
+    legacy_schema_hash: String,
+    schema_ipc: zippy_types::table::SchemaIpcPayload,
+    schema_has_custom_metadata: bool,
+    persisted_files_revision: u64,
+    persisted_files: Vec<serde_json::Value>,
+}
+
+impl LegacyCatalogMigrationTable {
+    /// Returns the stable normalized table descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &TableDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns the original JSON Arrow schema metadata stored by the registry.
+    #[must_use]
+    pub const fn legacy_schema(&self) -> &serde_json::Value {
+        &self.legacy_schema
+    }
+
+    /// Returns the legacy control-plane schema hash.
+    #[must_use]
+    pub fn legacy_schema_hash(&self) -> &str {
+        &self.legacy_schema_hash
+    }
+
+    /// Returns the schema-only Arrow IPC stream required by `CreateTable`.
+    #[must_use]
+    pub const fn schema_ipc(&self) -> &zippy_types::table::SchemaIpcPayload {
+        &self.schema_ipc
+    }
+
+    /// Returns whether schema or field metadata makes regenerated Arrow IPC byte ordering unstable.
+    #[must_use]
+    pub const fn schema_has_custom_metadata(&self) -> bool {
+        self.schema_has_custom_metadata
+    }
+
+    /// Returns the legacy revision of the complete persisted-file view.
+    #[must_use]
+    pub const fn persisted_files_revision(&self) -> u64 {
+        self.persisted_files_revision
+    }
+
+    /// Returns raw persisted-file metadata in legacy discovery order.
+    #[must_use]
+    pub fn persisted_files(&self) -> &[serde_json::Value] {
+        &self.persisted_files
+    }
+}
 
 /// Read-only bridge from the legacy master registry to the persistent catalog contract.
 #[derive(Clone)]
@@ -51,6 +153,20 @@ struct LegacyStreamView {
     persisted_files_revision: u64,
     writer_epoch: u64,
     source_configs: Vec<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct LegacyMigrationView {
+    catalog_revision: u64,
+    streams: Vec<LegacyMigrationStreamView>,
+}
+
+#[derive(Debug)]
+struct LegacyMigrationStreamView {
+    catalog: LegacyStreamView,
+    schema: serde_json::Value,
+    schema_hash: String,
+    persisted_files: Vec<serde_json::Value>,
 }
 
 impl LegacyCatalogAdapter {
@@ -92,6 +208,41 @@ impl LegacyCatalogAdapter {
             catalog_revision: registry.catalog_revision(),
             streams,
         })
+    }
+
+    fn capture_migration_view(&self) -> Result<LegacyMigrationView> {
+        let registry = self.lock_registry()?;
+        let mut source_configs = registry.source_configs_by_stream();
+        let streams = registry
+            .stream_records()
+            .map(|stream| LegacyMigrationStreamView {
+                catalog: LegacyStreamView {
+                    stream_name: stream.stream_name.clone(),
+                    persisted_files_revision: stream.persisted_files_revision,
+                    writer_epoch: stream.writer_epoch,
+                    source_configs: source_configs
+                        .remove(&stream.stream_name)
+                        .unwrap_or_default(),
+                },
+                schema: stream.schema.clone(),
+                schema_hash: stream.schema_hash.clone(),
+                persisted_files: stream.persisted_files.clone(),
+            })
+            .collect();
+        Ok(LegacyMigrationView {
+            catalog_revision: registry.catalog_revision(),
+            streams,
+        })
+    }
+
+    /// Captures all table-relevant migration data under one legacy registry lock.
+    ///
+    /// The returned value is detached from the live registry. Hashing and Arrow IPC encoding occur
+    /// after releasing the lock, so migration work cannot extend the legacy control-plane critical
+    /// section. Runtime liveness records are intentionally absent.
+    pub fn capture_migration_snapshot(&self) -> Result<LegacyCatalogMigrationSnapshot> {
+        let view = self.capture_migration_view()?;
+        build_migration_snapshot(view)
     }
 
     fn read_revision(&self) -> Result<u64> {
@@ -248,6 +399,224 @@ impl CatalogWrite for LegacyCatalogAdapter {
         let error = unsupported_plan(operator).with_request_id(envelope.request_id);
         Box::pin(async move { Err(error) })
     }
+}
+
+fn build_migration_snapshot(view: LegacyMigrationView) -> Result<LegacyCatalogMigrationSnapshot> {
+    let namespace = default_namespace_descriptor();
+    let mut tables = Vec::new();
+    for stream in view.streams {
+        if !has_explicit_table_kind(&stream.catalog) || is_internal_table(&stream.catalog)? {
+            continue;
+        }
+        let descriptor = map_table(&stream.catalog)?;
+        let schema =
+            arrow_schema_from_stream_metadata(&stream.catalog.stream_name, &stream.schema)?;
+        let schema_has_custom_metadata = !schema.metadata().is_empty()
+            || schema
+                .fields()
+                .iter()
+                .any(|field| !field.metadata().is_empty());
+        let schema_ipc = encode_schema_ipc(&stream.catalog.stream_name, &schema)?;
+        tables.push(LegacyCatalogMigrationTable {
+            persisted_files_revision: stream.catalog.persisted_files_revision,
+            descriptor,
+            legacy_schema: stream.schema,
+            legacy_schema_hash: stream.schema_hash,
+            schema_ipc,
+            schema_has_custom_metadata,
+            persisted_files: stream.persisted_files,
+        });
+    }
+    tables.sort_by_key(|table| table.descriptor.table_id);
+    if let Some(duplicate) = tables
+        .windows(2)
+        .find(|pair| pair[0].descriptor.table_id == pair[1].descriptor.table_id)
+    {
+        return Err(data_corruption(
+            duplicate[0].descriptor.name.as_str(),
+            "deterministic legacy table id collision",
+        ));
+    }
+    let source_snapshot_hash = migration_snapshot_hash(view.catalog_revision, &namespace, &tables)?;
+    Ok(LegacyCatalogMigrationSnapshot {
+        source_catalog_revision: view.catalog_revision,
+        source_snapshot_hash,
+        namespace,
+        tables,
+    })
+}
+
+#[derive(Serialize)]
+struct MigrationSnapshotFingerprint<'a> {
+    format: &'static str,
+    source_catalog_revision: u64,
+    namespace: &'a NamespaceDescriptor,
+    tables: Vec<MigrationTableFingerprint<'a>>,
+}
+
+#[derive(Serialize)]
+struct MigrationTableFingerprint<'a> {
+    descriptor: &'a TableDescriptor,
+    legacy_schema: &'a serde_json::Value,
+    legacy_schema_hash: &'a str,
+    persisted_files_revision: u64,
+    persisted_files: &'a [serde_json::Value],
+}
+
+fn migration_snapshot_hash(
+    source_catalog_revision: u64,
+    namespace: &NamespaceDescriptor,
+    tables: &[LegacyCatalogMigrationTable],
+) -> Result<String> {
+    let fingerprint = MigrationSnapshotFingerprint {
+        format: "zippy.legacy_catalog.migration_snapshot.v1",
+        source_catalog_revision,
+        namespace,
+        tables: tables
+            .iter()
+            .map(|table| MigrationTableFingerprint {
+                descriptor: &table.descriptor,
+                legacy_schema: &table.legacy_schema,
+                legacy_schema_hash: &table.legacy_schema_hash,
+                persisted_files_revision: table.persisted_files_revision,
+                persisted_files: &table.persisted_files,
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&fingerprint).map_err(|error| {
+        ServerError::new(
+            ErrorCode::Internal,
+            format!("failed to encode legacy migration snapshot fingerprint error=[{error}]"),
+        )
+    })?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!(
+        "{LEGACY_MIGRATION_SNAPSHOT_HASH_SCHEME}:{digest:x}"
+    ))
+}
+
+fn arrow_schema_from_stream_metadata(
+    stream_name: &str,
+    schema: &serde_json::Value,
+) -> Result<Schema> {
+    let fields = schema
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| data_corruption(stream_name, "stream schema metadata missing fields"))?;
+    let fields = fields
+        .iter()
+        .map(|field| {
+            let name = field
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| data_corruption(stream_name, "stream schema field missing name"))?;
+            let segment_type = field
+                .get("segment_type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    data_corruption(stream_name, "stream schema field missing segment_type")
+                })?;
+            let nullable = field
+                .get("nullable")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    data_corruption(stream_name, "stream schema field missing nullable")
+                })?;
+            let timezone = field.get("timezone").and_then(serde_json::Value::as_str);
+            let data_type =
+                parse_arrow_schema_metadata_data_type(stream_name, segment_type, timezone)?;
+            let metadata =
+                string_map_from_json_value(stream_name, field.get("metadata"), "field metadata")?;
+            Ok(Field::new(name, data_type, nullable).with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let metadata =
+        string_map_from_json_value(stream_name, schema.get("metadata"), "schema metadata")?;
+    Ok(Schema::new_with_metadata(fields, metadata))
+}
+
+fn parse_arrow_schema_metadata_data_type(
+    stream_name: &str,
+    segment_type: &str,
+    timezone: Option<&str>,
+) -> Result<DataType> {
+    match segment_type {
+        "int64" => Ok(DataType::Int64),
+        "float64" => Ok(DataType::Float64),
+        "utf8" => Ok(DataType::Utf8),
+        "timestamp_ns_tz" => timezone
+            .map(|timezone| {
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone.to_owned().into()))
+            })
+            .ok_or_else(|| {
+                data_corruption(
+                    stream_name,
+                    "timestamp_ns_tz stream schema field missing timezone",
+                )
+            }),
+        "timestamp_ns" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        _ => Err(data_corruption(
+            stream_name,
+            &format!("unsupported stream field type segment_type=[{segment_type}]"),
+        )),
+    }
+}
+
+fn string_map_from_json_value(
+    stream_name: &str,
+    value: Option<&serde_json::Value>,
+    context: &str,
+) -> Result<HashMap<String, String>> {
+    let Some(value) = value else {
+        return Ok(HashMap::new());
+    };
+    let object = value.as_object().ok_or_else(|| {
+        data_corruption(
+            stream_name,
+            &format!("stream schema {context} must be an object"),
+        )
+    })?;
+    object
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .ok_or_else(|| {
+                    data_corruption(
+                        stream_name,
+                        &format!("stream schema {context} values must be strings"),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn encode_schema_ipc(
+    stream_name: &str,
+    schema: &Schema,
+) -> Result<zippy_types::table::SchemaIpcPayload> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut bytes, schema).map_err(|error| {
+            data_corruption(
+                stream_name,
+                &format!("failed to encode legacy table schema IPC error=[{error}]"),
+            )
+        })?;
+        writer.finish().map_err(|error| {
+            data_corruption(
+                stream_name,
+                &format!("failed to finish legacy table schema IPC error=[{error}]"),
+            )
+        })?;
+    }
+    zippy_types::table::SchemaIpcPayload::new(bytes).map_err(|error| {
+        data_corruption(
+            stream_name,
+            &format!("legacy table schema IPC is empty error=[{error}]"),
+        )
+    })
 }
 
 fn map_tables(view: &LegacyCatalogView) -> Result<Vec<TableDescriptor>> {
@@ -491,6 +860,7 @@ fn unsupported_plan(operator: &str) -> ServerError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::future::Future;
     use std::num::NonZeroU32;
     use std::pin::pin;
@@ -498,7 +868,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Wake, Waker};
 
+    use arrow::datatypes::{DataType, Field, Schema};
     use serde_json::json;
+    use zippy_core::{canonical_schema_hash, schema_metadata};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
         CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, ListNamespacesRequest,
@@ -535,6 +907,38 @@ mod tests {
     fn add_stream(registry: &mut Registry, stream_name: &str, config: serde_json::Value) {
         registry
             .register_stream(stream_name, json!({"fields": []}), "schema", 64, 64)
+            .unwrap();
+        registry
+            .register_source(
+                &format!("{stream_name}_source"),
+                "test",
+                &format!("{stream_name}_process"),
+                stream_name,
+                config,
+            )
+            .unwrap();
+    }
+
+    fn add_migratable_stream(
+        registry: &mut Registry,
+        stream_name: &str,
+        config: serde_json::Value,
+        custom_metadata: bool,
+    ) {
+        let field = Field::new("value", DataType::Int64, false).with_metadata(if custom_metadata {
+            HashMap::from([("unit".to_owned(), "ticks".to_owned())])
+        } else {
+            HashMap::new()
+        });
+        let schema = Arc::new(Schema::new(vec![field]));
+        registry
+            .register_stream(
+                stream_name,
+                schema_metadata(&schema),
+                &canonical_schema_hash(&schema),
+                64,
+                64,
+            )
             .unwrap();
         registry
             .register_source(
@@ -1137,5 +1541,71 @@ mod tests {
         );
         assert_eq!(first_table.current_snapshot_version, 5);
         assert_eq!(first_table.writer_epoch, 7);
+    }
+
+    #[test]
+    fn migration_snapshot_is_atomic_deterministic_and_preserves_legacy_file_order() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "events",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        registry
+            .replace_persisted_files(
+                "events",
+                vec![
+                    json!({"file_path": "/legacy/second.parquet", "row_count": 2}),
+                    json!({"file_path": "/legacy/first.parquet", "row_count": 1}),
+                ],
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+
+        let first = adapter.capture_migration_snapshot().unwrap();
+        let second = adapter.capture_migration_snapshot().unwrap();
+
+        assert_eq!(first.source_snapshot_hash(), second.source_snapshot_hash());
+        assert!(first.source_snapshot_hash().starts_with("sha256-v1:"));
+        assert_eq!(first.tables().len(), 1);
+        let table = &first.tables()[0];
+        assert_eq!(
+            table.descriptor().current_snapshot_version,
+            table.persisted_files_revision()
+        );
+        assert_eq!(table.persisted_files().len(), 2);
+        assert_eq!(
+            table.persisted_files()[0]["file_path"],
+            "/legacy/second.parquet"
+        );
+        assert_eq!(
+            table.persisted_files()[1]["file_path"],
+            "/legacy/first.parquet"
+        );
+        assert!(!table.schema_ipc().as_bytes().is_empty());
+        assert!(!table.schema_has_custom_metadata());
+    }
+
+    #[test]
+    fn migration_snapshot_marks_custom_schema_metadata_as_noncanonical_ipc() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "metadata_events",
+            json!({"zippy_table_kind": "append_table"}),
+            true,
+        );
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(registry)),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let snapshot = adapter.capture_migration_snapshot().unwrap();
+
+        assert_eq!(snapshot.tables().len(), 1);
+        assert!(snapshot.tables()[0].schema_has_custom_metadata());
     }
 }

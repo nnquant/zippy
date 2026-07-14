@@ -73,6 +73,8 @@ pub enum DataDirectoryError {
     AlreadyExists { path: PathBuf },
     #[error("data directory is already owned by another process path=[{path}]")]
     OwnershipHeld { path: PathBuf },
+    #[error("catalog runtime is already active for data directory path=[{path}]")]
+    CatalogRuntimeOwnershipHeld { path: PathBuf },
     #[cfg(unix)]
     #[error(
         "managed data path owner does not match the current user path=[{path}] owner_uid=[{owner_uid}] current_uid=[{current_uid}]"
@@ -327,18 +329,23 @@ fn write_format_version(
     writeln!(temporary, "{expected_version}").map_err(|error| io_error(path, error))?;
     match temporary.publish_noclobber() {
         Ok(_) => {}
-        Err(DataDirectoryError::AlreadyExists { .. }) => {
-            require_regular_file(path)?;
-            require_owner_permissions(path)?;
-            let found = read_format_version(path)?;
-            if found != expected_version {
-                return Err(DataDirectoryError::UnsupportedFormatVersion {
-                    found,
-                    supported: expected_version,
-                });
+        Err(failure) => {
+            let (error, _) = failure.into_parts();
+            match error {
+                DataDirectoryError::AlreadyExists { .. } => {
+                    require_regular_file(path)?;
+                    require_owner_permissions(path)?;
+                    let found = read_format_version(path)?;
+                    if found != expected_version {
+                        return Err(DataDirectoryError::UnsupportedFormatVersion {
+                            found,
+                            supported: expected_version,
+                        });
+                    }
+                }
+                error => return Err(error),
             }
         }
-        Err(error) => return Err(error),
     }
     Ok(())
 }

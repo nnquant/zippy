@@ -243,6 +243,56 @@ def test_detached_child_forwards_remaining_startup_budget_to_native(
     assert 0.0 < remaining <= 5.0
 
 
+def test_detached_child_preserves_stable_native_error_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class NativeFailure(RuntimeError):
+        pass
+
+    def failing_native_runner(*_args: object, **_kwargs: object) -> None:
+        error = NativeFailure("native storage failed")
+        setattr(error, "zippy_error_code", "DATA_CORRUPTION")
+        raise error
+
+    outcome_file = tmp_path / "server.outcome.json"
+    monkeypatch.setattr(zippy, "run_server_daemon", failing_native_runner)
+    monkeypatch.setattr(cli_server, "_validate_inherited_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli_server,
+        "_validate_child_starting_state",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(cli_server, "_cleanup_child_state_from_environment", lambda: None)
+    monkeypatch.setenv("ZIPPY_SERVER_OUTCOME_FILE", str(outcome_file))
+    monkeypatch.setenv("ZIPPY_SERVER_LAUNCH_NONCE", "native-failure-generation")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "server",
+            "run",
+            str(tmp_path / "server.sock"),
+            "--foreground",
+            "--ready-file",
+            str(tmp_path / "server.json"),
+            "--launch-nonce",
+            "native-failure-generation",
+        ],
+    )
+
+    assert result.exit_code != 0
+    outcome = json.loads(outcome_file.read_text(encoding="utf-8"))
+    assert outcome["clean"] is False
+    assert outcome["error_code"] == "DATA_CORRUPTION"
+    validated = server_process._read_shutdown_outcome(
+        outcome_file,
+        pid=os.getpid(),
+        launch_nonce="native-failure-generation",
+    )
+    assert validated is not None
+    assert validated["error_code"] == "DATA_CORRUPTION"
+
+
 def test_server_run_rejects_missing_explicit_config_before_spawning(tmp_path: Path) -> None:
     runner = CliRunner()
 
@@ -535,6 +585,85 @@ def test_server_status_rejects_generation_change_during_health_probe(
 
     assert status["status"] == "unknown"
     assert status["health_error"] == "server generation changed during health probe"
+
+
+def test_server_status_never_trusts_static_ready_record_after_daemon_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control_endpoint = str(tmp_path / "failed-native-status.sock")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    paths = _server_paths(
+        control_endpoint,
+        run_dir=run_dir,
+        log_dir=tmp_path / "logs",
+    )
+    state = _valid_ready_record()
+    state.update(
+        {
+            "launch_nonce": "failed-native-generation",
+            "pid": 43003,
+            "control_endpoint": control_endpoint,
+            "launcher": {
+                "process_identity": {"boot_id": "boot-failed", "start_ticks": "3"},
+            },
+        }
+    )
+    paths.state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(server_process, "_lock_is_held", lambda _path: False)
+    monkeypatch.setattr(server_process, "_process_matches", lambda *_args: False)
+
+    status = _server_status(control_endpoint, run_dir=run_dir, webui_url=None)
+
+    assert status["status"] == "stopped"
+    assert status["stale_state"] is True
+
+
+@pytest.mark.parametrize(
+    ("state_name", "error_code"),
+    [("stopping", None), ("failed", "DATA_CORRUPTION")],
+)
+def test_server_status_does_not_probe_transitioned_generation_as_healthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state_name: str,
+    error_code: str | None,
+) -> None:
+    control_endpoint = str(tmp_path / "transition-status.sock")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(mode=0o700)
+    paths = _server_paths(
+        control_endpoint,
+        run_dir=run_dir,
+        log_dir=tmp_path / "logs",
+    )
+    state: dict[str, object] = {
+        "schema_version": 1,
+        "status": state_name,
+        "launch_nonce": "transition-generation",
+        "pid": 43004,
+        "launcher": {
+            "process_identity": {"boot_id": "boot-transition", "start_ticks": "4"},
+            "requested_control_endpoint": control_endpoint,
+            "state_file": str(paths.state_file),
+        },
+    }
+    if error_code is not None:
+        state["error_code"] = error_code
+    paths.state_file.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(server_process, "_lock_is_held", lambda _path: True)
+    monkeypatch.setattr(server_process, "_process_matches", lambda *_args: True)
+
+    def unexpected_live_health(*_args: object, **_kwargs: object):
+        raise AssertionError("transitioned state must not run live readiness probes")
+
+    monkeypatch.setattr(server_process, "_live_health", unexpected_live_health)
+
+    status = _server_status(control_endpoint, run_dir=run_dir, webui_url=None)
+
+    assert status["status"] == state_name
+    if error_code is not None:
+        assert status["error_code"] == error_code
 
 
 def test_webui_url_rejects_sensitive_path() -> None:

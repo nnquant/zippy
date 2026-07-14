@@ -7,6 +7,7 @@ edition.workspace = true
 arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 signal-hook = { version = "0.3", features = ["iterator"] }
 tokio.workspace = true
 tracing.workspace = true
