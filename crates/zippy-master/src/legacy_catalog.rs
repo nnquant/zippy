@@ -1,6 +1,7 @@
 //! Read-only catalog compatibility over persistent legacy registry metadata.
 
 use std::collections::{BTreeMap, HashMap};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -88,6 +89,7 @@ pub struct LegacyCatalogMigrationTable {
     schema_has_custom_metadata: bool,
     persisted_files_revision: u64,
     persisted_files: Vec<serde_json::Value>,
+    migration_files: Vec<LegacyMigrationFile>,
 }
 
 impl LegacyCatalogMigrationTable {
@@ -131,6 +133,203 @@ impl LegacyCatalogMigrationTable {
     #[must_use]
     pub fn persisted_files(&self) -> &[serde_json::Value] {
         &self.persisted_files
+    }
+
+    /// Returns typed persisted-file projections in original registry discovery order.
+    ///
+    /// Each projection retains its zero-based registry position and computed Gateway scan order.
+    /// The raw values returned by [`Self::persisted_files`] remain the frozen V1 fingerprint input.
+    #[must_use]
+    pub fn migration_files(&self) -> &[LegacyMigrationFile] {
+        &self.migration_files
+    }
+}
+
+/// Gateway-compatible stable ordering key for one legacy persisted file.
+///
+/// Missing legacy numeric fields are represented as zero, exactly matching the current Gateway
+/// persisted-file ordering contract. A field that is present with the wrong JSON type is rejected
+/// while the migration snapshot is built rather than silently treated as missing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LegacyMigrationScanOrderKey {
+    writer_epoch: u64,
+    source_segment_id: u64,
+    source_generation: u64,
+    created_at: u64,
+    file_path: String,
+}
+
+impl LegacyMigrationScanOrderKey {
+    /// Returns the effective writer epoch, defaulting missing legacy metadata to zero.
+    #[must_use]
+    pub const fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+
+    /// Returns the effective source segment identity, defaulting a missing field to zero.
+    #[must_use]
+    pub const fn source_segment_id(&self) -> u64 {
+        self.source_segment_id
+    }
+
+    /// Returns the effective source generation, defaulting a missing field to zero.
+    #[must_use]
+    pub const fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    /// Returns the effective legacy creation timestamp, defaulting a missing field to zero.
+    #[must_use]
+    pub const fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    /// Returns the validated canonical absolute UTF-8 path used as the final ordering component.
+    #[must_use]
+    pub fn file_path(&self) -> &str {
+        &self.file_path
+    }
+}
+
+/// Strongly typed audit projection of one raw legacy persisted-file registry entry.
+///
+/// This projection validates metadata only. It does not canonicalize through the host filesystem,
+/// open a file, follow a mount, verify Parquet contents, or prove that a checksum and row count are
+/// physically true. Those operations remain the storage verifier's responsibility. The exact raw
+/// JSON value is retained unchanged so opaque legacy extensions and the frozen V1 migration hash
+/// remain available without reconstructing JSON from typed fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyMigrationFile {
+    canonical_value: serde_json::Value,
+    registry_index: u64,
+    file_path: String,
+    persist_data_root: Option<String>,
+    row_count: Option<NonZeroU64>,
+    checksum: Option<String>,
+    stream_name: String,
+    stream_name_was_declared: bool,
+    schema_hash: String,
+    schema_hash_was_declared: bool,
+    writer_epoch: Option<u64>,
+    source_segment_id: Option<u64>,
+    source_generation: Option<u64>,
+    created_at: Option<u64>,
+    scan_order_key: LegacyMigrationScanOrderKey,
+    effective_scan_order: u64,
+}
+
+impl LegacyMigrationFile {
+    /// Returns the exact registry JSON value used by the frozen V1 snapshot fingerprint.
+    #[must_use]
+    pub const fn canonical_value(&self) -> &serde_json::Value {
+        &self.canonical_value
+    }
+
+    /// Returns untyped extension fields retained from the registry entry.
+    ///
+    /// Known typed fields are excluded from this iterator. Nested values are borrowed directly
+    /// from [`Self::canonical_value`] and are never normalized or reserialized.
+    pub fn opaque_extras(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.canonical_value
+            .as_object()
+            .expect("validated legacy migration file metadata is an object")
+            .iter()
+            .filter(|(name, _)| !is_typed_legacy_migration_file_field(name))
+            .map(|(name, value)| (name.as_str(), value))
+    }
+
+    /// Returns the zero-based position in the captured registry vector.
+    #[must_use]
+    pub const fn registry_index(&self) -> u64 {
+        self.registry_index
+    }
+
+    /// Returns the validated canonical absolute UTF-8 file path.
+    #[must_use]
+    pub fn file_path(&self) -> &str {
+        &self.file_path
+    }
+
+    /// Returns the optional canonical absolute root declared by legacy metadata.
+    ///
+    /// The file path is guaranteed to be a strict lexical descendant when this value is present.
+    #[must_use]
+    pub fn persist_data_root(&self) -> Option<&str> {
+        self.persist_data_root.as_deref()
+    }
+
+    /// Returns the optional nonzero row-count claim from the registry.
+    #[must_use]
+    pub const fn row_count(&self) -> Option<NonZeroU64> {
+        self.row_count
+    }
+
+    /// Returns the optional canonical lowercase `sha256-v1` checksum claim.
+    #[must_use]
+    pub fn checksum(&self) -> Option<&str> {
+        self.checksum.as_deref()
+    }
+
+    /// Returns the effective stream name after validating an optional raw declaration.
+    #[must_use]
+    pub fn stream_name(&self) -> &str {
+        &self.stream_name
+    }
+
+    /// Returns whether the raw file metadata explicitly declared its stream name.
+    #[must_use]
+    pub const fn stream_name_was_declared(&self) -> bool {
+        self.stream_name_was_declared
+    }
+
+    /// Returns the effective legacy schema hash after validating an optional raw declaration.
+    #[must_use]
+    pub fn schema_hash(&self) -> &str {
+        &self.schema_hash
+    }
+
+    /// Returns whether the raw file metadata explicitly declared its schema hash.
+    #[must_use]
+    pub const fn schema_hash_was_declared(&self) -> bool {
+        self.schema_hash_was_declared
+    }
+
+    /// Returns the optional writer epoch exactly as declared by legacy metadata.
+    #[must_use]
+    pub const fn writer_epoch(&self) -> Option<u64> {
+        self.writer_epoch
+    }
+
+    /// Returns the optional source segment identity exactly as declared by legacy metadata.
+    #[must_use]
+    pub const fn source_segment_id(&self) -> Option<u64> {
+        self.source_segment_id
+    }
+
+    /// Returns the optional source generation exactly as declared by legacy metadata.
+    #[must_use]
+    pub const fn source_generation(&self) -> Option<u64> {
+        self.source_generation
+    }
+
+    /// Returns the optional legacy creation timestamp exactly as declared by metadata.
+    #[must_use]
+    pub const fn created_at(&self) -> Option<u64> {
+        self.created_at
+    }
+
+    /// Returns the exact key used by the current Gateway stable persisted-file sort.
+    #[must_use]
+    pub const fn scan_order_key(&self) -> &LegacyMigrationScanOrderKey {
+        &self.scan_order_key
+    }
+
+    /// Returns the zero-based position after stable Gateway-compatible ordering.
+    ///
+    /// Equal keys retain registry discovery order through [`Self::registry_index`].
+    #[must_use]
+    pub const fn effective_scan_order(&self) -> u64 {
+        self.effective_scan_order
     }
 }
 
@@ -401,6 +600,292 @@ impl CatalogWrite for LegacyCatalogAdapter {
     }
 }
 
+fn project_legacy_migration_files(
+    stream_name: &str,
+    schema_hash: &str,
+    persisted_files: &[serde_json::Value],
+) -> Result<Vec<LegacyMigrationFile>> {
+    let mut files = persisted_files
+        .iter()
+        .enumerate()
+        .map(|(registry_index, value)| {
+            project_legacy_migration_file(stream_name, schema_hash, registry_index, value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut effective_order = (0..files.len()).collect::<Vec<_>>();
+    effective_order.sort_by(|left, right| {
+        files[*left]
+            .scan_order_key
+            .cmp(&files[*right].scan_order_key)
+            .then_with(|| {
+                files[*left]
+                    .registry_index
+                    .cmp(&files[*right].registry_index)
+            })
+    });
+    for (effective_scan_order, registry_index) in effective_order.into_iter().enumerate() {
+        files[registry_index].effective_scan_order =
+            u64::try_from(effective_scan_order).map_err(|_| {
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "legacy persisted-file scan order exceeds u64",
+                )
+                .with_retryable(false)
+            })?;
+    }
+    Ok(files)
+}
+
+fn project_legacy_migration_file(
+    stream_name: &str,
+    schema_hash: &str,
+    registry_index: usize,
+    value: &serde_json::Value,
+) -> Result<LegacyMigrationFile> {
+    let object = value.as_object().ok_or_else(|| {
+        migration_file_corruption(
+            stream_name,
+            registry_index,
+            "entry",
+            "metadata must be a JSON object",
+        )
+    })?;
+    let file_path = required_string_field(stream_name, registry_index, object, "file_path")?;
+    let file_components =
+        canonical_absolute_path_components(file_path, false).map_err(|reason| {
+            migration_file_corruption(stream_name, registry_index, "file_path", reason)
+        })?;
+    let persist_data_root =
+        optional_string_field(stream_name, registry_index, object, "persist_data_root")?;
+    if let Some(root) = persist_data_root {
+        let root_components = canonical_absolute_path_components(root, true).map_err(|reason| {
+            migration_file_corruption(stream_name, registry_index, "persist_data_root", reason)
+        })?;
+        if file_components.len() <= root_components.len()
+            || !file_components.starts_with(&root_components)
+        {
+            return Err(migration_file_corruption(
+                stream_name,
+                registry_index,
+                "persist_data_root",
+                "file_path must be a strict lexical descendant of persist_data_root",
+            ));
+        }
+    }
+
+    let row_count = match optional_u64_field(stream_name, registry_index, object, "row_count")? {
+        Some(value) => Some(NonZeroU64::new(value).ok_or_else(|| {
+            migration_file_corruption(
+                stream_name,
+                registry_index,
+                "row_count",
+                "value must be nonzero",
+            )
+        })?),
+        None => None,
+    };
+    let checksum = optional_string_field(stream_name, registry_index, object, "checksum")?;
+    if let Some(checksum) = checksum {
+        validate_legacy_sha256_checksum(checksum).map_err(|reason| {
+            migration_file_corruption(stream_name, registry_index, "checksum", reason)
+        })?;
+    }
+
+    let declared_stream_name =
+        optional_string_field(stream_name, registry_index, object, "stream_name")?;
+    if declared_stream_name.is_some_and(|declared| declared != stream_name) {
+        return Err(migration_file_corruption(
+            stream_name,
+            registry_index,
+            "stream_name",
+            "value does not match the owning legacy table",
+        ));
+    }
+    let declared_schema_hash =
+        optional_string_field(stream_name, registry_index, object, "schema_hash")?;
+    if declared_schema_hash.is_some_and(|declared| declared != schema_hash) {
+        return Err(migration_file_corruption(
+            stream_name,
+            registry_index,
+            "schema_hash",
+            "value does not match the owning legacy table schema",
+        ));
+    }
+
+    let writer_epoch = optional_u64_field(stream_name, registry_index, object, "writer_epoch")?;
+    let source_segment_id =
+        optional_u64_field(stream_name, registry_index, object, "source_segment_id")?;
+    let source_generation =
+        optional_u64_field(stream_name, registry_index, object, "source_generation")?;
+    let created_at = optional_u64_field(stream_name, registry_index, object, "created_at")?;
+    let registry_index_u64 = u64::try_from(registry_index).map_err(|_| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "legacy persisted-file registry index exceeds u64",
+        )
+        .with_retryable(false)
+    })?;
+
+    Ok(LegacyMigrationFile {
+        canonical_value: value.clone(),
+        registry_index: registry_index_u64,
+        file_path: file_path.to_owned(),
+        persist_data_root: persist_data_root.map(str::to_owned),
+        row_count,
+        checksum: checksum.map(str::to_owned),
+        stream_name: stream_name.to_owned(),
+        stream_name_was_declared: declared_stream_name.is_some(),
+        schema_hash: schema_hash.to_owned(),
+        schema_hash_was_declared: declared_schema_hash.is_some(),
+        writer_epoch,
+        source_segment_id,
+        source_generation,
+        created_at,
+        scan_order_key: LegacyMigrationScanOrderKey {
+            writer_epoch: writer_epoch.unwrap_or_default(),
+            source_segment_id: source_segment_id.unwrap_or_default(),
+            source_generation: source_generation.unwrap_or_default(),
+            created_at: created_at.unwrap_or_default(),
+            file_path: file_path.to_owned(),
+        },
+        effective_scan_order: 0,
+    })
+}
+
+fn required_string_field<'a>(
+    stream_name: &str,
+    registry_index: usize,
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a str> {
+    optional_string_field(stream_name, registry_index, object, field)?.ok_or_else(|| {
+        migration_file_corruption(
+            stream_name,
+            registry_index,
+            field,
+            "required field is missing",
+        )
+    })
+}
+
+fn optional_string_field<'a>(
+    stream_name: &str,
+    registry_index: usize,
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<Option<&'a str>> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            migration_file_corruption(
+                stream_name,
+                registry_index,
+                field,
+                "present value must be a nonempty string",
+            )
+        })
+}
+
+fn optional_u64_field(
+    stream_name: &str,
+    registry_index: usize,
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<Option<u64>> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    value.as_u64().map(Some).ok_or_else(|| {
+        migration_file_corruption(
+            stream_name,
+            registry_index,
+            field,
+            "present value must be an unsigned integer",
+        )
+    })
+}
+
+fn canonical_absolute_path_components(
+    value: &str,
+    allow_root: bool,
+) -> std::result::Result<Vec<&str>, &'static str> {
+    if !value.starts_with('/') {
+        return Err("value must be an absolute POSIX path");
+    }
+    if value.chars().any(char::is_control) {
+        return Err("value contains a control character");
+    }
+    if value == "/" {
+        return allow_root
+            .then(Vec::new)
+            .ok_or("file path must name a component below the filesystem root");
+    }
+    if value.ends_with('/') {
+        return Err("canonical path must not have a trailing separator");
+    }
+    let mut components = Vec::new();
+    for component in value[1..].split('/') {
+        if component.is_empty() {
+            return Err("canonical path must not contain repeated separators");
+        }
+        if matches!(component, "." | "..") {
+            return Err("canonical path must not contain traversal components");
+        }
+        components.push(component);
+    }
+    Ok(components)
+}
+
+fn validate_legacy_sha256_checksum(checksum: &str) -> std::result::Result<(), &'static str> {
+    let digest = checksum
+        .strip_prefix("sha256-v1:")
+        .ok_or("checksum must use the sha256-v1 scheme")?;
+    if digest.len() != 64
+        || digest
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err("checksum must contain 64 canonical lowercase hexadecimal digits");
+    }
+    Ok(())
+}
+
+fn is_typed_legacy_migration_file_field(field: &str) -> bool {
+    matches!(
+        field,
+        "file_path"
+            | "persist_data_root"
+            | "row_count"
+            | "checksum"
+            | "stream_name"
+            | "schema_hash"
+            | "writer_epoch"
+            | "source_segment_id"
+            | "source_generation"
+            | "created_at"
+    )
+}
+
+fn migration_file_corruption(
+    stream_name: &str,
+    registry_index: usize,
+    field: &str,
+    reason: &str,
+) -> ServerError {
+    data_corruption(
+        stream_name,
+        &format!(
+            "legacy persisted-file metadata is invalid registry_index=[{registry_index}] \
+             field=[{field}] reason=[{reason}]"
+        ),
+    )
+}
+
 fn build_migration_snapshot(view: LegacyMigrationView) -> Result<LegacyCatalogMigrationSnapshot> {
     let namespace = default_namespace_descriptor();
     let mut tables = Vec::new();
@@ -417,6 +902,11 @@ fn build_migration_snapshot(view: LegacyMigrationView) -> Result<LegacyCatalogMi
                 .iter()
                 .any(|field| !field.metadata().is_empty());
         let schema_ipc = encode_schema_ipc(&stream.catalog.stream_name, &schema)?;
+        let migration_files = project_legacy_migration_files(
+            &stream.catalog.stream_name,
+            &stream.schema_hash,
+            &stream.persisted_files,
+        )?;
         tables.push(LegacyCatalogMigrationTable {
             persisted_files_revision: stream.catalog.persisted_files_revision,
             descriptor,
@@ -425,6 +915,7 @@ fn build_migration_snapshot(view: LegacyMigrationView) -> Result<LegacyCatalogMi
             schema_ipc,
             schema_has_custom_metadata,
             persisted_files: stream.persisted_files,
+            migration_files,
         });
     }
     tables.sort_by_key(|table| table.descriptor.table_id);
@@ -879,7 +1370,9 @@ mod tests {
     use zippy_types::table::{CatalogName, TableRef};
     use zippy_types::{ErrorCode, NamespaceId, RequestId, ServerErrorDetails, TableId};
 
-    use super::{legacy_namespace_id, map_tables, LegacyCatalogAdapter};
+    use super::{
+        legacy_namespace_id, map_tables, LegacyCatalogAdapter, LegacyCatalogMigrationSnapshot,
+    };
     use crate::registry::Registry;
     use crate::server::MasterServer;
     use crate::snapshot::{
@@ -949,6 +1442,44 @@ mod tests {
                 config,
             )
             .unwrap();
+    }
+
+    fn plain_migratable_schema_hash() -> String {
+        canonical_schema_hash(&Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])))
+    }
+
+    fn capture_migration_snapshot_with_raw_files(
+        persisted_files: Vec<serde_json::Value>,
+    ) -> zippy_types::Result<LegacyCatalogMigrationSnapshot> {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "typed_events",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        registry
+            .set_stream_segment_metadata(
+                "typed_events",
+                1,
+                Vec::new(),
+                persisted_files,
+                Vec::new(),
+                1,
+                1,
+                Vec::new(),
+                7,
+            )
+            .unwrap();
+        LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(registry)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .capture_migration_snapshot()
     }
 
     fn test_adapter() -> (LegacyCatalogAdapter, Arc<Mutex<Registry>>) {
@@ -1607,5 +2138,236 @@ mod tests {
 
         assert_eq!(snapshot.tables().len(), 1);
         assert!(snapshot.tables()[0].schema_has_custom_metadata());
+    }
+
+    #[test]
+    fn migration_snapshot_v1_fixture_hash_does_not_drift_with_typed_projection() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "fixture_events",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        registry
+            .replace_persisted_files(
+                "fixture_events",
+                vec![json!({
+                    "file_path": "/legacy/fixture-events.parquet",
+                    "persist_data_root": "/legacy",
+                    "row_count": 3,
+                    "checksum": format!("sha256-v1:{}", "1".repeat(64)),
+                    "writer_epoch": 7,
+                    "source_segment_id": 2,
+                    "source_generation": 1,
+                    "created_at": 1_234,
+                    "vendor_extension": {"codec": "zstd"}
+                })],
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(registry)),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let snapshot = adapter.capture_migration_snapshot().unwrap();
+
+        assert_eq!(
+            snapshot.source_snapshot_hash(),
+            "sha256-v1:9949fea4f921c8f404f477f3c2a51af6642bbe3aebefd50a5cf993bd89e31136"
+        );
+        let table = &snapshot.tables()[0];
+        assert_eq!(table.persisted_files().len(), 1);
+        assert_eq!(table.migration_files().len(), 1);
+        assert_eq!(
+            table.migration_files()[0].canonical_value(),
+            &table.persisted_files()[0]
+        );
+        assert_eq!(
+            serde_json::to_vec(table.migration_files()[0].canonical_value()).unwrap(),
+            serde_json::to_vec(&table.persisted_files()[0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn migration_file_projection_accepts_mixed_legacy_and_audited_metadata() {
+        let schema_hash = plain_migratable_schema_hash();
+        let minimal = json!({
+            "file_path": "/legacy/minimal.parquet",
+            "opaque_legacy_flag": true
+        });
+        let audited = json!({
+            "file_path": "/legacy/audited.parquet",
+            "persist_data_root": "/legacy",
+            "row_count": 9,
+            "checksum": format!("sha256-v1:{}", "a".repeat(64)),
+            "stream_name": "typed_events",
+            "schema_hash": schema_hash,
+            "writer_epoch": 8,
+            "source_segment_id": 11,
+            "source_generation": 2,
+            "created_at": 77,
+            "vendor_extension": {"compression": "zstd"}
+        });
+
+        let snapshot =
+            capture_migration_snapshot_with_raw_files(vec![minimal.clone(), audited.clone()])
+                .unwrap();
+        let table = &snapshot.tables()[0];
+        assert_eq!(table.persisted_files(), &[minimal, audited]);
+        let files = table.migration_files();
+        assert_eq!(files.len(), 2);
+
+        assert_eq!(files[0].registry_index(), 0);
+        assert_eq!(files[0].file_path(), "/legacy/minimal.parquet");
+        assert_eq!(files[0].persist_data_root(), None);
+        assert_eq!(files[0].row_count(), None);
+        assert_eq!(files[0].checksum(), None);
+        assert_eq!(files[0].stream_name(), "typed_events");
+        assert!(!files[0].stream_name_was_declared());
+        assert_eq!(files[0].schema_hash(), plain_migratable_schema_hash());
+        assert!(!files[0].schema_hash_was_declared());
+        assert_eq!(files[0].scan_order_key().writer_epoch(), 0);
+        assert_eq!(files[0].effective_scan_order(), 0);
+        let minimal_extras = files[0].opaque_extras().collect::<Vec<_>>();
+        assert_eq!(minimal_extras.len(), 1);
+        assert_eq!(minimal_extras[0].0, "opaque_legacy_flag");
+        assert_eq!(minimal_extras[0].1, &json!(true));
+
+        assert_eq!(files[1].registry_index(), 1);
+        assert_eq!(files[1].persist_data_root(), Some("/legacy"));
+        assert_eq!(files[1].row_count().unwrap().get(), 9);
+        let expected_checksum = format!("sha256-v1:{}", "a".repeat(64));
+        assert_eq!(files[1].checksum(), Some(expected_checksum.as_str()));
+        assert!(files[1].stream_name_was_declared());
+        assert!(files[1].schema_hash_was_declared());
+        assert_eq!(files[1].writer_epoch(), Some(8));
+        assert_eq!(files[1].source_segment_id(), Some(11));
+        assert_eq!(files[1].source_generation(), Some(2));
+        assert_eq!(files[1].created_at(), Some(77));
+        assert_eq!(files[1].effective_scan_order(), 1);
+        assert_eq!(
+            files[1]
+                .opaque_extras()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec!["vendor_extension"]
+        );
+    }
+
+    #[test]
+    fn malformed_migration_file_fails_the_complete_table_snapshot() {
+        let malformed = [
+            ("entry", json!("not-an-object")),
+            ("file_path", json!({"file_path": "relative.parquet"})),
+            (
+                "file_path",
+                json!({"file_path": "/legacy/../outside.parquet"}),
+            ),
+            (
+                "persist_data_root",
+                json!({
+                    "file_path": "/outside/file.parquet",
+                    "persist_data_root": "/legacy"
+                }),
+            ),
+            (
+                "row_count",
+                json!({"file_path": "/legacy/a", "row_count": 0}),
+            ),
+            (
+                "checksum",
+                json!({"file_path": "/legacy/a", "checksum": "sha256-v1:ABC"}),
+            ),
+            (
+                "stream_name",
+                json!({"file_path": "/legacy/a", "stream_name": "other"}),
+            ),
+            (
+                "schema_hash",
+                json!({"file_path": "/legacy/a", "schema_hash": "other"}),
+            ),
+            (
+                "writer_epoch",
+                json!({"file_path": "/legacy/a", "writer_epoch": "7"}),
+            ),
+        ];
+
+        for (field, malformed_file) in malformed {
+            let error = capture_migration_snapshot_with_raw_files(vec![
+                json!({"file_path": "/legacy/valid.parquet"}),
+                malformed_file,
+            ])
+            .unwrap_err();
+            assert_eq!(error.code(), ErrorCode::DataCorruption, "field={field}");
+            assert!(
+                error.message().contains("registry_index=[1]"),
+                "field={field} error={error}"
+            );
+            assert!(
+                error.message().contains(&format!("field=[{field}]")),
+                "field={field} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_scan_order_matches_gateway_key_and_registry_tie_breaking() {
+        let raw_files = vec![
+            json!({
+                "file_path": "/legacy/epoch-2.parquet",
+                "writer_epoch": 2,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 10
+            }),
+            json!({
+                "file_path": "/legacy/epoch-1-segment-2.parquet",
+                "writer_epoch": 1,
+                "source_segment_id": 2,
+                "source_generation": 0,
+                "created_at": 10
+            }),
+            json!({
+                "file_path": "/legacy/equal.parquet",
+                "writer_epoch": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 10,
+                "copy": "first"
+            }),
+            json!({
+                "file_path": "/legacy/equal.parquet",
+                "writer_epoch": 1,
+                "source_segment_id": 1,
+                "source_generation": 0,
+                "created_at": 10,
+                "copy": "second"
+            }),
+        ];
+        let snapshot = capture_migration_snapshot_with_raw_files(raw_files.clone()).unwrap();
+        let table = &snapshot.tables()[0];
+
+        assert_eq!(table.persisted_files(), raw_files);
+        assert_eq!(
+            table
+                .migration_files()
+                .iter()
+                .map(|file| file.effective_scan_order())
+                .collect::<Vec<_>>(),
+            vec![3, 2, 0, 1]
+        );
+        let mut effective = table.migration_files().iter().collect::<Vec<_>>();
+        effective.sort_by_key(|file| file.effective_scan_order());
+        assert_eq!(
+            effective
+                .iter()
+                .map(|file| file.registry_index())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1, 0]
+        );
+        assert_eq!(effective[0].scan_order_key(), effective[1].scan_order_key());
+        assert_eq!(effective[0].opaque_extras().next().unwrap().1, "first");
+        assert_eq!(effective[1].opaque_extras().next().unwrap().1, "second");
     }
 }
