@@ -22,8 +22,9 @@ use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
     CatalogCommandV1, CatalogIdempotencyRead, CatalogOutcomeV1, CatalogRead, CatalogWrite,
     CreateNamespaceCommand, CreateTableCommand, LegacyCatalogImportCommandV2,
-    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportReplayProbeV2, LegacyCatalogImportResponseV2,
-    VersionedCatalogCommand, VersionedCatalogResponse,
+    LegacyCatalogImportEnvelopeV2, LegacyCatalogImportFileV2, LegacyCatalogImportReplayProbeV2,
+    LegacyCatalogImportResponseV2, VersionedCatalogCommand, VersionedCatalogResponse,
+    LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY, LEGACY_REGISTRY_INDEX_METADATA_KEY,
 };
 use zippy_types::table::{
     CatalogName, ExternalDataPath, MetadataMap, MetadataScalar, SchemaCompatibility,
@@ -67,8 +68,6 @@ const REQUEST_ID_DOMAIN: &[u8] = b"zippy.legacy_catalog.metadata_import.request.
 const MIGRATION_V2_ACTOR_PRINCIPAL: &str = "zippy-server/legacy-catalog-physical-v2";
 const REQUEST_ID_V2_DOMAIN: &[u8] = b"zippy.legacy_catalog.physical_import.request.v2";
 const MAX_LEGACY_FILES_PER_TABLE: usize = 4_096;
-const LEGACY_REGISTRY_INDEX_METADATA_KEY: &str = "zippy.migration.legacy_registry_index";
-const LEGACY_SCAN_ORDER_METADATA_KEY: &str = "zippy.migration.legacy_effective_scan_order";
 
 /// A capability required before a blocked table can be imported without weakening V1 invariants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -214,6 +213,21 @@ struct PlannedLegacyTableImportV2 {
     expected_revision: u64,
     command: LegacyCatalogImportCommandV2,
     file_specs: Vec<LegacyParquetImportSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedLegacyCatalogTableView {
+    pub(crate) canonical_schema_hash: String,
+    pub(crate) files: Vec<LegacyCatalogImportFileV2>,
+    pub(crate) cache: BTreeMap<String, VerifiedLegacyCatalogFileCacheEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedLegacyCatalogFileCacheEntry {
+    source_metadata: serde_json::Value,
+    canonical_schema_hash: String,
+    verification_root: Option<PathBuf>,
+    file: LegacyCatalogImportFileV2,
 }
 
 #[derive(Debug, Clone)]
@@ -858,7 +872,7 @@ fn build_v2_table_import(
             MetadataScalar::UInt64(file.registry_index()),
         );
         metadata.insert(
-            LEGACY_SCAN_ORDER_METADATA_KEY.to_owned(),
+            LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY.to_owned(),
             MetadataScalar::UInt64(file.effective_scan_order()),
         );
         file_specs.push(LegacyParquetImportSpec {
@@ -893,6 +907,96 @@ fn build_v2_table_import(
             legacy_files_revision: table.persisted_files_revision(),
         },
         file_specs,
+    })
+}
+
+pub(crate) async fn verify_legacy_catalog_table_view(
+    snapshot: &LegacyCatalogMigrationSnapshot,
+    table: &LegacyCatalogMigrationTable,
+    trusted_fallback_root: Option<&Path>,
+    retained: Option<&BTreeMap<String, VerifiedLegacyCatalogFileCacheEntry>>,
+) -> Result<VerifiedLegacyCatalogTableView> {
+    let canonical_schema_hash = canonical_schema_hash_from_ipc(table.schema_ipc())?;
+    if table.migration_files().is_empty() {
+        return Ok(VerifiedLegacyCatalogTableView {
+            canonical_schema_hash,
+            files: Vec::new(),
+            cache: BTreeMap::new(),
+        });
+    }
+    if trusted_fallback_root.is_none()
+        && table
+            .migration_files()
+            .iter()
+            .any(|file| file.persist_data_root().is_none())
+    {
+        return Err(ServerError::new(
+            ErrorCode::InvalidArgument,
+            "legacy reconcile file lacks a trusted persistence root",
+        )
+        .with_table_id(table.descriptor().table_id)
+        .with_retryable(false));
+    }
+    let request_id = RequestId::from_u128(1).expect("one is a nonzero request id");
+    let planned = build_v2_table_import(snapshot, table, 0, request_id, 0, trusted_fallback_root)?;
+    let mut ordered_source = table.migration_files().iter().collect::<Vec<_>>();
+    ordered_source.sort_by_key(|file| file.effective_scan_order());
+    if ordered_source.len() != planned.file_specs.len() {
+        return Err(ServerError::new(
+            ErrorCode::Internal,
+            "legacy reconcile verification plan length changed",
+        )
+        .with_table_id(table.descriptor().table_id)
+        .with_retryable(false));
+    }
+    let mut files = Vec::with_capacity(planned.file_specs.len());
+    let mut cache = BTreeMap::new();
+    for (source, spec) in ordered_source.into_iter().zip(planned.file_specs) {
+        let verification_root = spec.allowed_root.clone();
+        let cached = retained
+            .and_then(|entries| entries.get(source.file_path()))
+            .filter(|entry| {
+                entry.source_metadata == *source.canonical_value()
+                    && entry.canonical_schema_hash == canonical_schema_hash
+                    && entry.verification_root == verification_root
+            });
+        let file = match cached {
+            Some(entry) => {
+                let mut file = entry.file.clone();
+                file.discovery_order = source.effective_scan_order();
+                file
+            }
+            None => {
+                let table_id = spec.table_id;
+                tokio::task::spawn_blocking(move || verify_legacy_parquet_import(spec))
+                    .await
+                    .map_err(|error| {
+                        ServerError::new(
+                            ErrorCode::Internal,
+                            format!(
+                                "legacy reconcile physical verifier task failed error=[{error}]"
+                            ),
+                        )
+                        .with_table_id(table_id)
+                        .with_retryable(false)
+                    })??
+            }
+        };
+        cache.insert(
+            source.file_path().to_owned(),
+            VerifiedLegacyCatalogFileCacheEntry {
+                source_metadata: source.canonical_value().clone(),
+                canonical_schema_hash: canonical_schema_hash.clone(),
+                verification_root,
+                file: file.clone(),
+            },
+        );
+        files.push(file);
+    }
+    Ok(VerifiedLegacyCatalogTableView {
+        canonical_schema_hash,
+        files,
+        cache,
     })
 }
 
@@ -1615,9 +1719,10 @@ mod tests {
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1,
         CatalogRead, CatalogWrite, CreateNamespaceCommand, ListTablesRequest,
-        VersionedCatalogCommand,
+        VersionedCatalogCommand, LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY,
+        LEGACY_REGISTRY_INDEX_METADATA_KEY,
     };
-    use zippy_types::table::{CatalogName, MetadataScalar, TableRef};
+    use zippy_types::table::{CatalogName, DataFileLocation, MetadataScalar, TableRef};
     use zippy_types::{ErrorCode, NamespaceId, RequestId};
 
     use super::{
@@ -1626,8 +1731,7 @@ mod tests {
         LegacyCatalogTableMigrationOutcome, LegacyCatalogTablePlanStatus,
         LegacyCatalogV2ImportRequirement, LEGACY_CATALOG_PHYSICAL_MIGRATION_VERSION,
         LEGACY_EMPTY_NATIVE_SNAPSHOT_BASE, LEGACY_IMPORTED_NATIVE_SNAPSHOT_BASE,
-        LEGACY_MIGRATION_VERSION_CONFIG_KEY, LEGACY_REGISTRY_INDEX_METADATA_KEY,
-        LEGACY_REVISION_BASE_CONFIG_KEY, LEGACY_SCAN_ORDER_METADATA_KEY,
+        LEGACY_MIGRATION_VERSION_CONFIG_KEY, LEGACY_REVISION_BASE_CONFIG_KEY,
         LEGACY_STREAM_NAME_CONFIG_KEY, NATIVE_SNAPSHOT_BASE_CONFIG_KEY,
     };
 
@@ -1772,6 +1876,74 @@ mod tests {
             .capture_migration_snapshot()
             .unwrap();
         (master, snapshot)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_verifier_reuses_retained_files_and_evicts_removed_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let retained_path = root.join("retained.parquet");
+        let removed_path = root.join("removed.parquet");
+        let added_path = root.join("added.parquet");
+        write_parquet(&retained_path, vec![1, 2]);
+        write_parquet(&removed_path, vec![3]);
+        let retained = legacy_file_value(&retained_path, Some(root), 1, 10, 2);
+        let removed = legacy_file_value(&removed_path, Some(root), 1, 20, 1);
+        let (master, first_snapshot) =
+            snapshot_with_tables(vec![("events", vec![retained.clone(), removed])]);
+        let first_table = first_snapshot.tables().first().unwrap();
+        let first =
+            super::verify_legacy_catalog_table_view(&first_snapshot, first_table, None, None)
+                .await
+                .unwrap();
+        assert_eq!(first.files.len(), 2);
+
+        std::fs::remove_file(&retained_path).unwrap();
+        write_parquet(&added_path, vec![4, 5, 6]);
+        let added = legacy_file_value(&added_path, Some(root), 1, 1, 3);
+        master
+            .registry()
+            .lock()
+            .unwrap()
+            .replace_persisted_files("events", vec![retained, added])
+            .unwrap();
+        let second_snapshot = master
+            .legacy_catalog_adapter()
+            .capture_migration_snapshot()
+            .unwrap();
+        let second = super::verify_legacy_catalog_table_view(
+            &second_snapshot,
+            second_snapshot.tables().first().unwrap(),
+            None,
+            Some(&first.cache),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.cache.len(), 2);
+        assert!(!second.cache.contains_key(removed_path.to_str().unwrap()));
+        assert_eq!(
+            second
+                .files
+                .iter()
+                .map(|file| file.discovery_order)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            second
+                .files
+                .iter()
+                .map(|file| match &file.file.location {
+                    DataFileLocation::ExternalLegacy(path) => path.as_str(),
+                    DataFileLocation::Managed(_) => panic!("legacy verifier returned managed path"),
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                added_path.to_str().unwrap(),
+                retained_path.to_str().unwrap()
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2069,7 +2241,7 @@ mod tests {
         assert_eq!(
             scan.file_specs[0]
                 .metadata
-                .get(LEGACY_SCAN_ORDER_METADATA_KEY),
+                .get(LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY),
             Some(&MetadataScalar::UInt64(0))
         );
         assert_eq!(

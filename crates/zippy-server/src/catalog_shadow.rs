@@ -14,10 +14,6 @@ use zippy_types::table::{CatalogName, TableRef, TableState};
 use zippy_types::{ErrorCode, ServerError};
 
 pub(crate) const LEGACY_STREAM_NAME_CONFIG_KEY: &str = "zippy.migration.legacy_stream_name";
-pub(crate) const LEGACY_REVISION_BASE_CONFIG_KEY: &str =
-    "zippy.migration.legacy_persisted_files_revision_base";
-pub(crate) const NATIVE_SNAPSHOT_BASE_CONFIG_KEY: &str =
-    "zippy.migration.native_snapshot_version_base";
 
 /// Resolves exact native Catalog snapshots for asynchronous Gateway comparisons.
 pub(crate) struct SqliteCatalogPersistedReadShadowSource {
@@ -86,11 +82,28 @@ impl PersistedReadShadowSource for SqliteCatalogPersistedReadShadowSource {
                 });
             }
 
-            let native_snapshot_version = resolve_native_snapshot_version(
-                &stream_name,
-                persisted_files_revision,
-                &table.config,
-            )?;
+            validate_legacy_stream_mapping(&stream_name, &table.config)?;
+            let mapping = self
+                .catalog
+                .resolve_legacy_file_view_mapping(table.table_id, persisted_files_revision)
+                .await
+                .map_err(map_catalog_error)?;
+            if mapping.table_id != table.table_id
+                || mapping.legacy_files_revision != persisted_files_revision
+            {
+                return Err(ZippyError::DataCorruption {
+                    reason: format!(
+                        "native Catalog returned an inconsistent legacy mapping \
+                         stream_name=[{}] requested_revision=[{}] mapped_table_id=[{}] \
+                         mapped_revision=[{}]",
+                        stream_name,
+                        persisted_files_revision,
+                        mapping.table_id,
+                        mapping.legacy_files_revision
+                    ),
+                });
+            }
+            let native_snapshot_version = mapping.native_snapshot_version;
             if native_snapshot_version > table.current_snapshot_version {
                 return Err(ZippyError::Conflict {
                     reason: format!(
@@ -201,11 +214,10 @@ impl PersistedReadShadowSource for SqliteCatalogPersistedReadShadowSource {
     }
 }
 
-fn resolve_native_snapshot_version(
+fn validate_legacy_stream_mapping(
     stream_name: &str,
-    legacy_revision: u64,
     config: &std::collections::BTreeMap<String, String>,
-) -> zippy_core::Result<u64> {
+) -> zippy_core::Result<()> {
     let mapped_stream = required_mapping(config, LEGACY_STREAM_NAME_CONFIG_KEY, stream_name)?;
     if mapped_stream != stream_name {
         return Err(ZippyError::Conflict {
@@ -216,33 +228,7 @@ fn resolve_native_snapshot_version(
             ),
         });
     }
-    let legacy_base = parse_mapping_u64(config, LEGACY_REVISION_BASE_CONFIG_KEY, stream_name)?;
-    let native_base = parse_mapping_u64(config, NATIVE_SNAPSHOT_BASE_CONFIG_KEY, stream_name)?;
-    if native_base == 0 {
-        return Err(ZippyError::DataCorruption {
-            reason: format!(
-                "native shadow snapshot base must be nonzero stream_name=[{}]",
-                stream_name
-            ),
-        });
-    }
-    let delta = legacy_revision
-        .checked_sub(legacy_base)
-        .ok_or_else(|| ZippyError::Conflict {
-            reason: format!(
-                "requested legacy revision predates native shadow mapping stream_name=[{}] \
-                 requested=[{}] base=[{}]",
-                stream_name, legacy_revision, legacy_base
-            ),
-        })?;
-    native_base
-        .checked_add(delta)
-        .ok_or_else(|| ZippyError::DataCorruption {
-            reason: format!(
-                "native shadow revision mapping overflow stream_name=[{}] legacy_revision=[{}]",
-                stream_name, legacy_revision
-            ),
-        })
+    Ok(())
 }
 
 fn required_mapping<'a>(
@@ -258,23 +244,6 @@ fn required_mapping<'a>(
             reason: format!(
                 "native table lacks an exact legacy revision mapping stream_name=[{}] key=[{}]",
                 stream_name, key
-            ),
-        })
-}
-
-fn parse_mapping_u64(
-    config: &std::collections::BTreeMap<String, String>,
-    key: &str,
-    stream_name: &str,
-) -> zippy_core::Result<u64> {
-    let value = required_mapping(config, key, stream_name)?;
-    value
-        .parse::<u64>()
-        .map_err(|error| ZippyError::DataCorruption {
-            reason: format!(
-                "native table has an invalid legacy revision mapping stream_name=[{}] \
-                 key=[{}] value=[{}] error=[{}]",
-                stream_name, key, value, error
             ),
         })
 }
@@ -312,49 +281,22 @@ mod tests {
 
     use super::*;
 
-    fn mapping(legacy_base: u64, native_base: u64) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (
-                LEGACY_STREAM_NAME_CONFIG_KEY.to_string(),
-                "ticks".to_string(),
-            ),
-            (
-                LEGACY_REVISION_BASE_CONFIG_KEY.to_string(),
-                legacy_base.to_string(),
-            ),
-            (
-                NATIVE_SNAPSHOT_BASE_CONFIG_KEY.to_string(),
-                native_base.to_string(),
-            ),
-        ])
-    }
-
-    #[test]
-    fn exact_revision_mapping_handles_imported_nonzero_baselines() {
-        let config = mapping(37, 1);
-        assert_eq!(
-            resolve_native_snapshot_version("ticks", 37, &config).unwrap(),
-            1
-        );
-        assert_eq!(
-            resolve_native_snapshot_version("ticks", 40, &config).unwrap(),
-            4
-        );
-    }
-
-    #[test]
-    fn exact_revision_mapping_rejects_missing_wrong_and_historical_values() {
-        let missing = BTreeMap::new();
-        assert!(resolve_native_snapshot_version("ticks", 1, &missing).is_err());
-
-        let mut wrong_stream = mapping(0, 1);
-        wrong_stream.insert(
+    fn mapping(stream_name: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(
             LEGACY_STREAM_NAME_CONFIG_KEY.to_string(),
-            "orders".to_string(),
-        );
-        assert!(resolve_native_snapshot_version("ticks", 1, &wrong_stream).is_err());
+            stream_name.to_string(),
+        )])
+    }
 
-        let config = mapping(5, 1);
-        assert!(resolve_native_snapshot_version("ticks", 4, &config).is_err());
+    #[test]
+    fn exact_revision_mapping_requires_the_same_legacy_stream() {
+        validate_legacy_stream_mapping("ticks", &mapping("ticks")).unwrap();
+        assert!(validate_legacy_stream_mapping("ticks", &mapping("orders")).is_err());
+    }
+
+    #[test]
+    fn exact_revision_mapping_rejects_missing_stream_identity() {
+        let missing = BTreeMap::new();
+        assert!(validate_legacy_stream_mapping("ticks", &missing).is_err());
     }
 }

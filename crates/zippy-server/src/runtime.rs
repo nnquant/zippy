@@ -41,10 +41,12 @@ use crate::legacy_catalog_migration::{
     LegacyCatalogMigrationStartup,
 };
 use crate::{
-    catalog_shadow::SqliteCatalogPersistedReadShadowSource, LegacyCatalogMigrationDegradation,
-    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationStatus, LegacyQueryEngineAdapter,
-    LegacyServerHealth, LegacyServerServices, NativeStorageRuntime, NativeStorageRuntimeConfig,
-    NativeStorageShutdownOutcome, NativeStorageStartOutcome,
+    catalog_command_shadow::{LegacyCatalogShadowWorker, LegacyCatalogShadowWorkerConfig},
+    catalog_shadow::SqliteCatalogPersistedReadShadowSource,
+    LegacyCatalogMigrationDegradation, LegacyCatalogMigrationDegradedReason,
+    LegacyCatalogMigrationStatus, LegacyCatalogShadowShutdownOutcome, LegacyCatalogShadowStatus,
+    LegacyQueryEngineAdapter, LegacyServerHealth, LegacyServerServices, NativeStorageRuntime,
+    NativeStorageRuntimeConfig, NativeStorageShutdownOutcome, NativeStorageStartOutcome,
 };
 
 const DEFAULT_SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -427,6 +429,15 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
             .as_ref()
             .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
         || matches!(
+            outcome.legacy_catalog_shadow_outcome.as_ref(),
+            Some(LegacyCatalogShadowShutdownOutcome::TimedOut)
+        )
+        || outcome
+            .legacy_catalog_shadow_outcome
+            .as_ref()
+            .and_then(LegacyCatalogShadowShutdownOutcome::error)
+            .is_some_and(|error| error.code() == ErrorCode::DeadlineExceeded)
+        || matches!(
             outcome.native_storage_outcome.as_ref(),
             Some(NativeStorageShutdownOutcome::TimedOut)
         )
@@ -444,6 +455,12 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
             .or(outcome.master_error.as_ref())
             .or_else(|| {
                 outcome
+                    .legacy_catalog_shadow_outcome
+                    .as_ref()
+                    .and_then(LegacyCatalogShadowShutdownOutcome::error)
+            })
+            .or_else(|| {
+                outcome
                     .native_storage_outcome
                     .as_ref()
                     .and_then(NativeStorageShutdownOutcome::error)
@@ -454,7 +471,8 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
         code,
         format!(
             "server shutdown incomplete timed_out_processes=[{}] gateway_error=[{}] \
-             gateway_outcome=[{:?}] native_storage_outcome=[{:?}] master_error=[{}]",
+             gateway_outcome=[{:?}] legacy_catalog_shadow_outcome=[{:?}] \
+             native_storage_outcome=[{:?}] master_error=[{}]",
             outcome.timed_out_processes.join(","),
             outcome
                 .gateway_error
@@ -462,6 +480,7 @@ fn shutdown_outcome_error(outcome: &LegacyServerShutdownOutcome) -> Option<Serve
                 .map(ToString::to_string)
                 .unwrap_or_default(),
             outcome.gateway_outcome,
+            outcome.legacy_catalog_shadow_outcome,
             outcome.native_storage_outcome,
             outcome
                 .master_error
@@ -863,6 +882,8 @@ pub struct LegacyServerRuntimeHealth {
     pub services: LegacyServerHealth,
     /// Shadow migration status; degradation does not close Legacy authority admission.
     pub legacy_catalog_migration: LegacyCatalogMigrationStatus,
+    /// Online legacy-to-SQLite command shadow state; it never controls primary readiness.
+    pub legacy_catalog_shadow: Option<LegacyCatalogShadowStatus>,
     /// Process-local snapshot pin admission state when native storage is configured.
     pub catalog_runtime_snapshot_pins: Option<SqliteCatalogRuntimeSnapshotPinStatus>,
 }
@@ -878,6 +899,8 @@ pub struct LegacyServerShutdownOutcome {
     pub gateway_outcome: Option<GatewayShutdownOutcome>,
     /// Master listener or final snapshot failure observed while joining.
     pub master_error: Option<ServerError>,
+    /// Bounded event drain and final exact reconcile outcome, when shadowing was enabled.
+    pub legacy_catalog_shadow_outcome: Option<LegacyCatalogShadowShutdownOutcome>,
     /// Ordered native coordinator and Catalog cleanup state, when configured.
     pub native_storage_outcome: Option<NativeStorageShutdownOutcome>,
 }
@@ -893,6 +916,10 @@ impl LegacyServerShutdownOutcome {
                 .as_ref()
                 .is_none_or(GatewayShutdownOutcome::is_clean)
             && self.master_error.is_none()
+            && self
+                .legacy_catalog_shadow_outcome
+                .as_ref()
+                .is_none_or(LegacyCatalogShadowShutdownOutcome::is_complete)
             && self
                 .native_storage_outcome
                 .as_ref()
@@ -982,6 +1009,7 @@ pub struct LegacyServerRuntime {
     readiness: LegacyServerReadiness,
     shutdown_outcome: Option<LegacyServerShutdownOutcome>,
     native_storage: Option<NativeStorageRuntime>,
+    legacy_catalog_shadow: Option<LegacyCatalogShadowWorker>,
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     data_directory: Option<Arc<OwnedDataDirectory>>,
 }
@@ -1014,6 +1042,11 @@ impl LegacyServerRuntime {
             startup_deadline,
             legacy_catalog_migration,
         )?;
+        let mut legacy_catalog_shadow = start_legacy_catalog_shadow_if_enabled(
+            &runtime_config,
+            &master,
+            native_storage.as_ref(),
+        );
         let mut master_listener = match start_master_listener(
             &master,
             &control_endpoint,
@@ -1028,6 +1061,7 @@ impl LegacyServerRuntime {
                     &master,
                     &mut no_listener,
                     &mut no_gateway,
+                    &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
                     shutdown_timeout,
@@ -1041,6 +1075,7 @@ impl LegacyServerRuntime {
                 &master,
                 &mut master_listener,
                 &mut no_gateway,
+                &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
                 shutdown_timeout,
@@ -1058,6 +1093,7 @@ impl LegacyServerRuntime {
                     &master,
                     &mut master_listener,
                     &mut no_gateway,
+                    &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
                     shutdown_timeout,
@@ -1077,6 +1113,7 @@ impl LegacyServerRuntime {
                     &master,
                     &mut master_listener,
                     &mut no_gateway,
+                    &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
                     shutdown_timeout,
@@ -1099,6 +1136,7 @@ impl LegacyServerRuntime {
                     &master,
                     &mut master_listener,
                     &mut gateway,
+                    &mut legacy_catalog_shadow,
                     &mut native_storage,
                     None,
                     shutdown_timeout,
@@ -1115,6 +1153,7 @@ impl LegacyServerRuntime {
                 &master,
                 &mut master_listener,
                 &mut gateway,
+                &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
                 shutdown_timeout,
@@ -1132,6 +1171,7 @@ impl LegacyServerRuntime {
                 &master,
                 &mut master_listener,
                 &mut gateway,
+                &mut legacy_catalog_shadow,
                 &mut native_storage,
                 None,
                 shutdown_timeout,
@@ -1153,6 +1193,7 @@ impl LegacyServerRuntime {
                         &master,
                         &mut master_listener,
                         &mut gateway,
+                        &mut legacy_catalog_shadow,
                         &mut native_storage,
                         None,
                         shutdown_timeout,
@@ -1174,6 +1215,7 @@ impl LegacyServerRuntime {
                 &master,
                 &mut master_listener,
                 &mut gateway,
+                &mut legacy_catalog_shadow,
                 &mut native_storage,
                 Some(&services),
                 shutdown_timeout,
@@ -1188,6 +1230,7 @@ impl LegacyServerRuntime {
                 &master,
                 &mut master_listener,
                 &mut gateway,
+                &mut legacy_catalog_shadow,
                 &mut native_storage,
                 Some(&services),
                 shutdown_timeout,
@@ -1238,6 +1281,7 @@ impl LegacyServerRuntime {
             readiness,
             shutdown_outcome: None,
             native_storage,
+            legacy_catalog_shadow,
             legacy_catalog_migration,
             data_directory: Some(data_directory),
         })
@@ -1364,6 +1408,10 @@ impl LegacyServerRuntime {
             readiness,
             services,
             legacy_catalog_migration: self.legacy_catalog_migration.clone(),
+            legacy_catalog_shadow: self
+                .legacy_catalog_shadow
+                .as_ref()
+                .map(LegacyCatalogShadowWorker::status),
             catalog_runtime_snapshot_pins: self
                 .native_storage
                 .as_ref()
@@ -1384,12 +1432,9 @@ impl LegacyServerRuntime {
         }
         self.readiness.admission_open = false;
         self.services.begin_shutdown();
-        if let Some(native_storage) = self.native_storage.as_mut() {
-            native_storage.begin_shutdown();
-        }
     }
 
-    /// Stops Gateway, native storage, and master in ownership order and reports every failure.
+    /// Seals primary mutations, drains the shadow, then stops Master and native storage.
     pub fn shutdown(&mut self) -> LegacyServerShutdownOutcome {
         if let Some(outcome) = &self.shutdown_outcome {
             return outcome.clone();
@@ -1419,29 +1464,66 @@ impl LegacyServerRuntime {
         self.readiness.gateway_listener_ready = false;
         self.readiness.gateway_master_reachable = false;
 
-        let native_storage_outcome = self
-            .native_storage
-            .as_mut()
-            .map(|storage| storage.shutdown_until(deadline));
-        if native_storage_outcome
-            .as_ref()
-            .is_some_and(NativeStorageShutdownOutcome::is_complete)
-        {
-            self.native_storage.take();
-        }
-
-        let graceful = self
+        let graceful = self.master.drain_registered_processes_for_shutdown(
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        let seal_error = self
             .master
-            .request_graceful_shutdown(deadline.saturating_duration_since(Instant::now()));
-        self.readiness.master_listener_ready = false;
-        let listener_error =
-            finish_master_listener_until(&mut self.master_listener, deadline).err();
-        let master_error = budget_error.or(listener_error);
+            .seal_legacy_catalog_commit_events(deadline.saturating_duration_since(Instant::now()))
+            .err()
+            .map(|error| {
+                ServerError::new(
+                    ErrorCode::DeadlineExceeded,
+                    format!("seal legacy Catalog commit events error=[{error}]"),
+                )
+            });
+        let legacy_catalog_shadow_outcome = self
+            .legacy_catalog_shadow
+            .as_mut()
+            .map(|shadow| shadow.shutdown_until(deadline));
+        if legacy_catalog_shadow_outcome
+            .as_ref()
+            .is_some_and(LegacyCatalogShadowShutdownOutcome::is_complete)
+        {
+            self.legacy_catalog_shadow.take();
+        }
+        let shadow_joined = !matches!(
+            legacy_catalog_shadow_outcome.as_ref(),
+            Some(&LegacyCatalogShadowShutdownOutcome::TimedOut)
+        );
+        let listener_error = if shadow_joined && seal_error.is_none() {
+            self.master.shutdown();
+            self.readiness.master_listener_ready = false;
+            finish_master_listener_until(&mut self.master_listener, deadline).err()
+        } else {
+            None
+        };
+        let native_storage_outcome =
+            if shadow_joined && seal_error.is_none() && listener_error.is_none() {
+                let outcome = self
+                    .native_storage
+                    .as_mut()
+                    .map(|storage| storage.shutdown_until(deadline));
+                if outcome
+                    .as_ref()
+                    .is_some_and(NativeStorageShutdownOutcome::is_complete)
+                {
+                    self.native_storage.take();
+                }
+                outcome
+            } else {
+                None
+            };
+        let master_error = combine_optional_errors(
+            budget_error,
+            combine_optional_errors(seal_error, listener_error),
+        );
         let outcome = LegacyServerShutdownOutcome {
             timed_out_processes: graceful.timed_out_processes,
             gateway_error,
             gateway_outcome,
             master_error,
+            legacy_catalog_shadow_outcome,
             native_storage_outcome,
         };
         tracing::info!(
@@ -1455,6 +1537,7 @@ impl LegacyServerRuntime {
             timed_out_processes = ?outcome.timed_out_processes,
             gateway_error = ?outcome.gateway_error,
             gateway_outcome = ?outcome.gateway_outcome,
+            legacy_catalog_shadow_outcome = ?outcome.legacy_catalog_shadow_outcome,
             native_storage_outcome = ?outcome.native_storage_outcome,
             master_error = ?outcome.master_error,
             "zippy server runtime stopped"
@@ -1462,7 +1545,19 @@ impl LegacyServerRuntime {
         if outcome.is_clean() {
             self.data_directory.take();
         }
-        self.shutdown_outcome = Some(outcome.clone());
+        let retryable_ordered_cleanup = self.master.is_running()
+            || matches!(
+                outcome.legacy_catalog_shadow_outcome.as_ref(),
+                Some(&LegacyCatalogShadowShutdownOutcome::TimedOut)
+            )
+            || matches!(
+                outcome.native_storage_outcome.as_ref(),
+                Some(NativeStorageShutdownOutcome::TimedOut)
+            )
+            || (self.native_storage.is_some() && outcome.native_storage_outcome.is_none());
+        if !retryable_ordered_cleanup {
+            self.shutdown_outcome = Some(outcome.clone());
+        }
         outcome
     }
 }
@@ -1572,6 +1667,63 @@ fn prepare_legacy_catalog_migration(
                 LegacyCatalogMigrationDegradedReason::PlanningFailed,
                 &error,
             ))
+        }
+    }
+}
+
+fn start_legacy_catalog_shadow_if_enabled(
+    runtime_config: &ZippyConfig,
+    master: &MasterServer,
+    native_storage: Option<&NativeStorageRuntime>,
+) -> Option<LegacyCatalogShadowWorker> {
+    if runtime_config.catalog.backend != ZippyCatalogBackend::SqliteShadow {
+        return None;
+    }
+    let Some(native_storage) = native_storage else {
+        tracing::warn!(
+            component = "legacy_catalog_shadow",
+            event = "legacy_catalog_shadow_start_blocked",
+            reason = "native_storage_unavailable",
+            "legacy Catalog command shadow remains disabled"
+        );
+        return None;
+    };
+    let trusted_fallback_root =
+        match resolve_legacy_fallback_root(&runtime_config.table.persist.data_dir) {
+            Ok(root) => Some(root),
+            Err(error) => {
+                tracing::warn!(
+                    component = "legacy_catalog_shadow",
+                    event = "legacy_catalog_shadow_fallback_root_unavailable",
+                    error_code = %error.code(),
+                    "legacy Catalog shadow will fail closed for files without a declared root"
+                );
+                None
+            }
+        };
+    let configured = &runtime_config.catalog.shadow;
+    let config = LegacyCatalogShadowWorkerConfig {
+        queue_capacity: configured.queue_capacity,
+        max_files_per_table: configured.max_files_per_comparison,
+        max_metadata_bytes_per_table: configured.max_metadata_bytes_per_comparison,
+        operation_timeout: Duration::from_millis(configured.comparison_timeout_ms),
+        trusted_fallback_root,
+    };
+    match LegacyCatalogShadowWorker::install_and_start(
+        master,
+        native_storage.catalog_read_handle(),
+        native_storage.catalog_legacy_reconcile_handle(),
+        config,
+    ) {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::warn!(
+                component = "legacy_catalog_shadow",
+                event = "legacy_catalog_shadow_start_failed",
+                error_code = %error.code(),
+                "legacy Catalog command shadow failed to start; primary legacy authority remains active"
+            );
+            None
         }
     }
 }
@@ -1771,6 +1923,7 @@ fn rollback_startup(
     master: &MasterServer,
     master_listener: &mut Option<MasterListenerRuntime>,
     gateway: &mut Option<GatewayServer>,
+    legacy_catalog_shadow: &mut Option<LegacyCatalogShadowWorker>,
     native_storage: &mut Option<NativeStorageRuntime>,
     services: Option<&LegacyServiceSet>,
     shutdown_timeout: Duration,
@@ -1787,9 +1940,6 @@ fn rollback_startup(
     };
     if let Some(services) = services {
         services.begin_shutdown();
-    }
-    if let Some(native_storage) = native_storage.as_mut() {
-        native_storage.begin_shutdown();
     }
     let (gateway_outcome, gateway_error) = match gateway.take() {
         Some(gateway) => match gateway
@@ -1817,24 +1967,9 @@ fn rollback_startup(
         },
         None => (None, None),
     };
-    let native_storage_outcome = native_storage
-        .as_mut()
-        .map(|storage| storage.shutdown_until(deadline));
-    if native_storage_outcome
-        .as_ref()
-        .is_some_and(NativeStorageShutdownOutcome::is_complete)
-    {
-        native_storage.take();
-    } else if let Some(outcome) = native_storage_outcome.as_ref() {
-        tracing::warn!(
-            component = "server",
-            event = "server_start_rollback_native_storage_incomplete",
-            outcome = ?outcome,
-            "native storage cleanup was incomplete during startup rollback"
-        );
-    }
-    let graceful =
-        master.request_graceful_shutdown(deadline.saturating_duration_since(Instant::now()));
+    let graceful = master.drain_registered_processes_for_shutdown(
+        deadline.saturating_duration_since(Instant::now()),
+    );
     if !graceful.timed_out_processes.is_empty() {
         tracing::warn!(
             component = "server",
@@ -1843,7 +1978,34 @@ fn rollback_startup(
             "startup rollback timed out waiting for runtime processes"
         );
     }
-    let listener_error = finish_master_listener_until(master_listener, deadline).err();
+    let seal_error = master
+        .seal_legacy_catalog_commit_events(deadline.saturating_duration_since(Instant::now()))
+        .err()
+        .map(|error| {
+            ServerError::new(
+                ErrorCode::DeadlineExceeded,
+                format!("seal legacy Catalog commit events during rollback error=[{error}]"),
+            )
+        });
+    let legacy_catalog_shadow_outcome = legacy_catalog_shadow
+        .as_mut()
+        .map(|shadow| shadow.shutdown_until(deadline));
+    if legacy_catalog_shadow_outcome
+        .as_ref()
+        .is_some_and(LegacyCatalogShadowShutdownOutcome::is_complete)
+    {
+        legacy_catalog_shadow.take();
+    }
+    let shadow_joined = !matches!(
+        legacy_catalog_shadow_outcome.as_ref(),
+        Some(&LegacyCatalogShadowShutdownOutcome::TimedOut)
+    );
+    let listener_error = if shadow_joined && seal_error.is_none() {
+        master.shutdown();
+        finish_master_listener_until(master_listener, deadline).err()
+    } else {
+        None
+    };
     if let Some(error) = &listener_error {
         tracing::warn!(
             component = "server",
@@ -1852,11 +2014,41 @@ fn rollback_startup(
             "master listener cleanup failed during startup rollback"
         );
     }
+    let native_storage_outcome =
+        if shadow_joined && seal_error.is_none() && listener_error.is_none() {
+            let outcome = native_storage
+                .as_mut()
+                .map(|storage| storage.shutdown_until(deadline));
+            if outcome
+                .as_ref()
+                .is_some_and(NativeStorageShutdownOutcome::is_complete)
+            {
+                native_storage.take();
+            }
+            outcome
+        } else {
+            None
+        };
+    if let Some(outcome) = native_storage_outcome
+        .as_ref()
+        .filter(|outcome| !outcome.is_complete())
+    {
+        tracing::warn!(
+            component = "server",
+            event = "server_start_rollback_native_storage_incomplete",
+            outcome = ?outcome,
+            "native storage cleanup was incomplete during startup rollback"
+        );
+    }
     LegacyServerShutdownOutcome {
         timed_out_processes: graceful.timed_out_processes,
         gateway_error,
         gateway_outcome,
-        master_error: budget_error.or(listener_error),
+        master_error: combine_optional_errors(
+            budget_error,
+            combine_optional_errors(seal_error, listener_error),
+        ),
+        legacy_catalog_shadow_outcome,
         native_storage_outcome,
     }
 }
@@ -2534,6 +2726,7 @@ token = "must-not-appear-in-ready-record"
             gateway_error: None,
             gateway_outcome: None,
             master_error: None,
+            legacy_catalog_shadow_outcome: None,
             native_storage_outcome: None,
         };
 
@@ -2572,6 +2765,7 @@ token = "must-not-appear-in-ready-record"
             gateway_error: None,
             gateway_outcome: None,
             master_error: None,
+            legacy_catalog_shadow_outcome: None,
             native_storage_outcome: None,
         };
 

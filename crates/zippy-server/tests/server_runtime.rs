@@ -3,24 +3,38 @@
 #[allow(dead_code)]
 mod support;
 
-use std::fs;
+use std::fs::{self, File};
 use std::net::TcpListener;
+use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
 use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
-use zippy_core::{ControlEndpoint, DataDirectoryError, MasterClient, OwnedDataDirectory};
+use zippy_core::{
+    canonical_schema_hash, schema_metadata, ControlEndpoint, DataDirectoryError,
+    ManagedDataDirectory, MasterClient, OwnedDataDirectory,
+};
 use zippy_master::daemon::MasterDaemonConfig;
+use zippy_master::snapshot::{
+    RegistrySnapshot, SnapshotSourceRecord, SnapshotStore, SnapshotStreamRecord,
+};
 use zippy_server::{
-    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationState, LegacyServerMode,
+    LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationState,
+    LegacyCatalogShadowShutdownOutcome, LegacyCatalogShadowState, LegacyServerMode,
     LegacyServerRuntime, LegacyServerRuntimeConfig, ServiceHealth,
 };
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
-    CatalogWrite, CreateNamespaceCommand,
+    CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, LegacyFileViewContinuity,
+    ListTablesRequest,
 };
 use zippy_types::runtime::RuntimeRegistry;
-use zippy_types::table::CatalogName;
+use zippy_types::table::{CatalogName, DataFileLocation};
 use zippy_types::{ErrorCode, NamespaceId, RequestId};
 
 use support::{reserve_tcp_addr, wait_until_bindable};
@@ -208,7 +222,32 @@ fn runtime_config_with_shadow_catalog(
     data_dir: &std::path::Path,
     gateway_endpoint: std::net::SocketAddr,
 ) -> LegacyServerRuntimeConfig {
+    runtime_config_with_shadow_catalog_and_persist_root(temp, data_dir, gateway_endpoint, None)
+}
+
+fn runtime_config_with_shadow_catalog_and_persist_root(
+    temp: &tempfile::TempDir,
+    data_dir: &std::path::Path,
+    gateway_endpoint: std::net::SocketAddr,
+    persist_root: Option<&Path>,
+) -> LegacyServerRuntimeConfig {
     let config_path = temp.path().join("zippy-shadow-catalog.toml");
+    let persist = persist_root.map_or_else(String::new, |root| {
+        format!(
+            "[table.persist]\ndata_dir = {:?}\n\n",
+            root.display().to_string()
+        )
+    });
+    let metadata_budget_bytes = if persist_root.is_some() {
+        131_072
+    } else {
+        4_096
+    };
+    let max_comparison_metadata_bytes = if persist_root.is_some() {
+        65_536
+    } else {
+        1_024
+    };
     fs::write(
         &config_path,
         format!(
@@ -216,6 +255,7 @@ fn runtime_config_with_shadow_catalog(
                 "[server]\n",
                 "data_dir = {:?}\n",
                 "native_storage_enabled = true\n\n",
+                "{persist}",
                 "[catalog]\n",
                 "backend = \"sqlite_shadow\"\n\n",
                 "[catalog.runtime_snapshot_pins]\n",
@@ -223,9 +263,9 @@ fn runtime_config_with_shadow_catalog(
                 "max_active_tables = 5\n\n",
                 "[catalog.shadow]\n",
                 "queue_capacity = 3\n",
-                "metadata_budget_bytes = 4096\n",
+                "metadata_budget_bytes = {}\n",
                 "max_files_per_comparison = 8\n",
-                "max_metadata_bytes_per_comparison = 1024\n",
+                "max_metadata_bytes_per_comparison = {}\n",
                 "comparison_timeout_ms = 250\n",
                 "dedup_capacity = 5\n\n",
                 "[master]\n",
@@ -236,7 +276,10 @@ fn runtime_config_with_shadow_catalog(
                 "token = \"shadow-catalog-test\"\n"
             ),
             data_dir.display().to_string(),
-            gateway_endpoint.to_string()
+            metadata_budget_bytes,
+            max_comparison_metadata_bytes,
+            gateway_endpoint.to_string(),
+            persist = persist,
         ),
     )
     .unwrap();
@@ -252,6 +295,87 @@ fn runtime_config_with_shadow_catalog(
                 false,
             );
     LegacyServerRuntimeConfig::new(master).with_startup_timeout(Duration::from_secs(3))
+}
+
+fn append_table_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
+}
+
+fn write_test_parquet(path: &Path, values: Vec<i64>) {
+    let schema = append_table_schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(values))],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+fn seed_legacy_append_table(data_dir: &Path, persist_root: &Path, initial_file: &Path) {
+    let schema = append_table_schema();
+    let schema_hash = canonical_schema_hash(&schema);
+    let canonical_root = fs::canonicalize(persist_root).unwrap();
+    let canonical_file = fs::canonicalize(initial_file).unwrap();
+    let ownership = OwnedDataDirectory::acquire_or_initialize(data_dir).unwrap();
+    let snapshot_path = ownership
+        .directory()
+        .path(ManagedDataDirectory::Catalog)
+        .join("legacy-master-registry.json");
+    SnapshotStore::write(
+        &snapshot_path,
+        &RegistrySnapshot {
+            catalog_revision: 1,
+            streams: vec![SnapshotStreamRecord {
+                stream_name: "events".to_owned(),
+                schema: schema_metadata(&schema),
+                schema_hash: schema_hash.clone(),
+                data_path: "segment".to_owned(),
+                descriptor_generation: 0,
+                sealed_segments: Vec::new(),
+                persisted_files: vec![serde_json::json!({
+                    "persist_file_id": "events-0",
+                    "file_path": canonical_file,
+                    "persist_data_root": canonical_root,
+                    "stream_name": "events",
+                    "schema_hash": schema_hash,
+                    "writer_epoch": 1,
+                    "row_count": 2,
+                    "created_at": 1,
+                })],
+                persist_events: Vec::new(),
+                persist_revision: 1,
+                persisted_files_revision: 1,
+                segment_reader_leases: Vec::new(),
+                writer_epoch: 1,
+                buffer_size: 64,
+                frame_size: 64,
+                status: "restored".to_owned(),
+            }],
+            sources: vec![SnapshotSourceRecord {
+                source_name: "events_source".to_owned(),
+                source_type: "test".to_owned(),
+                process_id: "legacy_writer".to_owned(),
+                output_stream: "events".to_owned(),
+                config: serde_json::json!({
+                    "zippy_table_kind": "append_table",
+                    "persist_data_root": persist_root,
+                }),
+                status: "restored".to_owned(),
+                metrics: serde_json::json!({}),
+                writer_epoch: 1,
+                revision: 1,
+            }],
+            engines: Vec::new(),
+        },
+    )
+    .unwrap();
+    drop(ownership);
 }
 
 async fn seed_incompatible_native_catalog_revision(data_dir: &std::path::Path) {
@@ -483,6 +607,25 @@ fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
     assert_eq!(shadow["config"]["metadata_budget_bytes"], 4096);
     assert_eq!(shadow["config"]["comparison_timeout_ms"], 250);
 
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let command_shadow = loop {
+        let status = runtime
+            .health()
+            .legacy_catalog_shadow
+            .expect("SQLite shadow mode must expose command shadow status");
+        if status.state == LegacyCatalogShadowState::EligibleCandidate {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command shadow did not become eligible: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(command_shadow.reconciled_catalog_revision, 0);
+    assert_eq!(command_shadow.publisher.baseline_revision, 0);
+    assert_eq!(command_shadow.publisher.continuity_loss_epoch, 0);
+
     let migration = runtime.legacy_catalog_migration_status();
     assert_eq!(migration.state, LegacyCatalogMigrationState::Complete);
     let pin_status = runtime
@@ -509,7 +652,12 @@ fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
     assert_eq!(migration_metrics["state"], "complete");
     assert_eq!(migration_metrics["submitted_commands"], 1);
 
-    assert!(runtime.shutdown().is_clean());
+    let shutdown = runtime.shutdown();
+    assert!(shutdown.is_clean());
+    assert_eq!(
+        shutdown.legacy_catalog_shadow_outcome,
+        Some(LegacyCatalogShadowShutdownOutcome::Complete)
+    );
     wait_until_bindable(gateway_addr);
 
     let mut restarted = LegacyServerRuntime::start(runtime_config_with_shadow_catalog(
@@ -528,6 +676,235 @@ fn sqlite_shadow_runtime_exposes_bounded_gateway_comparison_worker() {
     assert_eq!(replay.target_revision_before, 1);
     assert_eq!(replay.target_revision_after, 1);
     assert!(restarted.shutdown().is_clean());
+    wait_until_bindable(gateway_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_file_commit_reconciles_native_exact_snapshot_through_shadow_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let persist_root = temp.path().join("persisted");
+    fs::create_dir_all(&persist_root).unwrap();
+    let initial_parquet_path = persist_root.join("events-0.parquet");
+    write_test_parquet(&initial_parquet_path, vec![1, 2]);
+    seed_legacy_append_table(&data_dir, &persist_root, &initial_parquet_path);
+    let gateway_addr = reserve_tcp_addr();
+    let mut runtime =
+        LegacyServerRuntime::start(runtime_config_with_shadow_catalog_and_persist_root(
+            &temp,
+            &data_dir,
+            gateway_addr,
+            Some(&persist_root),
+        ))
+        .expect("start server with a migrated legacy append table");
+
+    let initial_deadline = Instant::now() + Duration::from_secs(3);
+    let initial = loop {
+        let status = runtime
+            .health()
+            .legacy_catalog_shadow
+            .expect("SQLite shadow mode must expose command shadow status");
+        if status.state == LegacyCatalogShadowState::EligibleCandidate {
+            break status;
+        }
+        assert!(
+            Instant::now() < initial_deadline,
+            "initial table reconcile did not become eligible: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(initial.reconciled_catalog_revision, 1);
+    assert_eq!(initial.publisher.baseline_revision, 1);
+    assert_eq!(initial.publisher.published_total, 0);
+    assert_eq!(initial.exact_diffs_total, 1);
+    assert_eq!(initial.v3_reconciles_total, 0);
+
+    let mut client = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
+    client
+        .register_process("persisted_file_shadow_test")
+        .unwrap();
+    client
+        .register_stream("events", append_table_schema(), 64, 64)
+        .unwrap();
+    let new_parquet_path = persist_root.join("events-1.parquet");
+    write_test_parquet(&new_parquet_path, vec![11, 12, 13]);
+    client
+        .replace_persisted_files(
+            "events",
+            vec![
+                serde_json::json!({
+                    "persist_file_id": "events-0",
+                    "file_path": initial_parquet_path,
+                    "row_count": 2,
+                    "created_at": 1,
+                }),
+                serde_json::json!({
+                    "persist_file_id": "events-1",
+                    "file_path": new_parquet_path,
+                    "row_count": 3,
+                    "created_at": 2,
+                }),
+            ],
+        )
+        .unwrap();
+    let legacy_stream = client.get_stream("events").unwrap();
+    assert_eq!(legacy_stream.persisted_files_revision, 2);
+    assert_eq!(legacy_stream.persisted_files.len(), 2);
+
+    let reconcile_deadline = Instant::now() + Duration::from_secs(3);
+    let reconciled = loop {
+        let status = runtime
+            .health()
+            .legacy_catalog_shadow
+            .expect("command shadow status must remain observable");
+        if status.state == LegacyCatalogShadowState::EligibleCandidate
+            && status.reconciled_catalog_revision == 2
+            && status.v3_reconciles_total == 1
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < reconcile_deadline,
+            "persisted-file commit did not reach V3 reconcile: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(reconciled.consumed_catalog_revision, 2);
+    assert_eq!(
+        reconciled.full_reconciles_total,
+        initial.full_reconciles_total + 1
+    );
+    assert_eq!(reconciled.exact_diffs_total, initial.exact_diffs_total + 1);
+    assert_eq!(reconciled.publisher.published_total, 1);
+    assert_eq!(reconciled.publisher.latest_observed_revision, 2);
+    assert_eq!(reconciled.publisher.continuity_loss_epoch, 0);
+    assert_eq!(reconciled.revision_gaps_total, 0);
+    assert_eq!(reconciled.timeouts_total, 0);
+    assert_eq!(reconciled.catalog_errors_total, 0);
+    assert_eq!(reconciled.unsupported_mutations_total, 0);
+    assert_eq!(reconciled.last_error, None);
+    client.unregister_process().unwrap();
+
+    let shutdown = runtime.shutdown();
+    assert!(shutdown.is_clean(), "shutdown outcome: {shutdown:?}");
+    assert_eq!(
+        shutdown.legacy_catalog_shadow_outcome,
+        Some(LegacyCatalogShadowShutdownOutcome::Complete)
+    );
+    wait_until_bindable(gateway_addr);
+
+    let ownership = Arc::new(OwnedDataDirectory::acquire_or_initialize(&data_dir).unwrap());
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&ownership)).unwrap();
+    let tables = catalog
+        .list_tables(ListTablesRequest {
+            namespace_id: None,
+            after: None,
+            limit: NonZeroU32::new(8).unwrap(),
+        })
+        .await
+        .unwrap();
+    let table = tables
+        .tables
+        .into_iter()
+        .find(|table| table.name.as_str() == "events")
+        .expect("migrated events table must remain in native Catalog");
+    let mapping = catalog
+        .resolve_legacy_file_view_mapping(table.table_id, 2)
+        .await
+        .expect("V3 reconcile must publish an exact legacy revision mapping");
+    assert_eq!(mapping.table_id, table.table_id);
+    assert_eq!(mapping.legacy_files_revision, 2);
+    assert_eq!(mapping.source_catalog_revision, 2);
+    assert_eq!(mapping.continuity, LegacyFileViewContinuity::Contiguous);
+    assert!(mapping.request_id.is_some());
+    assert_eq!(
+        table.current_snapshot_version,
+        mapping.native_snapshot_version
+    );
+
+    let selector = CatalogSnapshotSelector {
+        table_id: table.table_id,
+        snapshot_version: mapping.native_snapshot_version,
+        schema_version: table.current_schema_version,
+    };
+    let snapshot = catalog
+        .read_snapshot_at(std::slice::from_ref(&selector))
+        .await
+        .expect("read exact native snapshot selected by the legacy mapping");
+    assert_eq!(snapshot.tables().len(), 1);
+    let native = &snapshot.tables()[0];
+    assert_eq!(native.selector(), &selector);
+    assert_eq!(native.files().as_slice().len(), 2);
+    let mut files = native.files().as_slice().iter().collect::<Vec<_>>();
+    files.sort_unstable_by_key(|file| file.legacy_discovery_order());
+    let expected = [(0, &initial_parquet_path, 2), (1, &new_parquet_path, 3)];
+    for (file, (order, expected_path, row_count)) in files.into_iter().zip(expected) {
+        assert_eq!(file.legacy_discovery_order(), Some(order));
+        assert_eq!(file.file.row_count.get(), row_count);
+        assert!(file.file.checksum.starts_with("sha256-v1:"));
+        match &file.file.location {
+            DataFileLocation::ExternalLegacy(path) => assert_eq!(
+                path.as_str(),
+                fs::canonicalize(expected_path).unwrap().to_str().unwrap()
+            ),
+            other => panic!("legacy shadow file has unexpected location: {other:?}"),
+        }
+    }
+    catalog.close().unwrap();
+    drop(ownership);
+}
+
+#[test]
+fn unsupported_online_table_creation_degrades_only_the_shadow_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("database");
+    let gateway_addr = reserve_tcp_addr();
+    let mut runtime = LegacyServerRuntime::start(runtime_config_with_shadow_catalog(
+        &temp,
+        &data_dir,
+        gateway_addr,
+    ))
+    .expect("start server with SQLite Catalog shadow");
+    let mut client = MasterClient::connect_endpoint(runtime.control_endpoint().clone()).unwrap();
+    client.register_process("late_table_writer").unwrap();
+    client
+        .register_stream(
+            "late_table",
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            16,
+            4,
+        )
+        .unwrap();
+    client.unregister_process().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let health = runtime.health();
+        let shadow = health
+            .legacy_catalog_shadow
+            .expect("command shadow status must remain observable");
+        if shadow.state == LegacyCatalogShadowState::BlockedUnsupported {
+            assert_eq!(shadow.unsupported_mutations_total, 1);
+            assert_eq!(
+                shadow.last_error.as_deref(),
+                Some("new_legacy_table_requires_migration_primitive")
+            );
+            assert!(health.readiness.is_ready());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command shadow did not fail closed: {shadow:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let shutdown = runtime.shutdown();
+    assert!(shutdown.is_clean(), "shutdown outcome: {shutdown:?}");
     wait_until_bindable(gateway_addr);
 }
 

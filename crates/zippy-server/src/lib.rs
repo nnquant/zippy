@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+mod catalog_command_shadow;
 mod catalog_shadow;
 mod composition;
 mod health;
@@ -19,6 +20,10 @@ mod native_storage;
 mod query_service;
 mod runtime;
 
+pub use catalog_command_shadow::{
+    LegacyCatalogShadowPublisherStatus, LegacyCatalogShadowShutdownOutcome,
+    LegacyCatalogShadowState, LegacyCatalogShadowStatus,
+};
 pub use composition::LegacyServerServices;
 pub use health::{LegacyServerCapabilities, LegacyServerHealth, ServiceHealth};
 pub use legacy_catalog_migration::{

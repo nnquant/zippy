@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use zippy_catalog::{
-    decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig, SqliteCatalogReadHandle,
+    decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig,
+    SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle,
     SqliteCatalogRuntimeSnapshotPinStatus,
 };
 use zippy_core::OwnedDataDirectory;
@@ -23,12 +24,13 @@ use zippy_storage::{
     StartupOrphanReconciliationReport,
 };
 use zippy_types::catalog::{CatalogActor, CatalogActorKind, CatalogPersistence, CatalogRead};
+use zippy_types::table::TableDescriptor;
 use zippy_types::{ErrorCode, Result, ServerError, TableId};
 
 use crate::legacy_catalog_migration::{
     execute_legacy_catalog_metadata_import, LegacyCatalogMigrationDegradation,
     LegacyCatalogMigrationDegradedReason, LegacyCatalogMigrationStartup,
-    LegacyCatalogMigrationStatus,
+    LegacyCatalogMigrationStatus, LEGACY_STREAM_NAME_CONFIG_KEY,
 };
 
 const SUPERVISOR_THREAD_NAME: &str = "zippy-native-storage";
@@ -325,6 +327,7 @@ impl NativeStorageStartup {
             catalog_file_verification: ready.catalog_file_verification,
             legacy_catalog_migration: ready.legacy_catalog_migration,
             catalog_read_handle: ready.catalog_read_handle,
+            catalog_legacy_reconcile_handle: ready.catalog_legacy_reconcile_handle,
             table_actors: ready.table_actors,
             table_actor_admission: ready.table_actor_admission,
             healthy: ready.healthy,
@@ -378,6 +381,7 @@ pub struct NativeStorageRuntime {
     catalog_file_verification: StartupCatalogFileVerificationReport,
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
+    catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
@@ -448,6 +452,12 @@ impl NativeStorageRuntime {
     #[must_use]
     pub fn catalog_read_handle(&self) -> SqliteCatalogReadHandle {
         self.catalog_read_handle.clone()
+    }
+
+    /// Returns a lifecycle-bound submitter for trusted legacy file-view reconciliation.
+    #[must_use]
+    pub fn catalog_legacy_reconcile_handle(&self) -> SqliteCatalogLegacyReconcileHandle {
+        self.catalog_legacy_reconcile_handle.clone()
     }
 
     /// Returns process-local query snapshot pin gauges, limits, and rejection counters.
@@ -580,6 +590,7 @@ struct SupervisorReady {
     catalog_file_verification: StartupCatalogFileVerificationReport,
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
+    catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
@@ -891,6 +902,15 @@ async fn supervise_storage(
             );
         }
     };
+    let catalog_legacy_reconcile_handle = match catalog.legacy_reconcile_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
+            );
+        }
+    };
 
     if startup
         .send(Ok(SupervisorReady {
@@ -898,6 +918,7 @@ async fn supervise_storage(
             catalog_file_verification,
             legacy_catalog_migration,
             catalog_read_handle,
+            catalog_legacy_reconcile_handle,
             table_actors: table_actor_handle,
             table_actor_admission,
             healthy: Arc::clone(&healthy),
@@ -1061,6 +1082,11 @@ fn build_table_runtime_registry(
     let mut tables = Vec::with_capacity(bootstrap.active_tables.len());
     let mut retained_bytes = bootstrap.runtime_metadata_bytes;
     for descriptor in bootstrap.active_tables {
+        // Legacy authority still owns these tables; its unknown log watermark cannot seed a
+        // native ingest actor until an explicit authority-cutover transaction replaces it.
+        if is_legacy_catalog_shadow_table(&descriptor.table)? {
+            continue;
+        }
         let table_id = descriptor.table.table_id;
         let decoded = decode_persisted_table_schema(&descriptor.table, &descriptor.schema)?;
         let next_retained_bytes = retained_bytes
@@ -1096,6 +1122,21 @@ fn build_table_runtime_registry(
         )?);
     }
     TableRuntimeRegistry::from_bootstraps(catalog_revision, tables)
+}
+
+fn is_legacy_catalog_shadow_table(table: &TableDescriptor) -> Result<bool> {
+    let Some(stream_name) = table.config.get(LEGACY_STREAM_NAME_CONFIG_KEY) else {
+        return Ok(false);
+    };
+    if stream_name != table.name.as_str() {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy shadow table stream identity does not match its Catalog name",
+        )
+        .with_table_id(table.table_id)
+        .with_retryable(false));
+    }
+    Ok(true)
 }
 
 async fn wait_for_startup_stage<F, T>(shutdown: &mut watch::Receiver<bool>, future: F) -> Result<T>
