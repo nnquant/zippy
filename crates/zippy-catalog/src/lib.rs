@@ -13,6 +13,7 @@
 
 mod domain;
 mod encoding;
+mod file_domain;
 mod manifest_domain;
 mod migration;
 mod service;

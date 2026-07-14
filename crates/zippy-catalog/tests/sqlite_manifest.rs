@@ -10,9 +10,10 @@ use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
 use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
     CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandFormatVersion,
-    CatalogCommandV1, CatalogOutcomeV1, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
-    CatalogWrite, CommandFingerprint, CommitCompactionCommand, CommitDataFilesCommand,
-    CreateNamespaceCommand, CreateTableCommand, VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead, CatalogOutcomeV1,
+    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite, CommandFingerprint,
+    CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand, CreateTableCommand,
+    ManagedDataFileProbe, VersionedCatalogCommand, VersionedCatalogResponse,
     MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
 };
 use zippy_types::table::{
@@ -369,6 +370,159 @@ fn assert_raw_count(connection: &Connection, table: &str, expected: i64) {
         })
         .expect("count raw catalog rows");
     assert_eq!(count, expected, "unexpected raw row count table=[{table}]");
+}
+
+fn file_probe(file: u128, table: u128, path: &str) -> ManagedDataFileProbe {
+    ManagedDataFileProbe {
+        file_id: file_id(file),
+        table_id: table_id(table),
+        path: ManagedDataPath::new(path).expect("valid managed probe path"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_probe_resolves_both_keys_and_preserves_removed_identity() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+    create_append_table(&catalog).await;
+    let (first, second, _) = persist_two_inputs(&catalog).await;
+
+    let exact = catalog
+        .inspect_data_file_references(&[
+            file_probe(10, TABLE, "tables/10/10.parquet"),
+            file_probe(15, TABLE, "tables/10/15.parquet"),
+        ])
+        .await
+        .expect("probe committed and absent identities");
+    assert_eq!(exact.catalog_revision, 3);
+    assert_eq!(exact.results.len(), 2);
+    let CatalogDataFileProbeMatch::Exact { reference } = &exact.results[0].matched else {
+        panic!("matching id and path must resolve exactly");
+    };
+    assert_eq!(reference.file_id, first.file_id);
+    assert_eq!(reference.table_id, first.table_id);
+    assert_eq!(reference.location, first.location);
+    assert_eq!(reference.file_size_bytes, first.file_size_bytes);
+    assert_eq!(reference.checksum, first.checksum);
+    assert_eq!(reference.state, DataFileState::Committed);
+    assert_eq!(
+        exact.results[1].matched,
+        CatalogDataFileProbeMatch::Unreferenced
+    );
+
+    let id_conflict = catalog
+        .inspect_data_file_references(&[file_probe(
+            20,
+            TABLE,
+            "tables/10/wrong-for-file-20.parquet",
+        )])
+        .await
+        .expect("probe mismatched path");
+    let CatalogDataFileProbeMatch::IdentityConflict {
+        by_file_id,
+        by_path,
+    } = &id_conflict.results[0].matched
+    else {
+        panic!("mismatched path must be an identity conflict");
+    };
+    assert_eq!(
+        by_file_id.as_ref().map(|entry| entry.file_id),
+        Some(second.file_id)
+    );
+    assert!(by_path.is_none());
+
+    let path_conflict = catalog
+        .inspect_data_file_references(&[file_probe(30, TABLE, "tables/10/20.parquet")])
+        .await
+        .expect("probe path owned by another id");
+    let CatalogDataFileProbeMatch::IdentityConflict {
+        by_file_id,
+        by_path,
+    } = &path_conflict.results[0].matched
+    else {
+        panic!("path owned by another id must be an identity conflict");
+    };
+    assert!(by_file_id.is_none());
+    assert_eq!(
+        by_path.as_ref().map(|entry| entry.file_id),
+        Some(second.file_id)
+    );
+
+    catalog
+        .command(commit_compaction(
+            4,
+            3,
+            2,
+            vec![first.file_id, second.file_id],
+            vec![compacted_file(40, 4)],
+            OffsetWatermark::Known(LogOffset::new(3)),
+        ))
+        .await
+        .expect("commit compaction");
+    let removed = catalog
+        .inspect_data_file_references(&[file_probe(10, TABLE, "tables/10/10.parquet")])
+        .await
+        .expect("probe historical file identity");
+    let CatalogDataFileProbeMatch::Exact { reference } = &removed.results[0].matched else {
+        panic!("historical identity must remain exact");
+    };
+    assert_eq!(reference.removed_snapshot_version, Some(3));
+    assert_eq!(reference.state, DataFileState::Committed);
+    catalog.close().expect("close sqlite catalog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_probe_is_dense_chunked_and_rejects_unbounded_or_ambiguous_inputs() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("open sqlite catalog");
+
+    let probes = (1_u128..=513)
+        .map(|value| file_probe(value, TABLE, &format!("parquet/{TABLE}/{value}.parquet")))
+        .collect::<Vec<_>>();
+    let response = catalog
+        .inspect_data_file_references(&probes)
+        .await
+        .expect("probe across SQLite bind chunks");
+    assert_eq!(response.catalog_revision, 0);
+    assert_eq!(response.results.len(), probes.len());
+    assert!(response
+        .results
+        .iter()
+        .all(|result| result.matched == CatalogDataFileProbeMatch::Unreferenced));
+
+    let unsorted = [probes[1].clone(), probes[0].clone()];
+    let error = catalog
+        .inspect_data_file_references(&unsorted)
+        .await
+        .expect_err("unsorted probes must fail before actor admission");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(!error.retryable());
+
+    let duplicate_path = [
+        file_probe(1, TABLE, "parquet/shared.parquet"),
+        file_probe(2, TABLE, "parquet/shared.parquet"),
+    ];
+    let error = catalog
+        .inspect_data_file_references(&duplicate_path)
+        .await
+        .expect_err("duplicate paths must be ambiguous");
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(!error.retryable());
+
+    let oversized = (1_u128..=4_097)
+        .map(|value| file_probe(value, TABLE, &format!("parquet/{value}.parquet")))
+        .collect::<Vec<_>>();
+    let error = catalog
+        .inspect_data_file_references(&oversized)
+        .await
+        .expect_err("oversized probe must fail before actor admission");
+    assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+    assert!(!error.retryable());
+    catalog.close().expect("close sqlite catalog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

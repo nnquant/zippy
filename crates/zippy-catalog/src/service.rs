@@ -10,15 +10,16 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::Connection;
 use tokio::sync::oneshot;
 use zippy_types::catalog::{
-    CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
-    ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest, ListTablesResponse,
-    NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
+    CatalogDataFileReferenceSnapshot, CatalogFileRead, CatalogQuerySnapshot, CatalogRead,
+    CatalogSnapshotSelector, CatalogWrite, ListNamespacesRequest, ListNamespacesResponse,
+    ListTablesRequest, ListTablesResponse, ManagedDataFileProbe, NamespaceRef,
+    VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
 
 use crate::SqliteCatalogConfig;
-use crate::{domain, manifest_domain, snapshot_domain, table_domain};
+use crate::{domain, file_domain, manifest_domain, snapshot_domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
@@ -283,6 +284,22 @@ impl CatalogRead for SqliteCatalog {
     }
 }
 
+impl CatalogFileRead for SqliteCatalog {
+    fn inspect_data_file_references<'a>(
+        &'a self,
+        probes: &'a [ManagedDataFileProbe],
+    ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>> {
+        Box::pin(async move {
+            file_domain::validate_file_probes(probes)?;
+            let probes = probes.to_vec();
+            await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|sender| ControlReadMessage::InspectFiles(probes, sender))
+            }))
+            .await
+        })
+    }
+}
+
 impl CatalogWrite for SqliteCatalog {
     fn command(
         &self,
@@ -492,6 +509,14 @@ trait CatalogReadBackend: Send + Sync + 'static {
     ) -> Result<CatalogQuerySnapshot> {
         snapshot_domain::read_snapshot_at(connection, selectors)
     }
+
+    fn inspect_data_file_references(
+        &self,
+        connection: &mut Connection,
+        probes: &[ManagedDataFileProbe],
+    ) -> Result<CatalogDataFileReferenceSnapshot> {
+        file_domain::inspect_data_file_references(connection, probes)
+    }
 }
 
 struct DomainCatalogReadBackend;
@@ -511,6 +536,10 @@ enum ControlReadMessage {
         oneshot::Sender<Result<ListTablesResponse>>,
     ),
     ResolveTables(Vec<TableRef>, oneshot::Sender<Result<Vec<TableDescriptor>>>),
+    InspectFiles(
+        Vec<ManagedDataFileProbe>,
+        oneshot::Sender<Result<CatalogDataFileReferenceSnapshot>>,
+    ),
 }
 
 enum SnapshotReadMessage {
@@ -714,6 +743,12 @@ fn control_read_loop(
             ControlReadMessage::ResolveTables(tables, response) => {
                 if !response.is_closed() {
                     let _ = response.send(backend.resolve_tables(&mut connection, &tables));
+                }
+            }
+            ControlReadMessage::InspectFiles(probes, response) => {
+                if !response.is_closed() {
+                    let _ = response
+                        .send(backend.inspect_data_file_references(&mut connection, &probes));
                 }
             }
         }

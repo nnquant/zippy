@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::table::{
-    CatalogName, DataFiles, NamespaceDescriptor, PendingDataFile, SchemaDescriptor,
-    SchemaIpcPayload, TableDefinition, TableDescriptor, TableRef, TableSnapshot,
+    CatalogName, DataFileLocation, DataFileState, DataFiles, NamespaceDescriptor, PendingDataFile,
+    SchemaDescriptor, SchemaIpcPayload, TableDefinition, TableDescriptor, TableRef, TableSnapshot,
 };
 use crate::{
     BoxFuture, CommittedOffset, ConsumerOffsetAuthority, DurableConsumerId, FileId, JobId, LeaseId,
@@ -1218,6 +1218,81 @@ pub struct ListTablesResponse {
     pub next_after: Option<TableId>,
 }
 
+/// One canonical managed file identity observed by a storage reconciler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedDataFileProbe {
+    /// The immutable file identity encoded by the candidate path and footer.
+    pub file_id: FileId,
+    /// The table identity encoded by the candidate path and footer.
+    pub table_id: TableId,
+    /// The canonical candidate path relative to the managed data root.
+    pub path: crate::table::ManagedDataPath,
+}
+
+/// Lightweight physical identity and lifecycle state for one Catalog data file.
+///
+/// This projection intentionally omits partition values, statistics, source
+/// lineage, and other manifest payloads. Recovery and maintenance callers can
+/// therefore reconcile bounded batches of local file identities without
+/// loading query manifests into memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDataFileReference {
+    /// The immutable file identity.
+    pub file_id: FileId,
+    /// The table that owns the file.
+    pub table_id: TableId,
+    /// The managed or external physical location recorded by the Catalog.
+    pub location: DataFileLocation,
+    /// The expected physical length in bytes.
+    pub file_size_bytes: u64,
+    /// The canonical content checksum stored at commit time.
+    pub checksum: String,
+    /// The first snapshot version that exposed this file.
+    pub added_snapshot_version: u64,
+    /// The first snapshot version that stopped exposing this file.
+    pub removed_snapshot_version: Option<u64>,
+    /// The current physical-deletion lifecycle state.
+    pub state: DataFileState,
+}
+
+/// Catalog identity outcome for one managed candidate probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CatalogDataFileProbeMatch {
+    /// Neither the immutable ID nor the managed path has ever been registered.
+    Unreferenced,
+    /// Both keys resolve the exact same Catalog row and table identity.
+    Exact {
+        /// The matching immutable Catalog record.
+        reference: CatalogDataFileReference,
+    },
+    /// One or both keys resolve a different immutable Catalog identity.
+    IdentityConflict {
+        /// The row found through the requested file ID, when one exists.
+        by_file_id: Option<CatalogDataFileReference>,
+        /// The row found through the requested managed path, when one exists.
+        by_path: Option<CatalogDataFileReference>,
+    },
+}
+
+/// Dense Catalog result corresponding to one managed file probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDataFileProbeResult {
+    /// The exact validated probe supplied by the caller.
+    pub probe: ManagedDataFileProbe,
+    /// The Catalog rows found through both immutable keys.
+    pub matched: CatalogDataFileProbeMatch,
+}
+
+/// One revision-consistent result for a bounded managed-file identity probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDataFileReferenceSnapshot {
+    /// The Catalog revision observed by the read transaction.
+    pub catalog_revision: u64,
+    /// Dense results in the same strict file-id order as the request.
+    pub results: Vec<CatalogDataFileProbeResult>,
+}
+
 /// Read-only access to immutable persistent catalog state.
 pub trait CatalogRead: Send + Sync {
     /// Returns the current catalog revision.
@@ -1264,6 +1339,26 @@ pub trait CatalogRead: Send + Sync {
     ) -> BoxFuture<'a, Result<CatalogQuerySnapshot>>;
 }
 
+/// Bounded Catalog projection used by storage recovery and maintenance.
+///
+/// This is separate from [`CatalogRead`] because legacy adapters cannot
+/// provide stable file identities. New storage code should require this trait
+/// explicitly instead of silently degrading to legacy path matching.
+pub trait CatalogFileRead: CatalogRead {
+    /// Inspects exact file identities and paths in one Catalog read transaction.
+    ///
+    /// Probes must be supplied in strict file-id order without duplicate IDs or
+    /// paths. Implementations return one dense result per probe and include
+    /// every lifecycle state. An unreferenced result is an observation at the
+    /// returned revision, not authorization to delete the physical file;
+    /// publication admission must also be excluded until deletion completes.
+    /// The response must not load file lineage or manifest blobs.
+    fn inspect_data_file_references<'a>(
+        &'a self,
+        probes: &'a [ManagedDataFileProbe],
+    ) -> BoxFuture<'a, Result<CatalogDataFileReferenceSnapshot>>;
+}
+
 /// Serialized mutation access to persistent catalog state.
 pub trait CatalogWrite: Send + Sync {
     /// Validates format, fingerprint, revision, and invariants before commit.
@@ -1304,9 +1399,9 @@ mod tests {
         AcquireProducerCommand, AcquireSnapshotLeaseCommand, AlterTableSchemaCommand, Catalog,
         CatalogActor, CatalogActorKind, CatalogCodec, CatalogCodecError, CatalogCommandEnvelopeV1,
         CatalogCommandFingerprintInputV1, CatalogCommandFormatVersion, CatalogCommandV1,
-        CatalogFingerprintError, CatalogOutcomeV1, CatalogQuerySnapshot, CatalogRead,
-        CatalogResponseV1, CatalogSnapshotSelector, CatalogTableSnapshot, CatalogWrite,
-        CommitCompactionCommand, CommitConsumerOffsetCommand, CommitDataFilesCommand,
+        CatalogFileRead, CatalogFingerprintError, CatalogOutcomeV1, CatalogQuerySnapshot,
+        CatalogRead, CatalogResponseV1, CatalogSnapshotSelector, CatalogTableSnapshot,
+        CatalogWrite, CommitCompactionCommand, CommitConsumerOffsetCommand, CommitDataFilesCommand,
         CreateMaintenanceJobCommand, CreateNamespaceCommand, CreateTableCommand, DropTableCommand,
         MaintenanceJobDescriptor, MaintenanceJobKind, MaintenanceJobState, ProducerDescriptor,
         ReleaseSnapshotLeaseCommand, SnapshotLeaseDescriptor, TransitionMaintenanceJobCommand,
@@ -1702,12 +1797,14 @@ mod tests {
 
     fn assert_catalog_is_object_safe(_: Option<&dyn Catalog>) {}
     fn assert_catalog_read_is_object_safe(_: Option<&dyn CatalogRead>) {}
+    fn assert_catalog_file_read_is_object_safe(_: Option<&dyn CatalogFileRead>) {}
     fn assert_catalog_write_is_object_safe(_: Option<&dyn CatalogWrite>) {}
 
     #[test]
     fn catalog_traits_are_object_safe() {
         assert_catalog_is_object_safe(None);
         assert_catalog_read_is_object_safe(None);
+        assert_catalog_file_read_is_object_safe(None);
         assert_catalog_write_is_object_safe(None);
     }
 
