@@ -1,10 +1,12 @@
 //! Asynchronous Catalog traits backed by one connection-owning SQLite actor.
 
+use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::Connection;
 use tokio::sync::oneshot;
 use zippy_types::catalog::{
@@ -13,12 +15,13 @@ use zippy_types::catalog::{
     NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, Result, ServerError};
+use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
 
 use crate::SqliteCatalogConfig;
 use crate::{domain, manifest_domain, snapshot_domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
+const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
 
 /// A typed SQLite Catalog whose only connection is owned by one OS actor thread.
 ///
@@ -29,12 +32,18 @@ const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 /// a command future has been polled and successfully enqueued, cancelling it
 /// abandons only the response; the actor still executes the command. Callers
 /// must treat that case as commit-unknown and replay the same request ID.
-/// Cancelled reads may be skipped before execution. `open`, `close`, and `Drop`
-/// remain synchronous in this migration slice and must not be wired into the
-/// server runtime until shutdown receives an absolute deadline.
+/// Cancelled reads may be skipped before execution.
+///
+/// Mutations retain their actor admission order. While a manifest mutation is
+/// being prepared outside SQLite, a later read may complete first and observe
+/// the preceding committed revision. A caller requiring read-after-write must
+/// await the mutation response before issuing the read. `open`, `close`, and
+/// `Drop` remain synchronous in this migration slice and must not be wired into
+/// the server runtime until shutdown receives an absolute deadline.
 pub struct SqliteCatalog {
-    sender: Option<SyncSender<ServiceMessage>>,
+    sender: Option<Sender<ServiceMessage>>,
     actor: Option<JoinHandle<()>>,
+    command_budget: Arc<CommandBudget>,
     manifest_queue_budget: Arc<ManifestQueueBudget>,
 }
 
@@ -45,15 +54,26 @@ impl SqliteCatalog {
     /// preflight, durable SQLite configuration, migrations, and integrity check
     /// have completed on the actor thread.
     pub fn open(config: SqliteCatalogConfig) -> Result<Self> {
+        Self::open_with_manifest_backend(config, Arc::new(DomainManifestPreparationBackend))
+    }
+
+    fn open_with_manifest_backend(
+        config: SqliteCatalogConfig,
+        manifest_backend: Arc<dyn ManifestPreparationBackend>,
+    ) -> Result<Self> {
         crate::validate_config(&config)?;
-        let (sender, receiver) = mpsc::sync_channel(config.command_capacity);
-        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = crossbeam_channel::bounded(config.command_capacity);
+        let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
+        let command_budget = Arc::new(CommandBudget::new(config.command_capacity));
         let manifest_queue_budget = Arc::new(ManifestQueueBudget::new(
             config.manifest_queue_capacity_bytes,
         ));
+        let actor_manifest_backend = Arc::clone(&manifest_backend);
         let actor = thread::Builder::new()
             .name(SERVICE_ACTOR_THREAD_NAME.to_owned())
-            .spawn(move || run_actor(config, receiver, startup_sender))
+            .spawn(move || {
+                run_actor(config, receiver, startup_sender, actor_manifest_backend);
+            })
             .map_err(|error| {
                 ServerError::new(
                     ErrorCode::Unavailable,
@@ -64,6 +84,7 @@ impl SqliteCatalog {
             Ok(Ok(())) => Ok(Self {
                 sender: Some(sender),
                 actor: Some(actor),
+                command_budget,
                 manifest_queue_budget,
             }),
             Ok(Err(error)) => {
@@ -92,8 +113,6 @@ impl SqliteCatalog {
     where
         T: Send + 'static,
     {
-        use std::sync::mpsc::TrySendError;
-
         let sender = self.sender.as_ref().ok_or_else(actor_stopped)?;
         let (response_sender, response_receiver) = oneshot::channel();
         match sender.try_send(build(response_sender)) {
@@ -110,7 +129,7 @@ impl SqliteCatalog {
         let Some(sender) = self.sender.take() else {
             return Ok(());
         };
-        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let (response_sender, response_receiver) = crossbeam_channel::bounded(1);
         let send_result = sender
             .send(ServiceMessage::Shutdown(response_sender))
             .map_err(|_| actor_stopped());
@@ -200,13 +219,81 @@ impl CatalogWrite for SqliteCatalog {
         Box::pin(async move {
             let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command)?;
             let VersionedCatalogCommand::V1(envelope) = &command;
+            let request_id = envelope.request_id;
+            let command_permit = self
+                .command_budget
+                .reserve()
+                .map_err(|error| error.with_request_id(request_id))?;
             let permit = self
                 .manifest_queue_budget
                 .reserve(queued_bytes)
-                .map_err(|error| error.with_request_id(envelope.request_id))?;
-            await_response(self.request(|sender| ServiceMessage::Command(command, permit, sender)))
-                .await
+                .map_err(|error| error.with_request_id(request_id))?;
+            await_response(self.request(|response| {
+                ServiceMessage::Command(CommandRequest {
+                    command,
+                    state: CommandRequestState {
+                        request_id,
+                        response,
+                        _command_permit: command_permit,
+                        _manifest_permit: permit,
+                    },
+                })
+            }))
+            .await
         })
+    }
+}
+
+struct CommandBudget {
+    used: AtomicUsize,
+    maximum: usize,
+}
+
+impl CommandBudget {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            maximum,
+        }
+    }
+
+    fn reserve(self: &Arc<Self>) -> Result<CommandPermit> {
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            if current >= self.maximum {
+                return Err(ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "sqlite catalog outstanding command budget exhausted used=[{current}] maximum=[{}]",
+                        self.maximum
+                    ),
+                ));
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(CommandPermit {
+                        budget: Arc::clone(self),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct CommandPermit {
+    budget: Arc<CommandBudget>,
+}
+
+impl Drop for CommandPermit {
+    fn drop(&mut self) {
+        let previous = self.budget.used.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
     }
 }
 
@@ -291,18 +378,179 @@ enum ServiceMessage {
         Vec<CatalogSnapshotSelector>,
         oneshot::Sender<Result<CatalogQuerySnapshot>>,
     ),
-    Command(
-        VersionedCatalogCommand,
-        Option<ManifestQueuePermit>,
-        oneshot::Sender<Result<VersionedCatalogResponse>>,
-    ),
-    Shutdown(SyncSender<Result<()>>),
+    Command(CommandRequest),
+    Shutdown(Sender<Result<()>>),
+}
+
+struct CommandRequest {
+    command: VersionedCatalogCommand,
+    state: CommandRequestState,
+}
+
+struct CommandRequestState {
+    request_id: RequestId,
+    response: oneshot::Sender<Result<VersionedCatalogResponse>>,
+    _command_permit: CommandPermit,
+    _manifest_permit: Option<ManifestQueuePermit>,
+}
+
+impl CommandRequestState {
+    fn send(self, result: Result<VersionedCatalogResponse>) {
+        let _ = self.response.send(result);
+    }
+}
+
+trait ManifestPreparationBackend: Send + Sync + 'static {
+    fn verify(&self, command: VersionedCatalogCommand) -> Result<domain::VerifiedManifestCommand>;
+
+    fn prepare(
+        &self,
+        preparation: domain::ManifestCommandPreparation,
+    ) -> domain::ManifestPreparationResult;
+}
+
+struct DomainManifestPreparationBackend;
+
+impl ManifestPreparationBackend for DomainManifestPreparationBackend {
+    fn verify(&self, command: VersionedCatalogCommand) -> Result<domain::VerifiedManifestCommand> {
+        domain::verify_manifest_command(command)
+    }
+
+    fn prepare(
+        &self,
+        preparation: domain::ManifestCommandPreparation,
+    ) -> domain::ManifestPreparationResult {
+        domain::prepare_manifest_command(preparation)
+    }
+}
+
+enum ManifestWorkerJob {
+    Verify(VersionedCatalogCommand),
+    Prepare(domain::ManifestCommandPreparation),
+}
+
+impl ManifestWorkerJob {
+    fn request_id(&self) -> RequestId {
+        match self {
+            Self::Verify(command) => command_request_id(command),
+            Self::Prepare(preparation) => preparation.request_id(),
+        }
+    }
+}
+
+enum ManifestWorkerCompletion {
+    Verified(Result<domain::VerifiedManifestCommand>),
+    Prepared(domain::ManifestPreparationResult),
+}
+
+enum ManifestWorkerSubmitError {
+    Full(ManifestWorkerJob),
+    Stopped(ManifestWorkerJob),
+}
+
+struct ManifestPreparationWorker {
+    sender: Option<Sender<ManifestWorkerJob>>,
+    actor: Option<JoinHandle<()>>,
+}
+
+impl ManifestPreparationWorker {
+    fn start(
+        backend: Arc<dyn ManifestPreparationBackend>,
+    ) -> Result<(Self, Receiver<ManifestWorkerCompletion>)> {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let (completion_sender, completion_receiver) = crossbeam_channel::bounded(1);
+        let actor = thread::Builder::new()
+            .name(MANIFEST_PREPARATION_THREAD_NAME.to_owned())
+            .spawn(move || {
+                manifest_worker_loop(receiver, completion_sender, backend);
+            })
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Unavailable,
+                    format!("start sqlite catalog manifest preparation worker error=[{error}]"),
+                )
+            })?;
+        Ok((
+            Self {
+                sender: Some(sender),
+                actor: Some(actor),
+            },
+            completion_receiver,
+        ))
+    }
+
+    fn submit(&self, job: ManifestWorkerJob) -> std::result::Result<(), ManifestWorkerSubmitError> {
+        let Some(sender) = &self.sender else {
+            return Err(ManifestWorkerSubmitError::Stopped(job));
+        };
+        match sender.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(job)) => Err(ManifestWorkerSubmitError::Full(job)),
+            Err(TrySendError::Disconnected(job)) => Err(ManifestWorkerSubmitError::Stopped(job)),
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.sender.take();
+        match self.actor.take() {
+            Some(actor) => actor.join().map_err(|_| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "sqlite catalog manifest preparation worker panicked",
+                )
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+fn manifest_worker_loop(
+    receiver: Receiver<ManifestWorkerJob>,
+    completion_sender: Sender<ManifestWorkerCompletion>,
+    backend: Arc<dyn ManifestPreparationBackend>,
+) {
+    while let Ok(job) = receiver.recv() {
+        let request_id = job.request_id();
+        let completion = match job {
+            ManifestWorkerJob::Verify(command) => {
+                let result = catch_unwind(AssertUnwindSafe(|| backend.verify(command)))
+                    .unwrap_or_else(|_| Err(manifest_worker_panicked(request_id, "verify")));
+                ManifestWorkerCompletion::Verified(result)
+            }
+            ManifestWorkerJob::Prepare(preparation) => {
+                let panic_result = domain::ManifestPreparationResult::failed(
+                    &preparation,
+                    manifest_worker_panicked(request_id, "prepare"),
+                );
+                let result = catch_unwind(AssertUnwindSafe(|| backend.prepare(preparation)))
+                    .unwrap_or(panic_result);
+                ManifestWorkerCompletion::Prepared(result)
+            }
+        };
+        if completion_sender.send(completion).is_err() {
+            break;
+        }
+    }
+}
+
+fn manifest_worker_panicked(request_id: RequestId, stage: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::Internal,
+        format!("sqlite catalog manifest preparation worker panicked stage=[{stage}]"),
+    )
+    .with_request_id(request_id)
+}
+
+fn command_request_id(command: &VersionedCatalogCommand) -> RequestId {
+    let VersionedCatalogCommand::V1(envelope) = command;
+    envelope.request_id
 }
 
 fn run_actor(
     config: SqliteCatalogConfig,
     receiver: Receiver<ServiceMessage>,
-    startup_sender: SyncSender<Result<()>>,
+    startup_sender: Sender<Result<()>>,
+    manifest_backend: Arc<dyn ManifestPreparationBackend>,
 ) {
     let (connection, _) = match crate::open_on_actor(&config) {
         Ok(opened) => opened,
@@ -311,68 +559,284 @@ fn run_actor(
             return;
         }
     };
+    let (mut manifest_worker, manifest_completions) =
+        match ManifestPreparationWorker::start(manifest_backend) {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = connection.close();
+                let _ = startup_sender.send(Err(error));
+                return;
+            }
+        };
     if startup_sender.send(Ok(())).is_err() {
+        let _ = manifest_worker.shutdown();
+        let _ = connection.close();
         return;
     }
-    actor_loop(connection, receiver);
+    actor_loop(
+        connection,
+        receiver,
+        &mut manifest_worker,
+        manifest_completions,
+    );
 }
 
-fn actor_loop(mut connection: Connection, receiver: Receiver<ServiceMessage>) {
+fn actor_loop(
+    mut connection: Connection,
+    receiver: Receiver<ServiceMessage>,
+    manifest_worker: &mut ManifestPreparationWorker,
+    manifest_completions: Receiver<ManifestWorkerCompletion>,
+) {
+    let mut active_manifest = None;
+    let mut pending_commands = VecDeque::new();
+    let mut draining = false;
     let mut shutdown_response = None;
-    while let Ok(message) = receiver.recv() {
-        match message {
-            ServiceMessage::Revision(response) => {
-                if !response.is_closed() {
-                    let _ = response.send(domain::revision(&connection));
-                }
+
+    loop {
+        if active_manifest.is_none() {
+            if let Some(command) = pending_commands.pop_front() {
+                start_command(
+                    &mut connection,
+                    manifest_worker,
+                    &mut active_manifest,
+                    command,
+                );
+                continue;
             }
-            ServiceMessage::GetNamespace(namespace, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(domain::get_namespace(&connection, namespace));
-                }
-            }
-            ServiceMessage::ListNamespaces(request, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(domain::list_namespaces(&mut connection, request));
-                }
-            }
-            ServiceMessage::GetTable(table, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(table_domain::get_table(&connection, table));
-                }
-            }
-            ServiceMessage::ListTables(request, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(table_domain::list_tables(&mut connection, request));
-                }
-            }
-            ServiceMessage::ResolveTables(tables, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(table_domain::resolve_tables(&mut connection, &tables));
-                }
-            }
-            ServiceMessage::ReadSnapshot(selectors, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(snapshot_domain::read_snapshot_at(
-                        &mut connection,
-                        &selectors,
-                    ));
-                }
-            }
-            ServiceMessage::Command(command, _manifest_permit, response) => {
-                let _ = response.send(domain::execute_command(&mut connection, command));
-            }
-            ServiceMessage::Shutdown(response) => {
-                shutdown_response = Some(response);
+            if draining {
                 break;
             }
         }
+
+        if active_manifest.is_some() {
+            if let Ok(completion) = manifest_completions.try_recv() {
+                handle_manifest_completion(
+                    &mut connection,
+                    manifest_worker,
+                    &mut active_manifest,
+                    completion,
+                );
+                continue;
+            }
+        }
+
+        if draining {
+            match manifest_completions.recv() {
+                Ok(completion) => handle_manifest_completion(
+                    &mut connection,
+                    manifest_worker,
+                    &mut active_manifest,
+                    completion,
+                ),
+                Err(_) => fail_active_manifest_worker(
+                    &mut active_manifest,
+                    "sqlite catalog manifest completion channel stopped during shutdown",
+                ),
+            }
+            continue;
+        }
+
+        if active_manifest.is_some() {
+            crossbeam_channel::select! {
+                recv(manifest_completions) -> completion => {
+                    match completion {
+                        Ok(completion) => handle_manifest_completion(
+                            &mut connection,
+                            manifest_worker,
+                            &mut active_manifest,
+                            completion,
+                        ),
+                        Err(_) => fail_active_manifest_worker(
+                            &mut active_manifest,
+                            "sqlite catalog manifest completion channel stopped",
+                        ),
+                    }
+                }
+                recv(receiver) -> message => {
+                    match message {
+                        Ok(message) => handle_service_message(
+                            &mut connection,
+                            manifest_worker,
+                            &mut active_manifest,
+                            &mut pending_commands,
+                            &mut draining,
+                            &mut shutdown_response,
+                            message,
+                        ),
+                        Err(_) => draining = true,
+                    }
+                }
+            }
+        } else {
+            match receiver.recv() {
+                Ok(message) => handle_service_message(
+                    &mut connection,
+                    manifest_worker,
+                    &mut active_manifest,
+                    &mut pending_commands,
+                    &mut draining,
+                    &mut shutdown_response,
+                    message,
+                ),
+                Err(_) => draining = true,
+            }
+        }
     }
+
+    let worker_result = manifest_worker.shutdown();
     let close_result = connection
         .close()
         .map_err(|(_, error)| crate::map_sqlite_error("close sqlite catalog database", error));
+    let shutdown_result = worker_result.and(close_result);
     if let Some(response) = shutdown_response {
-        let _ = response.send(close_result);
+        let _ = response.send(shutdown_result);
+    }
+}
+
+fn handle_service_message(
+    connection: &mut Connection,
+    manifest_worker: &ManifestPreparationWorker,
+    active_manifest: &mut Option<CommandRequestState>,
+    pending_commands: &mut VecDeque<CommandRequest>,
+    draining: &mut bool,
+    shutdown_response: &mut Option<Sender<Result<()>>>,
+    message: ServiceMessage,
+) {
+    match message {
+        ServiceMessage::Revision(response) => {
+            if !response.is_closed() {
+                let _ = response.send(domain::revision(connection));
+            }
+        }
+        ServiceMessage::GetNamespace(namespace, response) => {
+            if !response.is_closed() {
+                let _ = response.send(domain::get_namespace(connection, namespace));
+            }
+        }
+        ServiceMessage::ListNamespaces(request, response) => {
+            if !response.is_closed() {
+                let _ = response.send(domain::list_namespaces(connection, request));
+            }
+        }
+        ServiceMessage::GetTable(table, response) => {
+            if !response.is_closed() {
+                let _ = response.send(table_domain::get_table(connection, table));
+            }
+        }
+        ServiceMessage::ListTables(request, response) => {
+            if !response.is_closed() {
+                let _ = response.send(table_domain::list_tables(connection, request));
+            }
+        }
+        ServiceMessage::ResolveTables(tables, response) => {
+            if !response.is_closed() {
+                let _ = response.send(table_domain::resolve_tables(connection, &tables));
+            }
+        }
+        ServiceMessage::ReadSnapshot(selectors, response) => {
+            if !response.is_closed() {
+                let _ = response.send(snapshot_domain::read_snapshot_at(connection, &selectors));
+            }
+        }
+        ServiceMessage::Command(command) => {
+            if active_manifest.is_some() || !pending_commands.is_empty() {
+                pending_commands.push_back(command);
+            } else {
+                start_command(connection, manifest_worker, active_manifest, command);
+            }
+        }
+        ServiceMessage::Shutdown(response) => {
+            *draining = true;
+            *shutdown_response = Some(response);
+        }
+    }
+}
+
+fn start_command(
+    connection: &mut Connection,
+    manifest_worker: &ManifestPreparationWorker,
+    active_manifest: &mut Option<CommandRequestState>,
+    request: CommandRequest,
+) {
+    let CommandRequest { command, state } = request;
+    if domain::is_manifest_command(&command) {
+        submit_manifest_job(
+            manifest_worker,
+            active_manifest,
+            ManifestWorkerJob::Verify(command),
+            state,
+        );
+    } else {
+        state.send(domain::execute_command(connection, command));
+    }
+}
+
+fn handle_manifest_completion(
+    connection: &mut Connection,
+    manifest_worker: &ManifestPreparationWorker,
+    active_manifest: &mut Option<CommandRequestState>,
+    completion: ManifestWorkerCompletion,
+) {
+    let Some(state) = active_manifest.take() else {
+        tracing::error!("sqlite catalog received manifest completion without active command");
+        return;
+    };
+    match completion {
+        ManifestWorkerCompletion::Verified(Err(error)) => state.send(Err(error)),
+        ManifestWorkerCompletion::Verified(Ok(verified)) => {
+            match domain::begin_verified_manifest_command(connection, verified) {
+                Ok(domain::ManifestCommandStart::Replay(response)) => state.send(Ok(response)),
+                Ok(domain::ManifestCommandStart::Prepare(preparation)) => submit_manifest_job(
+                    manifest_worker,
+                    active_manifest,
+                    ManifestWorkerJob::Prepare(preparation),
+                    state,
+                ),
+                Err(error) => state.send(Err(error)),
+            }
+        }
+        ManifestWorkerCompletion::Prepared(result) => {
+            state.send(domain::finalize_manifest_preparation(connection, result));
+        }
+    }
+}
+
+fn submit_manifest_job(
+    manifest_worker: &ManifestPreparationWorker,
+    active_manifest: &mut Option<CommandRequestState>,
+    job: ManifestWorkerJob,
+    state: CommandRequestState,
+) {
+    match manifest_worker.submit(job) {
+        Ok(()) => *active_manifest = Some(state),
+        Err(ManifestWorkerSubmitError::Full(job)) => {
+            let request_id = job.request_id();
+            state.send(Err(ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "sqlite catalog manifest preparation queue is full",
+            )
+            .with_request_id(request_id)));
+        }
+        Err(ManifestWorkerSubmitError::Stopped(job)) => {
+            let request_id = job.request_id();
+            state.send(Err(ServerError::new(
+                ErrorCode::Unavailable,
+                "sqlite catalog manifest preparation worker is not running",
+            )
+            .with_request_id(request_id)));
+        }
+    }
+}
+
+fn fail_active_manifest_worker(
+    active_manifest: &mut Option<CommandRequestState>,
+    message: &'static str,
+) {
+    if let Some(state) = active_manifest.take() {
+        let request_id = state.request_id;
+        state.send(Err(
+            ServerError::new(ErrorCode::Unavailable, message).with_request_id(request_id)
+        ));
     }
 }
 
@@ -406,11 +870,230 @@ impl Drop for SqliteCatalog {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
 
-    use zippy_types::ErrorCode;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use tempfile::TempDir;
+    use zippy_core::DataDirectory;
+    use zippy_types::catalog::{
+        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
+        CatalogSnapshotSelector, CatalogWrite, CommitDataFilesCommand, CreateNamespaceCommand,
+        CreateTableCommand, VersionedCatalogCommand, VersionedCatalogResponse,
+    };
+    use zippy_types::table::{
+        AppendTableDefinition, CatalogName, DataFileLocation, DataFileProvenance, ManagedDataPath,
+        MetadataMap, NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload,
+        SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
+    };
+    use zippy_types::{
+        ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
+    };
 
-    use super::ManifestQueueBudget;
+    use super::{
+        domain, DomainManifestPreparationBackend, ManifestPreparationBackend, ManifestQueueBudget,
+        SqliteCatalog, SqliteCatalogConfig,
+    };
+
+    const NAMESPACE_ID: u128 = 1;
+    const TABLE_ID: u128 = 2;
+
+    struct BlockingManifestBackend {
+        started: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+
+    struct PanickingManifestBackend {
+        panic_prepare_once: AtomicBool,
+    }
+
+    impl ManifestPreparationBackend for BlockingManifestBackend {
+        fn verify(
+            &self,
+            command: VersionedCatalogCommand,
+        ) -> zippy_types::Result<domain::VerifiedManifestCommand> {
+            domain::verify_manifest_command(command)
+        }
+
+        fn prepare(
+            &self,
+            preparation: domain::ManifestCommandPreparation,
+        ) -> domain::ManifestPreparationResult {
+            self.started
+                .send(())
+                .expect("test preparation start observer must remain connected");
+            self.release
+                .recv()
+                .expect("test preparation release must be signalled");
+            domain::prepare_manifest_command(preparation)
+        }
+    }
+
+    impl ManifestPreparationBackend for PanickingManifestBackend {
+        fn verify(
+            &self,
+            command: VersionedCatalogCommand,
+        ) -> zippy_types::Result<domain::VerifiedManifestCommand> {
+            domain::verify_manifest_command(command)
+        }
+
+        fn prepare(
+            &self,
+            preparation: domain::ManifestCommandPreparation,
+        ) -> domain::ManifestPreparationResult {
+            if self.panic_prepare_once.swap(false, Ordering::AcqRel) {
+                panic!("injected manifest preparation panic");
+            }
+            domain::prepare_manifest_command(preparation)
+        }
+    }
+
+    fn data_directory(directory: &TempDir) -> DataDirectory {
+        DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
+    }
+
+    fn request_id(value: u128) -> RequestId {
+        RequestId::from_u128(value).expect("nonzero request id")
+    }
+
+    fn table_id() -> TableId {
+        TableId::from_u128(TABLE_ID).expect("nonzero table id")
+    }
+
+    fn command(
+        request: u128,
+        expected_revision: Option<u64>,
+        command: CatalogCommandV1,
+    ) -> VersionedCatalogCommand {
+        CatalogCommandEnvelopeV1::new(
+            request_id(request),
+            expected_revision,
+            CatalogActor {
+                kind: CatalogActorKind::Server,
+                principal: "catalog-service-test".to_owned(),
+            },
+            command,
+        )
+        .expect("valid command envelope")
+        .into()
+    }
+
+    fn schema_ipc() -> SchemaIpcPayload {
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        let mut payload = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut payload, &schema).expect("create IPC writer");
+        writer.finish().expect("finish schema-only IPC stream");
+        drop(writer);
+        SchemaIpcPayload::new(payload).expect("nonempty schema IPC payload")
+    }
+
+    async fn create_append_table(catalog: &SqliteCatalog) {
+        catalog
+            .command(command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create namespace");
+        catalog
+            .command(command(
+                2,
+                Some(1),
+                CatalogCommandV1::CreateTable(CreateTableCommand {
+                    table_id: table_id(),
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("ticks").expect("valid table name"),
+                    definition: TableDefinition::Append(AppendTableDefinition {
+                        event_time_column: None,
+                    }),
+                    schema_ipc: schema_ipc(),
+                    config: BTreeMap::new(),
+                }),
+            ))
+            .await
+            .expect("create append table");
+    }
+
+    fn pending_file(file: u128, offset: u64) -> PendingDataFile {
+        let offsets = OffsetRange::new(LogOffset::new(offset), LogOffset::new(offset))
+            .expect("valid one-row offset range");
+        let lineage = SourceSegmentLineages::new(vec![SourceSegmentLineage {
+            source: SourceSegmentIdentity {
+                segment_id: offset + 1,
+                generation: 1,
+                writer_epoch: 0,
+            },
+            offsets,
+        }])
+        .expect("valid source lineage");
+        PendingDataFile {
+            file_id: FileId::from_u128(file).expect("nonzero file id"),
+            table_id: table_id(),
+            schema_version: 1,
+            location: DataFileLocation::Managed(
+                ManagedDataPath::new(format!("tables/ticks/{file}.parquet"))
+                    .expect("valid managed path"),
+            ),
+            file_size_bytes: 128,
+            row_count: NonZeroU64::new(1).expect("nonzero row count"),
+            provenance: DataFileProvenance::Native(
+                NativeDataFileProvenance::new(offsets, lineage).expect("valid native provenance"),
+            ),
+            partition: MetadataMap::new(),
+            statistics: MetadataMap::new(),
+            metadata: MetadataMap::new(),
+            checksum: format!("sha256-v1:{file:064x}"),
+            created_at_ns: 1,
+        }
+    }
+
+    fn commit_data_file(
+        request: u128,
+        file: u128,
+        expected_revision: u64,
+        expected_snapshot_version: u64,
+        offset: u64,
+    ) -> VersionedCatalogCommand {
+        command(
+            request,
+            Some(expected_revision),
+            CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
+                table_id: table_id(),
+                expected_snapshot_version,
+                files: vec![pending_file(file, offset)],
+                committed_log_offset: OffsetWatermark::Known(LogOffset::new(offset)),
+            }),
+        )
+    }
+
+    fn blocking_backend() -> (
+        Arc<dyn ManifestPreparationBackend>,
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    ) {
+        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
+        (
+            Arc::new(BlockingManifestBackend {
+                started: started_sender,
+                release: release_receiver,
+            }),
+            started_receiver,
+            release_sender,
+        )
+    }
 
     #[test]
     fn manifest_queue_budget_releases_completed_reservations() {
@@ -432,5 +1115,190 @@ mod tests {
             .reserve(8)
             .expect("released byte budget can be reserved again")
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_manifest_preparation_keeps_reads_live_and_shutdown_drains_cancelled_commit() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let (backend, started, release) = blocking_backend();
+        let catalog = Arc::new(
+            SqliteCatalog::open_with_manifest_backend(config.clone(), backend)
+                .expect("open catalog with blocking manifest backend"),
+        );
+        create_append_table(&catalog).await;
+
+        let task_catalog = Arc::clone(&catalog);
+        let mut commit =
+            Box::pin(async move { task_catalog.command(commit_data_file(3, 10, 2, 1, 0)).await });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(commit.as_mut().poll(&mut context), Poll::Pending));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("manifest must reach semantic preparation");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), catalog.revision())
+                .await
+                .expect("revision read must not wait for manifest preparation"),
+            Ok(2)
+        );
+        drop(commit);
+
+        let catalog = match Arc::try_unwrap(catalog) {
+            Ok(catalog) => catalog,
+            Err(_) => panic!("cancelled manifest future must release its catalog Arc"),
+        };
+        let (closed_sender, closed_receiver) = crossbeam_channel::bounded(1);
+        let close_thread = std::thread::spawn(move || {
+            let _ = closed_sender.send(catalog.close());
+        });
+        assert!(matches!(
+            closed_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ));
+
+        release.send(()).expect("release manifest preparation");
+        closed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("catalog close must finish after preparation release")
+            .expect("catalog close must drain the accepted manifest");
+        close_thread.join().expect("join catalog close thread");
+
+        let reopened = SqliteCatalog::open(config).expect("reopen catalog after drained close");
+        assert_eq!(reopened.revision().await, Ok(3));
+        let snapshot = reopened
+            .read_snapshot_at(&[CatalogSnapshotSelector {
+                table_id: table_id(),
+                snapshot_version: 2,
+                schema_version: 1,
+            }])
+            .await
+            .expect("read committed manifest after restart");
+        assert_eq!(snapshot.tables()[0].files().as_slice().len(), 1);
+        reopened.close().expect("close reopened catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_manifest_preserves_pending_mutation_fifo() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let (backend, started, release) = blocking_backend();
+        let catalog = SqliteCatalog::open_with_manifest_backend(config, backend)
+            .expect("open catalog with blocking manifest backend");
+        create_append_table(&catalog).await;
+
+        let mut first = Box::pin(catalog.command(commit_data_file(3, 10, 2, 1, 0)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first manifest must reach semantic preparation");
+
+        let mut second = Box::pin(catalog.command(commit_data_file(4, 11, 3, 2, 1)));
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        release
+            .send(())
+            .expect("release first manifest preparation");
+        let VersionedCatalogResponse::V1(first_response) = first
+            .await
+            .expect("first manifest must commit before the pending manifest");
+        assert_eq!(first_response.catalog_revision, 3);
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second manifest must start after the first terminal result");
+        assert_eq!(catalog.revision().await, Ok(3));
+
+        release
+            .send(())
+            .expect("release second manifest preparation");
+        let VersionedCatalogResponse::V1(second_response) = second
+            .await
+            .expect("second manifest must commit from the updated parent state");
+        assert_eq!(second_response.catalog_revision, 4);
+        assert_eq!(catalog.revision().await, Ok(4));
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparation_panic_is_terminal_and_the_same_request_can_retry() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open_with_manifest_backend(
+            SqliteCatalogConfig::new(&data_directory),
+            Arc::new(PanickingManifestBackend {
+                panic_prepare_once: AtomicBool::new(true),
+            }),
+        )
+        .expect("open catalog with panicking manifest backend");
+        create_append_table(&catalog).await;
+
+        let command = commit_data_file(3, 10, 2, 1, 0);
+        let error = catalog
+            .command(command.clone())
+            .await
+            .expect_err("injected preparation panic must be terminal");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(error.request_id(), Some(request_id(3)));
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        let VersionedCatalogResponse::V1(response) = catalog
+            .command(command)
+            .await
+            .expect("worker must remain live and the released request can retry");
+        assert_eq!(response.catalog_revision, 3);
+        catalog.close().expect("close catalog after panic recovery");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_idempotency_commit_overrides_a_preparation_error() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let (backend, started, release) = blocking_backend();
+        let first = Arc::new(
+            SqliteCatalog::open_with_manifest_backend(config.clone(), backend)
+                .expect("open first catalog actor"),
+        );
+        create_append_table(&first).await;
+        let second = SqliteCatalog::open_with_manifest_backend(
+            config,
+            Arc::new(DomainManifestPreparationBackend),
+        )
+        .expect("open concurrent catalog actor");
+
+        let first_catalog = Arc::clone(&first);
+        let first_command = tokio::spawn(async move {
+            first_catalog
+                .command(commit_data_file(3, 11, 2, 1, 1))
+                .await
+        });
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("invalid command must pass the initial idempotency probe");
+
+        second
+            .command(commit_data_file(3, 10, 2, 1, 0))
+            .await
+            .expect("concurrent actor commits the request id first");
+        release.send(()).expect("release invalid preparation");
+        let error = first_command
+            .await
+            .expect("join first catalog command")
+            .expect_err("different fingerprint must conflict");
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert_eq!(error.request_id(), Some(request_id(3)));
+        assert_eq!(first.revision().await, Ok(3));
+
+        let first = match Arc::try_unwrap(first) {
+            Ok(catalog) => catalog,
+            Err(_) => panic!("manifest task must release the first catalog Arc"),
+        };
+        first.close().expect("close first catalog actor");
+        second.close().expect("close second catalog actor");
     }
 }

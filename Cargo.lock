@@ -2276,6 +2276,7 @@ name = "zippy-catalog"
 version = "0.5.0"
 dependencies = [
  "arrow",
+ "crossbeam-channel",
  "flatbuffers",
  "rusqlite",
  "serde",

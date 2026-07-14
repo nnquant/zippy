@@ -120,14 +120,24 @@ count, logical-offset coverage, or aggregate source-lineage coverage of its
 exact visible input set. Schema-version-specific logical coverage must also be
 identical; schema rewrites require a later command version.
 
+Manifest fingerprint verification and semantic preparation run on a dedicated
+bounded worker before the SQLite writer transaction. Mutations retain actor
+admission order, including while a manifest is preparing. Reads are allowed to
+overlap that preparation and may therefore complete first against the previous
+committed revision; read-after-write callers must await the mutation response.
+Accepted mutations continue after response cancellation, and synchronous close
+drains them before closing SQLite. Caller-side manifest byte preflight, large
+snapshot reads, CreateTable schema preparation, and manifest finalization still
+need further execution-domain isolation.
+
 Before server integration, the Catalog must still add remaining table commands,
 public producer-fenced ingest and lease-fenced maintenance orchestration, V2
 legacy/frame/key-value manifest contracts, a V2 legacy scan-order read contract,
 process-level ownership, network filesystem rejection, directory-handle pinning
-against parent replacement races, manifest preparation isolation from the
-shared Catalog actor, process-kill crash failpoints, and an absolute shutdown
-deadline. The current reliable `close` may wait indefinitely for an actor
-already executing work; dropping the handle invokes the same shutdown path.
+against parent replacement races, caller-side manifest admission offload, read
+actor isolation, process-kill crash failpoints, and an absolute shutdown deadline.
+The current reliable `close` may wait indefinitely for an actor already executing
+work; dropping the handle invokes the same shutdown path.
 
 The integrity timeout bounds SQLite VM progress-handler checks, not all wall
 time spent opening files, waiting in filesystem I/O, or running migrations.

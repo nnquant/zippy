@@ -6,9 +6,9 @@ use rusqlite::{
     params, Connection, Error as SqliteError, OptionalExtension, Params, TransactionBehavior,
 };
 use zippy_types::catalog::{
-    CatalogCodec, CatalogCommandV1, CatalogOutcomeV1, CatalogResponseV1, CreateNamespaceCommand,
-    ListNamespacesRequest, ListNamespacesResponse, NamespaceRef, VersionedCatalogCommand,
-    VersionedCatalogResponse,
+    CatalogActorKind, CatalogCodec, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogOutcomeV1,
+    CatalogResponseV1, CreateNamespaceCommand, ListNamespacesRequest, ListNamespacesResponse,
+    NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{CatalogName, NamespaceDescriptor};
 use zippy_types::{ErrorCode, NamespaceId, RequestId, Result, ServerError, ServerErrorDetails};
@@ -38,57 +38,223 @@ enum PreparedCommand {
     CommitCompaction(crate::manifest_domain::PreparedCommitCompaction),
 }
 
+#[derive(Clone)]
+struct CommandContext {
+    request_id: RequestId,
+    expected_revision: Option<u64>,
+    command_format_version: i64,
+    operation: &'static str,
+    fingerprint: [u8; 32],
+}
+
+/// A manifest command whose complete frozen fingerprint has been validated.
+pub(crate) struct VerifiedManifestCommand(VersionedCatalogCommand);
+
+/// The result of probing idempotency for one verified manifest command.
+pub(crate) enum ManifestCommandStart {
+    /// The exact committed response can be returned without semantic preparation.
+    Replay(VersionedCatalogResponse),
+    /// The first execution must be prepared outside the SQLite actor.
+    Prepare(ManifestCommandPreparation),
+}
+
+/// An owned, database-independent manifest preparation request.
+pub(crate) struct ManifestCommandPreparation {
+    context: CommandContext,
+    actor_kind: CatalogActorKind,
+    command: CatalogCommandV1,
+}
+
+impl ManifestCommandPreparation {
+    /// Returns the request identity used for structured worker failures.
+    pub(crate) const fn request_id(&self) -> RequestId {
+        self.context.request_id
+    }
+
+    fn context(&self) -> &CommandContext {
+        &self.context
+    }
+}
+
+/// A manifest semantic-preparation outcome that always retains its command context.
+pub(crate) struct ManifestPreparationResult {
+    context: CommandContext,
+    prepared: Result<PreparedCommand>,
+}
+
+impl ManifestPreparationResult {
+    /// Creates a terminal preparation failure while preserving idempotency context.
+    pub(crate) fn failed(preparation: &ManifestCommandPreparation, error: ServerError) -> Self {
+        Self {
+            context: preparation.context().clone(),
+            prepared: Err(error.with_request_id(preparation.request_id())),
+        }
+    }
+}
+
 /// Replays a committed response without a writer lock or executes one mutation atomically.
 pub(crate) fn execute_command(
     connection: &mut Connection,
     command: VersionedCatalogCommand,
 ) -> Result<VersionedCatalogResponse> {
     let VersionedCatalogCommand::V1(envelope) = command;
+    verify_envelope(&envelope)?;
+    let context = command_context(&envelope);
+    if let Some(response) = try_replay_context(connection, &context)? {
+        return Ok(response);
+    }
+    let prepared = prepare_command(envelope.actor.kind, envelope.command, context.request_id)?;
+    commit_prepared_command(connection, context, prepared)
+}
+
+/// Returns whether a command requires the database-independent manifest pipeline.
+pub(crate) fn is_manifest_command(command: &VersionedCatalogCommand) -> bool {
+    let VersionedCatalogCommand::V1(envelope) = command;
+    matches!(
+        &envelope.command,
+        CatalogCommandV1::CommitDataFiles(_) | CatalogCommandV1::CommitCompaction(_)
+    )
+}
+
+/// Validates the full frozen fingerprint without performing semantic preparation.
+pub(crate) fn verify_manifest_command(
+    command: VersionedCatalogCommand,
+) -> Result<VerifiedManifestCommand> {
+    let VersionedCatalogCommand::V1(envelope) = &command;
+    if !is_manifest_command(&command) {
+        return Err(ServerError::new(
+            ErrorCode::Internal,
+            "non-manifest command entered the manifest verification worker",
+        )
+        .with_request_id(envelope.request_id));
+    }
+    verify_envelope(envelope)?;
+    Ok(VerifiedManifestCommand(command))
+}
+
+/// Probes idempotency for a verified manifest before expensive semantic preparation.
+pub(crate) fn begin_verified_manifest_command(
+    connection: &Connection,
+    verified: VerifiedManifestCommand,
+) -> Result<ManifestCommandStart> {
+    let VersionedCatalogCommand::V1(envelope) = verified.0;
+    let context = command_context(&envelope);
+    if let Some(response) = try_replay_context(connection, &context)? {
+        return Ok(ManifestCommandStart::Replay(response));
+    }
+    Ok(ManifestCommandStart::Prepare(ManifestCommandPreparation {
+        context,
+        actor_kind: envelope.actor.kind,
+        command: envelope.command,
+    }))
+}
+
+/// Performs pure manifest validation and encoding without accessing SQLite.
+pub(crate) fn prepare_manifest_command(
+    preparation: ManifestCommandPreparation,
+) -> ManifestPreparationResult {
+    let request_id = preparation.context.request_id;
+    let prepared = match preparation.command {
+        CatalogCommandV1::CommitDataFiles(commit) => {
+            crate::manifest_domain::prepare_commit_data_files(preparation.actor_kind, commit)
+                .map(PreparedCommand::CommitDataFiles)
+        }
+        CatalogCommandV1::CommitCompaction(commit) => {
+            crate::manifest_domain::prepare_commit_compaction(preparation.actor_kind, commit)
+                .map(PreparedCommand::CommitCompaction)
+        }
+        _ => Err(ServerError::new(
+            ErrorCode::Internal,
+            "non-manifest command entered manifest semantic preparation",
+        )),
+    }
+    .map_err(|error| error.with_request_id(request_id));
+    ManifestPreparationResult {
+        context: preparation.context,
+        prepared,
+    }
+}
+
+/// Finalizes a prepared manifest or resolves a concurrent idempotent commit first.
+pub(crate) fn finalize_manifest_preparation(
+    connection: &mut Connection,
+    result: ManifestPreparationResult,
+) -> Result<VersionedCatalogResponse> {
+    match result.prepared {
+        Ok(prepared) => commit_prepared_command(connection, result.context, prepared),
+        Err(error) => match try_replay_context(connection, &result.context)? {
+            Some(response) => Ok(response),
+            None => Err(error),
+        },
+    }
+}
+
+fn verify_envelope(envelope: &CatalogCommandEnvelopeV1) -> Result<()> {
     envelope.verify_fingerprint().map_err(|error| {
         ServerError::new(
             ErrorCode::InvalidArgument,
             format!("invalid catalog command fingerprint error=[{error}]"),
         )
         .with_request_id(envelope.request_id)
-    })?;
+    })
+}
 
-    let request_id = envelope.request_id;
-    let command_format_version = i64::from(envelope.format_version.get());
-    let fingerprint = envelope.canonical_fingerprint.into_bytes();
-    let operation = command_operation(&envelope.command);
-    if let Some(response) = try_replay_idempotent_response(
-        connection,
-        request_id,
-        command_format_version,
-        operation,
-        &fingerprint,
-    )? {
-        return Ok(response);
+fn command_context(envelope: &CatalogCommandEnvelopeV1) -> CommandContext {
+    CommandContext {
+        request_id: envelope.request_id,
+        expected_revision: envelope.expected_revision,
+        command_format_version: i64::from(envelope.format_version.get()),
+        operation: command_operation(&envelope.command),
+        fingerprint: envelope.canonical_fingerprint.into_bytes(),
     }
+}
 
-    let actor_kind = envelope.actor.kind;
-    let prepared = match envelope.command {
+fn try_replay_context(
+    connection: &Connection,
+    context: &CommandContext,
+) -> Result<Option<VersionedCatalogResponse>> {
+    try_replay_idempotent_response(
+        connection,
+        context.request_id,
+        context.command_format_version,
+        context.operation,
+        &context.fingerprint,
+    )
+}
+
+fn prepare_command(
+    actor_kind: CatalogActorKind,
+    command: CatalogCommandV1,
+    request_id: RequestId,
+) -> Result<PreparedCommand> {
+    match command {
         CatalogCommandV1::CreateNamespace(create) => {
             validate_new_catalog_name(&create.name, "namespace")
                 .map_err(|error| error.with_request_id(request_id))?;
-            PreparedCommand::CreateNamespace(create)
+            Ok(PreparedCommand::CreateNamespace(create))
         }
-        CatalogCommandV1::CreateTable(create) => PreparedCommand::CreateTable(
+        CatalogCommandV1::CreateTable(create) => Ok(PreparedCommand::CreateTable(
             crate::table_domain::prepare_create_table(create)
                 .map_err(|error| error.with_request_id(request_id))?,
-        ),
-        CatalogCommandV1::CommitDataFiles(commit) => PreparedCommand::CommitDataFiles(
+        )),
+        CatalogCommandV1::CommitDataFiles(commit) => Ok(PreparedCommand::CommitDataFiles(
             crate::manifest_domain::prepare_commit_data_files(actor_kind, commit)
                 .map_err(|error| error.with_request_id(request_id))?,
-        ),
-        CatalogCommandV1::CommitCompaction(commit) => PreparedCommand::CommitCompaction(
+        )),
+        CatalogCommandV1::CommitCompaction(commit) => Ok(PreparedCommand::CommitCompaction(
             crate::manifest_domain::prepare_commit_compaction(actor_kind, commit)
                 .map_err(|error| error.with_request_id(request_id))?,
-        ),
-        ref unsupported => {
-            return Err(unsupported_command(unsupported).with_request_id(request_id));
-        }
-    };
+        )),
+        ref unsupported => Err(unsupported_command(unsupported).with_request_id(request_id)),
+    }
+}
+
+fn commit_prepared_command(
+    connection: &mut Connection,
+    context: CommandContext,
+    prepared: PreparedCommand,
+) -> Result<VersionedCatalogResponse> {
+    let request_id = context.request_id;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| {
@@ -97,9 +263,9 @@ pub(crate) fn execute_command(
     if let Some(response) = try_replay_idempotent_response(
         &transaction,
         request_id,
-        command_format_version,
-        operation,
-        &fingerprint,
+        context.command_format_version,
+        context.operation,
+        &context.fingerprint,
     )? {
         transaction.commit().map_err(|error| {
             crate::map_sqlite_error("commit catalog command replay", error)
@@ -110,7 +276,7 @@ pub(crate) fn execute_command(
 
     let actual_revision =
         revision(&transaction).map_err(|error| error.with_request_id(request_id))?;
-    if let Some(expected_revision) = envelope.expected_revision {
+    if let Some(expected_revision) = context.expected_revision {
         if expected_revision != actual_revision {
             return Err(revision_conflict(
                 request_id,
@@ -183,9 +349,9 @@ pub(crate) fn execute_command(
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 request_id.into_bytes().as_slice(),
-                command_format_version,
-                operation,
-                fingerprint.as_slice(),
+                context.command_format_version,
+                context.operation,
+                context.fingerprint.as_slice(),
                 response_blob,
                 encode_u64(committed_at_ns).as_slice(),
                 encode_u64(expires_at_ns).as_slice(),
