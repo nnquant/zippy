@@ -155,25 +155,33 @@ pub struct SnapshotStore;
 
 impl SnapshotStore {
     pub fn write(path: &Path, snapshot: &RegistrySnapshot) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
-                reason: format!(
-                    "failed to create registry snapshot parent error=[{}]",
-                    error
-                ),
-            })?;
-        }
-
-        let temp_path = path.with_extension("tmp");
-        let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| ZippyError::Io {
-            reason: format!("failed to serialize registry snapshot error=[{}]", error),
-        })?;
-        let mut temp_file = fs::File::create(&temp_path).map_err(|error| ZippyError::Io {
+        let parent = path.parent().ok_or_else(|| ZippyError::Io {
             reason: format!(
-                "failed to create registry snapshot temp file error=[{}]",
+                "registry snapshot path has no parent path=[{}]",
+                path.display()
+            ),
+        })?;
+        fs::create_dir_all(parent).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to create registry snapshot parent path=[{}] error=[{}]",
+                parent.display(),
                 error
             ),
         })?;
+
+        let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| ZippyError::Io {
+            reason: format!("failed to serialize registry snapshot error=[{}]", error),
+        })?;
+        let mut temp_file = tempfile::Builder::new()
+            .prefix(".legacy-master-registry.tmp-")
+            .tempfile_in(parent)
+            .map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to create registry snapshot temp file parent=[{}] error=[{}]",
+                    parent.display(),
+                    error
+                ),
+            })?;
         temp_file
             .write_all(&bytes)
             .map_err(|error| ZippyError::Io {
@@ -182,22 +190,42 @@ impl SnapshotStore {
                     error
                 ),
             })?;
-        temp_file.sync_all().map_err(|error| ZippyError::Io {
+        temp_file
+            .as_file()
+            .sync_all()
+            .map_err(|error| ZippyError::Io {
+                reason: format!(
+                    "failed to fsync registry snapshot temp file error=[{}]",
+                    error
+                ),
+            })?;
+        temp_file.persist(path).map_err(|error| ZippyError::Io {
             reason: format!(
-                "failed to fsync registry snapshot temp file error=[{}]",
-                error
+                "failed to move registry snapshot into place path=[{}] error=[{}]",
+                path.display(),
+                error.error
             ),
         })?;
-        fs::rename(&temp_path, path).map_err(|error| ZippyError::Io {
-            reason: format!(
-                "failed to move registry snapshot into place error=[{}]",
-                error
-            ),
-        })?;
+        sync_snapshot_parent(parent)?;
         Ok(())
     }
 
     pub fn load(path: &Path) -> Result<RegistrySnapshot> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to inspect registry snapshot path=[{}] error=[{}]",
+                path.display(),
+                error
+            ),
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ZippyError::Io {
+                reason: format!(
+                    "registry snapshot must be a regular non-symlink file path=[{}]",
+                    path.display()
+                ),
+            });
+        }
         let bytes = fs::read(path).map_err(|error| ZippyError::Io {
             reason: format!("failed to read registry snapshot error=[{}]", error),
         })?;
@@ -205,4 +233,22 @@ impl SnapshotStore {
             reason: format!("failed to decode registry snapshot error=[{}]", error),
         })
     }
+}
+
+#[cfg(unix)]
+fn sync_snapshot_parent(parent: &Path) -> Result<()> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to fsync registry snapshot parent path=[{}] error=[{}]",
+                parent.display(),
+                error
+            ),
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_snapshot_parent(_parent: &Path) -> Result<()> {
+    Ok(())
 }

@@ -1676,6 +1676,9 @@ fn map_gateway_error(error: ZippyError, query_id: QueryId) -> ServerError {
         ZippyError::NotFound { .. } => {
             ServerError::new(ErrorCode::NotFound, message).with_query_id(query_id)
         }
+        ZippyError::Conflict { .. } => {
+            ServerError::new(ErrorCode::Conflict, message).with_query_id(query_id)
+        }
         ZippyError::DataCorruption { .. } => {
             ServerError::new(ErrorCode::DataCorruption, message).with_query_id(query_id)
         }

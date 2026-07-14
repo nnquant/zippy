@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
@@ -49,13 +50,25 @@ impl ControlEndpoint {
 
     pub fn snapshot_dir(&self) -> PathBuf {
         match self {
+            Self::Unix(path) => unix_endpoint_state_dir(path),
+            Self::Tcp(addr) => home_dir()
+                .join(CONTROL_ENDPOINT_ROOT)
+                .join(tcp_endpoint_state_name(addr)),
+        }
+    }
+
+    /// Returns the pre-managed endpoint-scoped registry snapshot location.
+    pub fn legacy_snapshot_path(&self) -> PathBuf {
+        match self {
             Self::Unix(path) => path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from(".")),
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("master-registry.json"),
             Self::Tcp(addr) => home_dir()
                 .join(CONTROL_ENDPOINT_ROOT)
-                .join(format!("tcp-{}", addr.port())),
+                .join(format!("tcp-{}", addr.port()))
+                .join("master-registry.json"),
         }
     }
 
@@ -64,6 +77,31 @@ impl ControlEndpoint {
             Self::Unix(path) => Some(path.as_path()),
             Self::Tcp(_) => None,
         }
+    }
+}
+
+fn unix_endpoint_state_dir(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("master.sock"));
+    name.push(".zippy-state");
+    path.with_file_name(name)
+}
+
+fn tcp_endpoint_state_name(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(addr) => {
+            let [a, b, c, d] = addr.ip().octets();
+            format!("tcp-v4-{a}-{b}-{c}-{d}-{}", addr.port())
+        }
+        SocketAddr::V6(addr) => format!(
+            "tcp-v6-{:032x}-{}-{}-{}",
+            u128::from_be_bytes(addr.ip().octets()),
+            addr.port(),
+            addr.flowinfo(),
+            addr.scope_id()
+        ),
     }
 }
 

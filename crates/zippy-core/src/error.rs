@@ -10,6 +10,8 @@ pub enum ZippyError {
     ResourceExhausted { reason: String },
     #[error("resource not found reason=[{reason}]")]
     NotFound { reason: String },
+    #[error("operation conflicts with current state reason=[{reason}]")]
+    Conflict { reason: String },
     #[error("data corruption reason=[{reason}]")]
     DataCorruption { reason: String },
     #[error("schema mismatch reason=[{reason}]")]

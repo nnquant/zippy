@@ -39,6 +39,37 @@ fn resolves_explicit_tcp_endpoint() {
 }
 
 #[test]
+#[cfg(unix)]
+fn unix_endpoint_state_directories_include_the_socket_name() {
+    let first = ControlEndpoint::Unix(PathBuf::from("/tmp/zippy/a.sock"));
+    let second = ControlEndpoint::Unix(PathBuf::from("/tmp/zippy/b.sock"));
+
+    assert_eq!(
+        first.snapshot_dir(),
+        PathBuf::from("/tmp/zippy/a.sock.zippy-state")
+    );
+    assert_eq!(
+        second.snapshot_dir(),
+        PathBuf::from("/tmp/zippy/b.sock.zippy-state")
+    );
+    assert_ne!(first.snapshot_dir(), second.snapshot_dir());
+    assert_eq!(
+        first.legacy_snapshot_path(),
+        PathBuf::from("/tmp/zippy/master-registry.json")
+    );
+}
+
+#[test]
+fn tcp_endpoint_state_directories_include_the_full_address() {
+    let first = ControlEndpoint::Tcp("127.0.0.1:17690".parse().unwrap());
+    let second = ControlEndpoint::Tcp("127.0.0.2:17690".parse().unwrap());
+
+    assert_ne!(first.snapshot_dir(), second.snapshot_dir());
+    assert!(first.snapshot_dir().ends_with("tcp-v4-127-0-0-1-17690"));
+    assert!(second.snapshot_dir().ends_with("tcp-v4-127-0-0-2-17690"));
+}
+
+#[test]
 fn resolves_remote_zippy_uri_to_tcp_endpoint() {
     let endpoint = resolve_control_endpoint("zippy://127.0.0.1:17777/default").unwrap();
 

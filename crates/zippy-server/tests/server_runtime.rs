@@ -200,6 +200,7 @@ fn different_endpoints_cannot_own_the_same_data_root() {
             Err(error) => error,
         };
 
+    assert_eq!(error.code(), ErrorCode::Conflict);
     assert!(error.message().contains("already owned by another process"));
     assert!(!second_temp.path().join("zippy-server.sock").exists());
     assert!(first.shutdown().is_clean());

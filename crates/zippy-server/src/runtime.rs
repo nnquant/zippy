@@ -876,8 +876,8 @@ impl LegacyServerRuntime {
 
     /// Returns the process-owned managed data directory while the runtime is active.
     #[must_use]
-    pub fn data_directory(&self) -> Option<&Arc<OwnedDataDirectory>> {
-        self.data_directory.as_ref()
+    pub fn data_directory(&self) -> Option<&OwnedDataDirectory> {
+        self.data_directory.as_deref()
     }
 
     /// Returns the active compatibility mode.
@@ -1286,6 +1286,7 @@ fn map_core_error(stage: &str, error: ZippyError) -> ServerError {
         ZippyError::InvalidConfig { .. } => ErrorCode::InvalidArgument,
         ZippyError::ResourceExhausted { .. } => ErrorCode::ResourceExhausted,
         ZippyError::NotFound { .. } => ErrorCode::NotFound,
+        ZippyError::Conflict { .. } => ErrorCode::Conflict,
         ZippyError::DataCorruption { .. } => ErrorCode::DataCorruption,
         ZippyError::SchemaMismatch { .. } => ErrorCode::SchemaMismatch,
         ZippyError::Cancelled { .. } => ErrorCode::Cancelled,

@@ -41,6 +41,8 @@ pub struct ZippyConfig {
 pub struct ZippyServerConfig {
     /// Managed database root. `None` derives an endpoint-scoped default.
     pub data_dir: Option<PathBuf>,
+    /// Allows one offline import from the legacy endpoint-scoped snapshot.
+    pub import_legacy_endpoint_snapshot: bool,
 }
 
 /// Process-wide execution resource limits.
@@ -185,6 +187,7 @@ struct PartialZippyConfig {
 #[derive(Debug, Deserialize)]
 struct PartialServerConfig {
     data_dir: Option<String>,
+    import_legacy_endpoint_snapshot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,7 +306,8 @@ impl ZippyConfig {
                         error
                     ),
                 })?;
-                config.apply_partial(parse_config_toml(&content, path)?)?;
+                let config_base = absolute_parent(path)?;
+                config.apply_partial(parse_config_toml(&content, path)?, &config_base)?;
             }
         }
         config.apply_env()?;
@@ -316,11 +320,14 @@ impl ZippyConfig {
         serde_json::to_value(self).expect("zippy config must serialize")
     }
 
-    fn apply_partial(&mut self, partial: PartialZippyConfig) -> Result<()> {
+    fn apply_partial(&mut self, partial: PartialZippyConfig, config_base: &Path) -> Result<()> {
         if let Some(server) = partial.server {
             if let Some(data_dir) = server.data_dir {
                 let data_dir = non_empty(data_dir, "server.data_dir")?;
-                self.server.data_dir = Some(expand_home_config_path(&data_dir));
+                self.server.data_dir = Some(resolve_config_path(&data_dir, config_base));
+            }
+            if let Some(import) = server.import_legacy_endpoint_snapshot {
+                self.server.import_legacy_endpoint_snapshot = import;
             }
         }
         if let Some(runtime) = partial.runtime {
@@ -435,9 +442,23 @@ impl ZippyConfig {
     }
 
     fn apply_env(&mut self) -> Result<()> {
-        if let Some(data_dir) = env_string("ZIPPY_SERVER_DATA_DIR") {
-            let data_dir = non_empty(data_dir, "ZIPPY_SERVER_DATA_DIR")?;
-            self.server.data_dir = Some(expand_home_config_path(&data_dir));
+        if let Some(data_dir) = std::env::var_os("ZIPPY_SERVER_DATA_DIR") {
+            let data_dir = expand_home_path(PathBuf::from(data_dir));
+            if data_dir.as_os_str().is_empty() {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "env var must not be empty name=[ZIPPY_SERVER_DATA_DIR]".to_string(),
+                });
+            }
+            if !data_dir.is_absolute() {
+                return Err(ZippyError::InvalidConfig {
+                    reason: "env path must be absolute name=[ZIPPY_SERVER_DATA_DIR]".to_string(),
+                });
+            }
+            self.server.data_dir = Some(data_dir);
+        }
+        if let Some(value) = env_string("ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT") {
+            self.server.import_legacy_endpoint_snapshot =
+                parse_bool_env("ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT", &value)?;
         }
         if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
             self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;
@@ -879,10 +900,42 @@ fn validate_gateway(gateway: &ZippyGatewayConfig) -> Result<()> {
 }
 
 fn expand_home_config_path(path: &str) -> PathBuf {
-    if let Some(relative) = path.strip_prefix("~/") {
+    expand_home_path(PathBuf::from(path))
+}
+
+fn expand_home_path(path: PathBuf) -> PathBuf {
+    if path == Path::new("~") {
+        return home_dir();
+    }
+    if let Ok(relative) = path.strip_prefix("~") {
         return home_dir().join(relative);
     }
-    PathBuf::from(path)
+    path
+}
+
+fn resolve_config_path(path: &str, config_base: &Path) -> PathBuf {
+    let path = expand_home_config_path(path);
+    if path.is_absolute() {
+        path
+    } else {
+        config_base.join(path)
+    }
+}
+
+fn absolute_parent(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.is_absolute() {
+        return Ok(parent.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|current| current.join(parent))
+        .map_err(|error| ZippyError::Io {
+            reason: format!(
+                "failed to resolve zippy config parent path=[{}] error=[{}]",
+                path.display(),
+                error
+            ),
+        })
 }
 
 fn home_dir() -> PathBuf {

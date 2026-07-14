@@ -238,6 +238,11 @@ fn control_transport_preserves_structured_terminal_codes() {
         reason: "query deadline exceeded".to_string(),
     })
     .unwrap_err();
+    let conflict = control_response_result(ControlResponse::Error {
+        code: Some(ControlErrorCode::Conflict),
+        reason: "data root is already owned".to_string(),
+    })
+    .unwrap_err();
 
     assert!(matches!(
         cancelled,
@@ -247,6 +252,10 @@ fn control_transport_preserves_structured_terminal_codes() {
         deadline,
         ZippyError::DeadlineExceeded { ref reason }
             if reason == "query deadline exceeded"
+    ));
+    assert!(matches!(
+        conflict,
+        ZippyError::Conflict { ref reason } if reason == "data root is already owned"
     ));
 }
 

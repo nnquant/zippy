@@ -85,10 +85,11 @@ data_dir = "data/zippy"
 ```
 
 `ZIPPY_SERVER_DATA_DIR` overrides the file setting. A leading `~/` is expanded while configuration
-is loaded, so later environment changes cannot redirect an already loaded configuration. When the
-setting is absent, the runtime uses `<control-endpoint-state-dir>/data`; this keeps the default
-stable for one endpoint while preventing unrelated endpoint profiles from sharing a root by
-accident.
+is loaded. Relative paths in a TOML file resolve from that file's directory; the environment
+override must be absolute. When the setting is absent, the runtime uses
+`<control-endpoint-state-dir>/data`. Unix state directories include the complete socket file name,
+and TCP state directories include the complete bind address, so sibling sockets or equal ports on
+different addresses do not share a database root.
 
 The data-root lock is separate from the detached launcher's endpoint lock under `~/.zippy/run`.
 The launcher lock protects one CLI-managed endpoint generation. The data-root lock protects the
@@ -97,11 +98,22 @@ conflict before either listener is bound. `server.lock` is owner-only, never unl
 cleanup, and contains diagnostic PID/version/acquisition metadata; the kernel advisory lock is the
 authority and is released after process exit, including abrupt exit.
 
+The legacy registry snapshot now follows database identity rather than listener identity. Its
+managed path is `<data_root>/catalog/legacy-master-registry.json`. When no explicit data root is
+configured and an old endpoint-scoped `master-registry.json` exists, startup fails closed until the
+operator stops the old server and explicitly sets `ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT=1` for the
+one import. The import checks that the old endpoint is offline, publishes the managed snapshot with
+file and directory durability, and retains the old file as rollback evidence. An explicitly
+configured data root never imports endpoint state. Once the managed file exists it is always
+authoritative, even if the server later uses a different control endpoint.
+
 A clean server shutdown releases data-root ownership only after Gateway and Master/listener cleanup
 has completed. An incomplete shutdown retains the top-level capability, and a listener that has not
 joined retains its own capability clone. Ordinary `DataDirectory::open` remains a read-only layout
 validation operation and does not create missing directories. Writable SQLite Catalog
 configurations and durable file publication require an `OwnedDataDirectory` capability.
+Runtime inspection APIs expose only a borrowed capability; they do not expose the internal `Arc`
+used to retain ownership across the top-level runtime and listener thread.
 
 This phase establishes process ownership and crash-safe publication primitives. The production
 runtime still uses the legacy metadata authority until Parquet candidate publication, Catalog

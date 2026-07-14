@@ -1843,7 +1843,10 @@ SQLite physical schema version 与 `CatalogCommand` wire version 是两个独立
 实例 fail closed，干净 shutdown 最后释放，不完整 shutdown 保持 capability。可写
 `SqliteCatalogConfig` 必须持有 `Arc<OwnedDataDirectory>`，Catalog worker 退出前不会提前释放锁。
 通用 durable file primitive 已实现同目录临时 inode、file fsync、no-clobber publish、directory
-fsync、取消清理和 symlink 拒绝。Parquet candidate writer、checksum/metadata contract、Catalog
+fsync、取消清理和 symlink 拒绝。legacy registry snapshot 已迁入 data root 的 `catalog/`；默认
+数据根发现旧 endpoint snapshot 时会 fail closed，只有显式声明离线导入并确认旧 endpoint 不活跃
+后才迁移，显式数据根不会继承 endpoint 状态。Parquet
+candidate writer、checksum/metadata contract、Catalog
 commit coordinator、orphan reconciliation、snapshot lease 和 GC 尚未完成，因此 legacy metadata
 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。
 

@@ -339,6 +339,7 @@ fn control_error(code: Option<ErrorCode>, reason: String) -> ZippyError {
         Some(ErrorCode::InvalidArgument) => ZippyError::InvalidConfig { reason },
         Some(ErrorCode::ResourceExhausted) => ZippyError::ResourceExhausted { reason },
         Some(ErrorCode::NotFound) => ZippyError::NotFound { reason },
+        Some(ErrorCode::Conflict) => ZippyError::Conflict { reason },
         Some(ErrorCode::DataCorruption) => ZippyError::DataCorruption { reason },
         Some(ErrorCode::SchemaMismatch) => ZippyError::SchemaMismatch { reason },
         Some(ErrorCode::Cancelled) => ZippyError::Cancelled { reason },
