@@ -2,6 +2,7 @@ pub mod bus_protocol;
 pub mod config;
 pub mod control_transport;
 pub mod data_directory;
+pub mod data_directory_ownership;
 pub mod durable_file;
 pub mod endpoint;
 pub mod engine;
@@ -45,6 +46,9 @@ pub use control_transport::{
 pub use data_directory::{
     DataDirectory, DataDirectoryError, ManagedDataDirectory, DATA_FORMAT_VERSION,
     DATA_FORMAT_VERSION_FILE,
+};
+pub use data_directory_ownership::{
+    DataDirectoryOwner, OwnedDataDirectory, DATA_DIRECTORY_LOCK_FILE,
 };
 pub use durable_file::{DurableFileTransaction, DurablePublishedFile};
 pub use endpoint::{

@@ -25,6 +25,7 @@ arrow = "53.3.0"
 crossbeam-channel = "0.5.15"
 parquet = "53.3.0"
 rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"

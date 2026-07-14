@@ -18,3 +18,4 @@ zippy-types = { path = "../zippy-types" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix.workspace = true

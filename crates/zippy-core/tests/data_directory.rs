@@ -48,11 +48,47 @@ fn initialized_data_directory_can_be_reopened() {
 
 #[cfg(unix)]
 #[test]
+fn read_only_open_does_not_recreate_a_missing_managed_directory() {
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("server-data");
+    DataDirectory::initialize(&root).unwrap();
+    let parquet = root.join("parquet");
+    fs::remove_dir(&parquet).unwrap();
+
+    let error = DataDirectory::open(&root).unwrap_err();
+
+    assert!(matches!(error, DataDirectoryError::Io { path, .. } if path == parquet));
+    assert!(!parquet.exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn initialize_recovers_from_stale_version_temporary_file() {
     let parent = tempdir().unwrap();
     let root = parent.path().join("server-data");
     fs::create_dir(&root).unwrap();
     fs::write(root.join(".FORMAT_VERSION.tmp-stale"), b"").unwrap();
+
+    let data_directory = DataDirectory::initialize(&root).unwrap();
+
+    assert_eq!(data_directory.root(), root.canonicalize().unwrap());
+    assert_eq!(
+        fs::read_to_string(root.join(DATA_FORMAT_VERSION_FILE)).unwrap(),
+        format!("{DATA_FORMAT_VERSION}\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn initialize_recovers_from_an_inactive_bootstrap_lock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempdir().unwrap();
+    let root = parent.path().join("server-data");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(root.join("server.lock"), b"stale bootstrap owner\n").unwrap();
+    fs::set_permissions(root.join("server.lock"), fs::Permissions::from_mode(0o600)).unwrap();
 
     let data_directory = DataDirectory::initialize(&root).unwrap();
 

@@ -2,11 +2,14 @@ use std::fs;
 use std::io::Write;
 
 use tempfile::TempDir;
-use zippy_core::{DataDirectory, DataDirectoryError};
+use zippy_core::{DataDirectory, DataDirectoryError, OwnedDataDirectory};
 use zippy_types::table::ManagedDataPath;
 
-fn data_directory(directory: &TempDir) -> DataDirectory {
-    DataDirectory::initialize(directory.path().join("data")).expect("initialize data root")
+fn data_directory(directory: &TempDir) -> OwnedDataDirectory {
+    DataDirectory::initialize(directory.path().join("data"))
+        .expect("initialize data root")
+        .acquire_process_ownership()
+        .expect("acquire data root ownership")
 }
 
 fn managed_path(value: &str) -> ManagedDataPath {
@@ -33,7 +36,10 @@ fn durable_file_publishes_nested_contents_and_metadata() {
 
     assert!(!temporary_path.exists());
     assert_eq!(published.managed_path(), &path);
-    assert_eq!(published.path(), data_directory.root().join(path.as_str()));
+    assert_eq!(
+        published.path(),
+        data_directory.directory().root().join(path.as_str())
+    );
     assert_eq!(published.size_bytes(), 15);
     assert_eq!(
         fs::read(published.path()).expect("read final file"),
@@ -65,11 +71,12 @@ fn durable_file_never_overwrites_an_existing_target() {
     assert!(matches!(
         error,
         DataDirectoryError::AlreadyExists { path: existing }
-            if existing == data_directory.root().join(path.as_str())
+            if existing == data_directory.directory().root().join(path.as_str())
     ));
     assert!(!temporary_path.exists());
     assert_eq!(
-        fs::read(data_directory.root().join(path.as_str())).expect("read original file"),
+        fs::read(data_directory.directory().root().join(path.as_str()))
+            .expect("read original file"),
         b"first"
     );
 }
@@ -90,7 +97,11 @@ fn dropping_an_unpublished_file_removes_its_temporary_inode() {
     drop(transaction);
 
     assert!(!temporary_path.exists());
-    assert!(!data_directory.root().join(path.as_str()).exists());
+    assert!(!data_directory
+        .directory()
+        .root()
+        .join(path.as_str())
+        .exists());
 }
 
 #[cfg(unix)]
@@ -102,7 +113,7 @@ fn durable_file_rejects_a_symbolic_link_parent() {
     let data_directory = data_directory(&directory);
     let external = directory.path().join("external");
     fs::create_dir(&external).expect("create external directory");
-    let link = data_directory.root().join("parquet/link");
+    let link = data_directory.directory().root().join("parquet/link");
     symlink(&external, &link).expect("create parent symlink");
 
     let error = data_directory
@@ -123,7 +134,10 @@ fn durable_file_rejects_a_symbolic_link_parent() {
 fn durable_file_rejects_a_regular_file_parent_component() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
-    let parent = data_directory.root().join("parquet/not-a-directory");
+    let parent = data_directory
+        .directory()
+        .root()
+        .join("parquet/not-a-directory");
     fs::write(&parent, b"file").expect("create regular parent component");
 
     let error = data_directory

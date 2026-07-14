@@ -63,7 +63,7 @@ pub enum DataDirectoryError {
     Io { path: PathBuf, reason: String },
     #[error("data root must be a directory path=[{path}]")]
     NotDirectory { path: PathBuf },
-    #[error("data format marker must be a regular file path=[{path}]")]
+    #[error("managed data file must be a regular file path=[{path}]")]
     NotRegularFile { path: PathBuf },
     #[error("data root must not be a symbolic link path=[{path}]")]
     SymbolicLink { path: PathBuf },
@@ -71,6 +71,22 @@ pub enum DataDirectoryError {
     InvalidManagedPath { path: PathBuf },
     #[error("durable data file already exists path=[{path}]")]
     AlreadyExists { path: PathBuf },
+    #[error("data directory is already owned by another process path=[{path}]")]
+    OwnershipHeld { path: PathBuf },
+    #[cfg(unix)]
+    #[error(
+        "managed data path owner does not match the current user path=[{path}] owner_uid=[{owner_uid}] current_uid=[{current_uid}]"
+    )]
+    WrongOwner {
+        path: PathBuf,
+        owner_uid: u32,
+        current_uid: u32,
+    },
+    #[cfg(unix)]
+    #[error("managed data file must have exactly one hard link path=[{path}] links=[{links}]")]
+    UnexpectedLinkCount { path: PathBuf, links: u64 },
+    #[error("managed data path identity changed during secure open path=[{path}]")]
+    PathIdentityChanged { path: PathBuf },
     #[error("unversioned data root is not empty path=[{path}]")]
     UnversionedNonEmpty { path: PathBuf },
     #[error("invalid data format version path=[{path}] value=[{value}]")]
@@ -96,34 +112,20 @@ impl DataDirectory {
     ///
     /// An existing non-empty directory without `FORMAT_VERSION` is rejected so
     /// legacy or unrelated files cannot be silently claimed by the new server.
+    /// Initialization temporarily owns the process lock and releases it before
+    /// returning. Server runtimes should use
+    /// `OwnedDataDirectory::acquire_or_initialize` so ownership remains held
+    /// for their complete lifecycle.
     pub fn initialize(path: impl AsRef<Path>) -> Result<Self, DataDirectoryError> {
-        require_supported_platform()?;
-        let requested = path.as_ref();
-        reject_root_symlink(requested)?;
-
-        if requested.exists() {
-            require_directory(requested)?;
-        } else {
-            create_owner_directory(requested)?;
-        }
-
-        let root = canonicalize(requested)?;
-        let version_path = root.join(DATA_FORMAT_VERSION_FILE);
-        if version_path.exists() {
-            return Self::open(root);
-        }
-
-        if directory_has_unowned_entries(&root)? {
-            return Err(DataDirectoryError::UnversionedNonEmpty { path: root });
-        }
-
-        restrict_owner_permissions(&root)?;
-        write_format_version(&root, &version_path, DATA_FORMAT_VERSION)?;
-        ensure_managed_directories(&root)?;
-        Ok(Self { root })
+        let owned =
+            crate::data_directory_ownership::OwnedDataDirectory::acquire_or_initialize(path)?;
+        Ok(owned.directory().clone())
     }
 
-    /// Open a previously initialized data root after validating its format.
+    /// Opens a previously initialized data root without mutating its layout.
+    ///
+    /// Missing managed directories are rejected rather than repaired. Only an
+    /// owning initialization path may create or repair managed layout entries.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DataDirectoryError> {
         require_supported_platform()?;
         let requested = path.as_ref();
@@ -143,7 +145,7 @@ impl DataDirectory {
             });
         }
 
-        ensure_managed_directories(&root)?;
+        validate_managed_directories(&root)?;
         Ok(Self { root })
     }
 
@@ -155,6 +157,80 @@ impl DataDirectory {
     /// Return a managed child path after initialization has validated it.
     pub fn path(&self, directory: ManagedDataDirectory) -> PathBuf {
         self.root.join(directory.as_str())
+    }
+}
+
+pub(crate) fn prepare_data_root(path: &Path) -> Result<PathBuf, DataDirectoryError> {
+    require_supported_platform()?;
+    reject_root_symlink(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => require_directory(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_owner_directory(path) {
+                Ok(()) => sync_created_root_parent(path)?,
+                Err(create_error) => match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(DataDirectoryError::SymbolicLink {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    Ok(metadata) if metadata.is_dir() => {}
+                    Ok(_) => {
+                        return Err(DataDirectoryError::NotDirectory {
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    Err(_) => return Err(create_error),
+                },
+            }
+        }
+        Err(error) => return Err(io_error(path, error)),
+    }
+
+    let version_path = path.join(DATA_FORMAT_VERSION_FILE);
+    if fs::symlink_metadata(&version_path).is_ok() {
+        require_owner_permissions(path)?;
+    } else {
+        if directory_has_unowned_entries(path)? {
+            return Err(DataDirectoryError::UnversionedNonEmpty {
+                path: canonicalize(path)?,
+            });
+        }
+        restrict_owner_permissions(path)?;
+    }
+    canonicalize(path)
+}
+
+pub(crate) fn initialize_prepared_data_root(
+    root: PathBuf,
+) -> Result<DataDirectory, DataDirectoryError> {
+    let version_path = root.join(DATA_FORMAT_VERSION_FILE);
+    match fs::symlink_metadata(&version_path) {
+        Ok(_) => validate_format_version(&version_path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if directory_has_unowned_entries(&root)? {
+                return Err(DataDirectoryError::UnversionedNonEmpty { path: root });
+            }
+            restrict_owner_permissions(&root)?;
+            write_format_version(&root, &version_path, DATA_FORMAT_VERSION)?;
+        }
+        Err(error) => return Err(io_error(&version_path, error)),
+    }
+    ensure_managed_directories(&root)?;
+    Ok(DataDirectory { root })
+}
+
+fn validate_format_version(path: &Path) -> Result<(), DataDirectoryError> {
+    require_regular_file(path)?;
+    require_owner_permissions(path)?;
+    let found = read_format_version(path)?;
+    if found == DATA_FORMAT_VERSION {
+        Ok(())
+    } else {
+        Err(DataDirectoryError::UnsupportedFormatVersion {
+            found,
+            supported: DATA_FORMAT_VERSION,
+        })
     }
 }
 
@@ -206,6 +282,9 @@ fn directory_has_unowned_entries(path: &Path) -> Result<bool, DataDirectoryError
     for entry in fs::read_dir(path).map_err(|error| io_error(path, error))? {
         let entry = entry.map_err(|error| io_error(path, error))?;
         let file_name = entry.file_name();
+        if file_name == crate::data_directory_ownership::DATA_DIRECTORY_LOCK_FILE {
+            continue;
+        }
         let is_stale_version_temp = file_name
             .to_str()
             .is_some_and(|name| name.starts_with(DATA_FORMAT_VERSION_TEMP_PREFIX));
@@ -265,6 +344,7 @@ fn write_format_version(
 }
 
 fn ensure_managed_directories(root: &Path) -> Result<(), DataDirectoryError> {
+    let mut created = false;
     for directory in MANAGED_DIRECTORIES {
         let path = root.join(directory.as_str());
         match fs::symlink_metadata(&path) {
@@ -277,11 +357,38 @@ fn ensure_managed_directories(root: &Path) -> Result<(), DataDirectoryError> {
             Ok(_) => require_owner_permissions(&path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 create_owner_directory(&path)?;
+                created = true;
             }
             Err(error) => return Err(io_error(&path, error)),
         }
     }
+    if created {
+        sync_directory_io(root).map_err(|error| io_error(root, error))?;
+    }
     Ok(())
+}
+
+fn validate_managed_directories(root: &Path) -> Result<(), DataDirectoryError> {
+    for directory in MANAGED_DIRECTORIES {
+        let path = root.join(directory.as_str());
+        let metadata = fs::symlink_metadata(&path).map_err(|error| io_error(&path, error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(DataDirectoryError::SymbolicLink { path });
+        }
+        if !metadata.is_dir() {
+            return Err(DataDirectoryError::NotDirectory { path });
+        }
+        require_owner_permissions(&path)?;
+    }
+    Ok(())
+}
+
+fn sync_created_root_parent(path: &Path) -> Result<(), DataDirectoryError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    sync_directory_io(parent).map_err(|error| io_error(parent, error))
 }
 
 #[cfg(unix)]

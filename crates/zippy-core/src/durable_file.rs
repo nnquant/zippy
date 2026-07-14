@@ -8,9 +8,10 @@ use tempfile::NamedTempFile;
 use zippy_types::table::ManagedDataPath;
 
 use crate::data_directory::{
-    create_owner_directory, io_error, require_owner_permissions, sync_directory_io, DataDirectory,
+    create_owner_directory, io_error, require_owner_permissions, sync_directory_io,
     DataDirectoryError,
 };
+use crate::data_directory_ownership::OwnedDataDirectory;
 
 /// An unpublished file whose temporary inode lives beside its final target.
 ///
@@ -109,7 +110,7 @@ impl DurablePublishedFile {
     }
 }
 
-impl DataDirectory {
+impl OwnedDataDirectory {
     /// Creates an unpublished file under this managed data root.
     ///
     /// Missing parent directories are created with owner-only permissions and
@@ -119,7 +120,7 @@ impl DataDirectory {
         &self,
         managed_path: &ManagedDataPath,
     ) -> Result<DurableFileTransaction, DataDirectoryError> {
-        begin_durable_file(self.root(), managed_path)
+        begin_durable_file(self.directory().root(), managed_path)
     }
 }
 
