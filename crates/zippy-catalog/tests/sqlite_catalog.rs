@@ -1456,6 +1456,10 @@ async fn dropping_a_polled_command_future_does_not_cancel_its_commit() {
         .execute_batch("ROLLBACK")
         .expect("release sqlite writer lock");
 
+    catalog
+        .command(create_namespace(1, 1, "market", Some(0)))
+        .await
+        .expect("replay commit-unknown command before requiring read-after-write");
     assert_eq!(catalog.revision().await, Ok(1));
     assert!(catalog
         .get_namespace(NamespaceRef::Id(namespace_id(1)))
@@ -1465,7 +1469,7 @@ async fn dropping_a_polled_command_future_does_not_cancel_its_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn snapshot_validation_precedes_enqueue_and_cancelled_read_is_skippable() {
+async fn snapshot_validation_precedes_enqueue_and_reads_do_not_share_writer_queue() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let catalog =
@@ -1489,30 +1493,11 @@ async fn snapshot_validation_precedes_enqueue_and_cancelled_read_is_skippable() 
         snapshot_version: 1,
         schema_version: 1,
     }];
-    let cancelled_read = loop {
-        let mut read = catalog.read_snapshot_at(&selectors);
-        let poll = {
-            let mut context = Context::from_waker(Waker::noop());
-            read.as_mut().poll(&mut context)
-        };
-        match poll {
-            Poll::Pending => break read,
-            Poll::Ready(Err(error)) if error.code() == ErrorCode::ResourceExhausted => {
-                tokio::task::yield_now().await;
-            }
-            result => panic!("unexpected queued read poll result result=[{result:?}]"),
-        }
-    };
-
-    let queue_full = catalog
+    let independent_read = catalog
         .read_snapshot_at(&selectors)
         .await
-        .expect_err("valid read must observe the saturated actor queue");
-    assert_eq!(queue_full.code(), ErrorCode::ResourceExhausted);
-    assert_eq!(
-        queue_full.message(),
-        "sqlite catalog actor command queue is full"
-    );
+        .expect_err("missing snapshot read must execute independently of the blocked writer");
+    assert_eq!(independent_read.code(), ErrorCode::NotFound);
     let unsorted = [
         CatalogSnapshotSelector {
             table_id: table_id(2),
@@ -1548,8 +1533,6 @@ async fn snapshot_validation_precedes_enqueue_and_cancelled_read_is_skippable() 
     assert!(oversized_error
         .message()
         .starts_with("catalog snapshot selector count exceeds maximum"));
-    drop(cancelled_read);
-
     blocker
         .execute_batch("ROLLBACK")
         .expect("release sqlite writer lock");

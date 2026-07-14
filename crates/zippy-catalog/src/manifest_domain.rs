@@ -36,6 +36,7 @@ const MAX_METADATA_ENTRIES: usize = 4_096;
 const MAX_FILE_PATH_BYTES: usize = 4 * 1024;
 const MAX_CHECKSUM_BYTES: usize = 256;
 const SQLITE_IN_CHUNK: usize = 512;
+const PREFLIGHT_WORK_ITEMS_PER_YIELD: usize = 256;
 
 type CanonicalLineage = BTreeMap<SourceSegmentIdentity, Vec<OffsetRange>>;
 type CanonicalSchemaCoverage = BTreeMap<u64, Vec<OffsetRange>>;
@@ -105,19 +106,31 @@ struct ManifestTableState {
     writer_epoch: u64,
 }
 
-/// Validates common actor bounds and estimates manifest memory before actor admission.
-pub(crate) fn manifest_command_preflight_bytes(command: &VersionedCatalogCommand) -> Result<usize> {
+/// Cooperatively validates bounds and estimates memory before actor admission.
+pub(crate) async fn manifest_command_preflight_bytes(
+    command: &VersionedCatalogCommand,
+) -> Result<usize> {
     let VersionedCatalogCommand::V1(envelope) = command;
-    let result = (|| {
+    let mut work_since_yield = 0_usize;
+    let result = async {
         let principal_bytes = envelope.actor.principal.len();
         if principal_bytes > MAX_CATALOG_ACTOR_PRINCIPAL_BYTES {
             return Err(resource(format!(
-                "catalog actor principal exceeds byte limit actual=[{principal_bytes}] maximum=[{MAX_CATALOG_ACTOR_PRINCIPAL_BYTES}]"
+                concat!(
+                    "catalog actor principal exceeds byte limit actual=[{}] ",
+                    "maximum=[{}]"
+                ),
+                principal_bytes, MAX_CATALOG_ACTOR_PRINCIPAL_BYTES
             )));
         }
         let command_bytes = match &envelope.command {
             CatalogCommandV1::CommitDataFiles(command) => {
-                estimate_manifest_queue_bytes(&command.files, "persist")?
+                estimate_manifest_queue_bytes_cooperative(
+                    &command.files,
+                    "persist",
+                    &mut work_since_yield,
+                )
+                .await?
             }
             CatalogCommandV1::CommitCompaction(command) => {
                 if command.input_file_ids.len() > MAX_COMPACTION_INPUTS {
@@ -127,8 +140,12 @@ pub(crate) fn manifest_command_preflight_bytes(command: &VersionedCatalogCommand
                         MAX_COMPACTION_INPUTS
                     )));
                 }
-                let output_bytes =
-                    estimate_manifest_queue_bytes(&command.output_files, "compaction output")?;
+                let output_bytes = estimate_manifest_queue_bytes_cooperative(
+                    &command.output_files,
+                    "compaction output",
+                    &mut work_since_yield,
+                )
+                .await?;
                 let input_bytes = command
                     .input_file_ids
                     .len()
@@ -143,11 +160,16 @@ pub(crate) fn manifest_command_preflight_bytes(command: &VersionedCatalogCommand
             principal_bytes,
             "manifest queue actor principal bytes",
         )
-    })();
+    }
+    .await;
     result.map_err(|error: ServerError| error.with_request_id(envelope.request_id))
 }
 
-fn estimate_manifest_queue_bytes(files: &[PendingDataFile], context: &str) -> Result<usize> {
+async fn estimate_manifest_queue_bytes_cooperative(
+    files: &[PendingDataFile],
+    context: &str,
+    work_since_yield: &mut usize,
+) -> Result<usize> {
     if files.len() > MAX_MANIFEST_FILES {
         return Err(resource(format!(
             "{context} file count exceeds maximum actual=[{}] maximum=[{}]",
@@ -162,6 +184,7 @@ fn estimate_manifest_queue_bytes(files: &[PendingDataFile], context: &str) -> Re
     let mut admitted_payload = 0_usize;
     let mut lineage_rows = 0_usize;
     for file in files {
+        yield_after_preflight_work(work_since_yield).await;
         let path = match &file.location {
             DataFileLocation::Managed(path) => path.as_str(),
             DataFileLocation::ExternalLegacy(path) => path.as_str(),
@@ -188,8 +211,11 @@ fn estimate_manifest_queue_bytes(files: &[PendingDataFile], context: &str) -> Re
         };
         if file_lineage > MAX_LINEAGE_ROWS_PER_FILE {
             return Err(resource(format!(
-                "{context} file lineage count exceeds maximum file_id=[{}] actual=[{}] maximum=[{}]",
-                file.file_id, file_lineage, MAX_LINEAGE_ROWS_PER_FILE
+                concat!(
+                    "{} file lineage count exceeds maximum ",
+                    "file_id=[{}] actual=[{}] maximum=[{}]"
+                ),
+                context, file.file_id, file_lineage, MAX_LINEAGE_ROWS_PER_FILE
             )));
         }
         lineage_rows = checked_add(lineage_rows, file_lineage, "manifest lineage count")?;
@@ -209,7 +235,7 @@ fn estimate_manifest_queue_bytes(files: &[PendingDataFile], context: &str) -> Re
             "manifest admitted checksum bytes",
         )?;
         for map in [&file.partition, &file.statistics, &file.metadata] {
-            let metadata_bytes = estimate_metadata_bytes(map)?;
+            let metadata_bytes = estimate_metadata_bytes_cooperative(map, work_since_yield).await?;
             total = checked_add(total, metadata_bytes, "manifest queue metadata bytes")?;
             admitted_payload = checked_add(
                 admitted_payload,
@@ -229,6 +255,39 @@ fn estimate_manifest_queue_bytes(files: &[PendingDataFile], context: &str) -> Re
         }
     }
     Ok(total.max(1))
+}
+
+async fn estimate_metadata_bytes_cooperative(
+    metadata: &MetadataMap,
+    work_since_yield: &mut usize,
+) -> Result<usize> {
+    if metadata.len() > MAX_METADATA_ENTRIES {
+        return Err(resource(format!(
+            "manifest metadata entry count exceeds maximum actual=[{}] maximum=[{}]",
+            metadata.len(),
+            MAX_METADATA_ENTRIES
+        )));
+    }
+    let mut bytes = 0_usize;
+    for (key, value) in metadata {
+        yield_after_preflight_work(work_since_yield).await;
+        bytes = checked_add(bytes, key.len(), "manifest metadata key bytes")?;
+        bytes = checked_add(
+            bytes,
+            metadata_scalar_estimated_bytes(value),
+            "manifest metadata value bytes",
+        )?;
+        bytes = checked_add(bytes, 32, "manifest metadata encoding overhead")?;
+    }
+    Ok(bytes)
+}
+
+async fn yield_after_preflight_work(work_since_yield: &mut usize) {
+    *work_since_yield += 1;
+    if *work_since_yield >= PREFLIGHT_WORK_ITEMS_PER_YIELD {
+        *work_since_yield = 0;
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Validates and encodes a native persist command before taking the SQLite writer lock.
@@ -540,17 +599,24 @@ fn estimate_metadata_bytes(metadata: &MetadataMap) -> Result<usize> {
     let mut bytes = 0_usize;
     for (key, value) in metadata {
         bytes = checked_add(bytes, key.len(), "manifest metadata key bytes")?;
-        let value_bytes = match value {
-            MetadataScalar::Null => 0,
-            MetadataScalar::Boolean(_) => 1,
-            MetadataScalar::Int64(_) | MetadataScalar::UInt64(_) | MetadataScalar::Float64(_) => 8,
-            MetadataScalar::String(value) => value.len(),
-            MetadataScalar::Bytes(value) => value.len(),
-        };
-        bytes = checked_add(bytes, value_bytes, "manifest metadata value bytes")?;
+        bytes = checked_add(
+            bytes,
+            metadata_scalar_estimated_bytes(value),
+            "manifest metadata value bytes",
+        )?;
         bytes = checked_add(bytes, 32, "manifest metadata encoding overhead")?;
     }
     Ok(bytes)
+}
+
+fn metadata_scalar_estimated_bytes(value: &MetadataScalar) -> usize {
+    match value {
+        MetadataScalar::Null => 0,
+        MetadataScalar::Boolean(_) => 1,
+        MetadataScalar::Int64(_) | MetadataScalar::UInt64(_) | MetadataScalar::Float64(_) => 8,
+        MetadataScalar::String(value) => value.len(),
+        MetadataScalar::Bytes(value) => value.len(),
+    }
 }
 
 fn prepare_files(files: Vec<PendingDataFile>) -> Result<PreparedFiles> {

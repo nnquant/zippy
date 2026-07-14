@@ -1334,6 +1334,23 @@ fn rejects_actor_capacity_above_the_allocation_limit() {
 }
 
 #[test]
+fn rejects_read_lane_capacities_outside_allocation_limits() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    for config in [
+        SqliteCatalogConfig::new(&data_directory).with_control_read_capacity(0),
+        SqliteCatalogConfig::new(&data_directory).with_control_read_capacity(4_097),
+        SqliteCatalogConfig::new(&data_directory).with_snapshot_read_capacity(0),
+        SqliteCatalogConfig::new(&data_directory).with_snapshot_read_capacity(4_097),
+    ] {
+        let error = SqliteCatalogFoundation::open(config)
+            .err()
+            .expect("invalid read lane capacity must be rejected");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+}
+
+#[test]
 fn inspect_rejects_tampered_catalog_format_metadata() {
     assert_live_tamper_rejected(
         "UPDATE catalog_meta SET value = CAST('other-format' AS BLOB) \

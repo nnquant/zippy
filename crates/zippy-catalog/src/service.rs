@@ -1,4 +1,4 @@
-//! Asynchronous Catalog traits backed by one connection-owning SQLite actor.
+//! Asynchronous Catalog traits backed by isolated SQLite writer and read workers.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -22,8 +22,10 @@ use crate::{domain, manifest_domain, snapshot_domain, table_domain};
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
 const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
+const CONTROL_READ_THREAD_NAME: &str = "zippy-catalog-control-read";
+const SNAPSHOT_READ_THREAD_NAME: &str = "zippy-catalog-snapshot-read";
 
-/// A typed SQLite Catalog whose only connection is owned by one OS actor thread.
+/// A typed SQLite Catalog with thread-confined writer and read-only connections.
 ///
 /// Catalog trait futures submit through a bounded nonblocking queue and await a
 /// Tokio oneshot response. SQLite work therefore never blocks an async executor
@@ -43,6 +45,7 @@ const MANIFEST_PREPARATION_THREAD_NAME: &str = "zippy-catalog-manifest-prepare";
 pub struct SqliteCatalog {
     sender: Option<Sender<ServiceMessage>>,
     actor: Option<JoinHandle<()>>,
+    read_pool: Option<CatalogReadPool>,
     command_budget: Arc<CommandBudget>,
     manifest_queue_budget: Arc<ManifestQueueBudget>,
 }
@@ -54,12 +57,25 @@ impl SqliteCatalog {
     /// preflight, durable SQLite configuration, migrations, and integrity check
     /// have completed on the actor thread.
     pub fn open(config: SqliteCatalogConfig) -> Result<Self> {
-        Self::open_with_manifest_backend(config, Arc::new(DomainManifestPreparationBackend))
+        Self::open_with_backends(
+            config,
+            Arc::new(DomainManifestPreparationBackend),
+            Arc::new(DomainCatalogReadBackend),
+        )
     }
 
+    #[cfg(test)]
     fn open_with_manifest_backend(
         config: SqliteCatalogConfig,
         manifest_backend: Arc<dyn ManifestPreparationBackend>,
+    ) -> Result<Self> {
+        Self::open_with_backends(config, manifest_backend, Arc::new(DomainCatalogReadBackend))
+    }
+
+    fn open_with_backends(
+        config: SqliteCatalogConfig,
+        manifest_backend: Arc<dyn ManifestPreparationBackend>,
+        read_backend: Arc<dyn CatalogReadBackend>,
     ) -> Result<Self> {
         crate::validate_config(&config)?;
         let (sender, receiver) = crossbeam_channel::bounded(config.command_capacity);
@@ -68,11 +84,11 @@ impl SqliteCatalog {
         let manifest_queue_budget = Arc::new(ManifestQueueBudget::new(
             config.manifest_queue_capacity_bytes,
         ));
-        let actor_manifest_backend = Arc::clone(&manifest_backend);
+        let actor_config = config.clone();
         let actor = thread::Builder::new()
             .name(SERVICE_ACTOR_THREAD_NAME.to_owned())
             .spawn(move || {
-                run_actor(config, receiver, startup_sender, actor_manifest_backend);
+                run_actor(actor_config, receiver, startup_sender, manifest_backend);
             })
             .map_err(|error| {
                 ServerError::new(
@@ -81,12 +97,30 @@ impl SqliteCatalog {
                 )
             })?;
         match startup_receiver.recv() {
-            Ok(Ok(())) => Ok(Self {
-                sender: Some(sender),
-                actor: Some(actor),
-                command_budget,
-                manifest_queue_budget,
-            }),
+            Ok(Ok(())) => {
+                let mut catalog = Self {
+                    read_pool: None,
+                    sender: Some(sender),
+                    actor: Some(actor),
+                    command_budget,
+                    manifest_queue_budget,
+                };
+                match CatalogReadPool::start(&config, read_backend) {
+                    Ok(read_pool) => {
+                        catalog.read_pool = Some(read_pool);
+                        Ok(catalog)
+                    }
+                    Err(error) => {
+                        if let Err(cleanup_error) = catalog.shutdown() {
+                            tracing::error!(
+                                error = %cleanup_error,
+                                "sqlite catalog writer cleanup failed after read pool startup error"
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
             Ok(Err(error)) => {
                 join_startup_actor(actor)?;
                 Err(error)
@@ -106,7 +140,7 @@ impl SqliteCatalog {
         self.shutdown()
     }
 
-    fn request<T>(
+    fn writer_request<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<T>>) -> ServiceMessage,
     ) -> Result<oneshot::Receiver<Result<T>>>
@@ -125,9 +159,27 @@ impl SqliteCatalog {
         }
     }
 
+    fn read_pool(&self) -> Result<&CatalogReadPool> {
+        self.read_pool.as_ref().ok_or_else(read_pool_stopped)
+    }
+
     fn shutdown(&mut self) -> Result<()> {
+        let read_result = match self.read_pool.take() {
+            Some(mut read_pool) => read_pool.shutdown(),
+            None => Ok(()),
+        };
+        let writer_result = self.shutdown_writer();
+        read_result.and(writer_result)
+    }
+
+    fn shutdown_writer(&mut self) -> Result<()> {
         let Some(sender) = self.sender.take() else {
-            return Ok(());
+            return match self.actor.take() {
+                Some(actor) => actor.join().map_err(|_| {
+                    ServerError::new(ErrorCode::Internal, "sqlite catalog actor thread panicked")
+                }),
+                None => Ok(()),
+            };
         };
         let (response_sender, response_receiver) = crossbeam_channel::bounded(1);
         let send_result = sender
@@ -153,13 +205,21 @@ impl SqliteCatalog {
 
 impl CatalogRead for SqliteCatalog {
     fn revision(&self) -> BoxFuture<'_, Result<u64>> {
-        Box::pin(async move { await_response(self.request(ServiceMessage::Revision)).await })
+        Box::pin(async move {
+            await_response(
+                self.read_pool()
+                    .and_then(|pool| pool.control_request(ControlReadMessage::Revision)),
+            )
+            .await
+        })
     }
 
     fn get_namespace(&self, namespace: NamespaceRef) -> BoxFuture<'_, Result<NamespaceDescriptor>> {
         Box::pin(async move {
-            await_response(self.request(|sender| ServiceMessage::GetNamespace(namespace, sender)))
-                .await
+            await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|sender| ControlReadMessage::GetNamespace(namespace, sender))
+            }))
+            .await
         })
     }
 
@@ -168,20 +228,28 @@ impl CatalogRead for SqliteCatalog {
         request: ListNamespacesRequest,
     ) -> BoxFuture<'_, Result<ListNamespacesResponse>> {
         Box::pin(async move {
-            await_response(self.request(|sender| ServiceMessage::ListNamespaces(request, sender)))
-                .await
+            await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|sender| ControlReadMessage::ListNamespaces(request, sender))
+            }))
+            .await
         })
     }
 
     fn get_table(&self, table: TableRef) -> BoxFuture<'_, Result<TableDescriptor>> {
         Box::pin(async move {
-            await_response(self.request(|sender| ServiceMessage::GetTable(table, sender))).await
+            await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|sender| ControlReadMessage::GetTable(table, sender))
+            }))
+            .await
         })
     }
 
     fn list_tables(&self, request: ListTablesRequest) -> BoxFuture<'_, Result<ListTablesResponse>> {
         Box::pin(async move {
-            await_response(self.request(|sender| ServiceMessage::ListTables(request, sender))).await
+            await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|sender| ControlReadMessage::ListTables(request, sender))
+            }))
+            .await
         })
     }
 
@@ -191,9 +259,11 @@ impl CatalogRead for SqliteCatalog {
     ) -> BoxFuture<'a, Result<Vec<TableDescriptor>>> {
         Box::pin(async move {
             table_domain::validate_table_resolution_request(tables)?;
-            await_response(
-                self.request(|sender| ServiceMessage::ResolveTables(tables.to_vec(), sender)),
-            )
+            await_response(self.read_pool().and_then(|pool| {
+                pool.control_request(|sender| {
+                    ControlReadMessage::ResolveTables(tables.to_vec(), sender)
+                })
+            }))
             .await
         })
     }
@@ -205,8 +275,10 @@ impl CatalogRead for SqliteCatalog {
         Box::pin(async move {
             snapshot_domain::validate_snapshot_selectors(selectors)?;
             let selectors = selectors.to_vec();
-            await_response(self.request(|sender| ServiceMessage::ReadSnapshot(selectors, sender)))
-                .await
+            await_response(self.read_pool().and_then(|pool| {
+                pool.snapshot_request(|sender| SnapshotReadMessage::Read(selectors, sender))
+            }))
+            .await
         })
     }
 }
@@ -217,18 +289,18 @@ impl CatalogWrite for SqliteCatalog {
         command: VersionedCatalogCommand,
     ) -> BoxFuture<'_, Result<VersionedCatalogResponse>> {
         Box::pin(async move {
-            let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command)?;
             let VersionedCatalogCommand::V1(envelope) = &command;
             let request_id = envelope.request_id;
             let command_permit = self
                 .command_budget
                 .reserve()
                 .map_err(|error| error.with_request_id(request_id))?;
+            let queued_bytes = manifest_domain::manifest_command_preflight_bytes(&command).await?;
             let permit = self
                 .manifest_queue_budget
                 .reserve(queued_bytes)
                 .map_err(|error| error.with_request_id(request_id))?;
-            await_response(self.request(|response| {
+            await_response(self.writer_request(|response| {
                 ServiceMessage::Command(CommandRequest {
                     command,
                     state: CommandRequestState {
@@ -361,7 +433,61 @@ impl Drop for ManifestQueuePermit {
     }
 }
 
-enum ServiceMessage {
+trait CatalogReadBackend: Send + Sync + 'static {
+    fn revision(&self, connection: &Connection) -> Result<u64> {
+        domain::revision(connection)
+    }
+
+    fn get_namespace(
+        &self,
+        connection: &Connection,
+        namespace: NamespaceRef,
+    ) -> Result<NamespaceDescriptor> {
+        domain::get_namespace(connection, namespace)
+    }
+
+    fn list_namespaces(
+        &self,
+        connection: &mut Connection,
+        request: ListNamespacesRequest,
+    ) -> Result<ListNamespacesResponse> {
+        domain::list_namespaces(connection, request)
+    }
+
+    fn get_table(&self, connection: &Connection, table: TableRef) -> Result<TableDescriptor> {
+        table_domain::get_table(connection, table)
+    }
+
+    fn list_tables(
+        &self,
+        connection: &mut Connection,
+        request: ListTablesRequest,
+    ) -> Result<ListTablesResponse> {
+        table_domain::list_tables(connection, request)
+    }
+
+    fn resolve_tables(
+        &self,
+        connection: &mut Connection,
+        tables: &[TableRef],
+    ) -> Result<Vec<TableDescriptor>> {
+        table_domain::resolve_tables(connection, tables)
+    }
+
+    fn read_snapshot(
+        &self,
+        connection: &mut Connection,
+        selectors: &[CatalogSnapshotSelector],
+    ) -> Result<CatalogQuerySnapshot> {
+        snapshot_domain::read_snapshot_at(connection, selectors)
+    }
+}
+
+struct DomainCatalogReadBackend;
+
+impl CatalogReadBackend for DomainCatalogReadBackend {}
+
+enum ControlReadMessage {
     Revision(oneshot::Sender<Result<u64>>),
     GetNamespace(NamespaceRef, oneshot::Sender<Result<NamespaceDescriptor>>),
     ListNamespaces(
@@ -374,10 +500,247 @@ enum ServiceMessage {
         oneshot::Sender<Result<ListTablesResponse>>,
     ),
     ResolveTables(Vec<TableRef>, oneshot::Sender<Result<Vec<TableDescriptor>>>),
-    ReadSnapshot(
+}
+
+enum SnapshotReadMessage {
+    Read(
         Vec<CatalogSnapshotSelector>,
         oneshot::Sender<Result<CatalogQuerySnapshot>>,
     ),
+}
+
+struct CatalogReadPool {
+    control_sender: Option<Sender<ControlReadMessage>>,
+    snapshot_sender: Option<Sender<SnapshotReadMessage>>,
+    control_actor: Option<JoinHandle<Result<()>>>,
+    snapshot_actor: Option<JoinHandle<Result<()>>>,
+}
+
+impl CatalogReadPool {
+    fn start(config: &SqliteCatalogConfig, backend: Arc<dyn CatalogReadBackend>) -> Result<Self> {
+        let (control_sender, control_receiver) =
+            crossbeam_channel::bounded(config.control_read_capacity);
+        let control_actor = start_read_worker(
+            CONTROL_READ_THREAD_NAME,
+            config.clone(),
+            control_receiver,
+            Arc::clone(&backend),
+            control_read_loop,
+        )?;
+
+        let (snapshot_sender, snapshot_receiver) =
+            crossbeam_channel::bounded(config.snapshot_read_capacity);
+        let snapshot_actor = match start_read_worker(
+            SNAPSHOT_READ_THREAD_NAME,
+            config.clone(),
+            snapshot_receiver,
+            backend,
+            snapshot_read_loop,
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                drop(control_sender);
+                if let Err(cleanup_error) = join_read_worker(control_actor, "control read") {
+                    tracing::error!(
+                        error = %cleanup_error,
+                        "sqlite catalog control read cleanup failed after snapshot startup error"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            control_sender: Some(control_sender),
+            snapshot_sender: Some(snapshot_sender),
+            control_actor: Some(control_actor),
+            snapshot_actor: Some(snapshot_actor),
+        })
+    }
+
+    fn control_request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> ControlReadMessage,
+    ) -> Result<oneshot::Receiver<Result<T>>>
+    where
+        T: Send + 'static,
+    {
+        submit_read_request(
+            self.control_sender.as_ref(),
+            build,
+            "sqlite catalog control read queue is full",
+        )
+    }
+
+    fn snapshot_request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> SnapshotReadMessage,
+    ) -> Result<oneshot::Receiver<Result<T>>>
+    where
+        T: Send + 'static,
+    {
+        submit_read_request(
+            self.snapshot_sender.as_ref(),
+            build,
+            "sqlite catalog snapshot read queue is full",
+        )
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.control_sender.take();
+        self.snapshot_sender.take();
+        let control_result = match self.control_actor.take() {
+            Some(actor) => join_read_worker(actor, "control read"),
+            None => Ok(()),
+        };
+        let snapshot_result = match self.snapshot_actor.take() {
+            Some(actor) => join_read_worker(actor, "snapshot read"),
+            None => Ok(()),
+        };
+        control_result.and(snapshot_result)
+    }
+}
+
+fn submit_read_request<M, T>(
+    sender: Option<&Sender<M>>,
+    build: impl FnOnce(oneshot::Sender<Result<T>>) -> M,
+    full_message: &'static str,
+) -> Result<oneshot::Receiver<Result<T>>>
+where
+    M: Send + 'static,
+    T: Send + 'static,
+{
+    let sender = sender.ok_or_else(read_pool_stopped)?;
+    let (response_sender, response_receiver) = oneshot::channel();
+    match sender.try_send(build(response_sender)) {
+        Ok(()) => Ok(response_receiver),
+        Err(TrySendError::Full(_)) => {
+            Err(ServerError::new(ErrorCode::ResourceExhausted, full_message))
+        }
+        Err(TrySendError::Disconnected(_)) => Err(read_pool_stopped()),
+    }
+}
+
+fn start_read_worker<M>(
+    thread_name: &'static str,
+    config: SqliteCatalogConfig,
+    receiver: Receiver<M>,
+    backend: Arc<dyn CatalogReadBackend>,
+    run: fn(Connection, Receiver<M>, Arc<dyn CatalogReadBackend>) -> Result<()>,
+) -> Result<JoinHandle<Result<()>>>
+where
+    M: Send + 'static,
+{
+    let (startup_sender, startup_receiver) = crossbeam_channel::bounded(1);
+    let actor = thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            let connection = match crate::open_read_connection(&config) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = startup_sender.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            if startup_sender.send(Ok(())).is_err() {
+                return connection.close().map_err(|(_, error)| {
+                    crate::map_sqlite_error("close unclaimed catalog read connection", error)
+                });
+            }
+            run(connection, receiver, backend)
+        })
+        .map_err(|error| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                format!("start sqlite catalog read worker thread=[{thread_name}] error=[{error}]"),
+            )
+        })?;
+    match startup_receiver.recv() {
+        Ok(Ok(())) => Ok(actor),
+        Ok(Err(error)) => {
+            let _ = join_read_worker(actor, thread_name);
+            Err(error)
+        }
+        Err(_) => match join_read_worker(actor, thread_name) {
+            Ok(()) => Err(read_pool_stopped()),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn control_read_loop(
+    mut connection: Connection,
+    receiver: Receiver<ControlReadMessage>,
+    backend: Arc<dyn CatalogReadBackend>,
+) -> Result<()> {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            ControlReadMessage::Revision(response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.revision(&connection));
+                }
+            }
+            ControlReadMessage::GetNamespace(namespace, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.get_namespace(&connection, namespace));
+                }
+            }
+            ControlReadMessage::ListNamespaces(request, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.list_namespaces(&mut connection, request));
+                }
+            }
+            ControlReadMessage::GetTable(table, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.get_table(&connection, table));
+                }
+            }
+            ControlReadMessage::ListTables(request, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.list_tables(&mut connection, request));
+                }
+            }
+            ControlReadMessage::ResolveTables(tables, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.resolve_tables(&mut connection, &tables));
+                }
+            }
+        }
+    }
+    connection
+        .close()
+        .map_err(|(_, error)| crate::map_sqlite_error("close catalog control read", error))
+}
+
+fn snapshot_read_loop(
+    mut connection: Connection,
+    receiver: Receiver<SnapshotReadMessage>,
+    backend: Arc<dyn CatalogReadBackend>,
+) -> Result<()> {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            SnapshotReadMessage::Read(selectors, response) => {
+                if !response.is_closed() {
+                    let _ = response.send(backend.read_snapshot(&mut connection, &selectors));
+                }
+            }
+        }
+    }
+    connection
+        .close()
+        .map_err(|(_, error)| crate::map_sqlite_error("close catalog snapshot read", error))
+}
+
+fn join_read_worker(actor: JoinHandle<Result<()>>, role: &str) -> Result<()> {
+    actor.join().map_err(|_| {
+        ServerError::new(
+            ErrorCode::Internal,
+            format!("sqlite catalog {role} worker thread panicked"),
+        )
+    })?
+}
+
+enum ServiceMessage {
     Command(CommandRequest),
     Shutdown(Sender<Result<()>>),
 }
@@ -703,41 +1066,6 @@ fn handle_service_message(
     message: ServiceMessage,
 ) {
     match message {
-        ServiceMessage::Revision(response) => {
-            if !response.is_closed() {
-                let _ = response.send(domain::revision(connection));
-            }
-        }
-        ServiceMessage::GetNamespace(namespace, response) => {
-            if !response.is_closed() {
-                let _ = response.send(domain::get_namespace(connection, namespace));
-            }
-        }
-        ServiceMessage::ListNamespaces(request, response) => {
-            if !response.is_closed() {
-                let _ = response.send(domain::list_namespaces(connection, request));
-            }
-        }
-        ServiceMessage::GetTable(table, response) => {
-            if !response.is_closed() {
-                let _ = response.send(table_domain::get_table(connection, table));
-            }
-        }
-        ServiceMessage::ListTables(request, response) => {
-            if !response.is_closed() {
-                let _ = response.send(table_domain::list_tables(connection, request));
-            }
-        }
-        ServiceMessage::ResolveTables(tables, response) => {
-            if !response.is_closed() {
-                let _ = response.send(table_domain::resolve_tables(connection, &tables));
-            }
-        }
-        ServiceMessage::ReadSnapshot(selectors, response) => {
-            if !response.is_closed() {
-                let _ = response.send(snapshot_domain::read_snapshot_at(connection, &selectors));
-            }
-        }
         ServiceMessage::Command(command) => {
             if active_manifest.is_some() || !pending_commands.is_empty() {
                 pending_commands.push_back(command);
@@ -851,6 +1179,13 @@ fn actor_stopped() -> ServerError {
     )
 }
 
+fn read_pool_stopped() -> ServerError {
+    ServerError::new(
+        ErrorCode::Unavailable,
+        "sqlite catalog read pool is not running",
+    )
+}
+
 fn join_startup_actor(actor: JoinHandle<()>) -> Result<()> {
     actor.join().map_err(|_| {
         ServerError::new(
@@ -873,7 +1208,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
@@ -889,7 +1224,7 @@ mod tests {
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, DataFileLocation, DataFileProvenance, ManagedDataPath,
-        MetadataMap, NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload,
+        MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile, SchemaIpcPayload,
         SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
     };
     use zippy_types::{
@@ -897,8 +1232,8 @@ mod tests {
     };
 
     use super::{
-        domain, DomainManifestPreparationBackend, ManifestPreparationBackend, ManifestQueueBudget,
-        SqliteCatalog, SqliteCatalogConfig,
+        domain, snapshot_domain, CatalogReadBackend, DomainManifestPreparationBackend,
+        ManifestPreparationBackend, ManifestQueueBudget, SqliteCatalog, SqliteCatalogConfig,
     };
 
     const NAMESPACE_ID: u128 = 1;
@@ -911,6 +1246,13 @@ mod tests {
 
     struct PanickingManifestBackend {
         panic_prepare_once: AtomicBool,
+    }
+
+    struct BlockingSnapshotBackend {
+        started: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        block_once: AtomicBool,
+        calls: Arc<AtomicUsize>,
     }
 
     impl ManifestPreparationBackend for BlockingManifestBackend {
@@ -951,6 +1293,25 @@ mod tests {
                 panic!("injected manifest preparation panic");
             }
             domain::prepare_manifest_command(preparation)
+        }
+    }
+
+    impl CatalogReadBackend for BlockingSnapshotBackend {
+        fn read_snapshot(
+            &self,
+            connection: &mut rusqlite::Connection,
+            selectors: &[CatalogSnapshotSelector],
+        ) -> zippy_types::Result<zippy_types::catalog::CatalogQuerySnapshot> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.started
+                    .send(())
+                    .expect("test snapshot start observer must remain connected");
+                self.release
+                    .recv()
+                    .expect("test snapshot release must be signalled");
+            }
+            snapshot_domain::read_snapshot_at(connection, selectors)
         }
     }
 
@@ -1078,6 +1439,26 @@ mod tests {
         )
     }
 
+    fn commit_data_file_with_metadata(request: u128, entries: usize) -> VersionedCatalogCommand {
+        let mut file = pending_file(10, 0);
+        for index in 0..entries {
+            file.metadata.insert(
+                format!("field_{index:04}"),
+                MetadataScalar::String(format!("value_{index:04}")),
+            );
+        }
+        command(
+            request,
+            Some(2),
+            CatalogCommandV1::CommitDataFiles(CommitDataFilesCommand {
+                table_id: table_id(),
+                expected_snapshot_version: 1,
+                files: vec![file],
+                committed_log_offset: OffsetWatermark::Known(LogOffset::new(0)),
+            }),
+        )
+    }
+
     fn blocking_backend() -> (
         Arc<dyn ManifestPreparationBackend>,
         crossbeam_channel::Receiver<()>,
@@ -1092,6 +1473,28 @@ mod tests {
             }),
             started_receiver,
             release_sender,
+        )
+    }
+
+    fn blocking_snapshot_backend() -> (
+        Arc<dyn CatalogReadBackend>,
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(BlockingSnapshotBackend {
+                started: started_sender,
+                release: release_receiver,
+                block_once: AtomicBool::new(true),
+                calls: Arc::clone(&calls),
+            }),
+            started_receiver,
+            release_sender,
+            calls,
         )
     }
 
@@ -1115,6 +1518,146 @@ mod tests {
             .reserve(8)
             .expect("released byte budget can be reserved again")
             .is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cooperative_manifest_preflight_yields_and_releases_cancelled_command_budget() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory).with_command_capacity(1))
+                .expect("open single-command catalog");
+        create_append_table(&catalog).await;
+
+        let command = commit_data_file_with_metadata(3, 512);
+        let mut scanning = catalog.command(command.clone());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            scanning.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        let occupied = catalog
+            .command(command.clone())
+            .await
+            .expect_err("preflight must hold the global command permit until cancellation");
+        assert_eq!(occupied.code(), ErrorCode::ResourceExhausted);
+        drop(scanning);
+
+        let VersionedCatalogResponse::V1(response) = catalog
+            .command(command)
+            .await
+            .expect("cancelled preflight must release its command permit");
+        assert_eq!(response.catalog_revision, 3);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_snapshot_does_not_block_control_reads_or_writer_commit() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let (read_backend, started, release, _) = blocking_snapshot_backend();
+        let catalog = SqliteCatalog::open_with_backends(
+            config,
+            Arc::new(DomainManifestPreparationBackend),
+            read_backend,
+        )
+        .expect("open catalog with blocking snapshot backend");
+        create_append_table(&catalog).await;
+
+        let selectors = [CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        }];
+        let mut snapshot = catalog.read_snapshot_at(&selectors);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            snapshot.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot must reach the dedicated read worker");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), catalog.revision())
+                .await
+                .expect("control read must not wait for snapshot"),
+            Ok(2)
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            catalog.command(commit_data_file(3, 10, 2, 1, 0)),
+        )
+        .await
+        .expect("writer commit must not wait for snapshot")
+        .expect("commit one manifest while snapshot is blocked");
+        assert_eq!(catalog.revision().await, Ok(3));
+
+        release.send(()).expect("release snapshot read");
+        let snapshot = snapshot.await.expect("complete exact snapshot read");
+        assert_eq!(snapshot.catalog_revision(), 3);
+        assert!(snapshot.tables()[0].files().as_slice().is_empty());
+        catalog
+            .close()
+            .expect("close catalog read lanes and writer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_snapshot_is_skipped_and_releases_queue_capacity() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory).with_snapshot_read_capacity(1);
+        let (read_backend, started, release, calls) = blocking_snapshot_backend();
+        let catalog = SqliteCatalog::open_with_backends(
+            config,
+            Arc::new(DomainManifestPreparationBackend),
+            read_backend,
+        )
+        .expect("open catalog with one queued snapshot slot");
+        create_append_table(&catalog).await;
+
+        let selectors = [CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        }];
+        let mut active = catalog.read_snapshot_at(&selectors);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(active.as_mut().poll(&mut context), Poll::Pending));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first snapshot must occupy its worker");
+
+        let mut cancelled = catalog.read_snapshot_at(&selectors);
+        assert!(matches!(
+            cancelled.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        let full = catalog
+            .read_snapshot_at(&selectors)
+            .await
+            .expect_err("active and queued snapshots must saturate the lane");
+        assert_eq!(full.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(full.message(), "sqlite catalog snapshot read queue is full");
+        drop(cancelled);
+
+        release.send(()).expect("release active snapshot");
+        active.await.expect("finish active snapshot");
+        let final_snapshot = loop {
+            match catalog.read_snapshot_at(&selectors).await {
+                Err(error) if error.code() == ErrorCode::ResourceExhausted => {
+                    tokio::task::yield_now().await;
+                }
+                result => break result,
+            }
+        };
+        final_snapshot.expect("snapshot lane must recover after skipping cancellation");
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        catalog.close().expect("close catalog after cancellation");
     }
 
     #[tokio::test(flavor = "current_thread")]

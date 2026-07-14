@@ -5,8 +5,8 @@
 //! [`SqliteCatalog`] implements namespace and table-creation command slices plus
 //! exact SQLite snapshot reads, but legacy metadata remains authoritative in the
 //! server runtime. Physical SQLite schema versions are independent of
-//! CatalogCommand wire versions. Each handle creates, uses, and drops its SQLite
-//! connection exclusively on one dedicated OS actor thread.
+//! CatalogCommand wire versions. Each handle confines its writable connection and
+//! read-only connections to dedicated OS worker threads.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -43,8 +43,11 @@ pub const CATALOG_FORMAT: &str = "zippy.sqlite.catalog";
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INTEGRITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
+const DEFAULT_CONTROL_READ_CAPACITY: usize = 64;
+const DEFAULT_SNAPSHOT_READ_CAPACITY: usize = 8;
 const DEFAULT_MANIFEST_QUEUE_CAPACITY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_COMMAND_CAPACITY: usize = 4_096;
+const MAX_READ_CAPACITY: usize = 4_096;
 const MAX_MANIFEST_QUEUE_CAPACITY_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_BUSY_TIMEOUT_MILLIS: u128 = i32::MAX as u128;
 const ACTOR_THREAD_NAME: &str = "zippy-catalog-actor";
@@ -76,6 +79,8 @@ pub struct SqliteCatalogConfig {
     busy_timeout: Duration,
     integrity_check_timeout: Duration,
     command_capacity: usize,
+    control_read_capacity: usize,
+    snapshot_read_capacity: usize,
     manifest_queue_capacity_bytes: usize,
 }
 
@@ -96,6 +101,8 @@ impl SqliteCatalogConfig {
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
             integrity_check_timeout: DEFAULT_INTEGRITY_CHECK_TIMEOUT,
             command_capacity: DEFAULT_COMMAND_CAPACITY,
+            control_read_capacity: DEFAULT_CONTROL_READ_CAPACITY,
+            snapshot_read_capacity: DEFAULT_SNAPSHOT_READ_CAPACITY,
             manifest_queue_capacity_bytes: DEFAULT_MANIFEST_QUEUE_CAPACITY_BYTES,
         }
     }
@@ -118,6 +125,20 @@ impl SqliteCatalogConfig {
     #[must_use]
     pub const fn with_command_capacity(mut self, command_capacity: usize) -> Self {
         self.command_capacity = command_capacity;
+        self
+    }
+
+    /// Overrides the bounded queue capacity for control-plane Catalog reads.
+    #[must_use]
+    pub const fn with_control_read_capacity(mut self, control_read_capacity: usize) -> Self {
+        self.control_read_capacity = control_read_capacity;
+        self
+    }
+
+    /// Overrides the bounded queue capacity for exact Catalog snapshot reads.
+    #[must_use]
+    pub const fn with_snapshot_read_capacity(mut self, snapshot_read_capacity: usize) -> Self {
+        self.snapshot_read_capacity = snapshot_read_capacity;
         self
     }
 
@@ -352,6 +373,52 @@ fn open_on_actor(
     let integrity = run_quick_check(&connection, config.integrity_check_timeout)?;
     let status = inspect_connection(&connection, config, integrity)?;
     Ok((connection, status))
+}
+
+fn open_read_connection(config: &SqliteCatalogConfig) -> Result<Connection> {
+    validate_managed_catalog_path(config)?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let connection = Connection::open_with_flags(&config.path, flags)
+        .map_err(|error| map_sqlite_error("open read-only catalog database", error))?;
+    connection
+        .busy_timeout(config.busy_timeout)
+        .map_err(|error| map_sqlite_error("configure read-only catalog busy timeout", error))?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|error| map_sqlite_error("enable read-only catalog foreign keys", error))?;
+    connection
+        .pragma_update(None, "read_uncommitted", false)
+        .map_err(|error| map_sqlite_error("disable dirty catalog reads", error))?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|error| map_sqlite_error("enable query-only catalog connection", error))?;
+
+    let journal_mode: String = pragma(&connection, "journal_mode")?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            format!("catalog read connection requires WAL journal mode actual=[{journal_mode}]"),
+        ));
+    }
+    let query_only: u32 = pragma(&connection, "query_only")?;
+    let foreign_keys: u32 = pragma(&connection, "foreign_keys")?;
+    let read_uncommitted: u32 = pragma(&connection, "read_uncommitted")?;
+    if query_only != 1 || foreign_keys != 1 || read_uncommitted != 0 {
+        return Err(ServerError::new(
+            ErrorCode::Internal,
+            format!(
+                concat!(
+                    "catalog read connection pragmas are invalid query_only=[{}] ",
+                    "foreign_keys=[{}] read_uncommitted=[{}]"
+                ),
+                query_only, foreign_keys, read_uncommitted
+            ),
+        ));
+    }
+    let _ = migration::validate_metadata(&connection)?;
+    Ok(connection)
 }
 
 fn actor_loop(
@@ -612,6 +679,23 @@ fn validate_config(config: &SqliteCatalogConfig) -> Result<()> {
                 MAX_COMMAND_CAPACITY, config.command_capacity
             ),
         ));
+    }
+    for (name, capacity) in [
+        ("control read", config.control_read_capacity),
+        ("snapshot read", config.snapshot_read_capacity),
+    ] {
+        if !(1..=MAX_READ_CAPACITY).contains(&capacity) {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    concat!(
+                        "catalog {} capacity is outside bounds ",
+                        "min=[1] max=[{}] actual=[{}]"
+                    ),
+                    name, MAX_READ_CAPACITY, capacity
+                ),
+            ));
+        }
     }
     if !(1..=MAX_MANIFEST_QUEUE_CAPACITY_BYTES).contains(&config.manifest_queue_capacity_bytes) {
         return Err(ServerError::new(

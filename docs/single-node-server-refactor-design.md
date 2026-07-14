@@ -1767,14 +1767,17 @@ logical offset、schema-version coverage 和 lineage 等价。
 16 MiB、递归 field 不超过 4096、嵌套不超过 32 层、metadata 不超过 4096 项/1 MiB，FlatBuffer
 verifier 最多遍历 32768 个 table 和 16 MiB apparent size；schema 以版本化 canonical logical SHA-256
 （`sha256-v1:<64 hex>`）标识；持久化 typed BLOB 通过冻结的 V1 storage DTO 编解码，避免运行时
-domain 类型演进静默改变落盘格式。manifest fingerprint 校验与纯语义 preparation 已移到独立有界
-worker；mutation 保持 actor admission 顺序，重叠 read 可以在 preparation 期间读取前一个 committed
-revision，取消响应不会取消已接受写入，close 会排空已接受写入。其余 V1 mutation command、
-producer-fenced public ingest、maintenance lease-fenced worker、legacy/frame/KV V2 manifest、legacy
-importer/shadow/diff、caller-side manifest preflight 隔离、read actor 隔离、绝对 shutdown deadline
-尚未实现，因此 SQLite 仍不能成为 `zippy server run` 的 read/write authority。modern manifest 的多表
-exact `CatalogQuerySnapshot` 已在
-同一个 deferred transaction 中读取 table/schema/snapshot/visible files/native lineage；schema IPC 与
+domain 类型演进静默改变落盘格式。manifest preflight 在取得 command permit 后按每 256 个 file 或
+metadata work item 协作式 yield，完成后仍以精确 byte charge 进入聚合预算；fingerprint 校验与纯语义
+preparation 已移到独立有界 worker。control read 与 exact snapshot read 分别使用独立的有界队列、OS
+worker 和 read-only WAL connection，因此大 snapshot 不再阻塞 discovery/revision 或 writer commit。
+mutation 保持 actor admission 顺序；重叠 read 可以读取前一个 committed revision，取消响应不会取消
+已接受写入，close 会排空已接受工作。其余 V1 mutation command、producer-fenced public ingest、
+maintenance lease-fenced worker、legacy/frame/KV V2 manifest、legacy importer/shadow/diff、
+CreateTable preparation 隔离、manifest finalize 减负、read parallelism、active read interrupt 和绝对
+shutdown deadline 尚未实现，因此 SQLite 仍不能成为 `zippy server run` 的 read/write authority。
+modern manifest 的多表 exact `CatalogQuerySnapshot` 已在同一个 deferred transaction 中读取
+table/schema/snapshot/visible files/native lineage；schema IPC 与
 hash、snapshot chain、metadata checksum、file visibility 和 lineage coverage 都会重新验证。
 
 snapshot admission 要求 selector 按 table ID 严格升序且版本非零，最多 4096 张表；全有或全无的
