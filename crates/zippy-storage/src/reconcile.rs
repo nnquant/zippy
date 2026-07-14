@@ -1096,7 +1096,7 @@ fn validate_config(config: &StartupOrphanReconcilerConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_directory(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+pub(crate) fn validate_directory(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(corruption(format!(
             "reconciliation directory is not a non-symlink directory path=[{}]",

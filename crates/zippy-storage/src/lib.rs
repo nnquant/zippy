@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod candidate;
+mod catalog_verify;
 mod checksum;
 mod commit;
 mod commit_intent;
@@ -18,6 +19,10 @@ mod reconcile;
 pub use candidate::{
     DurableParquetCandidate, ParquetCandidateSpec, ParquetCandidateWriter,
     CANDIDATE_FOOTER_METADATA_KEY, PARQUET_CANDIDATE_FORMAT_VERSION,
+};
+pub use catalog_verify::{
+    StartupCatalogFileVerificationReport, StartupCatalogFileVerifier,
+    StartupCatalogFileVerifierConfig,
 };
 pub use commit::{
     CatalogCommitCoordinator, CatalogCommitCoordinatorConfig, CommitDataFilesIntent,

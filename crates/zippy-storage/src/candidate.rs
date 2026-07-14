@@ -249,7 +249,10 @@ fn encode_footer_metadata(spec: &ParquetCandidateSpec) -> Result<String> {
     Ok(value)
 }
 
-fn candidate_managed_path(table_id: TableId, file_id: FileId) -> Result<ManagedDataPath> {
+pub(crate) fn candidate_managed_path(
+    table_id: TableId,
+    file_id: FileId,
+) -> Result<ManagedDataPath> {
     ManagedDataPath::new(format!("parquet/{table_id}/{file_id}.parquet")).map_err(|error| {
         ServerError::new(
             ErrorCode::Internal,
@@ -442,8 +445,19 @@ fn inspect_existing_candidate(table_id: TableId, path: &Path) -> Result<(u64, St
 }
 
 pub(crate) fn open_existing_candidate(table_id: TableId, path: &Path) -> Result<(File, u64)> {
-    let path_metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error(table_id, "inspect existing candidate", path, error))?;
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            corruption_error(
+                table_id,
+                path,
+                None,
+                None,
+                "catalog-visible candidate is missing",
+            )
+        } else {
+            io_error(table_id, "inspect existing candidate", path, error)
+        }
+    })?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
         return Err(corruption_error(
             table_id,
@@ -644,23 +658,33 @@ pub(crate) fn verify_pending_candidate(
         .directory()
         .root()
         .join(managed_path.as_str());
-    let (mut file, actual_size) = open_existing_candidate(pending.table_id, &path)?;
+    let (file, actual_size) = open_existing_candidate(pending.table_id, &path)?;
+    verify_pending_candidate_file(file, actual_size, &path, pending, provenance)
+}
+
+fn verify_pending_candidate_file(
+    mut file: File,
+    actual_size: u64,
+    path: &Path,
+    pending: &PendingDataFile,
+    provenance: &NativeDataFileProvenance,
+) -> Result<()> {
     if actual_size != pending.file_size_bytes {
         return Err(corruption_error(
             pending.table_id,
-            &path,
+            path,
             Some(pending.checksum.clone()),
             None,
             "pending candidate size changed before verification",
         ));
     }
-    validate_parquet_footer_length(&mut file, actual_size, pending.table_id, &path)?;
+    validate_parquet_footer_length(&mut file, actual_size, pending.table_id, path)?;
     let actual_checksum = sha256_v1_reader(&mut file)
-        .map_err(|error| io_error(pending.table_id, "checksum pending candidate", &path, error))?;
+        .map_err(|error| io_error(pending.table_id, "checksum pending candidate", path, error))?;
     if actual_checksum != pending.checksum {
         return Err(corruption_error(
             pending.table_id,
-            &path,
+            path,
             Some(pending.checksum.clone()),
             Some(actual_checksum),
             "candidate no longer matches its pending descriptor",
@@ -668,11 +692,11 @@ pub(crate) fn verify_pending_candidate(
     }
 
     file.seek(SeekFrom::Start(0))
-        .map_err(|error| io_error(pending.table_id, "rewind pending candidate", &path, error))?;
+        .map_err(|error| io_error(pending.table_id, "rewind pending candidate", path, error))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| {
         corruption_error(
             pending.table_id,
-            &path,
+            path,
             Some(pending.checksum.clone()),
             Some(pending.checksum.clone()),
             &format!("candidate Parquet footer is invalid error=[{error}]"),
@@ -682,7 +706,7 @@ pub(crate) fn verify_pending_candidate(
     let actual_rows = u64::try_from(metadata.file_metadata().num_rows()).map_err(|_| {
         corruption_error(
             pending.table_id,
-            &path,
+            path,
             None,
             None,
             "candidate Parquet footer has a negative row count",
@@ -691,7 +715,7 @@ pub(crate) fn verify_pending_candidate(
     if actual_rows != pending.row_count.get() {
         return Err(corruption_error(
             pending.table_id,
-            &path,
+            path,
             None,
             None,
             "candidate Parquet row count does not match its pending descriptor",
@@ -709,7 +733,7 @@ pub(crate) fn verify_pending_candidate(
         .ok_or_else(|| {
             corruption_error(
                 pending.table_id,
-                &path,
+                path,
                 None,
                 None,
                 "candidate Parquet footer is missing its Zippy metadata envelope",
@@ -719,7 +743,7 @@ pub(crate) fn verify_pending_candidate(
         serde_json::from_str::<serde_json::Value>(footer_json).map_err(|error| {
             corruption_error(
                 pending.table_id,
-                &path,
+                path,
                 None,
                 None,
                 &format!("candidate footer metadata is invalid error=[{error}]"),
@@ -745,13 +769,182 @@ pub(crate) fn verify_pending_candidate(
     if actual_footer != expected_footer {
         return Err(corruption_error(
             pending.table_id,
-            &path,
+            path,
             None,
             None,
             "candidate Parquet footer does not match its pending descriptor",
         ));
     }
     Ok(())
+}
+
+pub(crate) fn verify_catalog_visible_candidate(
+    data_directory: &OwnedDataDirectory,
+    pending: &PendingDataFile,
+) -> Result<()> {
+    let DataFileLocation::Managed(managed_path) = &pending.location else {
+        return Err(corruption_error(
+            pending.table_id,
+            data_directory.directory().root(),
+            None,
+            None,
+            "catalog-visible native candidate is not managed by the data root",
+        ));
+    };
+    let DataFileProvenance::Native(provenance) = &pending.provenance else {
+        return Err(corruption_error(
+            pending.table_id,
+            &data_directory
+                .directory()
+                .root()
+                .join(managed_path.as_str()),
+            Some(pending.checksum.clone()),
+            None,
+            "catalog-visible managed candidate does not have native provenance",
+        ));
+    };
+    let expected = candidate_managed_path(pending.table_id, pending.file_id)?;
+    if managed_path != &expected {
+        return Err(corruption_error(
+            pending.table_id,
+            &data_directory
+                .directory()
+                .root()
+                .join(managed_path.as_str()),
+            Some(pending.checksum.clone()),
+            None,
+            "catalog-visible candidate path is not canonical for its table and file identity",
+        ));
+    }
+
+    let path = data_directory
+        .directory()
+        .root()
+        .join(managed_path.as_str());
+    let (file, actual_size) = open_catalog_visible_candidate(data_directory, pending, &path)?;
+    verify_pending_candidate_file(file, actual_size, &path, pending, provenance)
+}
+
+#[cfg(unix)]
+fn open_catalog_visible_candidate(
+    data_directory: &OwnedDataDirectory,
+    pending: &PendingDataFile,
+    path: &Path,
+) -> Result<(File, u64)> {
+    let root = data_directory.try_clone_root_directory().map_err(|error| {
+        ServerError::new(
+            ErrorCode::Unavailable,
+            format!("clone owned data-root descriptor error=[{error}]"),
+        )
+        .with_table_id(pending.table_id)
+    })?;
+    let parquet_path = data_directory.directory().root().join("parquet");
+    let parquet = open_catalog_directory_at(&root, "parquet", &parquet_path, pending.table_id)?;
+    let table_name = pending.table_id.to_string();
+    let table_path = parquet_path.join(&table_name);
+    let table = open_catalog_directory_at(&parquet, &table_name, &table_path, pending.table_id)?;
+    let file_name = format!("{}.parquet", pending.file_id);
+    let descriptor = rustix::fs::openat(
+        &table,
+        file_name.as_str(),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| catalog_openat_error(pending.table_id, path, "file", error))?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|error| {
+        io_error(
+            pending.table_id,
+            "inspect catalog-visible candidate descriptor",
+            path,
+            error,
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(corruption_error(
+            pending.table_id,
+            path,
+            None,
+            None,
+            "catalog-visible candidate is not a regular file",
+        ));
+    }
+    validate_existing_file_security(pending.table_id, path, &metadata)?;
+    Ok((file, metadata.len()))
+}
+
+#[cfg(unix)]
+fn open_catalog_directory_at(
+    parent: &File,
+    name: &str,
+    path: &Path,
+    table_id: TableId,
+) -> Result<File> {
+    let descriptor = rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| catalog_openat_error(table_id, path, "directory", error))?;
+    let directory = File::from(descriptor);
+    let metadata = directory.metadata().map_err(|error| {
+        io_error(
+            table_id,
+            "inspect catalog-visible directory descriptor",
+            path,
+            error,
+        )
+    })?;
+    crate::reconcile::validate_directory(path, &metadata)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn catalog_openat_error(
+    table_id: TableId,
+    path: &Path,
+    kind: &str,
+    error: rustix::io::Errno,
+) -> ServerError {
+    if matches!(
+        error,
+        rustix::io::Errno::NOENT | rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR
+    ) {
+        return corruption_error(
+            table_id,
+            path,
+            None,
+            None,
+            &format!("catalog-visible candidate {kind} is missing or unsafe"),
+        );
+    }
+    io_error(
+        table_id,
+        "open catalog-visible candidate relative to owned directory",
+        path,
+        std::io::Error::from(error),
+    )
+}
+
+#[cfg(not(unix))]
+fn open_catalog_visible_candidate(
+    _data_directory: &OwnedDataDirectory,
+    pending: &PendingDataFile,
+    path: &Path,
+) -> Result<(File, u64)> {
+    Err(ServerError::new(
+        ErrorCode::Unavailable,
+        format!(
+            "catalog-visible candidate verification requires descriptor-relative I/O path=[{}]",
+            path.display()
+        ),
+    )
+    .with_table_id(pending.table_id)
+    .with_retryable(false))
 }
 
 fn validate_parquet_footer_length(

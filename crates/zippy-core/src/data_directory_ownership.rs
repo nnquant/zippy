@@ -95,6 +95,13 @@ impl OwnedDataDirectory {
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
     }
+
+    /// Duplicates the validated root directory descriptor for descriptor-relative I/O.
+    pub fn try_clone_root_directory(&self) -> Result<File, DataDirectoryError> {
+        self._root_directory
+            .try_clone()
+            .map_err(|error| io_error(self.directory.root(), error))
+    }
 }
 
 impl DataDirectory {

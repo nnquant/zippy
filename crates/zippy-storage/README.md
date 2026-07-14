@@ -38,10 +38,12 @@ backlog budgets, not Parquet writer memory limits.
 
 ## Startup reconciliation
 
-`StartupOrphanReconciler` runs after durable intent replay and before table-writer admission. It
-scans only the canonical `parquet/<table_id>/<file_id>.parquet` tree, probes both `file_id` and
-managed path in one bounded Catalog transaction, and requires one stable Catalog revision across
-the whole pass. It reports:
+`StartupOrphanReconciler` runs only while table-writer admission is closed. The server composition
+root executes it once before durable intent replay, preserving atomic multi-file intent evidence,
+and once after replay, producing the revision-stable report used for readiness. Each pass scans only
+the canonical `parquet/<table_id>/<file_id>.parquet` tree, probes both `file_id` and managed path in
+one bounded Catalog transaction, and requires one stable Catalog revision across the whole pass. It
+reports:
 
 - current or historical Catalog references;
 - retained durable intents;
@@ -57,13 +59,23 @@ is streaming, so rejected excess entries are not first collected in memory. A re
 intent remains one atomic group: every file must be either an exact Catalog reference or
 unreferenced; a partial Catalog representation is corruption.
 
-The report is read-only. In particular, a Catalog `Unreferenced` result is not permission to unlink
-a file because publication could begin after the read transaction. Online orphan removal requires a
+The reconciliation report is read-only. In particular, a Catalog `Unreferenced` result is not
+permission to unlink a file because publication could begin after the read transaction. Online orphan removal requires a
 publication gate; ordinary file removal additionally requires snapshot leases and the safe-GC
 lifecycle. Read-only intent enumeration reports temporary WAL entries rather than cleaning them;
 only coordinator recovery performs that cleanup under startup ownership. This pass scans physical
-files toward the Catalog; the maintenance verifier remains responsible for the reverse check that
-every Catalog-referenced managed path exists and matches its checksum.
+files toward the Catalog.
+
+After replay and final reconciliation, `StartupCatalogFileVerifier` performs the reverse startup
+gate. It lists active tables in 512-table pages, reads current snapshots in batches of 512 at one
+stable Catalog revision, and fully verifies every currently visible managed file. Verification
+opens each path relative to the retained data-root and table directory descriptors with
+`O_NOFOLLOW`, then reuses the candidate size, checksum, Parquet footer, and row-count invariants.
+Missing files, symlink substitutions, and corrupted content fail startup with
+`DataCorruption`. The default pass admits at most 65,536 active tables, 65,536 current managed
+files, and 8 GiB of checksummed content. External legacy paths and historical files removed from
+the current snapshot are outside this startup gate; maintenance verification remains responsible
+for historical/deep audits.
 
 Logical drop, snapshot leases, safe GC, compaction, and integration with the authoritative server
 table actor remain later refactor steps.
