@@ -22,6 +22,8 @@ use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::reader::{ChunkReader, Length};
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+use zippy_types::{ErrorCode, ServerError};
 
 mod persisted_plan;
 
@@ -34,6 +36,94 @@ const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
 
 /// A server-supplied Parquet reader whose concrete storage capability remains opaque here.
 pub type BoxedAsyncFileReader = Box<dyn AsyncFileReader + Send>;
+
+type DeferredOpen = Box<dyn FnOnce() -> zippy_types::Result<BoxedAsyncFileReader> + Send>;
+
+enum DeferredParquetReaderState {
+    Unopened(Option<DeferredOpen>),
+    Opening(JoinHandle<zippy_types::Result<BoxedAsyncFileReader>>),
+    Open(BoxedAsyncFileReader),
+    Failed(ServerError),
+}
+
+struct DeferredParquetReader {
+    state: DeferredParquetReaderState,
+}
+
+impl DeferredParquetReader {
+    async fn ensure_open(&mut self) -> ParquetResult<()> {
+        loop {
+            match &mut self.state {
+                DeferredParquetReaderState::Unopened(open) => {
+                    let open = open
+                        .take()
+                        .expect("unopened deferred Parquet reader retains its opener");
+                    self.state =
+                        DeferredParquetReaderState::Opening(tokio::task::spawn_blocking(open));
+                }
+                DeferredParquetReaderState::Opening(opening) => {
+                    let completed = (&mut *opening).await;
+                    self.state = match completed {
+                        Ok(Ok(reader)) => DeferredParquetReaderState::Open(reader),
+                        Ok(Err(error)) => DeferredParquetReaderState::Failed(error),
+                        Err(error) => DeferredParquetReaderState::Failed(
+                            ServerError::new(
+                                ErrorCode::Internal,
+                                format!("deferred Parquet open worker failed error=[{error}]"),
+                            )
+                            .with_retryable(false),
+                        ),
+                    };
+                }
+                DeferredParquetReaderState::Open(_) => return Ok(()),
+                DeferredParquetReaderState::Failed(error) => {
+                    return Err(ParquetError::External(Box::new(error.clone())));
+                }
+            }
+        }
+    }
+}
+
+impl AsyncFileReader for DeferredParquetReader {
+    fn get_bytes(
+        &mut self,
+        range: Range<usize>,
+    ) -> Pin<Box<dyn Future<Output = ParquetResult<Bytes>> + Send + '_>> {
+        Box::pin(async move {
+            self.ensure_open().await?;
+            match &mut self.state {
+                DeferredParquetReaderState::Open(reader) => reader.get_bytes(range).await,
+                _ => unreachable!("successful deferred open installs an async Parquet reader"),
+            }
+        })
+    }
+
+    fn get_metadata(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = ParquetResult<Arc<ParquetMetaData>>> + Send + '_>> {
+        Box::pin(async move {
+            self.ensure_open().await?;
+            match &mut self.state {
+                DeferredParquetReaderState::Open(reader) => reader.get_metadata().await,
+                _ => unreachable!("successful deferred open installs an async Parquet reader"),
+            }
+        })
+    }
+}
+
+/// Creates a Parquet reader whose blocking open work begins only on its first read operation.
+///
+/// The opener runs once on Tokio's blocking pool. If the first read future is dropped while that
+/// work is active, the join handle remains inside the reader and a later call waits for the same
+/// job instead of enqueueing another open. Dropping the reader detaches the job, whose captured
+/// admission owners remain alive until the physical work actually exits.
+pub fn deferred_parquet_reader(
+    open: impl FnOnce() -> zippy_types::Result<BoxedAsyncFileReader> + Send + 'static,
+) -> BoxedAsyncFileReader {
+    Box::new(DeferredParquetReader {
+        state: DeferredParquetReaderState::Unopened(Some(Box::new(open))),
+    })
+}
 
 /// A path-free random-access file whose lifetime owns query admission and snapshot protection.
 ///
@@ -304,9 +394,11 @@ mod tests {
     use parquet::file::reader::ChunkReader;
 
     use super::{
-        AdmittedAsyncParquetReader, AdmittedParquetSource, AdmittedRandomAccessFile,
-        QuerySessionPolicy, MAX_POSITIONED_READ_BYTES,
+        deferred_parquet_reader, AdmittedAsyncParquetReader, AdmittedParquetSource,
+        AdmittedRandomAccessFile, BoxedAsyncFileReader, QuerySessionPolicy,
+        MAX_POSITIONED_READ_BYTES,
     };
+    use zippy_types::{ErrorCode, ServerError};
 
     struct TestAdmittedFile {
         contents: Arc<[u8]>,
@@ -351,6 +443,14 @@ mod tests {
     impl Drop for TestAdmittedFile {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -729,5 +829,196 @@ mod tests {
             Some(1)
         );
         assert_eq!(read_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_reader_opens_once_on_first_operation() {
+        let contents = parquet_fixture();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::clone(&opens);
+        let file_drops = Arc::clone(&drops);
+        let mut reader = deferred_parquet_reader(move || {
+            open_count.fetch_add(1, Ordering::SeqCst);
+            let source = AdmittedParquetSource::new(TestAdmittedFile::new(
+                &contents,
+                contents.len() as u64,
+                file_drops,
+            ));
+            Ok(Box::new(AdmittedAsyncParquetReader::new(source)) as BoxedAsyncFileReader)
+        });
+
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reader
+                .get_bytes(0..4)
+                .await
+                .expect("read through deferred opener")
+                .as_ref(),
+            b"PAR1"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reader
+                .get_metadata()
+                .await
+                .expect("read deferred Parquet metadata")
+                .file_metadata()
+                .num_rows(),
+            3
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        drop(reader);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_deferred_open_future_resumes_the_same_blocking_job() {
+        let (open_entries, mut observed_opens) = tokio::sync::mpsc::unbounded_channel();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let open_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let open_count = Arc::clone(&opens);
+        let release = Arc::clone(&open_release);
+        let mut reader = deferred_parquet_reader(move || {
+            let open_number = open_count.fetch_add(1, Ordering::SeqCst);
+            open_entries
+                .send(open_number)
+                .expect("observe deferred open entry");
+            let (released, release_signal) = &*release;
+            let mut released = released.lock().expect("lock deferred open release");
+            while !*released {
+                released = release_signal
+                    .wait(released)
+                    .expect("wait for deferred open release");
+            }
+            let source = AdmittedParquetSource::new(TestAdmittedFile::new(
+                b"0123456789",
+                10,
+                Arc::new(AtomicUsize::new(0)),
+            ));
+            Ok(Box::new(AdmittedAsyncParquetReader::new(source)) as BoxedAsyncFileReader)
+        });
+
+        {
+            let first = reader.get_bytes(0..1);
+            tokio::pin!(first);
+            tokio::select! {
+                result = &mut first => panic!("deferred open unexpectedly completed: {result:?}"),
+                observed = observed_opens.recv() => assert_eq!(observed, Some(0)),
+            }
+        }
+
+        let second = reader.get_bytes(1..2);
+        tokio::pin!(second);
+        tokio::select! {
+            result = &mut second => panic!("second read bypassed deferred open: {result:?}"),
+            observed = observed_opens.recv() => panic!("second deferred open entered: {observed:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        {
+            let (released, release_signal) = &*open_release;
+            *released.lock().expect("lock deferred open release") = true;
+            release_signal.notify_all();
+        }
+        assert_eq!(
+            second
+                .await
+                .expect("second read resumes completed deferred open")
+                .as_ref(),
+            b"1"
+        );
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_open_failure_is_sticky() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::clone(&opens);
+        let mut reader = deferred_parquet_reader(move || {
+            open_count.fetch_add(1, Ordering::SeqCst);
+            Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "test deferred open failure",
+            ))
+        });
+
+        for _ in 0..2 {
+            let error = reader
+                .get_bytes(0..1)
+                .await
+                .expect_err("deferred open remains failed");
+            assert!(error.to_string().contains("test deferred open failure"));
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_opening_reader_retains_captured_owner_until_job_exits() {
+        let (open_entries, mut observed_opens) = tokio::sync::mpsc::unbounded_channel();
+        let owner_drops = Arc::new(AtomicUsize::new(0));
+        let open_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let probe = DropProbe(Arc::clone(&owner_drops));
+        let release = Arc::clone(&open_release);
+        let mut reader = deferred_parquet_reader(move || {
+            let _probe = probe;
+            open_entries.send(()).expect("observe deferred open entry");
+            let (released, release_signal) = &*release;
+            let mut released = released.lock().expect("lock deferred open release");
+            while !*released {
+                released = release_signal
+                    .wait(released)
+                    .expect("wait for deferred open release");
+            }
+            Err(ServerError::new(
+                ErrorCode::Cancelled,
+                "test opening reader was dropped",
+            ))
+        });
+
+        {
+            let first = reader.get_bytes(0..1);
+            tokio::pin!(first);
+            tokio::select! {
+                result = &mut first => panic!("deferred open unexpectedly completed: {result:?}"),
+                observed = observed_opens.recv() => assert_eq!(observed, Some(())),
+            }
+        }
+        drop(reader);
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+
+        {
+            let (released, release_signal) = &*open_release;
+            *released.lock().expect("lock deferred open release") = true;
+            release_signal.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner_drops.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached deferred open job exits");
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_open_worker_panic_is_sticky() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::clone(&opens);
+        let mut reader = deferred_parquet_reader(move || {
+            open_count.fetch_add(1, Ordering::SeqCst);
+            panic!("test deferred open panic");
+        });
+
+        for _ in 0..2 {
+            let error = reader
+                .get_bytes(0..1)
+                .await
+                .expect_err("deferred open panic remains failed");
+            assert!(error.to_string().contains("open worker failed"));
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
     }
 }
