@@ -1,16 +1,16 @@
-//! Q0 query resource admission and cancellation coordination.
+//! Native query resource admission, lifecycle retention, and cancellation coordination.
 //!
 //! Stable identities, owner capabilities, one-time execution tokens, and snapshot guards remain
 //! defined by `zippy-types`. This module only coordinates their process-local runtime ownership.
 //! It is intentionally not wired to Gateway until a native physical planner exists.
-//! Q0 also does not retain terminal tombstones after every strong query owner exits; bounded
-//! status retention and query-ID reuse windows belong to the production registry integration.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zippy_types::query::{
     OpaqueQueryExecutionToken, QueryExecutionToken, QueryPlanInfo, QueryState,
@@ -19,6 +19,10 @@ use zippy_types::storage::OpaqueQueryReadSnapshot;
 use zippy_types::{ErrorCode, QueryId, Result, ServerError, SessionId};
 
 static NEXT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
+
+const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(300);
+const DEFAULT_MAX_REGISTERED_QUERIES: usize = 4096;
+const DEFAULT_MAX_QUERY_TOMBSTONES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueryServiceResourceConfig {
@@ -47,6 +51,43 @@ impl QueryServiceResourceConfig {
             || self.max_memory_bytes == 0
         {
             return Err(invalid("query service resource limits must be positive"));
+        }
+        Ok(self)
+    }
+}
+
+/// Bounded lifecycle retention for the process-local query registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryServiceRegistryConfig {
+    pub terminal_retention: Duration,
+    pub max_registered_queries: usize,
+    pub max_query_tombstones: usize,
+}
+
+impl Default for QueryServiceRegistryConfig {
+    fn default() -> Self {
+        Self {
+            terminal_retention: DEFAULT_TERMINAL_RETENTION,
+            max_registered_queries: DEFAULT_MAX_REGISTERED_QUERIES,
+            max_query_tombstones: DEFAULT_MAX_QUERY_TOMBSTONES,
+        }
+    }
+}
+
+impl QueryServiceRegistryConfig {
+    fn validate(self, resources: QueryServiceResourceConfig) -> Result<Self> {
+        if self.terminal_retention.is_zero()
+            || self.max_registered_queries == 0
+            || self.max_query_tombstones == 0
+        {
+            return Err(invalid(
+                "query service registry retention and capacities must be positive",
+            ));
+        }
+        if self.max_registered_queries < resources.max_active_queries {
+            return Err(invalid(
+                "query registry capacity must cover active logical query admission",
+            ));
         }
         Ok(self)
     }
@@ -98,17 +139,20 @@ pub(crate) struct QueryServiceStatus {
     pub active_cpu_slots: u32,
     pub active_memory_bytes: u64,
     pub active_snapshot_owners: usize,
+    pub query_tombstones: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueryRuntimeStatus {
     pub query_id: QueryId,
+    pub generation: u64,
     pub state: QueryState,
     pub logical_admitted: bool,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_memory_bytes: u64,
     pub cancellation_requested: bool,
+    pub finished_at_ns: Option<u64>,
     pub error: Option<ServerError>,
 }
 
@@ -119,10 +163,23 @@ pub(crate) struct QueryResourceCoordinator {
 
 impl QueryResourceCoordinator {
     pub(crate) fn new(config: QueryServiceResourceConfig) -> Result<Self> {
+        Self::with_registry_config(config, QueryServiceRegistryConfig::default())
+    }
+
+    pub(crate) fn with_registry_config(
+        config: QueryServiceResourceConfig,
+        registry_config: QueryServiceRegistryConfig,
+    ) -> Result<Self> {
+        let config = config.validate()?;
+        let registry_config = registry_config.validate(config)?;
         Ok(Self {
             inner: Arc::new(CoordinatorInner {
                 nonce: next_nonce(),
-                config: config.validate()?,
+                config,
+                terminal_retention_ns: duration_ns(registry_config.terminal_retention),
+                max_registered_queries: registry_config.max_registered_queries,
+                max_query_tombstones: registry_config.max_query_tombstones,
+                next_query_generation: AtomicU64::new(1),
                 state: Mutex::new(CoordinatorState::default()),
             }),
         })
@@ -146,9 +203,11 @@ impl QueryResourceCoordinator {
             return Err(deadline(query_id, "query expired before plan registration"));
         }
 
+        let generation = self.inner.next_query_generation();
         let control = Arc::new(QueryControl {
             owner: Arc::downgrade(&self.inner),
             query_id,
+            generation,
             budget,
             plan_expires_at_ns: info.expires_at_ns,
             execution_deadline_ns,
@@ -158,15 +217,14 @@ impl QueryResourceCoordinator {
         let ownership;
         {
             let mut state = self.inner.state.lock().unwrap();
-            state.prune_registry();
+            state
+                .registry
+                .remove_expired_terminal(now_ns, self.inner.terminal_retention_ns);
+            state.registry.remove_expired_tombstones(now_ns);
             if state.lifecycle != QueryServiceLifecycle::Accepting {
                 return Err(unavailable(query_id));
             }
-            if state
-                .registry
-                .get(&query_id)
-                .is_some_and(RegistryEntry::is_live)
-            {
+            if state.registry.is_query_id_reserved(query_id) {
                 return Err(ServerError::new(
                     ErrorCode::Conflict,
                     "query identifier is already registered",
@@ -185,6 +243,8 @@ impl QueryResourceCoordinator {
                     "global query snapshot owner admission is exhausted",
                 ));
             }
+            self.inner
+                .prepare_registry_for_registration(&mut state.registry, now_ns, query_id)?;
             ownership = Arc::new(SharedSnapshotOwnership {
                 owner: Arc::downgrade(&self.inner),
                 snapshot: Mutex::new(Some(snapshot)),
@@ -197,7 +257,7 @@ impl QueryResourceCoordinator {
             state.registry.insert(
                 query_id,
                 RegistryEntry {
-                    control: Arc::downgrade(&control),
+                    control: Arc::clone(&control),
                     snapshot_root: Some(Arc::clone(&ownership)),
                 },
             );
@@ -220,7 +280,7 @@ impl QueryResourceCoordinator {
         let transferred = token.into_any();
         let mut transferred = transferred
             .downcast::<TransferredPlanToken>()
-            .map_err(|_| invalid("query token was not issued by QueryService Q0"))?;
+            .map_err(|_| invalid("query token was not issued by this QueryService"))?;
         let query_id = transferred.info.query_id;
         if transferred.coordinator_nonce != self.inner.nonce {
             return Err(
@@ -270,12 +330,16 @@ impl QueryResourceCoordinator {
 struct CoordinatorInner {
     nonce: u64,
     config: QueryServiceResourceConfig,
+    terminal_retention_ns: u64,
+    max_registered_queries: usize,
+    max_query_tombstones: usize,
+    next_query_generation: AtomicU64,
     state: Mutex<CoordinatorState>,
 }
 
 struct CoordinatorState {
     lifecycle: QueryServiceLifecycle,
-    registry: HashMap<QueryId, RegistryEntry>,
+    registry: QueryRegistry,
     active_logical_queries: usize,
     active_tasks: usize,
     active_cpu_slots: u32,
@@ -284,13 +348,197 @@ struct CoordinatorState {
 }
 
 struct RegistryEntry {
-    control: Weak<QueryControl>,
+    control: Arc<QueryControl>,
     snapshot_root: Option<Arc<SharedSnapshotOwnership>>,
 }
 
-impl RegistryEntry {
-    fn is_live(&self) -> bool {
-        self.snapshot_root.is_some() || self.control.strong_count() > 0
+type TerminalOrderKey = Reverse<(u64, QueryId, u64)>;
+type TombstoneOrderKey = Reverse<(u64, QueryId, u64)>;
+
+#[derive(Clone, Copy)]
+struct QueryTombstone {
+    expires_at_ns: u64,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityEviction {
+    Evicted,
+    NoTerminal,
+    TombstoneCapacityExhausted,
+}
+
+#[derive(Default)]
+struct QueryRegistry {
+    by_id: HashMap<QueryId, RegistryEntry>,
+    drained_terminal_order: BinaryHeap<TerminalOrderKey>,
+    tombstones: HashMap<QueryId, QueryTombstone>,
+    tombstone_order: BinaryHeap<TombstoneOrderKey>,
+}
+
+impl QueryRegistry {
+    fn get(&self, query_id: &QueryId) -> Option<&RegistryEntry> {
+        self.by_id.get(query_id)
+    }
+
+    fn insert(&mut self, query_id: QueryId, entry: RegistryEntry) {
+        debug_assert!(!self.tombstones.contains_key(&query_id));
+        debug_assert!(self.by_id.insert(query_id, entry).is_none());
+    }
+
+    fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    fn controls(&self) -> Vec<Arc<QueryControl>> {
+        self.by_id
+            .values()
+            .map(|entry| Arc::clone(&entry.control))
+            .collect()
+    }
+
+    fn is_query_id_reserved(&self, query_id: QueryId) -> bool {
+        self.by_id.contains_key(&query_id) || self.tombstones.contains_key(&query_id)
+    }
+
+    fn take_snapshot_root(
+        &mut self,
+        query_id: QueryId,
+        generation: u64,
+    ) -> Option<Arc<SharedSnapshotOwnership>> {
+        self.by_id
+            .get_mut(&query_id)
+            .filter(|entry| entry.control.generation == generation)
+            .and_then(|entry| entry.snapshot_root.take())
+    }
+
+    fn record_drained_terminal(
+        &mut self,
+        query_id: QueryId,
+        finished_at_ns: u64,
+        generation: u64,
+    ) -> bool {
+        if self.is_current_generation(query_id, generation) {
+            self.drained_terminal_order
+                .push(Reverse((finished_at_ns, query_id, generation)));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_expired_terminal(&mut self, now_ns: u64, retention_ns: u64) {
+        loop {
+            self.discard_stale_terminal_entries();
+            let Some(Reverse((finished_at_ns, query_id, generation))) =
+                self.drained_terminal_order.peek().copied()
+            else {
+                return;
+            };
+            if now_ns.saturating_sub(finished_at_ns) < retention_ns {
+                return;
+            }
+            if !self.is_current_drained_generation(query_id, generation) {
+                return;
+            }
+            self.drained_terminal_order.pop();
+            self.by_id.remove(&query_id);
+        }
+    }
+
+    fn evict_oldest_terminal(
+        &mut self,
+        now_ns: u64,
+        retention_ns: u64,
+        max_tombstones: usize,
+    ) -> CapacityEviction {
+        self.discard_stale_terminal_entries();
+        let Some(Reverse((finished_at_ns, query_id, generation))) =
+            self.drained_terminal_order.peek().copied()
+        else {
+            return CapacityEviction::NoTerminal;
+        };
+        if !self.is_current_drained_generation(query_id, generation) {
+            return CapacityEviction::NoTerminal;
+        }
+        self.remove_expired_tombstones(now_ns);
+        if self.tombstones.len() >= max_tombstones {
+            return CapacityEviction::TombstoneCapacityExhausted;
+        }
+        self.drained_terminal_order.pop();
+        self.by_id.remove(&query_id);
+        let expires_at_ns = finished_at_ns.saturating_add(retention_ns);
+        if expires_at_ns > now_ns {
+            let previous = self.tombstones.insert(
+                query_id,
+                QueryTombstone {
+                    expires_at_ns,
+                    generation,
+                },
+            );
+            debug_assert!(previous.is_none());
+            self.tombstone_order
+                .push(Reverse((expires_at_ns, query_id, generation)));
+        }
+        CapacityEviction::Evicted
+    }
+
+    fn discard_stale_terminal_entries(&mut self) {
+        while let Some(Reverse((_, query_id, generation))) =
+            self.drained_terminal_order.peek().copied()
+        {
+            if self.is_current_generation(query_id, generation) {
+                return;
+            }
+            self.drained_terminal_order.pop();
+        }
+    }
+
+    fn is_current_generation(&self, query_id: QueryId, generation: u64) -> bool {
+        self.by_id
+            .get(&query_id)
+            .is_some_and(|entry| entry.control.generation == generation)
+    }
+
+    fn is_current_drained_generation(&self, query_id: QueryId, generation: u64) -> bool {
+        self.by_id.get(&query_id).is_some_and(|entry| {
+            entry.control.generation == generation && entry.snapshot_root.is_none()
+        })
+    }
+
+    fn remove_expired_tombstones(&mut self, now_ns: u64) {
+        loop {
+            self.discard_stale_tombstone_entries();
+            let Some(Reverse((expires_at_ns, query_id, generation))) =
+                self.tombstone_order.peek().copied()
+            else {
+                return;
+            };
+            if expires_at_ns > now_ns {
+                return;
+            }
+            self.tombstone_order.pop();
+            if self.is_current_tombstone(query_id, expires_at_ns, generation) {
+                self.tombstones.remove(&query_id);
+            }
+        }
+    }
+
+    fn discard_stale_tombstone_entries(&mut self) {
+        while let Some(Reverse((expires_at_ns, query_id, generation))) =
+            self.tombstone_order.peek().copied()
+        {
+            if self.is_current_tombstone(query_id, expires_at_ns, generation) {
+                return;
+            }
+            self.tombstone_order.pop();
+        }
+    }
+
+    fn is_current_tombstone(&self, query_id: QueryId, expires_at_ns: u64, generation: u64) -> bool {
+        self.tombstones.get(&query_id).is_some_and(|tombstone| {
+            tombstone.generation == generation && tombstone.expires_at_ns == expires_at_ns
+        })
     }
 }
 
@@ -298,7 +546,7 @@ impl Default for CoordinatorState {
     fn default() -> Self {
         Self {
             lifecycle: QueryServiceLifecycle::Accepting,
-            registry: HashMap::new(),
+            registry: QueryRegistry::default(),
             active_logical_queries: 0,
             active_tasks: 0,
             active_cpu_slots: 0,
@@ -309,14 +557,12 @@ impl Default for CoordinatorState {
 }
 
 impl CoordinatorState {
-    fn prune_registry(&mut self) {
-        self.registry.retain(|_, entry| entry.is_live());
-    }
-
-    fn take_snapshot_root(&mut self, query_id: QueryId) -> Option<Arc<SharedSnapshotOwnership>> {
-        self.registry
-            .get_mut(&query_id)
-            .and_then(|entry| entry.snapshot_root.take())
+    fn take_snapshot_root(
+        &mut self,
+        query_id: QueryId,
+        generation: u64,
+    ) -> Option<Arc<SharedSnapshotOwnership>> {
+        self.registry.take_snapshot_root(query_id, generation)
     }
 
     fn refresh_shutdown(&mut self) {
@@ -329,8 +575,7 @@ impl CoordinatorState {
         }
     }
 
-    fn status(&mut self) -> QueryServiceStatus {
-        self.prune_registry();
+    fn status(&self) -> QueryServiceStatus {
         QueryServiceStatus {
             lifecycle: self.lifecycle,
             registered_queries: self.registry.len(),
@@ -339,11 +584,59 @@ impl CoordinatorState {
             active_cpu_slots: self.active_cpu_slots,
             active_memory_bytes: self.active_memory_bytes,
             active_snapshot_owners: self.active_snapshot_owners,
+            query_tombstones: self.registry.tombstones.len(),
         }
     }
 }
 
 impl CoordinatorInner {
+    fn next_query_generation(&self) -> u64 {
+        self.next_query_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .expect("QueryService query generation space exhausted")
+    }
+
+    fn prepare_registry_for_registration(
+        &self,
+        registry: &mut QueryRegistry,
+        now_ns: u64,
+        query_id: QueryId,
+    ) -> Result<()> {
+        if registry.len() < self.max_registered_queries {
+            return Ok(());
+        }
+        registry.remove_expired_terminal(now_ns, self.terminal_retention_ns);
+        if registry.len() < self.max_registered_queries {
+            return Ok(());
+        }
+        match registry.evict_oldest_terminal(
+            now_ns,
+            self.terminal_retention_ns,
+            self.max_query_tombstones,
+        ) {
+            CapacityEviction::Evicted => Ok(()),
+            CapacityEviction::NoTerminal => Err(exhausted(
+                query_id,
+                format!(
+                    "query registry is full with non-drained work limit=[{}]",
+                    self.max_registered_queries
+                ),
+            )),
+            CapacityEviction::TombstoneCapacityExhausted => Err(exhausted(
+                query_id,
+                format!(
+                    concat!(
+                        "query tombstone capacity is exhausted limit=[{}]; ",
+                        "identity reuse remains blocked until retention expires"
+                    ),
+                    self.max_query_tombstones
+                ),
+            )),
+        }
+    }
+
     fn begin_execution(&self, control: &Arc<QueryControl>, now_ns: u64) -> Result<()> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
@@ -368,8 +661,9 @@ impl CoordinatorInner {
                 &mut query,
                 QueryState::TimedOut,
                 Some(error.clone()),
+                now_ns,
             );
-            let snapshot_root = global.take_snapshot_root(control.query_id);
+            let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
             drop(query);
             drop(global);
             release_snapshot_root(snapshot_root);
@@ -452,9 +746,7 @@ impl CoordinatorInner {
         global.active_tasks -= 1;
         global.active_cpu_slots -= cpu_slots;
         global.active_memory_bytes -= memory_bytes;
-        let snapshot_root = (query.state.is_terminal() && query.active_tasks == 0)
-            .then(|| global.take_snapshot_root(control.query_id))
-            .flatten();
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         global.refresh_shutdown();
         drop(query);
         drop(global);
@@ -490,8 +782,15 @@ impl CoordinatorInner {
                     .with_query_id(control.query_id),
             );
         }
-        Self::terminate_locked(&mut global, control, &mut query, QueryState::Finished, None);
-        let snapshot_root = global.take_snapshot_root(control.query_id);
+        Self::terminate_locked(
+            &mut global,
+            control,
+            &mut query,
+            QueryState::Finished,
+            None,
+            now_ns(),
+        );
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         drop(query);
         drop(global);
         release_snapshot_root(snapshot_root);
@@ -508,13 +807,18 @@ impl CoordinatorInner {
         let control = global
             .registry
             .get(&query_id)
-            .and_then(|entry| entry.control.upgrade())
+            .map(|entry| Arc::clone(&entry.control))
             .ok_or_else(|| not_found(query_id))?;
         let mut query = control.state.lock().unwrap();
-        Self::terminate_locked(&mut global, &control, &mut query, terminal, Some(error));
-        let snapshot_root = (query.active_tasks == 0)
-            .then(|| global.take_snapshot_root(query_id))
-            .flatten();
+        Self::terminate_locked(
+            &mut global,
+            &control,
+            &mut query,
+            terminal,
+            Some(error),
+            now_ns(),
+        );
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, &control, &mut query);
         drop(query);
         drop(global);
         release_snapshot_root(snapshot_root);
@@ -529,10 +833,15 @@ impl CoordinatorInner {
     ) {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
-        Self::terminate_locked(&mut global, control, &mut query, terminal, Some(error));
-        let snapshot_root = (query.active_tasks == 0)
-            .then(|| global.take_snapshot_root(control.query_id))
-            .flatten();
+        Self::terminate_locked(
+            &mut global,
+            control,
+            &mut query,
+            terminal,
+            Some(error),
+            now_ns(),
+        );
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         drop(query);
         drop(global);
         release_snapshot_root(snapshot_root);
@@ -544,6 +853,7 @@ impl CoordinatorInner {
         query: &mut QueryControlState,
         terminal: QueryState,
         error: Option<ServerError>,
+        finished_at_ns: u64,
     ) -> bool {
         if query.state.is_terminal() {
             return false;
@@ -553,6 +863,7 @@ impl CoordinatorInner {
         debug_assert_eq!(terminal == QueryState::Finished, error.is_none());
         query.state = terminal;
         query.error = error;
+        query.finished_at_ns = Some(finished_at_ns);
         if query.logical_admitted {
             query.logical_admitted = false;
             debug_assert!(global.active_logical_queries > 0);
@@ -565,14 +876,31 @@ impl CoordinatorInner {
         true
     }
 
+    fn retire_terminal_if_drained(
+        global: &mut CoordinatorState,
+        control: &QueryControl,
+        query: &mut QueryControlState,
+    ) -> Option<Arc<SharedSnapshotOwnership>> {
+        if !query.state.is_terminal() || query.active_tasks != 0 {
+            return None;
+        }
+        let snapshot_root = global.take_snapshot_root(control.query_id, control.generation);
+        if !query.retention_scheduled {
+            let finished_at_ns = query
+                .finished_at_ns
+                .expect("terminal query records its completion time");
+            query.retention_scheduled = global.registry.record_drained_terminal(
+                control.query_id,
+                finished_at_ns,
+                control.generation,
+            );
+        }
+        snapshot_root
+    }
+
     fn sweep_expired(&self, now_ns: u64) -> usize {
         let mut global = self.state.lock().unwrap();
-        global.prune_registry();
-        let controls = global
-            .registry
-            .values()
-            .filter_map(|entry| entry.control.upgrade())
-            .collect::<Vec<_>>();
+        let controls = global.registry.controls();
         let mut expired = 0;
         let mut snapshot_roots = Vec::new();
         for control in controls {
@@ -597,15 +925,20 @@ impl CoordinatorInner {
                     &mut query,
                     QueryState::TimedOut,
                     Some(error),
+                    now_ns,
                 );
                 expired += usize::from(terminated);
-                if terminated && query.active_tasks == 0 {
-                    if let Some(root) = global.take_snapshot_root(control.query_id) {
-                        snapshot_roots.push(root);
-                    }
+                if let Some(root) =
+                    Self::retire_terminal_if_drained(&mut global, &control, &mut query)
+                {
+                    snapshot_roots.push(root);
                 }
             }
         }
+        global
+            .registry
+            .remove_expired_terminal(now_ns, self.terminal_retention_ns);
+        global.registry.remove_expired_tombstones(now_ns);
         drop(global);
         for root in snapshot_roots {
             root.release();
@@ -618,12 +951,9 @@ impl CoordinatorInner {
         if global.lifecycle == QueryServiceLifecycle::Accepting {
             global.lifecycle = QueryServiceLifecycle::Draining;
         }
-        let controls = global
-            .registry
-            .values()
-            .filter_map(|entry| entry.control.upgrade())
-            .collect::<Vec<_>>();
+        let controls = global.registry.controls();
         let mut snapshot_roots = Vec::new();
+        let finished_at_ns = now_ns();
         for control in controls {
             let mut query = control.state.lock().unwrap();
             let error = ServerError::new(
@@ -637,11 +967,11 @@ impl CoordinatorInner {
                 &mut query,
                 QueryState::Cancelled,
                 Some(error),
+                finished_at_ns,
             );
-            if query.active_tasks == 0 {
-                if let Some(root) = global.take_snapshot_root(control.query_id) {
-                    snapshot_roots.push(root);
-                }
+            if let Some(root) = Self::retire_terminal_if_drained(&mut global, &control, &mut query)
+            {
+                snapshot_roots.push(root);
             }
         }
         global.refresh_shutdown();
@@ -663,17 +993,19 @@ impl CoordinatorInner {
             .unwrap()
             .registry
             .get(&query_id)
-            .and_then(|entry| entry.control.upgrade())
+            .map(|entry| Arc::clone(&entry.control))
             .ok_or_else(|| not_found(query_id))?;
         let query = control.state.lock().unwrap();
         Ok(QueryRuntimeStatus {
             query_id,
+            generation: control.generation,
             state: query.state,
             logical_admitted: query.logical_admitted,
             active_tasks: query.active_tasks,
             active_cpu_slots: query.active_cpu_slots,
             active_memory_bytes: query.active_memory_bytes,
             cancellation_requested: control.cancelled.load(Ordering::Acquire),
+            finished_at_ns: query.finished_at_ns,
             error: query.error.clone(),
         })
     }
@@ -683,11 +1015,7 @@ impl Drop for CoordinatorInner {
     fn drop(&mut self) {
         if let Ok(global) = self.state.get_mut() {
             global.lifecycle = QueryServiceLifecycle::Stopped;
-            for control in global
-                .registry
-                .values()
-                .filter_map(|entry| entry.control.upgrade())
-            {
+            for control in global.registry.controls() {
                 control.cancelled.store(true, Ordering::Release);
                 if let Ok(mut query) = control.state.lock() {
                     if !query.state.is_terminal() {
@@ -710,6 +1038,7 @@ impl Drop for CoordinatorInner {
 struct QueryControl {
     owner: Weak<CoordinatorInner>,
     query_id: QueryId,
+    generation: u64,
     budget: QueryResourceBudget,
     plan_expires_at_ns: u64,
     execution_deadline_ns: Option<u64>,
@@ -723,6 +1052,8 @@ struct QueryControlState {
     active_tasks: usize,
     active_cpu_slots: u32,
     active_memory_bytes: u64,
+    finished_at_ns: Option<u64>,
+    retention_scheduled: bool,
     error: Option<ServerError>,
 }
 
@@ -734,6 +1065,8 @@ impl Default for QueryControlState {
             active_tasks: 0,
             active_cpu_slots: 0,
             active_memory_bytes: 0,
+            finished_at_ns: None,
+            retention_scheduled: false,
             error: None,
         }
     }
@@ -1013,6 +1346,18 @@ impl<R: Send + 'static> Drop for QueryTaskPermit<R> {
     }
 }
 
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn next_nonce() -> u64 {
     NEXT_COORDINATOR_NONCE
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
@@ -1089,13 +1434,14 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use zippy_types::storage::{QueryReadSnapshotDescriptor, QueryReadSnapshotGuard};
     use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, SessionId};
 
     use super::{
         QueryResourceBudget, QueryResourceCoordinator, QueryServiceLifecycle,
-        QueryServiceResourceConfig, QueryTaskCharge,
+        QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryTaskCharge,
     };
 
     struct TestSnapshot {
@@ -1167,6 +1513,18 @@ mod tests {
         }
     }
 
+    fn registry_config(
+        max_registered_queries: usize,
+        max_query_tombstones: usize,
+        terminal_retention: Duration,
+    ) -> QueryServiceRegistryConfig {
+        QueryServiceRegistryConfig {
+            terminal_retention,
+            max_registered_queries,
+            max_query_tombstones,
+        }
+    }
+
     fn info(query_id: QueryId, expires_at_ns: u64) -> zippy_types::query::QueryPlanInfo {
         zippy_types::query::QueryPlanInfo {
             query_id,
@@ -1220,14 +1578,20 @@ mod tests {
             .unwrap();
         {
             let state = coordinator.inner.state.lock().unwrap();
-            assert_eq!(state.registry[&id].control.strong_count(), 1);
-            assert!(state.registry[&id].snapshot_root.is_some());
+            let entry = state.registry.get(&id).unwrap();
+            assert_eq!(Arc::strong_count(&entry.control), 2);
+            assert!(entry.snapshot_root.is_some());
         }
         drop(token);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_logical_queries, 0);
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(
+            coordinator.query_status(id).unwrap().state,
+            zippy_types::query::QueryState::Cancelled
+        );
+        assert_eq!(coordinator.sweep_expired(u64::MAX), 0);
         assert_eq!(coordinator.status().registered_queries, 0);
-        assert_eq!(coordinator.sweep_expired(200), 0);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
@@ -1466,6 +1830,336 @@ mod tests {
         drop(token);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.sweep_expired(30), 0);
+    }
+
+    #[test]
+    fn capacity_eviction_retains_query_id_tombstone_until_original_deadline() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 8, Duration::from_secs(1)),
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let expires_at = now.saturating_add(10_000_000_000);
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+
+        let first = coordinator
+            .register_planned(
+                info(first_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                now,
+            )
+            .unwrap();
+        drop(first);
+        let second = coordinator
+            .register_planned(
+                info(second_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                super::now_ns(),
+            )
+            .unwrap();
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(coordinator.status().query_tombstones, 1);
+
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        let reserved = coordinator
+            .register_planned(
+                info(first_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(first_id, Arc::clone(&rejected_drops)),
+                super::now_ns(),
+            )
+            .err()
+            .expect("early eviction must reserve the original query identifier");
+        assert_eq!(reserved.code(), ErrorCode::Conflict);
+        assert_eq!(rejected_drops.load(Ordering::Relaxed), 1);
+
+        drop(second);
+        let after_retention = now.saturating_add(2_000_000_000);
+        assert_eq!(coordinator.sweep_expired(after_retention), 0);
+        assert_eq!(coordinator.status().registered_queries, 0);
+        assert_eq!(coordinator.status().query_tombstones, 0);
+        let reused = coordinator
+            .register_planned(
+                info(first_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                after_retention,
+            )
+            .expect("query identifier becomes reusable after its full retention window");
+        drop(reused);
+    }
+
+    #[test]
+    fn tombstone_capacity_exhaustion_fails_closed() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 1, Duration::from_secs(30)),
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let expires_at = now.saturating_add(60_000_000_000);
+
+        let first_id = query_id(1);
+        let first = coordinator
+            .register_planned(
+                info(first_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                now,
+            )
+            .unwrap();
+        drop(first);
+
+        let second_id = query_id(2);
+        let second = coordinator
+            .register_planned(
+                info(second_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                super::now_ns(),
+            )
+            .unwrap();
+        drop(second);
+
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        let third_id = query_id(3);
+        let exhausted = coordinator
+            .register_planned(
+                info(third_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(third_id, Arc::clone(&rejected_drops)),
+                super::now_ns(),
+            )
+            .err()
+            .expect("unsafe identity eviction must fail when tombstones are full");
+        assert_eq!(exhausted.code(), ErrorCode::ResourceExhausted);
+        assert!(exhausted.message().contains("tombstone capacity"));
+        assert_eq!(rejected_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(coordinator.status().query_tombstones, 1);
+        assert_eq!(
+            coordinator.query_status(second_id).unwrap().state,
+            zippy_types::query::QueryState::Cancelled
+        );
+    }
+
+    #[test]
+    fn terminal_churn_keeps_registry_and_order_heaps_bounded() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(2, 16, Duration::from_secs(30)),
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let expires_at = now.saturating_add(60_000_000_000);
+
+        for value in 1..=10 {
+            let id = query_id(value);
+            let token = coordinator
+                .register_planned(
+                    info(id, expires_at),
+                    session_id(1),
+                    None,
+                    budget(),
+                    snapshot(id, Arc::new(AtomicUsize::new(0))),
+                    super::now_ns(),
+                )
+                .unwrap();
+            drop(token);
+        }
+
+        let state = coordinator.inner.state.lock().unwrap();
+        assert_eq!(state.registry.by_id.len(), 2);
+        assert_eq!(state.registry.drained_terminal_order.len(), 2);
+        assert_eq!(state.registry.tombstones.len(), 8);
+        assert_eq!(state.registry.tombstone_order.len(), 8);
+    }
+
+    #[test]
+    fn non_drained_terminal_query_is_not_capacity_evicted() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 8, Duration::from_secs(30)),
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let expires_at = now.saturating_add(60_000_000_000);
+        let first_id = query_id(1);
+        let token = coordinator
+            .register_planned(
+                info(first_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                now,
+            )
+            .unwrap();
+        let execution = coordinator
+            .begin_execution(token, now.saturating_add(1))
+            .unwrap();
+        let task = execution.admit_task(charge(1, 1), ()).unwrap();
+        coordinator.cancel(first_id).unwrap();
+        drop(execution);
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(coordinator.status().query_tombstones, 0);
+
+        let blocked_id = query_id(2);
+        let blocked = coordinator
+            .register_planned(
+                info(blocked_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(blocked_id, Arc::new(AtomicUsize::new(0))),
+                super::now_ns(),
+            )
+            .err()
+            .expect("a non-drained physical task must keep replacement admission bounded");
+        assert_eq!(blocked.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(coordinator.status().query_tombstones, 0);
+
+        drop(task);
+        let replacement = coordinator
+            .register_planned(
+                info(blocked_id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(blocked_id, Arc::new(AtomicUsize::new(0))),
+                super::now_ns(),
+            )
+            .expect("drained terminal work becomes safely capacity-evictable");
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(coordinator.status().query_tombstones, 1);
+        drop(replacement);
+    }
+
+    #[test]
+    fn old_plan_token_cannot_release_reused_query_generation() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 8, Duration::from_secs(1)),
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let expires_at = now.saturating_add(10_000_000_000);
+        let id = query_id(1);
+        let old_drops = Arc::new(AtomicUsize::new(0));
+        let old_token = coordinator
+            .register_planned(
+                info(id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&old_drops)),
+                now,
+            )
+            .unwrap();
+        let old_generation = coordinator.query_status(id).unwrap().generation;
+        coordinator.cancel(id).unwrap();
+        assert_eq!(old_drops.load(Ordering::Relaxed), 1);
+
+        let reuse_at = now.saturating_add(2_000_000_000);
+        assert_eq!(coordinator.status().registered_queries, 1);
+        let new_drops = Arc::new(AtomicUsize::new(0));
+        let new_token = coordinator
+            .register_planned(
+                info(id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&new_drops)),
+                reuse_at,
+            )
+            .unwrap();
+        let new_status = coordinator.query_status(id).unwrap();
+        assert!(new_status.generation > old_generation);
+        assert_eq!(new_status.state, zippy_types::query::QueryState::Planned);
+
+        drop(old_token);
+        let unaffected = coordinator.query_status(id).unwrap();
+        assert_eq!(unaffected.generation, new_status.generation);
+        assert_eq!(unaffected.state, zippy_types::query::QueryState::Planned);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.status().active_logical_queries, 1);
+        assert_eq!(coordinator.status().active_snapshot_owners, 1);
+
+        drop(new_token);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_logical_queries, 0);
+    }
+
+    #[test]
+    fn old_execution_scope_cannot_cancel_reused_query_generation() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 8, Duration::from_secs(1)),
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let expires_at = now.saturating_add(10_000_000_000);
+        let id = query_id(1);
+        let old_drops = Arc::new(AtomicUsize::new(0));
+        let old_token = coordinator
+            .register_planned(
+                info(id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&old_drops)),
+                now,
+            )
+            .unwrap();
+        let old_execution = coordinator
+            .begin_execution(old_token, now.saturating_add(1))
+            .unwrap();
+        let old_generation = coordinator.query_status(id).unwrap().generation;
+        coordinator.cancel(id).unwrap();
+        assert_eq!(old_drops.load(Ordering::Relaxed), 1);
+
+        let reuse_at = now.saturating_add(2_000_000_000);
+        let new_drops = Arc::new(AtomicUsize::new(0));
+        let new_token = coordinator
+            .register_planned(
+                info(id, expires_at),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&new_drops)),
+                reuse_at,
+            )
+            .unwrap();
+        let new_generation = coordinator.query_status(id).unwrap().generation;
+        assert!(new_generation > old_generation);
+
+        drop(old_execution);
+        let unaffected = coordinator.query_status(id).unwrap();
+        assert_eq!(unaffected.generation, new_generation);
+        assert_eq!(unaffected.state, zippy_types::query::QueryState::Planned);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.status().active_logical_queries, 1);
+
+        drop(new_token);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 1);
     }
 
     #[test]

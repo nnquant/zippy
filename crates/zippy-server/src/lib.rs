@@ -15,7 +15,7 @@ mod health;
 mod legacy_catalog_migration;
 mod legacy_query;
 mod native_storage;
-// Q0_REMOVE_DEAD_CODE_ALLOW: remove when the native planner constructs this coordinator.
+// Remove this allowance when the native planner constructs the coordinator directly.
 #[allow(dead_code)]
 mod query_service;
 #[allow(dead_code)]

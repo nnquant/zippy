@@ -1980,6 +1980,19 @@ Catalog 与 data-root capability。即使调用方保留了 shutdown 前克隆�
 只完成 persisted files 的生命周期绑定；active/sealed segment guard、DataFusion operator 取消传播以及
 Gateway compatibility reader 的能力化仍分别属于后续 query、ingest 和 authority 切换工作。
 
+QueryService registry 已从弱引用清理骨架升级为强持有、严格有界的 retained registry。每个查询实例除
+`QueryId` 外还有进程内单调 `generation`；terminal status 默认保留 5 分钟，registry 默认最多 4096 条。
+容量满时只允许淘汰已经 terminal、physical task 为零且 snapshot root 已从 registry 分离的最老记录，并
+为提前淘汰的 QueryId 保留到原 retention 截止时间的 tombstone；tombstone 默认上限 65,536，耗尽时
+fail closed。所有 snapshot root 操作同时校验 QueryId 和 generation，因此 retention 到期后即使旧 plan
+token 或 execution scope 仍被调用方持有，它们的 drop/cancel 也不能释放或终止同 ID 的新查询实例。
+仍有 physical task 的 terminal query 不进入可淘汰堆，避免以缩小 registry 为名提前复用身份或丢失 pin
+撤销根。终态保留只保留控制状态，不保留已经可释放的 snapshot、task、CPU 或 memory 预算。
+
+这一小步尚未完成托管 sweeper、deadline 有序调度、可唤醒 cancellation token、session/owner 鉴权和完整
+QueryStatus/metrics；当前 `sweep_expired` 仍是显式调用并扫描 registry。这些能力必须在接入真实
+DataFusion physical task 前完成，不能把现有 registry 视为 Phase 5 query lifecycle 全部验收。
+
 任务：
 
 1. 定义 `DataFileDescriptor` 和 checksum contract。
