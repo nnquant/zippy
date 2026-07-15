@@ -8,6 +8,7 @@ bytes.workspace = true
 datafusion.workspace = true
 parquet.workspace = true
 tokio.workspace = true
+zippy-types = { path = "../zippy-types" }
 
 [dev-dependencies]
 arrow.workspace = true

@@ -3603,6 +3603,7 @@ dependencies = [
  "datafusion",
  "parquet",
  "tokio",
+ "zippy-types",
 ]
 
 [[package]]

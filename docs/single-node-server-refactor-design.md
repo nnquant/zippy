@@ -2217,10 +2217,26 @@ drop future 后第二个 job 必须等待真实 I/O 退出，server 真实 persi
 metadata 路径。同一个 admitted source 在执行层只能选择同步或异步 adapter 之一，不能并发混用，因为该
 operation gate 只约束 async blocking job；生产 DataFusion 路径固定使用异步 adapter。
 
-这一阶段尚未实现 DataFusion `ParquetFileReaderFactory`。后续 factory 的 `FileMeta.location` 只能作为 opaque
-query-file key 在 capability-free manifest 中查表，不能编码真实路径；`create_reader` 必须先通过 execution
-admission 派生 file task，实际 open/checksum 仍延迟到 blocking job。`ZippyTableProvider`、projection/filter
-physical plan、多文件调度与 result stream 仍未完成。
+Stage 5.4b capability-free persisted planning primitive 已完成（2026-07-15）：
+`PersistedFileKey` 把 Query snapshot 中的 table/file scan ordinal 与稳定 `TableId/FileId` 绑定，
+`PersistedFileDescription` 再保存 snapshot/schema version、文件大小和行数；所有字段都是纯值，不包含 Catalog
+物理位置、reader、pin、callback 或 runtime capability。`PersistedTableDescription` 验证 ordinal 连续性、身份和
+版本一致性、重复文件及 `usize`/聚合溢出，同时保留 Catalog 计算的 decoded-schema memory charge，供执行准入
+使用。Arrow schema metadata 属于逻辑 schema，原样保留，但不能被解释为物理文件定位能力。
+
+`ZippyTableProvider` 只生成 planning-only `ParquetExec`：`FileMeta.location` 是单段 synthetic key，typed
+extension 携带同一纯文件描述，私有 marker factory 对任何 persisted-file I/O 都 fail closed。Filter pushdown
+声明为 `Inexact`，Parquet predicate 仅做 pruning，DataFusion 必须保留上层精确 `FilterExec`；有 filter 时不能
+向 scan 下推 limit。file-range repartition 已关闭，当前所有文件放进一个执行 partition；DataFusion 仍可能
+预打开下一个文件，因此并发硬边界始终是 QueryService file-task/CPU admission，而不是 file group 数量。
+空表使用 projected `EmptyExec`，无需虚构 reader capability。
+
+长期 QueryService token 仍不得保存 DataFusion `ExecutionPlan/Expr`、`TaskContext/SessionState/RuntimeEnv` 或
+真实 reader factory；这些对象可能携带 UDF、object-store、memory-pool 和 spill 能力。下一阶段在
+`begin_execution` 之后从同一 snapshot 投影 table description，创建受限 execution context，再把完整物理树中
+的 marker factory 全部替换为持 `Weak<NativeExecutionLease>` 的 server factory。factory 必须联合核验 typed
+extension、synthetic location、table/file ordinal、ID、snapshot/schema version、size，并拒绝 missing/unknown
+extension、location mismatch 与 file range；实际 open/checksum 继续延迟到 admitted blocking job。
 
 任务：
 

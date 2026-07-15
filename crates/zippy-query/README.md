@@ -25,6 +25,8 @@ Current scope:
 
 - isolated per-session `SessionContext` creation;
 - explicit optimizer target-partition policy, which is not a hard resource limit;
+- file-range repartitioning is disabled so DataFusion cannot split one admitted file task into
+  unaccounted parallel scan ranges;
 - Arrow ABI and SQL execution compatibility gates;
 - a path-free `AdmittedRandomAccessFile` contract and Parquet `ChunkReader` adapter whose source
   and every derived cursor share one owner. The server implementation places the complete
@@ -38,8 +40,27 @@ Current scope:
   CPU admission. All returned ranges keep the same exact result-memory permits as the synchronous
   adapter. One admitted source must not be scanned concurrently through both its synchronous and
   asynchronous adapters because the operation gate covers async blocking jobs only.
+- capability-free `PersistedTableDescription`, `PersistedFileKey`, and
+  `PersistedFileDescription` manifests. `PersistedFileKey` binds protocol-neutral
+  `TableId`/`FileId` values to exact snapshot scan ordinals; the controlled description
+  constructors add nonzero versions, sizes, row counts, and an Arrow schema, but no physical file
+  location, reader, pinned object, callback, runtime, or arbitrary extension. Logical Arrow
+  schema metadata is preserved and is not treated as a physical locator. Ordinals must be
+  contiguous in Catalog scan order, and file sizes and aggregate statistics are checked against
+  `usize` before DataFusion 44 can truncate them internally. Each table description retains the
+  Catalog-computed decoded-schema memory charge for execution admission.
+- a planning-only `ZippyTableProvider` that emits `ParquetExec` plans over synthetic opaque object
+  keys. Each `FileMeta` carries its typed pure file description as an extension. Filters are
+  declared `Inexact`: Parquet may use the predicate for pruning, while DataFusion retains an exact
+  `FilterExec`. The sealed reader factory always fails closed, so planning performs no I/O and the
+  resulting plan cannot perform persisted-file I/O without a server-owned snapshot binding stage.
+  Empty or optimizer-proven no-I/O plans may still execute. DataFusion 44 exposes one
+  `PartitionedFile.extensions` slot, so this typed identity currently occupies the same slot
+  otherwise used by `ParquetAccessPlan`; row-group access plans must be composed into a future
+  Zippy-owned extension instead of overwriting the identity.
 
-The next scope is a server `ParquetFileReaderFactory` that resolves only opaque query file IDs and a
-snapshot-bound `ZippyTableProvider`, followed by multi-file bounded scheduling, result-stream,
-memory-pool, and spill integration. Neither adapter may receive a raw path or a file handle detached
-from its QueryService permit.
+The next scope is a server binding stage that replaces the planning marker with a
+`ParquetFileReaderFactory` resolving only the typed opaque file identity through a live execution
+lease, followed by multi-file bounded scheduling, result-stream, memory-pool, and spill integration.
+The execution plan must not retain a `TaskContext`, `SessionState`, `RuntimeEnv`, raw path, or a file
+handle detached from its QueryService permit.

@@ -23,6 +23,12 @@ use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::reader::{ChunkReader, Length};
 use tokio::sync::Semaphore;
 
+mod persisted_plan;
+
+pub use persisted_plan::{
+    PersistedFileDescription, PersistedFileKey, PersistedTableDescription, ZippyTableProvider,
+};
+
 const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
 
 /// A path-free random-access file whose lifetime owns query admission and snapshot protection.
@@ -270,7 +276,9 @@ impl QuerySessionPolicy {
     /// Creates an isolated DataFusion session context using this policy.
     #[must_use]
     pub fn create_context(self) -> SessionContext {
-        let config = SessionConfig::new().with_target_partitions(self.target_partitions.get());
+        let config = SessionConfig::new()
+            .with_target_partitions(self.target_partitions.get())
+            .with_repartition_file_scans(false);
         SessionContext::new_with_config(config)
     }
 }
@@ -509,6 +517,14 @@ mod tests {
         let policy = QuerySessionPolicy::new(NonZeroUsize::new(2).unwrap());
         let context = policy.create_context();
         assert_eq!(context.state().config().target_partitions(), 2);
+        assert!(
+            !context
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .repartition_file_scans
+        );
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
