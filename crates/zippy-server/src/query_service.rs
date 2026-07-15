@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 use zippy_types::query::{
-    OpaqueQueryExecutionToken, QueryExecutionToken, QueryPlanInfo, QueryState,
+    OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryExecutionToken, QueryInstanceId,
+    QueryOwnerCapability, QueryPlanInfo, QueryState,
 };
 use zippy_types::storage::OpaqueQueryReadSnapshot;
 use zippy_types::{ErrorCode, QueryId, Result, ServerError, SessionId};
@@ -155,6 +156,7 @@ pub(crate) struct QueryServiceStatus {
 pub(crate) struct QueryRuntimeStatus {
     pub query_id: QueryId,
     pub generation: u64,
+    pub owner_session_id: SessionId,
     pub state: QueryState,
     pub logical_admitted: bool,
     pub active_tasks: usize,
@@ -163,6 +165,15 @@ pub(crate) struct QueryRuntimeStatus {
     pub cancellation_requested: bool,
     pub finished_at_ns: Option<u64>,
     pub error: Option<ServerError>,
+}
+
+impl QueryRuntimeStatus {
+    pub(crate) fn instance_id(&self) -> QueryInstanceId {
+        QueryInstanceId::new(
+            self.query_id,
+            NonZeroU64::new(self.generation).expect("QueryService query generation is nonzero"),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +240,7 @@ impl QueryResourceCoordinator {
             max_registered_queries: registry_config.max_registered_queries,
             max_query_tombstones: registry_config.max_query_tombstones,
             next_query_generation: AtomicU64::new(1),
+            next_owner_nonce: AtomicU64::new(1),
             state: Mutex::new(CoordinatorState::default()),
         });
         let sweeper = Arc::new(QueryServiceSweeper::start(
@@ -238,15 +250,30 @@ impl QueryResourceCoordinator {
         Ok(Self { inner, sweeper })
     }
 
+    pub(crate) fn owner(&self, session_id: SessionId) -> OpaqueQueryOwnerCapability {
+        Box::new(QueryServiceOwner {
+            session_id,
+            coordinator_nonce: self.inner.nonce,
+            owner_nonce: self.inner.next_owner_nonce(),
+        })
+    }
+
+    pub(crate) fn admin_handle(&self) -> QueryAdminHandle {
+        QueryAdminHandle {
+            coordinator: self.clone(),
+        }
+    }
+
     pub(crate) fn register_planned(
         &self,
+        owner: &dyn QueryOwnerCapability,
         info: QueryPlanInfo,
-        owner_session_id: SessionId,
         execution_deadline_ns: Option<u64>,
         budget: QueryResourceBudget,
         snapshot: OpaqueQueryReadSnapshot,
         now_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
+        let owner = self.validate_owner(owner)?;
         let query_id = info.query_id;
         let budget = budget.validate(self.inner.config)?;
         validate_plan_snapshot_binding(&info, snapshot.descriptor())?;
@@ -262,6 +289,8 @@ impl QueryResourceCoordinator {
             owner: Arc::downgrade(&self.inner),
             query_id,
             generation,
+            owner_session_id: owner.session_id,
+            owner_nonce: owner.owner_nonce,
             budget,
             plan_expires_at_ns: info.expires_at_ns,
             execution_deadline_ns,
@@ -320,7 +349,7 @@ impl QueryResourceCoordinator {
         let token: OpaqueQueryExecutionToken = Box::new(QueryServicePlanToken {
             coordinator_nonce: self.inner.nonce,
             info,
-            owner_session_id,
+            owner_session_id: owner.session_id,
             control,
             ownership: Some(ownership),
             armed: true,
@@ -357,13 +386,21 @@ impl QueryResourceCoordinator {
         })
     }
 
-    pub(crate) fn cancel(&self, query_id: QueryId) -> Result<()> {
-        self.inner.terminate_by_id(
-            query_id,
+    pub(crate) fn cancel_owned(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        instance_id: QueryInstanceId,
+    ) -> Result<()> {
+        let owner = self.validate_owner(owner)?;
+        let control = self.inner.control_instance(instance_id)?;
+        control.authorize(owner, instance_id.query_id())?;
+        self.inner.terminate_control(
+            &control,
             QueryState::Cancelled,
-            ServerError::new(ErrorCode::Cancelled, "query cancelled by coordinator")
-                .with_query_id(query_id),
-        )
+            ServerError::new(ErrorCode::Cancelled, "query cancelled by owner")
+                .with_query_id(instance_id.query_id()),
+        );
+        Ok(())
     }
 
     pub(crate) fn sweep_expired(&self, now_ns: u64) -> usize {
@@ -382,14 +419,113 @@ impl QueryResourceCoordinator {
         status
     }
 
-    pub(crate) fn query_status(&self, query_id: QueryId) -> Result<QueryRuntimeStatus> {
-        self.inner.query_status(query_id)
+    pub(crate) fn status_owned(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        instance_id: QueryInstanceId,
+    ) -> Result<QueryRuntimeStatus> {
+        let owner = self.validate_owner(owner)?;
+        let control = self.inner.control_instance(instance_id)?;
+        control.authorize(owner, instance_id.query_id())?;
+        self.inner.query_status(&control)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_planned_for_session(
+        &self,
+        info: QueryPlanInfo,
+        owner_session_id: SessionId,
+        execution_deadline_ns: Option<u64>,
+        budget: QueryResourceBudget,
+        snapshot: OpaqueQueryReadSnapshot,
+        now_ns: u64,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        let owner = self.owner(owner_session_id);
+        self.register_planned(
+            owner.as_ref(),
+            info,
+            execution_deadline_ns,
+            budget,
+            snapshot,
+            now_ns,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_current_for_test(&self, query_id: QueryId) -> Result<()> {
+        let instance_id = self.inner.current_instance_for_test(query_id)?;
+        self.admin_handle().cancel(instance_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn query_status_current_for_test(
+        &self,
+        query_id: QueryId,
+    ) -> Result<QueryRuntimeStatus> {
+        let instance_id = self.inner.current_instance_for_test(query_id)?;
+        self.admin_handle().status(instance_id)
+    }
+
+    fn validate_owner<'a>(
+        &self,
+        owner: &'a dyn QueryOwnerCapability,
+    ) -> Result<&'a QueryServiceOwner> {
+        let owner = owner
+            .as_any()
+            .downcast_ref::<QueryServiceOwner>()
+            .ok_or_else(|| permission_denied("query owner capability has a foreign type", None))?;
+        if owner.coordinator_nonce != self.inner.nonce {
+            return Err(permission_denied(
+                "query owner capability belongs to another QueryService",
+                None,
+            ));
+        }
+        Ok(owner)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct QueryAdminHandle {
+    coordinator: QueryResourceCoordinator,
+}
+
+impl QueryAdminHandle {
+    pub(crate) fn cancel(&self, instance_id: QueryInstanceId) -> Result<()> {
+        let control = self.coordinator.inner.control_instance(instance_id)?;
+        self.coordinator.inner.terminate_control(
+            &control,
+            QueryState::Cancelled,
+            ServerError::new(ErrorCode::Cancelled, "query cancelled by administrator")
+                .with_query_id(instance_id.query_id()),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn status(&self, instance_id: QueryInstanceId) -> Result<QueryRuntimeStatus> {
+        let control = self.coordinator.inner.control_instance(instance_id)?;
+        self.coordinator.inner.query_status(&control)
     }
 }
 
 struct QueryServiceSweeper {
     signal: Arc<QuerySweeperSignal>,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct QueryServiceOwner {
+    session_id: SessionId,
+    coordinator_nonce: u64,
+    owner_nonce: u64,
+}
+
+impl QueryOwnerCapability for QueryServiceOwner {
+    fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 struct QuerySweeperSignal {
@@ -487,6 +623,7 @@ struct CoordinatorInner {
     max_registered_queries: usize,
     max_query_tombstones: usize,
     next_query_generation: AtomicU64,
+    next_owner_nonce: AtomicU64,
     state: Mutex<CoordinatorState>,
 }
 
@@ -819,6 +956,39 @@ impl CoordinatorInner {
             .expect("QueryService query generation space exhausted")
     }
 
+    fn next_owner_nonce(&self) -> u64 {
+        self.next_owner_nonce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+                nonce.checked_add(1)
+            })
+            .expect("QueryService owner nonce space exhausted")
+    }
+
+    fn control_instance(&self, instance_id: QueryInstanceId) -> Result<Arc<QueryControl>> {
+        self.state
+            .lock()
+            .unwrap()
+            .registry
+            .control_for_generation(instance_id.query_id(), instance_id.generation().get())
+            .ok_or_else(|| not_found(instance_id.query_id()))
+    }
+
+    #[cfg(test)]
+    fn current_instance_for_test(&self, query_id: QueryId) -> Result<QueryInstanceId> {
+        let control = self
+            .state
+            .lock()
+            .unwrap()
+            .registry
+            .get(&query_id)
+            .map(|entry| Arc::clone(&entry.control))
+            .ok_or_else(|| not_found(query_id))?;
+        Ok(QueryInstanceId::new(
+            query_id,
+            NonZeroU64::new(control.generation).expect("QueryService query generation is nonzero"),
+        ))
+    }
+
     fn prepare_registry_for_registration(
         &self,
         registry: &mut QueryRegistry,
@@ -1021,35 +1191,6 @@ impl CoordinatorInner {
         Ok(())
     }
 
-    fn terminate_by_id(
-        &self,
-        query_id: QueryId,
-        terminal: QueryState,
-        error: ServerError,
-    ) -> Result<()> {
-        let mut global = self.state.lock().unwrap();
-        let control = global
-            .registry
-            .get(&query_id)
-            .map(|entry| Arc::clone(&entry.control))
-            .ok_or_else(|| not_found(query_id))?;
-        let mut query = control.state.lock().unwrap();
-        let signal = Self::terminate_locked(
-            &mut global,
-            &control,
-            &mut query,
-            terminal,
-            Some(error),
-            now_ns(),
-        );
-        let snapshot_root = Self::retire_terminal_if_drained(&mut global, &control, &mut query);
-        drop(query);
-        drop(global);
-        control.publish_terminal(signal);
-        release_snapshot_root(snapshot_root);
-        Ok(())
-    }
-
     fn terminate_control(
         &self,
         control: &Arc<QueryControl>,
@@ -1228,19 +1369,12 @@ impl CoordinatorInner {
         self.state.lock().unwrap().status()
     }
 
-    fn query_status(&self, query_id: QueryId) -> Result<QueryRuntimeStatus> {
-        let control = self
-            .state
-            .lock()
-            .unwrap()
-            .registry
-            .get(&query_id)
-            .map(|entry| Arc::clone(&entry.control))
-            .ok_or_else(|| not_found(query_id))?;
+    fn query_status(&self, control: &Arc<QueryControl>) -> Result<QueryRuntimeStatus> {
         let query = control.state.lock().unwrap();
         Ok(QueryRuntimeStatus {
-            query_id,
+            query_id: control.query_id,
             generation: control.generation,
+            owner_session_id: control.owner_session_id,
             state: query.state,
             logical_admitted: query.logical_admitted,
             active_tasks: query.active_tasks,
@@ -1301,6 +1435,8 @@ struct QueryControl {
     owner: Weak<CoordinatorInner>,
     query_id: QueryId,
     generation: u64,
+    owner_session_id: SessionId,
+    owner_nonce: u64,
     budget: QueryResourceBudget,
     plan_expires_at_ns: u64,
     execution_deadline_ns: Option<u64>,
@@ -1336,6 +1472,16 @@ impl Default for QueryControlState {
 }
 
 impl QueryControl {
+    fn authorize(&self, owner: &QueryServiceOwner, query_id: QueryId) -> Result<()> {
+        if self.owner_session_id != owner.session_id || self.owner_nonce != owner.owner_nonce {
+            return Err(permission_denied(
+                "query owner capability does not own the query instance",
+                Some(query_id),
+            ));
+        }
+        Ok(())
+    }
+
     fn cancel(self: &Arc<Self>, reason: &'static str) {
         if let Some(owner) = self.owner.upgrade() {
             owner.terminate_control(
@@ -1427,6 +1573,14 @@ impl QueryExecutionToken for QueryServicePlanToken {
 
     fn owner_session_id(&self) -> SessionId {
         self.owner_session_id
+    }
+
+    fn instance_id(&self) -> QueryInstanceId {
+        QueryInstanceId::new(
+            self.info.query_id,
+            NonZeroU64::new(self.control.generation)
+                .expect("QueryService query generation is nonzero"),
+        )
     }
 
     fn into_any(mut self: Box<Self>) -> Box<dyn Any + Send> {
@@ -1713,6 +1867,14 @@ fn not_found(query_id: QueryId) -> ServerError {
         .with_retryable(false)
 }
 
+fn permission_denied(message: impl Into<String>, query_id: Option<QueryId>) -> ServerError {
+    let error = ServerError::new(ErrorCode::PermissionDenied, message).with_retryable(false);
+    match query_id {
+        Some(query_id) => error.with_query_id(query_id),
+        None => error,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -1722,6 +1884,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use zippy_types::query::QueryOwnerCapability;
     use zippy_types::storage::{QueryReadSnapshotDescriptor, QueryReadSnapshotGuard};
     use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, SessionId};
 
@@ -1771,6 +1934,18 @@ mod tests {
     impl Drop for DropProbe {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct ForeignOwner(SessionId);
+
+    impl QueryOwnerCapability for ForeignOwner {
+        fn session_id(&self) -> SessionId {
+            self.0
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 
@@ -1860,12 +2035,156 @@ mod tests {
     }
 
     #[test]
+    fn owner_and_admin_capabilities_require_the_exact_query_instance() {
+        let foreign_coordinator = coordinator(config());
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let same_session_other_owner = coordinator.owner(session_id(1));
+        let other_service_owner = foreign_coordinator.owner(session_id(1));
+        let foreign_type = ForeignOwner(session_id(1));
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned(
+                owner.as_ref(),
+                info(id, 100),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let instance_id = token.instance_id();
+
+        for denied_owner in [
+            same_session_other_owner.as_ref(),
+            other_service_owner.as_ref(),
+            &foreign_type as &dyn QueryOwnerCapability,
+        ] {
+            assert_eq!(
+                coordinator
+                    .status_owned(denied_owner, instance_id)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::PermissionDenied
+            );
+        }
+
+        let owner_status = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(owner_status.instance_id(), instance_id);
+        assert_eq!(owner_status.owner_session_id, session_id(1));
+        assert_eq!(
+            coordinator.admin_handle().status(instance_id).unwrap(),
+            owner_status
+        );
+        coordinator
+            .cancel_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        coordinator
+            .cancel_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), instance_id)
+                .unwrap()
+                .state,
+            QueryState::Cancelled
+        );
+        drop(token);
+    }
+
+    #[test]
+    fn stale_owner_and_admin_instance_cannot_cancel_reused_query_id() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 8, Duration::from_nanos(1)),
+        )
+        .unwrap();
+        let owner = coordinator.owner(session_id(1));
+        let admin = coordinator.admin_handle();
+        let id = query_id(1);
+        let now = super::now_ns();
+        let expires_at_ns = now.saturating_add(60_000_000_000);
+        let old_drops = Arc::new(AtomicUsize::new(0));
+        let old_token = coordinator
+            .register_planned(
+                owner.as_ref(),
+                info(id, expires_at_ns),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&old_drops)),
+                now,
+            )
+            .unwrap();
+        let old_instance = old_token.instance_id();
+        coordinator
+            .cancel_owned(owner.as_ref(), old_instance)
+            .unwrap();
+        assert_eq!(old_drops.load(Ordering::Relaxed), 1);
+        let reuse_at = super::now_ns().saturating_add(2);
+        assert_eq!(coordinator.sweep_expired(reuse_at), 0);
+
+        let new_drops = Arc::new(AtomicUsize::new(0));
+        let new_token = coordinator
+            .register_planned(
+                owner.as_ref(),
+                info(id, expires_at_ns),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&new_drops)),
+                reuse_at,
+            )
+            .unwrap();
+        let new_instance = new_token.instance_id();
+        assert_ne!(old_instance, new_instance);
+
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), old_instance)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            coordinator
+                .cancel_owned(owner.as_ref(), old_instance)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            admin.cancel(old_instance).unwrap_err().code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            admin.status(old_instance).unwrap_err().code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            admin.status(new_instance).unwrap().state,
+            QueryState::Planned
+        );
+        assert_eq!(new_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.status().active_logical_queries, 1);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
+
+        drop(old_token);
+        assert_eq!(
+            admin.status(new_instance).unwrap().state,
+            QueryState::Planned
+        );
+        drop(new_token);
+        assert_eq!(new_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn registry_retains_revocable_snapshot_root_and_plan_drop_releases_once() {
         let coordinator = coordinator(config());
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 100),
                 session_id(1),
                 None,
@@ -1885,7 +2204,7 @@ mod tests {
         assert_eq!(coordinator.status().active_logical_queries, 0);
         assert_eq!(coordinator.status().registered_queries, 1);
         assert_eq!(
-            coordinator.query_status(id).unwrap().state,
+            coordinator.query_status_current_for_test(id).unwrap().state,
             zippy_types::query::QueryState::Cancelled
         );
         assert_eq!(coordinator.sweep_expired(u64::MAX), 0);
@@ -1900,7 +2219,7 @@ mod tests {
         let rejected_drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 100),
                 session_id(1),
                 None,
@@ -1911,7 +2230,7 @@ mod tests {
             .unwrap();
 
         let duplicate = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 100),
                 session_id(1),
                 None,
@@ -1929,7 +2248,7 @@ mod tests {
 
         let mismatched_drops = Arc::new(AtomicUsize::new(0));
         let mismatch = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(query_id(2), 100),
                 session_id(1),
                 None,
@@ -1945,7 +2264,7 @@ mod tests {
 
         let capacity_drops = Arc::new(AtomicUsize::new(0));
         let capacity = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(query_id(2), 100),
                 session_id(1),
                 None,
@@ -1981,7 +2300,7 @@ mod tests {
         let first_id = query_id(1);
         let second_id = query_id(2);
         let first = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, 100),
                 session_id(1),
                 None,
@@ -1991,7 +2310,7 @@ mod tests {
             )
             .unwrap();
         let second = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(second_id, 100),
                 session_id(1),
                 None,
@@ -2043,7 +2362,7 @@ mod tests {
         let replacement_drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 100),
                 session_id(1),
                 None,
@@ -2057,7 +2376,7 @@ mod tests {
             .admit_task(charge(2, 80), DropProbe(Arc::clone(&resource_drops)))
             .unwrap();
 
-        coordinator.cancel(id).unwrap();
+        coordinator.cancel_current_for_test(id).unwrap();
         let status = coordinator.status();
         assert_eq!(status.active_logical_queries, 0);
         assert_eq!(status.active_tasks, 1);
@@ -2066,7 +2385,7 @@ mod tests {
         assert!(task.is_cancelled());
         let replacement_id = query_id(2);
         let blocked_replacement = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(replacement_id, 100),
                 session_id(1),
                 None,
@@ -2087,7 +2406,7 @@ mod tests {
         assert_eq!(resource_drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_tasks, 0);
         let replacement = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(replacement_id, 100),
                 session_id(1),
                 None,
@@ -2106,7 +2425,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 20),
                 session_id(1),
                 None,
@@ -2118,7 +2437,7 @@ mod tests {
 
         assert_eq!(coordinator.sweep_expired(20), 1);
         assert_eq!(
-            coordinator.query_status(id).unwrap().state,
+            coordinator.query_status_current_for_test(id).unwrap().state,
             zippy_types::query::QueryState::TimedOut
         );
         assert_eq!(coordinator.status().active_logical_queries, 0);
@@ -2140,7 +2459,7 @@ mod tests {
         let first_id = query_id(1);
         let second_id = query_id(2);
         let first = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, 100),
                 session_id(1),
                 Some(20),
@@ -2150,7 +2469,7 @@ mod tests {
             )
             .unwrap();
         let second = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(second_id, 100),
                 session_id(1),
                 Some(30),
@@ -2166,18 +2485,27 @@ mod tests {
         assert_eq!(coordinator.sweep_expired(19), 0);
         assert_eq!(coordinator.sweep_expired(20), 1);
         assert_eq!(
-            coordinator.query_status(first_id).unwrap().state,
+            coordinator
+                .query_status_current_for_test(first_id)
+                .unwrap()
+                .state,
             QueryState::TimedOut
         );
         assert_eq!(
-            coordinator.query_status(second_id).unwrap().state,
+            coordinator
+                .query_status_current_for_test(second_id)
+                .unwrap()
+                .state,
             QueryState::Running
         );
         assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         assert_eq!(coordinator.sweep_expired(30), 1);
         assert_eq!(
-            coordinator.query_status(second_id).unwrap().state,
+            coordinator
+                .query_status_current_for_test(second_id)
+                .unwrap()
+                .state,
             QueryState::TimedOut
         );
         assert_eq!(coordinator.status().scheduled_deadlines, 0);
@@ -2200,7 +2528,7 @@ mod tests {
         let id = query_id(1);
         let drops = Arc::new(AtomicUsize::new(0));
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, now.saturating_add(20_000_000)),
                 session_id(1),
                 None,
@@ -2214,7 +2542,8 @@ mod tests {
 
         let wait_deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if coordinator.query_status(id).unwrap().state == QueryState::TimedOut {
+            if coordinator.query_status_current_for_test(id).unwrap().state == QueryState::TimedOut
+            {
                 break;
             }
             assert!(
@@ -2239,7 +2568,7 @@ mod tests {
         let now = super::now_ns();
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, now.saturating_add(60_000_000_000)),
                 session_id(1),
                 None,
@@ -2257,7 +2586,7 @@ mod tests {
         let waiter = tokio::spawn(async move { cancellation.wait_terminal().await });
         tokio::task::yield_now().await;
 
-        coordinator.cancel(id).unwrap();
+        coordinator.cancel_current_for_test(id).unwrap();
         let signal = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("terminal notification must wake without polling")
@@ -2269,9 +2598,9 @@ mod tests {
         assert!(task.is_cancelled());
         assert!(task.cancellation().is_cancelled());
 
-        coordinator.cancel(id).unwrap();
+        coordinator.cancel_current_for_test(id).unwrap();
         assert_eq!(
-            coordinator.query_status(id).unwrap().state,
+            coordinator.query_status_current_for_test(id).unwrap().state,
             QueryState::Cancelled
         );
         drop((execution, task));
@@ -2294,7 +2623,7 @@ mod tests {
         let second_id = query_id(2);
 
         let first = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, expires_at),
                 session_id(1),
                 None,
@@ -2305,7 +2634,7 @@ mod tests {
             .unwrap();
         drop(first);
         let second = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(second_id, expires_at),
                 session_id(1),
                 None,
@@ -2319,7 +2648,7 @@ mod tests {
 
         let rejected_drops = Arc::new(AtomicUsize::new(0));
         let reserved = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, expires_at),
                 session_id(1),
                 None,
@@ -2338,7 +2667,7 @@ mod tests {
         assert_eq!(coordinator.status().registered_queries, 0);
         assert_eq!(coordinator.status().query_tombstones, 0);
         let reused = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, expires_at),
                 session_id(1),
                 None,
@@ -2362,7 +2691,7 @@ mod tests {
 
         let first_id = query_id(1);
         let first = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, expires_at),
                 session_id(1),
                 None,
@@ -2375,7 +2704,7 @@ mod tests {
 
         let second_id = query_id(2);
         let second = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(second_id, expires_at),
                 session_id(1),
                 None,
@@ -2389,7 +2718,7 @@ mod tests {
         let rejected_drops = Arc::new(AtomicUsize::new(0));
         let third_id = query_id(3);
         let exhausted = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(third_id, expires_at),
                 session_id(1),
                 None,
@@ -2405,7 +2734,10 @@ mod tests {
         assert_eq!(coordinator.status().registered_queries, 1);
         assert_eq!(coordinator.status().query_tombstones, 1);
         assert_eq!(
-            coordinator.query_status(second_id).unwrap().state,
+            coordinator
+                .query_status_current_for_test(second_id)
+                .unwrap()
+                .state,
             zippy_types::query::QueryState::Cancelled
         );
     }
@@ -2423,7 +2755,7 @@ mod tests {
         for value in 1..=10 {
             let id = query_id(value);
             let token = coordinator
-                .register_planned(
+                .register_planned_for_session(
                     info(id, expires_at),
                     session_id(1),
                     None,
@@ -2454,7 +2786,7 @@ mod tests {
         let expires_at = now.saturating_add(60_000_000_000);
         let first_id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(first_id, expires_at),
                 session_id(1),
                 None,
@@ -2467,14 +2799,14 @@ mod tests {
             .begin_execution(token, now.saturating_add(1))
             .unwrap();
         let task = execution.admit_task(charge(1, 1), ()).unwrap();
-        coordinator.cancel(first_id).unwrap();
+        coordinator.cancel_current_for_test(first_id).unwrap();
         drop(execution);
         assert_eq!(coordinator.status().registered_queries, 1);
         assert_eq!(coordinator.status().query_tombstones, 0);
 
         let blocked_id = query_id(2);
         let blocked = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(blocked_id, expires_at),
                 session_id(1),
                 None,
@@ -2489,7 +2821,7 @@ mod tests {
 
         drop(task);
         let replacement = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(blocked_id, expires_at),
                 session_id(1),
                 None,
@@ -2515,7 +2847,7 @@ mod tests {
         let id = query_id(1);
         let old_drops = Arc::new(AtomicUsize::new(0));
         let old_token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, expires_at),
                 session_id(1),
                 None,
@@ -2524,15 +2856,18 @@ mod tests {
                 now,
             )
             .unwrap();
-        let old_generation = coordinator.query_status(id).unwrap().generation;
-        coordinator.cancel(id).unwrap();
+        let old_generation = coordinator
+            .query_status_current_for_test(id)
+            .unwrap()
+            .generation;
+        coordinator.cancel_current_for_test(id).unwrap();
         assert_eq!(old_drops.load(Ordering::Relaxed), 1);
 
         let reuse_at = now.saturating_add(2_000_000_000);
         assert_eq!(coordinator.status().registered_queries, 1);
         let new_drops = Arc::new(AtomicUsize::new(0));
         let new_token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, expires_at),
                 session_id(1),
                 None,
@@ -2541,13 +2876,13 @@ mod tests {
                 reuse_at,
             )
             .unwrap();
-        let new_status = coordinator.query_status(id).unwrap();
+        let new_status = coordinator.query_status_current_for_test(id).unwrap();
         assert!(new_status.generation > old_generation);
         assert_eq!(new_status.state, zippy_types::query::QueryState::Planned);
         assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         drop(old_token);
-        let unaffected = coordinator.query_status(id).unwrap();
+        let unaffected = coordinator.query_status_current_for_test(id).unwrap();
         assert_eq!(unaffected.generation, new_status.generation);
         assert_eq!(unaffected.state, zippy_types::query::QueryState::Planned);
         assert_eq!(new_drops.load(Ordering::Relaxed), 0);
@@ -2573,7 +2908,7 @@ mod tests {
         let id = query_id(1);
         let old_drops = Arc::new(AtomicUsize::new(0));
         let old_token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, expires_at),
                 session_id(1),
                 None,
@@ -2585,14 +2920,17 @@ mod tests {
         let old_execution = coordinator
             .begin_execution(old_token, now.saturating_add(1))
             .unwrap();
-        let old_generation = coordinator.query_status(id).unwrap().generation;
-        coordinator.cancel(id).unwrap();
+        let old_generation = coordinator
+            .query_status_current_for_test(id)
+            .unwrap()
+            .generation;
+        coordinator.cancel_current_for_test(id).unwrap();
         assert_eq!(old_drops.load(Ordering::Relaxed), 1);
 
         let reuse_at = now.saturating_add(2_000_000_000);
         let new_drops = Arc::new(AtomicUsize::new(0));
         let new_token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, expires_at),
                 session_id(1),
                 None,
@@ -2601,12 +2939,15 @@ mod tests {
                 reuse_at,
             )
             .unwrap();
-        let new_generation = coordinator.query_status(id).unwrap().generation;
+        let new_generation = coordinator
+            .query_status_current_for_test(id)
+            .unwrap()
+            .generation;
         assert!(new_generation > old_generation);
         assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         drop(old_execution);
-        let unaffected = coordinator.query_status(id).unwrap();
+        let unaffected = coordinator.query_status_current_for_test(id).unwrap();
         assert_eq!(unaffected.generation, new_generation);
         assert_eq!(unaffected.state, zippy_types::query::QueryState::Planned);
         assert_eq!(new_drops.load(Ordering::Relaxed), 0);
@@ -2623,7 +2964,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 100),
                 session_id(1),
                 None,
@@ -2663,7 +3004,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
-            .register_planned(
+            .register_planned_for_session(
                 info(id, 100),
                 session_id(1),
                 None,

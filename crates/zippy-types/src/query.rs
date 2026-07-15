@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -137,6 +137,41 @@ pub enum QueryState {
     TimedOut,
 }
 
+/// One process-local query incarnation identified by caller ID and server generation.
+///
+/// `QueryId` is caller-assigned and may be reused after terminal retention expires. The nonzero
+/// generation prevents delayed status or cancellation requests from targeting a newer incarnation
+/// that happens to reuse the same caller ID. This value is an ABA fence, not authorization; every
+/// control operation must also prove an engine-issued owner or administrator capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct QueryInstanceId {
+    query_id: QueryId,
+    generation: NonZeroU64,
+}
+
+impl QueryInstanceId {
+    /// Creates an exact query-instance identity.
+    #[must_use]
+    pub const fn new(query_id: QueryId, generation: NonZeroU64) -> Self {
+        Self {
+            query_id,
+            generation,
+        }
+    }
+
+    /// Returns the caller-assigned query identifier.
+    #[must_use]
+    pub const fn query_id(self) -> QueryId {
+        self.query_id
+    }
+
+    /// Returns the server-assigned process-local generation.
+    #[must_use]
+    pub const fn generation(self) -> NonZeroU64 {
+        self.generation
+    }
+}
+
 impl QueryState {
     /// Returns true when no further state transition is allowed.
     #[must_use]
@@ -255,6 +290,9 @@ pub trait QueryExecutionToken: Any + Send {
     /// Returns the owner session bound into this one-time token.
     fn owner_session_id(&self) -> SessionId;
 
+    /// Returns the exact query incarnation controlled by this token.
+    fn instance_id(&self) -> QueryInstanceId;
+
     /// Consumes the token into the engine's concrete origin-check boundary.
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
 }
@@ -275,8 +313,13 @@ pub type OpaqueQueryExecutionToken = Box<dyn QueryExecutionToken>;
 /// dropping the stream must cancel remaining operators and release query
 /// snapshot leases exactly once.
 pub trait RecordBatchStream: Send {
-    /// Returns the query whose lease ownership was transferred to this stream.
-    fn query_id(&self) -> QueryId;
+    /// Returns the exact query whose lease ownership was transferred to this stream.
+    fn instance_id(&self) -> QueryInstanceId;
+
+    /// Returns the caller-assigned query identifier.
+    fn query_id(&self) -> QueryId {
+        self.instance_id().query_id()
+    }
 
     /// Returns the stable schema shared by every batch in the stream.
     fn schema(&self) -> SchemaRef;
@@ -296,6 +339,8 @@ pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream>>;
 pub struct QueryStatus {
     /// The query identifier.
     pub query_id: QueryId,
+    /// The server-assigned generation paired with `query_id` for exact control operations.
+    pub generation: NonZeroU64,
     /// The owning client session.
     pub session_id: SessionId,
     /// The current query state.
@@ -314,6 +359,14 @@ pub struct QueryStatus {
     pub metrics: BTreeMap<String, u64>,
     /// A structured failure, cancellation, or timeout summary.
     pub error: Option<crate::ServerError>,
+}
+
+impl QueryStatus {
+    /// Returns the exact query incarnation represented by this status.
+    #[must_use]
+    pub const fn instance_id(&self) -> QueryInstanceId {
+        QueryInstanceId::new(self.query_id, self.generation)
+    }
 }
 
 /// The sole authority for query lifecycle, plans, execution, and cancellation.
@@ -337,18 +390,18 @@ pub trait QueryEngine: Send + Sync {
         token: OpaqueQueryExecutionToken,
     ) -> BoxFuture<'_, Result<SendableRecordBatchStream>>;
 
-    /// Cancels lifecycle phases after proving owner authority.
+    /// Cancels one exact lifecycle incarnation after proving owner authority.
     fn cancel<'a>(
         &'a self,
         owner: &'a dyn QueryOwnerCapability,
-        query_id: QueryId,
+        instance_id: QueryInstanceId,
     ) -> BoxFuture<'a, Result<()>>;
 
-    /// Returns status after proving owner authority.
+    /// Returns status for one exact lifecycle incarnation after proving owner authority.
     fn status<'a>(
         &'a self,
         owner: &'a dyn QueryOwnerCapability,
-        query_id: QueryId,
+        instance_id: QueryInstanceId,
     ) -> BoxFuture<'a, Result<QueryStatus>>;
 }
 
@@ -359,8 +412,8 @@ mod tests {
 
     use super::{
         LogicalPlanEnvelope, OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryEngine,
-        QueryExecutionToken, QueryInput, QueryOwnerCapability, QueryPlanInfo, QueryPriority,
-        QueryRequest, QueryState, QueryTableVersion, SendableRecordBatchStream,
+        QueryExecutionToken, QueryInput, QueryInstanceId, QueryOwnerCapability, QueryPlanInfo,
+        QueryPriority, QueryRequest, QueryState, QueryTableVersion, SendableRecordBatchStream,
     };
     use crate::{QueryId, ResourceLimit, SessionId};
 
@@ -395,6 +448,7 @@ mod tests {
         info: QueryPlanInfo,
         owner_session_id: SessionId,
         instance_nonce: u128,
+        generation: NonZeroU64,
     }
 
     impl QueryExecutionToken for TestToken {
@@ -404,6 +458,10 @@ mod tests {
 
         fn owner_session_id(&self) -> SessionId {
             self.owner_session_id
+        }
+
+        fn instance_id(&self) -> QueryInstanceId {
+            QueryInstanceId::new(self.info.query_id, self.generation)
         }
 
         fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
@@ -420,6 +478,10 @@ mod tests {
 
         fn owner_session_id(&self) -> SessionId {
             self.0.owner_session_id
+        }
+
+        fn instance_id(&self) -> QueryInstanceId {
+            self.0.instance_id()
         }
 
         fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
@@ -493,6 +555,7 @@ mod tests {
             info: test_plan_info(),
             owner_session_id: session_id,
             instance_nonce,
+            generation: NonZeroU64::new(1).unwrap(),
         };
         assert!(engine.accepts_token(Box::new(token(7))));
         assert!(!engine.accepts_token(Box::new(token(8))));
@@ -507,6 +570,23 @@ mod tests {
         assert!(QueryState::Running.can_transition_to(QueryState::Finished));
         assert!(!QueryState::Finished.can_transition_to(QueryState::Running));
         assert!(QueryState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn query_instance_identity_rejects_zero_generation() {
+        let instance =
+            QueryInstanceId::new(QueryId::from_u128(9).unwrap(), NonZeroU64::new(3).unwrap());
+
+        assert_eq!(instance.query_id(), QueryId::from_u128(9).unwrap());
+        assert_eq!(instance.generation().get(), 3);
+        assert_eq!(
+            serde_json::to_string(&instance).unwrap(),
+            r#"{"query_id":"00000000-0000-0000-0000-000000000009","generation":3}"#
+        );
+        assert!(serde_json::from_str::<QueryInstanceId>(
+            r#"{"query_id":"00000000-0000-0000-0000-000000000009","generation":0}"#,
+        )
+        .is_err());
     }
 
     #[test]

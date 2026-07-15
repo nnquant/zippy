@@ -1997,10 +1997,19 @@ QueryService shutdown 会发停止信号并 join，不能遗留 detached sleepin
 global/query 锁内只更新状态，随后在锁外通过 watch channel 发布一次终态通知；physical task permit 可
 取得不暴露 reader capability 的 cancellation handle，既保留低成本 atomic 检查，也能异步等待主动唤醒。
 
-这一小步尚未完成 session/owner 鉴权、完整 QueryStatus/metrics、planning 状态注册以及 DataFusion
-operator/result-stream 的实际取消传播。裸 `cancel(QueryId)` 仍只是 crate 内部协调入口，不能直接暴露为
-生产多租户 API。上述能力必须在接入真实 DataFusion physical task 前完成，不能把现有 registry 视为
-Phase 5 query lifecycle 全部验收。
+查询控制契约不再使用裸 `QueryId`。`QueryInstanceId` 将 caller-assigned ID 与非零 generation 绑定，
+execution token、result stream、status 和 cancel 均携带这一 exact-instance fence；保留期后同 ID 新实例
+出现时，任何旧 owner/admin 请求都返回 `NOT_FOUND`，不会回退命中新 generation。generation 只解决 ABA，
+不等价于授权：native QueryService 的 planned registration 已要求 engine-bound owner capability，并把
+session 与 owner nonce 固化进 control；普通 owner 和 admin 使用不同 handle，同 session 的另一 capability
+也不能读取或取消该实例。仅供单元测试的裸 QueryId helper 在生产构建中不存在。
+
+这一小步仍只覆盖 `Planned` 之后的 native staging 路径。完整 `QueryStatus`、planning 状态注册、session
+资源账本以及 DataFusion operator/result-stream 的实际取消传播尚未完成；不能用 `planned_at` 或登记时间
+冒充 `submitted_at`。下一步必须在 snapshot pin 之前同步 `submit`，立即分配 generation、登记
+`Planning`、返回 generation-bound planning handle，再异步完成 pin/plan。当前 Python/Gateway
+`collect_stream` 仍绕过 native QueryService，也没有可信的 per-connection owner session，因此不能据此
+宣称生产查询已经获得多租户隔离或统一资源治理。
 
 任务：
 

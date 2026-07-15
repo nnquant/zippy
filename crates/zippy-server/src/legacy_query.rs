@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -20,8 +21,8 @@ use zippy_gateway::legacy_query::{LegacyCollectCursor, LegacyCollectFacade, Lega
 use zippy_types::catalog::CatalogRead;
 use zippy_types::query::{
     LogicalPlanEnvelope, OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryEngine,
-    QueryExecutionToken, QueryInput, QueryOwnerCapability, QueryPlanInfo, QueryRequest, QueryState,
-    QueryStatus, RecordBatchStream, SendableRecordBatchStream,
+    QueryExecutionToken, QueryInput, QueryInstanceId, QueryOwnerCapability, QueryPlanInfo,
+    QueryRequest, QueryState, QueryStatus, RecordBatchStream, SendableRecordBatchStream,
 };
 use zippy_types::{
     BoxFuture, ErrorCode, QueryId, ResourceLimit, Result, ServerError, ServerErrorDetails,
@@ -402,12 +403,14 @@ impl QueryEngine for LegacyQueryEngineAdapter {
                 planned_at_ns,
                 expires_at_ns,
             };
+            let generation = self.inner.next_query_generation();
+            let instance_id = query_instance_id(request.query_id, generation);
             let control = Arc::new(QueryControl::new(
                 &request,
                 &info,
                 submitted_at_ns,
                 Arc::downgrade(&self.inner),
-                self.inner.next_query_generation(),
+                generation,
                 owner.owner_nonce,
             ));
             {
@@ -434,6 +437,7 @@ impl QueryEngine for LegacyQueryEngineAdapter {
                 owner_session_id: request.session_id,
                 owner_nonce: owner.owner_nonce,
                 engine_nonce: self.inner.nonce,
+                instance_id,
                 plan,
                 batch_rows,
                 control,
@@ -469,7 +473,7 @@ impl QueryEngine for LegacyQueryEngineAdapter {
                 )
                 .with_query_id(transferred.info.query_id));
             }
-            let control = inner.control(transferred.info.query_id)?;
+            let control = inner.control_instance(transferred.instance_id)?;
             if !Arc::ptr_eq(&control, &transferred.control) {
                 return Err(ServerError::new(
                     ErrorCode::Conflict,
@@ -620,11 +624,12 @@ impl QueryEngine for LegacyQueryEngineAdapter {
     fn cancel<'a>(
         &'a self,
         owner: &'a dyn QueryOwnerCapability,
-        query_id: QueryId,
+        instance_id: QueryInstanceId,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let owner = self.validate_owner(owner)?;
-            let control = self.inner.control(query_id)?;
+            let query_id = instance_id.query_id();
+            let control = self.inner.control_instance(instance_id)?;
             control.authorize(owner.session_id, owner.owner_nonce, query_id)?;
             control.cancel(query_id, "query cancelled by owner");
             Ok(())
@@ -634,11 +639,12 @@ impl QueryEngine for LegacyQueryEngineAdapter {
     fn status<'a>(
         &'a self,
         owner: &'a dyn QueryOwnerCapability,
-        query_id: QueryId,
+        instance_id: QueryInstanceId,
     ) -> BoxFuture<'a, Result<QueryStatus>> {
         Box::pin(async move {
             let owner = self.validate_owner(owner)?;
-            let control = self.inner.control(query_id)?;
+            let query_id = instance_id.query_id();
+            let control = self.inner.control_instance(instance_id)?;
             control.authorize(owner.session_id, owner.owner_nonce, query_id)?;
             let status = control.status.lock().unwrap().clone();
             Ok(status)
@@ -864,6 +870,22 @@ impl EngineInner {
             })
     }
 
+    fn control_instance(&self, instance_id: QueryInstanceId) -> Result<Arc<QueryControl>> {
+        let query_id = instance_id.query_id();
+        self.control(query_id).and_then(|control| {
+            if control.generation == instance_id.generation().get() {
+                Ok(control)
+            } else {
+                Err(ServerError::new(
+                    ErrorCode::NotFound,
+                    "query instance is no longer registered",
+                )
+                .with_query_id(query_id)
+                .with_retryable(false))
+            }
+        })
+    }
+
     fn acquire_query_permit(self: &Arc<Self>, query_id: QueryId) -> Result<QueryPermit> {
         let mut active = self.active_queries.load(Ordering::Acquire);
         loop {
@@ -1061,6 +1083,7 @@ struct LegacyExecutionToken {
     owner_session_id: SessionId,
     owner_nonce: u64,
     engine_nonce: u128,
+    instance_id: QueryInstanceId,
     plan: LegacyGatewayPlan,
     batch_rows: usize,
     control: Arc<QueryControl>,
@@ -1076,12 +1099,17 @@ impl QueryExecutionToken for LegacyExecutionToken {
         self.owner_session_id
     }
 
+    fn instance_id(&self) -> QueryInstanceId {
+        self.instance_id
+    }
+
     fn into_any(mut self: Box<Self>) -> Box<dyn Any + Send> {
         let transferred = LegacyTransferredToken {
             info: self.info.clone(),
             owner_session_id: self.owner_session_id,
             owner_nonce: self.owner_nonce,
             engine_nonce: self.engine_nonce,
+            instance_id: self.instance_id,
             plan: self.plan.clone(),
             batch_rows: self.batch_rows,
             control: Arc::clone(&self.control),
@@ -1105,6 +1133,7 @@ struct LegacyTransferredToken {
     owner_session_id: SessionId,
     owner_nonce: u64,
     engine_nonce: u128,
+    instance_id: QueryInstanceId,
     plan: LegacyGatewayPlan,
     batch_rows: usize,
     control: Arc<QueryControl>,
@@ -1139,6 +1168,8 @@ impl QueryControl {
             owner_nonce,
             status: Mutex::new(QueryStatus {
                 query_id: request.query_id,
+                generation: NonZeroU64::new(generation)
+                    .expect("legacy query generation is nonzero"),
                 session_id: request.session_id,
                 state: QueryState::Planned,
                 submitted_at_ns,
@@ -1430,8 +1461,8 @@ struct LegacyRecordBatchStream {
 }
 
 impl RecordBatchStream for LegacyRecordBatchStream {
-    fn query_id(&self) -> QueryId {
-        self.query_id
+    fn instance_id(&self) -> QueryInstanceId {
+        query_instance_id(self.query_id, self.control.generation)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -1735,6 +1766,13 @@ fn map_gateway_open_error(
     }
 }
 
+fn query_instance_id(query_id: QueryId, generation: u64) -> QueryInstanceId {
+    QueryInstanceId::new(
+        query_id,
+        NonZeroU64::new(generation).expect("query generation is nonzero"),
+    )
+}
+
 fn next_engine_nonce() -> u128 {
     let sequence = NEXT_ENGINE_NONCE.fetch_add(1, Ordering::Relaxed).max(1);
     (u128::from(now_ns()) << 64) | u128::from(sequence)
@@ -1771,7 +1809,10 @@ mod tests {
     };
     use zippy_gateway::{GatewayServer, GatewayServerConfig};
     use zippy_master::server::MasterServer;
-    use zippy_types::query::{QueryEngine, QueryInput, QueryPriority, QueryRequest, QueryState};
+    use zippy_types::query::{
+        OpaqueQueryExecutionToken, QueryEngine, QueryInput, QueryInstanceId, QueryPriority,
+        QueryRequest, QueryState,
+    };
     use zippy_types::{ErrorCode, QueryId, ResourceLimit, SessionId};
 
     use super::{
@@ -1816,6 +1857,10 @@ mod tests {
             spill_limit_bytes: ResourceLimit::Disabled,
             result_batch_rows: NonZeroU32::new(128),
         }
+    }
+
+    fn token_instance(token: &OpaqueQueryExecutionToken) -> QueryInstanceId {
+        token.instance_id()
     }
 
     fn persisted_stream(stream_name: &str, file_path: &std::path::Path) -> StreamInfo {
@@ -2028,23 +2073,21 @@ mod tests {
         let first_owner = engine.owner(session_id);
         let second_owner = engine.owner(session_id);
         let request = query_request(6, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(first_owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
 
         let error = engine
-            .status(second_owner.as_ref(), query_id)
+            .status(second_owner.as_ref(), instance_id)
             .await
             .unwrap_err();
 
         assert_eq!(error.code(), ErrorCode::PermissionDenied);
-        assert_eq!(
-            engine
-                .status(first_owner.as_ref(), query_id)
-                .await
-                .unwrap()
-                .state,
-            QueryState::Planned
-        );
+        let status = engine
+            .status(first_owner.as_ref(), instance_id)
+            .await
+            .unwrap();
+        assert_eq!(status.instance_id(), instance_id);
+        assert_eq!(status.state, QueryState::Planned);
         drop(token);
     }
 
@@ -2056,18 +2099,21 @@ mod tests {
         });
         let session_id = SessionId::from_u128(7).unwrap();
         let owner = engine.owner(session_id);
-        let evicted_id = QueryId::from_u128(7).unwrap();
         let evicted = engine
             .plan(owner.as_ref(), query_request(7, session_id))
             .await
             .unwrap();
+        let evicted_instance = token_instance(&evicted);
         drop(evicted);
         let replacement = engine
             .plan(owner.as_ref(), query_request(8, session_id))
             .await
             .unwrap();
 
-        let status_error = engine.status(owner.as_ref(), evicted_id).await.unwrap_err();
+        let status_error = engine
+            .status(owner.as_ref(), evicted_instance)
+            .await
+            .unwrap_err();
         let reuse_error = engine
             .plan(owner.as_ref(), query_request(7, session_id))
             .await
@@ -2098,6 +2144,7 @@ mod tests {
             .plan(owner.as_ref(), query_request(10, session_id))
             .await
             .unwrap();
+        let retained_instance = token_instance(&retained);
         drop(retained);
 
         let error = engine
@@ -2109,7 +2156,7 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::ResourceExhausted);
         assert_eq!(
             engine
-                .status(owner.as_ref(), QueryId::from_u128(10).unwrap())
+                .status(owner.as_ref(), retained_instance)
                 .await
                 .unwrap()
                 .state,
@@ -2124,12 +2171,12 @@ mod tests {
         let session_id = SessionId::from_u128(2).unwrap();
         let owner = engine.owner(session_id);
         let request = query_request(2, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
 
         drop(token);
 
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::Cancelled);
         assert_eq!(status.error.unwrap().code(), ErrorCode::Cancelled);
     }
@@ -2140,13 +2187,13 @@ mod tests {
         let session_id = SessionId::from_u128(20).unwrap();
         let owner = engine.owner(session_id);
         let request = query_request(20, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
 
         let execution = engine.execute(token);
         drop(execution);
 
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::Cancelled);
     }
 
@@ -2236,12 +2283,14 @@ mod tests {
             .plan(owner.as_ref(), query_request(27, session_id))
             .await
             .unwrap();
+        let first_instance = token_instance(&first);
         let first_control = engine.inner.control(first_id).unwrap();
         drop(first);
         let second = engine
             .plan(owner.as_ref(), query_request(28, session_id))
             .await
             .unwrap();
+        let second_instance = token_instance(&second);
         let second_control = engine.inner.control(second_id).unwrap();
         drop(second);
         let shared_finished_at = super::now_ns();
@@ -2259,11 +2308,14 @@ mod tests {
             .await
             .unwrap();
 
-        let evicted_error = engine.status(owner.as_ref(), first_id).await.unwrap_err();
+        let evicted_error = engine
+            .status(owner.as_ref(), first_instance)
+            .await
+            .unwrap_err();
         assert_eq!(evicted_error.code(), ErrorCode::NotFound);
         assert_eq!(
             engine
-                .status(owner.as_ref(), second_id)
+                .status(owner.as_ref(), second_instance)
                 .await
                 .unwrap()
                 .state,
@@ -2382,11 +2434,11 @@ mod tests {
         let session_id = SessionId::from_u128(42).unwrap();
         let owner = engine.owner(session_id);
         let request = query_request(42, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
 
         let error = engine.execute(token).await.err().unwrap();
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
 
         assert_eq!(error.code(), ErrorCode::ResourceExhausted);
         assert_eq!(status.state, QueryState::Failed);
@@ -2504,8 +2556,8 @@ mod tests {
         let owner = engine.owner(session_id);
         let mut request = query_request(34, session_id);
         request.deadline_ns = Some(super::now_ns().saturating_add(500_000_000));
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
         let mut execution = engine.execute(token);
 
         assert!(
@@ -2514,7 +2566,7 @@ mod tests {
                 .is_err()
         );
         accepted.recv_timeout(Duration::from_millis(500)).unwrap();
-        engine.cancel(owner.as_ref(), query_id).await.unwrap();
+        engine.cancel(owner.as_ref(), instance_id).await.unwrap();
 
         let error = tokio::time::timeout(Duration::from_millis(100), execution)
             .await
@@ -2523,7 +2575,11 @@ mod tests {
             .unwrap();
         assert_eq!(error.code(), ErrorCode::Cancelled);
         assert_eq!(
-            engine.status(owner.as_ref(), query_id).await.unwrap().state,
+            engine
+                .status(owner.as_ref(), instance_id)
+                .await
+                .unwrap()
+                .state,
             QueryState::Cancelled
         );
         assert_eq!(
@@ -2608,8 +2664,8 @@ mod tests {
         let owner = engine.owner(session_id);
         let mut request = query_request(36, session_id);
         request.deadline_ns = Some(super::now_ns().saturating_add(40_000_000));
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
         let mut execution = engine.execute(token);
 
         assert!(
@@ -2625,7 +2681,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(error.code(), ErrorCode::DeadlineExceeded);
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::TimedOut);
         assert_eq!(status.error.unwrap().code(), ErrorCode::DeadlineExceeded);
         assert_eq!(
@@ -2655,8 +2711,8 @@ mod tests {
         let owner = engine.owner(session_id);
         let mut request = query_request(37, session_id);
         request.deadline_ns = Some(super::now_ns().saturating_add(500_000_000));
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
         let mut execution = engine.execute(token);
 
         assert!(
@@ -2675,7 +2731,7 @@ mod tests {
         assert!(error
             .message()
             .contains("legacy gateway operational timeout"));
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::Failed);
         assert_eq!(status.error.as_ref(), Some(&error));
 
@@ -2699,6 +2755,7 @@ mod tests {
         let request = query_request(44, session_id);
         let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
         let mut execution = engine.execute(token);
 
         assert!(
@@ -2715,7 +2772,7 @@ mod tests {
 
         assert_eq!(error.code(), ErrorCode::Unavailable);
         assert_eq!(error.query_id(), Some(query_id));
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::Failed);
         assert_eq!(status.error.as_ref(), Some(&error));
 
@@ -2734,12 +2791,12 @@ mod tests {
         let session_id = SessionId::from_u128(3).unwrap();
         let owner = engine.owner(session_id);
         let request = query_request(3, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::TimedOut);
         assert_eq!(status.error.unwrap().code(), ErrorCode::DeadlineExceeded);
         drop(token);
@@ -2757,6 +2814,7 @@ mod tests {
         request.deadline_ns = Some(super::now_ns().saturating_add(10_000_000));
         let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
         let control = engine.inner.control(query_id).unwrap();
         let delivery = Arc::new(super::StreamDelivery::default());
         control.attach_delivery(&delivery).unwrap();
@@ -2765,7 +2823,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let status = engine.status(owner.as_ref(), query_id).await.unwrap();
+        let status = engine.status(owner.as_ref(), instance_id).await.unwrap();
         assert_eq!(status.state, QueryState::TimedOut);
         assert_eq!(status.error.unwrap().code(), ErrorCode::DeadlineExceeded);
         assert_eq!(
@@ -2796,6 +2854,7 @@ mod tests {
             .plan(owner.as_ref(), query_request(50, session_id))
             .await
             .unwrap();
+        let old_instance = token_instance(&old_token);
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -2803,11 +2862,28 @@ mod tests {
             .plan(owner.as_ref(), query_request(50, session_id))
             .await
             .unwrap();
+        let new_instance = token_instance(&new_token);
         let error = engine.execute(old_token).await.err().unwrap();
-        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert_eq!(error.code(), ErrorCode::NotFound);
         assert_eq!(
             engine
-                .status(owner.as_ref(), QueryId::from_u128(50).unwrap())
+                .status(owner.as_ref(), old_instance)
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            engine
+                .cancel(owner.as_ref(), old_instance)
+                .await
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            engine
+                .status(owner.as_ref(), new_instance)
                 .await
                 .unwrap()
                 .state,
@@ -2828,7 +2904,10 @@ mod tests {
         let error = engine.plan(owner.as_ref(), request).await.err().unwrap();
 
         assert_eq!(error.code(), ErrorCode::UnsupportedPlan);
-        let status_error = engine.status(owner.as_ref(), query_id).await.unwrap_err();
+        let status_error = engine
+            .status(owner.as_ref(), super::query_instance_id(query_id, 1))
+            .await
+            .unwrap_err();
         assert_eq!(status_error.code(), ErrorCode::NotFound);
     }
 
@@ -2838,13 +2917,17 @@ mod tests {
         let session_id = SessionId::from_u128(60).unwrap();
         let owner = engine.owner(session_id);
         let request = query_request(60, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
 
         engine.begin_shutdown();
 
         assert_eq!(
-            engine.status(owner.as_ref(), query_id).await.unwrap().state,
+            engine
+                .status(owner.as_ref(), instance_id)
+                .await
+                .unwrap()
+                .state,
             QueryState::Cancelled
         );
         let error = engine
@@ -2876,9 +2959,11 @@ mod tests {
         let session_id = SessionId::from_u128(5).unwrap();
         let owner = engine.owner(session_id);
         let request = query_request(5, session_id);
-        let query_id = request.query_id;
         let token = engine.plan(owner.as_ref(), request).await.unwrap();
+        let instance_id = token_instance(&token);
         let mut stream = engine.execute(token).await.unwrap();
+        assert_eq!(stream.instance_id(), instance_id);
+        assert_eq!(stream.query_id(), instance_id.query_id());
         let mut values = Vec::new();
 
         while let Some(batch) = poll_fn(|context| stream.as_mut().poll_next(context))
@@ -2899,7 +2984,11 @@ mod tests {
 
         assert_eq!(values, vec![1_i64, 2, 3, 4, 5]);
         assert_eq!(
-            engine.status(owner.as_ref(), query_id).await.unwrap().state,
+            engine
+                .status(owner.as_ref(), instance_id)
+                .await
+                .unwrap()
+                .state,
             QueryState::Finished
         );
         server.join().unwrap();

@@ -758,7 +758,7 @@ mod tests {
 
         let resources = runtime.query_resource_coordinator();
         let token = resources
-            .register_planned(
+            .register_planned_for_session(
                 info,
                 session_id(),
                 None,
@@ -789,7 +789,9 @@ mod tests {
             .admit_table_task(&execution, charge(), 0)
             .expect("admit lease-bound table task");
         assert_eq!(task.resource().selector().table_id, table_id(NATIVE_TABLE));
-        resources.cancel(query).expect("cancel running query");
+        resources
+            .cancel_current_for_test(query)
+            .expect("cancel running query");
         drop(execution);
         assert_eq!(
             runtime
@@ -846,7 +848,7 @@ mod tests {
             .expect("pin query snapshot");
         let resources = runtime.query_resource_coordinator();
         let token = resources
-            .register_planned(
+            .register_planned_for_session(
                 snapshot.plan_info(10, 20),
                 session_id(),
                 None,

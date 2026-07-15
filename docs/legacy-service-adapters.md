@@ -191,9 +191,11 @@ QueryId tombstone until the evicted query's original terminal-retention deadline
 be reused while delayed status or cancellation remains valid. Tombstones use a separate expiry
 heap and have a hard configurable limit (`max_query_tombstones`, default 65,536). If that limit is
 reached, further early eviction fails closed with `RESOURCE_EXHAUSTED` rather than dropping an
-unexpired identity guard. Reuse after retention is outside the legacy status guarantee; a future
-wire contract should carry an opaque query-instance key if it needs indefinite protection from
-arbitrarily delayed requests.
+unexpired identity guard. Every execution token, result stream, status, and cancellation target now
+also carries a `QueryInstanceId` composed of the caller-assigned `QueryId` and a nonzero
+engine-local generation. A delayed request for an instance removed after retention returns
+`NOT_FOUND`; it never falls back to a newer instance with the same `QueryId`. The instance ID is an
+ABA fence rather than authority, so owner-capability validation remains mandatory.
 
 ## Readiness boundary
 
