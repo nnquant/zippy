@@ -830,9 +830,7 @@ impl SqliteCatalogReadHandle {
             )?);
         }
         let snapshot = self.read_snapshot_at(&selectors).await?;
-        Ok(crate::SqliteCatalogPinnedQuerySnapshot::new(
-            snapshot, pins, ownership,
-        ))
+        crate::SqliteCatalogPinnedQuerySnapshot::try_new(snapshot, pins, ownership)
     }
 
     /// Reads exact metadata only after pinning every selected table against physical GC.
@@ -880,9 +878,7 @@ impl SqliteCatalogReadHandle {
             pins.push(runtime_snapshot_pins.pin(selector.table_id, selector.snapshot_version)?);
         }
         let snapshot = self.read_snapshot_at_with_limits(selectors, limits).await?;
-        Ok(crate::SqliteCatalogPinnedQuerySnapshot::new(
-            snapshot, pins, ownership,
-        ))
+        crate::SqliteCatalogPinnedQuerySnapshot::try_new(snapshot, pins, ownership)
     }
 
     fn runtime_snapshot_pin_registry(
@@ -3137,8 +3133,8 @@ mod tests {
         CatalogCommandEnvelopeV1, CatalogCommandReplayProbe, CatalogCommandV1,
         CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
         CatalogGarbageCollectionGuard, CatalogIdempotencyRead, CatalogPublicationControl,
-        CatalogPublicationPermit, CatalogRead, CatalogSnapshotSelector, CatalogTableSnapshot,
-        CatalogWrite, ClaimGarbageCollectionFilesRequest, CommandFingerprint,
+        CatalogPublicationPermit, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector,
+        CatalogTableSnapshot, CatalogWrite, ClaimGarbageCollectionFilesRequest, CommandFingerprint,
         CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand,
         CreateTableCommand, LegacyCatalogAdoptExistingTableCommandV4,
         LegacyCatalogAdvanceCheckpointCommandV4, LegacyCatalogBootstrapTableCommandV4,
@@ -3404,6 +3400,19 @@ mod tests {
         writer.finish().expect("finish schema-only IPC stream");
         drop(writer);
         SchemaIpcPayload::new(payload).expect("nonempty schema IPC payload")
+    }
+
+    fn wider_schema_ipc() -> SchemaIpcPayload {
+        let schema = Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("price", DataType::Int64, false),
+            Field::new("volume", DataType::Int64, false),
+        ]);
+        let mut payload = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut payload, &schema).expect("create IPC writer");
+        writer.finish().expect("finish schema-only IPC stream");
+        drop(writer);
+        SchemaIpcPayload::new(payload).expect("nonempty wider schema IPC payload")
     }
 
     fn canonical_hash(digit: char) -> String {
@@ -5111,6 +5120,127 @@ mod tests {
         catalog.close().expect("close catalog");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_schema_charges_follow_deterministic_table_ordinals() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+        let second_table_id = TableId::from_u128(3).expect("nonzero second table id");
+        catalog
+            .command(command(
+                3,
+                Some(2),
+                CatalogCommandV1::CreateTable(CreateTableCommand {
+                    table_id: second_table_id,
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("quotes").expect("valid table name"),
+                    definition: TableDefinition::Append(AppendTableDefinition {
+                        event_time_column: None,
+                    }),
+                    schema_ipc: wider_schema_ipc(),
+                    config: BTreeMap::new(),
+                }),
+            ))
+            .await
+            .expect("create second append table");
+        let selectors = [
+            CatalogSnapshotSelector {
+                table_id: table_id(),
+                snapshot_version: 1,
+                schema_version: 1,
+            },
+            CatalogSnapshotSelector {
+                table_id: second_table_id,
+                snapshot_version: 1,
+                schema_version: 1,
+            },
+        ];
+        let expected = catalog
+            .read_snapshot_at(&selectors)
+            .await
+            .expect("read expected exact schemas")
+            .tables()
+            .iter()
+            .map(|table| {
+                crate::decode_persisted_table_schema(table.table(), table.schema())
+                    .expect("decode expected persisted schema")
+                    .retained_charge_bytes()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(expected[0], expected[1]);
+
+        let pinned = catalog
+            .read_handle()
+            .expect("create read handle")
+            .read_pinned_snapshot_at(&selectors)
+            .await
+            .expect("pin exact two-table snapshot");
+        let manifests = pinned.tables().collect::<Vec<_>>();
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].selector().table_id, table_id());
+        assert_eq!(manifests[1].selector().table_id, second_table_id);
+        assert_eq!(
+            manifests
+                .iter()
+                .map(|table| table.retained_schema_charge_bytes().get())
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        drop((manifests, pinned));
+        assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 0);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_schema_sidecar_failure_rolls_back_runtime_pins() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+        let selector = CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        };
+        let snapshot = catalog
+            .read_snapshot_at(std::slice::from_ref(&selector))
+            .await
+            .expect("read valid exact snapshot");
+        let valid_table = &snapshot.tables()[0];
+        let mut corrupt_schema = valid_table.schema().clone();
+        corrupt_schema.schema_hash = canonical_hash('f');
+        let corrupt_table = CatalogTableSnapshot::new(
+            selector,
+            valid_table.table().clone(),
+            corrupt_schema,
+            valid_table.snapshot().clone(),
+            valid_table.files().clone(),
+        )
+        .expect("aggregate permits an independently corrupted schema payload");
+        let corrupt_snapshot =
+            CatalogQuerySnapshot::new(snapshot.catalog_revision(), vec![corrupt_table])
+                .expect("build corrupt exact snapshot fixture");
+        let pin = catalog
+            .pin_runtime_snapshot(table_id(), 1)
+            .expect("pin runtime snapshot before sidecar validation");
+        assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 1);
+
+        let error = crate::SqliteCatalogPinnedQuerySnapshot::try_new(
+            corrupt_snapshot,
+            vec![pin],
+            Arc::clone(&data_directory),
+        )
+        .expect_err("corrupt persisted schema must reject pinned owner construction");
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 0);
+        catalog.close().expect("close catalog");
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn pinned_external_legacy_reader_starts_at_offset_zero_after_checksum() {
@@ -5124,11 +5254,12 @@ mod tests {
         let pin = catalog
             .pin_runtime_snapshot(table_id(), 2)
             .expect("pin external legacy snapshot");
-        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::new(
+        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::try_new(
             snapshot,
             vec![pin],
             Arc::clone(&data_directory),
-        );
+        )
+        .expect("build pinned external legacy snapshot");
         let file = pinned
             .table(0)
             .expect("pinned external legacy table")
@@ -5160,11 +5291,12 @@ mod tests {
         let pin = catalog
             .pin_runtime_snapshot(table_id(), 2)
             .expect("pin external legacy snapshot");
-        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::new(
+        let pinned = crate::SqliteCatalogPinnedQuerySnapshot::try_new(
             snapshot,
             vec![pin],
             Arc::clone(&data_directory),
-        );
+        )
+        .expect("build pinned external legacy snapshot");
         let file = pinned
             .table(0)
             .expect("pinned external legacy table")

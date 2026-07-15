@@ -39,18 +39,34 @@ struct PinnedSnapshotOwner {
     snapshot: CatalogQuerySnapshot,
     descriptor: CatalogSnapshotPinDescriptor,
     scan_file_indices: Vec<Box<[usize]>>,
+    retained_schema_charge_bytes: Vec<NonZeroU64>,
     _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
     _data_directory: Arc<OwnedDataDirectory>,
 }
 
 impl SqliteCatalogPinnedQuerySnapshot {
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         snapshot: CatalogQuerySnapshot,
         pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
         data_directory: Arc<OwnedDataDirectory>,
-    ) -> Self {
+    ) -> Result<Self> {
         debug_assert!(!pins.is_empty());
         debug_assert_eq!(snapshot.tables().len(), pins.len());
+        let retained_schema_charge_bytes = snapshot
+            .tables()
+            .iter()
+            .map(|table| {
+                let decoded = crate::decode_persisted_table_schema(table.table(), table.schema())?;
+                NonZeroU64::new(decoded.retained_charge_bytes()).ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::DataCorruption,
+                        "decoded persisted schema has a zero retained-memory charge",
+                    )
+                    .with_table_id(table.selector().table_id)
+                    .with_retryable(false)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let descriptor = CatalogSnapshotPinDescriptor {
             catalog_revision: snapshot.catalog_revision(),
             selectors: snapshot
@@ -83,15 +99,16 @@ impl SqliteCatalogPinnedQuerySnapshot {
                 indices.into_boxed_slice()
             })
             .collect();
-        Self {
+        Ok(Self {
             owner: Arc::new(PinnedSnapshotOwner {
                 snapshot,
                 descriptor,
                 scan_file_indices,
+                retained_schema_charge_bytes,
                 _pins: pins,
                 _data_directory: data_directory,
             }),
-        }
+        })
     }
 
     /// Returns the Catalog revision shared by every pinned table manifest.
@@ -189,6 +206,15 @@ impl PinnedTableManifest {
     #[must_use]
     pub fn snapshot_metadata(&self) -> &TableSnapshot {
         self.raw_table().snapshot()
+    }
+
+    /// Returns the deterministic logical memory charge for decoding and retaining this schema.
+    ///
+    /// The pinned owner computes this scalar with the same verified persisted-schema decoder used
+    /// at execution time, but deliberately does not retain the decoded Arrow schema itself.
+    #[must_use]
+    pub fn retained_schema_charge_bytes(&self) -> NonZeroU64 {
+        self.owner.retained_schema_charge_bytes[self.table_index]
     }
 
     /// Returns the number of visible physical files in this exact snapshot.
