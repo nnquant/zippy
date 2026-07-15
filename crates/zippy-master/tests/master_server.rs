@@ -7,7 +7,7 @@ use zippy_core::bus_protocol::{
     ReleaseSegmentReaderLeaseRequest, UnregisterProcessRequest, UpdateRecordStatusRequest,
     WatchRequest, WatchResource, CONTROL_PROTOCOL_VERSION,
 };
-use zippy_core::{setup_log, LogConfig, ZippyConfig};
+use zippy_core::{setup_log, LogConfig, MasterClient, ZippyConfig};
 use zippy_master::registry::{Registry, RegistryError};
 use zippy_master::server::MasterServer;
 use zippy_master::snapshot::{
@@ -1309,6 +1309,8 @@ fn master_restores_registered_streams_from_snapshot_as_restored() {
                 status: "registered".to_string(),
             }],
             sources: vec![],
+            catalog_sources: vec![],
+            dropped_tables: vec![],
             engines: vec![],
         },
     )
@@ -1361,6 +1363,15 @@ fn master_restores_legacy_snapshot_without_frame_size() {
     assert_eq!(stream.status, "restored");
     assert_eq!(stream.buffer_size, 1024);
     assert_eq!(stream.frame_size, 1024);
+    assert!(
+        server
+            .legacy_catalog_adapter()
+            .capture_projection_snapshot_v4()
+            .unwrap()
+            .catalog_revision()
+            > 0,
+        "a nonempty legacy snapshot without catalog_revision needs a synthetic baseline"
+    );
 }
 
 #[test]
@@ -1400,6 +1411,8 @@ fn master_restores_control_plane_entities_from_snapshot_as_restored() {
                 writer_epoch: 1,
                 revision: 1,
             }],
+            catalog_sources: vec![],
+            dropped_tables: vec![],
             engines: vec![SnapshotEngineRecord {
                 engine_name: "mid_price_factor".to_string(),
                 engine_type: "reactive".to_string(),
@@ -1520,6 +1533,195 @@ fn master_does_not_restore_active_segment_descriptor_from_snapshot() {
 
     assert!(descriptor.is_none());
     let _ = fs::remove_file(wait_path);
+}
+
+#[test]
+fn master_persists_catalog_source_definition_and_drop_tombstone_across_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+    let table_schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+        "value",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )]));
+
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path.clone()),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let serving = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || serving.serve(&socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+
+    let mut client = MasterClient::connect(&wait_path).unwrap();
+    client
+        .register_process("catalog-definition-writer")
+        .unwrap();
+    client
+        .register_stream("events", std::sync::Arc::clone(&table_schema), 64, 64)
+        .unwrap();
+    client
+        .register_source(
+            "events_source",
+            "test",
+            "events",
+            serde_json::json!({"zippy_table_kind": "append_table"}),
+        )
+        .unwrap();
+    let online = server
+        .legacy_catalog_adapter()
+        .capture_projection_snapshot_v4()
+        .unwrap();
+    let table_id = online.tables()[0].descriptor().table_id;
+    client.unregister_source("events_source").unwrap();
+    let offline = server
+        .legacy_catalog_adapter()
+        .capture_projection_snapshot_v4()
+        .unwrap();
+    assert_eq!(offline, online);
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert!(snapshot.sources.is_empty());
+    assert_eq!(snapshot.catalog_sources.len(), 1);
+    assert!(snapshot.dropped_tables.is_empty());
+    client.unregister_process().unwrap();
+    server.shutdown();
+    join_handle.join().unwrap();
+
+    let restored = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let restored_projection = restored
+        .legacy_catalog_adapter()
+        .capture_projection_snapshot_v4()
+        .unwrap();
+    assert_eq!(restored_projection, offline);
+    assert!(restored
+        .registry()
+        .lock()
+        .unwrap()
+        .get_source("events_source")
+        .is_none());
+
+    let serving = restored.clone();
+    let second_socket_path = temp.path().join("master-restarted.sock");
+    let wait_path = second_socket_path.clone();
+    let join_handle = thread::spawn(move || serving.serve(&second_socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+    let mut client = MasterClient::connect(&wait_path).unwrap();
+    client.register_process("catalog-drop-writer").unwrap();
+    client
+        .register_source(
+            "events_source",
+            "test",
+            "events",
+            serde_json::json!({"zippy_table_kind": "append_table"}),
+        )
+        .unwrap();
+    assert!(client.drop_table("events", false).unwrap().dropped);
+    client.unregister_process().unwrap();
+    restored.shutdown();
+    join_handle.join().unwrap();
+
+    let final_server = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let final_projection = final_server
+        .legacy_catalog_adapter()
+        .capture_projection_snapshot_v4()
+        .unwrap();
+    assert!(final_projection.tables().is_empty());
+    assert_eq!(final_projection.dropped_tables().len(), 1);
+    assert_eq!(final_projection.dropped_tables()[0].table_id(), table_id);
+    assert_eq!(final_projection.dropped_tables()[0].name(), "events");
+    let final_snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert!(final_snapshot.streams.is_empty());
+    assert!(final_snapshot.sources.is_empty());
+    assert!(final_snapshot.catalog_sources.is_empty());
+    assert_eq!(final_snapshot.dropped_tables.len(), 1);
+
+    let mut revision_regression = final_snapshot.clone();
+    assert!(revision_regression.dropped_tables[0].dropped_catalog_revision > 1);
+    revision_regression.catalog_revision =
+        revision_regression.dropped_tables[0].dropped_catalog_revision - 1;
+    let corrupt_revision_path = temp.path().join("corrupt-revision.json");
+    SnapshotStore::write(&corrupt_revision_path, &revision_regression).unwrap();
+    assert!(MasterServer::from_snapshot_path(&corrupt_revision_path).is_err());
+
+    let mut duplicate_tombstone = final_snapshot;
+    duplicate_tombstone
+        .dropped_tables
+        .push(duplicate_tombstone.dropped_tables[0].clone());
+    let duplicate_tombstone_path = temp.path().join("duplicate-tombstone.json");
+    SnapshotStore::write(&duplicate_tombstone_path, &duplicate_tombstone).unwrap();
+    assert!(MasterServer::from_snapshot_path(&duplicate_tombstone_path).is_err());
+}
+
+#[test]
+fn master_restores_authoritative_source_definition_after_reverse_order_failover() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("master.sock");
+    let snapshot_path = temp.path().join("master-registry.json");
+    let table_schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+        "value",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )]));
+    let server = MasterServer::with_runtime_config(
+        Some(snapshot_path.clone()),
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+    );
+    let serving = server.clone();
+    let wait_path = socket_path.clone();
+    let join_handle = thread::spawn(move || serving.serve(&socket_path).unwrap());
+    wait_for_socket_ready(&wait_path);
+
+    let mut old = MasterClient::connect(&wait_path).unwrap();
+    old.register_process("old-writer").unwrap();
+    old.register_stream("events", table_schema, 64, 64).unwrap();
+    old.register_source(
+        "z_old_source",
+        "test",
+        "events",
+        serde_json::json!({"zippy_table_kind": "append_table", "feed": "old"}),
+    )
+    .unwrap();
+    old.unregister_process().unwrap();
+
+    let mut replacement = MasterClient::connect(&wait_path).unwrap();
+    replacement.register_process("replacement-writer").unwrap();
+    replacement
+        .register_source(
+            "a_new_source",
+            "test",
+            "events",
+            serde_json::json!({"zippy_table_kind": "append_table", "feed": "new"}),
+        )
+        .unwrap();
+    replacement.unregister_process().unwrap();
+    server.shutdown();
+    join_handle.join().unwrap();
+
+    let snapshot = SnapshotStore::load(&snapshot_path).unwrap();
+    assert_eq!(snapshot.sources.len(), 2);
+    assert_eq!(snapshot.catalog_sources.len(), 1);
+    assert_eq!(snapshot.catalog_sources[0].source_name, "a_new_source");
+
+    let restored = MasterServer::from_snapshot_path(&snapshot_path).unwrap();
+    let projection = restored
+        .legacy_catalog_adapter()
+        .capture_projection_snapshot_v4()
+        .unwrap();
+    assert_eq!(projection.tables().len(), 1);
+    assert_eq!(projection.tables()[0].sources().len(), 1);
+    assert_eq!(
+        projection.tables()[0].sources()[0].source_name,
+        "a_new_source"
+    );
+    let registry = restored.registry();
+    let registry = registry.lock().unwrap();
+    assert!(registry.get_source("a_new_source").is_some());
+    assert!(registry.get_source("z_old_source").is_some());
 }
 
 #[test]
@@ -2375,6 +2577,17 @@ fn registry_marks_control_plane_entities_lost_when_process_expires() {
         } => (process_id, process_token),
         other => panic!("unexpected process response: {:?}", other),
     };
+    assert!(matches!(
+        register_stream(
+            &socket_path,
+            &process_id,
+            &process_token,
+            "openctp_ticks",
+            1024,
+            256,
+        ),
+        ControlResponse::StreamRegistered { .. }
+    ));
 
     let source_response = send_control_request(
         &socket_path,

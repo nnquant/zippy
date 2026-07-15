@@ -40,6 +40,8 @@ delivery.
 | Internal physical shard discovery | Hidden by `zippy_internal` and strict legacy shard-name fallback |
 | Stable namespace/table identity | Deterministic SHA-256 domain-separated legacy IDs |
 | Catalog revision | Dedicated monotonic revision persisted in the legacy snapshot |
+| Source unregister | Runtime-liveness removal only; the persistent table declaration remains |
+| Explicit table drop | Durable `DropTable` tombstone projected through the V4 shadow |
 | Current snapshot version | Advances only when the committed persisted-file view changes |
 | Exact historical catalog snapshot | Rejected with `UNSUPPORTED_PLAN` |
 | Typed catalog mutation | Rejected with `UNSUPPORTED_PLAN` |
@@ -66,6 +68,36 @@ in-memory registry and notify watchers without cloning or serializing the persis
 Durable catalog mutations still use full rollback on snapshot failure, but their snapshots encode
 the restart-safe `registered` status and empty metrics instead of copying live values. Reloaded
 streams, sources, and engines enter `restored` with empty metrics.
+
+## Online Catalog shadow semantics
+
+The legacy registry now stores two separate source views. `SourceRecord` represents the active
+runtime owner and may disappear when a process disconnects or calls `unregister_source`.
+`CatalogSourceDefinition` is the persistent declaration used by discovery, migration, and the V4
+projection. Unregistering a runtime source neither removes this declaration nor advances the
+Catalog revision, so CTA feed reconnects and other ordinary liveness transitions cannot be
+misinterpreted as table deletion. Re-registering a writer may still advance the Catalog revision
+when its durable writer epoch or stable declaration changes.
+
+`DropTable` is the only supported legacy deletion boundary. It removes the stream and persistent
+source declaration, then writes a tombstone containing the deterministic table ID, complete table
+name, and committed Catalog revision. Tombstones are stored in `master-registry.json`, survive
+restart independently of commit-event delivery, and are included in the detached V4 projection
+snapshot. They are intentionally outside the active-table digest.
+
+The V4 shadow reconciler compares the complete active legacy projection, native projection rows,
+and durable tombstones. A tombstone authorizes `DropTable` even when the bounded commit-event queue
+lost the original notification or the worker was offline. Source absence alone never authorizes a
+drop. A table that is recreated with the same deterministic ID while its tombstone remains is a
+generation conflict and fails closed as `BlockedUnsupported`; clearing that conflict requires the
+planned V5 table-generation contract rather than silently reusing an old identity.
+V4 does not garbage-collect tombstones. They count against the global projection metadata budget,
+so long-running installations must monitor that budget until V5 adds generation-aware retention.
+
+Use the V4 shadow for online parity validation, restart recovery, and proving that explicit legacy
+drops converge in SQLite before authority cutover. Do not use source unregister, process expiry, or
+missing heartbeat state as schema-management operations. Operational tools must call `DropTable`
+when the intended action is permanent logical deletion.
 
 The runtime adapter does not maintain a best-effort mirror. Its boot-scoped records are embedded in
 the legacy `Registry` and are mutated while holding the same registry mutex as legacy

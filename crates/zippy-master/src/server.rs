@@ -40,10 +40,13 @@ use crate::legacy_catalog_commit::{
     LegacyCatalogCommitPublisherSealError, LegacyCatalogMutationAdmission,
 };
 use crate::legacy_runtime::LegacyRuntimeRegistryAdapter;
-use crate::registry::{Registry, RegistryError, StreamRecord};
+use crate::registry::{
+    CatalogSourceDefinition, DroppedTableTombstone, Registry, RegistryError, SourceRecord,
+    StreamRecord,
+};
 use crate::snapshot::{
-    RegistrySnapshot, SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore,
-    SnapshotStreamRecord,
+    RegistrySnapshot, SnapshotCatalogSourceRecord, SnapshotDroppedTableRecord,
+    SnapshotEngineRecord, SnapshotSourceRecord, SnapshotStore, SnapshotStreamRecord,
 };
 
 const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -291,7 +294,31 @@ impl MasterServer {
 
     pub fn from_snapshot_path(snapshot_path: &Path) -> Result<Self> {
         let snapshot = SnapshotStore::load(snapshot_path)?;
+        validate_registry_snapshot(&snapshot)?;
         let catalog_revision = snapshot.catalog_revision;
+        let rebuild_legacy_catalog_revision = catalog_revision == 0
+            && (!snapshot.streams.is_empty()
+                || !snapshot.sources.is_empty()
+                || !snapshot.catalog_sources.is_empty()
+                || !snapshot.dropped_tables.is_empty());
+        let catalog_sources = if snapshot.catalog_sources.is_empty() {
+            let mut definitions = BTreeMap::new();
+            for source in &snapshot.sources {
+                definitions.insert(
+                    source.output_stream.clone(),
+                    SnapshotCatalogSourceRecord {
+                        source_name: source.source_name.clone(),
+                        source_type: source.source_type.clone(),
+                        output_stream: source.output_stream.clone(),
+                        config: source.config.clone(),
+                        writer_epoch: source.writer_epoch,
+                    },
+                );
+            }
+            definitions.into_values().collect::<Vec<_>>()
+        } else {
+            snapshot.catalog_sources.clone()
+        };
         let server = Self::with_runtime_config(
             Some(snapshot_path.to_path_buf()),
             DEFAULT_LEASE_TIMEOUT,
@@ -329,26 +356,42 @@ impl MasterServer {
                     .map_err(registry_error)?;
             }
 
+            for source in catalog_sources {
+                registry
+                    .restore_catalog_source_definition(CatalogSourceDefinition {
+                        source_name: source.source_name,
+                        source_type: source.source_type,
+                        output_stream: source.output_stream,
+                        config: source.config,
+                        writer_epoch: source.writer_epoch,
+                    })
+                    .map_err(registry_error)?;
+            }
+
             for source in snapshot.sources {
                 registry.reserve_process_id(&source.process_id);
                 registry
-                    .register_source(
-                        &source.source_name,
-                        &source.source_type,
-                        &source.process_id,
-                        &source.output_stream,
-                        source.config,
-                    )
+                    .restore_source_record(SourceRecord {
+                        source_name: source.source_name,
+                        source_type: source.source_type,
+                        process_id: source.process_id,
+                        output_stream: source.output_stream,
+                        config: source.config,
+                        status: RESTORED_RUNTIME_STATUS.to_owned(),
+                        metrics: serde_json::json!({}),
+                        writer_epoch: source.writer_epoch,
+                        revision: source.revision,
+                    })
                     .map_err(registry_error)?;
+            }
+
+            for table in snapshot.dropped_tables {
                 registry
-                    .set_source_writer_epoch(&source.source_name, source.writer_epoch)
-                    .map_err(registry_error)?;
-                registry
-                    .set_source_status(
-                        &source.source_name,
-                        RESTORED_RUNTIME_STATUS,
-                        Some(serde_json::json!({})),
-                    )
+                    .restore_dropped_table_tombstone(DroppedTableTombstone {
+                        table_id: table.table_id,
+                        table_name: table.table_name,
+                        dropped_catalog_revision: table.dropped_catalog_revision,
+                    })
                     .map_err(registry_error)?;
             }
 
@@ -373,8 +416,24 @@ impl MasterServer {
                     .map_err(registry_error)?;
             }
 
-            registry.restore_catalog_revision(catalog_revision);
+            if !rebuild_legacy_catalog_revision {
+                registry.restore_catalog_revision(catalog_revision);
+            }
             registry.clear_runtime_records_for_restart();
+        }
+
+        if rebuild_legacy_catalog_revision {
+            tracing::info!(
+                component = "master",
+                event = "legacy_catalog_revision_rebuilt",
+                status = "success",
+                catalog_revision = server
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .catalog_revision(),
+                "rebuilt missing legacy Catalog revision from restored records"
+            );
         }
 
         Ok(server)
@@ -2089,12 +2148,14 @@ impl MasterServer {
                                 },
                             );
                         }
-                        self.publish_legacy_catalog_commit(
-                            previous_catalog_revision,
-                            registry.catalog_revision(),
-                            LegacyCatalogCommitMutationKind::UnregisterSource,
-                            &source.output_stream,
-                        );
+                        if registry.catalog_revision() != previous_catalog_revision {
+                            self.publish_legacy_catalog_commit(
+                                previous_catalog_revision,
+                                registry.catalog_revision(),
+                                LegacyCatalogCommitMutationKind::UnregisterSource,
+                                &source.output_stream,
+                            );
+                        }
                         tracing::info!(
                             component = "master_server",
                             event = "unregister_source",
@@ -3329,6 +3390,24 @@ impl MasterServer {
                     revision: source.revision,
                 })
                 .collect(),
+            catalog_sources: registry
+                .catalog_source_definitions()
+                .map(|source| SnapshotCatalogSourceRecord {
+                    source_name: source.source_name.clone(),
+                    source_type: source.source_type.clone(),
+                    output_stream: source.output_stream.clone(),
+                    config: source.config.clone(),
+                    writer_epoch: source.writer_epoch,
+                })
+                .collect(),
+            dropped_tables: registry
+                .dropped_table_tombstones()
+                .map(|table| SnapshotDroppedTableRecord {
+                    table_id: table.table_id,
+                    table_name: table.table_name.clone(),
+                    dropped_catalog_revision: table.dropped_catalog_revision,
+                })
+                .collect(),
             engines: registry
                 .list_engines()
                 .into_iter()
@@ -4193,6 +4272,71 @@ fn validate_register_stream_request(
 fn io_error(error: std::io::Error) -> ZippyError {
     ZippyError::Io {
         reason: error.to_string(),
+    }
+}
+
+fn validate_registry_snapshot(snapshot: &RegistrySnapshot) -> Result<()> {
+    let mut stream_names = HashSet::new();
+    for stream in &snapshot.streams {
+        if !stream_names.insert(stream.stream_name.as_str()) {
+            return Err(invalid_registry_snapshot("duplicate stream name"));
+        }
+    }
+
+    let mut runtime_source_names = HashSet::new();
+    for source in &snapshot.sources {
+        if !runtime_source_names.insert(source.source_name.as_str()) {
+            return Err(invalid_registry_snapshot("duplicate runtime source name"));
+        }
+        if !stream_names.contains(source.output_stream.as_str()) {
+            return Err(invalid_registry_snapshot(
+                "runtime source references an unknown output stream",
+            ));
+        }
+    }
+
+    let mut catalog_source_names = HashSet::new();
+    let mut catalog_source_outputs = HashSet::new();
+    for source in &snapshot.catalog_sources {
+        if !catalog_source_names.insert(source.source_name.as_str())
+            || !catalog_source_outputs.insert(source.output_stream.as_str())
+        {
+            return Err(invalid_registry_snapshot(
+                "duplicate Catalog source name or output stream",
+            ));
+        }
+        if !stream_names.contains(source.output_stream.as_str()) {
+            return Err(invalid_registry_snapshot(
+                "Catalog source references an unknown output stream",
+            ));
+        }
+    }
+
+    let mut dropped_table_ids = HashSet::new();
+    let mut dropped_table_names = HashSet::new();
+    for table in &snapshot.dropped_tables {
+        if !dropped_table_ids.insert(table.table_id)
+            || !dropped_table_names.insert(table.table_name.as_str())
+        {
+            return Err(invalid_registry_snapshot(
+                "duplicate dropped-table identity or name",
+            ));
+        }
+        if table.dropped_catalog_revision == 0
+            || (snapshot.catalog_revision != 0
+                && table.dropped_catalog_revision > snapshot.catalog_revision)
+        {
+            return Err(invalid_registry_snapshot(
+                "dropped-table revision is outside the Catalog revision boundary",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_registry_snapshot(reason: &str) -> ZippyError {
+    ZippyError::InvalidConfig {
+        reason: format!("invalid master registry snapshot reason=[{reason}]"),
     }
 }
 

@@ -94,6 +94,7 @@ pub struct LegacyCatalogProjectionSnapshotV4 {
     global_projection_digest: String,
     namespace: NamespaceDescriptor,
     tables: Vec<LegacyCatalogActivePublicTableV4>,
+    dropped_tables: Vec<LegacyCatalogDroppedTableV4>,
 }
 
 impl LegacyCatalogProjectionSnapshotV4 {
@@ -119,6 +120,40 @@ impl LegacyCatalogProjectionSnapshotV4 {
     #[must_use]
     pub fn tables(&self) -> &[LegacyCatalogActivePublicTableV4] {
         &self.tables
+    }
+
+    /// Returns durable explicit-drop tombstones in strict stable-table-id order.
+    #[must_use]
+    pub fn dropped_tables(&self) -> &[LegacyCatalogDroppedTableV4] {
+        &self.dropped_tables
+    }
+}
+
+/// Durable explicit deletion evidence detached from runtime source liveness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCatalogDroppedTableV4 {
+    table_id: TableId,
+    name: String,
+    dropped_catalog_revision: u64,
+}
+
+impl LegacyCatalogDroppedTableV4 {
+    /// Returns the stable legacy table identity that was explicitly dropped.
+    #[must_use]
+    pub const fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    /// Returns the complete legacy table name retained for diagnostics and collision checks.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the committed legacy Catalog revision that created the tombstone.
+    #[must_use]
+    pub const fn dropped_catalog_revision(&self) -> u64 {
+        self.dropped_catalog_revision
     }
 }
 
@@ -510,6 +545,7 @@ struct LegacyProjectionViewV4 {
     catalog_revision: u64,
     streams: Vec<LegacyProjectionStreamViewV4>,
     sources: Vec<LegacyProjectionSourceViewV4>,
+    dropped_tables: Vec<LegacyProjectionDroppedTableViewV4>,
 }
 
 #[derive(Debug)]
@@ -529,6 +565,13 @@ struct LegacyProjectionSourceViewV4 {
     output_stream: String,
     config: serde_json::Value,
     writer_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyProjectionDroppedTableViewV4 {
+    table_id: TableId,
+    name: String,
+    dropped_catalog_revision: u64,
 }
 
 impl LegacyCatalogAdapter {
@@ -618,7 +661,7 @@ impl LegacyCatalogAdapter {
         let registry = self.lock_registry()?;
         let mut metadata_budget = ProjectionMetadataBudgetWriter::new(maximum_metadata_bytes);
         let mut candidate_internal_markers = BTreeMap::<&str, Option<bool>>::new();
-        for source in registry.source_records() {
+        for source in registry.catalog_source_definitions() {
             if source.source_name.is_empty()
                 || source.source_type.is_empty()
                 || source.output_stream.is_empty()
@@ -643,7 +686,7 @@ impl LegacyCatalogAdapter {
                     .or_default();
             }
         }
-        for source in registry.source_records() {
+        for source in registry.catalog_source_definitions() {
             if let Some(marker) = candidate_internal_markers.get_mut(source.output_stream.as_str())
             {
                 merge_internal_table_marker(&source.output_stream, marker, &source.config)?;
@@ -664,7 +707,7 @@ impl LegacyCatalogAdapter {
         }
         let mut source_counts = BTreeMap::<&str, usize>::new();
         for source in registry
-            .source_records()
+            .catalog_source_definitions()
             .filter(|source| public_streams.contains(&source.output_stream))
         {
             let count = source_counts
@@ -706,6 +749,26 @@ impl LegacyCatalogAdapter {
                 "legacy Schema hash exceeds the global projection byte budget",
             )?;
         }
+        for table in registry.dropped_table_tombstones() {
+            write_projection_metadata_budget_value_v4(
+                &mut metadata_budget,
+                &table.table_name,
+                &table.table_id,
+                "legacy dropped-table identity exceeds the global projection byte budget",
+            )?;
+            write_projection_metadata_budget_value_v4(
+                &mut metadata_budget,
+                &table.table_name,
+                &table.table_name,
+                "legacy dropped-table name exceeds the global projection byte budget",
+            )?;
+            write_projection_metadata_budget_value_v4(
+                &mut metadata_budget,
+                &table.table_name,
+                &table.dropped_catalog_revision,
+                "legacy dropped-table revision exceeds the global projection byte budget",
+            )?;
+        }
         // Do not clone any public schema, source config, or file metadata until the complete
         // projection has passed the shared byte-budget preflight above.
         let streams = registry
@@ -721,7 +784,7 @@ impl LegacyCatalogAdapter {
             })
             .collect();
         let sources = registry
-            .source_records()
+            .catalog_source_definitions()
             .filter(|source| public_streams.contains(&source.output_stream))
             .map(|source| LegacyProjectionSourceViewV4 {
                 source_name: source.source_name.clone(),
@@ -731,10 +794,19 @@ impl LegacyCatalogAdapter {
                 writer_epoch: source.writer_epoch,
             })
             .collect();
+        let dropped_tables = registry
+            .dropped_table_tombstones()
+            .map(|table| LegacyProjectionDroppedTableViewV4 {
+                table_id: table.table_id,
+                name: table.table_name.clone(),
+                dropped_catalog_revision: table.dropped_catalog_revision,
+            })
+            .collect();
         Ok(LegacyProjectionViewV4 {
             catalog_revision: registry.catalog_revision(),
             streams,
             sources,
+            dropped_tables,
         })
     }
 
@@ -1294,6 +1366,35 @@ fn migration_snapshot_hash(
 fn build_projection_snapshot_v4(
     mut view: LegacyProjectionViewV4,
 ) -> Result<LegacyCatalogProjectionSnapshotV4> {
+    view.dropped_tables.sort_by(|left, right| {
+        left.table_id
+            .cmp(&right.table_id)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    if view.dropped_tables.iter().any(|table| {
+        table.name.is_empty()
+            || table.dropped_catalog_revision == 0
+            || table.dropped_catalog_revision > view.catalog_revision
+            || legacy_table_id(&table.name) != table.table_id
+    }) || view
+        .dropped_tables
+        .windows(2)
+        .any(|pair| pair[0].table_id == pair[1].table_id || pair[0].name == pair[1].name)
+    {
+        return Err(projection_corruption(
+            "dropped_tables",
+            "legacy projection contains an invalid or duplicate dropped-table tombstone",
+        ));
+    }
+    let dropped_tables = view
+        .dropped_tables
+        .into_iter()
+        .map(|table| LegacyCatalogDroppedTableV4 {
+            table_id: table.table_id,
+            name: table.name,
+            dropped_catalog_revision: table.dropped_catalog_revision,
+        })
+        .collect();
     view.streams
         .sort_by(|left, right| left.stream_name.cmp(&right.stream_name));
     if view
@@ -1357,6 +1458,15 @@ fn build_projection_snapshot_v4(
         let source_views = source_views_by_stream
             .remove(&stream_name)
             .unwrap_or_default();
+        if source_views
+            .iter()
+            .any(|source| source.writer_epoch != stream.writer_epoch)
+        {
+            return Err(projection_corruption(
+                &stream_name,
+                "legacy source writer epoch differs from its output stream",
+            ));
+        }
         let catalog = LegacyStreamView {
             stream_name: stream.stream_name,
             persisted_files_revision: stream.persisted_files_revision,
@@ -1472,6 +1582,7 @@ fn build_projection_snapshot_v4(
         global_projection_digest,
         namespace,
         tables,
+        dropped_tables,
     })
 }
 
@@ -2230,10 +2341,11 @@ mod tests {
     use zippy_types::{ErrorCode, NamespaceId, RequestId, ServerErrorDetails, TableId};
 
     use super::{
-        legacy_namespace_id, map_tables, source_owned_table_config, LegacyCatalogAdapter,
-        LegacyCatalogMigrationSnapshot, LegacyProjectionSourceViewV4, LegacyProjectionViewV4,
+        legacy_namespace_id, legacy_table_id, map_tables, source_owned_table_config,
+        LegacyCatalogAdapter, LegacyCatalogMigrationSnapshot, LegacyProjectionDroppedTableViewV4,
+        LegacyProjectionSourceViewV4, LegacyProjectionViewV4,
     };
-    use crate::registry::Registry;
+    use crate::registry::{CatalogSourceDefinition, Registry, RegistryError};
     use crate::server::MasterServer;
     use crate::snapshot::{
         RegistrySnapshot, SnapshotSourceRecord, SnapshotStore, SnapshotStreamRecord,
@@ -2915,6 +3027,8 @@ mod tests {
                     writer_epoch: 7,
                     revision: 9,
                 }],
+                catalog_sources: Vec::new(),
+                dropped_tables: Vec::new(),
                 engines: Vec::new(),
             },
         )
@@ -3183,6 +3297,70 @@ mod tests {
     }
 
     #[test]
+    fn projection_v4_retains_declared_table_when_runtime_source_unregisters() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "offline_events",
+            json!({"zippy_table_kind": "append_table", "endpoint": "source-a"}),
+            false,
+        );
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+        let baseline = adapter.capture_projection_snapshot_v4().unwrap();
+
+        registry
+            .lock()
+            .unwrap()
+            .unregister_source_for_process("offline_events_source", "offline_events_process")
+            .unwrap();
+
+        assert!(registry
+            .lock()
+            .unwrap()
+            .get_source("offline_events_source")
+            .is_none());
+        let offline = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(offline, baseline);
+    }
+
+    #[test]
+    fn projection_v4_retains_drop_tombstone_across_same_name_recreation() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "recreated_events",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+        let original = adapter.capture_projection_snapshot_v4().unwrap();
+        let table_id = original.tables()[0].descriptor().table_id;
+
+        let dropped = registry.lock().unwrap().drop_table("recreated_events");
+        assert!(dropped.stream.is_some());
+        let after_drop = adapter.capture_projection_snapshot_v4().unwrap();
+        assert!(after_drop.tables().is_empty());
+        assert_eq!(after_drop.dropped_tables().len(), 1);
+        assert_eq!(after_drop.dropped_tables()[0].table_id(), table_id);
+        assert_eq!(after_drop.dropped_tables()[0].name(), "recreated_events");
+
+        add_migratable_stream(
+            &mut registry.lock().unwrap(),
+            "recreated_events",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        let recreated = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(recreated.tables().len(), 1);
+        assert_eq!(recreated.tables()[0].descriptor().table_id, table_id);
+        assert_eq!(recreated.dropped_tables(), after_drop.dropped_tables());
+    }
+
+    #[test]
     fn projection_v4_digest_tracks_stable_source_writer_and_file_revision() {
         let mut registry = Registry::default();
         add_migratable_stream(
@@ -3202,7 +3380,7 @@ mod tests {
             registry.unregister_source("stable_events_source").unwrap();
             registry
                 .register_source(
-                    "stable_events_source",
+                    "stable_events_source_v2",
                     "test",
                     "stable_events_process",
                     "stable_events",
@@ -3210,7 +3388,7 @@ mod tests {
                 )
                 .unwrap();
             registry
-                .set_source_writer_epoch("stable_events_source", baseline_writer_epoch)
+                .set_source_writer_epoch("stable_events_source_v2", baseline_writer_epoch)
                 .unwrap();
         }
         let source_changed = adapter.capture_projection_snapshot_v4().unwrap();
@@ -3227,7 +3405,7 @@ mod tests {
             .lock()
             .unwrap()
             .set_source_writer_epoch(
-                "stable_events_source",
+                "stable_events_source_v2",
                 baseline_writer_epoch.saturating_add(1),
             )
             .unwrap();
@@ -3263,7 +3441,7 @@ mod tests {
     #[test]
     fn projection_v4_fails_closed_for_unbound_duplicate_and_malformed_sources() {
         let mut unbound = Registry::default();
-        unbound
+        let error = unbound
             .register_source(
                 "unbound_source",
                 "test",
@@ -3271,15 +3449,10 @@ mod tests {
                 "missing_stream",
                 json!({}),
             )
-            .unwrap();
-        let adapter = LegacyCatalogAdapter::new(
-            Arc::new(Mutex::new(unbound)),
-            Arc::new(AtomicBool::new(true)),
-        );
-        assert_eq!(
-            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
-            ErrorCode::DataCorruption
-        );
+            .unwrap_err();
+        assert!(matches!(error, RegistryError::StreamNotFound { .. }));
+        assert!(unbound.list_sources().is_empty());
+        assert_eq!(unbound.catalog_revision(), 0);
 
         let duplicate = LegacyProjectionSourceViewV4 {
             source_name: "duplicate".to_owned(),
@@ -3292,6 +3465,7 @@ mod tests {
             catalog_revision: 1,
             streams: Vec::new(),
             sources: vec![duplicate.clone(), duplicate],
+            dropped_tables: Vec::new(),
         })
         .unwrap_err();
         assert_eq!(error.code(), ErrorCode::DataCorruption);
@@ -3315,6 +3489,40 @@ mod tests {
             adapter.capture_projection_snapshot_v4().unwrap_err().code(),
             ErrorCode::DataCorruption
         );
+
+        let mut mismatched_writer = Registry::default();
+        add_migratable_stream_without_source(&mut mismatched_writer, "writer_mismatch", false);
+        mismatched_writer
+            .restore_catalog_source_definition(CatalogSourceDefinition {
+                source_name: "writer_mismatch_source".to_owned(),
+                source_type: "test".to_owned(),
+                output_stream: "writer_mismatch".to_owned(),
+                config: json!({"zippy_table_kind": "append_table"}),
+                writer_epoch: 1,
+            })
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(mismatched_writer)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+
+        let tombstone_name = "future_drop";
+        let error = super::build_projection_snapshot_v4(LegacyProjectionViewV4 {
+            catalog_revision: 1,
+            streams: Vec::new(),
+            sources: Vec::new(),
+            dropped_tables: vec![LegacyProjectionDroppedTableViewV4 {
+                table_id: legacy_table_id(tombstone_name),
+                name: tombstone_name.to_owned(),
+                dropped_catalog_revision: 2,
+            }],
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
     }
 
     #[test]

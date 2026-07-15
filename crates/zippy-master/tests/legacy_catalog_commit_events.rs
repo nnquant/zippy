@@ -146,7 +146,7 @@ fn committed_events_preserve_catalog_revision_order() {
     client.unregister_source("events-source").unwrap();
     assert!(client.drop_table("events", false).unwrap().dropped);
 
-    let events = (0..7)
+    let events = (0..6)
         .map(|_| receiver.recv_timeout(Duration::from_secs(1)).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
@@ -160,7 +160,6 @@ fn committed_events_preserve_catalog_revision_order() {
             LegacyCatalogCommitMutationKind::PublishPersistedFile,
             LegacyCatalogCommitMutationKind::ReplacePersistedFiles,
             LegacyCatalogCommitMutationKind::PersistEventWatermark,
-            LegacyCatalogCommitMutationKind::UnregisterSource,
             LegacyCatalogCommitMutationKind::DropTable,
         ]
     );
@@ -257,6 +256,11 @@ fn full_queue_does_not_change_primary_response_and_latches_gap() {
 
     server.shutdown();
     handle.join().unwrap().unwrap();
+    let sealed = metrics.snapshot();
+    assert!(sealed.sealed);
+    assert_eq!(sealed.final_revision, 2);
+    assert_eq!(sealed.latest_observed_revision, 2);
+    assert_eq!(sealed.continuity_loss_epoch, 1);
 }
 
 #[test]

@@ -26,7 +26,7 @@ pub enum LegacyCatalogCommitMutationKind {
     RegisterStream = 1,
     /// Source identity or writer-epoch metadata changed.
     RegisterSource = 2,
-    /// A source and its table-definition metadata were removed.
+    /// Compatibility marker for older publishers; runtime-only unregister no longer emits it.
     UnregisterSource = 3,
     /// One persisted-file descriptor was published.
     PublishPersistedFile = 4,
@@ -329,6 +329,15 @@ impl LegacyCatalogCommitPublisherMetrics {
     /// Captures the current counters without blocking the primary Master path.
     #[must_use]
     pub fn snapshot(&self) -> LegacyCatalogCommitPublisherMetricsSnapshot {
+        // Failed publication records its loss epoch before releasing the observed revision.
+        // Reading in this order therefore cannot pair a new revision with an older loss epoch.
+        let latest_observed_revision = self.state.latest_observed_revision.load(Ordering::Acquire);
+        let continuity_loss_epoch = self.state.continuity_loss_epoch.load(Ordering::Acquire);
+        let last_lost_revision = self.state.last_lost_revision.load(Ordering::Relaxed);
+        // Seal releases final_revision before sealed. Read the flag first so a true value makes
+        // the following final-revision load observe the matching shutdown boundary.
+        let sealed = self.state.sealed.load(Ordering::Acquire);
+        let final_revision = self.state.final_revision.load(Ordering::Acquire);
         LegacyCatalogCommitPublisherMetricsSnapshot {
             attempts_total: self.state.attempts_total.load(Ordering::Relaxed),
             published_total: self.state.published_total.load(Ordering::Relaxed),
@@ -342,11 +351,11 @@ impl LegacyCatalogCommitPublisherMetrics {
             baseline_revision: self.state.baseline_revision.load(Ordering::Acquire),
             last_published_revision: self.state.last_published_revision.load(Ordering::Relaxed),
             latest_committed_revision: self.state.latest_committed_revision.load(Ordering::Acquire),
-            latest_observed_revision: self.state.latest_observed_revision.load(Ordering::Acquire),
-            last_lost_revision: self.state.last_lost_revision.load(Ordering::Relaxed),
-            continuity_loss_epoch: self.state.continuity_loss_epoch.load(Ordering::Relaxed),
-            final_revision: self.state.final_revision.load(Ordering::Acquire),
-            sealed: self.state.sealed.load(Ordering::Acquire),
+            latest_observed_revision,
+            last_lost_revision,
+            continuity_loss_epoch,
+            final_revision,
+            sealed,
             continuity_lost: self.state.continuity_lost.load(Ordering::Acquire),
         }
     }
@@ -383,12 +392,6 @@ impl LegacyCatalogCommitPublisher {
 
     pub(crate) fn try_publish(&self, event: LegacyCatalogCommitEvent) {
         self.state.attempts_total.fetch_add(1, Ordering::Relaxed);
-        self.state
-            .latest_committed_revision
-            .store(event.catalog_revision(), Ordering::Release);
-        self.state
-            .latest_observed_revision
-            .store(event.catalog_revision(), Ordering::Release);
         let sender = match self.sender.try_lock() {
             Ok(sender) => sender,
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
@@ -397,6 +400,7 @@ impl LegacyCatalogCommitPublisher {
                     .publisher_busy_total
                     .fetch_add(1, Ordering::Relaxed);
                 self.record_continuity_loss(event.catalog_revision());
+                self.record_observed_commit(event.catalog_revision());
                 return;
             }
         };
@@ -405,6 +409,7 @@ impl LegacyCatalogCommitPublisher {
                 .disconnected_total
                 .fetch_add(1, Ordering::Relaxed);
             self.record_continuity_loss(event.catalog_revision());
+            self.record_observed_commit(event.catalog_revision());
             return;
         };
         match sender.try_send(event) {
@@ -425,16 +430,17 @@ impl LegacyCatalogCommitPublisher {
                 self.record_continuity_loss(event.catalog_revision());
             }
         }
+        self.record_observed_commit(event.catalog_revision());
     }
 
     pub(crate) fn record_unpublished_mutation(&self, catalog_revision: u64) {
         self.state
             .unpublished_mutation_total
             .fetch_add(1, Ordering::Relaxed);
+        self.record_continuity_loss(catalog_revision);
         self.state
             .latest_observed_revision
             .store(catalog_revision, Ordering::Release);
-        self.record_continuity_loss(catalog_revision);
     }
 
     pub(crate) fn seed_baseline_revision(&self, catalog_revision: u64) {
@@ -466,8 +472,17 @@ impl LegacyCatalogCommitPublisher {
             .store(catalog_revision, Ordering::Relaxed);
         self.state
             .continuity_loss_epoch
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::Release);
         self.state.continuity_lost.store(true, Ordering::Release);
+    }
+
+    fn record_observed_commit(&self, catalog_revision: u64) {
+        self.state
+            .latest_committed_revision
+            .store(catalog_revision, Ordering::Release);
+        self.state
+            .latest_observed_revision
+            .store(catalog_revision, Ordering::Release);
     }
 }
 
@@ -531,6 +546,13 @@ mod tests {
         assert_eq!(metrics.last_lost_revision, 2);
         assert_eq!(metrics.continuity_loss_epoch, 1);
         assert!(metrics.continuity_lost);
+
+        publisher.seal(2);
+        let sealed = publisher.metrics().snapshot();
+        assert!(sealed.sealed);
+        assert_eq!(sealed.final_revision, 2);
+        assert_eq!(sealed.latest_observed_revision, 2);
+        assert_eq!(sealed.continuity_loss_epoch, 1);
     }
 
     #[test]

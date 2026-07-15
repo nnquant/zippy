@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use zippy_types::runtime::{RuntimeCasUpdate, RuntimeObjectId, RuntimeRecord, RuntimeRegistration};
-use zippy_types::Result as ServerResult;
+use zippy_types::{Result as ServerResult, TableId};
 
+use crate::legacy_catalog::legacy_table_id;
 use crate::legacy_runtime::LegacyRuntimeState;
 
 type PersistedFileUpdate = Option<(u64, Vec<serde_json::Value>, Vec<serde_json::Value>)>;
@@ -75,6 +76,24 @@ pub struct SourceRecord {
     pub writer_epoch: u64,
     #[serde(default)]
     pub revision: u64,
+}
+
+/// Persistent Catalog declaration retained independently from source liveness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogSourceDefinition {
+    pub(crate) source_name: String,
+    pub(crate) source_type: String,
+    pub(crate) output_stream: String,
+    pub(crate) config: serde_json::Value,
+    pub(crate) writer_epoch: u64,
+}
+
+/// Durable proof that a table identity was removed through the explicit drop API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedTableTombstone {
+    pub(crate) table_id: TableId,
+    pub(crate) table_name: String,
+    pub(crate) dropped_catalog_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +427,8 @@ pub struct Registry {
     processes: BTreeMap<String, ProcessRecord>,
     streams: BTreeMap<String, StreamRecord>,
     sources: BTreeMap<String, SourceRecord>,
+    catalog_source_definitions: BTreeMap<String, CatalogSourceDefinition>,
+    dropped_table_tombstones: BTreeMap<TableId, DroppedTableTombstone>,
     engines: BTreeMap<String, EngineRecord>,
     next_process_id: u64,
     next_segment_reader_lease_id: u64,
@@ -1143,9 +1164,24 @@ impl Registry {
         output_stream: &str,
         config: serde_json::Value,
     ) -> Result<(), RegistryError> {
+        if !self.streams.contains_key(output_stream) {
+            return Err(RegistryError::StreamNotFound {
+                stream_name: output_stream.to_string(),
+            });
+        }
         self.validate_single_active_writer_source(source_name, output_stream)?;
+        if let Some(existing) = self.catalog_source_definitions.get(source_name) {
+            if existing.source_type != source_type
+                || existing.output_stream != output_stream
+                || existing.config != config
+            {
+                return Err(RegistryError::SourceAlreadyExists {
+                    source_name: source_name.to_string(),
+                });
+            }
+        }
         let existing_writer_epoch = self
-            .sources
+            .catalog_source_definitions
             .get(source_name)
             .map(|source| source.writer_epoch)
             .unwrap_or_default();
@@ -1161,10 +1197,14 @@ impl Registry {
         } else {
             existing_writer_epoch.max(current_stream_writer_epoch)
         };
-        let catalog_changed = self
-            .sources
-            .get(source_name)
-            .is_none_or(|source| source.writer_epoch != writer_epoch)
+        let replaced_definition = self.catalog_source_definitions.values().any(|source| {
+            source.output_stream == output_stream && source.source_name != source_name
+        });
+        let catalog_changed = replaced_definition
+            || self
+                .catalog_source_definitions
+                .get(source_name)
+                .is_none_or(|source| source.writer_epoch != writer_epoch)
             || self
                 .streams
                 .get(output_stream)
@@ -1184,6 +1224,18 @@ impl Registry {
                 });
             }
         }
+        self.catalog_source_definitions
+            .retain(|name, source| name == source_name || source.output_stream != output_stream);
+        self.catalog_source_definitions.insert(
+            source_name.to_string(),
+            CatalogSourceDefinition {
+                source_name: source_name.to_string(),
+                source_type: source_type.to_string(),
+                output_stream: output_stream.to_string(),
+                config: config.clone(),
+                writer_epoch,
+            },
+        );
         let revision = self.next_control_revision();
         if let Some(existing) = self.sources.get_mut(source_name) {
             if existing.process_id != process_id {
@@ -1403,6 +1455,10 @@ impl Registry {
                 })?;
         let catalog_changed = source.writer_epoch != writer_epoch
             || self
+                .catalog_source_definitions
+                .get(source_name)
+                .is_none_or(|definition| definition.writer_epoch != writer_epoch)
+            || self
                 .streams
                 .get(&source.output_stream)
                 .is_some_and(|stream| {
@@ -1417,6 +1473,9 @@ impl Registry {
             if stream.active_writer_source_name.as_deref() == Some(source_name) {
                 stream.writer_epoch = writer_epoch;
             }
+        }
+        if let Some(definition) = self.catalog_source_definitions.get_mut(source_name) {
+            definition.writer_epoch = writer_epoch;
         }
         if catalog_changed {
             self.next_catalog_revision();
@@ -2009,9 +2068,103 @@ impl Registry {
         self.sources.values().cloned().collect()
     }
 
-    /// Iterates source records without cloning runtime-only status and metrics fields.
-    pub(crate) fn source_records(&self) -> impl Iterator<Item = &SourceRecord> {
-        self.sources.values()
+    pub(crate) fn catalog_source_definitions(
+        &self,
+    ) -> impl Iterator<Item = &CatalogSourceDefinition> {
+        self.catalog_source_definitions.values()
+    }
+
+    pub(crate) fn dropped_table_tombstones(&self) -> impl Iterator<Item = &DroppedTableTombstone> {
+        self.dropped_table_tombstones.values()
+    }
+
+    pub(crate) fn restore_catalog_source_definition(
+        &mut self,
+        definition: CatalogSourceDefinition,
+    ) -> Result<(), RegistryError> {
+        if !self.streams.contains_key(&definition.output_stream) {
+            return Err(RegistryError::StreamNotFound {
+                stream_name: definition.output_stream,
+            });
+        }
+        if let Some(existing) = self.catalog_source_definitions.get(&definition.source_name) {
+            if existing != &definition {
+                return Err(RegistryError::SourceAlreadyExists {
+                    source_name: definition.source_name,
+                });
+            }
+            return Ok(());
+        }
+        if self.catalog_source_definitions.values().any(|existing| {
+            existing.output_stream == definition.output_stream
+                && existing.source_name != definition.source_name
+        }) {
+            return Err(RegistryError::SourceAlreadyExists {
+                source_name: definition.source_name,
+            });
+        }
+        self.catalog_source_definitions
+            .insert(definition.source_name.clone(), definition);
+        self.next_catalog_revision();
+        Ok(())
+    }
+
+    pub(crate) fn restore_source_record(
+        &mut self,
+        mut source: SourceRecord,
+    ) -> Result<(), RegistryError> {
+        if !self.streams.contains_key(&source.output_stream) {
+            return Err(RegistryError::StreamNotFound {
+                stream_name: source.output_stream,
+            });
+        }
+        if self.sources.contains_key(&source.source_name) {
+            return Err(RegistryError::SourceAlreadyExists {
+                source_name: source.source_name,
+            });
+        }
+        if let Some(definition) = self.catalog_source_definitions.get(&source.source_name) {
+            if definition.source_type != source.source_type
+                || definition.output_stream != source.output_stream
+                || definition.config != source.config
+                || definition.writer_epoch != source.writer_epoch
+            {
+                return Err(RegistryError::SourceAlreadyExists {
+                    source_name: source.source_name,
+                });
+            }
+        }
+        source.revision = self.next_control_revision();
+        self.runtime_state.observe_source_registered(&source);
+        self.sources.insert(source.source_name.clone(), source);
+        Ok(())
+    }
+
+    pub(crate) fn restore_dropped_table_tombstone(
+        &mut self,
+        tombstone: DroppedTableTombstone,
+    ) -> Result<(), RegistryError> {
+        if legacy_table_id(&tombstone.table_name) != tombstone.table_id
+            || tombstone.dropped_catalog_revision == 0
+        {
+            return Err(RegistryError::InvalidRecordKind {
+                kind: "invalid dropped table tombstone".to_string(),
+            });
+        }
+        match self.dropped_table_tombstones.get(&tombstone.table_id) {
+            Some(existing) if existing != &tombstone => Err(RegistryError::InvalidRecordKind {
+                kind: "conflicting dropped table tombstone".to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                self.catalog_revision = self
+                    .catalog_revision
+                    .max(tombstone.dropped_catalog_revision);
+                self.dropped_table_tombstones
+                    .insert(tombstone.table_id, tombstone);
+                Ok(())
+            }
+        }
     }
 
     pub fn list_engines(&self) -> Vec<EngineRecord> {
@@ -2028,7 +2181,7 @@ impl Registry {
 
     pub(crate) fn source_configs_by_stream(&self) -> BTreeMap<String, Vec<serde_json::Value>> {
         let mut configs = BTreeMap::<String, Vec<serde_json::Value>>::new();
-        for source in self.sources.values() {
+        for source in self.catalog_source_definitions.values() {
             configs
                 .entry(source.output_stream.clone())
                 .or_default()
@@ -2105,7 +2258,6 @@ impl Registry {
         let removed = self.sources.remove(source_name);
         if let Some(source) = &removed {
             self.clear_active_writer_source(&source.output_stream, source_name);
-            self.next_catalog_revision();
             self.runtime_state.remove_legacy_source(source_name);
         }
         removed
@@ -2136,7 +2288,6 @@ impl Registry {
                     source_name: source_name.to_string(),
                 })?;
         self.clear_active_writer_source(&removed.output_stream, source_name);
-        self.next_catalog_revision();
         self.runtime_state.remove_legacy_source(source_name);
         Ok(removed)
     }
@@ -2188,6 +2339,16 @@ impl Registry {
             .into_iter()
             .filter_map(|source_name| self.sources.remove(&source_name))
             .collect::<Vec<_>>();
+        let catalog_source_names = self
+            .catalog_source_definitions
+            .values()
+            .filter(|source| source.output_stream == table_name)
+            .map(|source| source.source_name.clone())
+            .collect::<Vec<_>>();
+        let removed_catalog_source = !catalog_source_names.is_empty();
+        for source_name in catalog_source_names {
+            self.catalog_source_definitions.remove(&source_name);
+        }
 
         let engine_names = self
             .engines
@@ -2204,8 +2365,17 @@ impl Registry {
             }
         }
 
-        if stream.is_some() || !sources.is_empty() {
-            self.next_catalog_revision();
+        if stream.is_some() || !sources.is_empty() || removed_catalog_source {
+            let dropped_catalog_revision = self.next_catalog_revision();
+            let table_id = legacy_table_id(table_name);
+            self.dropped_table_tombstones.insert(
+                table_id,
+                DroppedTableTombstone {
+                    table_id,
+                    table_name: table_name.to_string(),
+                    dropped_catalog_revision,
+                },
+            );
         }
         for source in &sources {
             self.runtime_state.remove_legacy_source(&source.source_name);

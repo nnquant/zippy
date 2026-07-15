@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use zippy_core::{Result, ZippyError};
+use zippy_types::TableId;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotStreamRecord {
@@ -130,6 +131,22 @@ pub struct SnapshotSourceRecord {
     pub revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCatalogSourceRecord {
+    pub source_name: String,
+    pub source_type: String,
+    pub output_stream: String,
+    pub config: serde_json::Value,
+    pub writer_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDroppedTableRecord {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub dropped_catalog_revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotEngineRecord {
     pub engine_name: String,
@@ -148,6 +165,10 @@ pub struct RegistrySnapshot {
     pub catalog_revision: u64,
     pub streams: Vec<SnapshotStreamRecord>,
     pub sources: Vec<SnapshotSourceRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalog_sources: Vec<SnapshotCatalogSourceRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_tables: Vec<SnapshotDroppedTableRecord>,
     pub engines: Vec<SnapshotEngineRecord>,
 }
 

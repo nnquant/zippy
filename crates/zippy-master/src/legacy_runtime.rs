@@ -1260,6 +1260,9 @@ mod tests {
         let mut registry = test_registry();
         let process_id = registry.register_process("worker");
         registry
+            .register_stream("ticks", serde_json::json!({"fields": []}), "schema", 64, 64)
+            .unwrap();
+        registry
             .register_source(
                 "source",
                 "test",
