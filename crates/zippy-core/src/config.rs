@@ -20,6 +20,10 @@ pub const DEFAULT_MAX_PARALLELISM: usize = DEFAULT_MAX_CPU_CORES;
 pub const MAX_PARALLELISM: usize = MAX_CPU_CORES;
 pub const DEFAULT_MAX_QUERY_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 pub const DEFAULT_QUERY_MAX_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
+/// Default lifetime of a query plan that has not started execution.
+pub const DEFAULT_QUERY_PLAN_TTL_MS: u64 = 30_000;
+/// Maximum configurable lifetime of an unexecuted query plan.
+pub const MAX_QUERY_PLAN_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const MAX_QUERY_BUFFER_BYTES: usize = u32::MAX as usize;
 /// Default number of logical native queries admitted concurrently.
 pub const DEFAULT_QUERY_MAX_CONCURRENT_QUERIES: usize = 64;
@@ -233,12 +237,29 @@ impl Default for ZippyQueryResourceConfig {
 }
 
 /// Optional query-specific limits plus native query admission resources.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyQueryConfig {
     pub parallelism: Option<usize>,
     pub max_buffered_bytes: Option<usize>,
+    #[serde(default = "default_query_plan_ttl_ms")]
+    pub plan_ttl_ms: u64,
     #[serde(default)]
     pub resources: ZippyQueryResourceConfig,
+}
+
+impl Default for ZippyQueryConfig {
+    fn default() -> Self {
+        Self {
+            parallelism: None,
+            max_buffered_bytes: None,
+            plan_ttl_ms: DEFAULT_QUERY_PLAN_TTL_MS,
+            resources: ZippyQueryResourceConfig::default(),
+        }
+    }
+}
+
+const fn default_query_plan_ttl_ms() -> u64 {
+    DEFAULT_QUERY_PLAN_TTL_MS
 }
 
 /// Master control endpoint defaults.
@@ -394,6 +415,7 @@ struct PartialRuntimeConfig {
 struct PartialQueryConfig {
     parallelism: Option<usize>,
     max_buffered_bytes: Option<usize>,
+    plan_ttl_ms: Option<u64>,
     resources: Option<PartialQueryResourceConfig>,
 }
 
@@ -761,6 +783,9 @@ impl ZippyConfig {
             if let Some(max_buffered_bytes) = query.max_buffered_bytes {
                 self.query.max_buffered_bytes = Some(max_buffered_bytes);
             }
+            if let Some(plan_ttl_ms) = query.plan_ttl_ms {
+                self.query.plan_ttl_ms = plan_ttl_ms;
+            }
             if let Some(resources) = query.resources {
                 if let Some(max_concurrent_queries) = resources.max_concurrent_queries {
                     self.query.resources.max_concurrent_queries = max_concurrent_queries;
@@ -895,6 +920,9 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_QUERY_MAX_BUFFERED_BYTES") {
             self.query.max_buffered_bytes =
                 Some(parse_usize_env("ZIPPY_QUERY_MAX_BUFFERED_BYTES", &value)?);
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_PLAN_TTL_MS") {
+            self.query.plan_ttl_ms = parse_u64_env("ZIPPY_QUERY_PLAN_TTL_MS", &value)?;
         }
         if let Some(value) = env_string("ZIPPY_QUERY_MAX_CONCURRENT_QUERIES") {
             self.query.resources.max_concurrent_queries =
@@ -1168,6 +1196,14 @@ impl ZippyConfig {
                     ),
                 });
             }
+        }
+        if self.query.plan_ttl_ms == 0 || self.query.plan_ttl_ms > MAX_QUERY_PLAN_TTL_MS {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query plan_ttl_ms must be between 1 and {} value=[{}]",
+                    MAX_QUERY_PLAN_TTL_MS, self.query.plan_ttl_ms
+                ),
+            });
         }
         if self.query.resources.max_concurrent_queries == 0
             || self.query.resources.max_concurrent_queries > MAX_QUERY_CONCURRENT_QUERIES

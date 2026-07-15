@@ -66,6 +66,7 @@ _MAX_PARALLELISM = 256
 _MISSING_CONFIG_VALUE = object()
 _DEFAULT_MAX_QUERY_BUFFER_BYTES = 512 * 1024 * 1024
 _DEFAULT_QUERY_MAX_BUFFERED_BYTES = 128 * 1024 * 1024
+_DEFAULT_QUERY_PLAN_TTL_MS = 30_000
 _MAX_QUERY_BUFFER_BYTES = (1 << 32) - 1
 _TEMPORAL_LITERAL_RE = re.compile(
     r"^(?P<year>\d{4})"
@@ -398,6 +399,7 @@ _BUILTIN_CONFIG: dict[str, object] = {
     "query": {
         "parallelism": None,
         "max_buffered_bytes": None,
+        "plan_ttl_ms": _DEFAULT_QUERY_PLAN_TTL_MS,
     },
     "table": {
         "row_capacity": 65_536,

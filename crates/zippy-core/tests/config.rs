@@ -5,6 +5,7 @@ use zippy_core::{
     ZippyCatalogBackend, ZippyConfig, ZippyRuntimeConfig,
     DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_PINS,
     DEFAULT_CATALOG_RUNTIME_SNAPSHOT_PIN_MAX_ACTIVE_TABLES, MAX_CATALOG_RUNTIME_SNAPSHOT_PINS,
+    MAX_QUERY_PLAN_TTL_MS,
 };
 
 const CONFIG_ENV_KEYS: &[&str] = &[
@@ -30,6 +31,7 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_QUERY_MAX_CONCURRENT_QUERIES",
     "ZIPPY_QUERY_MAX_MEMORY_BYTES",
     "ZIPPY_QUERY_PARALLELISM",
+    "ZIPPY_QUERY_PLAN_TTL_MS",
     "ZIPPY_TABLE_ROW_CAPACITY",
     "ZIPPY_TABLE_RETENTION_SEGMENTS",
     "ZIPPY_TABLE_PERSIST",
@@ -76,6 +78,7 @@ max_query_buffer_bytes = 268435456
 [query]
 parallelism = 6
 max_buffered_bytes = 67108864
+plan_ttl_ms = 45000
 
 [query.resources]
 max_concurrent_queries = 32
@@ -128,6 +131,7 @@ shutdown_timeout_ms = 3000
             ("ZIPPY_QUERY_MAX_CONCURRENT_QUERIES", "24"),
             ("ZIPPY_QUERY_MAX_MEMORY_BYTES", "603979776"),
             ("ZIPPY_QUERY_PARALLELISM", "8"),
+            ("ZIPPY_QUERY_PLAN_TTL_MS", "20000"),
             ("ZIPPY_TABLE_ROW_CAPACITY", "2048"),
             ("ZIPPY_TABLE_RETENTION_SEGMENTS", "5"),
             ("ZIPPY_TABLE_PERSIST", "true"),
@@ -164,6 +168,7 @@ shutdown_timeout_ms = 3000
             assert_eq!(config.runtime.max_query_buffer_bytes, 805306368);
             assert_eq!(config.query.parallelism, Some(8));
             assert_eq!(config.query.max_buffered_bytes, Some(100663296));
+            assert_eq!(config.query.plan_ttl_ms, 20000);
             assert_eq!(config.query.resources.max_concurrent_queries, 24);
             assert_eq!(config.query.resources.max_active_tasks, 36);
             assert_eq!(config.query.resources.max_memory_bytes, 603979776);
@@ -213,6 +218,7 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     assert_eq!(config.runtime.max_query_buffer_bytes, 536870912);
     assert_eq!(config.query.parallelism, None);
     assert_eq!(config.query.max_buffered_bytes, None);
+    assert_eq!(config.query.plan_ttl_ms, 30000);
     assert_eq!(config.query_parallelism(), 4);
     assert_eq!(config.query_max_buffered_bytes(), 134217728);
     assert_eq!(config.query.resources.max_concurrent_queries, 64);
@@ -675,9 +681,18 @@ fn zippy_config_serializes_native_storage_and_round_trips_equality() {
     assert_eq!(value["server"]["native_storage_enabled"], true);
     assert_eq!(value["runtime"]["max_cpu_cores"], 4);
     assert_eq!(value["runtime"]["max_parallelism"], 4);
+    assert_eq!(value["query"]["plan_ttl_ms"], 30000);
 
-    let decoded = serde_json::from_value::<ZippyConfig>(value).unwrap();
+    let decoded = serde_json::from_value::<ZippyConfig>(value.clone()).unwrap();
     assert_eq!(decoded, config);
+
+    let mut legacy_value = value;
+    legacy_value["query"]
+        .as_object_mut()
+        .expect("query config object")
+        .remove("plan_ttl_ms");
+    let legacy_decoded = serde_json::from_value::<ZippyConfig>(legacy_value).unwrap();
+    assert_eq!(legacy_decoded.query.plan_ttl_ms, 30000);
 }
 
 #[test]
@@ -1017,6 +1032,36 @@ fn zippy_config_rejects_zero_native_query_resource_limits() {
 
         assert!(error.to_string().contains(message), "field={field}");
     }
+}
+
+#[test]
+fn zippy_config_rejects_zero_query_plan_ttl() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(&config_path, "[query]\nplan_ttl_ms = 0\n").unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("query plan_ttl_ms must be between 1 and 86400000 value=[0]"));
+}
+
+#[test]
+fn zippy_config_rejects_query_plan_ttl_above_one_day() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!("[query]\nplan_ttl_ms = {}\n", MAX_QUERY_PLAN_TTL_MS + 1),
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("query plan_ttl_ms must be between 1 and 86400000 value=[86400001]"));
 }
 
 #[test]

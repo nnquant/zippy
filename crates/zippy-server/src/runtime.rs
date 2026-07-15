@@ -1255,7 +1255,11 @@ impl LegacyServerRuntime {
         }
 
         let services = match gateway.as_ref() {
-            Some(gateway_server) => match LegacyServerServices::new(&master, gateway_server) {
+            Some(gateway_server) => match LegacyServerServices::with_query_config(
+                &master,
+                gateway_server,
+                legacy_query_engine_config(&runtime_config),
+            ) {
                 Ok(services) => LegacyServiceSet::CatalogAndQuery { services },
                 Err(error) => {
                     let rollback = rollback_startup(
@@ -1678,6 +1682,7 @@ fn start_native_storage_if_enabled(
     );
     let runtime_snapshot_pins = runtime_config.catalog.runtime_snapshot_pins;
     let query_resources = native_query_resource_config(runtime_config)?;
+    let query_registry = native_query_registry_config(runtime_config);
     let catalog = SqliteCatalogConfig::new(data_directory).with_runtime_snapshot_pin_limits(
         runtime_snapshot_pins.max_active_pins,
         runtime_snapshot_pins.max_active_tables,
@@ -1686,6 +1691,7 @@ fn start_native_storage_if_enabled(
         .with_catalog_config(catalog)?
         .with_persist_controller_config(persist_controller)
         .with_query_resource_config(query_resources)
+        .with_query_registry_config(query_registry)
         .with_legacy_catalog_migration(legacy_catalog_migration);
     match NativeStorageRuntime::start_until(native_storage, startup_deadline) {
         NativeStorageStartOutcome::Ready(runtime) => Ok(Some(runtime)),
@@ -1725,6 +1731,22 @@ fn native_query_resource_config(
         })?,
         max_memory_bytes: runtime_config.query.resources.max_memory_bytes,
     })
+}
+
+fn native_query_registry_config(
+    runtime_config: &ZippyConfig,
+) -> crate::query_service::QueryServiceRegistryConfig {
+    crate::query_service::QueryServiceRegistryConfig {
+        plan_ttl: Duration::from_millis(runtime_config.query.plan_ttl_ms),
+        ..crate::query_service::QueryServiceRegistryConfig::default()
+    }
+}
+
+fn legacy_query_engine_config(runtime_config: &ZippyConfig) -> crate::LegacyQueryEngineConfig {
+    crate::LegacyQueryEngineConfig {
+        plan_ttl: Duration::from_millis(runtime_config.query.plan_ttl_ms),
+        ..crate::LegacyQueryEngineConfig::default()
+    }
 }
 
 fn prepare_legacy_catalog_migration(
@@ -2331,6 +2353,20 @@ mod tests {
         assert_eq!(lower_resources.max_active_tasks, 31);
         assert_eq!(lower_resources.max_cpu_slots, 6);
         assert_eq!(lower_resources.max_memory_bytes, 384 * 1024 * 1024);
+    }
+
+    #[test]
+    fn query_engines_use_the_server_plan_ttl() {
+        let mut config = ZippyConfig::default();
+        config.query.plan_ttl_ms = 12_345;
+
+        let registry = native_query_registry_config(&config);
+
+        assert_eq!(registry.plan_ttl, Duration::from_millis(12_345));
+        assert_eq!(
+            legacy_query_engine_config(&config).plan_ttl,
+            Duration::from_millis(12_345)
+        );
     }
 
     #[cfg(unix)]

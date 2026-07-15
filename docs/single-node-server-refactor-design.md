@@ -1522,6 +1522,7 @@ max_buffered_bytes = 268435456
 parallelism = 4
 max_buffered_bytes = 134217728
 max_spill_bytes = 4294967296
+plan_ttl_ms = 30000
 
 [query.resources]
 max_concurrent_queries = 8
@@ -2096,6 +2097,15 @@ scope，并在同一个 `global -> query` 临界区只允许 `Running -> Failed`
 并存，后者收到取消后仍按既有 RAII 规则退出：最后一个 task 撤销 snapshot root，最后一个 result permit
 才使 terminal 实例进入 retention。执行失败与 owner/admin cancel、timeout 或 shutdown 竞争时继续遵循
 first-terminal-wins，迟到的 `fail` 返回已经存在的终态错误。
+
+Stage 4.6 服务端 plan TTL 小步已完成（2026-07-15）：`query.plan_ttl_ms` 和
+`ZIPPY_QUERY_PLAN_TTL_MS` 统一配置未执行 plan 的存活时间，默认 30 秒，允许范围为 1 毫秒到 24 小时。
+server runtime 将同一值注入当前 authoritative Legacy/Gateway adapter 和 staged native QueryService，
+避免迁移期同一配置出现两种行为。native `complete_planning` 使用服务端完成时刻重写
+`planned_at_ns`，并计算
+`expires_at_ns=min(request_deadline, completed_at_ns+plan_ttl)`；没有 request deadline 时只使用服务端
+TTL。planner 仍可构造共享的 `QueryPlanInfo`，但其中两个时间字段只是输入占位，不能缩短或延长 lease。
+request deadline 覆盖 Planned/Running；server plan TTL 只覆盖 Planned，开始执行后立即删除。
 
 这一小步仍是 native staging，不是 authority 切换。可信 session policy、完整外部 `QueryStatus`、
 DataFusion operator/result-stream 的实际取消传播仍未完成；当前 Python/Gateway `collect_stream` 也仍绕过

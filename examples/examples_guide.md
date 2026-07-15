@@ -36,6 +36,7 @@ max_query_buffer_bytes = 536870912
 [query]
 parallelism = 2
 max_buffered_bytes = 134217728
+plan_ttl_ms = 30000
 
 [query.resources]
 max_concurrent_queries = 64
@@ -50,6 +51,7 @@ ZIPPY_MAX_CPU_CORES=8 \
 ZIPPY_QUERY_PARALLELISM=4 \
 ZIPPY_MAX_QUERY_BUFFER_BYTES=536870912 \
 ZIPPY_QUERY_MAX_BUFFERED_BYTES=134217728 \
+ZIPPY_QUERY_PLAN_TTL_MS=30000 \
 ZIPPY_QUERY_MAX_CONCURRENT_QUERIES=64 \
 ZIPPY_QUERY_MAX_ACTIVE_TASKS=32 \
 ZIPPY_QUERY_MAX_MEMORY_BYTES=536870912 \
@@ -65,6 +67,10 @@ fan-out 和 native Gateway persisted 文件扫描。
 旧的 `[runtime].max_parallelism` 和 `ZIPPY_MAX_PARALLELISM` 保留一个兼容周期。同一 TOML
 或环境变量层同时提供新旧名称时，两者必须相等；环境变量层仍整体覆盖 TOML。该 CPU 值目前
 是组件配置上限，不代表所有独立线程池已经共享一个进程级硬 semaphore。
+
+`query.plan_ttl_ms` / `ZIPPY_QUERY_PLAN_TTL_MS` 控制未执行计划持有 snapshot 的最长时间，默认
+30 秒，可配置 1 毫秒到 24 小时；Legacy/Gateway 与 native QueryService 使用同一值，查询 planner
+不能自行改变。
 
 persisted streaming 的进程级 Arrow 缓冲预算默认是 `512 MiB`，单查询默认是 `128 MiB`。
 单查询额度从全局额度中 admission，随后均分给活跃文件扫描槽位；默认并行度 4 时每槽约

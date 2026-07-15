@@ -141,7 +141,6 @@ impl NativeStorageRuntimeConfig {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn with_query_registry_config(
         mut self,
         query_registry: crate::query_service::QueryServiceRegistryConfig,

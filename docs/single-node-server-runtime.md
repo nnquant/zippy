@@ -135,6 +135,13 @@ and leaves task/result reservations to drain through RAII. Concurrent cancellati
 shutdown retain whichever terminal transition commits first; scope drop cannot relabel an execution
 failure as cancellation.
 
+`query.plan_ttl_ms` controls how long an unexecuted plan may retain its snapshot; it defaults to
+30,000 ms, accepts 1 ms through 24 hours, and `ZIPPY_QUERY_PLAN_TTL_MS` overrides it. The current
+Legacy/Gateway authority and staged native QueryService use the same value. QueryService derives the
+plan timestamps from its own completion time, configured TTL, and the earlier request deadline, so
+planner-supplied timestamps cannot change the lease. This plan TTL applies only while `Planned`; a
+request deadline remains active through `Running`.
+
 ## Managed data root ownership
 
 The native runtime acquires `<data_root>/server.lock` before logging, loading the legacy snapshot,

@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use zippy_core::{
     DEFAULT_MAX_CPU_CORES, DEFAULT_QUERY_MAX_ACTIVE_TASKS, DEFAULT_QUERY_MAX_CONCURRENT_QUERIES,
-    DEFAULT_QUERY_MAX_MEMORY_BYTES, MAX_QUERY_CONCURRENT_QUERIES,
+    DEFAULT_QUERY_MAX_MEMORY_BYTES, DEFAULT_QUERY_PLAN_TTL_MS, MAX_QUERY_CONCURRENT_QUERIES,
 };
 use zippy_types::query::{
     OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryExecutionToken, QueryInstanceId,
@@ -30,6 +30,7 @@ static NEXT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(300);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_PLANNING_DURATION: Duration = Duration::from_secs(30);
+const DEFAULT_PLAN_TTL: Duration = Duration::from_millis(DEFAULT_QUERY_PLAN_TTL_MS);
 const DEFAULT_MAX_REGISTERED_QUERIES: usize = MAX_QUERY_CONCURRENT_QUERIES;
 const DEFAULT_MAX_QUERY_TOMBSTONES: usize = 65_536;
 const QUERY_SWEEPER_THREAD_NAME: &str = "zippy-query-sweeper";
@@ -73,6 +74,7 @@ pub(crate) struct QueryServiceRegistryConfig {
     pub sweep_interval: Duration,
     pub terminal_retention: Duration,
     pub max_planning_duration: Duration,
+    pub plan_ttl: Duration,
     pub max_registered_queries: usize,
     pub max_query_tombstones: usize,
 }
@@ -83,6 +85,7 @@ impl Default for QueryServiceRegistryConfig {
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
             max_planning_duration: DEFAULT_MAX_PLANNING_DURATION,
+            plan_ttl: DEFAULT_PLAN_TTL,
             max_registered_queries: DEFAULT_MAX_REGISTERED_QUERIES,
             max_query_tombstones: DEFAULT_MAX_QUERY_TOMBSTONES,
         }
@@ -94,6 +97,7 @@ impl QueryServiceRegistryConfig {
         if self.sweep_interval.is_zero()
             || self.terminal_retention.is_zero()
             || self.max_planning_duration.is_zero()
+            || self.plan_ttl.is_zero()
             || self.max_registered_queries == 0
             || self.max_query_tombstones == 0
         {
@@ -295,6 +299,7 @@ impl QueryResourceCoordinator {
             max_registered_queries: registry_config.max_registered_queries,
             max_query_tombstones: registry_config.max_query_tombstones,
             max_planning_duration_ns: duration_ns(registry_config.max_planning_duration),
+            plan_ttl_ns: duration_ns(registry_config.plan_ttl),
             next_query_generation: AtomicU64::new(1),
             next_owner_nonce: AtomicU64::new(1),
             state: Mutex::new(CoordinatorState::default()),
@@ -448,6 +453,13 @@ impl QueryResourceCoordinator {
             return self.reject_planning(&mut token, error);
         }
         info.planned_at_ns = completed_at_ns;
+        let server_plan_expiry_ns = completed_at_ns.saturating_add(self.inner.plan_ttl_ns);
+        info.expires_at_ns = token
+            .control
+            .request_deadline_ns
+            .map_or(server_plan_expiry_ns, |deadline_ns| {
+                deadline_ns.min(server_plan_expiry_ns)
+            });
         if let Err(error) = validate_plan_snapshot_binding(&info, snapshot.descriptor()) {
             return self.reject_planning(&mut token, error);
         }
@@ -622,9 +634,7 @@ impl QueryResourceCoordinator {
         now_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
         validate_plan_snapshot_binding(&info, snapshot.descriptor())?;
-        if info.expires_at_ns <= now_ns
-            || execution_deadline_ns.is_some_and(|deadline| deadline <= now_ns)
-        {
+        if execution_deadline_ns.is_some_and(|deadline| deadline <= now_ns) {
             return Err(deadline(
                 info.query_id,
                 "query expired before test plan registration",
@@ -839,6 +849,7 @@ struct CoordinatorInner {
     max_registered_queries: usize,
     max_query_tombstones: usize,
     max_planning_duration_ns: u64,
+    plan_ttl_ns: u64,
     next_query_generation: AtomicU64,
     next_owner_nonce: AtomicU64,
     state: Mutex<CoordinatorState>,
@@ -980,13 +991,15 @@ impl QueryRegistry {
             ));
             debug_assert!(inserted_request_deadline);
         }
-        let inserted_plan_deadline = self.deadline_order.insert((
-            expires_at_ns,
-            control.query_id,
-            control.generation,
-            QueryDeadlineKind::PlanExpiry,
-        ));
-        debug_assert!(inserted_plan_deadline);
+        if control.request_deadline_ns != Some(expires_at_ns) {
+            let inserted_plan_deadline = self.deadline_order.insert((
+                expires_at_ns,
+                control.query_id,
+                control.generation,
+                QueryDeadlineKind::PlanExpiry,
+            ));
+            debug_assert!(inserted_plan_deadline);
+        }
     }
 
     fn len(&self) -> usize {
@@ -1394,8 +1407,7 @@ impl CoordinatorInner {
             return Err(error);
         }
 
-        if control.planning_deadline_ns <= completed_at_ns || info.expires_at_ns <= completed_at_ns
-        {
+        if control.planning_deadline_ns <= completed_at_ns {
             let error = deadline(control.query_id, "query expired while planning");
             let signal = Self::terminate_locked(
                 &mut global,
@@ -3055,6 +3067,7 @@ mod tests {
             sweep_interval: Duration::from_secs(3600),
             terminal_retention,
             max_planning_duration: DEFAULT_MAX_PLANNING_DURATION,
+            plan_ttl: Duration::from_nanos(90),
             max_registered_queries,
             max_query_tombstones,
         }
@@ -3065,6 +3078,7 @@ mod tests {
             resources,
             QueryServiceRegistryConfig {
                 sweep_interval: Duration::from_secs(3600),
+                plan_ttl: Duration::from_nanos(90),
                 ..QueryServiceRegistryConfig::default()
             },
         )
@@ -3080,6 +3094,22 @@ mod tests {
             QueryServiceRegistryConfig {
                 sweep_interval: Duration::from_secs(3600),
                 max_planning_duration,
+                plan_ttl: Duration::from_nanos(90),
+                ..QueryServiceRegistryConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn coordinator_with_plan_ttl(
+        resources: QueryServiceResourceConfig,
+        plan_ttl: Duration,
+    ) -> QueryResourceCoordinator {
+        QueryResourceCoordinator::with_registry_config(
+            resources,
+            QueryServiceRegistryConfig {
+                sweep_interval: Duration::from_secs(3600),
+                plan_ttl,
                 ..QueryServiceRegistryConfig::default()
             },
         )
@@ -3179,6 +3209,7 @@ mod tests {
             .expect("atomically bind plan and snapshot");
         assert_eq!(token.instance_id(), instance_id);
         assert_eq!(token.info().planned_at_ns, 20);
+        assert_eq!(token.info().expires_at_ns, 90);
 
         let planned_status = coordinator
             .status_owned(owner.as_ref(), instance_id)
@@ -3186,12 +3217,12 @@ mod tests {
         assert_eq!(planned_status.state, QueryState::Planned);
         let plan = planned_status.plan.expect("completed plan metadata");
         assert_eq!(plan.planned_at_ns, 20);
-        assert_eq!(plan.expires_at_ns, 80);
+        assert_eq!(plan.expires_at_ns, 90);
         assert_eq!(plan.catalog_revision, 1);
         assert!(plan.snapshots.is_empty());
         assert!(planned_status.started_at_ns.is_none());
         assert_eq!(coordinator.status().active_snapshot_owners, 1);
-        assert_eq!(coordinator.status().scheduled_deadlines, 2);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         let execution = coordinator.begin_execution(token, 30).unwrap();
         let running = coordinator
@@ -3238,6 +3269,46 @@ mod tests {
                 .state,
             QueryState::TimedOut
         );
+    }
+
+    #[test]
+    fn server_plan_ttl_replaces_past_and_future_planner_timestamps() {
+        let coordinator = coordinator_with_plan_ttl(
+            QueryServiceResourceConfig {
+                max_active_queries: 2,
+                ..config()
+            },
+            Duration::from_nanos(10),
+        );
+        let owner = coordinator.owner(session_id(1));
+
+        for (value, supplied_expiry) in [(1, 1), (2, u64::MAX)] {
+            let id = query_id(value);
+            let planning = coordinator
+                .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+                .unwrap();
+            let mut supplied = info(id, supplied_expiry);
+            supplied.planned_at_ns = u64::MAX;
+            let token = coordinator
+                .complete_planning_at_for_test(
+                    planning,
+                    supplied,
+                    snapshot(id, Arc::new(AtomicUsize::new(0))),
+                    20,
+                )
+                .unwrap();
+            assert_eq!(token.info().planned_at_ns, 20);
+            assert_eq!(token.info().expires_at_ns, 30);
+            let plan = coordinator
+                .admin_handle()
+                .status(token.instance_id())
+                .unwrap()
+                .plan
+                .expect("completed plan status");
+            assert_eq!(plan.planned_at_ns, 20);
+            assert_eq!(plan.expires_at_ns, 30);
+            drop(token);
+        }
     }
 
     #[test]
@@ -3298,7 +3369,7 @@ mod tests {
     }
 
     #[test]
-    fn completing_planning_replaces_server_expiry_with_request_and_plan_deadlines() {
+    fn completing_planning_installs_request_and_server_plan_deadlines() {
         let coordinator = coordinator_with_planning_duration(config(), Duration::from_nanos(10));
         let owner = coordinator.owner(session_id(1));
         let id = query_id(1);
@@ -3315,7 +3386,8 @@ mod tests {
                 15,
             )
             .unwrap();
-        assert_eq!(coordinator.status().scheduled_deadlines, 2);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
+        assert_eq!(token.info().expires_at_ns, 50);
 
         assert_eq!(coordinator.sweep_expired(20), 0);
         assert_eq!(
@@ -3326,12 +3398,13 @@ mod tests {
             QueryState::Planned
         );
         assert_eq!(coordinator.sweep_expired(50), 1);
+        let status = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(status.state, QueryState::TimedOut);
         assert_eq!(
-            coordinator
-                .status_owned(owner.as_ref(), instance_id)
-                .unwrap()
-                .state,
-            QueryState::TimedOut
+            status.error.expect("request deadline error").message(),
+            "query exceeded its request deadline"
         );
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().scheduled_deadlines, 0);
@@ -3405,13 +3478,13 @@ mod tests {
         let expired_id = query_id(2);
         let expired_drops = Arc::new(AtomicUsize::new(0));
         let expired = coordinator
-            .submit_at_for_test(owner.as_ref(), metadata(expired_id, None), budget(), 10)
+            .submit_at_for_test(owner.as_ref(), metadata(expired_id, Some(20)), budget(), 10)
             .unwrap();
         let expired_instance = expired.instance_id();
         let expired_error = coordinator
             .complete_planning_at_for_test(
                 expired,
-                info(expired_id, 20),
+                info(expired_id, u64::MAX),
                 snapshot(expired_id, Arc::clone(&expired_drops)),
                 20,
             )
@@ -4755,7 +4828,7 @@ mod tests {
 
     #[test]
     fn ttl_revokes_unexecuted_snapshot_even_when_plan_token_is_retained() {
-        let coordinator = coordinator(config());
+        let coordinator = coordinator_with_plan_ttl(config(), Duration::from_nanos(10));
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
@@ -4854,6 +4927,7 @@ mod tests {
                 sweep_interval: Duration::from_millis(5),
                 terminal_retention: Duration::from_secs(30),
                 max_planning_duration: DEFAULT_MAX_PLANNING_DURATION,
+                plan_ttl: Duration::from_millis(20),
                 max_registered_queries: 1,
                 max_query_tombstones: 8,
             },

@@ -9,7 +9,7 @@ use zippy_master::server::MasterServer;
 use zippy_types::catalog::CatalogRead;
 use zippy_types::{ErrorCode, Result, ServerError};
 
-use crate::{LegacyQueryEngineAdapter, LegacyServerHealth};
+use crate::{LegacyQueryEngineAdapter, LegacyQueryEngineConfig, LegacyServerHealth};
 
 /// Stable service handles composed from the existing single-node runtime.
 ///
@@ -29,6 +29,15 @@ pub struct LegacyServerServices {
 impl LegacyServerServices {
     /// Builds stable catalog and query services without changing wire behavior.
     pub fn new(master: &MasterServer, gateway: &GatewayServer) -> Result<Self> {
+        Self::with_query_config(master, gateway, LegacyQueryEngineConfig::default())
+    }
+
+    /// Builds stable services with server-owned query lifecycle configuration.
+    pub fn with_query_config(
+        master: &MasterServer,
+        gateway: &GatewayServer,
+        query_config: LegacyQueryEngineConfig,
+    ) -> Result<Self> {
         let catalog = Arc::new(master.legacy_catalog_adapter());
         let runtime = Arc::new(master.legacy_runtime_registry_adapter_inactive());
         let catalog_read: Arc<dyn CatalogRead> = catalog.clone();
@@ -42,9 +51,10 @@ impl LegacyServerServices {
                     )
                 },
             )?;
-        let query = Arc::new(LegacyQueryEngineAdapter::new_inactive(
+        let query = Arc::new(LegacyQueryEngineAdapter::new_inactive_with_config(
             gateway_facade.clone(),
             catalog_read,
+            query_config,
         )?);
         Ok(Self {
             master: master.clone(),
@@ -134,6 +144,7 @@ impl LegacyServerServices {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+    use std::time::Duration;
 
     use zippy_core::ControlEndpoint;
     use zippy_gateway::{GatewayServer, GatewayServerConfig};
@@ -144,7 +155,7 @@ mod tests {
     use zippy_types::{ErrorCode, QueryId, ResourceLimit, SessionId};
 
     use super::LegacyServerServices;
-    use crate::{LegacyGatewayPlan, ServiceHealth};
+    use crate::{LegacyGatewayPlan, LegacyQueryEngineConfig, ServiceHealth};
 
     #[test]
     fn composition_publishes_readiness_only_after_explicit_activation() {
@@ -186,6 +197,64 @@ mod tests {
             ErrorCode::Unavailable
         );
         assert_eq!(services.activate().unwrap_err().code(), ErrorCode::Conflict);
+    }
+
+    #[tokio::test]
+    async fn composition_applies_server_plan_ttl_to_legacy_queries() {
+        let master = MasterServer::default();
+        let gateway = GatewayServer::new(GatewayServerConfig {
+            endpoint: "127.0.0.1:0".to_string(),
+            master_endpoint: ControlEndpoint::Tcp("127.0.0.1:1".parse().unwrap()),
+            token: None,
+            max_write_rows: None,
+            max_connections: None,
+            max_subscribers: None,
+            max_blocking_requests: None,
+            write_timeout_ms: None,
+        })
+        .unwrap();
+        let services = LegacyServerServices::with_query_config(
+            &master,
+            &gateway,
+            LegacyQueryEngineConfig {
+                plan_ttl: Duration::from_millis(1_234),
+                ..LegacyQueryEngineConfig::default()
+            },
+        )
+        .unwrap();
+        services.activate().unwrap();
+        let query = services.query();
+        let session_id = SessionId::from_u128(1).unwrap();
+        let owner = query.owner(session_id);
+        let token = query
+            .plan(
+                owner.as_ref(),
+                QueryRequest {
+                    query_id: QueryId::from_u128(1).unwrap(),
+                    session_id,
+                    input: QueryInput::LogicalPlan(
+                        LegacyGatewayPlan::new("ticks", Vec::new())
+                            .unwrap()
+                            .encode()
+                            .unwrap(),
+                    ),
+                    tables: Vec::new(),
+                    priority: QueryPriority::Interactive,
+                    deadline_ns: None,
+                    memory_limit_bytes: ResourceLimit::ServerDefault,
+                    spill_limit_bytes: ResourceLimit::Disabled,
+                    result_batch_rows: NonZeroU32::new(128),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            token.info().expires_at_ns - token.info().planned_at_ns,
+            1_234_000_000
+        );
+        drop(token);
+        services.begin_shutdown();
     }
 
     #[test]

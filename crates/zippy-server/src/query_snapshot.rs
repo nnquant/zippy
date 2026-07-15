@@ -807,6 +807,7 @@ mod tests {
             .expect("reuse Catalog ownership")
             .with_query_registry_config(QueryServiceRegistryConfig {
                 sweep_interval: Duration::from_secs(3600),
+                plan_ttl: Duration::from_nanos(10),
                 ..QueryServiceRegistryConfig::default()
             });
         let runtime = NativeStorageRuntime::start(runtime_config).expect("start native storage");

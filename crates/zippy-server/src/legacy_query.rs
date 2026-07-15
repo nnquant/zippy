@@ -200,16 +200,12 @@ impl LegacyQueryEngineAdapter {
         Self::build(facade, catalog, config, ADMISSION_ACTIVE)
     }
 
-    pub(crate) fn new_inactive(
+    pub(crate) fn new_inactive_with_config(
         facade: LegacyCollectFacade,
         catalog: Arc<dyn CatalogRead>,
+        config: LegacyQueryEngineConfig,
     ) -> Result<Self> {
-        Self::build(
-            facade,
-            catalog,
-            LegacyQueryEngineConfig::default(),
-            ADMISSION_INITIALIZING,
-        )
+        Self::build(facade, catalog, config, ADMISSION_INITIALIZING)
     }
 
     fn build(

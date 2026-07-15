@@ -522,6 +522,7 @@ fn master_client_gets_config() {
     assert!(config.table.persist.enabled);
     assert_eq!(config.table.persist.method, "parquet");
     assert_eq!(config.table.persist.data_dir, "data");
+    assert_eq!(config.query.plan_ttl_ms, 30_000);
 
     server.join().unwrap();
 }
@@ -533,9 +534,14 @@ fn master_client_accepts_legacy_canonical_and_equal_dual_cpu_wire_configs() {
     legacy_runtime.remove("max_cpu_cores");
     legacy_runtime.insert("max_parallelism".to_string(), serde_json::json!(32));
     legacy["query"].as_object_mut().unwrap().remove("resources");
+    legacy["query"]
+        .as_object_mut()
+        .unwrap()
+        .remove("plan_ttl_ms");
     let legacy = fetch_wire_config(legacy).unwrap();
     assert_eq!(legacy.runtime.max_cpu_cores, 32);
     assert_eq!(legacy.query.resources.max_active_tasks, 128);
+    assert_eq!(legacy.query.plan_ttl_ms, 30_000);
 
     let mut canonical = ZippyConfig::default().to_json_value();
     let canonical_runtime = canonical["runtime"].as_object_mut().unwrap();

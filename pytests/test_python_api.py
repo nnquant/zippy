@@ -12433,7 +12433,7 @@ def test_remote_master_client_caches_full_config_for_gateway_limits(monkeypatch)
             "max_cpu_cores": 8,
             "max_parallelism": 8,
         },
-        "query": {"parallelism": 6},
+        "query": {"parallelism": 6, "plan_ttl_ms": 30000},
         "gateway": {
             "enabled": True,
             "endpoint": "127.0.0.1:17691",
@@ -12478,7 +12478,7 @@ def test_remote_master_client_caches_full_config_for_gateway_limits(monkeypatch)
     assert remote.remote_gateway_token() == "secret-token"
     assert "secret-token" not in repr(remote)
     assert second["runtime"] == {"max_cpu_cores": 8, "max_parallelism": 8}
-    assert second["query"] == {"parallelism": 6}
+    assert second["query"] == {"parallelism": 6, "plan_ttl_ms": 30000}
     assert second_gateway["token"] == "secret-token"
     assert gateway.max_cpu_cores == 8
     assert gateway.query_parallelism == 6
