@@ -1,9 +1,9 @@
 //! DataFusion integration for server-owned analytical queries.
 //!
 //! This crate is deliberately separate from the ingest and callback runtimes. It owns
-//! per-session DataFusion policy and, in later slices, Zippy table providers and physical
-//! operators. Keeping this boundary explicit prevents analytical planning or execution from
-//! entering the real-time data hot path.
+//! per-session DataFusion policy, capability-free persisted providers, and physical plan binding.
+//! Keeping this boundary explicit prevents analytical planning or execution from entering the
+//! real-time data hot path.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -26,10 +26,14 @@ use tokio::sync::Semaphore;
 mod persisted_plan;
 
 pub use persisted_plan::{
-    PersistedFileDescription, PersistedFileKey, PersistedTableDescription, ZippyTableProvider,
+    bind_persisted_snapshot_plan, BoundPersistedPlan, PersistedFileDescription, PersistedFileKey,
+    PersistedFileOpenRequest, PersistedFileOpener, PersistedTableDescription, ZippyTableProvider,
 };
 
 const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
+
+/// A server-supplied Parquet reader whose concrete storage capability remains opaque here.
+pub type BoxedAsyncFileReader = Box<dyn AsyncFileReader + Send>;
 
 /// A path-free random-access file whose lifetime owns query admission and snapshot protection.
 ///

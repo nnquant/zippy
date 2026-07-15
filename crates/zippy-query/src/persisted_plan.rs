@@ -1,16 +1,18 @@
-//! Capability-free persisted manifests and planning-only DataFusion integration.
+//! Capability-free persisted manifests and snapshot-bound DataFusion plan integration.
 
 use std::any::Any;
 use std::collections::HashSet;
+use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 
+use crate::BoxedAsyncFileReader;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DFSchema, DataFusionError, Result, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetExec, ParquetFileReaderFactory};
@@ -26,8 +28,14 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use zippy_types::{FileId, TableId};
 
 const PERSISTED_OBJECT_STORE_URL: &str = "zippy-query://persisted";
+const NORMALIZED_PERSISTED_OBJECT_STORE_URL: &str = "zippy-query://persisted/";
 const PLANNING_ONLY_READER_ERROR: &str =
     "planning-only Zippy Parquet scan has no snapshot-bound reader factory";
+const EXPIRED_EXECUTION_LEASE_ERROR: &str =
+    "snapshot-bound Zippy Parquet scan execution lease has expired";
+
+static PLANNING_READER_FACTORY: LazyLock<Arc<dyn ParquetFileReaderFactory>> =
+    LazyLock::new(|| Arc::new(PlanningOnlyParquetReaderFactory));
 
 /// Stable, path-free identity of one file in an exact query snapshot scan order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -371,6 +379,410 @@ impl PersistedTableDescription {
     }
 }
 
+/// Pure metadata passed from DataFusion's bound scan to a server-owned file opener.
+///
+/// The request deliberately contains no path, file handle, snapshot capability, or execution
+/// context. The opener must resolve the description through the live execution lease it owns and
+/// reject any value that does not exactly match that lease's retained snapshot manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedFileOpenRequest {
+    description: PersistedFileDescription,
+    partition_index: usize,
+}
+
+impl PersistedFileOpenRequest {
+    fn new(description: PersistedFileDescription, partition_index: usize) -> Self {
+        Self {
+            description,
+            partition_index,
+        }
+    }
+
+    /// Returns the exact path-free file description validated by the bound reader factory.
+    #[must_use]
+    pub const fn description(self) -> PersistedFileDescription {
+        self.description
+    }
+
+    /// Returns DataFusion's physical file-group partition index.
+    #[must_use]
+    pub const fn partition_index(self) -> usize {
+        self.partition_index
+    }
+}
+
+/// Server-owned bridge from a validated persisted file description to a lazy Parquet reader.
+///
+/// Implementations must perform only bounded, nonblocking construction in [`Self::open_reader`].
+/// File opening, checksum verification, and other blocking work must remain deferred inside the
+/// returned reader. The implementation must also revalidate the description against its live
+/// execution lease before admitting any physical file task.
+pub trait PersistedFileOpener: Send + Sync + 'static {
+    /// Creates a lazy reader for one snapshot-bound file description.
+    fn open_reader(
+        &self,
+        request: PersistedFileOpenRequest,
+    ) -> zippy_types::Result<BoxedAsyncFileReader>;
+}
+
+/// A physical plan whose persisted scans are bound to one weak execution authority.
+///
+/// Keeping the authority weak is intentional: cloning or retaining the DataFusion plan cannot
+/// prolong access to pinned storage after the server drops its native execution lease.
+#[derive(Debug)]
+pub struct BoundPersistedPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    bound_scan_count: usize,
+}
+
+impl BoundPersistedPlan {
+    /// Returns the immutable DataFusion plan while preserving this binding owner.
+    #[must_use]
+    pub const fn execution_plan(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.plan
+    }
+
+    /// Returns how many persisted Parquet scan nodes were bound in the complete plan tree.
+    #[must_use]
+    pub const fn bound_scan_count(&self) -> usize {
+        self.bound_scan_count
+    }
+}
+
+/// Validates and atomically binds every persisted scan in a complete physical plan tree.
+///
+/// The expected tables are the trust root and must be borrowed from the same retained manifest
+/// owned by the server's execution lease. This function must run inside a separately admitted
+/// physical-plan construction task because rewriting temporarily retains both the original and
+/// replacement plan nodes. An empty or optimizer-eliminated persisted scan is valid and produces
+/// a bound count of zero.
+pub fn bind_persisted_snapshot_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    expected_tables: &[PersistedTableDescription],
+    opener: &Arc<dyn PersistedFileOpener>,
+) -> Result<BoundPersistedPlan> {
+    validate_expected_tables(expected_tables)?;
+    let bound_factory: Arc<dyn ParquetFileReaderFactory> = Arc::new(BoundParquetReaderFactory {
+        opener: Arc::downgrade(opener),
+    });
+    let mut visited_marker_nodes = HashSet::new();
+    let mut bound_scan_count = 0_usize;
+
+    let plan = plan
+        .transform_up(|node| {
+            let Some(parquet) = node.as_any().downcast_ref::<ParquetExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let has_marker = has_factory(parquet, &PLANNING_READER_FACTORY);
+            let has_reserved_signal = is_reserved_zippy_scan(parquet);
+            if !has_marker {
+                if has_reserved_signal {
+                    return Err(binding_error(
+                        "persisted Parquet scan is missing the exact planning marker",
+                    ));
+                }
+                return Ok(Transformed::no(node));
+            }
+
+            let node_identity = Arc::as_ptr(&node) as *const () as usize;
+            if !visited_marker_nodes.insert(node_identity) {
+                return Err(binding_error(
+                    "persisted planning scan node is reused as a physical-plan DAG child",
+                ));
+            }
+            validate_planning_scan(parquet, expected_tables)?;
+            bound_scan_count = bound_scan_count
+                .checked_add(1)
+                .ok_or_else(|| binding_error("persisted physical plan scan count overflowed"))?;
+            let replacement: Arc<dyn ExecutionPlan> = Arc::new(
+                parquet
+                    .clone()
+                    .with_parquet_file_reader_factory(Arc::clone(&bound_factory)),
+            );
+            Ok(Transformed::yes(replacement))
+        })?
+        .data;
+
+    validate_bound_tree(&plan, expected_tables, &bound_factory)?;
+    Ok(BoundPersistedPlan {
+        plan,
+        bound_scan_count,
+    })
+}
+
+fn validate_expected_tables(expected_tables: &[PersistedTableDescription]) -> Result<()> {
+    let mut table_ids = HashSet::with_capacity(expected_tables.len());
+    let file_capacity = expected_tables.iter().try_fold(0_usize, |total, table| {
+        total
+            .checked_add(table.file_count())
+            .ok_or_else(|| binding_error("expected persisted file count overflowed"))
+    })?;
+    let mut file_ids = HashSet::with_capacity(file_capacity);
+    for (expected_index, table) in expected_tables.iter().enumerate() {
+        if table.table_index() != expected_index {
+            return Err(binding_error(format!(
+                "persisted table ordinal is not contiguous expected=[{expected_index}] actual=[{}]",
+                table.table_index()
+            )));
+        }
+        if !table_ids.insert(table.table_id()) {
+            return Err(binding_error(format!(
+                "persisted snapshot contains duplicate table identity table_id=[{}]",
+                table.table_id().as_u128()
+            )));
+        }
+        for file in table.files() {
+            if !file_ids.insert(file.file_id()) {
+                return Err(binding_error(format!(
+                    "persisted snapshot contains duplicate physical file identity file_id=[{}]",
+                    file.file_id().as_u128()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_planning_scan(
+    parquet: &ParquetExec,
+    expected_tables: &[PersistedTableDescription],
+) -> Result<()> {
+    let config = parquet.base_config();
+    if config.object_store_url.as_str() != NORMALIZED_PERSISTED_OBJECT_STORE_URL {
+        return Err(binding_error(format!(
+            "persisted scan object-store URL mismatch actual=[{}]",
+            config.object_store_url.as_str()
+        )));
+    }
+    if !config.table_partition_cols.is_empty() || !config.output_ordering.is_empty() {
+        return Err(binding_error(
+            "persisted scan introduced partition columns or output ordering",
+        ));
+    }
+    if config.file_groups.len() != 1 {
+        return Err(binding_error(format!(
+            "persisted scan must contain exactly one file group actual=[{}]",
+            config.file_groups.len()
+        )));
+    }
+    let files = &config.file_groups[0];
+    let first = files
+        .first()
+        .ok_or_else(|| binding_error("persisted planning scan cannot represent an empty table"))?;
+    let first_description = partitioned_file_description(first)?;
+    let expected_table = expected_tables
+        .get(first_description.table_index())
+        .ok_or_else(|| {
+            binding_error(format!(
+                "persisted scan table ordinal is out of bounds actual=[{}]",
+                first_description.table_index()
+            ))
+        })?;
+    if config.file_schema.as_ref() != expected_table.schema().as_ref() {
+        return Err(binding_error(format!(
+            "persisted scan schema mismatch table_id=[{}]",
+            expected_table.table_id().as_u128()
+        )));
+    }
+    if config.statistics != expected_table.statistics() {
+        return Err(binding_error(format!(
+            "persisted scan statistics mismatch table_id=[{}]",
+            expected_table.table_id().as_u128()
+        )));
+    }
+    if files.len() != expected_table.file_count() {
+        return Err(binding_error(format!(
+            "persisted scan file count mismatch table_id=[{}] expected=[{}] actual=[{}]",
+            expected_table.table_id().as_u128(),
+            expected_table.file_count(),
+            files.len()
+        )));
+    }
+    if let Some(projection) = &config.projection {
+        if let Some(index) = projection
+            .iter()
+            .copied()
+            .find(|&index| index >= expected_table.schema().fields().len())
+        {
+            return Err(binding_error(format!(
+                "persisted scan projection index is out of bounds index=[{index}]"
+            )));
+        }
+    }
+    for (partitioned, expected_file) in files.iter().zip(expected_table.files()) {
+        validate_partitioned_file(partitioned, *expected_file)?;
+    }
+    Ok(())
+}
+
+fn validate_partitioned_file(
+    partitioned: &PartitionedFile,
+    expected: PersistedFileDescription,
+) -> Result<()> {
+    let actual = partitioned_file_description(partitioned)?;
+    if actual != expected {
+        return Err(binding_error(format!(
+            "persisted scan file description mismatch file_id=[{}]",
+            actual.file_id().as_u128()
+        )));
+    }
+    let expected_partitioned = expected.into_partitioned_file();
+    if partitioned.object_meta != expected_partitioned.object_meta {
+        return Err(binding_error(format!(
+            "persisted scan synthetic object metadata mismatch file_id=[{}]",
+            expected.file_id().as_u128()
+        )));
+    }
+    if !partitioned.partition_values.is_empty()
+        || partitioned.range.is_some()
+        || partitioned.statistics.is_some()
+        || partitioned.metadata_size_hint.is_some()
+    {
+        return Err(binding_error(format!(
+            "persisted scan file contains unsupported physical metadata file_id=[{}]",
+            expected.file_id().as_u128()
+        )));
+    }
+    Ok(())
+}
+
+fn partitioned_file_description(partitioned: &PartitionedFile) -> Result<PersistedFileDescription> {
+    partitioned
+        .extensions
+        .as_ref()
+        .and_then(|extension| extension.downcast_ref::<PersistedFileDescription>())
+        .copied()
+        .ok_or_else(|| {
+            binding_error("persisted scan file is missing its typed snapshot description")
+        })
+}
+
+fn file_meta_description(file_meta: &FileMeta) -> Result<PersistedFileDescription> {
+    file_meta
+        .extensions
+        .as_ref()
+        .and_then(|extension| extension.downcast_ref::<PersistedFileDescription>())
+        .copied()
+        .ok_or_else(|| {
+            binding_error("persisted reader request is missing its typed snapshot description")
+        })
+}
+
+fn validate_reader_file_meta(file_meta: &FileMeta) -> Result<PersistedFileDescription> {
+    let description = file_meta_description(file_meta)?;
+    let expected = description.into_partitioned_file();
+    if file_meta.object_meta != expected.object_meta {
+        return Err(binding_error(format!(
+            "persisted reader synthetic object metadata mismatch file_id=[{}]",
+            description.file_id().as_u128()
+        )));
+    }
+    if file_meta.range.is_some() || file_meta.metadata_size_hint.is_some() {
+        return Err(binding_error(format!(
+            "persisted reader request contains unsupported physical metadata file_id=[{}]",
+            description.file_id().as_u128()
+        )));
+    }
+    Ok(description)
+}
+
+fn validate_bound_tree(
+    plan: &Arc<dyn ExecutionPlan>,
+    expected_tables: &[PersistedTableDescription],
+    bound_factory: &Arc<dyn ParquetFileReaderFactory>,
+) -> Result<()> {
+    if let Some(parquet) = plan.as_any().downcast_ref::<ParquetExec>() {
+        if has_factory(parquet, &PLANNING_READER_FACTORY) {
+            return Err(binding_error(
+                "persisted physical plan retained a planning-only reader marker",
+            ));
+        }
+        let has_bound_factory = has_factory(parquet, bound_factory);
+        if is_reserved_zippy_scan(parquet) {
+            if !has_bound_factory {
+                return Err(binding_error(
+                    "persisted physical plan retained an unbound reader factory",
+                ));
+            }
+            validate_planning_scan(parquet, expected_tables)?;
+        } else if has_bound_factory {
+            return Err(binding_error(
+                "snapshot-bound reader factory escaped onto a non-Zippy Parquet scan",
+            ));
+        }
+    }
+    for child in plan.children() {
+        validate_bound_tree(child, expected_tables, bound_factory)?;
+    }
+    Ok(())
+}
+
+fn has_factory(parquet: &ParquetExec, expected: &Arc<dyn ParquetFileReaderFactory>) -> bool {
+    parquet
+        .parquet_file_reader_factory()
+        .is_some_and(|actual| Arc::ptr_eq(actual, expected))
+}
+
+fn is_reserved_zippy_scan(parquet: &ParquetExec) -> bool {
+    parquet
+        .base_config()
+        .object_store_url
+        .as_str()
+        .starts_with("zippy-query://")
+        || parquet
+            .base_config()
+            .file_groups
+            .iter()
+            .flatten()
+            .any(|file| {
+                file.extensions.as_ref().is_some_and(|extension| {
+                    extension
+                        .downcast_ref::<PersistedFileDescription>()
+                        .is_some()
+                })
+            })
+}
+
+fn binding_error(message: impl Into<String>) -> DataFusionError {
+    DataFusionError::Plan(message.into())
+}
+
+struct BoundParquetReaderFactory {
+    opener: Weak<dyn PersistedFileOpener>,
+}
+
+impl fmt::Debug for BoundParquetReaderFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundParquetReaderFactory")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ParquetFileReaderFactory for BoundParquetReaderFactory {
+    fn create_reader(
+        &self,
+        partition_index: usize,
+        file_meta: FileMeta,
+        _metadata_size_hint: Option<usize>,
+        _metrics: &ExecutionPlanMetricsSet,
+    ) -> Result<BoxedAsyncFileReader> {
+        if partition_index != 0 {
+            return Err(binding_error(format!(
+                "persisted reader partition ordinal mismatch expected=[0] actual=[{partition_index}]"
+            )));
+        }
+        let description = validate_reader_file_meta(&file_meta)?;
+        let opener = self
+            .opener
+            .upgrade()
+            .ok_or_else(|| DataFusionError::Execution(EXPIRED_EXECUTION_LEASE_ERROR.to_owned()))?;
+        opener
+            .open_reader(PersistedFileOpenRequest::new(description, partition_index))
+            .map_err(|error| DataFusionError::External(Box::new(error)))
+    }
+}
+
 /// A planning-only DataFusion table over one capability-free persisted manifest.
 ///
 /// Planning produces a [`ParquetExec`] whose file metadata uses synthetic keys and typed pure
@@ -379,17 +791,13 @@ impl PersistedTableDescription {
 #[derive(Debug)]
 pub struct ZippyTableProvider {
     table: PersistedTableDescription,
-    planning_reader_factory: Arc<PlanningOnlyParquetReaderFactory>,
 }
 
 impl ZippyTableProvider {
     /// Creates a provider that can plan, but cannot execute, the persisted manifest.
     #[must_use]
     pub fn new(table: PersistedTableDescription) -> Self {
-        Self {
-            table,
-            planning_reader_factory: Arc::new(PlanningOnlyParquetReaderFactory::default()),
-        }
+        Self { table }
     }
 
     /// Returns the capability-free persisted manifest.
@@ -472,7 +880,7 @@ impl TableProvider for ZippyTableProvider {
                     .with_projection(projection.cloned())
                     .with_limit(scan_limit);
             let mut builder = ParquetExec::builder(file_scan_config)
-                .with_parquet_file_reader_factory(self.planning_reader_factory.clone());
+                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY));
             if let Some(predicate) = conjunction(filters.iter().cloned()) {
                 let table_schema = DFSchema::try_from(self.table.schema.as_ref().clone())?;
                 builder =
@@ -491,10 +899,8 @@ impl TableProvider for ZippyTableProvider {
     }
 }
 
-#[derive(Debug, Default)]
-struct PlanningOnlyParquetReaderFactory {
-    execution_attempts: AtomicUsize,
-}
+#[derive(Debug)]
+struct PlanningOnlyParquetReaderFactory;
 
 impl ParquetFileReaderFactory for PlanningOnlyParquetReaderFactory {
     fn create_reader(
@@ -504,7 +910,6 @@ impl ParquetFileReaderFactory for PlanningOnlyParquetReaderFactory {
         _metadata_size_hint: Option<usize>,
         _metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Box<dyn AsyncFileReader + Send>> {
-        self.execution_attempts.fetch_add(1, Ordering::Relaxed);
         Err(DataFusionError::Execution(
             PLANNING_ONLY_READER_ERROR.to_owned(),
         ))
@@ -514,19 +919,46 @@ impl ParquetFileReaderFactory for PlanningOnlyParquetReaderFactory {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::{
-        PersistedFileDescription, PersistedFileKey, PersistedTableDescription, ZippyTableProvider,
-        PERSISTED_OBJECT_STORE_URL, PLANNING_ONLY_READER_ERROR,
+        bind_persisted_snapshot_plan, has_factory, PersistedFileDescription, PersistedFileKey,
+        PersistedFileOpenRequest, PersistedFileOpener, PersistedTableDescription,
+        PlanningOnlyParquetReaderFactory, ZippyTableProvider, PERSISTED_OBJECT_STORE_URL,
+        PLANNING_ONLY_READER_ERROR, PLANNING_READER_FACTORY,
     };
-    use crate::QuerySessionPolicy;
+    use crate::{BoxedAsyncFileReader, QuerySessionPolicy};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::physical_plan::parquet::ParquetExec;
+    use datafusion::datasource::listing::{FileRange, PartitionedFile};
+    use datafusion::datasource::physical_plan::parquet::{ParquetExec, ParquetFileReaderFactory};
+    use datafusion::datasource::physical_plan::{FileMeta, FileScanConfig};
     use datafusion::datasource::TableProvider;
+    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::filter::FilterExec;
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{collect, ExecutionPlan};
-    use zippy_types::{FileId, TableId};
+    use zippy_types::{ErrorCode, FileId, ServerError, TableId};
+
+    struct RecordingOpener {
+        requests: Arc<Mutex<Vec<PersistedFileOpenRequest>>>,
+    }
+
+    impl PersistedFileOpener for RecordingOpener {
+        fn open_reader(
+            &self,
+            request: PersistedFileOpenRequest,
+        ) -> zippy_types::Result<BoxedAsyncFileReader> {
+            self.requests
+                .lock()
+                .expect("recording opener lock")
+                .push(request);
+            Err(ServerError::new(
+                ErrorCode::Internal,
+                "test opener intentionally has no physical reader",
+            ))
+        }
+    }
 
     fn nonzero(value: u64) -> NonZeroU64 {
         NonZeroU64::new(value).expect("test value must be nonzero")
@@ -563,6 +995,89 @@ mod tests {
             Field::new("price", DataType::Int64, false),
             Field::new("volume", DataType::Int64, false),
         ]))
+    }
+
+    fn table(
+        table_index: usize,
+        id: u128,
+        snapshot_version: u64,
+        file_ids: &[u128],
+    ) -> PersistedTableDescription {
+        let table_id = table_id(id);
+        PersistedTableDescription::try_new(
+            table_index,
+            table_id,
+            nonzero(snapshot_version),
+            nonzero(2),
+            schema(),
+            nonzero(512),
+            file_ids
+                .iter()
+                .enumerate()
+                .map(|(file_index, &id)| {
+                    file(table_index, file_index, table_id, snapshot_version, id)
+                })
+                .collect(),
+        )
+        .expect("build persisted test table")
+    }
+
+    fn recording_opener() -> (
+        Arc<dyn PersistedFileOpener>,
+        Arc<Mutex<Vec<PersistedFileOpenRequest>>>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let opener: Arc<dyn PersistedFileOpener> = Arc::new(RecordingOpener {
+            requests: Arc::clone(&requests),
+        });
+        (opener, requests)
+    }
+
+    fn planning_config(table: &PersistedTableDescription) -> FileScanConfig {
+        let files = table
+            .files()
+            .iter()
+            .copied()
+            .map(PersistedFileDescription::into_partitioned_file)
+            .collect();
+        FileScanConfig::new(
+            ObjectStoreUrl::parse(PERSISTED_OBJECT_STORE_URL)
+                .expect("parse persisted object-store URL"),
+            Arc::clone(table.schema()),
+        )
+        .with_file_groups(vec![files])
+        .with_statistics(table.statistics())
+    }
+
+    fn marked_plan(config: FileScanConfig) -> Arc<dyn ExecutionPlan> {
+        ParquetExec::builder(config)
+            .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
+            .build_arc()
+    }
+
+    fn file_meta(partitioned: &PartitionedFile) -> FileMeta {
+        FileMeta {
+            object_meta: partitioned.object_meta.clone(),
+            range: partitioned.range.clone(),
+            extensions: partitioned.extensions.clone(),
+            metadata_size_hint: partitioned.metadata_size_hint,
+        }
+    }
+
+    fn reader_error(
+        factory: &Arc<dyn ParquetFileReaderFactory>,
+        partition_index: usize,
+        file_meta: FileMeta,
+    ) -> String {
+        match factory.create_reader(
+            partition_index,
+            file_meta,
+            None,
+            &ExecutionPlanMetricsSet::new(),
+        ) {
+            Ok(_) => panic!("reader creation must fail in this test"),
+            Err(error) => error.to_string(),
+        }
     }
 
     fn find_plan<T: 'static>(plan: &Arc<dyn ExecutionPlan>) -> Option<&T> {
@@ -759,25 +1274,24 @@ mod tests {
                 .expect("extension remains a pure file description");
             assert_eq!(*extension, expected);
         }
-        assert_eq!(
-            provider
-                .planning_reader_factory
-                .execution_attempts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        let planning_plan = Arc::clone(&plan);
+        let (opener, _) = recording_opener();
+        let bound = bind_persisted_snapshot_plan(
+            plan,
+            std::slice::from_ref(provider.description()),
+            &opener,
+        )
+        .expect("bind nested persisted scan");
+        assert_eq!(bound.bound_scan_count(), 1);
+        assert!(has_filter_ancestor_of_parquet(bound.execution_plan()));
+        let bound_parquet = find_plan::<ParquetExec>(bound.execution_plan())
+            .expect("bound physical plan contains ParquetExec");
+        assert!(!has_factory(bound_parquet, &PLANNING_READER_FACTORY));
 
-        let error = collect(plan, context.task_ctx())
+        let error = collect(planning_plan, context.task_ctx())
             .await
             .expect_err("planning-only marker factory rejects execution");
         assert!(error.to_string().contains(PLANNING_ONLY_READER_ERROR));
-        assert_eq!(
-            provider
-                .planning_reader_factory
-                .execution_attempts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
     }
 
     #[tokio::test]
@@ -808,12 +1322,297 @@ mod tests {
             .expect("execute empty persisted query");
 
         assert!(batches.is_empty());
-        assert_eq!(
-            provider
-                .planning_reader_factory
-                .execution_attempts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
+    }
+
+    #[tokio::test]
+    async fn binder_accepts_distinct_self_join_scans_and_zero_scan_plans() {
+        let other_table = table(1, 2, 8, &[20]);
+        let table = table(0, 1, 7, &[10, 11]);
+        let provider = Arc::new(ZippyTableProvider::new(table.clone()));
+        let context =
+            QuerySessionPolicy::new(std::num::NonZeroUsize::new(2).unwrap()).create_context();
+        context
+            .register_table("ticks", provider)
+            .expect("register persisted table");
+        let plan = context
+            .sql("select a.price from ticks a join ticks b on a.symbol = b.symbol")
+            .await
+            .expect("plan persisted self join")
+            .create_physical_plan()
+            .await
+            .expect("create persisted self-join physical plan");
+        let (opener, _) = recording_opener();
+        let bound = bind_persisted_snapshot_plan(plan, std::slice::from_ref(&table), &opener)
+            .expect("bind distinct self-join scans");
+        assert_eq!(bound.bound_scan_count(), 2);
+
+        let eliminated: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::physical_plan::empty::EmptyExec::new(schema()));
+        let bound = bind_persisted_snapshot_plan(eliminated, std::slice::from_ref(&table), &opener)
+            .expect("bind optimizer-eliminated scan plan");
+        assert_eq!(bound.bound_scan_count(), 0);
+
+        context
+            .register_table(
+                "quotes",
+                Arc::new(ZippyTableProvider::new(other_table.clone())),
+            )
+            .expect("register second persisted table");
+        let plan = context
+            .sql("select t.price from ticks t join quotes q on t.symbol = q.symbol")
+            .await
+            .expect("plan persisted multi-table join")
+            .create_physical_plan()
+            .await
+            .expect("create persisted multi-table physical plan");
+        let expected_tables = [table, other_table];
+        let bound = bind_persisted_snapshot_plan(plan, &expected_tables, &opener)
+            .expect("bind different persisted table ordinals");
+        assert_eq!(bound.bound_scan_count(), 2);
+    }
+
+    #[test]
+    fn binder_rejects_missing_foreign_reused_and_already_bound_markers() {
+        let table = table(0, 1, 7, &[10]);
+        let (opener, _) = recording_opener();
+
+        let missing: Arc<dyn ExecutionPlan> =
+            ParquetExec::builder(planning_config(&table)).build_arc();
+        assert!(
+            bind_persisted_snapshot_plan(missing, std::slice::from_ref(&table), &opener,).is_err()
         );
+
+        let foreign_factory: Arc<dyn ParquetFileReaderFactory> =
+            Arc::new(PlanningOnlyParquetReaderFactory);
+        let foreign: Arc<dyn ExecutionPlan> = ParquetExec::builder(planning_config(&table))
+            .with_parquet_file_reader_factory(foreign_factory)
+            .build_arc();
+        assert!(
+            bind_persisted_snapshot_plan(foreign, std::slice::from_ref(&table), &opener,).is_err()
+        );
+
+        let shared = marked_plan(planning_config(&table));
+        let reused: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(vec![
+            Arc::clone(&shared),
+            Arc::clone(&shared),
+        ]));
+        assert!(
+            bind_persisted_snapshot_plan(reused, std::slice::from_ref(&table), &opener,).is_err()
+        );
+
+        let bound = bind_persisted_snapshot_plan(
+            marked_plan(planning_config(&table)),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .expect("first binding succeeds");
+        assert!(bind_persisted_snapshot_plan(
+            Arc::clone(bound.execution_plan()),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let ordinary_config = FileScanConfig::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::clone(table.schema()),
+        )
+        .with_file_groups(vec![vec![PartitionedFile::new("ordinary.parquet", 128)]]);
+        let ordinary: Arc<dyn ExecutionPlan> = ParquetExec::builder(ordinary_config).build_arc();
+        let ordinary =
+            bind_persisted_snapshot_plan(ordinary, std::slice::from_ref(&table), &opener)
+                .expect("ordinary Parquet scan remains outside persisted binding");
+        assert_eq!(ordinary.bound_scan_count(), 0);
+    }
+
+    #[test]
+    fn binder_rejects_tampered_manifest_metadata_before_opening() {
+        let table = table(0, 1, 7, &[10, 11]);
+        let (opener, requests) = recording_opener();
+
+        let mut config = planning_config(&table);
+        config.object_store_url = ObjectStoreUrl::local_filesystem();
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0][0].object_meta.location = "wrong-object-key".into();
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0][0].object_meta.size += 1;
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0][0].range = Some(FileRange { start: 0, end: 1 });
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0][0].metadata_size_hint = Some(64);
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0][0]
+            .partition_values
+            .push(datafusion::common::ScalarValue::Utf8(Some(
+                "unexpected".to_owned(),
+            )));
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0][0].extensions = None;
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let expected = table.files()[0];
+        let mut config = planning_config(&table);
+        let wrong_snapshot = PersistedFileDescription::try_new(
+            expected.key(),
+            nonzero(expected.snapshot_version().get() + 1),
+            expected.schema_version(),
+            expected.file_size_bytes(),
+            expected.row_count(),
+        )
+        .expect("build cross-snapshot description");
+        config.file_groups[0][0] = wrong_snapshot.into_partitioned_file();
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        let wrong_schema = PersistedFileDescription::try_new(
+            expected.key(),
+            expected.snapshot_version(),
+            nonzero(1),
+            expected.file_size_bytes(),
+            expected.row_count(),
+        )
+        .expect("build cross-schema description");
+        config.file_groups[0][0] = wrong_schema.into_partitioned_file();
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0].swap(0, 1);
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_groups[0].pop();
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.statistics = datafusion::common::Statistics::new_unknown(table.schema());
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let mut config = planning_config(&table);
+        config.file_schema = Arc::new(Schema::new(vec![Field::new(
+            "other",
+            DataType::Int64,
+            false,
+        )]));
+        assert!(bind_persisted_snapshot_plan(
+            marked_plan(config),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        assert!(requests.lock().expect("request log lock").is_empty());
+    }
+
+    #[test]
+    fn bound_factory_revalidates_file_meta_and_expires_with_opener() {
+        let table = table(0, 1, 7, &[10]);
+        let (opener, requests) = recording_opener();
+        let bound = bind_persisted_snapshot_plan(
+            marked_plan(planning_config(&table)),
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .expect("bind persisted scan");
+        let parquet = find_plan::<ParquetExec>(bound.execution_plan())
+            .expect("bound plan contains ParquetExec");
+        let factory = parquet
+            .parquet_file_reader_factory()
+            .expect("bound reader factory");
+        let partitioned = &parquet.base_config().file_groups[0][0];
+
+        let error = reader_error(factory, 0, file_meta(partitioned));
+        assert!(error.contains("test opener intentionally"));
+        assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+        let mut wrong_size = file_meta(partitioned);
+        wrong_size.object_meta.size += 1;
+        let error = reader_error(factory, 0, wrong_size);
+        assert!(error.contains("object metadata mismatch"));
+
+        let mut ranged = file_meta(partitioned);
+        ranged.range = Some(FileRange { start: 0, end: 1 });
+        let error = reader_error(factory, 0, ranged);
+        assert!(error.contains("unsupported physical metadata"));
+
+        let error = reader_error(factory, 1, file_meta(partitioned));
+        assert!(error.contains("partition ordinal mismatch"));
+        assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+        drop(opener);
+        let error = reader_error(factory, 0, file_meta(partitioned));
+        assert!(error.contains("execution lease has expired"));
+        assert_eq!(requests.lock().expect("request log lock").len(), 1);
     }
 }
