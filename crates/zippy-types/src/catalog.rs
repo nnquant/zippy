@@ -3,6 +3,7 @@
 mod wire_v1;
 mod wire_v2;
 mod wire_v3;
+mod wire_v4;
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -33,6 +34,18 @@ pub const CATALOG_COMMAND_FORMAT_VERSION_V1: u32 = 1;
 pub const LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2: u32 = 2;
 /// The online typed legacy file-view reconcile format.
 pub const LEGACY_CATALOG_RECONCILE_FORMAT_VERSION_V3: u32 = 3;
+/// The full legacy metadata projection and checkpoint format.
+pub const LEGACY_CATALOG_PROJECTION_FORMAT_VERSION_V4: u32 = 4;
+/// Maximum files carried by one frozen V4 bootstrap or adoption command.
+pub const MAX_LEGACY_CATALOG_PROJECTION_FILES_V4: usize = 4_096;
+/// Maximum stable source records carried by one V4 table projection.
+pub const MAX_LEGACY_CATALOG_PROJECTION_SOURCES_V4: usize = 4_096;
+/// Maximum recursive value depth admitted by the V4 canonical wire.
+pub const MAX_LEGACY_CATALOG_VALUE_DEPTH_V4: usize = 32;
+/// Maximum recursive value nodes admitted across one V4 command or digest table.
+pub const MAX_LEGACY_CATALOG_VALUE_NODES_V4: usize = 65_536;
+/// Maximum canonical V4 fingerprint or projection-digest input bytes.
+pub const MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4: usize = 64 * 1024 * 1024;
 /// Reserved file metadata key binding verifier-observed Arrow Schema to a V2 import command.
 pub const LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY: &str =
     "zippy.legacy_import.verified_schema_hash";
@@ -250,6 +263,24 @@ pub enum CatalogFingerprintError {
         /// The maximum accepted UTF-8 byte length.
         maximum: usize,
     },
+    /// A frozen V4 command or digest exceeds a permanent resource boundary.
+    #[error(
+        "legacy Catalog V4 resource exceeds limit resource=[{resource}] actual=[{actual}] maximum=[{maximum}]"
+    )]
+    LegacyProjectionResourceLimit {
+        /// Stable name of the bounded resource.
+        resource: &'static str,
+        /// Observed count.
+        actual: usize,
+        /// Permanent maximum.
+        maximum: usize,
+    },
+    /// A frozen V4 identity set is empty, duplicate, or not in its required order.
+    #[error("invalid legacy Catalog V4 identity set resource=[{resource}]")]
+    InvalidLegacyProjectionIdentity {
+        /// Stable name of the invalid identity domain.
+        resource: &'static str,
+    },
     /// Canonical JSON encoding failed.
     #[error("failed to encode canonical catalog command error=[{0}]")]
     Encode(serde_json::Error),
@@ -279,6 +310,9 @@ pub enum CatalogCodecError {
     /// Frozen V2 legacy-import fields failed explicit conversion into validated domain types.
     #[error("invalid frozen V2 legacy import payload error=[{0}]")]
     InvalidLegacyImportV2(String),
+    /// Frozen V4 legacy-projection fields failed explicit conversion into validated domain types.
+    #[error("invalid frozen V4 legacy projection payload error=[{0}]")]
+    InvalidLegacyProjectionV4(String),
 }
 
 /// An idempotent and optionally revision-guarded catalog mutation.
@@ -600,6 +634,599 @@ pub struct LegacyCatalogReconcileResponseV3 {
     pub continuity: LegacyFileViewContinuity,
 }
 
+/// A deterministic recursive value used by the frozen legacy source projection.
+///
+/// Object keys are stored in a [`BTreeMap`], and floating-point values use
+/// [`crate::table::FiniteMetadataFloat`], so canonical fingerprints cannot depend on hash-map
+/// iteration or non-finite JSON values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum LegacyCatalogValueV4 {
+    /// JSON null.
+    Null,
+    /// A Boolean value.
+    Boolean(bool),
+    /// A signed integer value.
+    Int64(i64),
+    /// An unsigned integer value.
+    #[serde(rename = "uint64")]
+    UInt64(u64),
+    /// A finite IEEE-754 binary64 value.
+    Float64(crate::table::FiniteMetadataFloat),
+    /// A UTF-8 string.
+    String(String),
+    /// An ordered list of recursive values.
+    Array(Vec<Self>),
+    /// A key-sorted object of recursive values.
+    Object(BTreeMap<String, Self>),
+}
+
+/// Complete typed projection of one legacy source record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogSourceV4 {
+    /// Stable source identity within the legacy registry.
+    pub source_name: String,
+    /// Legacy source implementation kind.
+    pub source_type: String,
+    /// Legacy stream receiving source output.
+    pub output_stream: String,
+    /// Complete deterministic source configuration.
+    pub config: LegacyCatalogValueV4,
+    /// Source writer fencing epoch.
+    pub writer_epoch: u64,
+}
+
+/// Authority phase of the singleton legacy projection checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyCatalogProjectionPhaseV4 {
+    /// Only the migration foundation is available.
+    FoundationOnly,
+    /// File views are shadowed, but complete metadata is not yet proven.
+    FileShadow,
+    /// Complete table and source metadata is shadowed.
+    FullShadow,
+    /// Final reconcile and checkpoint gates permit read-cutover evaluation.
+    ReadCutoverReady,
+    /// SQLite Catalog is the native metadata authority.
+    NativeAuthoritative,
+}
+
+/// How one source Catalog checkpoint advance proves notification continuity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyCatalogCheckpointModeV4 {
+    /// The source revision advances by exactly one notification.
+    Contiguous,
+    /// A complete source snapshot supersedes any missed notifications.
+    FullReconcile,
+}
+
+/// Durable lifecycle state of one legacy table projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyCatalogProjectionTableStateV4 {
+    /// The projected table is active in both Catalogs.
+    Active,
+    /// The projected table was logically dropped; its history remains readable.
+    Dropped,
+}
+
+/// Whether a per-table row has a complete stable source projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyCatalogProjectionCompletenessV4 {
+    /// V2/V3 synchronized table and file cursors, but no complete stable source set is available.
+    Seeded,
+    /// V4 bootstrap, adoption, or sync proved the complete stable source set and projection hash.
+    Complete,
+}
+
+/// Online creation of one complete legacy table projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogBootstrapTableCommandV4 {
+    /// Immutable table identity.
+    pub table_id: TableId,
+    /// Existing namespace owning the table.
+    pub namespace_id: NamespaceId,
+    /// Byte-exact table name.
+    pub name: CatalogName,
+    /// Typed table definition.
+    pub definition: TableDefinition,
+    /// Initial Arrow schema IPC. It is logically validated but excluded from the fingerprint.
+    pub schema_ipc: SchemaIpcPayload,
+    /// Canonical logical hash of `schema_ipc`.
+    pub canonical_schema_hash: String,
+    /// Complete stable table configuration.
+    pub config: BTreeMap<String, String>,
+    /// Captured table writer epoch.
+    pub writer_epoch: u64,
+    /// Complete typed source set in strict source-name order.
+    pub sources: Vec<LegacyCatalogSourceV4>,
+    /// Complete physically verified file view in legacy scan order.
+    pub files: Vec<LegacyCatalogImportFileV2>,
+    /// Legacy file-view revision represented by `files`.
+    pub legacy_files_revision: u64,
+}
+
+/// Strictly adopts one already migrated V1/V2/V3 table into complete V4 projection state.
+///
+/// Adoption never creates or mutates a table, snapshot, or file. An existing mapping is immutable
+/// and must match exactly. The sole exception is an empty V1-migrated base table: after strict
+/// migration-config and snapshot verification, adoption atomically creates its missing V4 base
+/// mapping while attaching complete projection state and the stable source set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogAdoptExistingTableCommandV4 {
+    /// Existing immutable table identity.
+    pub table_id: TableId,
+    /// Existing namespace identity.
+    pub namespace_id: NamespaceId,
+    /// Existing byte-exact table name.
+    pub name: CatalogName,
+    /// Existing typed table definition.
+    pub definition: TableDefinition,
+    /// Current schema version.
+    pub expected_schema_version: u64,
+    /// Current canonical Schema hash.
+    pub expected_schema_hash: String,
+    /// Existing complete stable table configuration.
+    pub config: BTreeMap<String, String>,
+    /// Current native snapshot cursor.
+    pub expected_snapshot_version: u64,
+    /// Current legacy file-view revision.
+    pub expected_legacy_files_revision: u64,
+    /// Current writer epoch.
+    pub expected_writer_epoch: u64,
+    /// Complete typed stable source set in strict source-name order.
+    pub sources: Vec<LegacyCatalogSourceV4>,
+    /// Complete physically verified current file view in legacy scan order.
+    pub files: Vec<LegacyCatalogImportFileV2>,
+}
+
+/// Metadata-only synchronization of an existing projected table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogSyncTableMetadataCommandV4 {
+    /// Projected table identity.
+    pub table_id: TableId,
+    /// Projection revision that must still be current.
+    pub expected_projection_revision: u64,
+    /// Schema version that must still be current.
+    pub expected_schema_version: u64,
+    /// Canonical Schema hash that must still be current.
+    pub expected_schema_hash: String,
+    /// Native snapshot cursor that must remain unchanged.
+    pub expected_snapshot_version: u64,
+    /// Legacy file-view revision that must remain unchanged.
+    pub expected_legacy_files_revision: u64,
+    /// Writer epoch that must still be current.
+    pub expected_writer_epoch: u64,
+    /// Table-local stable source metadata hash that must still be current.
+    pub expected_source_metadata_hash: String,
+    /// New captured writer epoch.
+    pub writer_epoch: u64,
+    /// Complete replacement typed source set in strict source-name order.
+    pub sources: Vec<LegacyCatalogSourceV4>,
+}
+
+/// Logical removal of an existing projected table while retaining its history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogDropTableCommandV4 {
+    /// Projected table identity.
+    pub table_id: TableId,
+    /// Projection revision that must still be current.
+    pub expected_projection_revision: u64,
+    /// Schema version that must still be current.
+    pub expected_schema_version: u64,
+    /// Canonical Schema hash that must still be current.
+    pub expected_schema_hash: String,
+    /// Native snapshot cursor that must still be current.
+    pub expected_snapshot_version: u64,
+    /// Legacy file-view revision that must still be current.
+    pub expected_legacy_files_revision: u64,
+    /// Writer epoch that must still be current.
+    pub expected_writer_epoch: u64,
+    /// Table-local stable source metadata hash expected for complete projections.
+    ///
+    /// Seeded projections have not captured complete source metadata and therefore require
+    /// `None` when they are removed after disappearing from the full legacy snapshot. The
+    /// combination `None` plus `expected_projection_revision = 0` is reserved for atomically
+    /// absorbing and dropping a strictly validated empty, unprojected V1 migration base.
+    pub expected_source_metadata_hash: Option<String>,
+}
+
+/// Durable acknowledgement of one source Catalog revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogAdvanceCheckpointCommandV4 {
+    /// Checkpoint generation that must still be current.
+    pub expected_checkpoint_generation: u64,
+    /// Previously acknowledged source Catalog revision.
+    pub expected_source_catalog_revision: u64,
+    /// Previously acknowledged complete stable projection digest.
+    pub expected_source_projection_hash: String,
+    /// Authority phase that must still be current.
+    pub expected_phase: LegacyCatalogProjectionPhaseV4,
+    /// Target shadow epoch. It may advance only during a full reconcile.
+    pub shadow_epoch: u64,
+    /// Target authority phase.
+    pub phase: LegacyCatalogProjectionPhaseV4,
+    /// Continuity proof for this checkpoint advance.
+    pub mode: LegacyCatalogCheckpointModeV4,
+    /// Worker-computed digest of the complete logical source projection.
+    pub target_projection_digest: String,
+    /// Publisher continuity-loss epoch observed with the target snapshot.
+    pub observed_continuity_loss_epoch: u64,
+}
+
+/// The five legacy projection operations assigned to frozen internal format V4.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "command", rename_all = "snake_case")]
+pub enum LegacyCatalogProjectionCommandV4 {
+    /// Create an empty or nonempty table and its explicit base mapping.
+    BootstrapTable(LegacyCatalogBootstrapTableCommandV4),
+    /// Attach complete projection state to a strictly verified pre-V4 migrated table.
+    AdoptExistingTable(LegacyCatalogAdoptExistingTableCommandV4),
+    /// Replace writer and complete typed source metadata without a new snapshot.
+    SyncTableMetadata(LegacyCatalogSyncTableMetadataCommandV4),
+    /// Logically drop a table while retaining snapshots and mappings.
+    DropTable(LegacyCatalogDropTableCommandV4),
+    /// Persist source progress after recomputing the complete projection digest.
+    AdvanceCheckpoint(LegacyCatalogAdvanceCheckpointCommandV4),
+}
+
+/// Idempotent trusted V4 envelope for complete legacy metadata projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogProjectionEnvelopeV4 {
+    /// Fixed V4 format version.
+    pub format_version: CatalogCommandFormatVersion,
+    /// Globally unique idempotency key.
+    pub request_id: RequestId,
+    /// Audited server actor; this field does not grant authority.
+    pub actor: CatalogActor,
+    /// Shadow epoch that fences this worker instance.
+    pub expected_shadow_epoch: u64,
+    /// Digest of the complete stable table/source projection used to build the command.
+    ///
+    /// This is a distinct domain from the startup migration snapshot hash: it must bind the full
+    /// stable source set and must exclude boot-scoped process, status, and metrics state.
+    pub source_projection_hash: String,
+    /// Legacy Catalog revision captured with that snapshot.
+    pub source_catalog_revision: u64,
+    /// Typed projection operation.
+    pub command: LegacyCatalogProjectionCommandV4,
+    /// SHA-256 of the canonical logical V4 fields.
+    pub canonical_fingerprint: CommandFingerprint,
+}
+
+impl LegacyCatalogProjectionEnvelopeV4 {
+    /// Creates a V4 envelope and computes its canonical logical fingerprint.
+    pub fn new(
+        request_id: RequestId,
+        actor: CatalogActor,
+        expected_shadow_epoch: u64,
+        source_projection_hash: String,
+        source_catalog_revision: u64,
+        command: LegacyCatalogProjectionCommandV4,
+    ) -> std::result::Result<Self, CatalogFingerprintError> {
+        let mut envelope = Self {
+            format_version: CatalogCommandFormatVersion::new(
+                LEGACY_CATALOG_PROJECTION_FORMAT_VERSION_V4,
+            ),
+            request_id,
+            actor,
+            expected_shadow_epoch,
+            source_projection_hash,
+            source_catalog_revision,
+            command,
+            canonical_fingerprint: CommandFingerprint::from_bytes([0; 32]),
+        };
+        envelope.canonical_fingerprint = envelope.fingerprint()?;
+        Ok(envelope)
+    }
+
+    /// Recomputes and validates the canonical logical fingerprint.
+    pub fn verify_fingerprint(&self) -> std::result::Result<(), CatalogFingerprintError> {
+        if self.fingerprint()? == self.canonical_fingerprint {
+            Ok(())
+        } else {
+            Err(CatalogFingerprintError::Mismatch)
+        }
+    }
+
+    fn fingerprint(&self) -> std::result::Result<CommandFingerprint, CatalogFingerprintError> {
+        if self.format_version.get() != LEGACY_CATALOG_PROJECTION_FORMAT_VERSION_V4 {
+            return Err(CatalogFingerprintError::UnsupportedFormatVersion {
+                actual: self.format_version.get(),
+            });
+        }
+        let actual = self.actor.principal.len();
+        if actual > MAX_CATALOG_ACTOR_PRINCIPAL_BYTES {
+            return Err(CatalogFingerprintError::ActorPrincipalTooLarge {
+                actual,
+                maximum: MAX_CATALOG_ACTOR_PRINCIPAL_BYTES,
+            });
+        }
+        validate_v4_command_shape(&self.command)?;
+        let mut writer = BoundedFingerprintWriter::new(MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4);
+        serde_json::to_writer(&mut writer, &wire_v4::FingerprintInputRefV4::from(self))
+            .map_err(CatalogFingerprintError::Encode)?;
+        let digest = writer.finish();
+        let mut fingerprint = [0_u8; 32];
+        fingerprint.copy_from_slice(&digest);
+        Ok(CommandFingerprint::from_bytes(fingerprint))
+    }
+}
+
+/// Minimal durable table result returned by a V4 projection mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogProjectionTableResultV4 {
+    /// Mutated table identity.
+    pub table_id: TableId,
+    /// New per-table projection revision.
+    pub projection_revision: u64,
+    /// Current immutable native snapshot cursor.
+    pub native_snapshot_version: u64,
+    /// Current mapped legacy file-view revision.
+    pub legacy_files_revision: u64,
+    /// Current writer epoch.
+    pub writer_epoch: u64,
+    /// Whether complete stable source metadata is attached.
+    pub completeness: LegacyCatalogProjectionCompletenessV4,
+    /// Current projection lifecycle state.
+    pub state: LegacyCatalogProjectionTableStateV4,
+}
+
+/// Durable singleton checkpoint returned after a V4 checkpoint advance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogProjectionCheckpointV4 {
+    /// Monotonic checkpoint CAS generation.
+    pub checkpoint_generation: u64,
+    /// Fencing epoch for projection workers.
+    pub shadow_epoch: u64,
+    /// Current authority phase.
+    pub phase: LegacyCatalogProjectionPhaseV4,
+    /// Last durably acknowledged source Catalog revision.
+    pub source_catalog_revision: u64,
+    /// Digest of the acknowledged complete stable legacy projection.
+    pub source_projection_hash: String,
+    /// Digest recomputed from complete typed projected table and source state.
+    pub projection_digest: String,
+    /// Continuity proof used for the last advance.
+    pub mode: LegacyCatalogCheckpointModeV4,
+    /// Highest publisher continuity-loss epoch resolved by a full reconcile.
+    pub resolved_continuity_loss_epoch: u64,
+    /// Last checkpoint commit time in Unix nanoseconds.
+    pub updated_at_ns: u64,
+}
+
+/// Complete typed state of one projected legacy table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogTableProjectionV4 {
+    /// Projected table identity.
+    pub table_id: TableId,
+    /// Per-table projection CAS revision.
+    pub projection_revision: u64,
+    /// Current schema version.
+    pub schema_version: u64,
+    /// Current canonical Schema hash.
+    pub schema_hash: String,
+    /// Current native snapshot cursor.
+    pub native_snapshot_version: u64,
+    /// Current legacy file-view revision.
+    pub legacy_files_revision: u64,
+    /// Current table writer epoch.
+    pub writer_epoch: u64,
+    /// Whether complete stable source metadata is attached.
+    pub completeness: LegacyCatalogProjectionCompletenessV4,
+    /// Projection lifecycle state.
+    pub state: LegacyCatalogProjectionTableStateV4,
+    /// Table-local digest of complete stable sources, absent only for a V2/V3-seeded row.
+    pub source_metadata_hash: Option<String>,
+    /// Complete typed source set in strict source-name order.
+    pub sources: Vec<LegacyCatalogSourceV4>,
+    /// Last table projection commit time in Unix nanoseconds.
+    pub updated_at_ns: u64,
+}
+
+/// Canonical logical table input to the cross-Catalog V4 projection digest.
+///
+/// Native-only snapshot and projection revisions are intentionally absent. The digest binds the
+/// complete logical descriptor, stable sources, and exact legacy file-view revision available to
+/// both the legacy source and SQLite Catalog. Physical file identity remains proven by the V3
+/// full-view mapping bound to that revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogProjectionDigestTableV4 {
+    /// Immutable table identity.
+    pub table_id: TableId,
+    /// Owning namespace identity.
+    pub namespace_id: NamespaceId,
+    /// Byte-exact table name.
+    pub name: CatalogName,
+    /// Typed table definition.
+    pub definition: TableDefinition,
+    /// Current logical Schema version.
+    pub schema_version: u64,
+    /// Current canonical Schema hash.
+    pub schema_hash: String,
+    /// Complete stable table configuration.
+    pub config: BTreeMap<String, String>,
+    /// Current legacy file-view revision.
+    pub legacy_files_revision: u64,
+    /// Current table writer epoch.
+    pub writer_epoch: u64,
+    /// Logical projection lifecycle state.
+    pub state: LegacyCatalogProjectionTableStateV4,
+    /// Complete stable source set.
+    pub sources: Vec<LegacyCatalogSourceV4>,
+}
+
+/// Computes the shared canonical digest of a complete V4 logical projection.
+///
+/// Tables and sources are canonicalized by identity. Boot-scoped process, status, metrics, and
+/// active-writer liveness are absent by type and cannot influence authority continuity.
+pub fn compute_legacy_catalog_projection_digest_v4(
+    tables: &[LegacyCatalogProjectionDigestTableV4],
+) -> std::result::Result<String, CatalogFingerprintError> {
+    let mut canonical = tables.to_vec();
+    canonical.sort_by_key(|table| table.table_id);
+    if canonical
+        .windows(2)
+        .any(|pair| pair[0].table_id == pair[1].table_id)
+    {
+        return Err(CatalogFingerprintError::InvalidLegacyProjectionIdentity {
+            resource: "table_id",
+        });
+    }
+    for table in &mut canonical {
+        if table.state != LegacyCatalogProjectionTableStateV4::Active {
+            return Err(CatalogFingerprintError::InvalidLegacyProjectionIdentity {
+                resource: "active_table_state",
+            });
+        }
+        table
+            .sources
+            .sort_by(|left, right| left.source_name.cmp(&right.source_name));
+        validate_v4_sources(&table.sources)?;
+    }
+    let mut writer = BoundedFingerprintWriter::with_domain(
+        MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4,
+        b"zippy.legacy_catalog.projection_digest.v4\0",
+    );
+    serde_json::to_writer(
+        &mut writer,
+        &wire_v4::ProjectionDigestInputRefV4::from(canonical.as_slice()),
+    )
+    .map_err(CatalogFingerprintError::Encode)?;
+    Ok(format!("sha256-v1:{:x}", writer.finish()))
+}
+
+/// Computes the canonical table-local digest of a complete stable V4 source set.
+pub fn compute_legacy_catalog_source_metadata_hash_v4(
+    sources: &[LegacyCatalogSourceV4],
+) -> std::result::Result<String, CatalogFingerprintError> {
+    let mut canonical = sources.to_vec();
+    canonical.sort_by(|left, right| left.source_name.cmp(&right.source_name));
+    validate_v4_sources(&canonical)?;
+    let mut writer = BoundedFingerprintWriter::with_domain(
+        MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4,
+        b"zippy.legacy_catalog.source_metadata_hash.v4\0",
+    );
+    serde_json::to_writer(
+        &mut writer,
+        &wire_v4::SourceMetadataDigestInputRefV4::from(canonical.as_slice()),
+    )
+    .map_err(CatalogFingerprintError::Encode)?;
+    Ok(format!("sha256-v1:{:x}", writer.finish()))
+}
+
+/// V4 response outcome stored for exact idempotent replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "outcome", rename_all = "snake_case")]
+pub enum LegacyCatalogProjectionOutcomeV4 {
+    /// Result of `BootstrapTable`.
+    BootstrapTable(LegacyCatalogProjectionTableResultV4),
+    /// Result of `AdoptExistingTable`.
+    AdoptExistingTable(LegacyCatalogProjectionTableResultV4),
+    /// Result of `SyncTableMetadata`.
+    SyncTableMetadata(LegacyCatalogProjectionTableResultV4),
+    /// Result of `DropTable`.
+    DropTable(LegacyCatalogProjectionTableResultV4),
+    /// Result of `AdvanceCheckpoint`.
+    AdvanceCheckpoint(LegacyCatalogProjectionCheckpointV4),
+}
+
+/// Durable exact result of one V4 projection command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCatalogProjectionResponseV4 {
+    /// Request id from the command envelope.
+    pub request_id: RequestId,
+    /// Catalog revision after the mutation committed.
+    pub catalog_revision: u64,
+    /// Typed operation result.
+    pub outcome: LegacyCatalogProjectionOutcomeV4,
+}
+
+/// Stable codec for durable V4 projection response records.
+pub struct LegacyCatalogProjectionCodecV4;
+
+impl LegacyCatalogProjectionCodecV4 {
+    /// Encodes one recursive source configuration through the frozen V4 value mirror.
+    pub fn encode_source_config(
+        value: &LegacyCatalogValueV4,
+    ) -> std::result::Result<Vec<u8>, CatalogCodecError> {
+        validate_v4_value_shapes(std::iter::once(value))
+            .map_err(|error| CatalogCodecError::InvalidLegacyProjectionV4(error.to_string()))?;
+        let mut writer = BoundedVecWriter::new(MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4);
+        if let Err(error) = wire_v4::write_value_v4(&mut writer, value) {
+            return if writer.limit_exceeded() {
+                Err(CatalogCodecError::InvalidLegacyProjectionV4(
+                    "V4 source configuration exceeds the canonical byte limit".to_owned(),
+                ))
+            } else {
+                Err(CatalogCodecError::Json(error))
+            };
+        }
+        Ok(writer.finish())
+    }
+
+    /// Decodes one recursive source configuration through the frozen V4 value mirror.
+    pub fn decode_source_config(
+        bytes: &[u8],
+    ) -> std::result::Result<LegacyCatalogValueV4, CatalogCodecError> {
+        if bytes.len() > MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4 {
+            return Err(CatalogCodecError::InvalidLegacyProjectionV4(
+                "V4 source configuration exceeds the canonical byte limit".to_owned(),
+            ));
+        }
+        let value = wire_v4::decode_value_v4(bytes)
+            .map_err(CatalogCodecError::InvalidLegacyProjectionV4)?;
+        validate_v4_value_shapes(std::iter::once(&value))
+            .map_err(|error| CatalogCodecError::InvalidLegacyProjectionV4(error.to_string()))?;
+        let mut writer = BoundedFingerprintWriter::new(MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4);
+        if let Err(error) = wire_v4::write_value_v4(&mut writer, &value) {
+            return if writer.limit_exceeded() {
+                Err(CatalogCodecError::InvalidLegacyProjectionV4(
+                    "V4 source configuration exceeds the canonical byte limit".to_owned(),
+                ))
+            } else {
+                Err(CatalogCodecError::Json(error))
+            };
+        }
+        Ok(value)
+    }
+
+    /// Encodes one response through the permanently assigned V4 response mirror.
+    pub fn encode_response(
+        response: &LegacyCatalogProjectionResponseV4,
+    ) -> std::result::Result<Vec<u8>, CatalogCodecError> {
+        Ok(serde_json::to_vec(&wire_v4::ResponseEnvelopeV4::from(
+            response,
+        ))?)
+    }
+
+    /// Decodes one frozen V4 response and rejects unknown versions or fields.
+    pub fn decode_response(
+        bytes: &[u8],
+    ) -> std::result::Result<LegacyCatalogProjectionResponseV4, CatalogCodecError> {
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            format_version: u32,
+        }
+
+        let version = serde_json::from_slice::<VersionProbe>(bytes)?.format_version;
+        if version != LEGACY_CATALOG_PROJECTION_FORMAT_VERSION_V4 {
+            return Err(CatalogCodecError::UnsupportedVersion { actual: version });
+        }
+        serde_json::from_slice::<wire_v4::ResponseEnvelopeV4>(bytes)?
+            .into_domain()
+            .map_err(CatalogCodecError::InvalidLegacyProjectionV4)
+    }
+}
+
 /// Fixed-cost lookup result for one startup-only V2 legacy-import request ID.
 ///
 /// The probe validates the retained response's intrinsic import invariants but intentionally does
@@ -744,6 +1371,223 @@ fn validate_fingerprint_fields(
         });
     }
     Ok(())
+}
+
+fn validate_v4_command_shape(
+    command: &LegacyCatalogProjectionCommandV4,
+) -> std::result::Result<(), CatalogFingerprintError> {
+    match command {
+        LegacyCatalogProjectionCommandV4::BootstrapTable(command) => {
+            validate_v4_files(command.files.len())?;
+            validate_v4_sources(&command.sources)
+        }
+        LegacyCatalogProjectionCommandV4::AdoptExistingTable(command) => {
+            validate_v4_files(command.files.len())?;
+            validate_v4_sources(&command.sources)
+        }
+        LegacyCatalogProjectionCommandV4::SyncTableMetadata(command) => {
+            validate_v4_sources(&command.sources)
+        }
+        LegacyCatalogProjectionCommandV4::DropTable(_)
+        | LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(_) => Ok(()),
+    }
+}
+
+fn validate_v4_files(actual: usize) -> std::result::Result<(), CatalogFingerprintError> {
+    if actual > MAX_LEGACY_CATALOG_PROJECTION_FILES_V4 {
+        return Err(CatalogFingerprintError::LegacyProjectionResourceLimit {
+            resource: "files",
+            actual,
+            maximum: MAX_LEGACY_CATALOG_PROJECTION_FILES_V4,
+        });
+    }
+    Ok(())
+}
+
+fn validate_v4_sources(
+    sources: &[LegacyCatalogSourceV4],
+) -> std::result::Result<(), CatalogFingerprintError> {
+    if sources.len() > MAX_LEGACY_CATALOG_PROJECTION_SOURCES_V4 {
+        return Err(CatalogFingerprintError::LegacyProjectionResourceLimit {
+            resource: "sources",
+            actual: sources.len(),
+            maximum: MAX_LEGACY_CATALOG_PROJECTION_SOURCES_V4,
+        });
+    }
+    if sources.iter().any(|source| {
+        source.source_name.is_empty()
+            || source.source_type.is_empty()
+            || source.output_stream.is_empty()
+    }) || sources
+        .windows(2)
+        .any(|pair| pair[0].source_name.as_str() >= pair[1].source_name.as_str())
+    {
+        return Err(CatalogFingerprintError::InvalidLegacyProjectionIdentity {
+            resource: "source_name",
+        });
+    }
+
+    validate_v4_value_shapes(sources.iter().map(|source| &source.config))
+}
+
+fn validate_v4_value_shapes<'a>(
+    values: impl IntoIterator<Item = &'a LegacyCatalogValueV4>,
+) -> std::result::Result<(), CatalogFingerprintError> {
+    let mut nodes = 0_usize;
+    let mut stack = values
+        .into_iter()
+        .map(|value| (value, 1_usize))
+        .collect::<Vec<_>>();
+    while let Some((value, depth)) = stack.pop() {
+        nodes =
+            nodes
+                .checked_add(1)
+                .ok_or(CatalogFingerprintError::LegacyProjectionResourceLimit {
+                    resource: "value_nodes",
+                    actual: usize::MAX,
+                    maximum: MAX_LEGACY_CATALOG_VALUE_NODES_V4,
+                })?;
+        if nodes > MAX_LEGACY_CATALOG_VALUE_NODES_V4 {
+            return Err(CatalogFingerprintError::LegacyProjectionResourceLimit {
+                resource: "value_nodes",
+                actual: nodes,
+                maximum: MAX_LEGACY_CATALOG_VALUE_NODES_V4,
+            });
+        }
+        if depth > MAX_LEGACY_CATALOG_VALUE_DEPTH_V4 {
+            return Err(CatalogFingerprintError::LegacyProjectionResourceLimit {
+                resource: "value_depth",
+                actual: depth,
+                maximum: MAX_LEGACY_CATALOG_VALUE_DEPTH_V4,
+            });
+        }
+        let next_depth = depth.saturating_add(1);
+        match value {
+            LegacyCatalogValueV4::Array(values) => {
+                stack.extend(values.iter().map(|value| (value, next_depth)));
+            }
+            LegacyCatalogValueV4::Object(values) => {
+                stack.extend(values.values().map(|value| (value, next_depth)));
+            }
+            LegacyCatalogValueV4::Null
+            | LegacyCatalogValueV4::Boolean(_)
+            | LegacyCatalogValueV4::Int64(_)
+            | LegacyCatalogValueV4::UInt64(_)
+            | LegacyCatalogValueV4::Float64(_)
+            | LegacyCatalogValueV4::String(_) => {}
+        }
+    }
+    Ok(())
+}
+
+struct BoundedFingerprintWriter {
+    digest: Sha256,
+    written: usize,
+    maximum: usize,
+    limit_exceeded: bool,
+}
+
+struct BoundedVecWriter {
+    bytes: Vec<u8>,
+    maximum: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedVecWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            limit_exceeded: false,
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+}
+
+impl Write for BoundedVecWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.bytes.len().checked_add(bytes.len()) else {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "legacy Catalog V4 canonical byte overflow",
+            ));
+        };
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "legacy Catalog V4 canonical bytes exceed limit",
+            ));
+        }
+        if next > self.bytes.capacity() {
+            let doubled = self.bytes.capacity().max(1_024).saturating_mul(2);
+            let target_capacity = next.max(doubled).min(self.maximum);
+            self.bytes
+                .try_reserve_exact(target_capacity.saturating_sub(self.bytes.len()))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BoundedFingerprintWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            digest: Sha256::new(),
+            written: 0,
+            maximum,
+            limit_exceeded: false,
+        }
+    }
+
+    fn with_domain(maximum: usize, domain: &[u8]) -> Self {
+        let mut writer = Self::new(maximum);
+        writer.digest.update(domain);
+        writer
+    }
+
+    fn finish(self) -> sha2::digest::Output<Sha256> {
+        self.digest.finalize()
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+}
+
+impl Write for BoundedFingerprintWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.written.checked_add(bytes.len()) else {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "legacy Catalog V4 canonical byte overflow",
+            ));
+        };
+        if next > self.maximum {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "legacy Catalog V4 canonical bytes exceed limit",
+            ));
+        }
+        self.digest.update(bytes);
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 struct FingerprintWriter(Sha256);
