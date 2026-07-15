@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use zippy_catalog::{
     decode_persisted_table_schema, SqliteCatalog, SqliteCatalogConfig,
     SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle,
+    SqliteCatalogRuntimeSnapshotPinAdmissionControl, SqliteCatalogRuntimeSnapshotPinRecord,
     SqliteCatalogRuntimeSnapshotPinStatus,
 };
 use zippy_core::OwnedDataDirectory;
@@ -49,6 +50,7 @@ pub struct NativeStorageRuntimeConfig {
     reconciliation: StartupOrphanReconcilerConfig,
     catalog_file_verification: StartupCatalogFileVerifierConfig,
     table_actors: TableActorRegistryConfig,
+    query_resources: crate::query_service::QueryServiceResourceConfig,
     actor: CatalogActor,
     legacy_catalog_migration: LegacyCatalogMigrationStartup,
 }
@@ -65,6 +67,7 @@ impl NativeStorageRuntimeConfig {
             reconciliation: StartupOrphanReconcilerConfig::new(),
             catalog_file_verification: StartupCatalogFileVerifierConfig::new(),
             table_actors: TableActorRegistryConfig::new(),
+            query_resources: crate::query_service::QueryServiceResourceConfig::default(),
             actor: CatalogActor {
                 kind: CatalogActorKind::Server,
                 principal: DEFAULT_SERVER_ACTOR_PRINCIPAL.to_owned(),
@@ -128,6 +131,14 @@ impl NativeStorageRuntimeConfig {
         self
     }
 
+    pub(crate) fn with_query_resource_config(
+        mut self,
+        query_resources: crate::query_service::QueryServiceResourceConfig,
+    ) -> Self {
+        self.query_resources = query_resources;
+        self
+    }
+
     /// Replaces the audited server principal used for recovered Catalog commits.
     #[must_use]
     pub fn with_actor(mut self, actor: CatalogActor) -> Self {
@@ -156,6 +167,7 @@ impl NativeStorageRuntimeConfig {
         }
         self.persist_controller.validate()?;
         self.table_actors.validate()?;
+        self.query_resources.validate()?;
         Ok(())
     }
 }
@@ -322,14 +334,24 @@ impl NativeStorageStartup {
     }
 
     fn take_runtime(&mut self, ready: SupervisorReady) -> NativeStorageRuntime {
+        let query_snapshot_coordinator = crate::query_snapshot::NativeQuerySnapshotCoordinator::new(
+            ready.catalog_read_handle.clone(),
+            ready.table_actors.clone(),
+        );
+        let query_resources =
+            crate::query_service::QueryResourceCoordinator::new(ready.query_resources)
+                .expect("validated native query resource configuration");
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
             legacy_catalog_migration: ready.legacy_catalog_migration,
             catalog_read_handle: ready.catalog_read_handle,
             catalog_legacy_reconcile_handle: ready.catalog_legacy_reconcile_handle,
+            runtime_snapshot_pin_admission: ready.runtime_snapshot_pin_admission,
             table_actors: ready.table_actors,
             table_actor_admission: ready.table_actor_admission,
+            query_snapshot_coordinator,
+            query_resources,
             healthy: ready.healthy,
             terminal_failure: Arc::clone(&self.terminal_failure),
             shutdown: self.shutdown.take(),
@@ -337,6 +359,7 @@ impl NativeStorageStartup {
             supervisor: self.supervisor.take(),
             shutdown_requested: false,
             final_shutdown: None,
+            storage_shutdown_signalled: false,
         }
     }
 }
@@ -382,8 +405,11 @@ pub struct NativeStorageRuntime {
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
     catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
+    runtime_snapshot_pin_admission: SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
+    query_snapshot_coordinator: crate::query_snapshot::NativeQuerySnapshotCoordinator,
+    query_resources: crate::query_service::QueryResourceCoordinator,
     healthy: Arc<AtomicBool>,
     terminal_failure: Arc<Mutex<Option<ServerError>>>,
     shutdown: Option<watch::Sender<bool>>,
@@ -391,6 +417,7 @@ pub struct NativeStorageRuntime {
     supervisor: Option<JoinHandle<()>>,
     shutdown_requested: bool,
     final_shutdown: Option<NativeStorageShutdownOutcome>,
+    storage_shutdown_signalled: bool,
 }
 
 impl NativeStorageRuntime {
@@ -465,6 +492,27 @@ impl NativeStorageRuntime {
         self.catalog_read_handle.runtime_snapshot_pin_status()
     }
 
+    /// Returns active query-attributed snapshot pins for diagnostics.
+    pub fn runtime_query_snapshot_pins(
+        &self,
+    ) -> Result<Vec<SqliteCatalogRuntimeSnapshotPinRecord>> {
+        self.catalog_read_handle.runtime_query_snapshot_pins()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn query_snapshot_coordinator(
+        &self,
+    ) -> crate::query_snapshot::NativeQuerySnapshotCoordinator {
+        self.query_snapshot_coordinator.clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn query_resource_coordinator(
+        &self,
+    ) -> crate::query_service::QueryResourceCoordinator {
+        self.query_resources.clone()
+    }
+
     /// Returns the number of active native table runtimes recovered before readiness.
     #[must_use]
     pub fn table_runtime_count(&self) -> usize {
@@ -504,12 +552,14 @@ impl NativeStorageRuntime {
     /// Irreversibly closes native work admission and requests ordered background cleanup.
     pub fn begin_shutdown(&mut self) {
         self.healthy.store(false, Ordering::Release);
-        if self.shutdown_requested {
-            return;
+        if !self.shutdown_requested {
+            self.shutdown_requested = true;
+            self.query_snapshot_coordinator.close_admission();
+            self.runtime_snapshot_pin_admission.close_admission();
+            self.table_actor_admission.close();
         }
-        self.shutdown_requested = true;
-        self.table_actor_admission.close();
-        signal_shutdown(self.shutdown.as_ref());
+        self.query_resources.begin_shutdown();
+        self.try_signal_storage_shutdown();
     }
 
     /// Waits for ordered cleanup until an absolute monotonic deadline.
@@ -518,6 +568,17 @@ impl NativeStorageRuntime {
             return outcome.clone();
         }
         self.begin_shutdown();
+        while !self.try_signal_storage_shutdown() {
+            let now = Instant::now();
+            if now >= deadline {
+                return NativeStorageShutdownOutcome::TimedOut;
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(2)),
+            );
+        }
         let Some(completion) = self.completion.as_ref() else {
             let outcome = NativeStorageShutdownOutcome::Failed(supervisor_stopped());
             self.final_shutdown = Some(outcome.clone());
@@ -550,6 +611,28 @@ impl NativeStorageRuntime {
             self.final_shutdown = Some(outcome.clone());
         }
         outcome
+    }
+
+    fn try_signal_storage_shutdown(&mut self) -> bool {
+        if self.storage_shutdown_signalled {
+            return true;
+        }
+        let queries_drained = self.query_resources.status().lifecycle
+            == crate::query_service::QueryServiceLifecycle::Stopped;
+        let snapshot_planning_drained = self.query_snapshot_coordinator.planning_drained();
+        let pins_drained = match self.catalog_read_handle.runtime_snapshot_pin_status() {
+            Ok(status) => status.active_pins == 0,
+            Err(_) => self
+                .supervisor
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished),
+        };
+        if !queries_drained || !snapshot_planning_drained || !pins_drained {
+            return false;
+        }
+        signal_shutdown(self.shutdown.as_ref());
+        self.storage_shutdown_signalled = true;
+        true
     }
 
     /// Waits for ordered cleanup for at most the supplied positive duration.
@@ -591,9 +674,11 @@ struct SupervisorReady {
     legacy_catalog_migration: LegacyCatalogMigrationStatus,
     catalog_read_handle: SqliteCatalogReadHandle,
     catalog_legacy_reconcile_handle: SqliteCatalogLegacyReconcileHandle,
+    runtime_snapshot_pin_admission: SqliteCatalogRuntimeSnapshotPinAdmissionControl,
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
+    query_resources: crate::query_service::QueryServiceResourceConfig,
 }
 
 fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageStartup> {
@@ -911,6 +996,7 @@ async fn supervise_storage(
             );
         }
     };
+    let runtime_snapshot_pin_admission = catalog.runtime_snapshot_pin_admission_control();
 
     if startup
         .send(Ok(SupervisorReady {
@@ -919,9 +1005,11 @@ async fn supervise_storage(
             legacy_catalog_migration,
             catalog_read_handle,
             catalog_legacy_reconcile_handle,
+            runtime_snapshot_pin_admission,
             table_actors: table_actor_handle,
             table_actor_admission,
             healthy: Arc::clone(&healthy),
+            query_resources: config.query_resources,
         }))
         .is_err()
     {
@@ -1124,7 +1212,7 @@ fn build_table_runtime_registry(
     TableRuntimeRegistry::from_bootstraps(catalog_revision, tables)
 }
 
-fn is_legacy_catalog_shadow_table(table: &TableDescriptor) -> Result<bool> {
+pub(crate) fn is_legacy_catalog_shadow_table(table: &TableDescriptor) -> Result<bool> {
     let Some(stream_name) = table.config.get(LEGACY_STREAM_NAME_CONFIG_KEY) else {
         return Ok(false);
     };

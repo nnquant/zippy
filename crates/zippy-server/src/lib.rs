@@ -18,6 +18,8 @@ mod native_storage;
 // Q0_REMOVE_DEAD_CODE_ALLOW: remove when the native planner constructs this coordinator.
 #[allow(dead_code)]
 mod query_service;
+#[allow(dead_code)]
+mod query_snapshot;
 mod runtime;
 
 pub use catalog_command_shadow::{

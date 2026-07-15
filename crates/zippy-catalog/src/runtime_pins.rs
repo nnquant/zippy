@@ -5,14 +5,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use zippy_types::{ErrorCode, Result, ServerError, TableId};
+use zippy_types::catalog::CatalogSnapshotSelector;
+use zippy_types::{ErrorCode, LeaseId, QueryId, Result, ServerError, TableId};
 
 const RUNTIME_PIN_SHARDS: usize = 64;
 
+/// One exact table selector and query lease identity admitted as an atomic query pin group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteCatalogQuerySnapshotPinRequest {
+    /// Exact historical table version to protect and read.
+    pub selector: CatalogSnapshotSelector,
+    /// Lease identity published in the finalized query snapshot descriptor.
+    pub lease_id: LeaseId,
+}
+
 /// Current process-local query snapshot pin admission state and cumulative rejections.
 ///
-/// Active values are independently sampled lock-free gauges. Under concurrent admission or drop,
-/// one returned sample can briefly observe different instants for the two gauges. Exhaustion
+/// Active values are independently sampled gauges. Under concurrent admission or drop, one
+/// returned sample can briefly observe different instants for its gauges. Exhaustion
 /// counters are monotonic for the lifetime of one [`crate::SqliteCatalog`] instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SqliteCatalogRuntimeSnapshotPinStatus {
@@ -20,6 +30,8 @@ pub struct SqliteCatalogRuntimeSnapshotPinStatus {
     pub admission_open: bool,
     /// Query snapshot pin guards currently retained by callers.
     pub active_pins: usize,
+    /// Active pins attributed to a query and stable lease identity.
+    pub active_query_pins: usize,
     /// Table entries retained by query pins or an active GC exclusion.
     pub active_tables: usize,
     /// Configured maximum number of active query snapshot pin guards.
@@ -30,6 +42,21 @@ pub struct SqliteCatalogRuntimeSnapshotPinStatus {
     pub pin_budget_exhaustions_total: u64,
     /// Pin or GC admissions rejected because `max_active_tables` was reached.
     pub table_budget_exhaustions_total: u64,
+}
+
+/// One active query-attributed process-local Catalog pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SqliteCatalogRuntimeSnapshotPinRecord {
+    /// Query that owns the pin.
+    pub query_id: QueryId,
+    /// Stable lease identity carried by the query snapshot descriptor.
+    pub lease_id: LeaseId,
+    /// Table protected by the pin.
+    pub table_id: TableId,
+    /// Exact persisted snapshot protected against physical GC.
+    pub snapshot_version: u64,
+    /// Acquisition time as UTC Unix nanoseconds.
+    pub acquired_at_ns: u64,
 }
 
 #[derive(Default)]
@@ -48,6 +75,7 @@ pub(crate) struct RuntimeSnapshotPinRegistry {
     max_tables: usize,
     pin_budget_exhaustions: AtomicU64,
     table_budget_exhaustions: AtomicU64,
+    query_pins: Mutex<HashMap<LeaseId, SqliteCatalogRuntimeSnapshotPinRecord>>,
     _runtime_ownership: Option<zippy_core::CatalogRuntimeOwnership>,
 }
 
@@ -83,6 +111,7 @@ impl RuntimeSnapshotPinRegistry {
             max_tables,
             pin_budget_exhaustions: AtomicU64::new(0),
             table_budget_exhaustions: AtomicU64::new(0),
+            query_pins: Mutex::new(HashMap::new()),
             _runtime_ownership: runtime_ownership,
         })
     }
@@ -92,9 +121,59 @@ impl RuntimeSnapshotPinRegistry {
         table_id: TableId,
         snapshot_version: u64,
     ) -> Result<SqliteCatalogRuntimeSnapshotPin> {
+        self.pin_internal(table_id, snapshot_version, None)
+    }
+
+    pub(crate) fn pin_query(
+        self: &Arc<Self>,
+        query_id: QueryId,
+        lease_id: LeaseId,
+        table_id: TableId,
+        snapshot_version: u64,
+        acquired_at_ns: u64,
+    ) -> Result<SqliteCatalogRuntimeSnapshotPin> {
+        self.pin_internal(
+            table_id,
+            snapshot_version,
+            Some(SqliteCatalogRuntimeSnapshotPinRecord {
+                query_id,
+                lease_id,
+                table_id,
+                snapshot_version,
+                acquired_at_ns,
+            }),
+        )
+    }
+
+    fn pin_internal(
+        self: &Arc<Self>,
+        table_id: TableId,
+        snapshot_version: u64,
+        query_pin: Option<SqliteCatalogRuntimeSnapshotPinRecord>,
+    ) -> Result<SqliteCatalogRuntimeSnapshotPin> {
         if snapshot_version == 0 {
             return Err(invalid("runtime snapshot pin version must be nonzero"));
         }
+        if query_pin.is_some_and(|pin| pin.acquired_at_ns == 0) {
+            return Err(invalid(
+                "query runtime snapshot pin acquisition time must be nonzero",
+            ));
+        }
+        let mut query_pins = query_pin
+            .map(|pin| {
+                let pins = self.query_pins.lock().map_err(|_| poisoned())?;
+                if pins.contains_key(&pin.lease_id) {
+                    return Err(ServerError::new(
+                        ErrorCode::Conflict,
+                        "query runtime snapshot lease identity is already active",
+                    )
+                    .with_query_id(pin.query_id)
+                    .with_table_id(pin.table_id)
+                    .with_retryable(false));
+                }
+                Ok(pins)
+            })
+            .transpose()?;
         let shard = self.shard(table_id);
         let mut tables = shard.lock().map_err(|_| poisoned())?;
         if self.closed.load(Ordering::Acquire) {
@@ -142,11 +221,16 @@ impl RuntimeSnapshotPinRegistry {
         let count = table.pins.entry(snapshot_version).or_default();
         *count += 1;
         table.pin_count += 1;
+        if let (Some(pin), Some(query_pins)) = (query_pin, query_pins.as_mut()) {
+            let previous = query_pins.insert(pin.lease_id, pin);
+            debug_assert!(previous.is_none());
+        }
         Ok(SqliteCatalogRuntimeSnapshotPin {
             _token: RuntimeSnapshotPinToken {
                 registry: Arc::clone(self),
                 table_id,
                 snapshot_version,
+                lease_id: query_pin.map(|pin| pin.lease_id),
             },
         })
     }
@@ -204,12 +288,29 @@ impl RuntimeSnapshotPinRegistry {
         SqliteCatalogRuntimeSnapshotPinStatus {
             admission_open: !self.closed.load(Ordering::Acquire),
             active_pins: self.active_pins.load(Ordering::Acquire),
+            active_query_pins: self
+                .query_pins
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
             active_tables: self.active_tables.load(Ordering::Acquire),
             max_active_pins: self.max_pins,
             max_active_tables: self.max_tables,
             pin_budget_exhaustions_total: self.pin_budget_exhaustions.load(Ordering::Relaxed),
             table_budget_exhaustions_total: self.table_budget_exhaustions.load(Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn query_pin_records(&self) -> Vec<SqliteCatalogRuntimeSnapshotPinRecord> {
+        let mut records = self
+            .query_pins
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|record| record.lease_id);
+        records
     }
 
     pub(crate) fn close(&self) {
@@ -219,7 +320,15 @@ impl RuntimeSnapshotPinRegistry {
         }
     }
 
-    fn release_pin(&self, table_id: TableId, snapshot_version: u64) {
+    fn release_pin(&self, table_id: TableId, snapshot_version: u64, lease_id: Option<LeaseId>) {
+        if let Some(lease_id) = lease_id {
+            let removed = self
+                .query_pins
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&lease_id);
+            debug_assert!(removed.is_some());
+        }
         let shard = self.shard(table_id);
         let mut tables = shard.lock().unwrap_or_else(|error| error.into_inner());
         let remove_table = if let Some(table) = tables.get_mut(&table_id) {
@@ -306,12 +415,13 @@ struct RuntimeSnapshotPinToken {
     registry: Arc<RuntimeSnapshotPinRegistry>,
     table_id: TableId,
     snapshot_version: u64,
+    lease_id: Option<LeaseId>,
 }
 
 impl Drop for RuntimeSnapshotPinToken {
     fn drop(&mut self) {
         self.registry
-            .release_pin(self.table_id, self.snapshot_version);
+            .release_pin(self.table_id, self.snapshot_version, self.lease_id);
     }
 }
 
@@ -365,7 +475,7 @@ fn poisoned() -> ServerError {
 #[cfg(test)]
 mod tests {
     use super::RuntimeSnapshotPinRegistry;
-    use zippy_types::{ErrorCode, TableId};
+    use zippy_types::{ErrorCode, LeaseId, QueryId, TableId};
 
     fn table(value: u128) -> TableId {
         TableId::from_u128(value).expect("nonzero table id")
@@ -377,6 +487,7 @@ mod tests {
         let initial = registry.status();
         assert!(initial.admission_open);
         assert_eq!(initial.active_pins, 0);
+        assert_eq!(initial.active_query_pins, 0);
         assert_eq!(initial.active_tables, 0);
         assert_eq!(initial.max_active_pins, 2);
         assert_eq!(initial.max_active_tables, 1);
@@ -405,6 +516,7 @@ mod tests {
         drop(other_table);
         let released = registry.status();
         assert_eq!(released.active_pins, 0);
+        assert_eq!(released.active_query_pins, 0);
         assert_eq!(released.active_tables, 0);
         assert_eq!(released.pin_budget_exhaustions_total, 1);
         assert_eq!(released.table_budget_exhaustions_total, 1);
@@ -439,5 +551,38 @@ mod tests {
             .expect_err("closed registry rejects new pin");
         assert_eq!(error.code(), ErrorCode::Unavailable);
         drop(existing);
+    }
+
+    #[test]
+    fn query_pin_records_are_unique_auditable_and_removed_with_the_guard() {
+        let registry = RuntimeSnapshotPinRegistry::new_with_limits(2, 2);
+        let query_id = QueryId::from_u128(11).expect("nonzero query id");
+        let lease_id = LeaseId::from_u128(12).expect("nonzero lease id");
+        let pin = registry
+            .pin_query(query_id, lease_id, table(1), 7, 99)
+            .expect("attribute query pin");
+        let status = registry.status();
+        assert_eq!(status.active_pins, 1);
+        assert_eq!(status.active_query_pins, 1);
+        assert_eq!(
+            registry.query_pin_records(),
+            vec![super::SqliteCatalogRuntimeSnapshotPinRecord {
+                query_id,
+                lease_id,
+                table_id: table(1),
+                snapshot_version: 7,
+                acquired_at_ns: 99,
+            }]
+        );
+
+        let duplicate = registry
+            .pin_query(query_id, lease_id, table(2), 8, 100)
+            .expect_err("active lease identity must be unique");
+        assert_eq!(duplicate.code(), ErrorCode::Conflict);
+        assert_eq!(registry.status().active_pins, 1);
+
+        drop(pin);
+        assert_eq!(registry.status().active_query_pins, 0);
+        assert!(registry.query_pin_records().is_empty());
     }
 }

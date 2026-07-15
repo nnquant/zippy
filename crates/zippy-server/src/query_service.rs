@@ -28,6 +28,17 @@ pub(crate) struct QueryServiceResourceConfig {
     pub max_memory_bytes: u64,
 }
 
+impl Default for QueryServiceResourceConfig {
+    fn default() -> Self {
+        Self {
+            max_active_queries: 64,
+            max_active_tasks: 256,
+            max_cpu_slots: 4,
+            max_memory_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 impl QueryServiceResourceConfig {
     pub(crate) fn validate(self) -> Result<Self> {
         if self.max_active_queries == 0
@@ -144,6 +155,7 @@ impl QueryResourceCoordinator {
             cancelled: AtomicBool::new(false),
             state: Mutex::new(QueryControlState::default()),
         });
+        let ownership;
         {
             let mut state = self.inner.state.lock().unwrap();
             state.prune_registry();
@@ -153,7 +165,7 @@ impl QueryResourceCoordinator {
             if state
                 .registry
                 .get(&query_id)
-                .is_some_and(|entry| entry.strong_count() > 0)
+                .is_some_and(RegistryEntry::is_live)
             {
                 return Err(ServerError::new(
                     ErrorCode::Conflict,
@@ -173,17 +185,23 @@ impl QueryResourceCoordinator {
                     "global query snapshot owner admission is exhausted",
                 ));
             }
+            ownership = Arc::new(SharedSnapshotOwnership {
+                owner: Arc::downgrade(&self.inner),
+                snapshot: Mutex::new(Some(snapshot)),
+            });
             state.active_snapshot_owners = state
                 .active_snapshot_owners
                 .checked_add(1)
                 .ok_or_else(|| exhausted(query_id, "snapshot owner accounting is exhausted"))?;
             state.active_logical_queries += 1;
-            state.registry.insert(query_id, Arc::downgrade(&control));
+            state.registry.insert(
+                query_id,
+                RegistryEntry {
+                    control: Arc::downgrade(&control),
+                    snapshot_root: Some(Arc::clone(&ownership)),
+                },
+            );
         }
-        let ownership = Arc::new(SharedSnapshotOwnership {
-            owner: Arc::downgrade(&self.inner),
-            snapshot: Mutex::new(Some(snapshot)),
-        });
         Ok(Box::new(QueryServicePlanToken {
             coordinator_nonce: self.inner.nonce,
             info,
@@ -257,12 +275,23 @@ struct CoordinatorInner {
 
 struct CoordinatorState {
     lifecycle: QueryServiceLifecycle,
-    registry: HashMap<QueryId, Weak<QueryControl>>,
+    registry: HashMap<QueryId, RegistryEntry>,
     active_logical_queries: usize,
     active_tasks: usize,
     active_cpu_slots: u32,
     active_memory_bytes: u64,
     active_snapshot_owners: usize,
+}
+
+struct RegistryEntry {
+    control: Weak<QueryControl>,
+    snapshot_root: Option<Arc<SharedSnapshotOwnership>>,
+}
+
+impl RegistryEntry {
+    fn is_live(&self) -> bool {
+        self.snapshot_root.is_some() || self.control.strong_count() > 0
+    }
 }
 
 impl Default for CoordinatorState {
@@ -281,8 +310,13 @@ impl Default for CoordinatorState {
 
 impl CoordinatorState {
     fn prune_registry(&mut self) {
+        self.registry.retain(|_, entry| entry.is_live());
+    }
+
+    fn take_snapshot_root(&mut self, query_id: QueryId) -> Option<Arc<SharedSnapshotOwnership>> {
         self.registry
-            .retain(|_, control| control.strong_count() > 0);
+            .get_mut(&query_id)
+            .and_then(|entry| entry.snapshot_root.take())
     }
 
     fn refresh_shutdown(&mut self) {
@@ -335,6 +369,10 @@ impl CoordinatorInner {
                 QueryState::TimedOut,
                 Some(error.clone()),
             );
+            let snapshot_root = global.take_snapshot_root(control.query_id);
+            drop(query);
+            drop(global);
+            release_snapshot_root(snapshot_root);
             return Err(error);
         }
         if query.state != QueryState::Planned {
@@ -414,7 +452,13 @@ impl CoordinatorInner {
         global.active_tasks -= 1;
         global.active_cpu_slots -= cpu_slots;
         global.active_memory_bytes -= memory_bytes;
+        let snapshot_root = (query.state.is_terminal() && query.active_tasks == 0)
+            .then(|| global.take_snapshot_root(control.query_id))
+            .flatten();
         global.refresh_shutdown();
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
     }
 
     fn release_snapshot_owner(&self) {
@@ -447,6 +491,10 @@ impl CoordinatorInner {
             );
         }
         Self::terminate_locked(&mut global, control, &mut query, QueryState::Finished, None);
+        let snapshot_root = global.take_snapshot_root(control.query_id);
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
         Ok(())
     }
 
@@ -460,10 +508,16 @@ impl CoordinatorInner {
         let control = global
             .registry
             .get(&query_id)
-            .and_then(Weak::upgrade)
+            .and_then(|entry| entry.control.upgrade())
             .ok_or_else(|| not_found(query_id))?;
         let mut query = control.state.lock().unwrap();
         Self::terminate_locked(&mut global, &control, &mut query, terminal, Some(error));
+        let snapshot_root = (query.active_tasks == 0)
+            .then(|| global.take_snapshot_root(query_id))
+            .flatten();
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
         Ok(())
     }
 
@@ -476,6 +530,12 @@ impl CoordinatorInner {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
         Self::terminate_locked(&mut global, control, &mut query, terminal, Some(error));
+        let snapshot_root = (query.active_tasks == 0)
+            .then(|| global.take_snapshot_root(control.query_id))
+            .flatten();
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
     }
 
     fn terminate_locked(
@@ -511,9 +571,10 @@ impl CoordinatorInner {
         let controls = global
             .registry
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(|entry| entry.control.upgrade())
             .collect::<Vec<_>>();
         let mut expired = 0;
+        let mut snapshot_roots = Vec::new();
         for control in controls {
             let mut query = control.state.lock().unwrap();
             let due = match query.state {
@@ -530,14 +591,24 @@ impl CoordinatorInner {
             };
             if due {
                 let error = deadline(control.query_id, "query exceeded its runtime deadline");
-                expired += usize::from(Self::terminate_locked(
+                let terminated = Self::terminate_locked(
                     &mut global,
                     &control,
                     &mut query,
                     QueryState::TimedOut,
                     Some(error),
-                ));
+                );
+                expired += usize::from(terminated);
+                if terminated && query.active_tasks == 0 {
+                    if let Some(root) = global.take_snapshot_root(control.query_id) {
+                        snapshot_roots.push(root);
+                    }
+                }
             }
+        }
+        drop(global);
+        for root in snapshot_roots {
+            root.release();
         }
         expired
     }
@@ -550,8 +621,9 @@ impl CoordinatorInner {
         let controls = global
             .registry
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(|entry| entry.control.upgrade())
             .collect::<Vec<_>>();
+        let mut snapshot_roots = Vec::new();
         for control in controls {
             let mut query = control.state.lock().unwrap();
             let error = ServerError::new(
@@ -566,9 +638,18 @@ impl CoordinatorInner {
                 QueryState::Cancelled,
                 Some(error),
             );
+            if query.active_tasks == 0 {
+                if let Some(root) = global.take_snapshot_root(control.query_id) {
+                    snapshot_roots.push(root);
+                }
+            }
         }
         global.refresh_shutdown();
-        global.status()
+        drop(global);
+        for root in snapshot_roots {
+            root.release();
+        }
+        self.status()
     }
 
     fn status(&self) -> QueryServiceStatus {
@@ -582,7 +663,7 @@ impl CoordinatorInner {
             .unwrap()
             .registry
             .get(&query_id)
-            .and_then(Weak::upgrade)
+            .and_then(|entry| entry.control.upgrade())
             .ok_or_else(|| not_found(query_id))?;
         let query = control.state.lock().unwrap();
         Ok(QueryRuntimeStatus {
@@ -602,7 +683,11 @@ impl Drop for CoordinatorInner {
     fn drop(&mut self) {
         if let Ok(global) = self.state.get_mut() {
             global.lifecycle = QueryServiceLifecycle::Stopped;
-            for control in global.registry.values().filter_map(Weak::upgrade) {
+            for control in global
+                .registry
+                .values()
+                .filter_map(|entry| entry.control.upgrade())
+            {
                 control.cancelled.store(true, Ordering::Release);
                 if let Ok(mut query) = control.state.lock() {
                     if !query.state.is_terminal() {
@@ -673,6 +758,23 @@ struct SharedSnapshotOwnership {
     snapshot: Mutex<Option<OpaqueQueryReadSnapshot>>,
 }
 
+impl SharedSnapshotOwnership {
+    fn release(&self) {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if snapshot.is_none() {
+            return;
+        }
+        drop(snapshot);
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_snapshot_owner();
+        }
+    }
+}
+
 impl Drop for SharedSnapshotOwnership {
     fn drop(&mut self) {
         let snapshot = self
@@ -680,10 +782,18 @@ impl Drop for SharedSnapshotOwnership {
             .get_mut()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        drop(snapshot);
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_snapshot_owner();
+        if snapshot.is_some() {
+            drop(snapshot);
+            if let Some(owner) = self.owner.upgrade() {
+                owner.release_snapshot_owner();
+            }
         }
+    }
+}
+
+fn release_snapshot_root(root: Option<Arc<SharedSnapshotOwnership>>) {
+    if let Some(root) = root {
+        root.release();
     }
 }
 
@@ -755,7 +865,72 @@ impl QueryExecutionScope {
         self.control.query_id
     }
 
-    pub(crate) fn admit_task<R: Send + 'static>(
+    /// Borrows the concrete snapshot capability while this execution scope owns it.
+    ///
+    /// The callback boundary prevents a reference from escaping the ownership lock. A physical
+    /// planner may clone only lease-bound task capabilities from the concrete guard.
+    fn with_snapshot<T, R>(&self, inspect: impl FnOnce(&T) -> Result<R>) -> Result<R>
+    where
+        T: Any + Send,
+    {
+        let ownership = self
+            .ownership
+            .as_ref()
+            .ok_or_else(|| unavailable(self.control.query_id))?;
+        let snapshot = ownership
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let snapshot = snapshot.as_ref().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Internal,
+                "QueryService execution scope lost snapshot ownership",
+            )
+            .with_query_id(self.control.query_id)
+            .with_retryable(false)
+        })?;
+        let snapshot = snapshot.as_any().downcast_ref::<T>().ok_or_else(|| {
+            invalid("query snapshot was not issued by the expected storage engine")
+                .with_query_id(self.control.query_id)
+        })?;
+        inspect(snapshot)
+    }
+
+    /// Admits resources before allowing a lease-bound physical task to escape the snapshot guard.
+    pub(crate) fn admit_snapshot_task<T, R>(
+        &self,
+        charge: QueryTaskCharge,
+        build: impl FnOnce(&T) -> Result<R>,
+    ) -> Result<QueryTaskPermit<R>>
+    where
+        T: Any + Send,
+        R: Send + 'static,
+    {
+        let owner = self.control.owner.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "QueryService coordinator is unavailable",
+            )
+            .with_query_id(self.control.query_id)
+        })?;
+        owner.admit_task(&self.control, charge)?;
+        let resource = match self.with_snapshot(build) {
+            Ok(resource) => resource,
+            Err(error) => {
+                owner.release_task(&self.control, charge);
+                return Err(error);
+            }
+        };
+        Ok(QueryTaskPermit {
+            owner: Arc::downgrade(&owner),
+            control: Arc::clone(&self.control),
+            ownership: self.ownership.as_ref().map(Arc::clone),
+            charge,
+            resource: Some(resource),
+        })
+    }
+
+    fn admit_task<R: Send + 'static>(
         &self,
         charge: QueryTaskCharge,
         resource: R,
@@ -809,12 +984,14 @@ pub(crate) struct QueryTaskPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryTaskPermit<R> {
+    #[cfg(test)]
     pub(crate) fn resource(&self) -> &R {
         self.resource
             .as_ref()
             .expect("live task permit retains its physical resource")
     }
 
+    #[cfg(test)]
     pub(crate) fn resource_mut(&mut self) -> &mut R {
         self.resource
             .as_mut()
@@ -865,10 +1042,9 @@ fn validate_plan_snapshot_binding(
             .iter()
             .zip(&info.snapshots)
             .any(|(actual, planned)| {
-                let selector = actual.catalog.selector();
-                selector.table_id != planned.table_id
-                    || selector.snapshot_version != planned.snapshot_version
-                    || selector.schema_version != planned.schema_version
+                actual.table_id != planned.table_id
+                    || actual.persisted_snapshot_version != planned.snapshot_version
+                    || actual.schema_version != planned.schema_version
             })
     {
         return Err(
@@ -930,6 +1106,10 @@ mod tests {
     impl QueryReadSnapshotGuard for TestSnapshot {
         fn descriptor(&self) -> &QueryReadSnapshotDescriptor {
             &self.descriptor
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
 
         fn renew(&mut self, _expires_at_ns: u64) -> BoxFuture<'_, Result<()>> {
@@ -1024,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_is_weak_and_plan_drop_releases_once() {
+    fn registry_retains_revocable_snapshot_root_and_plan_drop_releases_once() {
         let coordinator = QueryResourceCoordinator::new(config()).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
@@ -1040,7 +1220,8 @@ mod tests {
             .unwrap();
         {
             let state = coordinator.inner.state.lock().unwrap();
-            assert_eq!(state.registry[&id].strong_count(), 1);
+            assert_eq!(state.registry[&id].control.strong_count(), 1);
+            assert!(state.registry[&id].snapshot_root.is_some());
         }
         drop(token);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
@@ -1259,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn ttl_releases_logical_admission_without_forcing_token_owned_snapshot_drop() {
+    fn ttl_revokes_unexecuted_snapshot_even_when_plan_token_is_retained() {
         let coordinator = QueryResourceCoordinator::new(config()).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
@@ -1280,8 +1461,8 @@ mod tests {
             zippy_types::query::QueryState::TimedOut
         );
         assert_eq!(coordinator.status().active_logical_queries, 0);
-        assert_eq!(coordinator.status().active_snapshot_owners, 1);
-        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
         drop(token);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.sweep_expired(30), 0);
@@ -1328,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_of_planned_token_waits_for_exactly_once_snapshot_release() {
+    fn shutdown_revokes_planned_snapshot_without_waiting_for_token_drop() {
         let coordinator = QueryResourceCoordinator::new(config()).unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
@@ -1344,13 +1525,13 @@ mod tests {
             .unwrap();
 
         let draining = coordinator.begin_shutdown();
-        assert_eq!(draining.lifecycle, QueryServiceLifecycle::Draining);
+        assert_eq!(draining.lifecycle, QueryServiceLifecycle::Stopped);
         assert_eq!(draining.active_logical_queries, 0);
-        assert_eq!(draining.active_snapshot_owners, 1);
-        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(draining.active_snapshot_owners, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(
             coordinator.begin_shutdown().lifecycle,
-            QueryServiceLifecycle::Draining
+            QueryServiceLifecycle::Stopped
         );
         drop(token);
         assert_eq!(drops.load(Ordering::Relaxed), 1);

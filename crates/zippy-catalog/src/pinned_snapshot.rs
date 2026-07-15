@@ -10,6 +10,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use zippy_core::OwnedDataDirectory;
 use zippy_types::catalog::{CatalogQuerySnapshot, CatalogSnapshotSelector};
+use zippy_types::storage::{CatalogSnapshotPinDescriptor, CatalogSnapshotPinGuard};
 use zippy_types::table::{
     DataFileDescriptor, DataFileLocation, DataFileProvenance, DataFileState, MetadataMap,
     SchemaDescriptor, TableDescriptor, TableSnapshot,
@@ -36,6 +37,7 @@ pub struct SqliteCatalogPinnedQuerySnapshot {
 
 struct PinnedSnapshotOwner {
     snapshot: CatalogQuerySnapshot,
+    descriptor: CatalogSnapshotPinDescriptor,
     scan_file_indices: Vec<Box<[usize]>>,
     _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
     _data_directory: Arc<OwnedDataDirectory>,
@@ -47,6 +49,16 @@ impl SqliteCatalogPinnedQuerySnapshot {
         pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
         data_directory: Arc<OwnedDataDirectory>,
     ) -> Self {
+        debug_assert!(!pins.is_empty());
+        debug_assert_eq!(snapshot.tables().len(), pins.len());
+        let descriptor = CatalogSnapshotPinDescriptor {
+            catalog_revision: snapshot.catalog_revision(),
+            selectors: snapshot
+                .tables()
+                .iter()
+                .map(|table| table.selector().clone())
+                .collect(),
+        };
         let scan_file_indices = snapshot
             .tables()
             .iter()
@@ -74,6 +86,7 @@ impl SqliteCatalogPinnedQuerySnapshot {
         Self {
             owner: Arc::new(PinnedSnapshotOwner {
                 snapshot,
+                descriptor,
                 scan_file_indices,
                 _pins: pins,
                 _data_directory: data_directory,
@@ -85,6 +98,12 @@ impl SqliteCatalogPinnedQuerySnapshot {
     #[must_use]
     pub fn catalog_revision(&self) -> u64 {
         self.owner.snapshot.catalog_revision()
+    }
+
+    /// Borrows path-free audit data for this exact pinned Catalog snapshot.
+    #[must_use]
+    pub fn descriptor(&self) -> &CatalogSnapshotPinDescriptor {
+        &self.owner.descriptor
     }
 
     /// Returns the number of exact table manifests retained by this owner.
@@ -114,6 +133,16 @@ impl SqliteCatalogPinnedQuerySnapshot {
             owner: Arc::clone(&self.owner),
             table_index,
         })
+    }
+}
+
+impl CatalogSnapshotPinGuard for SqliteCatalogPinnedQuerySnapshot {
+    fn descriptor(&self) -> &CatalogSnapshotPinDescriptor {
+        self.descriptor()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
     }
 }
 

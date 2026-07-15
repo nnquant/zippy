@@ -47,13 +47,13 @@ delivery.
 | Typed catalog mutation | Rejected with `UNSUPPORTED_PLAN` |
 | Process/source/engine runtime status | Supported from the same legacy Registry critical section |
 | Subscription connection status | Supported for legacy reader attach/detach registrations |
-| Segment reader lease status | Not projected; these query/storage leases remain on their legacy owner path |
+| Segment reader lease status | Not projected; active-segment leases remain on their legacy owner path |
 | Query runtime status | Intentionally absent; `QueryEngine` is the sole authority |
 | Runtime restart recovery | Never restored; every master boot receives a new boot ID and empty records |
 | Runtime owner authorization | Not expressible by the current trait; trusted in-process callers only |
 | Legacy filter/projection collect | Supported through the bounded producer path |
 | SQL | Rejected with `UNSUPPORTED_PLAN` |
-| Snapshot query pinning | Rejected; no materialized fallback is allowed |
+| Snapshot query pinning | Rejected by the legacy query adapter; native persisted queries use the server-owned coordinator |
 | Head/tail/slice or residual operations | Rejected until a bounded implementation exists |
 | Per-query memory override and spill | Rejected when the legacy runtime cannot enforce it |
 
@@ -136,6 +136,15 @@ Query lifecycle is not copied into the runtime adapter. `QueryEngine` remains th
 for plan, execution, status, cancellation, TTL, and retention. Legacy subscription coverage is
 limited to reader attach/detach paths; the current legacy wire protocol has no general-purpose
 subscription connection registration message.
+
+Native storage does not extend `LegacyQueryEngineAdapter` with new lease semantics. Its
+`NativeQuerySnapshotCoordinator` resolves native actor-backed tables and legacy-shadow
+persisted-only tables, then acquires one all-or-nothing, query-attributed Catalog pin set. Safe plan
+descriptors contain version and source-identity audit data but no physical paths; file access stays
+behind the Catalog-issued pinned reader capability. Query TTL, cancellation, shutdown, and final
+physical-task release revoke that capability through the server-owned QueryService lifecycle.
+Active segment leases and the Gateway compatibility reader still use their existing paths until the
+later ingest/query and authority-switch phases.
 
 The composition root creates this runtime adapter with closed admission. `activate()` opens it only
 after legacy dependencies are ready, and `begin_shutdown()` closes it irreversibly under the same
@@ -236,7 +245,8 @@ belong to the SQLite catalog, manifest storage, and DataFusion phases.
 ## Removal path
 
 1. SQLite becomes the catalog read authority after importer and shadow-diff validation.
-2. Manifest storage provides exact schema/file snapshots and leases.
+2. Manifest storage provides exact schema/file snapshots and persisted-query leases; active-segment
+   leases follow in the native query/ingest path.
 3. DataFusion implements native plan version 1 and server-side SQL.
 4. The composition root switches trait objects to the new implementations.
 5. Runtime mutation receives an owner-capability contract before it becomes a remote API.

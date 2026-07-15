@@ -1,11 +1,12 @@
 //! Asynchronous Catalog traits backed by isolated SQLite writer and read workers.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use rusqlite::{Connection, TransactionBehavior};
@@ -26,7 +27,7 @@ use zippy_types::catalog::{
     VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError, TableId};
+use zippy_types::{BoxFuture, ErrorCode, QueryId, RequestId, Result, ServerError, TableId};
 
 use crate::SqliteCatalogConfig;
 use crate::{
@@ -107,6 +108,32 @@ pub struct SqliteCatalogReadHandle {
     endpoint: Arc<CatalogReadEndpoint>,
     runtime_snapshot_pins: Weak<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
     ownership: Weak<zippy_core::OwnedDataDirectory>,
+}
+
+/// Owner-issued control capability that irreversibly closes runtime snapshot-pin admission.
+///
+/// The capability holds only a weak reference, so retaining it cannot extend Catalog or data-root
+/// ownership. Shutdown orchestration closes this gate before sampling active pins, which prevents a
+/// read handle from inserting a new pin after the zero-pin drain decision.
+pub struct SqliteCatalogRuntimeSnapshotPinAdmissionControl {
+    runtime_snapshot_pins: Weak<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
+}
+
+impl SqliteCatalogRuntimeSnapshotPinAdmissionControl {
+    /// Irreversibly closes new query-pin and garbage-collection exclusion admission.
+    pub fn close_admission(&self) {
+        if let Some(runtime_snapshot_pins) = self.runtime_snapshot_pins.upgrade() {
+            runtime_snapshot_pins.close();
+        }
+    }
+}
+
+impl fmt::Debug for SqliteCatalogRuntimeSnapshotPinAdmissionControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SqliteCatalogRuntimeSnapshotPinAdmissionControl")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Cloneable lifecycle-bound submitter for trusted online legacy file-view reconciliation.
@@ -258,6 +285,16 @@ impl SqliteCatalog {
         })
     }
 
+    /// Issues the lifecycle control used to close runtime pin admission before Catalog shutdown.
+    #[must_use]
+    pub fn runtime_snapshot_pin_admission_control(
+        &self,
+    ) -> SqliteCatalogRuntimeSnapshotPinAdmissionControl {
+        SqliteCatalogRuntimeSnapshotPinAdmissionControl {
+            runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
+        }
+    }
+
     /// Creates a lifecycle-bound online legacy reconcile submitter.
     ///
     /// Creating this handle is an ordinary mutation boundary and permanently seals any unused V2
@@ -355,6 +392,12 @@ impl SqliteCatalog {
     #[must_use]
     pub fn runtime_snapshot_pin_status(&self) -> crate::SqliteCatalogRuntimeSnapshotPinStatus {
         self.runtime_snapshot_pins.status()
+    }
+
+    /// Returns a bounded snapshot of active query-attributed runtime pins.
+    #[must_use]
+    pub fn runtime_query_snapshot_pins(&self) -> Vec<crate::SqliteCatalogRuntimeSnapshotPinRecord> {
+        self.runtime_snapshot_pins.query_pin_records()
     }
 
     /// Excludes new runtime pins for one table and captures its current minimum pin.
@@ -723,11 +766,81 @@ impl SqliteCatalogReadHandle {
             .map(|registry| registry.status())
     }
 
+    /// Returns active query-attributed runtime pins for diagnostics and shutdown barriers.
+    pub fn runtime_query_snapshot_pins(
+        &self,
+    ) -> Result<Vec<crate::SqliteCatalogRuntimeSnapshotPinRecord>> {
+        self.runtime_snapshot_pin_registry()
+            .map(|registry| registry.query_pin_records())
+    }
+
+    /// Atomically admits query-attributed pins before reading exact Catalog metadata.
+    ///
+    /// Requests must be nonempty, in strict table-ID order, and use unique lease identities. If
+    /// any pin or the Catalog read fails, every pin acquired by this call is released before
+    /// returning.
+    pub async fn read_pinned_query_snapshot_at(
+        &self,
+        query_id: QueryId,
+        requests: &[crate::SqliteCatalogQuerySnapshotPinRequest],
+    ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
+        if requests.is_empty() {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "query-attributed pinned snapshot requires at least one table",
+            )
+            .with_query_id(query_id)
+            .with_retryable(false));
+        }
+        let selectors = requests
+            .iter()
+            .map(|request| request.selector.clone())
+            .collect::<Vec<_>>();
+        snapshot_domain::validate_snapshot_selectors(&selectors)?;
+        let mut lease_ids = HashSet::with_capacity(requests.len());
+        if let Some(duplicate) = requests
+            .iter()
+            .find(|request| !lease_ids.insert(request.lease_id))
+        {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "query snapshot pin requests contain a duplicate lease identity",
+            )
+            .with_query_id(query_id)
+            .with_table_id(duplicate.selector.table_id)
+            .with_retryable(false));
+        }
+        let acquired_at_ns = unix_time_ns()?;
+        let ownership = self.ownership.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "sqlite catalog data-directory ownership is no longer available",
+            )
+            .with_retryable(false)
+        })?;
+        let runtime_snapshot_pins = self.runtime_snapshot_pin_registry()?;
+        let mut pins = Vec::with_capacity(requests.len());
+        for request in requests {
+            pins.push(runtime_snapshot_pins.pin_query(
+                query_id,
+                request.lease_id,
+                request.selector.table_id,
+                request.selector.snapshot_version,
+                acquired_at_ns,
+            )?);
+        }
+        let snapshot = self.read_snapshot_at(&selectors).await?;
+        Ok(crate::SqliteCatalogPinnedQuerySnapshot::new(
+            snapshot, pins, ownership,
+        ))
+    }
+
     /// Reads exact metadata only after pinning every selected table against physical GC.
     ///
-    /// Pin admission precedes the Catalog read. If any table is currently excluded by a GC claim,
-    /// or if the read fails, all pins already acquired by this call are released before the error
-    /// is returned. The successful result must remain alive through physical file execution.
+    /// Selectors must be nonempty. Pin admission precedes the Catalog read. If any table is
+    /// currently excluded by a GC claim, or if the read fails, all pins already acquired by this
+    /// call are released before the error is returned. The successful result must remain alive
+    /// through physical file execution.
     pub async fn read_pinned_snapshot_at(
         &self,
         selectors: &[CatalogSnapshotSelector],
@@ -745,6 +858,13 @@ impl SqliteCatalogReadHandle {
         selectors: &[CatalogSnapshotSelector],
         limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
     ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
+        if selectors.is_empty() {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "pinned snapshot requires at least one table",
+            )
+            .with_retryable(false));
+        }
         snapshot_domain::validate_snapshot_selectors(selectors)?;
         let limits = limits.validate()?;
         let ownership = self.ownership.upgrade().ok_or_else(|| {
@@ -2898,6 +3018,25 @@ async fn await_response<T>(response: Result<oneshot::Receiver<Result<T>>>) -> Re
     response?.await.map_err(|_| actor_stopped())?
 }
 
+fn unix_time_ns() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            ServerError::new(
+                ErrorCode::Internal,
+                format!("system clock is before Unix epoch error=[{error}]"),
+            )
+            .with_retryable(false)
+        })?;
+    u64::try_from(duration.as_nanos()).map_err(|_| {
+        ServerError::new(
+            ErrorCode::Internal,
+            "system clock Unix nanoseconds exceed u64",
+        )
+        .with_retryable(false)
+    })
+}
+
 fn actor_stopped() -> ServerError {
     ServerError::new(
         ErrorCode::Unavailable,
@@ -4900,6 +5039,60 @@ mod tests {
             .expect("claim after final pinned reader drops");
         assert_eq!(claimed.files.len(), 1);
         assert_eq!(claimed.files[0].file_id(), FileId::from_u128(10).unwrap());
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attributed_multi_table_read_failure_rolls_back_all_runtime_pins() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog =
+            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(41).expect("nonzero query id");
+        let empty_attributed = handle
+            .read_pinned_query_snapshot_at(query_id, &[])
+            .await
+            .expect_err("empty attributed pin must not retain uncounted ownership");
+        assert_eq!(empty_attributed.code(), ErrorCode::InvalidArgument);
+        let empty_generic = handle
+            .read_pinned_snapshot_at(&[])
+            .await
+            .expect_err("empty generic pin must not retain uncounted ownership");
+        assert_eq!(empty_generic.code(), ErrorCode::InvalidArgument);
+        let requests = vec![
+            crate::SqliteCatalogQuerySnapshotPinRequest {
+                selector: CatalogSnapshotSelector {
+                    table_id: table_id(),
+                    snapshot_version: 1,
+                    schema_version: 1,
+                },
+                lease_id: zippy_types::LeaseId::from_u128(42).expect("nonzero lease id"),
+            },
+            crate::SqliteCatalogQuerySnapshotPinRequest {
+                selector: CatalogSnapshotSelector {
+                    table_id: TableId::from_u128(3).expect("nonzero missing table id"),
+                    snapshot_version: 1,
+                    schema_version: 1,
+                },
+                lease_id: zippy_types::LeaseId::from_u128(43).expect("nonzero lease id"),
+            },
+        ];
+        let error = handle
+            .read_pinned_query_snapshot_at(query_id, &requests)
+            .await
+            .expect_err("missing second table must fail the exact read");
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        let status = handle
+            .runtime_snapshot_pin_status()
+            .expect("read pin status after rollback");
+        assert_eq!(status.active_pins, 0);
+        assert_eq!(status.active_query_pins, 0);
+        assert!(handle
+            .runtime_query_snapshot_pins()
+            .expect("read query pin audit records")
+            .is_empty());
         catalog.close().expect("close catalog");
     }
 

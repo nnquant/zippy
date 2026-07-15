@@ -2,7 +2,7 @@
 
 日期：2026-07-13
 
-状态：实施中（Phase 0/1 已完成，Phase 2 P2.2 与 Phase 3 基础设施进行中）
+状态：实施中（Phase 0/1 已完成，Phase 2 P2.2 与 Phase 3 持久化查询租约基础设施进行中）
 
 适用范围：Zippy 单机部署模式。本文不设计集群、Raft、多副本、跨节点查询和分布式事务。
 
@@ -1847,9 +1847,10 @@ V2 `discovery_order` 表示旧 Gateway 对 persisted files 应用
 `(writer_epoch, source_segment_id, source_generation, created_at, file_path)` 后的零基稳定扫描位置，
 不是 Registry vector index。Registry index 只保留为迁移审计信息；Server planner 必须在任何文件
 读取前完成全 snapshot 路径去重和单表文件数准入，避免部分表先提交后才发现后续表不可导入。
-raw snapshot 仍按 `file_id` 排序；只有 pinned scan view 根据 discovery ordinal 调度读取。Step 3 需要
-把 QueryService 接到生命周期绑定的 snapshot pin/lease capability API，并关闭直接持有 raw path DTO
-或绕过 pin owner 打开文件的权威侧入口。
+raw snapshot 仍按 `file_id` 排序；只有 pinned scan view 根据 discovery ordinal 调度读取。Step 3 已将
+QueryService 接到生命周期绑定的 persisted snapshot pin/lease capability API，并关闭 native query
+descriptor 直接携带 raw path DTO 的入口。Gateway compatibility authority 仍能沿旧路径持有路径 DTO，
+必须在后续 authority 切换中改为使用同一 pinned reader capability，不能绕过 pin owner 打开文件。
 
 任务：
 
@@ -1905,9 +1906,10 @@ fd 逐级 `openat(O_NOFOLLOW)`；ExternalLegacy 逐组件拒绝 symlink，并复
 checksum、Parquet footer、精确 Schema、row count 及读取前后 descriptor identity。缺失、symlink
 替换、身份变化或内容损坏均 fail closed；该完整检查在每次 native startup 执行，包括 migration
 request-ID 已 replay、未重复扫描导入文件的启动。
-该 gate 不声明历史 snapshot 可用，native historical query admission 仍关闭，历史文件深度审计属于
-maintenance。snapshot lease、logical drop、safe GC 和权威 Gateway 写入口
-接线尚未完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
+该 gate 不声明任意历史 snapshot 可用；native query 只允许固定本次规划选择的 current persisted
+snapshot，历史文件深度审计属于 maintenance。普通查询的进程内 snapshot pin、min pinned snapshot
+和 safe-GC 排除已接线；logical drop、跨进程长 lease、active segment lease 和权威 Gateway 写入口仍未
+完成，因此 legacy metadata 仍是 server authority，不能把本段基础设施视为 Phase 3 验收完成。显式设置
 `[server].native_storage_enabled = true`（或 `ZIPPY_SERVER_NATIVE_STORAGE=true`）后，
 `NativeStorageRuntime` 会在任何 listener 绑定前依次执行 Catalog open、pre-replay reconciliation、
 durable intent replay、post-replay reconciliation 和 Catalog-to-physical current-snapshot verification；
@@ -1948,8 +1950,35 @@ authority。daemon 已每 50 ms 检查动态 readiness，并以共享 latch 保�
 原子迁移为带稳定 ErrorCode 的 failed，再关闭 server admission、执行有界清理并非零退出；cleanup 错误
 或超时只作为附加诊断，不覆盖首因。正常信号清理前迁移为 stopping，清理中 status 不再从旧 ready
 记录报告 healthy。detached outcome 同样保留稳定 ErrorCode，不再统一降级为 runtime_error。
-但由于 Gateway authority、snapshot lease 和普通历史文件 safe GC 仍未完成，legacy Gateway 仍是业务写 authority，不能据此
-宣称 native ingest 已对外可用。
+但由于 Gateway authority、logical drop 和 active segment lease 仍未完成，legacy Gateway 仍是业务写
+authority，不能据此宣称 native ingest 已对外可用。
+
+当前 query snapshot 接线进展（2026-07-15）：`NativeQuerySnapshotCoordinator` 是
+`NativeStorageRuntime` 持有的单实例能力，不由每个调用方临时创建。它先按稳定 `TableId` 去重排序，
+再让有 actor 的 native 表在串行写入边界观察 `writer_epoch`、persisted snapshot version 与 committed
+offset；没有 actor 的 legacy shadow persisted-only 表直接选择 Catalog current snapshot。所有表随后在
+同一个 query-attributed Catalog read 中全有或全无地 pin，冲突进行有界重试，任一解析、预算或读取失败
+都通过 RAII 回滚全部 pin。Pinned storage snapshot 至少包含一张物理表；常量等无表查询后续使用不持有
+data-root capability 的独立计划类型，避免出现未计入 `active_pins` 的空 owner。
+
+每个 pin 记录 `query_id`、唯一 `lease_id`、table、snapshot version 和取得时间，供状态与故障审计；
+普通短查询只保存在进程内 registry，不对 SQLite 热路径逐条写 lease。对上暴露的
+`TableReadSnapshotDescriptor` 只有 table/schema/snapshot/writer/offset 与 segment identity 审计字段，
+不包含文件路径；执行器只能从不可伪造、绑定 Catalog instance 的 pinned reader capability 打开文件。
+QueryService 在复制 task capability 前先预留 query/task/CPU/memory 预算，并用 storage origin nonce 拒绝
+其他 runtime 伪造或复用 guard。物理 task admission 只接受 server 内部选择的 table index，不把任意
+capability callback 暴露给执行器；生产构建中的 task permit 也不提供 resource 提取接口，因此 capability
+不能通过 clone 或回调副作用逃出 permit 生命周期。
+
+Query registry 持有一个可撤销 snapshot root：未执行计划到 TTL、计划 drop、cancel、timeout 或 shutdown
+都会恰好一次撤销 pin，即使调用方仍泄漏 plan token；已经运行的 physical task 则保留 pin 到最后一个
+task permit 释放。Native storage shutdown 先关闭 snapshot coordinator、Catalog 通用 runtime-pin gate
+和 table admission；Catalog gate 的关闭会等待所有并发 pin admission 越过线性化点，随后再等待 in-flight
+snapshot planning、QueryService 和 Catalog runtime pins 都归零，最后才通知 storage supervisor 关闭
+Catalog 与 data-root capability。即使调用方保留了 shutdown 前克隆的 raw Catalog read handle，也不能在
+零 pin 检查后插入新 pin。该阶段
+只完成 persisted files 的生命周期绑定；active/sealed segment guard、DataFusion operator 取消传播以及
+Gateway compatibility reader 的能力化仍分别属于后续 query、ingest 和 authority 切换工作。
 
 任务：
 
@@ -1960,7 +1989,8 @@ authority。daemon 已每 50 ms 检查动态 readiness，并以共享 latch 保�
 5. Query snapshot 从 Catalog 读取 typed files。
 6. 实现 added/removed snapshot visibility。
 7. 实现 persisted/live source segment identity dedup。
-8. 实现 snapshot lease 和 min pinned snapshot。
+8. 实现 snapshot lease 和 min pinned snapshot。普通进程内 persisted query pin 已完成；跨进程长 lease
+   与 active segment lease 待后续阶段。
 9. 实现 orphan scanner、verify 和 safe GC。
 10. 将 drop table 改为 logical drop + asynchronous physical GC。
 

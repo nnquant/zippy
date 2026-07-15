@@ -33,10 +33,13 @@ pub use pinned_snapshot::{
     PinnedDataFile, PinnedDataFileLocationKind, PinnedDataFileReader, PinnedTableManifest,
     SqliteCatalogPinnedQuerySnapshot,
 };
-pub use runtime_pins::{SqliteCatalogRuntimeSnapshotPin, SqliteCatalogRuntimeSnapshotPinStatus};
+pub use runtime_pins::{
+    SqliteCatalogQuerySnapshotPinRequest, SqliteCatalogRuntimeSnapshotPin,
+    SqliteCatalogRuntimeSnapshotPinRecord, SqliteCatalogRuntimeSnapshotPinStatus,
+};
 pub use service::{
     SqliteCatalog, SqliteCatalogLegacyImportSession, SqliteCatalogLegacyReconcileHandle,
-    SqliteCatalogReadHandle,
+    SqliteCatalogReadHandle, SqliteCatalogRuntimeSnapshotPinAdmissionControl,
 };
 pub use snapshot_domain::SqliteCatalogSnapshotReadLimits;
 pub use storage_codec::{

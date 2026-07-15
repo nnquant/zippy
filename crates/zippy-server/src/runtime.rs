@@ -1677,6 +1677,27 @@ fn start_native_storage_if_enabled(
             .min(MAX_PERSIST_PARALLEL_WRITERS),
     );
     let runtime_snapshot_pins = runtime_config.catalog.runtime_snapshot_pins;
+    let query_parallelism = runtime_config.query_parallelism();
+    let query_resources = crate::query_service::QueryServiceResourceConfig {
+        max_active_queries: runtime_snapshot_pins.max_active_pins.clamp(1, 64),
+        max_active_tasks: query_parallelism.saturating_mul(4).max(1),
+        max_cpu_slots: u32::try_from(query_parallelism).map_err(|_| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "configured query parallelism exceeds u32",
+            )
+            .with_retryable(false)
+        })?,
+        max_memory_bytes: u64::try_from(runtime_config.runtime.max_query_buffer_bytes).map_err(
+            |_| {
+                ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "configured query buffer byte budget exceeds u64",
+                )
+                .with_retryable(false)
+            },
+        )?,
+    };
     let catalog = SqliteCatalogConfig::new(data_directory).with_runtime_snapshot_pin_limits(
         runtime_snapshot_pins.max_active_pins,
         runtime_snapshot_pins.max_active_tables,
@@ -1684,6 +1705,7 @@ fn start_native_storage_if_enabled(
     let native_storage = NativeStorageRuntimeConfig::new(data_directory)
         .with_catalog_config(catalog)?
         .with_persist_controller_config(persist_controller)
+        .with_query_resource_config(query_resources)
         .with_legacy_catalog_migration(legacy_catalog_migration);
     match NativeStorageRuntime::start_until(native_storage, startup_deadline) {
         NativeStorageStartOutcome::Ready(runtime) => Ok(Some(runtime)),
