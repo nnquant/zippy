@@ -2067,10 +2067,31 @@ native `QueryRuntimeStatus` 分开记录可信 `submitted_at_ns`、可选 `plan:
 `*_at`/planned-registration helper 只在 `cfg(test)` 存在，用于确定性 deadline 和保持旧 Planned+ 单测；
 生产调用方只能走 submit-first 流程。
 
-这一小步仍是 native staging，不是 authority 切换。session 资源账本、完整外部 `QueryStatus`、
+Stage 4.4 资源账本小步已完成（2026-07-15）：`CoordinatorState` 在同一把 global 锁内维护只包含
+非空项的 session usage ledger，按 session 汇总 logical query、physical task、CPU slot、task memory、
+result permit 和 result memory；没有增加第二把 session 锁，也不会让 session 状态与全局 admission 发生
+时间差。查询、session 和全局三层把 task/result memory 计入同一个硬上限，状态同时保留分项和总量。
+当前不配置 per-session quota：owner capability 仍由 crate 内调用方按裸 `SessionId` 创建，在 Gateway
+建立可信 connection/session authority 前加配额只会形成伪隔离。
+
+Task admission 现在先生成不可提取的 RAII reservation，再执行 snapshot-bound resource builder；builder
+返回错误或 unwind 都会归还 query/session/global 的 task、CPU 和 memory 计数。内部
+`QueryResultPermit` 同样用 RAII 计量结果缓冲，并且 admission 失败会正常析构调用方传入的结果对象。
+每查询和全局 result permit 数量还分别受现有 active-task 上限约束，不能通过大量一字节 charge 先耗尽
+permit/control 元数据。`QueryTaskPermit::into_result` 在同一个 `global -> query` 临界区释放 task/CPU
+charge 并取得 result charge，使已经占满预算的 operator 可以把同一批内存无缝交给 delivery，而不需要
+双重计费或制造未计费窗口。payload、result 或 snapshot 析构 unwind 时，独立 scope guard 仍会归还
+reservation 和 snapshot-owner 计数。
+
+`Finished` 只允许在 task 和 result permit 都归零后进入；计算或传输错误、cancel、timeout 和 shutdown
+形成的 terminal query 在最后一个 task 离开后立即撤销 snapshot root，但只有 task 和 result permit 都
+归零后才进入 retention/eviction heap。shutdown 也会等待 result permit，因而不会把仍被发送的缓冲误报
+为已 drain。公开 `RecordBatchStream` 目前仍直接返回裸 `RecordBatch`，所以 result permit 只是后续
+native stream/Flight delivery 的内部原语，尚不能覆盖客户端取得 batch 后的长期持有。
+
+这一小步仍是 native staging，不是 authority 切换。可信 session policy、完整外部 `QueryStatus`、
 DataFusion operator/result-stream 的实际取消传播仍未完成；当前 Python/Gateway `collect_stream` 也仍绕过
-native QueryService，且没有可信的 per-connection owner session，因此不能据此宣称生产查询已经获得
-多租户隔离或统一资源治理。
+native QueryService，因此不能据此宣称生产查询已经获得多租户隔离或统一资源治理。
 
 任务：
 

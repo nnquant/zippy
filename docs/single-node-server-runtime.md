@@ -121,7 +121,14 @@ hard semaphore shared by every independent thread pool. The legacy `runtime.max_
 configured separately under `[query.resources]`: 64 concurrent logical queries and 512 MiB task
 memory by default. When omitted, active tasks resolve to four times the effective per-query
 parallelism (16 under default CPU settings). Its memory budget is independent from the Gateway-wide
-`runtime.max_query_buffer_bytes` Arrow buffer pool.
+`runtime.max_query_buffer_bytes` Arrow buffer pool. Inside the staged native QueryService, physical
+task and result-delivery reservations now share this one memory ceiling and are aggregated by
+session, query, and process. Session entries disappear when their logical, task, and result usage all
+reach zero. In-flight result permits reuse the configured active-task count as a hard query/process
+count ceiling, and task-to-result handoff reclassifies charges atomically. A query cannot enter
+`Finished` until result delivery reservations are gone. This is usage accounting only; per-session
+quotas wait for a trusted connection/session authority. The native result permit is not yet attached
+to the public `RecordBatchStream`, so this does not make the native query frontend production-ready.
 
 ## Managed data root ownership
 

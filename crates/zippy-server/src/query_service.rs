@@ -150,6 +150,11 @@ pub(crate) struct QueryTaskCharge {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryResultCharge {
+    pub memory_bytes: NonZeroU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryServiceLifecycle {
     Accepting,
     Draining,
@@ -160,9 +165,13 @@ pub(crate) enum QueryServiceLifecycle {
 pub(crate) struct QueryServiceStatus {
     pub lifecycle: QueryServiceLifecycle,
     pub registered_queries: usize,
+    pub tracked_sessions: usize,
     pub active_logical_queries: usize,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
+    pub active_task_memory_bytes: u64,
+    pub active_result_permits: usize,
+    pub active_result_memory_bytes: u64,
     pub active_memory_bytes: u64,
     pub active_snapshot_owners: usize,
     pub query_tombstones: usize,
@@ -192,10 +201,25 @@ pub(crate) struct QueryRuntimeStatus {
     pub logical_admitted: bool,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
+    pub active_task_memory_bytes: u64,
+    pub active_result_permits: usize,
+    pub active_result_memory_bytes: u64,
     pub active_memory_bytes: u64,
     pub cancellation_requested: bool,
     pub finished_at_ns: Option<u64>,
     pub error: Option<ServerError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuerySessionResourceStatus {
+    pub session_id: SessionId,
+    pub active_logical_queries: usize,
+    pub active_tasks: usize,
+    pub active_cpu_slots: u32,
+    pub active_task_memory_bytes: u64,
+    pub active_result_permits: usize,
+    pub active_result_memory_bytes: u64,
+    pub active_memory_bytes: u64,
 }
 
 impl QueryRuntimeStatus {
@@ -375,6 +399,11 @@ impl QueryResourceCoordinator {
                 query_id,
             )?;
             state.active_logical_queries += 1;
+            state
+                .sessions
+                .entry(owner.session_id)
+                .or_default()
+                .active_logical_queries += 1;
             state.registry.insert_planning(
                 query_id,
                 RegistryEntry {
@@ -552,6 +581,14 @@ impl QueryResourceCoordinator {
         self.inner.query_status(&control)
     }
 
+    pub(crate) fn session_status_owned(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+    ) -> Result<QuerySessionResourceStatus> {
+        let owner = self.validate_owner(owner)?;
+        Ok(self.inner.session_status(owner.session_id))
+    }
+
     #[cfg(test)]
     pub(crate) fn submit_at_for_test(
         &self,
@@ -680,6 +717,10 @@ impl QueryAdminHandle {
         let control = self.coordinator.inner.control_instance(instance_id)?;
         self.coordinator.inner.query_status(&control)
     }
+
+    pub(crate) fn session_status(&self, session_id: SessionId) -> QuerySessionResourceStatus {
+        self.coordinator.inner.session_status(session_id)
+    }
 }
 
 struct QueryServiceSweeper {
@@ -806,11 +847,51 @@ struct CoordinatorInner {
 struct CoordinatorState {
     lifecycle: QueryServiceLifecycle,
     registry: QueryRegistry,
+    sessions: HashMap<SessionId, SessionResourceUsage>,
     active_logical_queries: usize,
     active_tasks: usize,
     active_cpu_slots: u32,
-    active_memory_bytes: u64,
+    active_task_memory_bytes: u64,
+    active_result_permits: usize,
+    active_result_memory_bytes: u64,
     active_snapshot_owners: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SessionResourceUsage {
+    active_logical_queries: usize,
+    active_tasks: usize,
+    active_cpu_slots: u32,
+    active_task_memory_bytes: u64,
+    active_result_permits: usize,
+    active_result_memory_bytes: u64,
+}
+
+impl SessionResourceUsage {
+    fn is_idle(self) -> bool {
+        self.active_logical_queries == 0
+            && self.active_tasks == 0
+            && self.active_cpu_slots == 0
+            && self.active_task_memory_bytes == 0
+            && self.active_result_permits == 0
+            && self.active_result_memory_bytes == 0
+    }
+
+    fn status(self, session_id: SessionId) -> QuerySessionResourceStatus {
+        QuerySessionResourceStatus {
+            session_id,
+            active_logical_queries: self.active_logical_queries,
+            active_tasks: self.active_tasks,
+            active_cpu_slots: self.active_cpu_slots,
+            active_task_memory_bytes: self.active_task_memory_bytes,
+            active_result_permits: self.active_result_permits,
+            active_result_memory_bytes: self.active_result_memory_bytes,
+            active_memory_bytes: self
+                .active_task_memory_bytes
+                .checked_add(self.active_result_memory_bytes)
+                .expect("session query memory accounting remains within global budget"),
+        }
+    }
 }
 
 struct RegistryEntry {
@@ -1117,10 +1198,13 @@ impl Default for CoordinatorState {
         Self {
             lifecycle: QueryServiceLifecycle::Accepting,
             registry: QueryRegistry::default(),
+            sessions: HashMap::new(),
             active_logical_queries: 0,
             active_tasks: 0,
             active_cpu_slots: 0,
-            active_memory_bytes: 0,
+            active_task_memory_bytes: 0,
+            active_result_permits: 0,
+            active_result_memory_bytes: 0,
             active_snapshot_owners: 0,
         }
     }
@@ -1139,20 +1223,47 @@ impl CoordinatorState {
         if self.lifecycle == QueryServiceLifecycle::Draining
             && self.active_logical_queries == 0
             && self.active_tasks == 0
+            && self.active_result_permits == 0
             && self.active_snapshot_owners == 0
         {
             self.lifecycle = QueryServiceLifecycle::Stopped;
         }
     }
 
+    fn session_status(&self, session_id: SessionId) -> QuerySessionResourceStatus {
+        self.sessions
+            .get(&session_id)
+            .copied()
+            .unwrap_or_default()
+            .status(session_id)
+    }
+
+    fn remove_idle_session(&mut self, session_id: SessionId) {
+        if self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|usage| usage.is_idle())
+        {
+            self.sessions.remove(&session_id);
+        }
+    }
+
     fn status(&self) -> QueryServiceStatus {
+        let active_memory_bytes = self
+            .active_task_memory_bytes
+            .checked_add(self.active_result_memory_bytes)
+            .expect("global query memory accounting remains within configured budget");
         QueryServiceStatus {
             lifecycle: self.lifecycle,
             registered_queries: self.registry.len(),
+            tracked_sessions: self.sessions.len(),
             active_logical_queries: self.active_logical_queries,
             active_tasks: self.active_tasks,
             active_cpu_slots: self.active_cpu_slots,
-            active_memory_bytes: self.active_memory_bytes,
+            active_task_memory_bytes: self.active_task_memory_bytes,
+            active_result_permits: self.active_result_permits,
+            active_result_memory_bytes: self.active_result_memory_bytes,
+            active_memory_bytes,
             active_snapshot_owners: self.active_snapshot_owners,
             query_tombstones: self.registry.tombstones.len(),
             scheduled_deadlines: self.registry.deadline_order.len(),
@@ -1452,7 +1563,11 @@ impl CoordinatorInner {
         Ok(())
     }
 
-    fn admit_task(&self, control: &Arc<QueryControl>, charge: QueryTaskCharge) -> Result<()> {
+    fn reserve_task(
+        self: &Arc<Self>,
+        control: &Arc<QueryControl>,
+        charge: QueryTaskCharge,
+    ) -> Result<QueryTaskReservation> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
         if query.state.is_terminal() {
@@ -1474,7 +1589,9 @@ impl CoordinatorInner {
         let cpu_slots = charge.cpu_slots.get();
         let memory_bytes = charge.memory_bytes.get();
         let query_cpu_after = query.active_cpu_slots.checked_add(cpu_slots);
-        let query_memory_after = query.active_memory_bytes.checked_add(memory_bytes);
+        let query_task_memory_after = query.active_task_memory_bytes.checked_add(memory_bytes);
+        let query_memory_after = query_task_memory_after
+            .and_then(|task_memory| task_memory.checked_add(query.active_result_memory_bytes));
         if query.active_tasks >= control.budget.max_active_tasks
             || query_cpu_after.is_none_or(|value| value > control.budget.max_cpu_slots)
             || query_memory_after.is_none_or(|value| value > control.budget.max_memory_bytes)
@@ -1485,7 +1602,9 @@ impl CoordinatorInner {
             ));
         }
         let global_cpu_after = global.active_cpu_slots.checked_add(cpu_slots);
-        let global_memory_after = global.active_memory_bytes.checked_add(memory_bytes);
+        let global_task_memory_after = global.active_task_memory_bytes.checked_add(memory_bytes);
+        let global_memory_after = global_task_memory_after
+            .and_then(|task_memory| task_memory.checked_add(global.active_result_memory_bytes));
         if global.active_tasks >= self.config.max_active_tasks
             || global_cpu_after.is_none_or(|value| value > self.config.max_cpu_slots)
             || global_memory_after.is_none_or(|value| value > self.config.max_memory_bytes)
@@ -1498,12 +1617,30 @@ impl CoordinatorInner {
 
         query.active_tasks += 1;
         query.active_cpu_slots = query_cpu_after.expect("validated per-query CPU addition");
-        query.active_memory_bytes =
-            query_memory_after.expect("validated per-query memory addition");
+        query.active_task_memory_bytes =
+            query_task_memory_after.expect("validated per-query task memory addition");
         global.active_tasks += 1;
         global.active_cpu_slots = global_cpu_after.expect("validated global CPU addition");
-        global.active_memory_bytes = global_memory_after.expect("validated global memory addition");
-        Ok(())
+        global.active_task_memory_bytes =
+            global_task_memory_after.expect("validated global task memory addition");
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("admitted query retains its session resource ledger");
+        session.active_tasks += 1;
+        session.active_cpu_slots = session
+            .active_cpu_slots
+            .checked_add(cpu_slots)
+            .expect("session CPU accounting remains within global budget");
+        session.active_task_memory_bytes = session
+            .active_task_memory_bytes
+            .checked_add(memory_bytes)
+            .expect("session task memory accounting remains within global budget");
+        Ok(QueryTaskReservation {
+            owner: Arc::downgrade(self),
+            control: Arc::clone(control),
+            charge: Some(charge),
+        })
     }
 
     fn release_task(&self, control: &Arc<QueryControl>, charge: QueryTaskCharge) {
@@ -1514,11 +1651,220 @@ impl CoordinatorInner {
         debug_assert!(query.active_tasks > 0 && global.active_tasks > 0);
         query.active_tasks -= 1;
         query.active_cpu_slots -= cpu_slots;
-        query.active_memory_bytes -= memory_bytes;
+        query.active_task_memory_bytes -= memory_bytes;
         global.active_tasks -= 1;
         global.active_cpu_slots -= cpu_slots;
-        global.active_memory_bytes -= memory_bytes;
+        global.active_task_memory_bytes -= memory_bytes;
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active task retains its session resource ledger");
+        debug_assert!(session.active_tasks > 0);
+        session.active_tasks -= 1;
+        session.active_cpu_slots -= cpu_slots;
+        session.active_task_memory_bytes -= memory_bytes;
         let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+        global.remove_idle_session(control.owner_session_id);
+        global.refresh_shutdown();
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
+    }
+
+    fn reserve_result(
+        self: &Arc<Self>,
+        control: &Arc<QueryControl>,
+        charge: QueryResultCharge,
+    ) -> Result<QueryResultReservation> {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Running {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not running")
+                    .with_query_id(control.query_id),
+            );
+        }
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(control.query_id));
+        }
+
+        let memory_bytes = charge.memory_bytes.get();
+        let query_result_memory_after = query.active_result_memory_bytes.checked_add(memory_bytes);
+        let query_memory_after = query_result_memory_after
+            .and_then(|result_memory| result_memory.checked_add(query.active_task_memory_bytes));
+        let query_permits_after = query.active_result_permits.checked_add(1);
+        if query.active_result_permits >= control.budget.max_active_tasks
+            || query_permits_after.is_none()
+            || query_memory_after.is_none_or(|value| value > control.budget.max_memory_bytes)
+        {
+            return Err(exhausted(
+                control.query_id,
+                "per-query result resources are exhausted",
+            ));
+        }
+        let global_result_memory_after =
+            global.active_result_memory_bytes.checked_add(memory_bytes);
+        let global_memory_after = global_result_memory_after
+            .and_then(|result_memory| result_memory.checked_add(global.active_task_memory_bytes));
+        let global_permits_after = global.active_result_permits.checked_add(1);
+        if global.active_result_permits >= self.config.max_active_tasks
+            || global_permits_after.is_none()
+            || global_memory_after.is_none_or(|value| value > self.config.max_memory_bytes)
+        {
+            return Err(exhausted(
+                control.query_id,
+                "global result resources are exhausted",
+            ));
+        }
+
+        query.active_result_permits = query_permits_after.expect("validated result permit count");
+        query.active_result_memory_bytes =
+            query_result_memory_after.expect("validated per-query result memory addition");
+        global.active_result_permits =
+            global_permits_after.expect("validated global result permit count");
+        global.active_result_memory_bytes =
+            global_result_memory_after.expect("validated global result memory addition");
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("admitted query retains its session resource ledger");
+        session.active_result_permits += 1;
+        session.active_result_memory_bytes = session
+            .active_result_memory_bytes
+            .checked_add(memory_bytes)
+            .expect("session result memory accounting remains within global budget");
+        Ok(QueryResultReservation {
+            owner: Arc::downgrade(self),
+            control: Arc::clone(control),
+            charge: Some(charge),
+        })
+    }
+
+    fn transfer_task_to_result(
+        self: &Arc<Self>,
+        control: &Arc<QueryControl>,
+        task_charge: QueryTaskCharge,
+        result_charge: QueryResultCharge,
+    ) -> Result<QueryResultReservation> {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Running {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not running")
+                    .with_query_id(control.query_id),
+            );
+        }
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(control.query_id));
+        }
+
+        let cpu_slots = task_charge.cpu_slots.get();
+        let task_memory_bytes = task_charge.memory_bytes.get();
+        let result_memory_bytes = result_charge.memory_bytes.get();
+        debug_assert!(query.active_tasks > 0 && global.active_tasks > 0);
+        let query_task_memory_after = query
+            .active_task_memory_bytes
+            .checked_sub(task_memory_bytes)
+            .expect("task reservation owns its per-query memory charge");
+        let query_result_memory_after = query
+            .active_result_memory_bytes
+            .checked_add(result_memory_bytes);
+        let query_memory_after = query_result_memory_after
+            .and_then(|result_memory| result_memory.checked_add(query_task_memory_after));
+        let query_permits_after = query.active_result_permits.checked_add(1);
+        if query.active_result_permits >= control.budget.max_active_tasks
+            || query_permits_after.is_none()
+            || query_memory_after.is_none_or(|value| value > control.budget.max_memory_bytes)
+        {
+            return Err(exhausted(
+                control.query_id,
+                "per-query task-to-result transfer is exhausted",
+            ));
+        }
+
+        let global_task_memory_after = global
+            .active_task_memory_bytes
+            .checked_sub(task_memory_bytes)
+            .expect("task reservation owns its global memory charge");
+        let global_result_memory_after = global
+            .active_result_memory_bytes
+            .checked_add(result_memory_bytes);
+        let global_memory_after = global_result_memory_after
+            .and_then(|result_memory| result_memory.checked_add(global_task_memory_after));
+        let global_permits_after = global.active_result_permits.checked_add(1);
+        if global.active_result_permits >= self.config.max_active_tasks
+            || global_permits_after.is_none()
+            || global_memory_after.is_none_or(|value| value > self.config.max_memory_bytes)
+        {
+            return Err(exhausted(
+                control.query_id,
+                "global task-to-result transfer is exhausted",
+            ));
+        }
+
+        query.active_tasks -= 1;
+        query.active_cpu_slots -= cpu_slots;
+        query.active_task_memory_bytes = query_task_memory_after;
+        query.active_result_permits = query_permits_after.expect("validated result permit count");
+        query.active_result_memory_bytes =
+            query_result_memory_after.expect("validated per-query result memory addition");
+        global.active_tasks -= 1;
+        global.active_cpu_slots -= cpu_slots;
+        global.active_task_memory_bytes = global_task_memory_after;
+        global.active_result_permits =
+            global_permits_after.expect("validated global result permit count");
+        global.active_result_memory_bytes =
+            global_result_memory_after.expect("validated global result memory addition");
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active task retains its session resource ledger");
+        debug_assert!(session.active_tasks > 0);
+        session.active_tasks -= 1;
+        session.active_cpu_slots -= cpu_slots;
+        session.active_task_memory_bytes -= task_memory_bytes;
+        session.active_result_permits += 1;
+        session.active_result_memory_bytes = session
+            .active_result_memory_bytes
+            .checked_add(result_memory_bytes)
+            .expect("session result memory accounting remains within global budget");
+        Ok(QueryResultReservation {
+            owner: Arc::downgrade(self),
+            control: Arc::clone(control),
+            charge: Some(result_charge),
+        })
+    }
+
+    fn release_result(&self, control: &Arc<QueryControl>, charge: QueryResultCharge) {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        let memory_bytes = charge.memory_bytes.get();
+        debug_assert!(query.active_result_permits > 0 && global.active_result_permits > 0);
+        query.active_result_permits -= 1;
+        query.active_result_memory_bytes -= memory_bytes;
+        global.active_result_permits -= 1;
+        global.active_result_memory_bytes -= memory_bytes;
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active result retains its session resource ledger");
+        debug_assert!(session.active_result_permits > 0);
+        session.active_result_permits -= 1;
+        session.active_result_memory_bytes -= memory_bytes;
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+        global.remove_idle_session(control.owner_session_id);
         global.refresh_shutdown();
         drop(query);
         drop(global);
@@ -1535,10 +1881,10 @@ impl CoordinatorInner {
     fn finish(&self, control: &Arc<QueryControl>) -> Result<()> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
-        if query.active_tasks != 0 {
+        if query.active_tasks != 0 || query.active_result_permits != 0 {
             return Err(ServerError::new(
                 ErrorCode::Conflict,
-                "query cannot finish while physical tasks remain active",
+                "query cannot finish while physical tasks or result delivery remain active",
             )
             .with_query_id(control.query_id));
         }
@@ -1623,6 +1969,13 @@ impl CoordinatorInner {
             query.logical_admitted = false;
             debug_assert!(global.active_logical_queries > 0);
             global.active_logical_queries -= 1;
+            let session = global
+                .sessions
+                .get_mut(&control.owner_session_id)
+                .expect("logically admitted query retains its session resource ledger");
+            debug_assert!(session.active_logical_queries > 0);
+            session.active_logical_queries -= 1;
+            global.remove_idle_session(control.owner_session_id);
         }
         if terminal != QueryState::Finished {
             control.cancelled.store(true, Ordering::Release);
@@ -1636,11 +1989,16 @@ impl CoordinatorInner {
         control: &QueryControl,
         query: &mut QueryControlState,
     ) -> Option<Arc<SharedSnapshotOwnership>> {
-        if !query.state.is_terminal() || query.active_tasks != 0 {
+        if !query.state.is_terminal() {
             return None;
         }
-        let snapshot_root = global.take_snapshot_root(control.query_id, control.generation);
-        if !query.retention_scheduled {
+        let snapshot_root = if query.active_tasks == 0 {
+            global.take_snapshot_root(control.query_id, control.generation)
+        } else {
+            None
+        };
+        if query.active_tasks == 0 && query.active_result_permits == 0 && !query.retention_scheduled
+        {
             let finished_at_ns = query
                 .finished_at_ns
                 .expect("terminal query records its completion time");
@@ -1758,6 +2116,10 @@ impl CoordinatorInner {
         self.state.lock().unwrap().status()
     }
 
+    fn session_status(&self, session_id: SessionId) -> QuerySessionResourceStatus {
+        self.state.lock().unwrap().session_status(session_id)
+    }
+
     fn query_status(&self, control: &Arc<QueryControl>) -> Result<QueryRuntimeStatus> {
         let query = control.state.lock().unwrap();
         Ok(QueryRuntimeStatus {
@@ -1776,7 +2138,13 @@ impl CoordinatorInner {
             logical_admitted: query.logical_admitted,
             active_tasks: query.active_tasks,
             active_cpu_slots: query.active_cpu_slots,
-            active_memory_bytes: query.active_memory_bytes,
+            active_task_memory_bytes: query.active_task_memory_bytes,
+            active_result_permits: query.active_result_permits,
+            active_result_memory_bytes: query.active_result_memory_bytes,
+            active_memory_bytes: query
+                .active_task_memory_bytes
+                .checked_add(query.active_result_memory_bytes)
+                .expect("query memory accounting remains within configured budget"),
             cancellation_requested: control.cancelled.load(Ordering::Acquire),
             finished_at_ns: query.finished_at_ns,
             error: query.error.clone(),
@@ -1850,7 +2218,9 @@ struct QueryControlState {
     logical_admitted: bool,
     active_tasks: usize,
     active_cpu_slots: u32,
-    active_memory_bytes: u64,
+    active_task_memory_bytes: u64,
+    active_result_permits: usize,
+    active_result_memory_bytes: u64,
     finished_at_ns: Option<u64>,
     retention_scheduled: bool,
     error: Option<ServerError>,
@@ -1865,7 +2235,9 @@ impl Default for QueryControlState {
             logical_admitted: true,
             active_tasks: 0,
             active_cpu_slots: 0,
-            active_memory_bytes: 0,
+            active_task_memory_bytes: 0,
+            active_result_permits: 0,
+            active_result_memory_bytes: 0,
             finished_at_ns: None,
             retention_scheduled: false,
             error: None,
@@ -1920,6 +2292,18 @@ struct SharedSnapshotOwnership {
     snapshot: Mutex<Option<OpaqueQueryReadSnapshot>>,
 }
 
+struct SnapshotOwnerReleaseGuard {
+    owner: Weak<CoordinatorInner>,
+}
+
+impl Drop for SnapshotOwnerReleaseGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_snapshot_owner();
+        }
+    }
+}
+
 impl SharedSnapshotOwnership {
     fn release(&self) {
         let snapshot = self
@@ -1930,10 +2314,10 @@ impl SharedSnapshotOwnership {
         if snapshot.is_none() {
             return;
         }
+        let _release = SnapshotOwnerReleaseGuard {
+            owner: self.owner.clone(),
+        };
         drop(snapshot);
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_snapshot_owner();
-        }
     }
 }
 
@@ -1945,10 +2329,10 @@ impl Drop for SharedSnapshotOwnership {
             .unwrap_or_else(|error| error.into_inner())
             .take();
         if snapshot.is_some() {
+            let _release = SnapshotOwnerReleaseGuard {
+                owner: self.owner.clone(),
+            };
             drop(snapshot);
-            if let Some(owner) = self.owner.upgrade() {
-                owner.release_snapshot_owner();
-            }
         }
     }
 }
@@ -2080,6 +2464,18 @@ impl QueryExecutionScope {
         self.control.query_id
     }
 
+    pub(crate) fn instance_id(&self) -> QueryInstanceId {
+        QueryInstanceId::new(
+            self.control.query_id,
+            NonZeroU64::new(self.control.generation)
+                .expect("QueryService query generation is nonzero"),
+        )
+    }
+
+    pub(crate) fn cancellation(&self) -> QueryCancellation {
+        self.control.cancellation()
+    }
+
     /// Borrows the concrete snapshot capability while this execution scope owns it.
     ///
     /// The callback boundary prevents a reference from escaping the ownership lock. A physical
@@ -2128,20 +2524,12 @@ impl QueryExecutionScope {
             )
             .with_query_id(self.control.query_id)
         })?;
-        owner.admit_task(&self.control, charge)?;
-        let resource = match self.with_snapshot(build) {
-            Ok(resource) => resource,
-            Err(error) => {
-                owner.release_task(&self.control, charge);
-                return Err(error);
-            }
-        };
+        let reservation = owner.reserve_task(&self.control, charge)?;
+        let resource = self.with_snapshot(build)?;
         Ok(QueryTaskPermit {
-            owner: Arc::downgrade(&owner),
-            control: Arc::clone(&self.control),
             ownership: self.ownership.as_ref().map(Arc::clone),
-            charge,
             resource: Some(resource),
+            reservation: Some(reservation),
         })
     }
 
@@ -2157,13 +2545,30 @@ impl QueryExecutionScope {
             )
             .with_query_id(self.control.query_id)
         })?;
-        owner.admit_task(&self.control, charge)?;
+        let reservation = owner.reserve_task(&self.control, charge)?;
         Ok(QueryTaskPermit {
-            owner: Arc::downgrade(&owner),
-            control: Arc::clone(&self.control),
             ownership: self.ownership.as_ref().map(Arc::clone),
-            charge,
             resource: Some(resource),
+            reservation: Some(reservation),
+        })
+    }
+
+    pub(crate) fn admit_result<R: Send + 'static>(
+        &self,
+        charge: QueryResultCharge,
+        result: R,
+    ) -> Result<QueryResultPermit<R>> {
+        let owner = self.control.owner.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "QueryService coordinator is unavailable",
+            )
+            .with_query_id(self.control.query_id)
+        })?;
+        let reservation = owner.reserve_result(&self.control, charge)?;
+        Ok(QueryResultPermit {
+            result: Some(result),
+            reservation: Some(reservation),
         })
     }
 
@@ -2190,12 +2595,59 @@ impl Drop for QueryExecutionScope {
     }
 }
 
-pub(crate) struct QueryTaskPermit<R: Send + 'static> {
+struct QueryTaskReservation {
     owner: Weak<CoordinatorInner>,
     control: Arc<QueryControl>,
-    ownership: Option<Arc<SharedSnapshotOwnership>>,
-    charge: QueryTaskCharge,
+    charge: Option<QueryTaskCharge>,
+}
+
+impl QueryTaskReservation {
+    fn try_into_result(&mut self, charge: QueryResultCharge) -> Result<QueryResultReservation> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(self.control.query_id))?;
+        let task_charge = self
+            .charge
+            .expect("live task reservation retains its resource charge");
+        let result = owner.transfer_task_to_result(&self.control, task_charge, charge)?;
+        self.charge = None;
+        Ok(result)
+    }
+}
+
+impl Drop for QueryTaskReservation {
+    fn drop(&mut self) {
+        let Some(charge) = self.charge.take() else {
+            return;
+        };
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_task(&self.control, charge);
+        }
+    }
+}
+
+struct QueryResultReservation {
+    owner: Weak<CoordinatorInner>,
+    control: Arc<QueryControl>,
+    charge: Option<QueryResultCharge>,
+}
+
+impl Drop for QueryResultReservation {
+    fn drop(&mut self) {
+        let Some(charge) = self.charge.take() else {
+            return;
+        };
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_result(&self.control, charge);
+        }
+    }
+}
+
+pub(crate) struct QueryTaskPermit<R: Send + 'static> {
     resource: Option<R>,
+    ownership: Option<Arc<SharedSnapshotOwnership>>,
+    reservation: Option<QueryTaskReservation>,
 }
 
 impl<R: Send + 'static> QueryTaskPermit<R> {
@@ -2214,21 +2666,85 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.control.cancelled.load(Ordering::Acquire)
+        self.reservation
+            .as_ref()
+            .expect("live task permit retains its resource reservation")
+            .control
+            .cancelled
+            .load(Ordering::Acquire)
     }
 
     pub(crate) fn cancellation(&self) -> QueryCancellation {
-        self.control.cancellation()
+        self.reservation
+            .as_ref()
+            .expect("live task permit retains its resource reservation")
+            .control
+            .cancellation()
+    }
+
+    /// Converts a task-owned buffer and atomically reclassifies its charge for result delivery.
+    ///
+    /// The task charge must cover memory materialized by `convert` until the reclassification
+    /// commits. A rejected transfer drops the converted result before releasing that task charge.
+    pub(crate) fn into_result<T: Send + 'static>(
+        mut self,
+        charge: QueryResultCharge,
+        convert: impl FnOnce(R) -> Result<T>,
+    ) -> Result<QueryResultPermit<T>> {
+        let resource = self
+            .resource
+            .take()
+            .expect("live task permit retains its physical resource");
+        let result = convert(resource)?;
+        let reservation = match self
+            .reservation
+            .as_mut()
+            .expect("live task permit retains its resource reservation")
+            .try_into_result(charge)
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                drop(result);
+                return Err(error);
+            }
+        };
+        drop(self.ownership.take());
+        Ok(QueryResultPermit {
+            result: Some(result),
+            reservation: Some(reservation),
+        })
     }
 }
 
-impl<R: Send + 'static> Drop for QueryTaskPermit<R> {
-    fn drop(&mut self) {
-        drop(self.resource.take());
-        drop(self.ownership.take());
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_task(&self.control, self.charge);
-        }
+pub(crate) struct QueryResultPermit<R: Send + 'static> {
+    result: Option<R>,
+    reservation: Option<QueryResultReservation>,
+}
+
+impl<R: Send + 'static> QueryResultPermit<R> {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.reservation
+            .as_ref()
+            .expect("live result permit retains its resource reservation")
+            .control
+            .cancelled
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cancellation(&self) -> QueryCancellation {
+        self.reservation
+            .as_ref()
+            .expect("live result permit retains its resource reservation")
+            .control
+            .cancellation()
+    }
+}
+
+impl<R: Send + 'static> AsRef<R> for QueryResultPermit<R> {
+    fn as_ref(&self) -> &R {
+        self.result
+            .as_ref()
+            .expect("live result permit retains its result buffer")
     }
 }
 
@@ -2326,6 +2842,7 @@ fn permission_denied(message: impl Into<String>, query_id: Option<QueryId>) -> S
 mod tests {
     use std::any::Any;
     use std::num::{NonZeroU32, NonZeroU64};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -2336,12 +2853,17 @@ mod tests {
     use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, ServerError, SessionId};
 
     use super::{
-        QueryResourceBudget, QueryResourceCoordinator, QueryServiceLifecycle,
+        QueryResourceBudget, QueryResourceCoordinator, QueryResultCharge, QueryServiceLifecycle,
         QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState,
         QuerySubmissionMetadata, QueryTaskCharge, DEFAULT_MAX_PLANNING_DURATION,
     };
 
     struct TestSnapshot {
+        descriptor: QueryReadSnapshotDescriptor,
+        drops: Arc<AtomicUsize>,
+    }
+
+    struct PanicSnapshot {
         descriptor: QueryReadSnapshotDescriptor,
         drops: Arc<AtomicUsize>,
     }
@@ -2377,11 +2899,66 @@ mod tests {
         }
     }
 
+    impl QueryReadSnapshotGuard for PanicSnapshot {
+        fn descriptor(&self) -> &QueryReadSnapshotDescriptor {
+            &self.descriptor
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn renew(&mut self, _expires_at_ns: u64) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn release(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async move {
+                drop(self);
+                Ok(())
+            })
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+            self
+        }
+    }
+
+    impl Drop for PanicSnapshot {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            panic!("test snapshot drop panic");
+        }
+    }
+
     struct DropProbe(Arc<AtomicUsize>);
 
     impl Drop for DropProbe {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct AccountingDropProbe {
+        coordinator: QueryResourceCoordinator,
+        observed_active_tasks: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for AccountingDropProbe {
+        fn drop(&mut self) {
+            self.observed_active_tasks
+                .store(self.coordinator.status().active_tasks, Ordering::Relaxed);
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct PanicDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for PanicDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            panic!("test resource drop panic");
         }
     }
 
@@ -2498,9 +3075,26 @@ mod tests {
         })
     }
 
+    fn panic_snapshot(query_id: QueryId, drops: Arc<AtomicUsize>) -> Box<PanicSnapshot> {
+        Box::new(PanicSnapshot {
+            descriptor: QueryReadSnapshotDescriptor {
+                query_id,
+                catalog_revision: 1,
+                tables: Vec::new(),
+            },
+            drops,
+        })
+    }
+
     fn charge(cpu_slots: u32, memory_bytes: u64) -> QueryTaskCharge {
         QueryTaskCharge {
             cpu_slots: NonZeroU32::new(cpu_slots).unwrap(),
+            memory_bytes: NonZeroU64::new(memory_bytes).unwrap(),
+        }
+    }
+
+    fn result_charge(memory_bytes: u64) -> QueryResultCharge {
+        QueryResultCharge {
             memory_bytes: NonZeroU64::new(memory_bytes).unwrap(),
         }
     }
@@ -3234,6 +3828,701 @@ mod tests {
         drop((first, second));
         assert_eq!(coordinator.status().active_tasks, 0);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn session_ledger_aggregates_queries_and_removes_idle_sessions() {
+        let resources = QueryServiceResourceConfig {
+            max_active_queries: 3,
+            max_active_tasks: 3,
+            max_cpu_slots: 3,
+            max_memory_bytes: 300,
+        };
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let coordinator = coordinator(resources);
+        let first_session = session_id(1);
+        let second_session = session_id(2);
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let third_id = query_id(3);
+        let first = coordinator
+            .register_planned_for_session(
+                info(first_id, 100),
+                first_session,
+                None,
+                query_budget,
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned_for_session(
+                info(second_id, 100),
+                first_session,
+                None,
+                query_budget,
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let third = coordinator
+            .register_planned_for_session(
+                info(third_id, 100),
+                second_session,
+                None,
+                query_budget,
+                snapshot(third_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(coordinator.status().tracked_sessions, 2);
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(first_session)
+                .active_logical_queries,
+            2
+        );
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(second_session)
+                .active_logical_queries,
+            1
+        );
+
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+        let first_task = first.admit_task(charge(1, 20), ()).unwrap();
+        let second_task = second.admit_task(charge(1, 30), ()).unwrap();
+        let first_usage = coordinator.admin_handle().session_status(first_session);
+        assert_eq!(first_usage.active_tasks, 2);
+        assert_eq!(first_usage.active_cpu_slots, 2);
+        assert_eq!(first_usage.active_task_memory_bytes, 50);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 50);
+
+        drop((first_task, second_task));
+        drop((first, second));
+        assert_eq!(coordinator.status().tracked_sessions, 1);
+        drop(third);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(first_session)
+                .active_memory_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn task_reservation_rolls_back_build_errors_and_panics() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                info(id, 100),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+
+        let build_error = execution
+            .admit_snapshot_task::<TestSnapshot, ()>(charge(1, 40), |_| {
+                Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "test task build failed",
+                ))
+            })
+            .err()
+            .expect("task build error must be returned");
+        assert_eq!(build_error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(
+            coordinator
+                .session_status_owned(owner.as_ref())
+                .unwrap()
+                .active_task_memory_bytes,
+            0
+        );
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = execution.admit_snapshot_task::<TestSnapshot, ()>(charge(1, 40), |_| {
+                panic!("test task build panic")
+            });
+        }));
+        assert!(panic.is_err());
+        let service = coordinator.status();
+        assert_eq!(service.active_tasks, 0);
+        assert_eq!(service.active_cpu_slots, 0);
+        assert_eq!(service.active_memory_bytes, 0);
+        let query = coordinator
+            .status_owned(owner.as_ref(), execution.instance_id())
+            .unwrap();
+        assert_eq!(query.active_tasks, 0);
+        assert_eq!(query.active_task_memory_bytes, 0);
+        drop(execution);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn task_and_result_memory_share_query_global_and_session_budget() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), query_budget, 10)
+            .unwrap();
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                info(id, 100),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let task = execution.admit_task(charge(1, 80), ()).unwrap();
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+
+        let rejection = execution
+            .admit_result(result_charge(30), DropProbe(Arc::clone(&rejected_drops)))
+            .err()
+            .expect("task and result memory must share one hard budget");
+        assert_eq!(rejection.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(rejected_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_result_permits, 0);
+
+        let accepted_drops = Arc::new(AtomicUsize::new(0));
+        let result = execution
+            .admit_result(result_charge(20), DropProbe(Arc::clone(&accepted_drops)))
+            .unwrap();
+        let _ = result.as_ref();
+        let service = coordinator.status();
+        assert_eq!(service.active_task_memory_bytes, 80);
+        assert_eq!(service.active_result_permits, 1);
+        assert_eq!(service.active_result_memory_bytes, 20);
+        assert_eq!(service.active_memory_bytes, 100);
+        let session = coordinator.session_status_owned(owner.as_ref()).unwrap();
+        assert_eq!(session.active_task_memory_bytes, 80);
+        assert_eq!(session.active_result_memory_bytes, 20);
+        assert_eq!(session.active_memory_bytes, 100);
+
+        drop(task);
+        drop(result);
+        assert_eq!(accepted_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn task_to_result_transfer_reclassifies_full_budget_atomically() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 80,
+        });
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 80,
+        };
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), query_budget, 10)
+            .unwrap();
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                info(id, 100),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let task = execution
+            .admit_task(charge(1, 80), String::from("batch"))
+            .unwrap();
+
+        let result = task
+            .into_result(result_charge(80), |mut batch| {
+                batch.push_str("-ready");
+                Ok(batch)
+            })
+            .expect("same memory may move atomically from task to result accounting");
+        assert_eq!(result.as_ref(), "batch-ready");
+        let service = coordinator.status();
+        assert_eq!(service.active_tasks, 0);
+        assert_eq!(service.active_cpu_slots, 0);
+        assert_eq!(service.active_task_memory_bytes, 0);
+        assert_eq!(service.active_result_permits, 1);
+        assert_eq!(service.active_result_memory_bytes, 80);
+        assert_eq!(service.active_memory_bytes, 80);
+        let query = coordinator
+            .status_owned(owner.as_ref(), execution.instance_id())
+            .unwrap();
+        assert_eq!(query.active_tasks, 0);
+        assert_eq!(query.active_result_permits, 1);
+        assert_eq!(query.active_memory_bytes, 80);
+
+        drop(result);
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn rejected_task_to_result_transfer_drops_result_before_task_charge() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let first = coordinator
+            .register_planned_for_session(
+                info(first_id, 100),
+                session_id(1),
+                None,
+                query_budget,
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned_for_session(
+                info(second_id, 100),
+                session_id(2),
+                None,
+                query_budget,
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+        let first_result = first.admit_result(result_charge(10), ()).unwrap();
+        let second_task = second.admit_task(charge(1, 20), ()).unwrap();
+        let observed_active_tasks = Arc::new(AtomicUsize::new(usize::MAX));
+        let result_drops = Arc::new(AtomicUsize::new(0));
+
+        let transfer = second_task.into_result(result_charge(20), |_| {
+            Ok(AccountingDropProbe {
+                coordinator: coordinator.clone(),
+                observed_active_tasks: Arc::clone(&observed_active_tasks),
+                drops: Arc::clone(&result_drops),
+            })
+        });
+        let error = match transfer {
+            Ok(_) => panic!("full result permit capacity must reject transfer"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(result_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_active_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 0);
+        assert_eq!(coordinator.status().active_result_permits, 1);
+
+        drop(first_result);
+        first.finish().unwrap();
+        second.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn result_permit_count_is_bounded_per_query_and_globally() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 3,
+            max_active_tasks: 2,
+            max_cpu_slots: 3,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let execution = |id_value: u128, session_value: u128| {
+            let id = query_id(id_value);
+            let token = coordinator
+                .register_planned_for_session(
+                    info(id, 100),
+                    session_id(session_value),
+                    None,
+                    query_budget,
+                    snapshot(id, Arc::new(AtomicUsize::new(0))),
+                    10,
+                )
+                .unwrap();
+            coordinator.begin_execution(token, 11).unwrap()
+        };
+        let first = execution(1, 1);
+        let second = execution(2, 2);
+        let third = execution(3, 3);
+
+        let first_result = first.admit_result(result_charge(10), ()).unwrap();
+        let per_query = first
+            .admit_result(result_charge(10), ())
+            .err()
+            .expect("one query cannot exceed its task-derived result permit bound");
+        assert_eq!(per_query.code(), ErrorCode::ResourceExhausted);
+        let second_result = second.admit_result(result_charge(10), ()).unwrap();
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        let global = third
+            .admit_result(result_charge(10), DropProbe(Arc::clone(&rejected_drops)))
+            .err()
+            .expect("global result permits cannot exceed active task capacity");
+        assert_eq!(global.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(rejected_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_result_permits, 2);
+
+        drop((first_result, second_result));
+        first.finish().unwrap();
+        second.finish().unwrap();
+        third.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn finish_rejects_outstanding_result_delivery_and_cancels_on_scope_drop() {
+        let coordinator = coordinator(config());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&drops)),
+                10,
+            )
+            .unwrap();
+        let instance_id = token.instance_id();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let result = execution.admit_result(result_charge(20), ()).unwrap();
+
+        let error = execution
+            .finish()
+            .expect_err("result delivery must drain before Finished");
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        let status = coordinator.admin_handle().status(instance_id).unwrap();
+        assert_eq!(status.state, QueryState::Cancelled);
+        assert!(status.cancellation_requested);
+        assert!(result.is_cancelled());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        drop(result);
+        assert_eq!(coordinator.status().active_result_permits, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn payload_drop_panics_still_release_task_and_result_reservations() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let task_drops = Arc::new(AtomicUsize::new(0));
+        let task = execution
+            .admit_task(charge(1, 20), PanicDropProbe(Arc::clone(&task_drops)))
+            .unwrap();
+        let task_panic = catch_unwind(AssertUnwindSafe(|| drop(task)));
+        assert!(task_panic.is_err());
+        assert_eq!(task_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 0);
+
+        let result_drops = Arc::new(AtomicUsize::new(0));
+        let result = execution
+            .admit_result(result_charge(20), PanicDropProbe(Arc::clone(&result_drops)))
+            .unwrap();
+        let result_panic = catch_unwind(AssertUnwindSafe(|| drop(result)));
+        assert!(result_panic.is_err());
+        assert_eq!(result_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_result_permits, 0);
+        assert_eq!(coordinator.status().active_result_memory_bytes, 0);
+
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn snapshot_drop_panic_still_releases_owner_accounting() {
+        let coordinator = coordinator(config());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                panic_snapshot(id, Arc::clone(&drops)),
+                10,
+            )
+            .unwrap();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(token)));
+        assert!(panic.is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        let status = coordinator.status();
+        assert_eq!(status.active_logical_queries, 0);
+        assert_eq!(status.active_snapshot_owners, 0);
+        assert_eq!(status.tracked_sessions, 0);
+    }
+
+    #[test]
+    fn task_and_result_memory_block_each_other_across_queries_and_sessions() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let first = coordinator
+            .register_planned_for_session(
+                info(first_id, 100),
+                session_id(1),
+                None,
+                query_budget,
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned_for_session(
+                info(second_id, 100),
+                session_id(2),
+                None,
+                query_budget,
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let first_instance = first.instance_id();
+        let second_instance = second.instance_id();
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+
+        let first_result = first.admit_result(result_charge(80), ()).unwrap();
+        let task_error = second
+            .admit_task(charge(1, 30), ())
+            .err()
+            .expect("another query result must consume global task memory budget");
+        assert_eq!(task_error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 0);
+        assert_eq!(coordinator.status().active_result_memory_bytes, 80);
+
+        let second_small_task = second.admit_task(charge(1, 20), ()).unwrap();
+        let service = coordinator.status();
+        let first_query = coordinator.admin_handle().status(first_instance).unwrap();
+        let second_query = coordinator.admin_handle().status(second_instance).unwrap();
+        let first_session = coordinator.admin_handle().session_status(session_id(1));
+        let second_session = coordinator.admin_handle().session_status(session_id(2));
+        assert_eq!(service.active_logical_queries, 2);
+        assert_eq!(service.active_tasks, 1);
+        assert_eq!(service.active_cpu_slots, 1);
+        assert_eq!(service.active_task_memory_bytes, 20);
+        assert_eq!(service.active_result_permits, 1);
+        assert_eq!(service.active_result_memory_bytes, 80);
+        assert_eq!(service.active_memory_bytes, 100);
+        assert_eq!(
+            service.active_logical_queries,
+            first_session.active_logical_queries + second_session.active_logical_queries
+        );
+        assert_eq!(
+            service.active_tasks,
+            first_session.active_tasks + second_session.active_tasks
+        );
+        assert_eq!(
+            service.active_cpu_slots,
+            first_session.active_cpu_slots + second_session.active_cpu_slots
+        );
+        assert_eq!(
+            service.active_task_memory_bytes,
+            first_session.active_task_memory_bytes + second_session.active_task_memory_bytes
+        );
+        assert_eq!(
+            service.active_result_permits,
+            first_session.active_result_permits + second_session.active_result_permits
+        );
+        assert_eq!(
+            service.active_result_memory_bytes,
+            first_session.active_result_memory_bytes + second_session.active_result_memory_bytes
+        );
+        assert_eq!(
+            service.active_memory_bytes,
+            first_query.active_memory_bytes + second_query.active_memory_bytes
+        );
+        assert_eq!(first_query.active_result_memory_bytes, 80);
+        assert_eq!(second_query.active_task_memory_bytes, 20);
+
+        drop(second_small_task);
+        drop(first_result);
+        let second_task = second.admit_task(charge(1, 80), ()).unwrap();
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        let result_error = first
+            .admit_result(result_charge(30), DropProbe(Arc::clone(&rejected_drops)))
+            .err()
+            .expect("another query task must consume global result memory budget");
+        assert_eq!(result_error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(rejected_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 80);
+        assert_eq!(coordinator.status().active_result_memory_bytes, 0);
+
+        drop(second_task);
+        first.finish().unwrap();
+        second.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn result_permit_blocks_terminal_eviction_until_its_memory_is_released() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 1, Duration::from_secs(60)),
+        )
+        .unwrap();
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&drops)),
+                10,
+            )
+            .unwrap();
+        let instance_id = token.instance_id();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let result = execution.admit_result(result_charge(20), ()).unwrap();
+        coordinator.admin_handle().cancel(instance_id).unwrap();
+        drop(execution);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_result_permits, 1);
+
+        let replacement_owner = coordinator.owner(session_id(2));
+        let blocked = coordinator
+            .submit_at_for_test(
+                replacement_owner.as_ref(),
+                metadata(query_id(2), None),
+                budget(),
+                20,
+            )
+            .err()
+            .expect("terminal query with a result permit must not be evicted");
+        assert_eq!(blocked.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(coordinator.status().query_tombstones, 0);
+
+        drop(result);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+        let replacement = coordinator
+            .submit_at_for_test(
+                replacement_owner.as_ref(),
+                metadata(query_id(2), None),
+                budget(),
+                21,
+            )
+            .expect("fully drained terminal query may be capacity-evicted");
+        assert_eq!(coordinator.status().query_tombstones, 1);
+        assert_eq!(coordinator.status().tracked_sessions, 1);
+        drop(replacement);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn shutdown_waits_for_result_permits_without_retaining_snapshot() {
+        let coordinator = coordinator(config());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&drops)),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let result = execution.admit_result(result_charge(20), ()).unwrap();
+
+        let draining = coordinator.begin_shutdown();
+        assert_eq!(draining.lifecycle, QueryServiceLifecycle::Draining);
+        assert_eq!(draining.active_logical_queries, 0);
+        assert_eq!(draining.active_result_permits, 1);
+        assert_eq!(draining.active_result_memory_bytes, 20);
+        assert_eq!(draining.active_snapshot_owners, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(result.is_cancelled());
+        let cancellation = result.cancellation();
+        assert!(cancellation.terminal_signal().is_some());
+        assert!(cancellation.is_cancelled());
+        drop(execution);
+        assert_eq!(
+            coordinator.status().lifecycle,
+            QueryServiceLifecycle::Draining
+        );
+
+        drop(result);
+        assert_eq!(coordinator.status().active_result_permits, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+        assert_eq!(
+            coordinator.status().lifecycle,
+            QueryServiceLifecycle::Stopped
+        );
     }
 
     #[test]
