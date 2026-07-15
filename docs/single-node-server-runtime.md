@@ -154,6 +154,17 @@ global-then-query lock that installs the snapshot root. An unrelated small permi
 larger snapshot, and there is no check/install TOCTOU window. The reservation currently remains at
 its conservative peak until the final snapshot owner drops; a later shrink-only reclassification may
 improve concurrency without weakening pre-admission.
+After execution starts, one snapshot-wide projection task derives capability-free persisted table
+metadata from that exact pinned owner. Charge inspection reads only a precomputed scalar profile;
+table/file capability clones and schema decoding occur only after task, CPU, and memory admission.
+The retained charge covers decoded schemas and all projected table/file containers, while the task
+peak additionally reserves one maximum schema-decode transient and bounded construction scratch.
+The server verifies Catalog revision, query-wide table order and uniqueness, selectors, schema
+ownership and charge, file visibility, scan ordinals, versions, sizes, and duplicate identities
+before atomically shrinking the task into one `ProjectedSnapshotManifest` retained permit. The
+result contains no path, reader, pin, callback, or runtime capability. Physical-plan objects and
+execution/operator allocations are deliberately excluded and require separate `PhysicalPlan` and
+`OperatorArena` reservations in the next binding stage.
 Physical executors now have one consuming `QueryExecutionScope::fail(error)` boundary: it records a
 `Running -> Failed` transition, preserves the original structured error, wakes cancellation waiters,
 and leaves task/retained/result reservations to drain through RAII. Concurrent cancellation,

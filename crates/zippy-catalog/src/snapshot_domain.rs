@@ -29,7 +29,7 @@ const LINEAGE_QUERY_CHUNK_SIZE: usize = 512;
 const MAX_SNAPSHOT_RAW_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_RAW_DECODE_EXPANSION: usize = 32;
 const SNAPSHOT_SCHEMA_DECODE_TRANSIENT_BYTES: usize =
-    zippy_types::schema_contract::MAX_CATALOG_SCHEMA_IPC_BYTES * 8;
+    crate::PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES;
 const SNAPSHOT_FIXED_ALLOCATOR_MARGIN_BYTES: usize = 1024 * 1024;
 const TABLE_ROW_LENGTHS_SQL: &str =
     "SELECT length(table_id), length(namespace_id), length(CAST(name AS BLOB)), \

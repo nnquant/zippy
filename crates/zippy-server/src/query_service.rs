@@ -3183,6 +3183,25 @@ impl QueryExecutionScope {
         })
     }
 
+    /// Computes a scalar snapshot-derived charge before admitting and building a physical task.
+    ///
+    /// The charge callback may only inspect immutable metadata and return the conservative task
+    /// peak. The resource callback runs only after task, CPU, and memory admission commits. The
+    /// snapshot is immutable across both callbacks, while cancellation or shutdown between them is
+    /// observed by `reserve_task` and prevents the resource from being cloned or allocated.
+    pub(crate) fn admit_snapshot_task_with_charge<T, R>(
+        &self,
+        inspect_charge: impl FnOnce(&T) -> Result<QueryTaskCharge>,
+        build: impl FnOnce(&T, QueryTaskCharge) -> Result<R>,
+    ) -> Result<QueryTaskPermit<R>>
+    where
+        T: Any + Send,
+        R: Send + 'static,
+    {
+        let charge = self.with_snapshot(inspect_charge)?;
+        self.admit_snapshot_task(charge, |snapshot| build(snapshot, charge))
+    }
+
     fn admit_task<R: Send + 'static>(
         &self,
         charge: QueryTaskCharge,
@@ -5324,6 +5343,80 @@ mod tests {
         assert_eq!(query.active_task_memory_bytes, 0);
         drop(execution);
         assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn snapshot_derived_charge_precedes_reservation_and_resource_build() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+
+        let error_builds = Arc::new(AtomicUsize::new(0));
+        let build_count = Arc::clone(&error_builds);
+        let inspect_error = execution
+            .admit_snapshot_task_with_charge::<TestSnapshot, ()>(
+                |_| {
+                    Err(ServerError::new(
+                        ErrorCode::DataCorruption,
+                        "test snapshot charge failed",
+                    ))
+                },
+                move |_, _| {
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .err()
+            .expect("charge inspection failure must stop before resource construction");
+        assert_eq!(inspect_error.code(), ErrorCode::DataCorruption);
+        assert_eq!(error_builds.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.status().active_tasks, 0);
+
+        let rejected_builds = Arc::new(AtomicUsize::new(0));
+        let build_count = Arc::clone(&rejected_builds);
+        let admission_error = execution
+            .admit_snapshot_task_with_charge::<TestSnapshot, ()>(
+                |_| Ok(charge(1, 81)),
+                move |_, _| {
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .err()
+            .expect("over-budget derived charge must stop before resource construction");
+        assert_eq!(admission_error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(rejected_builds.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.status().active_tasks, 0);
+
+        let successful_builds = Arc::new(AtomicUsize::new(0));
+        let build_count = Arc::clone(&successful_builds);
+        let task = execution
+            .admit_snapshot_task_with_charge::<TestSnapshot, usize>(
+                |_| Ok(charge(1, 40)),
+                move |_, admitted_charge| {
+                    assert_eq!(admitted_charge, charge(1, 40));
+                    build_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(42)
+                },
+            )
+            .expect("admitted derived charge may construct one resource");
+        assert_eq!(*task.resource(), 42);
+        assert_eq!(successful_builds.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 1);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 40);
+        drop(task);
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
     }
 
     #[test]

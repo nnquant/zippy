@@ -30,8 +30,8 @@ mod storage_codec;
 mod table_domain;
 
 pub use pinned_snapshot::{
-    PinnedDataFile, PinnedDataFileLocationKind, PinnedDataFileReader, PinnedTableManifest,
-    SqliteCatalogPinnedQuerySnapshot,
+    PinnedDataFile, PinnedDataFileLocationKind, PinnedDataFileReader,
+    PinnedSnapshotProjectionProfile, PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot,
 };
 pub use runtime_pins::{
     SqliteCatalogQuerySnapshotPinRequest, SqliteCatalogRuntimeSnapshotPin,
@@ -66,6 +66,10 @@ pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;
 
 /// The stable catalog format marker stored in `catalog_meta`.
 pub const CATALOG_FORMAT: &str = "zippy.sqlite.catalog";
+
+/// Conservative transient bytes reserved while decoding one persisted Arrow schema.
+pub const PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES: usize =
+    zippy_types::schema_contract::MAX_CATALOG_SCHEMA_IPC_BYTES * 8;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INTEGRITY_CHECK_TIMEOUT: Duration = Duration::from_secs(5);

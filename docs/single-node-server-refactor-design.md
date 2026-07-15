@@ -2281,6 +2281,35 @@ root，在锁外析构 root，再由内嵌 permit 按 exact reservation 退账�
 后续可增加只减不增的 actual-size reclassification，但不得先分配再追认额度。下一步是在 execution 开始后从同一
 snapshot 投影并记账 exact table description，再接入 `NativeExecutionLease` 和延迟文件准入 factory。
 
+Stage 5.4e exact persisted snapshot projection 已完成（2026-07-15）：execution 开始后，Server 以整个
+`NativeQueryReadSnapshot` 为单位只申请一个 task，而不是逐表申请 task 或 retained permit。第一次短借用 snapshot
+只读取 Catalog 预计算的 `PinnedSnapshotProjectionProfile` 标量；它包含表数、可见文件数和 decoded-schema charge
+总额，不调用会 clone owner 的 table/file capability API。QueryService 完成 task/CPU/memory reserve 后，第二次短
+借用才允许 clone pinned owner 和最小 path-free audit sidecar。因此低预算、取消或 shutdown 在 reserve 阶段失败时，
+不会提前派生 pin capability 或开始 schema decode。
+
+投影按 table ID 和 Catalog scan ordinal 顺序构造一个 capability-free `ProjectedSnapshotManifest`。Server 联合校验
+query ID、Catalog revision、table count、连续 table/file ordinal、严格递增且唯一的 `TableId`、selector、table/
+schema/snapshot descriptor、文件 table identity、Committed/visibility interval、非零版本/大小和 schema 单调性。
+每张表的 Arrow schema 必须由同一个 `PinnedTableManifest` 通过 table-aware decoder 解码，decoder 得到的 retained
+charge 必须与 Catalog pin 时预计算值完全相等；最终仍经过 `PersistedTableDescription::try_new` 复核重复 `FileId`、
+snapshot 绑定和平台/聚合溢出。任一表失败或执行取消都会析构已完成的部分并由 task RAII 一次回滚，不会发布部分
+manifest。
+
+retained charge 覆盖全部 decoded schema、manifest/table/file 容器和 allocator margin；构建 task peak 在完整 retained
+输出之外，再独立覆盖一次 128 MiB 最大 schema decode transient、audit/校验临时容器和 Vec-to-Arc 重叠。该 transient
+不能复用 snapshot planning permit 的保守余量，因为后者不是可独占转移的子额度。成功转换在 QueryService 的同一
+临界区释放 task count/CPU/peak memory，并登记一个 `ProjectedSnapshotManifest` retained permit。synthetic key、
+`PartitionedFile`、DataFusion physical plan、metrics 和执行 operator 分配不在该 charge 中，后续必须分别由
+`PhysicalPlan` 与 `OperatorArena` permit 覆盖。
+
+下一步是引入 `NativeExecutionLease` 和 zippy-query-owned 全树 binding/validation API：完整物理计划中的每个
+planning marker 都必须被唯一替换并联合核验，漏绑、重复绑定或元数据错配一律 fail closed；随后接入延迟、有界的
+Parquet reader factory。lease 必须 consuming 地接管原始 `QueryRetainedPermit<ProjectedSnapshotManifest>`，不能只
+clone 其中可 clone 的 table/schema/file description 后提前退还 retained 账；只有物理计划取得自己独立且完整的
+`PhysicalPlan` charge 后才能原子转移或释放 manifest permit。故障测试必须覆盖 charge inspect 与 reserve 之间取消、
+投影中途取消，以及 query/revision/table/schema/file/legacy scan-order 的逐项错配。
+
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）

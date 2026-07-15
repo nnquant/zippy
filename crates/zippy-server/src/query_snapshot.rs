@@ -2,7 +2,8 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
+use std::mem::size_of;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
@@ -11,24 +12,27 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use zippy_catalog::{
-    conservative_table_resolution_owned_peak_bytes, PinnedDataFile, PinnedTableManifest,
-    SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
+    conservative_table_resolution_owned_peak_bytes, decode_persisted_table_schema, PinnedDataFile,
+    PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
     SqliteCatalogReadHandle, SqliteCatalogSnapshotReadLimits,
+    PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES,
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
+use zippy_query::{PersistedFileDescription, PersistedFileKey, PersistedTableDescription};
 use zippy_types::catalog::CatalogSnapshotSelector;
 use zippy_types::query::QueryTableVersion;
 use zippy_types::storage::{
     CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseDescriptor, OpaqueQueryReadSnapshot,
     QueryReadSnapshotDescriptor, QueryReadSnapshotGuard, TableReadSnapshotDescriptor,
 };
-use zippy_types::table::{TableDescriptor, TableRef};
+use zippy_types::table::{DataFileState, TableDescriptor, TableRef};
 use zippy_types::{
     BoxFuture, ErrorCode, LeaseId, OffsetWatermark, QueryId, Result, ServerError, TableId,
 };
 
 use crate::query_service::{
-    QueryExecutionScope, QueryPlanDraft, QueryPlanningToken, QueryTaskCharge, QueryTaskPermit,
+    QueryCancellation, QueryExecutionScope, QueryPlanDraft, QueryPlanningToken,
+    QueryRetainedCharge, QueryRetainedKind, QueryRetainedPermit, QueryTaskCharge, QueryTaskPermit,
 };
 
 const MAX_SNAPSHOT_COORDINATION_ATTEMPTS: usize = 3;
@@ -40,6 +44,13 @@ const QUERY_SNAPSHOT_READ_LIMITS: SqliteCatalogSnapshotReadLimits =
         max_source_lineage_rows: 16_384,
         max_raw_response_bytes: 2 * 1024 * 1024,
     };
+const PROJECTED_SCHEMA_DECODE_TRANSIENT_BYTES: u64 = PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES as u64;
+const PROJECTED_MANIFEST_FIXED_RETAINED_BYTES: u64 = 64 * 1024;
+const PROJECTED_MANIFEST_BYTES_PER_TABLE: u64 = 4 * 1024;
+const PROJECTED_MANIFEST_BYTES_PER_FILE: u64 = 256;
+const PROJECTED_MANIFEST_FIXED_TASK_MARGIN_BYTES: u64 = 1024 * 1024;
+const PROJECTED_MANIFEST_TASK_BYTES_PER_TABLE: u64 = 512;
+const PROJECTED_MANIFEST_TASK_BYTES_PER_FILE: u64 = 512;
 static NEXT_SNAPSHOT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn conservative_query_snapshot_planning_peak_bytes(reference_count: usize) -> Result<NonZeroU64> {
@@ -81,6 +92,143 @@ fn conservative_query_snapshot_planning_peak_bytes(reference_count: usize) -> Re
         )
         .with_retryable(false)
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectedSnapshotCharges {
+    task_peak_bytes: NonZeroU64,
+    retained_bytes: NonZeroU64,
+}
+
+/// Capability-free persisted tables projected from one exact native snapshot.
+#[derive(Debug)]
+pub(crate) struct ProjectedSnapshotManifest {
+    query_id: QueryId,
+    catalog_revision: u64,
+    tables: Vec<PersistedTableDescription>,
+    retained_memory_bytes: NonZeroU64,
+}
+
+impl ProjectedSnapshotManifest {
+    pub(crate) const fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    pub(crate) const fn catalog_revision(&self) -> u64 {
+        self.catalog_revision
+    }
+
+    pub(crate) fn tables(&self) -> &[PersistedTableDescription] {
+        &self.tables
+    }
+
+    pub(crate) fn table(&self, table_index: usize) -> Option<&PersistedTableDescription> {
+        self.tables.get(table_index)
+    }
+
+    pub(crate) const fn retained_memory_bytes(&self) -> NonZeroU64 {
+        self.retained_memory_bytes
+    }
+}
+
+struct PinnedProjectionInput {
+    query_id: QueryId,
+    catalog_revision: u64,
+    tables: Box<[QueryTableVersion]>,
+    pinned: SqliteCatalogPinnedQuerySnapshot,
+    charges: ProjectedSnapshotCharges,
+}
+
+fn projected_snapshot_charges(
+    pinned: &SqliteCatalogPinnedQuerySnapshot,
+) -> Result<ProjectedSnapshotCharges> {
+    let profile = pinned.projection_profile();
+    let table_count = profile.table_count();
+    let file_count = profile.file_count();
+    let retained_schema_bytes = profile.retained_schema_bytes();
+
+    let retained = checked_projection_add(
+        PROJECTED_MANIFEST_FIXED_RETAINED_BYTES,
+        u64::try_from(size_of::<ProjectedSnapshotManifest>())
+            .map_err(|_| projection_exhausted("projected manifest layout exceeds u64"))?,
+        "manifest root",
+    )?;
+    let retained = checked_projection_add(retained, retained_schema_bytes, "decoded schemas")?;
+    let retained = checked_projection_add(
+        retained,
+        checked_projection_mul(
+            table_count,
+            PROJECTED_MANIFEST_BYTES_PER_TABLE,
+            "table descriptions",
+        )?,
+        "table descriptions",
+    )?;
+    let retained = checked_projection_add(
+        retained,
+        checked_projection_mul(
+            file_count,
+            PROJECTED_MANIFEST_BYTES_PER_FILE,
+            "file descriptions",
+        )?,
+        "file descriptions",
+    )?;
+    let retained_bytes = NonZeroU64::new(retained)
+        .ok_or_else(|| projection_exhausted("projected retained charge must be nonzero"))?;
+
+    let task_peak = checked_projection_add(
+        retained,
+        PROJECTED_SCHEMA_DECODE_TRANSIENT_BYTES,
+        "schema decode transient",
+    )?;
+    let task_peak = checked_projection_add(
+        task_peak,
+        PROJECTED_MANIFEST_FIXED_TASK_MARGIN_BYTES,
+        "task allocator margin",
+    )?;
+    let task_peak = checked_projection_add(
+        task_peak,
+        checked_projection_mul(
+            table_count,
+            PROJECTED_MANIFEST_TASK_BYTES_PER_TABLE,
+            "transient table metadata",
+        )?,
+        "transient table metadata",
+    )?;
+    let task_peak = checked_projection_add(
+        task_peak,
+        checked_projection_mul(
+            file_count,
+            PROJECTED_MANIFEST_TASK_BYTES_PER_FILE,
+            "transient file validation",
+        )?,
+        "transient file validation",
+    )?;
+    let task_peak_bytes = NonZeroU64::new(task_peak)
+        .ok_or_else(|| projection_exhausted("projected task peak must be nonzero"))?;
+    Ok(ProjectedSnapshotCharges {
+        task_peak_bytes,
+        retained_bytes,
+    })
+}
+
+fn checked_projection_add(left: u64, right: u64, component: &str) -> Result<u64> {
+    left.checked_add(right).ok_or_else(|| {
+        projection_exhausted(format!(
+            "projected snapshot byte addition overflow component=[{component}]"
+        ))
+    })
+}
+
+fn checked_projection_mul(left: u64, right: u64, component: &str) -> Result<u64> {
+    left.checked_mul(right).ok_or_else(|| {
+        projection_exhausted(format!(
+            "projected snapshot byte multiplication overflow component=[{component}]"
+        ))
+    })
+}
+
+fn projection_exhausted(message: impl Into<String>) -> ServerError {
+    ServerError::new(ErrorCode::ResourceExhausted, message).with_retryable(false)
 }
 
 /// Coordinates serialized table observations with exact, GC-protected Catalog manifests.
@@ -358,6 +506,81 @@ impl NativeQuerySnapshotCoordinator {
                 })
             },
         )
+    }
+
+    /// Projects the exact pinned snapshot into capability-free persisted query metadata.
+    ///
+    /// Admission covers the complete retained manifest plus one bounded schema-decode transient.
+    /// The first callback computes only scalar charges; cloning the pinned owner and allocating
+    /// audit metadata happens only after QueryService reserves task, CPU, and memory capacity.
+    pub(crate) fn project_persisted_snapshot(
+        &self,
+        execution: &QueryExecutionScope,
+    ) -> Result<QueryRetainedPermit<ProjectedSnapshotManifest>> {
+        let query_id = execution.query_id();
+        let task = execution
+            .admit_snapshot_task_with_charge::<NativeQueryReadSnapshot, PinnedProjectionInput>(
+                |snapshot| {
+                    self.validate_origin(snapshot)?;
+                    let charges = projected_snapshot_charges(&snapshot.pinned)
+                        .map_err(|error| error.with_query_id(query_id))?;
+                    Ok(QueryTaskCharge {
+                        cpu_slots: NonZeroU32::new(1).expect("projection CPU charge is nonzero"),
+                        memory_bytes: charges.task_peak_bytes,
+                    })
+                },
+                |snapshot, admitted_charge| {
+                    self.validate_origin(snapshot)?;
+                    if snapshot.descriptor.query_id != query_id {
+                        return Err(corruption(
+                            query_id,
+                            "native query snapshot identity changed during persisted projection",
+                        ));
+                    }
+                    let charges = projected_snapshot_charges(&snapshot.pinned)
+                        .map_err(|error| error.with_query_id(query_id))?;
+                    if admitted_charge
+                        != (QueryTaskCharge {
+                            cpu_slots: NonZeroU32::new(1)
+                                .expect("projection CPU charge is nonzero"),
+                            memory_bytes: charges.task_peak_bytes,
+                        })
+                    {
+                        return Err(corruption(
+                            query_id,
+                            "persisted projection charge changed after task admission",
+                        ));
+                    }
+                    let tables = snapshot
+                        .descriptor
+                        .tables
+                        .iter()
+                        .map(|table| QueryTableVersion {
+                            table_id: table.table_id,
+                            snapshot_version: table.persisted_snapshot_version,
+                            schema_version: table.schema_version,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    Ok(PinnedProjectionInput {
+                        query_id,
+                        catalog_revision: snapshot.descriptor.catalog_revision,
+                        tables,
+                        pinned: snapshot.pinned.clone(),
+                        charges,
+                    })
+                },
+            )?;
+
+        let cancellation = task.cancellation();
+        task.into_retained(|input| {
+            let manifest = project_pinned_snapshot(input, &cancellation)?;
+            let charge = QueryRetainedCharge {
+                kind: QueryRetainedKind::ProjectedSnapshotManifest,
+                memory_bytes: manifest.retained_memory_bytes(),
+            };
+            Ok((manifest, charge))
+        })
     }
 
     async fn pin_persisted_once(
@@ -719,6 +942,246 @@ fn next_coordinator_nonce() -> u64 {
         .expect("native query snapshot coordinator nonce exhausted u64")
 }
 
+fn project_pinned_snapshot(
+    input: PinnedProjectionInput,
+    cancellation: &QueryCancellation,
+) -> Result<ProjectedSnapshotManifest> {
+    let PinnedProjectionInput {
+        query_id,
+        catalog_revision,
+        tables: audit_tables,
+        pinned,
+        charges,
+    } = input;
+    ensure_projection_active(cancellation, query_id)?;
+    if pinned.catalog_revision() != catalog_revision {
+        return Err(corruption(
+            query_id,
+            "pinned Catalog revision differs from the query snapshot audit",
+        ));
+    }
+    if pinned.table_count() != audit_tables.len() {
+        return Err(corruption(
+            query_id,
+            "pinned Catalog table count differs from the query snapshot audit",
+        ));
+    }
+    let actual_charges =
+        projected_snapshot_charges(&pinned).map_err(|error| error.with_query_id(query_id))?;
+    if actual_charges != charges {
+        return Err(corruption(
+            query_id,
+            "pinned Catalog projection charge changed after task admission",
+        ));
+    }
+
+    let mut projected_tables = Vec::with_capacity(audit_tables.len());
+    let mut previous_table_id = None;
+    for (table_index, (audit, table)) in audit_tables.iter().zip(pinned.tables()).enumerate() {
+        ensure_projection_active(cancellation, query_id)?;
+        if table.table_index() != table_index {
+            return Err(
+                corruption(query_id, "pinned Catalog table ordinal is not contiguous")
+                    .with_table_id(audit.table_id),
+            );
+        }
+        if previous_table_id.is_some_and(|previous| previous >= audit.table_id) {
+            return Err(corruption(
+                query_id,
+                "query snapshot table identities are duplicated or out of order",
+            )
+            .with_table_id(audit.table_id));
+        }
+        previous_table_id = Some(audit.table_id);
+
+        let selector = table.selector();
+        if selector.table_id != audit.table_id
+            || selector.snapshot_version != audit.snapshot_version
+            || selector.schema_version != audit.schema_version
+        {
+            return Err(corruption(
+                query_id,
+                "pinned Catalog selector differs from the query snapshot audit",
+            )
+            .with_table_id(audit.table_id));
+        }
+        let table_descriptor = table.table_descriptor();
+        let schema_descriptor = table.schema();
+        let snapshot_metadata = table.snapshot_metadata();
+        if table_descriptor.table_id != audit.table_id
+            || table_descriptor.current_snapshot_version < audit.snapshot_version
+            || table_descriptor.current_schema_version < audit.schema_version
+            || schema_descriptor.table_id != audit.table_id
+            || schema_descriptor.schema_version != audit.schema_version
+            || snapshot_metadata.table_id != audit.table_id
+            || snapshot_metadata.snapshot_version != audit.snapshot_version
+        {
+            return Err(corruption(
+                query_id,
+                "pinned table metadata differs from the selected Catalog boundary",
+            )
+            .with_table_id(audit.table_id));
+        }
+        let snapshot_version = nonzero_projection_version(
+            query_id,
+            audit.table_id,
+            audit.snapshot_version,
+            "snapshot",
+        )?;
+        let schema_version =
+            nonzero_projection_version(query_id, audit.table_id, audit.schema_version, "schema")?;
+        let decoded = decode_persisted_table_schema(table_descriptor, schema_descriptor)
+            .map_err(|error| error.with_query_id(query_id).with_table_id(audit.table_id))?;
+        ensure_projection_active(cancellation, query_id)?;
+        let retained_schema_bytes =
+            NonZeroU64::new(decoded.retained_charge_bytes()).ok_or_else(|| {
+                corruption(
+                    query_id,
+                    "decoded persisted schema has zero retained-memory charge",
+                )
+                .with_table_id(audit.table_id)
+            })?;
+        if retained_schema_bytes != table.retained_schema_charge_bytes() {
+            return Err(corruption(
+                query_id,
+                "decoded persisted schema charge differs from the pinned Catalog audit",
+            )
+            .with_table_id(audit.table_id));
+        }
+
+        let mut files = Vec::with_capacity(table.file_count());
+        for (file_index, file) in table.files().enumerate() {
+            files.push(project_pinned_file(
+                query_id,
+                table_index,
+                file_index,
+                audit.table_id,
+                snapshot_version,
+                schema_version,
+                &file,
+            )?);
+        }
+        let projected = PersistedTableDescription::try_new(
+            table_index,
+            audit.table_id,
+            snapshot_version,
+            schema_version,
+            decoded.into_schema(),
+            retained_schema_bytes,
+            files,
+        )
+        .map_err(|error| {
+            corruption(
+                query_id,
+                format!("persisted table projection is invalid error=[{error}]"),
+            )
+            .with_table_id(audit.table_id)
+        })?;
+        projected_tables.push(projected);
+    }
+    ensure_projection_active(cancellation, query_id)?;
+
+    Ok(ProjectedSnapshotManifest {
+        query_id,
+        catalog_revision,
+        tables: projected_tables,
+        retained_memory_bytes: charges.retained_bytes,
+    })
+}
+
+fn ensure_projection_active(cancellation: &QueryCancellation, query_id: QueryId) -> Result<()> {
+    if !cancellation.is_cancelled() {
+        return Ok(());
+    }
+    if let Some(signal) = cancellation.terminal_signal() {
+        return Err(signal.error.unwrap_or_else(|| {
+            ServerError::new(
+                ErrorCode::Cancelled,
+                "persisted snapshot projection was cancelled",
+            )
+            .with_query_id(query_id)
+            .with_retryable(false)
+        }));
+    }
+    Err(ServerError::new(
+        ErrorCode::Cancelled,
+        "persisted snapshot projection was cancelled",
+    )
+    .with_query_id(query_id)
+    .with_retryable(false))
+}
+
+fn project_pinned_file(
+    query_id: QueryId,
+    table_index: usize,
+    file_index: usize,
+    table_id: TableId,
+    snapshot_version: NonZeroU64,
+    table_schema_version: NonZeroU64,
+    file: &PinnedDataFile,
+) -> Result<PersistedFileDescription> {
+    if file.table_id() != table_id {
+        return Err(
+            corruption(query_id, "pinned data file belongs to another table")
+                .with_table_id(table_id),
+        );
+    }
+    if file.state() != DataFileState::Committed
+        || file.added_snapshot_version() == 0
+        || file.added_snapshot_version() > snapshot_version.get()
+        || file
+            .removed_snapshot_version()
+            .is_some_and(|removed| removed <= snapshot_version.get())
+    {
+        return Err(corruption(
+            query_id,
+            "pinned data file is not visible at the selected snapshot",
+        )
+        .with_table_id(table_id));
+    }
+    let file_schema_version =
+        nonzero_projection_version(query_id, table_id, file.schema_version(), "file schema")?;
+    if file_schema_version > table_schema_version {
+        return Err(corruption(
+            query_id,
+            "pinned data file schema is newer than the selected table schema",
+        )
+        .with_table_id(table_id));
+    }
+    let file_size_bytes = NonZeroU64::new(file.file_size_bytes()).ok_or_else(|| {
+        corruption(query_id, "pinned data file has zero physical size").with_table_id(table_id)
+    })?;
+    PersistedFileDescription::try_new(
+        PersistedFileKey::new(table_index, file_index, table_id, file.file_id()),
+        snapshot_version,
+        file_schema_version,
+        file_size_bytes,
+        file.row_count(),
+    )
+    .map_err(|error| {
+        corruption(
+            query_id,
+            format!("persisted file projection is invalid error=[{error}]"),
+        )
+        .with_table_id(table_id)
+    })
+}
+
+fn nonzero_projection_version(
+    query_id: QueryId,
+    table_id: TableId,
+    version: u64,
+    kind: &str,
+) -> Result<NonZeroU64> {
+    NonZeroU64::new(version).ok_or_else(|| {
+        corruption(
+            query_id,
+            format!("persisted projection contains zero {kind} version"),
+        )
+        .with_table_id(table_id)
+    })
+}
+
 fn corruption(query_id: QueryId, message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::DataCorruption, message)
         .with_query_id(query_id)
@@ -765,7 +1228,8 @@ mod tests {
     };
     use crate::query_physical::AdmittedPinnedParquetFile;
     use crate::query_service::{
-        QueryResourceBudget, QueryServiceRegistryConfig, QuerySubmissionMetadata, QueryTaskCharge,
+        QueryResourceBudget, QueryRetainedKind, QueryServiceRegistryConfig,
+        QuerySubmissionMetadata, QueryTaskCharge,
     };
 
     const NAMESPACE: u128 = 1;
@@ -1007,6 +1471,14 @@ mod tests {
         }
     }
 
+    fn projection_budget() -> QueryResourceBudget {
+        QueryResourceBudget {
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: DEFAULT_QUERY_MAX_MEMORY_BYTES,
+        }
+    }
+
     fn snapshot_peak_bytes(selector_count: usize) -> u64 {
         super::conservative_query_snapshot_planning_peak_bytes(selector_count)
             .expect("query snapshot limits have a valid conservative peak")
@@ -1146,6 +1618,211 @@ mod tests {
             .runtime_query_snapshot_pins()
             .expect("query pins released")
             .is_empty());
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_snapshot_projection_is_capability_free_ordered_and_retained_accounted() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let query = query_id(113);
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                projection_budget(),
+                10,
+            )
+            .expect("register projected snapshot query");
+        let snapshot = snapshot_coordinator
+            .pin_persisted(&planning, &mixed_refs())
+            .await
+            .expect("pin mixed projected snapshot");
+        let expected_charges =
+            super::projected_snapshot_charges(&snapshot.pinned).expect("estimate projection");
+        assert!(
+            expected_charges.task_peak_bytes.get()
+                >= expected_charges
+                    .retained_bytes
+                    .get()
+                    .checked_add(super::PROJECTED_SCHEMA_DECODE_TRANSIENT_BYTES)
+                    .expect("projection charge comparison remains within u64")
+        );
+        let catalog_revision = snapshot.descriptor.catalog_revision;
+        let token = resources
+            .complete_native_planning_at_for_test(planning, snapshot.plan_draft(), snapshot, 10)
+            .expect("complete projected snapshot plan");
+        let execution = resources
+            .begin_execution(token, 11)
+            .expect("begin projected snapshot execution");
+
+        let projected = snapshot_coordinator
+            .project_persisted_snapshot(&execution)
+            .expect("project exact persisted snapshot");
+        assert_eq!(
+            projected.kind(),
+            QueryRetainedKind::ProjectedSnapshotManifest
+        );
+        assert_eq!(projected.memory_bytes(), expected_charges.retained_bytes);
+        let status = resources.status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_cpu_slots, 0);
+        assert_eq!(status.active_task_memory_bytes, 0);
+        assert_eq!(status.active_retained_permits, 1);
+        assert_eq!(
+            status.active_retained_memory_bytes,
+            expected_charges.retained_bytes.get()
+        );
+
+        let manifest = projected.resource();
+        assert_eq!(manifest.query_id(), query);
+        assert_eq!(manifest.catalog_revision(), catalog_revision);
+        assert_eq!(
+            manifest.retained_memory_bytes(),
+            expected_charges.retained_bytes
+        );
+        assert_eq!(manifest.tables().len(), 2);
+        let native = manifest.table(0).expect("native projected table");
+        assert_eq!(native.table_index(), 0);
+        assert_eq!(native.table_id(), table_id(NATIVE_TABLE));
+        assert_eq!(native.snapshot_version().get(), 1);
+        assert_eq!(native.schema_version().get(), 1);
+        assert_eq!(native.schema().as_ref(), arrow_schema().as_ref());
+        assert_eq!(native.file_count(), 0);
+        let legacy = manifest.table(1).expect("legacy projected table");
+        assert_eq!(legacy.table_index(), 1);
+        assert_eq!(legacy.table_id(), table_id(LEGACY_TABLE));
+        assert_eq!(legacy.snapshot_version().get(), 1);
+        assert_eq!(legacy.schema_version().get(), 1);
+        assert_eq!(legacy.schema().as_ref(), arrow_schema().as_ref());
+        assert_eq!(legacy.file_count(), 0);
+
+        drop(projected);
+        assert_eq!(resources.status().active_retained_permits, 0);
+        execution
+            .finish()
+            .expect("finish after retained manifest drop");
+        assert_eq!(resources.status().active_memory_bytes, 0);
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persisted_file_projection_preserves_exact_identity_versions_and_scan_order() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        runtime
+            .table_actor(table_id(NATIVE_TABLE))
+            .expect("native table actor")
+            .persist(persist_request())
+            .await
+            .expect("persist one native Parquet file");
+
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let query = query_id(114);
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                projection_budget(),
+                10,
+            )
+            .expect("register persisted file projection query");
+        let snapshot = snapshot_coordinator
+            .pin_persisted(
+                &planning,
+                &[TableRef::Id {
+                    table_id: table_id(NATIVE_TABLE),
+                }],
+            )
+            .await
+            .expect("pin persisted file snapshot");
+        let pinned_file = snapshot.pinned.table(0).unwrap().file(0).unwrap();
+        let expected_file_id = pinned_file.file_id();
+        let expected_size = pinned_file.file_size_bytes();
+        let expected_rows = pinned_file.row_count();
+        drop(pinned_file);
+        let expected_snapshot_version = snapshot.descriptor.tables[0].persisted_snapshot_version;
+        let token = resources
+            .complete_native_planning_at_for_test(planning, snapshot.plan_draft(), snapshot, 10)
+            .expect("complete persisted file projection plan");
+        let execution = resources.begin_execution(token, 11).unwrap();
+        let projected = snapshot_coordinator
+            .project_persisted_snapshot(&execution)
+            .expect("project persisted file snapshot");
+
+        let table = projected
+            .resource()
+            .table(0)
+            .expect("projected native table");
+        assert_eq!(table.table_index(), 0);
+        assert_eq!(table.table_id(), table_id(NATIVE_TABLE));
+        assert_eq!(table.snapshot_version().get(), expected_snapshot_version);
+        assert_eq!(table.file_count(), 1);
+        let file = table.files()[0];
+        assert_eq!(file.key().table_index(), 0);
+        assert_eq!(file.key().file_index(), 0);
+        assert_eq!(file.key().table_id(), table_id(NATIVE_TABLE));
+        assert_eq!(file.file_id(), expected_file_id);
+        assert_eq!(file.snapshot_version().get(), expected_snapshot_version);
+        assert_eq!(file.schema_version(), table.schema_version());
+        assert_eq!(file.file_size_bytes().get(), expected_size);
+        assert_eq!(file.row_count(), expected_rows);
+
+        drop(projected);
+        execution.finish().unwrap();
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projection_budget_failure_precedes_manifest_build_and_rolls_back_task_accounting() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let query = query_id(115);
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register projection query with snapshot-only budget");
+        let snapshot = snapshot_coordinator
+            .pin_persisted(&planning, &mixed_refs())
+            .await
+            .expect("snapshot-only budget still admits pinning");
+        let token = resources
+            .complete_native_planning_at_for_test(planning, snapshot.plan_draft(), snapshot, 10)
+            .expect("complete under-budget projection plan");
+        let execution = resources.begin_execution(token, 11).unwrap();
+
+        let error = snapshot_coordinator
+            .project_persisted_snapshot(&execution)
+            .err()
+            .expect("projection peak must exceed the snapshot-only budget");
+        assert_eq!(error.code(), zippy_types::ErrorCode::ResourceExhausted);
+        let status = resources.status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_cpu_slots, 0);
+        assert_eq!(status.active_task_memory_bytes, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_retained_memory_bytes, 0);
+
+        execution.finish().unwrap();
+        assert_eq!(resources.status().active_memory_bytes, 0);
         assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
     }
 

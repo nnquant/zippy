@@ -59,8 +59,15 @@ Current scope:
   otherwise used by `ParquetAccessPlan`; row-group access plans must be composed into a future
   Zippy-owned extension instead of overwriting the identity.
 
-The next scope is a server binding stage that replaces the planning marker with a
-`ParquetFileReaderFactory` resolving only the typed opaque file identity through a live execution
-lease, followed by multi-file bounded scheduling, result-stream, memory-pool, and spill integration.
-The execution plan must not retain a `TaskContext`, `SessionState`, `RuntimeEnv`, raw path, or a file
-handle detached from its QueryService permit.
+The server now projects these descriptions snapshot-wide from one exact pinned Catalog owner after
+QueryService task admission. It verifies query-level table ordering and uniqueness, descriptor and
+file identities, visibility, versions, and the decoder-produced schema charge before retaining a
+capability-free manifest. This does not make the planning-only provider executable.
+
+The next scope is a zippy-query-owned whole-plan binding and validation stage that replaces every
+planning marker with a `ParquetFileReaderFactory` resolving only the typed opaque file identity
+through a live execution lease. It must reject missing, duplicate, or mismatched bindings before
+multi-file bounded scheduling, result-stream, memory-pool, and spill integration. The execution plan
+must consume or retain the original admitted manifest owner rather than cloning table descriptions
+and releasing their retained-memory permit early. It must not retain a `TaskContext`,
+`SessionState`, `RuntimeEnv`, raw path, or a file handle detached from its QueryService permit.

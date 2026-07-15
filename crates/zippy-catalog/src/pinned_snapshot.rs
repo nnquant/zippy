@@ -38,11 +38,42 @@ pub struct SqliteCatalogPinnedQuerySnapshot {
     owner: Arc<PinnedSnapshotOwner>,
 }
 
+/// Pure scalar metadata used to admit one capability-free snapshot projection.
+///
+/// Reading this value does not clone a table/file capability or expose a physical location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedSnapshotProjectionProfile {
+    table_count: u64,
+    file_count: u64,
+    retained_schema_bytes: u64,
+}
+
+impl PinnedSnapshotProjectionProfile {
+    /// Returns the number of exact table manifests in the pinned snapshot.
+    #[must_use]
+    pub const fn table_count(self) -> u64 {
+        self.table_count
+    }
+
+    /// Returns the number of visible files across every exact table manifest.
+    #[must_use]
+    pub const fn file_count(self) -> u64 {
+        self.file_count
+    }
+
+    /// Returns the sum of verified decoded-schema retained-memory charges.
+    #[must_use]
+    pub const fn retained_schema_bytes(self) -> u64 {
+        self.retained_schema_bytes
+    }
+}
+
 struct PinnedSnapshotOwner {
     snapshot: CatalogQuerySnapshot,
     descriptor: CatalogSnapshotPinDescriptor,
     scan_file_indices: Vec<Box<[usize]>>,
     retained_schema_charge_bytes: Vec<NonZeroU64>,
+    projection_profile: PinnedSnapshotProjectionProfile,
     _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
     _data_directory: Arc<OwnedDataDirectory>,
     // Keep this field last so owned snapshot data and sidecars drop before admission is released.
@@ -104,13 +135,19 @@ impl SqliteCatalogPinnedQuerySnapshot {
                 });
                 indices.into_boxed_slice()
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let projection_profile = projection_profile(
+            snapshot.tables().len(),
+            scan_file_indices.as_slice(),
+            retained_schema_charge_bytes.as_slice(),
+        )?;
         Ok(Self {
             owner: Arc::new(PinnedSnapshotOwner {
                 snapshot,
                 descriptor,
                 scan_file_indices,
                 retained_schema_charge_bytes,
+                projection_profile,
                 _pins: pins,
                 _data_directory: data_directory,
                 _memory_lease: memory_lease,
@@ -145,6 +182,12 @@ impl SqliteCatalogPinnedQuerySnapshot {
         self.owner.snapshot.tables().len()
     }
 
+    /// Returns scalar projection metadata without deriving a table or file capability.
+    #[must_use]
+    pub fn projection_profile(&self) -> PinnedSnapshotProjectionProfile {
+        self.owner.projection_profile
+    }
+
     /// Returns true when the query references no tables.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -167,6 +210,62 @@ impl SqliteCatalogPinnedQuerySnapshot {
             table_index,
         })
     }
+}
+
+fn projection_profile(
+    expected_table_count: usize,
+    scan_file_indices: &[Box<[usize]>],
+    retained_schema_charge_bytes: &[NonZeroU64],
+) -> Result<PinnedSnapshotProjectionProfile> {
+    if scan_file_indices.len() != expected_table_count
+        || retained_schema_charge_bytes.len() != expected_table_count
+    {
+        return Err(ServerError::new(
+            ErrorCode::Internal,
+            "pinned projection sidecar table counts differ",
+        )
+        .with_retryable(false));
+    }
+    let table_count = u64::try_from(scan_file_indices.len()).map_err(|_| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "pinned projection table count exceeds u64",
+        )
+        .with_retryable(false)
+    })?;
+    let file_count = scan_file_indices.iter().try_fold(0_u64, |total, files| {
+        let count = u64::try_from(files.len()).map_err(|_| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "pinned projection file count exceeds u64",
+            )
+            .with_retryable(false)
+        })?;
+        total.checked_add(count).ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "pinned projection file count overflow",
+            )
+            .with_retryable(false)
+        })
+    })?;
+    let retained_schema_bytes =
+        retained_schema_charge_bytes
+            .iter()
+            .try_fold(0_u64, |total, charge| {
+                total.checked_add(charge.get()).ok_or_else(|| {
+                    ServerError::new(
+                        ErrorCode::ResourceExhausted,
+                        "pinned projection schema charge overflow",
+                    )
+                    .with_retryable(false)
+                })
+            })?;
+    Ok(PinnedSnapshotProjectionProfile {
+        table_count,
+        file_count,
+        retained_schema_bytes,
+    })
 }
 
 impl CatalogSnapshotPinGuard for SqliteCatalogPinnedQuerySnapshot {
@@ -200,6 +299,12 @@ pub struct PinnedTableManifest {
 }
 
 impl PinnedTableManifest {
+    /// Returns the deterministic table ordinal in the pinned query snapshot.
+    #[must_use]
+    pub const fn table_index(&self) -> usize {
+        self.table_index
+    }
+
     /// Returns the exact Catalog selector protected by this manifest.
     #[must_use]
     pub fn selector(&self) -> &CatalogSnapshotSelector {
