@@ -3602,6 +3602,7 @@ dependencies = [
  "bytes",
  "datafusion",
  "parquet",
+ "sha2",
  "tokio",
  "zippy-types",
 ]

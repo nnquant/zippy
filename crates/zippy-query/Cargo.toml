@@ -7,6 +7,7 @@ edition.workspace = true
 bytes.workspace = true
 datafusion.workspace = true
 parquet.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 zippy-types = { path = "../zippy-types" }
 

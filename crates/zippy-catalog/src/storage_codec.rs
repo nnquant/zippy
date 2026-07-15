@@ -2,10 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
-use std::mem::{size_of, size_of_val};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
@@ -20,6 +19,7 @@ use zippy_types::schema_contract::{
     MAX_CATALOG_SCHEMA_NESTING_DEPTH as MAX_SCHEMA_NESTING_DEPTH,
 };
 use zippy_types::schema_hash::canonical_catalog_schema_hash_v1;
+use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
 use zippy_types::table::{
     AppendTableDefinition, ColumnName, ColumnSet, FiniteMetadataFloat, FrameTableDefinition,
     KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaDescriptor, SchemaIpcPayload,
@@ -30,8 +30,6 @@ use zippy_types::{ErrorCode, Result, ServerError};
 const MAX_SCHEMA_FLATBUFFER_DEPTH: usize = 64;
 const MAX_SCHEMA_FLATBUFFER_TABLES: usize = 32_768;
 const MAX_SCHEMA_FLATBUFFER_APPARENT_BYTES: usize = 16 * 1024 * 1024;
-const DECODED_SCHEMA_CHARGE_MULTIPLIER: u64 = 2;
-const DECODED_SCHEMA_FIXED_OVERHEAD_BYTES: u64 = 1024;
 const MAX_TYPED_JSON_BYTES: usize = 1024 * 1024;
 const TYPED_JSON_CHUNK_BYTES: usize = 64 * 1024;
 const TYPED_JSON_MAGIC: &[u8; 3] = b"ZCJ";
@@ -148,54 +146,23 @@ pub fn decode_persisted_table_schema(
             format!("persisted catalog table schema is incompatible error=[{error}]"),
         )
     })?;
-    let retained_charge_bytes = decoded_schema_retained_charge(schema.as_ref()).map_err(|error| {
-        ServerError::new(
-            error.code(),
-            format!(
-                "persisted catalog schema retained-memory charge failed schema_version=[{}] error=[{error}]",
-                descriptor.schema_version
-            ),
-        )
-        .with_table_id(descriptor.table_id)
-        .with_retryable(false)
-    })?;
+    let retained_charge_bytes = conservative_arrow_schema_retained_bytes(schema.as_ref())
+        .map_err(|error| {
+            ServerError::new(
+                error.code(),
+                format!(
+                    "persisted catalog schema retained-memory charge failed schema_version=[{}] error=[{error}]",
+                    descriptor.schema_version
+                ),
+            )
+            .with_table_id(descriptor.table_id)
+            .with_retryable(false)
+        })?
+        .get();
     Ok(DecodedPersistedTableSchema {
         schema,
         retained_charge_bytes,
     })
-}
-
-fn decoded_schema_retained_charge(schema: &Schema) -> Result<u64> {
-    let root_bytes = size_of_val(schema)
-        .checked_add(size_of::<SchemaRef>())
-        .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
-        .ok_or_else(|| schema_budget_exhausted("decoded schema root byte charge overflow"))?;
-    let metadata_slots = schema
-        .metadata
-        .capacity()
-        .checked_mul(size_of::<(String, String)>())
-        .ok_or_else(|| schema_budget_exhausted("decoded schema metadata slot charge overflow"))?;
-    let metadata_strings = schema
-        .metadata
-        .iter()
-        .try_fold(0_usize, |bytes, (key, value)| {
-            bytes
-                .checked_add(key.capacity())
-                .and_then(|bytes| bytes.checked_add(value.capacity()))
-                .ok_or_else(|| {
-                    schema_budget_exhausted("decoded schema metadata string charge overflow")
-                })
-        })?;
-    let reported_bytes = root_bytes
-        .checked_add(schema.fields().size())
-        .and_then(|bytes| bytes.checked_add(metadata_slots))
-        .and_then(|bytes| bytes.checked_add(metadata_strings))
-        .ok_or_else(|| schema_budget_exhausted("decoded schema retained byte charge overflow"))?;
-    u64::try_from(reported_bytes)
-        .ok()
-        .and_then(|bytes| bytes.checked_mul(DECODED_SCHEMA_CHARGE_MULTIPLIER))
-        .and_then(|bytes| bytes.checked_add(DECODED_SCHEMA_FIXED_OVERHEAD_BYTES))
-        .ok_or_else(|| schema_budget_exhausted("decoded schema retained byte charge overflow"))
 }
 
 /// Decodes exactly one schema-only Arrow IPC stream supplied by a command.
@@ -1182,6 +1149,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionFields, UnionMode};
     use arrow::ipc::convert::IpcSchemaEncoder;
     use arrow::ipc::writer::StreamWriter;
+    use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FiniteMetadataFloat,
         KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaCompatibility,
@@ -1667,10 +1635,10 @@ mod tests {
         let payload =
             raw_null_field_schema_payload(MAX_SCHEMA_TOTAL_FIELDS, Some("reused"), true, true);
         let schema = decode_schema_ipc_stream(&payload).unwrap();
-        let retained_charge = super::decoded_schema_retained_charge(schema.as_ref()).unwrap();
+        let retained_charge = conservative_arrow_schema_retained_bytes(schema.as_ref()).unwrap();
 
         assert_eq!(schema.fields().len(), MAX_SCHEMA_TOTAL_FIELDS);
-        assert!(retained_charge > payload.len() as u64);
+        assert!(retained_charge.get() > payload.len() as u64);
     }
 
     #[test]

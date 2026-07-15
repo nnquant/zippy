@@ -24,6 +24,7 @@ pub mod resource;
 pub mod runtime;
 pub mod schema_contract;
 pub mod schema_hash;
+pub mod schema_memory;
 pub mod storage;
 pub mod subscription;
 pub mod table;

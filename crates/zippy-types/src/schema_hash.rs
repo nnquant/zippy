@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use arrow::datatypes::{
     DataType, Field, Fields, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode,
 };
+use sha2::digest::Output;
 use sha2::{Digest, Sha256};
 
 const CATALOG_SCHEMA_HASH_DOMAIN_V1: &[u8] = b"zippy.catalog.canonical-arrow-schema.v1\0";
@@ -17,9 +18,25 @@ const SHA256_PREFIX: &str = "sha256-v1:";
 /// this function so a schema cannot cross hash domains accidentally.
 #[must_use]
 pub fn canonical_catalog_schema_hash_v1(schema: &Schema) -> String {
+    let digest = canonical_catalog_schema_digest_output_v1(schema);
+    format!("{SHA256_PREFIX}{digest:x}")
+}
+
+/// Computes the durable Catalog V1 logical digest bytes of an Arrow schema.
+///
+/// This output form avoids hexadecimal formatting when another authenticated
+/// envelope, such as a query admission fingerprint, needs to incorporate the
+/// exact canonical schema content. Metadata key ordering may still require a
+/// bounded temporary allocation.
+#[must_use]
+pub fn canonical_catalog_schema_digest_v1(schema: &Schema) -> [u8; 32] {
+    canonical_catalog_schema_digest_output_v1(schema).into()
+}
+
+fn canonical_catalog_schema_digest_output_v1(schema: &Schema) -> Output<Sha256> {
     let mut encoder = CanonicalArrowSchemaEncoderV1::new();
     encoder.schema(schema);
-    format!("{SHA256_PREFIX}{:x}", encoder.digest.finalize())
+    encoder.digest.finalize()
 }
 
 struct CanonicalArrowSchemaEncoderV1 {
@@ -262,10 +279,11 @@ impl CanonicalArrowSchemaEncoderV1 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use super::canonical_catalog_schema_hash_v1;
+    use super::{canonical_catalog_schema_digest_v1, canonical_catalog_schema_hash_v1};
 
     #[test]
     fn canonical_catalog_schema_hash_v1_has_a_stable_golden_value() {
@@ -275,9 +293,56 @@ mod tests {
             HashMap::from([("source".to_owned(), "feed".to_owned())]),
         );
 
+        let expected = "sha256-v1:ef1c08e2fa3e43f5a32554934a53dec5e9a5e8c639b2af165b348f3fd8b951ab";
+        assert_eq!(canonical_catalog_schema_hash_v1(&schema), expected);
         assert_eq!(
-            canonical_catalog_schema_hash_v1(&schema),
-            "sha256-v1:ef1c08e2fa3e43f5a32554934a53dec5e9a5e8c639b2af165b348f3fd8b951ab"
+            canonical_catalog_schema_digest_v1(&schema),
+            hex_digest(expected.strip_prefix("sha256-v1:").unwrap())
         );
+    }
+
+    #[test]
+    fn canonical_digest_sorts_metadata_and_captures_nested_content() {
+        let mut left_metadata = HashMap::new();
+        left_metadata.insert("currency".to_owned(), "cny".to_owned());
+        left_metadata.insert("source".to_owned(), "feed".to_owned());
+        let mut right_metadata = HashMap::new();
+        right_metadata.insert("source".to_owned(), "feed".to_owned());
+        right_metadata.insert("currency".to_owned(), "cny".to_owned());
+
+        let left = Schema::new_with_metadata(
+            vec![Field::new(
+                "levels",
+                DataType::List(Arc::new(Field::new("price", DataType::Float64, false))),
+                false,
+            )],
+            left_metadata,
+        );
+        let reordered = Schema::new_with_metadata(left.fields().to_vec(), right_metadata);
+        let changed_nested = Schema::new_with_metadata(
+            vec![Field::new(
+                "levels",
+                DataType::List(Arc::new(Field::new("costs", DataType::Float64, false))),
+                false,
+            )],
+            left.metadata().clone(),
+        );
+
+        assert_eq!(
+            canonical_catalog_schema_digest_v1(&left),
+            canonical_catalog_schema_digest_v1(&reordered)
+        );
+        assert_ne!(
+            canonical_catalog_schema_digest_v1(&left),
+            canonical_catalog_schema_digest_v1(&changed_nested)
+        );
+    }
+
+    fn hex_digest(value: &str) -> [u8; 32] {
+        let mut output = [0_u8; 32];
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        output
     }
 }

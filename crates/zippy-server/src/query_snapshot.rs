@@ -21,7 +21,8 @@ use zippy_catalog::{
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
 use zippy_query::{
-    BoxedAsyncFileReader, PersistedFileDescription, PersistedFileKey, PersistedTableDescription,
+    BoxedAsyncFileReader, PersistedFileDescription, PersistedFileKey, PersistedSnapshotDescription,
+    PersistedTableDescription,
 };
 use zippy_types::catalog::CatalogSnapshotSelector;
 use zippy_types::query::QueryTableVersion;
@@ -110,7 +111,7 @@ struct ProjectedSnapshotCharges {
 pub(crate) struct ProjectedSnapshotManifest {
     query_id: QueryId,
     catalog_revision: u64,
-    tables: Vec<PersistedTableDescription>,
+    description: PersistedSnapshotDescription,
     retained_memory_bytes: NonZeroU64,
 }
 
@@ -124,11 +125,15 @@ impl ProjectedSnapshotManifest {
     }
 
     pub(crate) fn tables(&self) -> &[PersistedTableDescription] {
-        &self.tables
+        self.description.tables()
     }
 
     pub(crate) fn table(&self, table_index: usize) -> Option<&PersistedTableDescription> {
-        self.tables.get(table_index)
+        self.description.table(table_index)
+    }
+
+    pub(crate) const fn description(&self) -> &PersistedSnapshotDescription {
+        &self.description
     }
 
     pub(crate) const fn retained_memory_bytes(&self) -> NonZeroU64 {
@@ -1154,7 +1159,6 @@ fn project_pinned_snapshot(
             snapshot_version,
             schema_version,
             decoded.into_schema(),
-            retained_schema_bytes,
             files,
         )
         .map_err(|error| {
@@ -1164,14 +1168,28 @@ fn project_pinned_snapshot(
             )
             .with_table_id(audit.table_id)
         })?;
+        if projected.retained_schema_bytes() != retained_schema_bytes {
+            return Err(corruption(
+                query_id,
+                "query schema charge differs from the pinned Catalog audit",
+            )
+            .with_table_id(audit.table_id));
+        }
         projected_tables.push(projected);
     }
     ensure_projection_active(cancellation, query_id)?;
 
+    let description = PersistedSnapshotDescription::try_new(projected_tables).map_err(|error| {
+        corruption(
+            query_id,
+            format!("persisted snapshot projection is invalid error=[{error}]"),
+        )
+    })?;
+
     Ok(ProjectedSnapshotManifest {
         query_id,
         catalog_revision,
-        tables: projected_tables,
+        description,
         retained_memory_bytes: charges.retained_bytes,
     })
 }

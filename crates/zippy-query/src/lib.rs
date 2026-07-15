@@ -26,10 +26,16 @@ use tokio::task::JoinHandle;
 use zippy_types::{ErrorCode, ServerError};
 
 mod persisted_plan;
+mod prepared_plan;
 
 pub use persisted_plan::{
-    bind_persisted_snapshot_plan, BoundPersistedPlan, PersistedFileDescription, PersistedFileKey,
-    PersistedFileOpenRequest, PersistedFileOpener, PersistedTableDescription, ZippyTableProvider,
+    BoundPersistedPlan, PersistedFileDescription, PersistedFileKey, PersistedFileOpenRequest,
+    PersistedFileOpener, PersistedSnapshotDescription, PersistedTableDescription,
+    ZippyTableProvider,
+};
+pub use prepared_plan::{
+    prepare_persisted_plan, profile_persisted_plan, PersistedPlanLimits, PersistedPlanProfile,
+    PersistedTableBinding, PreparedPersistedPlan,
 };
 
 const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;

@@ -25,6 +25,9 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::ExecutionPlan;
 use parquet::arrow::async_reader::AsyncFileReader;
+use sha2::{Digest, Sha256};
+use zippy_types::schema_hash::canonical_catalog_schema_digest_v1;
+use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
 use zippy_types::{FileId, TableId};
 
 const PERSISTED_OBJECT_STORE_URL: &str = "zippy-query://persisted";
@@ -33,6 +36,7 @@ const PLANNING_ONLY_READER_ERROR: &str =
     "planning-only Zippy Parquet scan has no snapshot-bound reader factory";
 const EXPIRED_EXECUTION_LEASE_ERROR: &str =
     "snapshot-bound Zippy Parquet scan execution lease has expired";
+const PERSISTED_SNAPSHOT_DIGEST_VERSION: u32 = 1;
 
 static PLANNING_READER_FACTORY: LazyLock<Arc<dyn ParquetFileReaderFactory>> =
     LazyLock::new(|| Arc::new(PlanningOnlyParquetReaderFactory));
@@ -219,17 +223,192 @@ impl PersistedFileDescription {
 /// File descriptions are checked for table/snapshot consistency, duplicate identities, schema
 /// monotonicity, and aggregate platform-size overflow at construction. The manifest contains no
 /// storage location and no execution context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedTableDescription {
     table_index: usize,
     table_id: TableId,
     snapshot_version: NonZeroU64,
     schema_version: NonZeroU64,
     schema: SchemaRef,
+    schema_digest: [u8; 32],
     retained_schema_bytes: NonZeroU64,
     files: Arc<[PersistedFileDescription]>,
     total_file_size_bytes: usize,
     total_rows: usize,
+}
+
+/// Validated, capability-free description of every persisted table in one query snapshot.
+///
+/// Construction is the only place that performs cross-table identity validation. The resulting
+/// value is cheap to clone and lets planning, binding, and execution reuse the same proven table
+/// and file ordering without repeatedly scanning the complete manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSnapshotDescription {
+    tables: Arc<[PersistedTableDescription]>,
+    total_file_count: usize,
+    max_files_per_table: usize,
+    total_retained_schema_bytes: u64,
+    max_retained_schema_bytes: u64,
+    max_columns_per_table: usize,
+    manifest_digest: [u8; 32],
+}
+
+impl PersistedSnapshotDescription {
+    /// Creates one nonempty snapshot description after linear-time global identity validation.
+    pub fn try_new(tables: Vec<PersistedTableDescription>) -> Result<Self> {
+        if tables.is_empty() {
+            return Err(binding_error(
+                "persisted snapshot description must contain at least one table",
+            ));
+        }
+
+        let mut table_ids = HashSet::with_capacity(tables.len());
+        let total_file_count = tables.iter().try_fold(0_usize, |total, table| {
+            total
+                .checked_add(table.file_count())
+                .ok_or_else(|| binding_error("persisted snapshot file count overflowed usize"))
+        })?;
+        let mut file_ids = HashSet::with_capacity(total_file_count);
+        let mut max_files_per_table = 0_usize;
+        let mut total_retained_schema_bytes = 0_u64;
+        let mut max_retained_schema_bytes = 0_u64;
+        let mut max_columns_per_table = 0_usize;
+
+        for (expected_table_index, table) in tables.iter().enumerate() {
+            if table.table_index() != expected_table_index {
+                return Err(binding_error(format!(
+                    "persisted table ordinal is not contiguous expected=[{expected_table_index}] actual=[{}]",
+                    table.table_index()
+                )));
+            }
+            if !table_ids.insert(table.table_id()) {
+                return Err(binding_error(format!(
+                    "persisted snapshot contains duplicate table identity table_id=[{}]",
+                    table.table_id().as_u128()
+                )));
+            }
+
+            max_files_per_table = max_files_per_table.max(table.file_count());
+            let retained_schema_bytes = table.retained_schema_bytes().get();
+            total_retained_schema_bytes = total_retained_schema_bytes
+                .checked_add(retained_schema_bytes)
+                .ok_or_else(|| binding_error("persisted snapshot schema bytes overflowed u64"))?;
+            max_retained_schema_bytes = max_retained_schema_bytes.max(retained_schema_bytes);
+            max_columns_per_table = max_columns_per_table.max(table.schema().fields().len());
+
+            for (expected_file_index, file) in table.files().iter().enumerate() {
+                if file.table_index() != expected_table_index
+                    || file.file_index() != expected_file_index
+                    || file.table_id() != table.table_id()
+                    || file.snapshot_version() != table.snapshot_version()
+                    || file.schema_version() > table.schema_version()
+                {
+                    return Err(binding_error(
+                        "persisted snapshot file description is inconsistent",
+                    ));
+                }
+                if !file_ids.insert(file.file_id()) {
+                    return Err(binding_error(format!(
+                        "persisted snapshot contains duplicate physical file identity file_id=[{}]",
+                        file.file_id().as_u128()
+                    )));
+                }
+            }
+        }
+
+        let manifest_digest = persisted_snapshot_digest(&tables)?;
+        Ok(Self {
+            tables: tables.into(),
+            total_file_count,
+            max_files_per_table,
+            total_retained_schema_bytes,
+            max_retained_schema_bytes,
+            max_columns_per_table,
+            manifest_digest,
+        })
+    }
+
+    /// Returns the validated tables in deterministic snapshot order.
+    #[must_use]
+    pub fn tables(&self) -> &[PersistedTableDescription] {
+        &self.tables
+    }
+
+    /// Returns one table by its deterministic snapshot ordinal.
+    #[must_use]
+    pub fn table(&self, table_index: usize) -> Option<&PersistedTableDescription> {
+        self.tables.get(table_index)
+    }
+
+    /// Returns the number of tables in the snapshot description.
+    #[must_use]
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub(crate) const fn total_file_count(&self) -> usize {
+        self.total_file_count
+    }
+
+    pub(crate) const fn max_files_per_table(&self) -> usize {
+        self.max_files_per_table
+    }
+
+    pub(crate) const fn total_retained_schema_bytes(&self) -> u64 {
+        self.total_retained_schema_bytes
+    }
+
+    pub(crate) const fn max_retained_schema_bytes(&self) -> u64 {
+        self.max_retained_schema_bytes
+    }
+
+    pub(crate) const fn max_columns_per_table(&self) -> usize {
+        self.max_columns_per_table
+    }
+
+    pub(crate) const fn manifest_digest(&self) -> [u8; 32] {
+        self.manifest_digest
+    }
+}
+
+fn persisted_snapshot_digest(tables: &[PersistedTableDescription]) -> Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    digest.update(PERSISTED_SNAPSHOT_DIGEST_VERSION.to_le_bytes());
+    digest.update(
+        u64::try_from(tables.len())
+            .map_err(|_| binding_error("persisted snapshot table count exceeds u64"))?
+            .to_le_bytes(),
+    );
+    for table in tables {
+        digest.update(
+            u64::try_from(table.table_index())
+                .map_err(|_| binding_error("persisted snapshot table ordinal exceeds u64"))?
+                .to_le_bytes(),
+        );
+        digest.update(table.table_id().as_u128().to_le_bytes());
+        digest.update(table.snapshot_version().get().to_le_bytes());
+        digest.update(table.schema_version().get().to_le_bytes());
+        digest.update(table.schema_digest());
+        digest.update(table.retained_schema_bytes().get().to_le_bytes());
+        digest.update(
+            u64::try_from(table.file_count())
+                .map_err(|_| binding_error("persisted snapshot file count exceeds u64"))?
+                .to_le_bytes(),
+        );
+        for file in table.files() {
+            digest.update(
+                u64::try_from(file.file_index())
+                    .map_err(|_| binding_error("persisted snapshot file ordinal exceeds u64"))?
+                    .to_le_bytes(),
+            );
+            digest.update(file.file_id().as_u128().to_le_bytes());
+            digest.update(file.snapshot_version().get().to_le_bytes());
+            digest.update(file.schema_version().get().to_le_bytes());
+            digest.update(file.file_size_bytes().get().to_le_bytes());
+            digest.update(file.row_count().get().to_le_bytes());
+        }
+    }
+    Ok(digest.finalize().into())
 }
 
 impl PersistedTableDescription {
@@ -240,9 +419,15 @@ impl PersistedTableDescription {
         snapshot_version: NonZeroU64,
         schema_version: NonZeroU64,
         schema: SchemaRef,
-        retained_schema_bytes: NonZeroU64,
         files: Vec<PersistedFileDescription>,
     ) -> Result<Self> {
+        let retained_schema_bytes = conservative_arrow_schema_retained_bytes(schema.as_ref())
+            .map_err(|error| {
+                DataFusionError::ResourcesExhausted(format!(
+                    "persisted schema retained-memory charge failed error=[{error}]"
+                ))
+            })?;
+        let schema_digest = canonical_catalog_schema_digest_v1(schema.as_ref());
         let mut file_ids = HashSet::with_capacity(files.len());
         let mut total_file_size_bytes = 0_usize;
         let mut total_rows = 0_usize;
@@ -315,6 +500,7 @@ impl PersistedTableDescription {
             snapshot_version,
             schema_version,
             schema,
+            schema_digest,
             retained_schema_bytes,
             files: files.into(),
             total_file_size_bytes,
@@ -352,7 +538,13 @@ impl PersistedTableDescription {
         &self.schema
     }
 
-    /// Returns the Catalog-computed logical memory charge for retaining the decoded schema.
+    /// Returns the canonical content digest of the exact Arrow schema.
+    #[must_use]
+    pub const fn schema_digest(&self) -> [u8; 32] {
+        self.schema_digest
+    }
+
+    /// Returns the shared conservative memory charge for retaining the decoded schema.
     #[must_use]
     pub const fn retained_schema_bytes(&self) -> NonZeroU64 {
         self.retained_schema_bytes
@@ -418,6 +610,9 @@ impl PersistedFileOpenRequest {
 /// returned reader. The implementation must also revalidate the description against its live
 /// execution lease before admitting any physical file task.
 pub trait PersistedFileOpener: Send + Sync + 'static {
+    /// Returns the exact capability-free snapshot this opener is authorized to resolve.
+    fn snapshot_description(&self) -> &PersistedSnapshotDescription;
+
     /// Creates a lazy reader for one snapshot-bound file description.
     fn open_reader(
         &self,
@@ -429,16 +624,24 @@ pub trait PersistedFileOpener: Send + Sync + 'static {
 ///
 /// Keeping the authority weak is intentional: cloning or retaining the DataFusion plan cannot
 /// prolong access to pinned storage after the server drops its native execution lease.
-#[derive(Debug)]
 pub struct BoundPersistedPlan {
     plan: Arc<dyn ExecutionPlan>,
     bound_scan_count: usize,
 }
 
+impl fmt::Debug for BoundPersistedPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundPersistedPlan")
+            .field("root", &self.plan.name())
+            .field("bound_scan_count", &self.bound_scan_count)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BoundPersistedPlan {
-    /// Returns the immutable DataFusion plan while preserving this binding owner.
-    #[must_use]
-    pub const fn execution_plan(&self) -> &Arc<dyn ExecutionPlan> {
+    #[cfg(test)]
+    pub(crate) const fn execution_plan(&self) -> &Arc<dyn ExecutionPlan> {
         &self.plan
     }
 
@@ -456,12 +659,17 @@ impl BoundPersistedPlan {
 /// physical-plan construction task because rewriting temporarily retains both the original and
 /// replacement plan nodes. An empty or optimizer-eliminated persisted scan is valid and produces
 /// a bound count of zero.
-pub fn bind_persisted_snapshot_plan(
+pub(crate) fn bind_persisted_snapshot_plan(
     plan: Arc<dyn ExecutionPlan>,
-    expected_tables: &[PersistedTableDescription],
+    expected_snapshot: &PersistedSnapshotDescription,
     opener: &Arc<dyn PersistedFileOpener>,
 ) -> Result<BoundPersistedPlan> {
-    validate_expected_tables(expected_tables)?;
+    if opener.snapshot_description() != expected_snapshot {
+        return Err(binding_error(
+            "persisted file opener belongs to another snapshot description",
+        ));
+    }
+    let expected_tables = expected_snapshot.tables();
     let bound_factory: Arc<dyn ParquetFileReaderFactory> = Arc::new(BoundParquetReaderFactory {
         opener: Arc::downgrade(opener),
     });
@@ -508,39 +716,6 @@ pub fn bind_persisted_snapshot_plan(
         plan,
         bound_scan_count,
     })
-}
-
-fn validate_expected_tables(expected_tables: &[PersistedTableDescription]) -> Result<()> {
-    let mut table_ids = HashSet::with_capacity(expected_tables.len());
-    let file_capacity = expected_tables.iter().try_fold(0_usize, |total, table| {
-        total
-            .checked_add(table.file_count())
-            .ok_or_else(|| binding_error("expected persisted file count overflowed"))
-    })?;
-    let mut file_ids = HashSet::with_capacity(file_capacity);
-    for (expected_index, table) in expected_tables.iter().enumerate() {
-        if table.table_index() != expected_index {
-            return Err(binding_error(format!(
-                "persisted table ordinal is not contiguous expected=[{expected_index}] actual=[{}]",
-                table.table_index()
-            )));
-        }
-        if !table_ids.insert(table.table_id()) {
-            return Err(binding_error(format!(
-                "persisted snapshot contains duplicate table identity table_id=[{}]",
-                table.table_id().as_u128()
-            )));
-        }
-        for file in table.files() {
-            if !file_ids.insert(file.file_id()) {
-                return Err(binding_error(format!(
-                    "persisted snapshot contains duplicate physical file identity file_id=[{}]",
-                    file.file_id().as_u128()
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_planning_scan(
@@ -743,6 +918,10 @@ fn is_reserved_zippy_scan(parquet: &ParquetExec) -> bool {
             })
 }
 
+pub(crate) fn is_exact_planning_parquet(parquet: &ParquetExec) -> bool {
+    has_factory(parquet, &PLANNING_READER_FACTORY) && is_reserved_zippy_scan(parquet)
+}
+
 fn binding_error(message: impl Into<String>) -> DataFusionError {
     DataFusionError::Plan(message.into())
 }
@@ -777,6 +956,19 @@ impl ParquetFileReaderFactory for BoundParquetReaderFactory {
             .opener
             .upgrade()
             .ok_or_else(|| DataFusionError::Execution(EXPIRED_EXECUTION_LEASE_ERROR.to_owned()))?;
+        let expected_file = opener
+            .snapshot_description()
+            .table(description.table_index())
+            .and_then(|table| table.files().get(description.file_index()))
+            .copied()
+            .ok_or_else(|| {
+                binding_error("persisted reader request is absent from the opener snapshot")
+            })?;
+        if expected_file != description {
+            return Err(binding_error(
+                "persisted reader request differs from the opener snapshot",
+            ));
+        }
         opener
             .open_reader(PersistedFileOpenRequest::new(description, partition_index))
             .map_err(|error| DataFusionError::External(Box::new(error)))
@@ -922,10 +1114,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        bind_persisted_snapshot_plan, has_factory, PersistedFileDescription, PersistedFileKey,
-        PersistedFileOpenRequest, PersistedFileOpener, PersistedTableDescription,
-        PlanningOnlyParquetReaderFactory, ZippyTableProvider, PERSISTED_OBJECT_STORE_URL,
-        PLANNING_ONLY_READER_ERROR, PLANNING_READER_FACTORY,
+        bind_persisted_snapshot_plan as bind_validated_snapshot_plan, has_factory,
+        PersistedFileDescription, PersistedFileKey, PersistedFileOpenRequest, PersistedFileOpener,
+        PersistedSnapshotDescription, PersistedTableDescription, PlanningOnlyParquetReaderFactory,
+        ZippyTableProvider, PERSISTED_OBJECT_STORE_URL, PLANNING_ONLY_READER_ERROR,
+        PLANNING_READER_FACTORY,
     };
     use crate::{BoxedAsyncFileReader, QuerySessionPolicy};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -938,13 +1131,19 @@ mod tests {
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{collect, ExecutionPlan};
+    use zippy_types::schema_memory::conservative_arrow_schema_retained_bytes;
     use zippy_types::{ErrorCode, FileId, ServerError, TableId};
 
     struct RecordingOpener {
+        snapshot: PersistedSnapshotDescription,
         requests: Arc<Mutex<Vec<PersistedFileOpenRequest>>>,
     }
 
     impl PersistedFileOpener for RecordingOpener {
+        fn snapshot_description(&self) -> &PersistedSnapshotDescription {
+            &self.snapshot
+        }
+
         fn open_reader(
             &self,
             request: PersistedFileOpenRequest,
@@ -1010,7 +1209,6 @@ mod tests {
             nonzero(snapshot_version),
             nonzero(2),
             schema(),
-            nonzero(512),
             file_ids
                 .iter()
                 .enumerate()
@@ -1022,15 +1220,28 @@ mod tests {
         .expect("build persisted test table")
     }
 
-    fn recording_opener() -> (
+    fn recording_opener(
+        tables: &[PersistedTableDescription],
+    ) -> (
         Arc<dyn PersistedFileOpener>,
         Arc<Mutex<Vec<PersistedFileOpenRequest>>>,
     ) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let opener: Arc<dyn PersistedFileOpener> = Arc::new(RecordingOpener {
+            snapshot: PersistedSnapshotDescription::try_new(tables.to_vec())
+                .expect("build recording opener snapshot"),
             requests: Arc::clone(&requests),
         });
         (opener, requests)
+    }
+
+    fn bind_persisted_snapshot_plan(
+        plan: Arc<dyn ExecutionPlan>,
+        tables: &[PersistedTableDescription],
+        opener: &Arc<dyn PersistedFileOpener>,
+    ) -> datafusion::common::Result<super::BoundPersistedPlan> {
+        let snapshot = PersistedSnapshotDescription::try_new(tables.to_vec())?;
+        bind_validated_snapshot_plan(plan, &snapshot, opener)
     }
 
     fn planning_config(table: &PersistedTableDescription) -> FileScanConfig {
@@ -1115,7 +1326,6 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![first, wrong_snapshot],
         )
         .is_err());
@@ -1125,7 +1335,6 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![first, file(0, 1, table_id, 7, 10)],
         )
         .is_err());
@@ -1135,7 +1344,6 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![file(1, 0, table_id, 7, 12)],
         )
         .is_err());
@@ -1145,7 +1353,6 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![file(0, 1, table_id, 7, 12)],
         )
         .is_err());
@@ -1155,7 +1362,6 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![file(0, 0, other_table_id, 7, 12)],
         )
         .is_err());
@@ -1165,10 +1371,61 @@ mod tests {
             nonzero(7),
             nonzero(1),
             schema(),
-            nonzero(512),
             vec![file(0, 0, table_id, 7, 12)],
         )
         .is_err());
+    }
+
+    #[test]
+    fn snapshot_description_validates_global_identities_once() {
+        assert!(PersistedSnapshotDescription::try_new(Vec::new()).is_err());
+
+        let first = table(0, 1, 7, &[10]);
+        let duplicate_table = table(1, 1, 7, &[20]);
+        assert!(
+            PersistedSnapshotDescription::try_new(vec![first.clone(), duplicate_table,]).is_err()
+        );
+
+        let duplicate_file = table(1, 2, 7, &[10]);
+        assert!(
+            PersistedSnapshotDescription::try_new(vec![first.clone(), duplicate_file,]).is_err()
+        );
+
+        let noncontiguous = table(2, 3, 7, &[30]);
+        assert!(PersistedSnapshotDescription::try_new(vec![first.clone(), noncontiguous]).is_err());
+
+        let second = table(1, 2, 7, &[20, 21]);
+        let snapshot = PersistedSnapshotDescription::try_new(vec![first, second])
+            .expect("build globally valid snapshot description");
+        assert_eq!(snapshot.table_count(), 2);
+        assert_eq!(snapshot.total_file_count(), 3);
+        assert_eq!(snapshot.max_files_per_table(), 2);
+        assert_eq!(snapshot.tables()[1].table_id(), table_id(2));
+    }
+
+    #[test]
+    fn snapshot_description_accepts_maximum_expected_file_scale_linearly() {
+        let file_ids = (1_u128..=4096).collect::<Vec<_>>();
+        let snapshot = PersistedSnapshotDescription::try_new(vec![table(0, 1, 7, &file_ids)])
+            .expect("validate 4096-file snapshot");
+        assert_eq!(snapshot.total_file_count(), 4096);
+    }
+
+    #[test]
+    fn binder_rejects_an_opener_for_another_snapshot_synchronously() {
+        let expected = table(0, 1, 7, &[10]);
+        let foreign = table(0, 2, 8, &[20]);
+        let expected_snapshot =
+            PersistedSnapshotDescription::try_new(vec![expected.clone()]).unwrap();
+        let (foreign_opener, requests) = recording_opener(&[foreign]);
+        let error = bind_validated_snapshot_plan(
+            marked_plan(planning_config(&expected)),
+            &expected_snapshot,
+            &foreign_opener,
+        )
+        .expect_err("foreign snapshot opener must fail during binding");
+        assert!(error.to_string().contains("another snapshot"));
+        assert!(requests.lock().expect("request log lock").is_empty());
     }
 
     #[tokio::test]
@@ -1180,7 +1437,6 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![file(0, 0, table_id, 7, 10)],
         )
         .expect("build projection test table");
@@ -1219,11 +1475,13 @@ mod tests {
             nonzero(7),
             nonzero(2),
             schema(),
-            nonzero(512),
             vec![first, second],
         )
         .expect("build test table description");
-        assert_eq!(table.retained_schema_bytes(), nonzero(512));
+        assert_eq!(
+            table.retained_schema_bytes(),
+            conservative_arrow_schema_retained_bytes(table.schema().as_ref()).unwrap()
+        );
         let provider = Arc::new(ZippyTableProvider::new(table));
         let context =
             QuerySessionPolicy::new(std::num::NonZeroUsize::new(2).unwrap()).create_context();
@@ -1275,7 +1533,7 @@ mod tests {
             assert_eq!(*extension, expected);
         }
         let planning_plan = Arc::clone(&plan);
-        let (opener, _) = recording_opener();
+        let (opener, _) = recording_opener(std::slice::from_ref(provider.description()));
         let bound = bind_persisted_snapshot_plan(
             plan,
             std::slice::from_ref(provider.description()),
@@ -1302,7 +1560,6 @@ mod tests {
             nonzero(1),
             nonzero(1),
             schema(),
-            nonzero(512),
             Vec::new(),
         )
         .expect("build empty persisted table description");
@@ -1341,7 +1598,7 @@ mod tests {
             .create_physical_plan()
             .await
             .expect("create persisted self-join physical plan");
-        let (opener, _) = recording_opener();
+        let (opener, _) = recording_opener(std::slice::from_ref(&table));
         let bound = bind_persisted_snapshot_plan(plan, std::slice::from_ref(&table), &opener)
             .expect("bind distinct self-join scans");
         assert_eq!(bound.bound_scan_count(), 2);
@@ -1366,7 +1623,8 @@ mod tests {
             .await
             .expect("create persisted multi-table physical plan");
         let expected_tables = [table, other_table];
-        let bound = bind_persisted_snapshot_plan(plan, &expected_tables, &opener)
+        let (multi_table_opener, _) = recording_opener(&expected_tables);
+        let bound = bind_persisted_snapshot_plan(plan, &expected_tables, &multi_table_opener)
             .expect("bind different persisted table ordinals");
         assert_eq!(bound.bound_scan_count(), 2);
     }
@@ -1374,7 +1632,7 @@ mod tests {
     #[test]
     fn binder_rejects_missing_foreign_reused_and_already_bound_markers() {
         let table = table(0, 1, 7, &[10]);
-        let (opener, _) = recording_opener();
+        let (opener, _) = recording_opener(std::slice::from_ref(&table));
 
         let missing: Arc<dyn ExecutionPlan> =
             ParquetExec::builder(planning_config(&table)).build_arc();
@@ -1428,7 +1686,7 @@ mod tests {
     #[test]
     fn binder_rejects_tampered_manifest_metadata_before_opening() {
         let table = table(0, 1, 7, &[10, 11]);
-        let (opener, requests) = recording_opener();
+        let (opener, requests) = recording_opener(std::slice::from_ref(&table));
 
         let mut config = planning_config(&table);
         config.object_store_url = ObjectStoreUrl::local_filesystem();
@@ -1578,7 +1836,7 @@ mod tests {
     #[test]
     fn bound_factory_revalidates_file_meta_and_expires_with_opener() {
         let table = table(0, 1, 7, &[10]);
-        let (opener, requests) = recording_opener();
+        let (opener, requests) = recording_opener(std::slice::from_ref(&table));
         let bound = bind_persisted_snapshot_plan(
             marked_plan(planning_config(&table)),
             std::slice::from_ref(&table),
