@@ -878,6 +878,16 @@ impl SqlPreflightVisitor {
                     "persisted SQL WINDOW expressions are unsupported because physical ordering expansion is not pre-admissible",
                 ));
             }
+            if function
+                .name
+                .0
+                .last()
+                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("unnest"))
+            {
+                return Err(plan_error(
+                    "persisted SQL UNNEST is unsupported because schema-driven expansion is not pre-admissible",
+                ));
+            }
             if !function.within_group.is_empty()
                 || [&function.parameters, &function.args]
                     .into_iter()
@@ -892,14 +902,15 @@ impl SqlPreflightVisitor {
                     "persisted SQL ordered aggregate expressions are unsupported because physical ordering expansion is not pre-admissible",
                 ));
             }
-            if function
-                .name
-                .0
-                .last()
-                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("unnest"))
-            {
+            let is_bounded_aggregate = function.name.0.len() == 1
+                && function.name.0.last().is_some_and(|identifier| {
+                    ["count", "min", "max", "sum", "avg"]
+                        .iter()
+                        .any(|name| identifier.value.eq_ignore_ascii_case(name))
+                });
+            if !is_bounded_aggregate {
                 return Err(plan_error(
-                    "persisted SQL UNNEST is unsupported because schema-driven expansion is not pre-admissible",
+                    "persisted SQL function is outside the bounded aggregate allowlist",
                 ));
             }
         }
@@ -1646,6 +1657,38 @@ mod tests {
         prepare_persisted_plan(policy(), &sql, &bindings, &tables, profile)
             .await
             .expect("prepare repeated scalar subqueries under clone-fanout admission");
+    }
+
+    #[tokio::test]
+    async fn constant_function_outputs_fail_before_optimizer_materialization() {
+        let tables = vec![table(0, 1, 0)];
+        let bindings = vec![binding("ticks", 0)];
+        for sql in [
+            "select repeat('x', 1000000000) from ticks",
+            concat!(
+                "select repeat('x', 1000000000 + ",
+                "cast(false and price > 0 as bigint)) from ticks"
+            ),
+            "select abs(price) from ticks",
+        ] {
+            let error = profile_persisted_plan(sql, &bindings, &tables, limits())
+                .expect_err("non-aggregate function must fail before optimizer evaluation");
+            assert!(error.to_string().contains("bounded aggregate allowlist"));
+        }
+
+        for sql in [
+            "select count(*) from ticks",
+            "select min(price) from ticks",
+            "select max(price) from ticks",
+            "select sum(price) from ticks",
+            "select avg(price) from ticks",
+        ] {
+            let profile = profile_persisted_plan(sql, &bindings, &tables, limits())
+                .expect("profile bounded aggregate function");
+            prepare_persisted_plan(policy(), sql, &bindings, &tables, profile)
+                .await
+                .expect("prepare bounded aggregate function");
+        }
     }
 
     #[test]
