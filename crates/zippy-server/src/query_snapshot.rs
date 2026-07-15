@@ -1340,10 +1340,13 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::async_reader::AsyncFileReader;
-    use parquet::file::reader::ChunkReader;
+    use parquet::file::reader::{ChunkReader, Length};
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
-    use zippy_query::{AdmittedAsyncParquetReader, PersistedFileDescription, PersistedFileKey};
+    use zippy_query::{
+        parquet_metadata_memory_charge, AdmittedAsyncParquetReader, PersistedFileDescription,
+        PersistedFileKey, PARQUET_TRAILER_SIZE_BYTES,
+    };
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
@@ -2322,6 +2325,25 @@ mod tests {
         assert_eq!(resources.status().active_tasks, 1);
         assert_eq!(resources.status().active_result_permits, 0);
 
+        let file_size_bytes = source.len();
+        let trailer_size_bytes =
+            u64::try_from(PARQUET_TRAILER_SIZE_BYTES).expect("Parquet trailer length fits u64");
+        let trailer_bytes = source
+            .get_bytes(
+                file_size_bytes
+                    .checked_sub(trailer_size_bytes)
+                    .expect("persisted Parquet file contains its trailer"),
+                PARQUET_TRAILER_SIZE_BYTES,
+            )
+            .expect("read query-accounted Parquet trailer");
+        let mut trailer = [0_u8; PARQUET_TRAILER_SIZE_BYTES];
+        trailer.copy_from_slice(trailer_bytes.as_ref());
+        let expected_metadata_memory_bytes =
+            parquet_metadata_memory_charge(file_size_bytes, &trailer)
+                .expect("compute admitted Parquet metadata charge");
+        drop(trailer_bytes);
+        assert_eq!(resources.status().active_result_permits, 0);
+
         let range = source
             .get_bytes(0, 4)
             .expect("read one query-accounted Parquet range");
@@ -2352,6 +2374,10 @@ mod tests {
             .expect("read permit-owned async Parquet metadata");
         assert_eq!(metadata.num_row_groups(), 1);
         assert_eq!(metadata.file_metadata().num_rows(), 1);
+        assert_eq!(
+            resources.status().active_task_memory_bytes,
+            expected_metadata_memory_bytes.get()
+        );
         drop(async_reader);
         assert_eq!(resources.status().active_result_permits, 0);
         assert_eq!(resources.status().active_result_memory_bytes, 0);

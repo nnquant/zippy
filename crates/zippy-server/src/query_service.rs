@@ -2630,6 +2630,12 @@ impl CoordinatorInner {
     fn finish(&self, control: &Arc<QueryControl>) -> Result<()> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
         if query.active_tasks != 0
             || query.active_retained_permits != 0
             || query.active_result_permits != 0
@@ -2642,12 +2648,6 @@ impl CoordinatorInner {
                 ),
             )
             .with_query_id(control.query_id));
-        }
-        if query.state.is_terminal() {
-            return Err(query.error.clone().unwrap_or_else(|| {
-                ServerError::new(ErrorCode::Conflict, "query is already terminal")
-                    .with_query_id(control.query_id)
-            }));
         }
         if query.state != QueryState::Running {
             return Err(
@@ -5715,6 +5715,92 @@ mod tests {
         assert_eq!(coordinator.status().active_task_memory_bytes, 0);
         first.finish().unwrap();
         second.finish().unwrap();
+    }
+
+    #[test]
+    fn task_memory_growth_and_admin_cancel_are_linearized_across_all_ledgers() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let session = session_id(1);
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session,
+                None,
+                query_budget,
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let instance_id = token.instance_id();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let task = execution.admit_task(charge(1, 20), ()).unwrap();
+        let cancellation = task.cancellation();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            let mut task = task;
+            worker_barrier.wait();
+            let result = task.grow_memory_to(NonZeroU64::new(80).unwrap());
+            (task, result)
+        });
+
+        barrier.wait();
+        coordinator.admin_handle().cancel(instance_id).unwrap();
+        let (task, growth) = worker.join().unwrap();
+        let terminal = cancellation
+            .terminal_signal()
+            .expect("administrator cancellation publishes a terminal signal");
+        let query_status = coordinator.admin_handle().status(instance_id).unwrap();
+        assert_eq!(terminal.state, QueryState::Cancelled);
+        assert_eq!(terminal.state, query_status.state);
+        assert_eq!(terminal.error, query_status.error);
+
+        let expected_memory = match growth {
+            Ok(()) => 80,
+            Err(error) => {
+                assert_eq!(Some(error), terminal.error);
+                20
+            }
+        };
+        assert_eq!(query_status.active_task_memory_bytes, expected_memory);
+        assert_eq!(
+            coordinator.status().active_task_memory_bytes,
+            expected_memory
+        );
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(session)
+                .active_task_memory_bytes,
+            expected_memory
+        );
+
+        drop(task);
+        drop(execution);
+        let status = coordinator.status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_cpu_slots, 0);
+        assert_eq!(status.active_task_memory_bytes, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert_eq!(status.tracked_sessions, 0);
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(session)
+                .active_memory_bytes,
+            0
+        );
     }
 
     #[test]

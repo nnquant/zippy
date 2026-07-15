@@ -133,6 +133,24 @@ struct NativeExecutionAuthority {
     snapshot_coordinator: NativeQuerySnapshotCoordinator,
     accepting_readers: AtomicBool,
     execution: Mutex<Option<QueryExecutionScope>>,
+    #[cfg(test)]
+    reader_admission_pause: Mutex<Option<Arc<ReaderAdmissionPause>>>,
+}
+
+#[cfg(test)]
+struct ReaderAdmissionPause {
+    entered: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl ReaderAdmissionPause {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        }
+    }
 }
 
 impl NativeExecutionAuthority {
@@ -146,6 +164,8 @@ impl NativeExecutionAuthority {
             snapshot_coordinator,
             accepting_readers: AtomicBool::new(true),
             execution: Mutex::new(Some(execution)),
+            #[cfg(test)]
+            reader_admission_pause: Mutex::new(None),
         }
     }
 
@@ -164,6 +184,8 @@ impl NativeExecutionAuthority {
         if !self.accepting_readers.load(Ordering::Acquire) {
             return Err(closed_execution(self.binding.instance_id));
         }
+        #[cfg(test)]
+        self.pause_reader_after_initial_gate();
         let execution = self
             .execution
             .lock()
@@ -189,6 +211,19 @@ impl NativeExecutionAuthority {
             },
             description,
         )
+    }
+
+    #[cfg(test)]
+    fn pause_reader_after_initial_gate(&self) {
+        let pause = self
+            .reader_admission_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(pause) = pause {
+            pause.entered.wait();
+            pause.resume.wait();
+        }
     }
 }
 
@@ -502,28 +537,38 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use parquet::errors::ParquetError;
     use tempfile::TempDir;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
     use zippy_query::{
-        PersistedSnapshotDescription, PersistedTableBinding, PersistedTableDescription,
-        QuerySessionPolicy,
+        PersistedFileDescription, PersistedSnapshotDescription, PersistedTableBinding,
+        PersistedTableDescription, QuerySessionPolicy,
     };
+    use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
         CreateNamespaceCommand, CreateTableCommand,
     };
     use zippy_types::query::QueryState;
     use zippy_types::table::{
-        AppendTableDefinition, CatalogName, SchemaIpcPayload, TableDefinition, TableRef,
+        AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance,
+        SchemaIpcPayload, SourceSegmentIdentity, SourceSegmentLineage, SourceSegmentLineages,
+        TableDefinition, TableRef,
     };
     use zippy_types::{
-        ErrorCode, NamespaceId, QueryId, RequestId, ServerError, SessionId, TableId,
+        ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, QueryId,
+        RequestId, ServerError, SessionId, TableId,
     };
 
-    use super::{AdmittedPreparedPersistedPlan, NativeExecutionLease, PHYSICAL_BUILD_CPU_SLOTS};
+    use super::{
+        AdmittedPreparedPersistedPlan, NativeExecutionLease, ReaderAdmissionPause,
+        PERSISTED_FILE_TASK_MEMORY_BYTES, PHYSICAL_BUILD_CPU_SLOTS,
+    };
     use crate::legacy_catalog_migration::LEGACY_STREAM_NAME_CONFIG_KEY;
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
@@ -589,6 +634,52 @@ mod tests {
         SchemaIpcPayload::new(bytes).expect("nonempty schema IPC")
     }
 
+    fn persist_request() -> PersistRequest {
+        let offset = LogOffset::new(0);
+        let offsets = OffsetRange::new(offset, offset).expect("single offset range");
+        let provenance = NativeDataFileProvenance::new(
+            offsets,
+            SourceSegmentLineages::new(vec![SourceSegmentLineage {
+                source: SourceSegmentIdentity {
+                    segment_id: 1,
+                    generation: 1,
+                    writer_epoch: 0,
+                },
+                offsets,
+            }])
+            .expect("one source segment lineage"),
+        )
+        .expect("valid native provenance");
+        let schema = schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42_i64]))],
+        )
+        .expect("build persisted query batch");
+        let candidate = PersistCandidateInput::new(
+            ParquetCandidateSpec {
+                file_id: FileId::from_u128(100).expect("nonzero file ID"),
+                table_id: table_id(TABLE),
+                schema_version: 1,
+                schema,
+                provenance,
+                partition: MetadataMap::new(),
+                metadata: MetadataMap::new(),
+                created_at_ns: 1_752_492_600_000_000_100,
+            },
+            vec![batch],
+        )
+        .expect("build persisted query candidate");
+        PersistRequest::new(
+            request_id(100),
+            table_id(TABLE),
+            1,
+            vec![candidate],
+            OffsetWatermark::Known(offset),
+        )
+        .expect("build persist request")
+    }
+
     fn actor() -> CatalogActor {
         CatalogActor {
             kind: CatalogActorKind::Server,
@@ -611,7 +702,7 @@ mod tests {
         .into()
     }
 
-    async fn seed_catalog(catalog: &SqliteCatalog, extra_revision: bool) {
+    async fn seed_catalog(catalog: &SqliteCatalog, extra_revision: bool, active_table: bool) {
         catalog
             .command(command(
                 1,
@@ -624,7 +715,9 @@ mod tests {
             .await
             .expect("create namespace");
         let mut config = BTreeMap::new();
-        config.insert(LEGACY_STREAM_NAME_CONFIG_KEY.to_owned(), "ticks".to_owned());
+        if !active_table {
+            config.insert(LEGACY_STREAM_NAME_CONFIG_KEY.to_owned(), "ticks".to_owned());
+        }
         catalog
             .command(command(
                 2,
@@ -655,7 +748,7 @@ mod tests {
         }
     }
 
-    async fn start_runtime(extra_revision: bool) -> TestRuntime {
+    async fn start_runtime_with_table(extra_revision: bool, active_table: bool) -> TestRuntime {
         let temp = tempfile::tempdir().expect("create temp directory");
         let ownership = Arc::new(
             OwnedDataDirectory::acquire_or_initialize(temp.path().join("database"))
@@ -663,7 +756,7 @@ mod tests {
         );
         let catalog_config = SqliteCatalogConfig::new(&ownership);
         let catalog = SqliteCatalog::open(catalog_config.clone()).expect("open seed Catalog");
-        seed_catalog(&catalog, extra_revision).await;
+        seed_catalog(&catalog, extra_revision, active_table).await;
         catalog.close().expect("close seed Catalog");
         let runtime_config = NativeStorageRuntimeConfig::new(&ownership)
             .with_catalog_config(catalog_config)
@@ -679,6 +772,21 @@ mod tests {
             _ownership: ownership,
             runtime,
         }
+    }
+
+    async fn start_runtime(extra_revision: bool) -> TestRuntime {
+        start_runtime_with_table(extra_revision, false).await
+    }
+
+    async fn start_runtime_with_file() -> TestRuntime {
+        let test = start_runtime_with_table(false, true).await;
+        test.runtime
+            .table_actor(table_id(TABLE))
+            .expect("native table actor")
+            .persist(persist_request())
+            .await
+            .expect("persist one native Parquet file");
+        test
     }
 
     fn budget() -> QueryResourceBudget {
@@ -772,6 +880,168 @@ mod tests {
             .cancellation()
     }
 
+    fn persisted_description(lease: &NativeExecutionLease) -> PersistedFileDescription {
+        lease
+            .opener
+            .as_ref()
+            .expect("live lease owns its file opener")
+            .snapshot_description()
+            .table(0)
+            .and_then(|table| table.files().first())
+            .copied()
+            .expect("persisted snapshot contains one file")
+    }
+
+    #[derive(Clone, Copy)]
+    enum LeaseTerminalAction {
+        Finish,
+        Fail,
+        Drop,
+    }
+
+    async fn assert_second_reader_gate(action: LeaseTerminalAction, value: u128) {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, value).await;
+        let cancellation = lease_cancellation(&lease);
+        let authority = Arc::clone(&lease.authority);
+        let description = persisted_description(&lease);
+        let pause = Arc::new(ReaderAdmissionPause::new());
+        *authority
+            .reader_admission_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&pause));
+        let worker_authority = Arc::clone(&authority);
+        let worker = std::thread::spawn(move || worker_authority.open_reader(description));
+        pause.entered.wait();
+
+        let expected_state = match action {
+            LeaseTerminalAction::Finish => {
+                lease.finish().expect("finish before reader admission");
+                QueryState::Finished
+            }
+            LeaseTerminalAction::Fail => {
+                lease
+                    .fail(ServerError::new(
+                        ErrorCode::Internal,
+                        "physical execution failed before reader admission",
+                    ))
+                    .expect("fail before reader admission");
+                QueryState::Failed
+            }
+            LeaseTerminalAction::Drop => {
+                drop(lease);
+                QueryState::Cancelled
+            }
+        };
+        pause.resume.wait();
+        let open_error = worker
+            .join()
+            .expect("join paused persisted reader")
+            .err()
+            .expect("second reader gate must reject the closed execution");
+        assert_eq!(open_error.code(), ErrorCode::Cancelled);
+        assert_eq!(
+            cancellation
+                .terminal_signal()
+                .expect("lease action publishes one terminal signal")
+                .state,
+            expected_state
+        );
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_cpu_slots, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert_eq!(status.tracked_sessions, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
+        test.shutdown();
+    }
+
+    async fn assert_reader_outlives_lease(action: LeaseTerminalAction, value: u128) {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, value).await;
+        let cancellation = lease_cancellation(&lease);
+        let authority = Arc::clone(&lease.authority);
+        let description = persisted_description(&lease);
+        let reader = authority
+            .open_reader(description)
+            .expect("admit one real persisted reader");
+
+        let expected_error = match action {
+            LeaseTerminalAction::Fail => {
+                let error = ServerError::new(
+                    ErrorCode::Internal,
+                    "physical execution failed with an admitted reader",
+                )
+                .with_query_id(lease.instance_id().query_id());
+                lease
+                    .fail(error.clone())
+                    .expect("publish failure with admitted reader");
+                Some(error)
+            }
+            LeaseTerminalAction::Drop => {
+                drop(lease);
+                None
+            }
+            LeaseTerminalAction::Finish => panic!("finish has a separate conflict test"),
+        };
+        let terminal = cancellation
+            .terminal_signal()
+            .expect("lease action publishes a terminal signal");
+        match expected_error {
+            Some(error) => {
+                assert_eq!(terminal.state, QueryState::Failed);
+                assert_eq!(terminal.error, Some(error));
+            }
+            None => assert_eq!(terminal.state, QueryState::Cancelled),
+        }
+        let closed = authority
+            .open_reader(description)
+            .err()
+            .expect("terminated lease rejects another persisted reader");
+        assert_eq!(closed.code(), ErrorCode::Cancelled);
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 1);
+        assert_eq!(status.active_cpu_slots, 1);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(
+            test.runtime
+                .runtime_query_snapshot_pins()
+                .expect("read retained query snapshot pins")
+                .len(),
+            1
+        );
+        drop(reader);
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_cpu_slots, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert_eq!(status.tracked_sessions, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
+        test.shutdown();
+    }
+
+    fn deferred_open_server_error(error: &ParquetError) -> &ServerError {
+        match error {
+            ParquetError::External(source) => source
+                .downcast_ref::<ServerError>()
+                .expect("deferred native reader preserves its structured ServerError"),
+            other => panic!("deferred native reader returned an unexpected error: {other}"),
+        }
+    }
+
     #[tokio::test]
     async fn successful_finish_failure_and_drop_release_execution_authority() {
         let mut test = start_runtime(false).await;
@@ -824,6 +1094,19 @@ mod tests {
         test.shutdown();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_admission_second_gate_linearizes_finish_fail_and_drop() {
+        assert_second_reader_gate(LeaseTerminalAction::Finish, 151).await;
+        assert_second_reader_gate(LeaseTerminalAction::Fail, 152).await;
+        assert_second_reader_gate(LeaseTerminalAction::Drop, 153).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_reader_fail_and_drop_keep_task_pin_until_reader_drop() {
+        assert_reader_outlives_lease(LeaseTerminalAction::Fail, 161).await;
+        assert_reader_outlives_lease(LeaseTerminalAction::Drop, 162).await;
+    }
+
     #[tokio::test]
     async fn finish_with_outstanding_task_cancels_and_leaves_only_that_task_accounted() {
         let mut test = start_runtime(false).await;
@@ -856,6 +1139,231 @@ mod tests {
         let status = test.runtime.query_resource_coordinator().status();
         assert_eq!(status.active_tasks, 0);
         assert_eq!(status.active_retained_permits, 0);
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_reader_finish_closes_admission_and_drains_task_and_snapshot_pin() {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, 251).await;
+        assert_eq!(lease.plan().bound_scan_count(), 1);
+        let cancellation = lease_cancellation(&lease);
+        let authority = Arc::clone(&lease.authority);
+        let description = lease
+            .opener
+            .as_ref()
+            .expect("live lease owns its file opener")
+            .snapshot_description()
+            .table(0)
+            .and_then(|table| table.files().first())
+            .copied()
+            .expect("persisted snapshot contains one file");
+        let reader = authority
+            .open_reader(description)
+            .expect("admit one real persisted reader");
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 1);
+        assert_eq!(status.active_retained_permits, 1);
+        assert_eq!(
+            test.runtime
+                .runtime_query_snapshot_pins()
+                .expect("read active query snapshot pins")
+                .len(),
+            1
+        );
+
+        let error = lease
+            .finish()
+            .expect_err("finish must reject the admitted persisted reader");
+        assert_eq!(error.code(), ErrorCode::Conflict);
+        assert_eq!(
+            cancellation
+                .terminal_signal()
+                .expect("failed finish publishes cancellation")
+                .state,
+            QueryState::Cancelled
+        );
+        let closed = authority
+            .open_reader(description)
+            .err()
+            .expect("closed execution must reject another persisted reader");
+        assert_eq!(closed.code(), ErrorCode::Cancelled);
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 1);
+        assert_eq!(status.active_retained_permits, 0);
+        drop(reader);
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_lease_with_reader_finish_returns_first_terminal_error() {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, 252).await;
+        let instance_id = lease.instance_id();
+        let cancellation = lease_cancellation(&lease);
+        let authority = Arc::clone(&lease.authority);
+        let description = lease
+            .opener
+            .as_ref()
+            .expect("live lease owns its file opener")
+            .snapshot_description()
+            .table(0)
+            .and_then(|table| table.files().first())
+            .copied()
+            .expect("persisted snapshot contains one file");
+        let reader = authority
+            .open_reader(description)
+            .expect("admit one real persisted reader");
+
+        let admin = test.runtime.query_resource_coordinator().admin_handle();
+        admin
+            .cancel(instance_id)
+            .expect("administrator cancellation wins the terminal transition");
+        let terminal = cancellation
+            .terminal_signal()
+            .expect("administrator cancellation publishes a terminal signal");
+        let status = admin
+            .status(instance_id)
+            .expect("cancelled query remains visible while its reader is active");
+        assert_eq!(terminal.state, QueryState::Cancelled);
+        assert_eq!(terminal.state, status.state);
+        assert_eq!(terminal.error, status.error);
+
+        let error = lease
+            .finish()
+            .expect_err("late finish must return the first terminal error");
+        assert_eq!(Some(error), terminal.error);
+        let closed = authority
+            .open_reader(description)
+            .err()
+            .expect("late finish closes persisted reader admission");
+        assert_eq!(closed.code(), ErrorCode::Cancelled);
+
+        drop(reader);
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
+        test.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_footer_growth_rejection_is_sticky_and_releases_task_and_pin() {
+        let mut test = start_runtime_with_file().await;
+        let lease = prepare_lease(&test, 253).await;
+        let instance_id = lease.instance_id();
+        let authority = Arc::clone(&lease.authority);
+        let description = persisted_description(&lease);
+        let mut reader = authority
+            .open_reader(description)
+            .expect("admit one real persisted reader");
+        let admin = test.runtime.query_resource_coordinator().admin_handle();
+        let before_fill = admin
+            .status(instance_id)
+            .expect("read query resources before filling its budget");
+        assert_eq!(
+            before_fill.active_task_memory_bytes,
+            PERSISTED_FILE_TASK_MEMORY_BYTES
+        );
+        let filler_memory = DEFAULT_QUERY_MAX_MEMORY_BYTES
+            .checked_sub(before_fill.active_memory_bytes)
+            .and_then(NonZeroU64::new)
+            .expect("query has positive memory remaining after reader admission");
+        let filler = {
+            let execution = authority
+                .execution
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            execution
+                .as_ref()
+                .expect("live lease owns execution scope")
+                .admit_build_task(QueryTaskCharge {
+                    cpu_slots: NonZeroU32::new(1).expect("nonzero filler CPU charge"),
+                    memory_bytes: filler_memory,
+                })
+                .expect("fill the query memory budget after reader admission")
+        };
+        assert_eq!(
+            admin
+                .status(instance_id)
+                .expect("read full query memory budget")
+                .active_memory_bytes,
+            DEFAULT_QUERY_MAX_MEMORY_BYTES
+        );
+
+        let first_error = reader
+            .get_metadata()
+            .await
+            .expect_err("footer charge growth must be rejected at the full budget");
+        assert_eq!(
+            deferred_open_server_error(&first_error).code(),
+            ErrorCode::ResourceExhausted
+        );
+        let after_first = admin
+            .status(instance_id)
+            .expect("failed deferred open remains query-visible");
+        assert_eq!(after_first.active_tasks, 1);
+        assert_eq!(after_first.active_task_memory_bytes, filler_memory.get());
+        assert_eq!(
+            after_first.active_memory_bytes,
+            DEFAULT_QUERY_MAX_MEMORY_BYTES - PERSISTED_FILE_TASK_MEMORY_BYTES
+        );
+
+        let second_error = reader
+            .get_metadata()
+            .await
+            .expect_err("deferred footer growth failure remains sticky");
+        assert_eq!(
+            deferred_open_server_error(&second_error).code(),
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(
+            admin
+                .status(instance_id)
+                .expect("sticky failure does not change resource accounting"),
+            after_first
+        );
+
+        drop(filler);
+        lease
+            .fail(
+                ServerError::new(
+                    ErrorCode::ResourceExhausted,
+                    "persisted Parquet metadata exceeded the query memory budget",
+                )
+                .with_query_id(instance_id.query_id()),
+            )
+            .expect("publish footer admission failure");
+        drop(reader);
+
+        let status = test.runtime.query_resource_coordinator().status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_cpu_slots, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert_eq!(status.tracked_sessions, 0);
+        assert!(test
+            .runtime
+            .runtime_query_snapshot_pins()
+            .expect("read drained query snapshot pins")
+            .is_empty());
         test.shutdown();
     }
 
