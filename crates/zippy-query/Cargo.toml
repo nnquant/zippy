@@ -1,0 +1,14 @@
+[package]
+name = "zippy-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+
+[dev-dependencies]
+arrow.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

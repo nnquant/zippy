@@ -2165,9 +2165,24 @@ WebUI、maintenance 和 compaction 的进程所有权、启动/关闭、健康�
 
 目标：服务器拥有完整查询计划和执行。
 
+Stage 5.1 Arrow/DataFusion ABI spike 已完成（2026-07-15）：新增独立 `zippy-query` crate，固定
+DataFusion `44.0.0`，只启用 `parquet` 与 `recursive_protection` feature。该版本声明 Arrow/Parquet
+`53.3.0` 兼容范围，当前锁图将
+Zippy workspace、DataFusion 和 Parquet 统一解析为 `53.4.1`，没有第二套 Arrow 类型。编译期测试把
+workspace `RecordBatch` 直接赋给 DataFusion re-export 类型，并单独验证 clone 后 Arrow value buffer 地址
+不变；另一项运行时测试把 workspace batch 注册到隔离的 `SessionContext` 并执行 SQL。不允许增加
+IPC/FFI round-trip 作为版本不兼容的补救。当前 Rust `1.86` 工具链还要求锁定传递依赖
+`comfy-table 7.1.4` 和 `psm 0.1.28`；后者避免 recursive protection 解析到要求 Rust 1.88 的 archive
+writer。升级任一依赖前必须先提升并验证 workspace Rust 基线。
+
+此提交只建立查询 crate 和 per-session context policy，不把 DataFusion 依赖接入 `zippy-server`、ingest、
+table actor 或 callback 热路径，也不宣称查询 authority 已切换。下一小步先让 native planner 产出不含
+服务端时间的 capability-free draft，再实现持有 QueryService task permit 的 pinned Parquet source；
+DataFusion 不能取得裸路径、裸文件或脱离资源账本的 reader。
+
 任务：
 
-1. 完成 DataFusion/Arrow version spike。
+1. 完成 DataFusion/Arrow version spike。（已完成）
 2. 新建 `zippy-query` 和 per-session `SessionContext` policy。
 3. 实现 `ZippyTableProvider`。
 4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。
