@@ -32,9 +32,14 @@ Current scope:
   concurrency, or snapshot-pin accounting has been released. Every materialized Parquet range
   first obtains a separate exact memory permit; `Bytes::from_owner` retains that permit through all
   zero-copy clones and releases it only with the final clone.
+- an `AdmittedAsyncParquetReader` that moves range and metadata work onto Tokio blocking workers.
+  Each in-flight worker retains the admitted source and a shared capacity-one operation permit even
+  if its async future is dropped, preventing detached blocking jobs from bypassing the file task's
+  CPU admission. All returned ranges keep the same exact result-memory permits as the synchronous
+  adapter. One admitted source must not be scanned concurrently through both its synchronous and
+  asynchronous adapters because the operation gate covers async blocking jobs only.
 
-The current synchronous adapter is for the first bounded-blocking persisted scan slice. DataFusion
-44's stock `ParquetExec` uses an asynchronous file-reader factory, so the next scope is a
-permit-owned async reader and snapshot-bound `ZippyTableProvider`, followed by multi-file bounded
-scheduling, result-stream, memory-pool, and spill integration. Neither adapter may receive a raw
-path or a file handle detached from its QueryService permit.
+The next scope is a server `ParquetFileReaderFactory` that resolves only opaque query file IDs and a
+snapshot-bound `ZippyTableProvider`, followed by multi-file bounded scheduling, result-stream,
+memory-pool, and spill integration. Neither adapter may receive a raw path or a file handle detached
+from its QueryService permit.

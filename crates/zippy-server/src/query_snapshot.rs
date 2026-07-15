@@ -666,9 +666,11 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::async_reader::AsyncFileReader;
     use parquet::file::reader::ChunkReader;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::OwnedDataDirectory;
+    use zippy_query::AdmittedAsyncParquetReader;
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1,
@@ -1132,6 +1134,17 @@ mod tests {
         assert_eq!(resources.status().active_result_permits, 1);
         assert_eq!(resources.status().active_result_memory_bytes, 4);
         drop(cloned_range);
+        assert_eq!(resources.status().active_result_permits, 0);
+        assert_eq!(resources.status().active_result_memory_bytes, 0);
+
+        let mut async_reader = AdmittedAsyncParquetReader::new(source.clone());
+        let metadata = async_reader
+            .get_metadata()
+            .await
+            .expect("read permit-owned async Parquet metadata");
+        assert_eq!(metadata.num_row_groups(), 1);
+        assert_eq!(metadata.file_metadata().num_rows(), 1);
+        drop(async_reader);
         assert_eq!(resources.status().active_result_permits, 0);
         assert_eq!(resources.status().active_result_memory_bytes, 0);
 

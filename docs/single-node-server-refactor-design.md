@@ -2207,10 +2207,20 @@ buffer；返回值使用 `Bytes::from_owner(QueryResultPermit<Vec<u8>>)`，所�
 同一 reservation，只有最终 clone drop 才释放 result permit 和字节额度。大 range 的 positioned I/O 按
 1 MiB 分块，在块间重新检查取消；分块只负责取消响应，动态 result permit 才是内存硬边界。
 
-这一小步仍只提供 bounded-blocking 同步 scan primitive。DataFusion 44 的标准 `ParquetExec` 使用
-`ParquetFileReaderFactory/AsyncFileReader`；后续 `ZippyTableProvider` 必须给异步 reader 复用同一 permit
-ownership 规则，并以 opaque table/file identity 代替真实路径。多文件调度、filter/projection physical
-plan、result stream 和 authority switch 尚未完成。
+Stage 5.4a permit-owned async Parquet reader 已完成（2026-07-15）：
+`AdmittedAsyncParquetReader` 实现 Parquet `AsyncFileReader`，把 range read 和 metadata parsing 交给
+`tokio::spawn_blocking`，避免同步 descriptor I/O 阻塞 async runtime worker。每个 blocking job clone 的仍是
+完整 admitted source，并持有所有 source clone 共享的 capacity-one operation permit，因此调用方 drop future
+时既不会提前归还 task/CPU/pin，也不能反复 poll/drop future 向 Tokio blocking queue 注入无界 detached job；
+job 返回的 `Bytes` 继续携带 exact-size result-memory permit。单元测试覆盖 async range/footer metadata 以及
+drop future 后第二个 job 必须等待真实 I/O 退出，server 真实 persisted 文件测试覆盖 permit-owned async
+metadata 路径。同一个 admitted source 在执行层只能选择同步或异步 adapter 之一，不能并发混用，因为该
+operation gate 只约束 async blocking job；生产 DataFusion 路径固定使用异步 adapter。
+
+这一阶段尚未实现 DataFusion `ParquetFileReaderFactory`。后续 factory 的 `FileMeta.location` 只能作为 opaque
+query-file key 在 capability-free manifest 中查表，不能编码真实路径；`create_reader` 必须先通过 execution
+admission 派生 file task，实际 open/checksum 仍延迟到 blocking job。`ZippyTableProvider`、projection/filter
+physical plan、多文件调度与 result stream 仍未完成。
 
 任务：
 

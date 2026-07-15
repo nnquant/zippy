@@ -8,14 +8,20 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+use std::future::Future;
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::reader::{ChunkReader, Length};
+use tokio::sync::Semaphore;
 
 const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
 
@@ -50,6 +56,7 @@ pub trait AdmittedRandomAccessFile: Send + Sync + 'static {
 /// cannot release its query task reservation or snapshot lease while physical reads remain.
 pub struct AdmittedParquetSource<R: AdmittedRandomAccessFile> {
     inner: Arc<R>,
+    blocking_operation_gate: Arc<Semaphore>,
 }
 
 impl<R: AdmittedRandomAccessFile> AdmittedParquetSource<R> {
@@ -58,6 +65,7 @@ impl<R: AdmittedRandomAccessFile> AdmittedParquetSource<R> {
     pub fn new(reader: R) -> Self {
         Self {
             inner: Arc::new(reader),
+            blocking_operation_gate: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -66,6 +74,7 @@ impl<R: AdmittedRandomAccessFile> Clone for AdmittedParquetSource<R> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            blocking_operation_gate: Arc::clone(&self.blocking_operation_gate),
         }
     }
 }
@@ -167,6 +176,75 @@ impl<R: AdmittedRandomAccessFile> Read for AdmittedParquetCursor<R> {
     }
 }
 
+/// An asynchronous Parquet reader that delegates positioned I/O to blocking scan workers.
+///
+/// The wrapped source and every blocking job retain the same admitted file owner. Dropping an
+/// in-flight future therefore cannot release task or snapshot ownership before its blocking I/O
+/// exits. All readers cloned from one source also share a capacity-one operation gate, so detached
+/// blocking work cannot exceed the file task's admitted CPU slot. Each returned [`Bytes`] retains
+/// its own exact query-memory reservation. A source used by this adapter must not be scanned
+/// concurrently through its synchronous [`ChunkReader`] API, which is intentionally outside the
+/// async operation gate.
+pub struct AdmittedAsyncParquetReader<R: AdmittedRandomAccessFile> {
+    source: AdmittedParquetSource<R>,
+}
+
+impl<R: AdmittedRandomAccessFile> AdmittedAsyncParquetReader<R> {
+    /// Creates an async reader over an already admitted Parquet source.
+    #[must_use]
+    pub fn new(source: AdmittedParquetSource<R>) -> Self {
+        Self { source }
+    }
+}
+
+impl<R: AdmittedRandomAccessFile> AsyncFileReader for AdmittedAsyncParquetReader<R> {
+    fn get_bytes(
+        &mut self,
+        range: Range<usize>,
+    ) -> Pin<Box<dyn Future<Output = ParquetResult<Bytes>> + Send + '_>> {
+        let source = self.source.clone();
+        let operation_gate = Arc::clone(&source.blocking_operation_gate);
+        Box::pin(async move {
+            let start = u64::try_from(range.start).map_err(|_| {
+                ParquetError::EOF("async Parquet range start does not fit u64".to_owned())
+            })?;
+            let length = range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| ParquetError::EOF("async Parquet range is reversed".to_owned()))?;
+            let operation_permit = operation_gate.acquire_owned().await.map_err(|_| {
+                ParquetError::General("admitted Parquet operation gate is closed".to_owned())
+            })?;
+            tokio::task::spawn_blocking(move || {
+                let _operation_permit = operation_permit;
+                source.get_bytes(start, length)
+            })
+            .await
+            .map_err(|error| ParquetError::External(Box::new(error)))?
+        })
+    }
+
+    fn get_metadata(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = ParquetResult<Arc<ParquetMetaData>>> + Send + '_>> {
+        let source = self.source.clone();
+        let operation_gate = Arc::clone(&source.blocking_operation_gate);
+        Box::pin(async move {
+            let operation_permit = operation_gate.acquire_owned().await.map_err(|_| {
+                ParquetError::General("admitted Parquet operation gate is closed".to_owned())
+            })?;
+            tokio::task::spawn_blocking(move || {
+                let _operation_permit = operation_permit;
+                ParquetMetaDataReader::new()
+                    .parse_and_finish(&source)
+                    .map(Arc::new)
+            })
+            .await
+            .map_err(|error| ParquetError::External(Box::new(error)))?
+        })
+    }
+}
+
 /// Immutable policy used to create one query session context.
 ///
 /// A context is intentionally not shared between client sessions. Catalog registration,
@@ -202,17 +280,20 @@ mod tests {
     use std::io::{self, Read};
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use arrow::array::{Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+    use parquet::arrow::async_reader::AsyncFileReader;
+    use parquet::arrow::ArrowWriter;
     use parquet::file::reader::ChunkReader;
 
     use super::{
-        AdmittedParquetSource, AdmittedRandomAccessFile, QuerySessionPolicy,
-        MAX_POSITIONED_READ_BYTES,
+        AdmittedAsyncParquetReader, AdmittedParquetSource, AdmittedRandomAccessFile,
+        QuerySessionPolicy, MAX_POSITIONED_READ_BYTES,
     };
 
     struct TestAdmittedFile {
@@ -330,6 +411,73 @@ mod tests {
         fn read_at(&self, _offset: u64, _buffer: &mut [u8]) -> io::Result<usize> {
             Ok(0)
         }
+    }
+
+    struct BlockingRangeFile {
+        contents: Arc<[u8]>,
+        read_entries: tokio::sync::mpsc::UnboundedSender<usize>,
+        read_count: Arc<AtomicUsize>,
+        first_read_release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl AdmittedRandomAccessFile for BlockingRangeFile {
+        type RangeBuffer = Vec<u8>;
+
+        fn file_size_bytes(&self) -> u64 {
+            self.contents.len() as u64
+        }
+
+        fn reserve_range_buffer(&self, length: usize) -> io::Result<Self::RangeBuffer> {
+            Ok(vec![0_u8; length])
+        }
+
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+            let read_number = self.read_count.fetch_add(1, Ordering::SeqCst);
+            self.read_entries.send(read_number).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "read observer was dropped")
+            })?;
+            if read_number == 0 {
+                let (released, release_signal) = &*self.first_read_release;
+                let mut released = released.lock().expect("lock first read release");
+                while !*released {
+                    released = release_signal
+                        .wait(released)
+                        .expect("wait for first read release");
+                }
+            }
+
+            let offset = usize::try_from(offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "read offset does not fit usize",
+                )
+            })?;
+            if offset >= self.contents.len() || buffer.is_empty() {
+                return Ok(0);
+            }
+            let read = buffer.len().min(self.contents.len() - offset);
+            buffer[..read].copy_from_slice(&self.contents[offset..offset + read]);
+            Ok(read)
+        }
+    }
+
+    fn parquet_fixture() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("build async Parquet fixture batch");
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, schema, None).expect("create Parquet fixture writer");
+        writer.write(&batch).expect("write Parquet fixture batch");
+        writer.close().expect("close Parquet fixture writer");
+        bytes
     }
 
     #[test]
@@ -477,5 +625,89 @@ mod tests {
             largest_read.load(Ordering::Relaxed),
             MAX_POSITIONED_READ_BYTES
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_parquet_reader_uses_the_admitted_source_for_ranges_and_metadata() {
+        let contents = parquet_fixture();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source = AdmittedParquetSource::new(TestAdmittedFile::new(
+            &contents,
+            contents.len() as u64,
+            Arc::clone(&drops),
+        ));
+        let mut reader = AdmittedAsyncParquetReader::new(source);
+
+        assert_eq!(
+            reader
+                .get_bytes(0..4)
+                .await
+                .expect("read async Parquet magic")
+                .as_ref(),
+            b"PAR1"
+        );
+        let metadata = reader
+            .get_metadata()
+            .await
+            .expect("read async Parquet metadata");
+        assert_eq!(metadata.num_row_groups(), 1);
+        assert_eq!(metadata.file_metadata().num_rows(), 3);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        drop(reader);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_async_future_keeps_the_shared_blocking_gate_until_io_exits() {
+        let (read_entries, mut observed_reads) = tokio::sync::mpsc::unbounded_channel();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let first_read_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let source = AdmittedParquetSource::new(BlockingRangeFile {
+            contents: Arc::from(&b"0123456789"[..]),
+            read_entries,
+            read_count: Arc::clone(&read_count),
+            first_read_release: Arc::clone(&first_read_release),
+        });
+        let mut reader = AdmittedAsyncParquetReader::new(source);
+
+        {
+            let first_read = reader.get_bytes(0..1);
+            tokio::pin!(first_read);
+            tokio::select! {
+                result = &mut first_read => panic!("first read unexpectedly completed: {result:?}"),
+                observed = observed_reads.recv() => assert_eq!(observed, Some(0)),
+            }
+        }
+
+        let second_read = reader.get_bytes(1..2);
+        tokio::pin!(second_read);
+        tokio::select! {
+            result = &mut second_read => panic!("second read bypassed the blocking gate: {result:?}"),
+            observed = observed_reads.recv() => panic!("second blocking read entered early: {observed:?}"),
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert_eq!(read_count.load(Ordering::SeqCst), 1);
+
+        {
+            let (released, release_signal) = &*first_read_release;
+            *released.lock().expect("lock first read release") = true;
+            release_signal.notify_all();
+        }
+
+        assert_eq!(
+            second_read
+                .await
+                .expect("second read completes after first I/O exits")
+                .as_ref(),
+            b"1"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observed_reads.recv())
+                .await
+                .expect("observe second blocking read"),
+            Some(1)
+        );
+        assert_eq!(read_count.load(Ordering::SeqCst), 2);
     }
 }
