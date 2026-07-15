@@ -2089,6 +2089,14 @@ reservation 和 snapshot-owner 计数。
 为已 drain。公开 `RecordBatchStream` 目前仍直接返回裸 `RecordBatch`，所以 result permit 只是后续
 native stream/Flight delivery 的内部原语，尚不能覆盖客户端取得 batch 后的长期持有。
 
+Stage 4.5 执行失败终态小步已完成（2026-07-15）：`QueryExecutionScope::fail(error)` 消费唯一执行
+scope，并在同一个 `global -> query` 临界区只允许 `Running -> Failed`。QueryService 会把真实 query ID
+绑定到算子错误、释放 logical admission、删除 deadline、设置 cancellation flag，并在锁外发布一次终态
+通知；scope drop 不会再把已记录的执行错误覆盖成 `Cancelled`。失败可以与仍存活的 task/result permit
+并存，后者收到取消后仍按既有 RAII 规则退出：最后一个 task 撤销 snapshot root，最后一个 result permit
+才使 terminal 实例进入 retention。执行失败与 owner/admin cancel、timeout 或 shutdown 竞争时继续遵循
+first-terminal-wins，迟到的 `fail` 返回已经存在的终态错误。
+
 这一小步仍是 native staging，不是 authority 切换。可信 session policy、完整外部 `QueryStatus`、
 DataFusion operator/result-stream 的实际取消传播仍未完成；当前 Python/Gateway `collect_stream` 也仍绕过
 native QueryService，因此不能据此宣称生产查询已经获得多租户隔离或统一资源治理。

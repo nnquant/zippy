@@ -129,6 +129,11 @@ count ceiling, and task-to-result handoff reclassifies charges atomically. A que
 `Finished` until result delivery reservations are gone. This is usage accounting only; per-session
 quotas wait for a trusted connection/session authority. The native result permit is not yet attached
 to the public `RecordBatchStream`, so this does not make the native query frontend production-ready.
+Physical executors now have one consuming `QueryExecutionScope::fail(error)` boundary: it records a
+`Running -> Failed` transition, preserves the original structured error, wakes cancellation waiters,
+and leaves task/result reservations to drain through RAII. Concurrent cancellation, timeout, and
+shutdown retain whichever terminal transition commits first; scope drop cannot relabel an execution
+failure as cancellation.
 
 ## Managed data root ownership
 

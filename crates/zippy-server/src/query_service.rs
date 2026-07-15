@@ -1916,6 +1916,38 @@ impl CoordinatorInner {
         Ok(())
     }
 
+    fn fail_execution(&self, control: &Arc<QueryControl>, error: ServerError) -> Result<()> {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Running {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not running")
+                    .with_query_id(control.query_id)
+                    .with_retryable(false),
+            );
+        }
+        let signal = Self::terminate_locked(
+            &mut global,
+            control,
+            &mut query,
+            QueryState::Failed,
+            Some(error.with_query_id(control.query_id)),
+            now_ns(),
+        );
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+        drop(query);
+        drop(global);
+        control.publish_terminal(signal);
+        release_snapshot_root(snapshot_root);
+        Ok(())
+    }
+
     fn terminate_control(
         &self,
         control: &Arc<QueryControl>,
@@ -2581,6 +2613,21 @@ impl QueryExecutionScope {
             .with_query_id(self.control.query_id)
         })?;
         owner.finish(&self.control)?;
+        self.armed = false;
+        drop(self.ownership.take());
+        Ok(())
+    }
+
+    /// Records a physical execution error without allowing scope drop to relabel it as cancellation.
+    pub(crate) fn fail(mut self, error: ServerError) -> Result<()> {
+        let owner = self.control.owner.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "QueryService coordinator is unavailable",
+            )
+            .with_query_id(self.control.query_id)
+        })?;
+        owner.fail_execution(&self.control, error)?;
         self.armed = false;
         drop(self.ownership.take());
         Ok(())
@@ -4246,6 +4293,121 @@ mod tests {
 
         drop(result);
         assert_eq!(coordinator.status().active_result_permits, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn execution_failure_preserves_error_and_drains_physical_resources() {
+        let coordinator = coordinator(config());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&drops)),
+                10,
+            )
+            .unwrap();
+        let instance_id = token.instance_id();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let cancellation = execution.cancellation();
+        let task = execution.admit_task(charge(1, 20), ()).unwrap();
+        let result = execution.admit_result(result_charge(10), ()).unwrap();
+
+        execution
+            .fail(
+                ServerError::new(ErrorCode::InvalidArgument, "physical operator failed")
+                    .with_query_id(query_id(99))
+                    .with_retryable(false),
+            )
+            .unwrap();
+
+        let status = coordinator.admin_handle().status(instance_id).unwrap();
+        assert_eq!(status.state, QueryState::Failed);
+        assert!(!status.logical_admitted);
+        assert!(status.cancellation_requested);
+        let error = status.error.expect("execution failure is retained");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error.message(), "physical operator failed");
+        assert_eq!(error.query_id(), Some(id));
+        let signal = cancellation
+            .terminal_signal()
+            .expect("execution failure wakes cancellation waiters");
+        assert_eq!(signal.state, QueryState::Failed);
+        assert_eq!(signal.error, Some(error));
+        assert!(task.is_cancelled());
+        assert!(result.is_cancelled());
+        assert_eq!(coordinator.status().active_tasks, 1);
+        assert_eq!(coordinator.status().active_result_permits, 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        drop(task);
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().tracked_sessions, 1);
+        drop(result);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn concurrent_execution_failure_and_admin_cancel_keep_first_terminal() {
+        let coordinator = coordinator(config());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&drops)),
+                10,
+            )
+            .unwrap();
+        let instance_id = token.instance_id();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let cancellation = execution.cancellation();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            execution.fail(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "physical operator failed",
+            ))
+        });
+
+        barrier.wait();
+        coordinator.admin_handle().cancel(instance_id).unwrap();
+        let failure_result = worker.join().unwrap();
+        let status = coordinator.admin_handle().status(instance_id).unwrap();
+        let signal = cancellation
+            .terminal_signal()
+            .expect("the winning terminal transition is published");
+        assert_eq!(signal.state, status.state);
+        assert_eq!(signal.error, status.error);
+        match status.state {
+            QueryState::Failed => {
+                failure_result.expect("execution failure won the terminal race");
+                assert_eq!(
+                    status.error.as_ref().map(ServerError::code),
+                    Some(ErrorCode::InvalidArgument)
+                );
+            }
+            QueryState::Cancelled => {
+                assert_eq!(
+                    failure_result.expect_err("administrator cancellation won the terminal race"),
+                    status
+                        .error
+                        .expect("cancelled query retains its terminal error")
+                );
+            }
+            state => panic!("unexpected terminal state [{state:?}]"),
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().tracked_sessions, 0);
     }
 
