@@ -2356,6 +2356,132 @@ impl CoordinatorInner {
         })
     }
 
+    fn rebuild_retained_with_task(
+        self: &Arc<Self>,
+        retained_control: &Arc<QueryControl>,
+        task_control: &Arc<QueryControl>,
+        old_retained_charge: QueryRetainedCharge,
+        task_charge: QueryTaskCharge,
+        new_retained_charge: QueryRetainedCharge,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(retained_control, task_control)
+            || retained_control.query_id != task_control.query_id
+            || retained_control.generation != task_control.generation
+        {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                "retained rebuild resources belong to different query instances",
+            )
+            .with_query_id(retained_control.query_id)
+            .with_retryable(false));
+        }
+
+        let old_retained_memory_bytes = old_retained_charge.memory_bytes.get();
+        let task_memory_bytes = task_charge.memory_bytes.get();
+        let rebuild_peak_memory_bytes = old_retained_memory_bytes
+            .checked_add(task_memory_bytes)
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "retained rebuild memory reservation is exhausted",
+                )
+                .with_query_id(retained_control.query_id)
+                .with_retryable(false)
+            })?;
+        let new_retained_memory_bytes = new_retained_charge.memory_bytes.get();
+        if new_retained_memory_bytes > rebuild_peak_memory_bytes {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                format!(
+                    concat!(
+                        "rebuilt retained query resource exceeds its combined reservation ",
+                        "old_retained=[{}] task=[{}] rebuilt=[{}]"
+                    ),
+                    old_retained_memory_bytes, task_memory_bytes, new_retained_memory_bytes
+                ),
+            )
+            .with_query_id(retained_control.query_id)
+            .with_retryable(false));
+        }
+
+        let mut global = self.state.lock().unwrap();
+        let mut query = retained_control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(retained_control.query_id)
+            }));
+        }
+        if query.state != QueryState::Running {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not running")
+                    .with_query_id(retained_control.query_id),
+            );
+        }
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(retained_control.query_id));
+        }
+
+        let cpu_slots = task_charge.cpu_slots.get();
+        debug_assert!(query.active_tasks > 0 && global.active_tasks > 0);
+        debug_assert!(query.active_retained_permits > 0 && global.active_retained_permits > 0);
+        let query_task_memory_after = query
+            .active_task_memory_bytes
+            .checked_sub(task_memory_bytes)
+            .expect("task reservation owns its per-query memory charge");
+        let query_retained_memory_after = query
+            .active_retained_memory_bytes
+            .checked_sub(old_retained_memory_bytes)
+            .and_then(|memory| memory.checked_add(new_retained_memory_bytes))
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "per-query retained rebuild accounting is exhausted",
+                )
+                .with_query_id(retained_control.query_id)
+                .with_retryable(false)
+            })?;
+        let global_task_memory_after = global
+            .active_task_memory_bytes
+            .checked_sub(task_memory_bytes)
+            .expect("task reservation owns its global memory charge");
+        let global_retained_memory_after = global
+            .active_retained_memory_bytes
+            .checked_sub(old_retained_memory_bytes)
+            .and_then(|memory| memory.checked_add(new_retained_memory_bytes))
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "global retained rebuild accounting is exhausted",
+                )
+                .with_query_id(retained_control.query_id)
+                .with_retryable(false)
+            })?;
+
+        query.active_tasks -= 1;
+        query.active_cpu_slots -= cpu_slots;
+        query.active_task_memory_bytes = query_task_memory_after;
+        query.active_retained_memory_bytes = query_retained_memory_after;
+        global.active_tasks -= 1;
+        global.active_cpu_slots -= cpu_slots;
+        global.active_task_memory_bytes = global_task_memory_after;
+        global.active_retained_memory_bytes = global_retained_memory_after;
+        let session = global
+            .sessions
+            .get_mut(&retained_control.owner_session_id)
+            .expect("active retained rebuild keeps its session resource ledger");
+        debug_assert!(session.active_tasks > 0 && session.active_retained_permits > 0);
+        session.active_tasks -= 1;
+        session.active_cpu_slots -= cpu_slots;
+        session.active_task_memory_bytes -= task_memory_bytes;
+        session.active_retained_memory_bytes = session
+            .active_retained_memory_bytes
+            .checked_sub(old_retained_memory_bytes)
+            .and_then(|memory| memory.checked_add(new_retained_memory_bytes))
+            .expect("session retained rebuild accounting remains within global budget");
+        Ok(())
+    }
+
     fn release_retained(&self, control: &Arc<QueryControl>, charge: QueryRetainedCharge) {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
@@ -3202,6 +3328,15 @@ impl QueryExecutionScope {
         self.admit_snapshot_task(charge, |snapshot| build(snapshot, charge))
     }
 
+    /// Admits an empty physical-build task before any charged resource is allocated.
+    ///
+    /// The caller must construct the charged resource inside a permit-owned conversion such as
+    /// [`QueryRetainedPermit::rebuild_with_build_task`], so CPU and peak memory are already
+    /// reserved.
+    pub(crate) fn admit_build_task(&self, charge: QueryTaskCharge) -> Result<QueryTaskPermit<()>> {
+        self.admit_task(charge, ())
+    }
+
     fn admit_task<R: Send + 'static>(
         &self,
         charge: QueryTaskCharge,
@@ -3337,6 +3472,47 @@ struct QueryRetainedReservation {
     owner: Weak<CoordinatorInner>,
     control: Arc<QueryControl>,
     charge: Option<QueryRetainedCharge>,
+}
+
+impl QueryRetainedReservation {
+    fn try_rebuild_with_task(
+        &mut self,
+        task: &mut QueryTaskReservation,
+        new_charge: QueryRetainedCharge,
+    ) -> Result<()> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(self.control.query_id))?;
+        let task_owner = task
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(task.control.query_id))?;
+        if !Arc::ptr_eq(&owner, &task_owner) {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                "retained rebuild resources belong to different QueryService coordinators",
+            )
+            .with_query_id(self.control.query_id)
+            .with_retryable(false));
+        }
+        let old_charge = self
+            .charge
+            .expect("live retained reservation retains its resource charge");
+        let task_charge = task
+            .charge
+            .expect("live task reservation retains its resource charge");
+        owner.rebuild_retained_with_task(
+            &self.control,
+            &task.control,
+            old_charge,
+            task_charge,
+            new_charge,
+        )?;
+        self.charge = Some(new_charge);
+        task.charge = None;
+        Ok(())
+    }
 }
 
 impl Drop for QueryRetainedReservation {
@@ -3539,6 +3715,54 @@ impl<R: Send + 'static> QueryRetainedPermit<R> {
             .and_then(|reservation| reservation.charge)
             .expect("live retained permit owns its memory reservation")
             .memory_bytes
+    }
+
+    /// Rebuilds a retained resource under a separately admitted physical-task reservation.
+    ///
+    /// `convert` runs without the service lock while both the old retained charge and task peak
+    /// remain accounted. After it produces the replacement, the coordinator atomically replaces
+    /// the old retained kind and memory charge and releases the task/CPU charge. The replacement
+    /// charge may use at most the combined old-retained and task memory reservations.
+    ///
+    /// A rejected commit destroys the replacement before normal RAII releases the old retained
+    /// and task permits. The two permits must belong to the exact same running query instance.
+    /// Only an empty permit issued by [`QueryExecutionScope::admit_build_task`] is accepted, so a
+    /// pinned file, reader, or other task capability cannot be reclassified as retained memory.
+    pub(crate) fn rebuild_with_build_task<U>(
+        mut self,
+        mut task: QueryTaskPermit<()>,
+        convert: impl FnOnce(R, ()) -> Result<(U, QueryRetainedCharge)>,
+    ) -> Result<QueryRetainedPermit<U>>
+    where
+        U: Send + 'static,
+    {
+        let retained_resource = self
+            .resource
+            .take()
+            .expect("live retained permit owns its query resource");
+        task.resource
+            .take()
+            .expect("live task permit retains its empty physical-build resource");
+        let (rebuilt_resource, new_charge) = convert(retained_resource, ())?;
+        let rebuild = self
+            .reservation
+            .as_mut()
+            .expect("live retained permit owns its memory reservation")
+            .try_rebuild_with_task(
+                task.reservation
+                    .as_mut()
+                    .expect("live task permit retains its resource reservation"),
+                new_charge,
+            );
+        if let Err(error) = rebuild {
+            drop(rebuilt_resource);
+            return Err(error);
+        }
+        drop(task.ownership.take());
+        Ok(QueryRetainedPermit {
+            resource: Some(rebuilt_resource),
+            reservation: self.reservation.take(),
+        })
     }
 }
 
@@ -3840,6 +4064,16 @@ mod tests {
         drops: Arc<AtomicUsize>,
     }
 
+    struct RebuiltAccountingDropProbe {
+        coordinator: QueryResourceCoordinator,
+        observed_active_tasks: Arc<AtomicUsize>,
+        observed_active_retained_permits: Arc<AtomicUsize>,
+        observed_active_retained_memory_bytes: Arc<AtomicUsize>,
+        retained_resource: DropProbe,
+        task_resource: DropProbe,
+        drops: Arc<AtomicUsize>,
+    }
+
     impl Drop for RetainedAccountingDropProbe {
         fn drop(&mut self) {
             self.observed_active_retained_permits.store(
@@ -3854,6 +4088,23 @@ mod tests {
         fn drop(&mut self) {
             self.observed_active_tasks
                 .store(self.coordinator.status().active_tasks, Ordering::Relaxed);
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for RebuiltAccountingDropProbe {
+        fn drop(&mut self) {
+            let status = self.coordinator.status();
+            self.observed_active_tasks
+                .store(status.active_tasks, Ordering::Relaxed);
+            self.observed_active_retained_permits
+                .store(status.active_retained_permits, Ordering::Relaxed);
+            self.observed_active_retained_memory_bytes.store(
+                usize::try_from(status.active_retained_memory_bytes)
+                    .expect("test retained memory fits usize"),
+                Ordering::Relaxed,
+            );
+            let _ = (&self.retained_resource, &self.task_resource);
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5685,6 +5936,446 @@ mod tests {
         assert_eq!(observed_permits.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_retained_permits, 0);
         assert_eq!(coordinator.status().active_memory_bytes, 0);
+    }
+
+    #[test]
+    fn retained_rebuild_atomically_replaces_charge_and_releases_task() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let owner_session_id = session_id(1);
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                owner_session_id,
+                None,
+                QueryResourceBudget {
+                    max_active_tasks: 2,
+                    max_cpu_slots: 2,
+                    max_memory_bytes: 100,
+                },
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let retained_resource_drops = Arc::new(AtomicUsize::new(0));
+        let task_resource_drops = Arc::new(AtomicUsize::new(0));
+        let rebuilt_drops = Arc::new(AtomicUsize::new(0));
+        let observed_tasks = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed_retained_permits = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed_retained_memory = Arc::new(AtomicUsize::new(usize::MAX));
+        let retained = execution
+            .admit_task(
+                charge(1, 40),
+                DropProbe(Arc::clone(&retained_resource_drops)),
+            )
+            .unwrap()
+            .into_retained(|resource| {
+                Ok((
+                    resource,
+                    retained_charge(QueryRetainedKind::SchemaManifest, 30),
+                ))
+            })
+            .unwrap();
+        let task = execution.admit_build_task(charge(1, 40)).unwrap();
+
+        let rebuilt = retained
+            .rebuild_with_build_task(task, |retained_resource, ()| {
+                let peak = coordinator.status();
+                assert_eq!(peak.active_tasks, 1);
+                assert_eq!(peak.active_task_memory_bytes, 40);
+                assert_eq!(peak.active_retained_permits, 1);
+                assert_eq!(peak.active_retained_memory_bytes, 30);
+                assert_eq!(peak.active_memory_bytes, 70);
+                Ok((
+                    RebuiltAccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&observed_tasks),
+                        observed_active_retained_permits: Arc::clone(&observed_retained_permits),
+                        observed_active_retained_memory_bytes: Arc::clone(
+                            &observed_retained_memory,
+                        ),
+                        retained_resource,
+                        task_resource: DropProbe(Arc::clone(&task_resource_drops)),
+                        drops: Arc::clone(&rebuilt_drops),
+                    },
+                    retained_charge(QueryRetainedKind::PhysicalPlan, 50),
+                ))
+            })
+            .expect("retained rebuild may consume the combined old and task memory peak");
+
+        assert_eq!(rebuilt.kind(), QueryRetainedKind::PhysicalPlan);
+        assert_eq!(rebuilt.memory_bytes().get(), 50);
+        assert_eq!(retained_resource_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(task_resource_drops.load(Ordering::Relaxed), 0);
+        let service = coordinator.status();
+        assert_eq!(service.active_tasks, 0);
+        assert_eq!(service.active_cpu_slots, 0);
+        assert_eq!(service.active_task_memory_bytes, 0);
+        assert_eq!(service.active_retained_permits, 1);
+        assert_eq!(service.active_retained_memory_bytes, 50);
+        assert_eq!(service.active_memory_bytes, 50);
+        let session = coordinator.admin_handle().session_status(owner_session_id);
+        assert_eq!(session.active_tasks, 0);
+        assert_eq!(session.active_retained_permits, 1);
+        assert_eq!(session.active_retained_memory_bytes, 50);
+        assert_eq!(session.active_memory_bytes, 50);
+        let query = coordinator
+            .admin_handle()
+            .status(execution.instance_id())
+            .unwrap();
+        assert_eq!(query.active_tasks, 0);
+        assert_eq!(query.active_retained_permits, 1);
+        assert_eq!(query.active_retained_memory_bytes, 50);
+        assert_eq!(query.active_memory_bytes, 50);
+
+        drop(rebuilt);
+        assert_eq!(rebuilt_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(retained_resource_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(task_resource_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_tasks.load(Ordering::Relaxed), 0);
+        assert_eq!(observed_retained_permits.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_retained_memory.load(Ordering::Relaxed), 50);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn retained_rebuild_rejects_foreign_query_before_releasing_either_reservation() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 50,
+        };
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let first = coordinator
+            .register_planned_for_session(
+                info(first_id, 100),
+                session_id(1),
+                None,
+                query_budget,
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned_for_session(
+                info(second_id, 100),
+                session_id(2),
+                None,
+                query_budget,
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+        let retained_resource_drops = Arc::new(AtomicUsize::new(0));
+        let task_resource_drops = Arc::new(AtomicUsize::new(0));
+        let rebuilt_drops = Arc::new(AtomicUsize::new(0));
+        let observed_tasks = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed_retained_permits = Arc::new(AtomicUsize::new(usize::MAX));
+        let observed_retained_memory = Arc::new(AtomicUsize::new(usize::MAX));
+        let retained = first
+            .admit_task(
+                charge(1, 20),
+                DropProbe(Arc::clone(&retained_resource_drops)),
+            )
+            .unwrap()
+            .into_retained(|resource| {
+                Ok((
+                    resource,
+                    retained_charge(QueryRetainedKind::SchemaManifest, 20),
+                ))
+            })
+            .unwrap();
+        let task = second.admit_build_task(charge(1, 30)).unwrap();
+
+        let error = retained
+            .rebuild_with_build_task(task, |retained_resource, ()| {
+                Ok((
+                    RebuiltAccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&observed_tasks),
+                        observed_active_retained_permits: Arc::clone(&observed_retained_permits),
+                        observed_active_retained_memory_bytes: Arc::clone(
+                            &observed_retained_memory,
+                        ),
+                        retained_resource,
+                        task_resource: DropProbe(Arc::clone(&task_resource_drops)),
+                        drops: Arc::clone(&rebuilt_drops),
+                    },
+                    retained_charge(QueryRetainedKind::PhysicalPlan, 40),
+                ))
+            })
+            .err()
+            .expect("resources from different query instances cannot rebuild one permit");
+
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(!error.retryable());
+        assert_eq!(error.query_id(), Some(first_id));
+        assert_eq!(rebuilt_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(retained_resource_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(task_resource_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_retained_permits.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_retained_memory.load(Ordering::Relaxed), 20);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        first.finish().unwrap();
+        second.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn retained_rebuild_oversize_and_cancelled_commit_destroy_rebuild_before_raii() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                QueryResourceBudget {
+                    max_active_tasks: 2,
+                    max_cpu_slots: 2,
+                    max_memory_bytes: 100,
+                },
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+
+        let oversize_observed_tasks = Arc::new(AtomicUsize::new(usize::MAX));
+        let oversize_observed_retained = Arc::new(AtomicUsize::new(usize::MAX));
+        let oversize_observed_memory = Arc::new(AtomicUsize::new(usize::MAX));
+        let oversize_drops = Arc::new(AtomicUsize::new(0));
+        let retained = execution
+            .admit_task(charge(1, 20), DropProbe(Arc::new(AtomicUsize::new(0))))
+            .unwrap()
+            .into_retained(|resource| {
+                Ok((
+                    resource,
+                    retained_charge(QueryRetainedKind::SchemaManifest, 20),
+                ))
+            })
+            .unwrap();
+        let task = execution.admit_build_task(charge(1, 30)).unwrap();
+        let error = retained
+            .rebuild_with_build_task(task, |retained_resource, ()| {
+                Ok((
+                    RebuiltAccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&oversize_observed_tasks),
+                        observed_active_retained_permits: Arc::clone(&oversize_observed_retained),
+                        observed_active_retained_memory_bytes: Arc::clone(
+                            &oversize_observed_memory,
+                        ),
+                        retained_resource,
+                        task_resource: DropProbe(Arc::new(AtomicUsize::new(0))),
+                        drops: Arc::clone(&oversize_drops),
+                    },
+                    retained_charge(QueryRetainedKind::PhysicalPlan, 51),
+                ))
+            })
+            .err()
+            .expect("rebuilt memory cannot exceed old retained plus task memory");
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert_eq!(oversize_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(oversize_observed_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(oversize_observed_retained.load(Ordering::Relaxed), 1);
+        assert_eq!(oversize_observed_memory.load(Ordering::Relaxed), 20);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+
+        let cancelled_observed_tasks = Arc::new(AtomicUsize::new(usize::MAX));
+        let cancelled_observed_retained = Arc::new(AtomicUsize::new(usize::MAX));
+        let cancelled_observed_memory = Arc::new(AtomicUsize::new(usize::MAX));
+        let cancelled_drops = Arc::new(AtomicUsize::new(0));
+        let retained = execution
+            .admit_task(charge(1, 20), DropProbe(Arc::new(AtomicUsize::new(0))))
+            .unwrap()
+            .into_retained(|resource| {
+                Ok((
+                    resource,
+                    retained_charge(QueryRetainedKind::SchemaManifest, 20),
+                ))
+            })
+            .unwrap();
+        let task = execution.admit_build_task(charge(1, 30)).unwrap();
+        let error = retained
+            .rebuild_with_build_task(task, |retained_resource, ()| {
+                coordinator.cancel_current_for_test(id)?;
+                Ok((
+                    RebuiltAccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&cancelled_observed_tasks),
+                        observed_active_retained_permits: Arc::clone(&cancelled_observed_retained),
+                        observed_active_retained_memory_bytes: Arc::clone(
+                            &cancelled_observed_memory,
+                        ),
+                        retained_resource,
+                        task_resource: DropProbe(Arc::new(AtomicUsize::new(0))),
+                        drops: Arc::clone(&cancelled_drops),
+                    },
+                    retained_charge(QueryRetainedKind::PhysicalPlan, 40),
+                ))
+            })
+            .err()
+            .expect("cancelled query cannot commit a retained rebuild");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(cancelled_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(cancelled_observed_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(cancelled_observed_retained.load(Ordering::Relaxed), 1);
+        assert_eq!(cancelled_observed_memory.load(Ordering::Relaxed), 20);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        drop(execution);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn retained_rebuild_conversion_error_and_panic_release_both_original_permits() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+
+        let error_resource_drops = Arc::new(AtomicUsize::new(0));
+        let retained = execution
+            .admit_task(charge(1, 20), DropProbe(Arc::clone(&error_resource_drops)))
+            .unwrap()
+            .into_retained(|resource| {
+                Ok((
+                    resource,
+                    retained_charge(QueryRetainedKind::SchemaManifest, 10),
+                ))
+            })
+            .unwrap();
+        let task = execution.admit_build_task(charge(1, 20)).unwrap();
+        let error = retained
+            .rebuild_with_build_task::<()>(task, |retained_resource, ()| {
+                let task_resource = DropProbe(Arc::clone(&error_resource_drops));
+                drop((retained_resource, task_resource));
+                Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "test retained rebuild failed",
+                ))
+            })
+            .err()
+            .expect("fallible rebuild must release both original reservations");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(error_resource_drops.load(Ordering::Relaxed), 2);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+
+        let panic_resource_drops = Arc::new(AtomicUsize::new(0));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let retained = execution
+                .admit_task(charge(1, 20), DropProbe(Arc::clone(&panic_resource_drops)))
+                .unwrap()
+                .into_retained(|resource| {
+                    Ok((
+                        resource,
+                        retained_charge(QueryRetainedKind::SchemaManifest, 10),
+                    ))
+                })
+                .unwrap();
+            let task = execution.admit_build_task(charge(1, 20)).unwrap();
+            let _ = retained.rebuild_with_build_task::<()>(task, |retained_resource, ()| {
+                let task_resource = DropProbe(Arc::clone(&panic_resource_drops));
+                drop((retained_resource, task_resource));
+                panic!("test retained rebuild panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(panic_resource_drops.load(Ordering::Relaxed), 2);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn rejected_retained_rebuild_drop_panic_still_releases_original_reservations() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let original_resource_drops = Arc::new(AtomicUsize::new(0));
+        let rebuilt_drops = Arc::new(AtomicUsize::new(0));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let retained = execution
+                .admit_task(
+                    charge(1, 20),
+                    DropProbe(Arc::clone(&original_resource_drops)),
+                )
+                .unwrap()
+                .into_retained(|resource| {
+                    Ok((
+                        resource,
+                        retained_charge(QueryRetainedKind::SchemaManifest, 10),
+                    ))
+                })
+                .unwrap();
+            let task = execution.admit_build_task(charge(1, 20)).unwrap();
+            let _ = retained.rebuild_with_build_task(task, |retained_resource, ()| {
+                let task_resource = DropProbe(Arc::clone(&original_resource_drops));
+                drop((retained_resource, task_resource));
+                Ok((
+                    PanicDropProbe(Arc::clone(&rebuilt_drops)),
+                    retained_charge(QueryRetainedKind::PhysicalPlan, 31),
+                ))
+            });
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(original_resource_drops.load(Ordering::Relaxed), 2);
+        assert_eq!(rebuilt_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        execution.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
     }
 
     #[test]
