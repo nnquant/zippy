@@ -2238,6 +2238,21 @@ extension 携带同一纯文件描述，私有 marker factory 对任何 persiste
 extension、synthetic location、table/file ordinal、ID、snapshot/schema version、size，并拒绝 missing/unknown
 extension、location mismatch 与 file range；实际 open/checksum 继续延迟到 admitted blocking job。
 
+Stage 5.4c execution-retained memory accounting 已完成（2026-07-15）：QueryService 将 capability-free
+Schema、投影 manifest、physical plan、Parquet metadata 和 operator arena 作为独立 retained 资源记账。
+task、retained 和 result memory 共用 query/session/process 三级硬上限；task 构建峰值向 retained 实际占用的
+转换在同一个 `global -> query` 临界区原子完成，同时释放 task count 与 CPU slot，且 retained charge 只允许
+小于或等于原 task memory。构建失败、panic、cancel 或 draining 竞态都会先析构产物，再通过 RAII 回滚 task
+reservation。retained permit 会阻止 `Finished`、terminal eviction、session 清理和 shutdown complete，资源
+析构始终先于账本额度释放；原 snapshot root 仍可在 physical task 归零后释放，因为 retained 类型不得携带
+reader、pin、路径或其他存储 capability。
+
+这一步只覆盖 execution 开始后的新增分配。`SqliteCatalogPinnedQuerySnapshot` 在 planning 阶段构建，当前由
+Catalog snapshot hard limits 约束，但尚未在读取前从 QueryService 预留内存。下一步必须增加独立的 planning
+snapshot peak reservation，并让 opaque RAII lease 随 Catalog queue request、SQLite worker、snapshot response、
+pinned owner 和 execution ownership 传递；不能在 snapshot 已分配后追认额度，也不能复用要求在 `finish` 前
+归零的 execution-retained permit。
+
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）

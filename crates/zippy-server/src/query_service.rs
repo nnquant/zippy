@@ -195,6 +195,21 @@ pub(crate) struct QueryResultCharge {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryRetainedKind {
+    ProjectedSnapshotManifest,
+    SchemaManifest,
+    PhysicalPlan,
+    ParquetMetadata,
+    OperatorArena,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryRetainedCharge {
+    pub kind: QueryRetainedKind,
+    pub memory_bytes: NonZeroU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryServiceLifecycle {
     Accepting,
     Draining,
@@ -210,6 +225,8 @@ pub(crate) struct QueryServiceStatus {
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_task_memory_bytes: u64,
+    pub active_retained_permits: usize,
+    pub active_retained_memory_bytes: u64,
     pub active_result_permits: usize,
     pub active_result_memory_bytes: u64,
     pub active_memory_bytes: u64,
@@ -242,6 +259,8 @@ pub(crate) struct QueryRuntimeStatus {
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_task_memory_bytes: u64,
+    pub active_retained_permits: usize,
+    pub active_retained_memory_bytes: u64,
     pub active_result_permits: usize,
     pub active_result_memory_bytes: u64,
     pub active_memory_bytes: u64,
@@ -257,6 +276,8 @@ pub(crate) struct QuerySessionResourceStatus {
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_task_memory_bytes: u64,
+    pub active_retained_permits: usize,
+    pub active_retained_memory_bytes: u64,
     pub active_result_permits: usize,
     pub active_result_memory_bytes: u64,
     pub active_memory_bytes: u64,
@@ -901,6 +922,8 @@ struct CoordinatorState {
     active_tasks: usize,
     active_cpu_slots: u32,
     active_task_memory_bytes: u64,
+    active_retained_permits: usize,
+    active_retained_memory_bytes: u64,
     active_result_permits: usize,
     active_result_memory_bytes: u64,
     active_snapshot_owners: usize,
@@ -912,6 +935,8 @@ struct SessionResourceUsage {
     active_tasks: usize,
     active_cpu_slots: u32,
     active_task_memory_bytes: u64,
+    active_retained_permits: usize,
+    active_retained_memory_bytes: u64,
     active_result_permits: usize,
     active_result_memory_bytes: u64,
 }
@@ -922,6 +947,8 @@ impl SessionResourceUsage {
             && self.active_tasks == 0
             && self.active_cpu_slots == 0
             && self.active_task_memory_bytes == 0
+            && self.active_retained_permits == 0
+            && self.active_retained_memory_bytes == 0
             && self.active_result_permits == 0
             && self.active_result_memory_bytes == 0
     }
@@ -933,11 +960,14 @@ impl SessionResourceUsage {
             active_tasks: self.active_tasks,
             active_cpu_slots: self.active_cpu_slots,
             active_task_memory_bytes: self.active_task_memory_bytes,
+            active_retained_permits: self.active_retained_permits,
+            active_retained_memory_bytes: self.active_retained_memory_bytes,
             active_result_permits: self.active_result_permits,
             active_result_memory_bytes: self.active_result_memory_bytes,
             active_memory_bytes: self
                 .active_task_memory_bytes
-                .checked_add(self.active_result_memory_bytes)
+                .checked_add(self.active_retained_memory_bytes)
+                .and_then(|memory| memory.checked_add(self.active_result_memory_bytes))
                 .expect("session query memory accounting remains within global budget"),
         }
     }
@@ -1254,6 +1284,8 @@ impl Default for CoordinatorState {
             active_tasks: 0,
             active_cpu_slots: 0,
             active_task_memory_bytes: 0,
+            active_retained_permits: 0,
+            active_retained_memory_bytes: 0,
             active_result_permits: 0,
             active_result_memory_bytes: 0,
             active_snapshot_owners: 0,
@@ -1274,6 +1306,7 @@ impl CoordinatorState {
         if self.lifecycle == QueryServiceLifecycle::Draining
             && self.active_logical_queries == 0
             && self.active_tasks == 0
+            && self.active_retained_permits == 0
             && self.active_result_permits == 0
             && self.active_snapshot_owners == 0
         {
@@ -1302,7 +1335,8 @@ impl CoordinatorState {
     fn status(&self) -> QueryServiceStatus {
         let active_memory_bytes = self
             .active_task_memory_bytes
-            .checked_add(self.active_result_memory_bytes)
+            .checked_add(self.active_retained_memory_bytes)
+            .and_then(|memory| memory.checked_add(self.active_result_memory_bytes))
             .expect("global query memory accounting remains within configured budget");
         QueryServiceStatus {
             lifecycle: self.lifecycle,
@@ -1312,6 +1346,8 @@ impl CoordinatorState {
             active_tasks: self.active_tasks,
             active_cpu_slots: self.active_cpu_slots,
             active_task_memory_bytes: self.active_task_memory_bytes,
+            active_retained_permits: self.active_retained_permits,
+            active_retained_memory_bytes: self.active_retained_memory_bytes,
             active_result_permits: self.active_result_permits,
             active_result_memory_bytes: self.active_result_memory_bytes,
             active_memory_bytes,
@@ -1641,7 +1677,8 @@ impl CoordinatorInner {
         let query_cpu_after = query.active_cpu_slots.checked_add(cpu_slots);
         let query_task_memory_after = query.active_task_memory_bytes.checked_add(memory_bytes);
         let query_memory_after = query_task_memory_after
-            .and_then(|task_memory| task_memory.checked_add(query.active_result_memory_bytes));
+            .and_then(|task_memory| task_memory.checked_add(query.active_retained_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_result_memory_bytes));
         if query.active_tasks >= control.budget.max_active_tasks
             || query_cpu_after.is_none_or(|value| value > control.budget.max_cpu_slots)
             || query_memory_after.is_none_or(|value| value > control.budget.max_memory_bytes)
@@ -1654,7 +1691,8 @@ impl CoordinatorInner {
         let global_cpu_after = global.active_cpu_slots.checked_add(cpu_slots);
         let global_task_memory_after = global.active_task_memory_bytes.checked_add(memory_bytes);
         let global_memory_after = global_task_memory_after
-            .and_then(|task_memory| task_memory.checked_add(global.active_result_memory_bytes));
+            .and_then(|task_memory| task_memory.checked_add(global.active_retained_memory_bytes))
+            .and_then(|memory| memory.checked_add(global.active_result_memory_bytes));
         if global.active_tasks >= self.config.max_active_tasks
             || global_cpu_after.is_none_or(|value| value > self.config.max_cpu_slots)
             || global_memory_after.is_none_or(|value| value > self.config.max_memory_bytes)
@@ -1747,7 +1785,8 @@ impl CoordinatorInner {
         let memory_bytes = charge.memory_bytes.get();
         let query_result_memory_after = query.active_result_memory_bytes.checked_add(memory_bytes);
         let query_memory_after = query_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(query.active_task_memory_bytes));
+            .and_then(|result_memory| result_memory.checked_add(query.active_task_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes));
         let query_permits_after = query.active_result_permits.checked_add(1);
         if query.active_result_permits >= control.budget.max_active_tasks
             || query_permits_after.is_none()
@@ -1761,7 +1800,8 @@ impl CoordinatorInner {
         let global_result_memory_after =
             global.active_result_memory_bytes.checked_add(memory_bytes);
         let global_memory_after = global_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(global.active_task_memory_bytes));
+            .and_then(|result_memory| result_memory.checked_add(global.active_task_memory_bytes))
+            .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes));
         let global_permits_after = global.active_result_permits.checked_add(1);
         if global.active_result_permits >= self.config.max_active_tasks
             || global_permits_after.is_none()
@@ -1832,7 +1872,8 @@ impl CoordinatorInner {
             .active_result_memory_bytes
             .checked_add(result_memory_bytes);
         let query_memory_after = query_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(query_task_memory_after));
+            .and_then(|result_memory| result_memory.checked_add(query_task_memory_after))
+            .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes));
         let query_permits_after = query.active_result_permits.checked_add(1);
         if query.active_result_permits >= control.budget.max_active_tasks
             || query_permits_after.is_none()
@@ -1852,7 +1893,8 @@ impl CoordinatorInner {
             .active_result_memory_bytes
             .checked_add(result_memory_bytes);
         let global_memory_after = global_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(global_task_memory_after));
+            .and_then(|result_memory| result_memory.checked_add(global_task_memory_after))
+            .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes));
         let global_permits_after = global.active_result_permits.checked_add(1);
         if global.active_result_permits >= self.config.max_active_tasks
             || global_permits_after.is_none()
@@ -1897,6 +1939,140 @@ impl CoordinatorInner {
         })
     }
 
+    fn transfer_task_to_retained(
+        self: &Arc<Self>,
+        control: &Arc<QueryControl>,
+        task_charge: QueryTaskCharge,
+        retained_charge: QueryRetainedCharge,
+    ) -> Result<QueryRetainedReservation> {
+        let task_memory_bytes = task_charge.memory_bytes.get();
+        let retained_memory_bytes = retained_charge.memory_bytes.get();
+        if retained_memory_bytes > task_memory_bytes {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                format!(
+                    concat!(
+                        "retained query resource exceeds its allocation reservation ",
+                        "reserved=[{}] retained=[{}]"
+                    ),
+                    task_memory_bytes, retained_memory_bytes
+                ),
+            )
+            .with_query_id(control.query_id)
+            .with_retryable(false));
+        }
+
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Running {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not running")
+                    .with_query_id(control.query_id),
+            );
+        }
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(control.query_id));
+        }
+
+        let cpu_slots = task_charge.cpu_slots.get();
+        debug_assert!(query.active_tasks > 0 && global.active_tasks > 0);
+        let query_task_memory_after = query
+            .active_task_memory_bytes
+            .checked_sub(task_memory_bytes)
+            .expect("task reservation owns its per-query memory charge");
+        let query_retained_memory_after = query
+            .active_retained_memory_bytes
+            .checked_add(retained_memory_bytes);
+        let query_permits_after = query.active_retained_permits.checked_add(1);
+        if query_retained_memory_after.is_none() || query_permits_after.is_none() {
+            return Err(exhausted(
+                control.query_id,
+                "per-query task-to-retained transfer is exhausted",
+            ));
+        }
+
+        let global_task_memory_after = global
+            .active_task_memory_bytes
+            .checked_sub(task_memory_bytes)
+            .expect("task reservation owns its global memory charge");
+        let global_retained_memory_after = global
+            .active_retained_memory_bytes
+            .checked_add(retained_memory_bytes);
+        let global_permits_after = global.active_retained_permits.checked_add(1);
+        if global_retained_memory_after.is_none() || global_permits_after.is_none() {
+            return Err(exhausted(
+                control.query_id,
+                "global task-to-retained transfer is exhausted",
+            ));
+        }
+
+        query.active_tasks -= 1;
+        query.active_cpu_slots -= cpu_slots;
+        query.active_task_memory_bytes = query_task_memory_after;
+        query.active_retained_permits =
+            query_permits_after.expect("validated retained permit count");
+        query.active_retained_memory_bytes =
+            query_retained_memory_after.expect("validated per-query retained memory addition");
+        global.active_tasks -= 1;
+        global.active_cpu_slots -= cpu_slots;
+        global.active_task_memory_bytes = global_task_memory_after;
+        global.active_retained_permits =
+            global_permits_after.expect("validated global retained permit count");
+        global.active_retained_memory_bytes =
+            global_retained_memory_after.expect("validated global retained memory addition");
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active task retains its session resource ledger");
+        debug_assert!(session.active_tasks > 0);
+        session.active_tasks -= 1;
+        session.active_cpu_slots -= cpu_slots;
+        session.active_task_memory_bytes -= task_memory_bytes;
+        session.active_retained_permits = session
+            .active_retained_permits
+            .checked_add(1)
+            .expect("session retained permit accounting remains within global capacity");
+        session.active_retained_memory_bytes = session
+            .active_retained_memory_bytes
+            .checked_add(retained_memory_bytes)
+            .expect("session retained memory accounting remains within global budget");
+        Ok(QueryRetainedReservation {
+            owner: Arc::downgrade(self),
+            control: Arc::clone(control),
+            charge: Some(retained_charge),
+        })
+    }
+
+    fn release_retained(&self, control: &Arc<QueryControl>, charge: QueryRetainedCharge) {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        let memory_bytes = charge.memory_bytes.get();
+        debug_assert!(query.active_retained_permits > 0 && global.active_retained_permits > 0);
+        query.active_retained_permits -= 1;
+        query.active_retained_memory_bytes -= memory_bytes;
+        global.active_retained_permits -= 1;
+        global.active_retained_memory_bytes -= memory_bytes;
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active retained resource keeps its session resource ledger");
+        debug_assert!(session.active_retained_permits > 0);
+        session.active_retained_permits -= 1;
+        session.active_retained_memory_bytes -= memory_bytes;
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+        global.remove_idle_session(control.owner_session_id);
+        global.refresh_shutdown();
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
+    }
+
     fn release_result(&self, control: &Arc<QueryControl>, charge: QueryResultCharge) {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
@@ -1931,10 +2107,16 @@ impl CoordinatorInner {
     fn finish(&self, control: &Arc<QueryControl>) -> Result<()> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
-        if query.active_tasks != 0 || query.active_result_permits != 0 {
+        if query.active_tasks != 0
+            || query.active_retained_permits != 0
+            || query.active_result_permits != 0
+        {
             return Err(ServerError::new(
                 ErrorCode::Conflict,
-                "query cannot finish while physical tasks or result delivery remain active",
+                concat!(
+                    "query cannot finish while physical tasks, retained resources, or result ",
+                    "delivery remain active"
+                ),
             )
             .with_query_id(control.query_id));
         }
@@ -2079,7 +2261,10 @@ impl CoordinatorInner {
         } else {
             None
         };
-        if query.active_tasks == 0 && query.active_result_permits == 0 && !query.retention_scheduled
+        if query.active_tasks == 0
+            && query.active_retained_permits == 0
+            && query.active_result_permits == 0
+            && !query.retention_scheduled
         {
             let finished_at_ns = query
                 .finished_at_ns
@@ -2221,11 +2406,14 @@ impl CoordinatorInner {
             active_tasks: query.active_tasks,
             active_cpu_slots: query.active_cpu_slots,
             active_task_memory_bytes: query.active_task_memory_bytes,
+            active_retained_permits: query.active_retained_permits,
+            active_retained_memory_bytes: query.active_retained_memory_bytes,
             active_result_permits: query.active_result_permits,
             active_result_memory_bytes: query.active_result_memory_bytes,
             active_memory_bytes: query
                 .active_task_memory_bytes
-                .checked_add(query.active_result_memory_bytes)
+                .checked_add(query.active_retained_memory_bytes)
+                .and_then(|memory| memory.checked_add(query.active_result_memory_bytes))
                 .expect("query memory accounting remains within configured budget"),
             cancellation_requested: control.cancelled.load(Ordering::Acquire),
             finished_at_ns: query.finished_at_ns,
@@ -2301,6 +2489,8 @@ struct QueryControlState {
     active_tasks: usize,
     active_cpu_slots: u32,
     active_task_memory_bytes: u64,
+    active_retained_permits: usize,
+    active_retained_memory_bytes: u64,
     active_result_permits: usize,
     active_result_memory_bytes: u64,
     finished_at_ns: Option<u64>,
@@ -2318,6 +2508,8 @@ impl Default for QueryControlState {
             active_tasks: 0,
             active_cpu_slots: 0,
             active_task_memory_bytes: 0,
+            active_retained_permits: 0,
+            active_retained_memory_bytes: 0,
             active_result_permits: 0,
             active_result_memory_bytes: 0,
             finished_at_ns: None,
@@ -2711,6 +2903,22 @@ impl QueryTaskReservation {
         self.charge = None;
         Ok(result)
     }
+
+    fn try_into_retained(
+        &mut self,
+        charge: QueryRetainedCharge,
+    ) -> Result<QueryRetainedReservation> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(self.control.query_id))?;
+        let task_charge = self
+            .charge
+            .expect("live task reservation retains its resource charge");
+        let retained = owner.transfer_task_to_retained(&self.control, task_charge, charge)?;
+        self.charge = None;
+        Ok(retained)
+    }
 }
 
 impl Drop for QueryTaskReservation {
@@ -2728,6 +2936,23 @@ struct QueryResultReservation {
     owner: Weak<CoordinatorInner>,
     control: Arc<QueryControl>,
     charge: Option<QueryResultCharge>,
+}
+
+struct QueryRetainedReservation {
+    owner: Weak<CoordinatorInner>,
+    control: Arc<QueryControl>,
+    charge: Option<QueryRetainedCharge>,
+}
+
+impl Drop for QueryRetainedReservation {
+    fn drop(&mut self) {
+        let Some(charge) = self.charge.take() else {
+            return;
+        };
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_retained(&self.control, charge);
+        }
+    }
 }
 
 impl Drop for QueryResultReservation {
@@ -2854,6 +3079,71 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
             result: Some(result),
             reservation: Some(reservation),
         })
+    }
+
+    /// Builds a capability-free retained resource under this task's peak-memory reservation.
+    ///
+    /// A successful conversion atomically releases the task and CPU charges while retaining the
+    /// returned resource's smaller long-lived memory charge. The retained charge must not exceed
+    /// the task memory that covered construction. On conversion or transfer failure, the built
+    /// resource is destroyed before the original task reservation is released.
+    pub(crate) fn into_retained<T: Send + 'static>(
+        mut self,
+        convert: impl FnOnce(R) -> Result<(T, QueryRetainedCharge)>,
+    ) -> Result<QueryRetainedPermit<T>> {
+        let resource = self
+            .resource
+            .take()
+            .expect("live task permit retains its physical resource");
+        let (retained, charge) = convert(resource)?;
+        let reservation = match self
+            .reservation
+            .as_mut()
+            .expect("live task permit retains its resource reservation")
+            .try_into_retained(charge)
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                drop(retained);
+                return Err(error);
+            }
+        };
+        drop(self.ownership.take());
+        Ok(QueryRetainedPermit {
+            // Field order is intentional: Rust drops the retained resource before its charge.
+            resource: Some(retained),
+            reservation: Some(reservation),
+        })
+    }
+}
+
+pub(crate) struct QueryRetainedPermit<R: Send + 'static> {
+    // Field order is part of the accounting invariant: memory is freed before its ledger charge.
+    resource: Option<R>,
+    reservation: Option<QueryRetainedReservation>,
+}
+
+impl<R: Send + 'static> QueryRetainedPermit<R> {
+    pub(crate) fn resource(&self) -> &R {
+        self.resource
+            .as_ref()
+            .expect("live retained permit owns its query resource")
+    }
+
+    pub(crate) fn kind(&self) -> QueryRetainedKind {
+        self.reservation
+            .as_ref()
+            .and_then(|reservation| reservation.charge)
+            .expect("live retained permit owns its memory reservation")
+            .kind
+    }
+
+    pub(crate) fn memory_bytes(&self) -> NonZeroU64 {
+        self.reservation
+            .as_ref()
+            .and_then(|reservation| reservation.charge)
+            .expect("live retained permit owns its memory reservation")
+            .memory_bytes
     }
 }
 
@@ -3017,8 +3307,9 @@ mod tests {
 
     use super::{
         QueryPlanDraft, QueryResourceBudget, QueryResourceCoordinator, QueryResultCharge,
-        QueryServiceLifecycle, QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState,
-        QuerySubmissionMetadata, QueryTaskCharge, DEFAULT_MAX_PLANNING_DURATION,
+        QueryRetainedCharge, QueryRetainedKind, QueryServiceLifecycle, QueryServiceRegistryConfig,
+        QueryServiceResourceConfig, QueryState, QuerySubmissionMetadata, QueryTaskCharge,
+        DEFAULT_MAX_PLANNING_DURATION,
     };
 
     struct TestSnapshot {
@@ -3106,6 +3397,22 @@ mod tests {
         coordinator: QueryResourceCoordinator,
         observed_active_tasks: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
+    }
+
+    struct RetainedAccountingDropProbe {
+        coordinator: QueryResourceCoordinator,
+        observed_active_retained_permits: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for RetainedAccountingDropProbe {
+        fn drop(&mut self) {
+            self.observed_active_retained_permits.store(
+                self.coordinator.status().active_retained_permits,
+                Ordering::Relaxed,
+            );
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     impl Drop for AccountingDropProbe {
@@ -3284,6 +3591,13 @@ mod tests {
 
     fn result_charge(memory_bytes: u64) -> QueryResultCharge {
         QueryResultCharge {
+            memory_bytes: NonZeroU64::new(memory_bytes).unwrap(),
+        }
+    }
+
+    fn retained_charge(kind: QueryRetainedKind, memory_bytes: u64) -> QueryRetainedCharge {
+        QueryRetainedCharge {
+            kind,
             memory_bytes: NonZeroU64::new(memory_bytes).unwrap(),
         }
     }
@@ -4434,6 +4748,378 @@ mod tests {
     }
 
     #[test]
+    fn task_to_retained_transfer_shrinks_peak_and_shares_the_memory_budget() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        };
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), query_budget, 10)
+            .unwrap();
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                draft(id),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let observed_permits = Arc::new(AtomicUsize::new(0));
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let task = execution.admit_task(charge(1, 80), ()).unwrap();
+        let retained = task
+            .into_retained(|()| {
+                Ok((
+                    RetainedAccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_retained_permits: Arc::clone(&observed_permits),
+                        drops: Arc::clone(&retained_drops),
+                    },
+                    retained_charge(QueryRetainedKind::SchemaManifest, 30),
+                ))
+            })
+            .expect("task peak memory may shrink into retained schema memory");
+
+        assert_eq!(retained.kind(), QueryRetainedKind::SchemaManifest);
+        assert_eq!(retained.memory_bytes().get(), 30);
+        let _ = retained.resource();
+        let result = execution
+            .admit_result(result_charge(70), ())
+            .expect("retained and result memory share the same exact budget");
+        let rejected = execution
+            .admit_task(charge(1, 1), ())
+            .err()
+            .expect("retained memory must block additional task allocation");
+        assert_eq!(rejected.code(), ErrorCode::ResourceExhausted);
+
+        let service = coordinator.status();
+        assert_eq!(service.active_tasks, 0);
+        assert_eq!(service.active_cpu_slots, 0);
+        assert_eq!(service.active_task_memory_bytes, 0);
+        assert_eq!(service.active_retained_permits, 1);
+        assert_eq!(service.active_retained_memory_bytes, 30);
+        assert_eq!(service.active_result_memory_bytes, 70);
+        assert_eq!(service.active_memory_bytes, 100);
+        let session = coordinator.session_status_owned(owner.as_ref()).unwrap();
+        assert_eq!(session.active_retained_permits, 1);
+        assert_eq!(session.active_retained_memory_bytes, 30);
+        assert_eq!(session.active_result_memory_bytes, 70);
+        assert_eq!(session.active_memory_bytes, 100);
+        let query = coordinator
+            .status_owned(owner.as_ref(), execution.instance_id())
+            .unwrap();
+        assert_eq!(query.active_retained_permits, 1);
+        assert_eq!(query.active_retained_memory_bytes, 30);
+        assert_eq!(query.active_memory_bytes, 100);
+
+        drop(result);
+        let finish_error = execution
+            .finish()
+            .expect_err("retained resources must be dropped before successful finish");
+        assert_eq!(finish_error.code(), ErrorCode::Conflict);
+        drop(retained);
+        assert_eq!(retained_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_permits.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+    }
+
+    #[test]
+    fn retained_memory_blocks_other_sessions_and_aggregates_globally() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let first = coordinator
+            .register_planned_for_session(
+                info(first_id, 100),
+                session_id(1),
+                None,
+                query_budget,
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned_for_session(
+                info(second_id, 100),
+                session_id(2),
+                None,
+                query_budget,
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+        let retained = first
+            .admit_task(charge(1, 80), ())
+            .unwrap()
+            .into_retained(|()| Ok(((), retained_charge(QueryRetainedKind::SchemaManifest, 70))))
+            .unwrap();
+
+        let blocked = second
+            .admit_task(charge(1, 31), ())
+            .err()
+            .expect("another session cannot exceed memory retained by the first query");
+        assert_eq!(blocked.code(), ErrorCode::ResourceExhausted);
+        let task = second.admit_task(charge(1, 30), ()).unwrap();
+        let service = coordinator.status();
+        let first_session = coordinator.admin_handle().session_status(session_id(1));
+        let second_session = coordinator.admin_handle().session_status(session_id(2));
+        assert_eq!(service.active_retained_memory_bytes, 70);
+        assert_eq!(service.active_task_memory_bytes, 30);
+        assert_eq!(service.active_memory_bytes, 100);
+        assert_eq!(first_session.active_retained_memory_bytes, 70);
+        assert_eq!(first_session.active_memory_bytes, 70);
+        assert_eq!(second_session.active_task_memory_bytes, 30);
+        assert_eq!(second_session.active_memory_bytes, 30);
+
+        drop(task);
+        drop(retained);
+        first.finish().unwrap();
+        second.finish().unwrap();
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn oversized_retained_charge_is_internal_and_drops_value_before_task_reservation() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let observed_tasks = Arc::new(AtomicUsize::new(0));
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let task = execution.admit_task(charge(1, 40), ()).unwrap();
+        let error = task
+            .into_retained(|()| {
+                Ok((
+                    AccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&observed_tasks),
+                        drops: Arc::clone(&retained_drops),
+                    },
+                    retained_charge(QueryRetainedKind::SchemaManifest, 41),
+                ))
+            })
+            .err()
+            .expect("retained memory cannot exceed its construction reservation");
+
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(!error.retryable());
+        assert_eq!(error.query_id(), Some(id));
+        assert_eq!(retained_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_tasks.load(Ordering::Relaxed), 1);
+        let status = coordinator.status();
+        assert_eq!(status.active_tasks, 0);
+        assert_eq!(status.active_retained_permits, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        drop(execution);
+    }
+
+    #[test]
+    fn task_to_retained_conversion_errors_panics_and_cancellation_roll_back() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+
+        let failed_drops = Arc::new(AtomicUsize::new(0));
+        let error = execution
+            .admit_task(charge(1, 20), DropProbe(Arc::clone(&failed_drops)))
+            .unwrap()
+            .into_retained::<()>(|resource| {
+                drop(resource);
+                Err(ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "test retained conversion failed",
+                ))
+            })
+            .err()
+            .expect("conversion error must roll back its task");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(failed_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+
+        let panic_drops = Arc::new(AtomicUsize::new(0));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let task = execution
+                .admit_task(charge(1, 20), DropProbe(Arc::clone(&panic_drops)))
+                .unwrap();
+            let _ = task.into_retained::<()>(|resource| -> Result<((), QueryRetainedCharge)> {
+                drop(resource);
+                panic!("test retained conversion panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(panic_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+
+        let observed_tasks = Arc::new(AtomicUsize::new(0));
+        let cancelled_drops = Arc::new(AtomicUsize::new(0));
+        let task = execution.admit_task(charge(1, 20), ()).unwrap();
+        let error = task
+            .into_retained(|()| {
+                coordinator.cancel_current_for_test(id)?;
+                Ok((
+                    AccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&observed_tasks),
+                        drops: Arc::clone(&cancelled_drops),
+                    },
+                    retained_charge(QueryRetainedKind::SchemaManifest, 10),
+                ))
+            })
+            .err()
+            .expect("cancelled query cannot commit a retained resource");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(cancelled_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        drop(execution);
+    }
+
+    #[test]
+    fn retained_permit_blocks_terminal_drain_and_shutdown_until_final_drop() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let snapshot_drops = Arc::new(AtomicUsize::new(0));
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                draft(id),
+                snapshot(id, Arc::clone(&snapshot_drops)),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let retained = execution
+            .admit_task(charge(1, 40), ())
+            .unwrap()
+            .into_retained(|()| {
+                Ok((
+                    DropProbe(Arc::new(AtomicUsize::new(0))),
+                    retained_charge(QueryRetainedKind::SchemaManifest, 20),
+                ))
+            })
+            .unwrap();
+
+        drop(execution);
+        let terminal = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .expect("retained permit keeps terminal registry entry live");
+        assert_eq!(terminal.state, QueryState::Cancelled);
+        assert_eq!(terminal.active_retained_permits, 1);
+        assert_eq!(snapshot_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().tracked_sessions, 1);
+        let draining = coordinator.begin_shutdown();
+        assert_eq!(draining.lifecycle, QueryServiceLifecycle::Draining);
+        assert_eq!(draining.active_retained_permits, 1);
+
+        drop(retained);
+        let stopped = coordinator.status();
+        assert_eq!(stopped.lifecycle, QueryServiceLifecycle::Stopped);
+        assert_eq!(stopped.active_retained_permits, 0);
+        assert_eq!(stopped.active_retained_memory_bytes, 0);
+        assert_eq!(stopped.active_memory_bytes, 0);
+        assert_eq!(stopped.tracked_sessions, 0);
+    }
+
+    #[test]
+    fn draining_during_retained_conversion_rejects_transfer_and_rolls_back() {
+        let coordinator = coordinator(config());
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let observed_tasks = Arc::new(AtomicUsize::new(0));
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let task = execution.admit_task(charge(1, 20), ()).unwrap();
+        let error = task
+            .into_retained(|()| {
+                let draining = coordinator.begin_shutdown();
+                assert_eq!(draining.lifecycle, QueryServiceLifecycle::Draining);
+                Ok((
+                    AccountingDropProbe {
+                        coordinator: coordinator.clone(),
+                        observed_active_tasks: Arc::clone(&observed_tasks),
+                        drops: Arc::clone(&retained_drops),
+                    },
+                    retained_charge(QueryRetainedKind::SchemaManifest, 10),
+                ))
+            })
+            .err()
+            .expect("draining query cannot commit a retained resource");
+
+        assert!(matches!(
+            error.code(),
+            ErrorCode::Cancelled | ErrorCode::Unavailable
+        ));
+        assert_eq!(retained_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_tasks.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_tasks, 0);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        drop(execution);
+        assert_eq!(
+            coordinator.status().lifecycle,
+            QueryServiceLifecycle::Stopped
+        );
+    }
+
+    #[test]
     fn rejected_task_to_result_transfer_drops_result_before_task_charge() {
         let coordinator = coordinator(QueryServiceResourceConfig {
             max_active_queries: 2,
@@ -4703,7 +5389,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_drop_panics_still_release_task_and_result_reservations() {
+    fn payload_drop_panics_still_release_task_retained_and_result_reservations() {
         let coordinator = coordinator(config());
         let id = query_id(1);
         let token = coordinator
@@ -4726,6 +5412,23 @@ mod tests {
         assert_eq!(task_drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_tasks, 0);
         assert_eq!(coordinator.status().active_task_memory_bytes, 0);
+
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let retained = execution
+            .admit_task(charge(1, 20), ())
+            .unwrap()
+            .into_retained(|()| {
+                Ok((
+                    PanicDropProbe(Arc::clone(&retained_drops)),
+                    retained_charge(QueryRetainedKind::SchemaManifest, 10),
+                ))
+            })
+            .unwrap();
+        let retained_panic = catch_unwind(AssertUnwindSafe(|| drop(retained)));
+        assert!(retained_panic.is_err());
+        assert_eq!(retained_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_retained_permits, 0);
+        assert_eq!(coordinator.status().active_retained_memory_bytes, 0);
 
         let result_drops = Arc::new(AtomicUsize::new(0));
         let result = execution

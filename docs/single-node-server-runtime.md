@@ -122,18 +122,23 @@ configured separately under `[query.resources]`: 64 concurrent logical queries a
 memory by default. When omitted, active tasks resolve to four times the effective per-query
 parallelism (16 under default CPU settings). Its memory budget is independent from the Gateway-wide
 `runtime.max_query_buffer_bytes` Arrow buffer pool. Inside the staged native QueryService, physical
-task and result-delivery reservations now share this one memory ceiling and are aggregated by
-session, query, and process. Session entries disappear when their logical, task, and result usage all
-reach zero. In-flight result permits reuse the configured active-task count as a hard query/process
-count ceiling, and task-to-result handoff reclassifies charges atomically. A query cannot enter
-`Finished` until result delivery reservations are gone. This is usage accounting only; per-session
+task, capability-free retained execution metadata, and result-delivery reservations now share this
+one memory ceiling and are aggregated by session, query, and process. Session entries disappear when
+their logical, task, retained, and result usage all reach zero. In-flight result permits reuse the
+configured active-task count as a hard query/process count ceiling. Task-to-result and
+task-to-retained handoffs reclassify charges atomically; retained memory may only shrink from the
+task peak that covered its construction. A query cannot enter `Finished` until retained execution
+metadata and result delivery reservations are gone. This is usage accounting only; per-session
 quotas wait for a trusted connection/session authority. The native result permit is not yet attached
 to the public `RecordBatchStream`, so this does not make the native query frontend production-ready.
+The Catalog snapshot allocated during `Planning` is still bounded by Catalog read limits rather than
+pre-reserved from this memory ledger; production authority requires a separate planning-snapshot
+reservation that follows the Catalog worker and pinned owner before those allocations begin.
 Physical executors now have one consuming `QueryExecutionScope::fail(error)` boundary: it records a
 `Running -> Failed` transition, preserves the original structured error, wakes cancellation waiters,
-and leaves task/result reservations to drain through RAII. Concurrent cancellation, timeout, and
-shutdown retain whichever terminal transition commits first; scope drop cannot relabel an execution
-failure as cancellation.
+and leaves task/retained/result reservations to drain through RAII. Concurrent cancellation,
+timeout, and shutdown retain whichever terminal transition commits first; scope drop cannot relabel
+an execution failure as cancellation.
 
 `query.plan_ttl_ms` controls how long an unexecuted plan may retain its snapshot; it defaults to
 30,000 ms, accepts 1 ms through 24 hours, and `ZIPPY_QUERY_PLAN_TTL_MS` overrides it. The current
