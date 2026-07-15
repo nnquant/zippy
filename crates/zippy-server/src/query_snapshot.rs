@@ -11,14 +11,18 @@ use std::sync::Mutex;
 
 #[cfg(test)]
 use tokio::sync::Semaphore;
+#[cfg(test)]
+use zippy_catalog::PinnedTableManifest;
 use zippy_catalog::{
     conservative_table_resolution_owned_peak_bytes, decode_persisted_table_schema, PinnedDataFile,
-    PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
+    SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
     SqliteCatalogReadHandle, SqliteCatalogSnapshotReadLimits,
     PERSISTED_SCHEMA_DECODE_TRANSIENT_BYTES,
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
-use zippy_query::{PersistedFileDescription, PersistedFileKey, PersistedTableDescription};
+use zippy_query::{
+    BoxedAsyncFileReader, PersistedFileDescription, PersistedFileKey, PersistedTableDescription,
+};
 use zippy_types::catalog::CatalogSnapshotSelector;
 use zippy_types::query::QueryTableVersion;
 use zippy_types::storage::{
@@ -30,6 +34,7 @@ use zippy_types::{
     BoxFuture, ErrorCode, LeaseId, OffsetWatermark, QueryId, Result, ServerError, TableId,
 };
 
+use crate::query_physical::AdmittedPinnedParquetFile;
 use crate::query_service::{
     QueryCancellation, QueryExecutionScope, QueryPlanDraft, QueryPlanningToken,
     QueryRetainedCharge, QueryRetainedKind, QueryRetainedPermit, QueryTaskCharge, QueryTaskPermit,
@@ -453,7 +458,8 @@ impl NativeQuerySnapshotCoordinator {
     }
 
     /// Admits one table task before cloning its capability from the pinned snapshot.
-    pub(crate) fn admit_table_task(
+    #[cfg(test)]
+    fn admit_table_task(
         &self,
         execution: &QueryExecutionScope,
         charge: QueryTaskCharge,
@@ -476,7 +482,8 @@ impl NativeQuerySnapshotCoordinator {
     }
 
     /// Admits one physical file task before deriving its capability from the pinned snapshot.
-    pub(crate) fn admit_file_task(
+    #[cfg(test)]
+    fn admit_file_task(
         &self,
         execution: &QueryExecutionScope,
         charge: QueryTaskCharge,
@@ -513,7 +520,7 @@ impl NativeQuerySnapshotCoordinator {
     /// The description is path-free and untrusted at this boundary. Every stable identity,
     /// ordinal, version, and scalar file property is revalidated after task admission but before
     /// the pinned capability can escape the snapshot guard.
-    pub(crate) fn admit_described_file_task(
+    fn admit_described_file_task(
         &self,
         execution: &QueryExecutionScope,
         charge: QueryTaskCharge,
@@ -572,6 +579,20 @@ impl NativeQuerySnapshotCoordinator {
                 Ok(file)
             },
         )
+    }
+
+    /// Returns a lazy reader for one exactly described file without exposing its capability.
+    ///
+    /// The raw `PinnedDataFile` and its task permit remain structurally sealed inside the reader.
+    /// Callers therefore cannot clone or open the capability and then release query accounting.
+    pub(crate) fn deferred_described_file_reader(
+        &self,
+        execution: &QueryExecutionScope,
+        charge: QueryTaskCharge,
+        description: PersistedFileDescription,
+    ) -> Result<BoxedAsyncFileReader> {
+        let task = self.admit_described_file_task(execution, charge, description)?;
+        Ok(AdmittedPinnedParquetFile::deferred(task))
     }
 
     /// Projects the exact pinned snapshot into capability-free persisted query metadata.
@@ -1921,18 +1942,16 @@ mod tests {
         ];
         for description in forged {
             let error = snapshot_coordinator
-                .admit_described_file_task(&execution, charge(), description)
+                .deferred_described_file_reader(&execution, charge(), description)
                 .err()
                 .expect("forged persisted file description must be rejected");
             assert_eq!(error.code(), zippy_types::ErrorCode::DataCorruption);
             assert_eq!(resources.status().active_tasks, 0);
         }
 
-        let task = snapshot_coordinator
-            .admit_described_file_task(&execution, charge(), file)
+        let mut reader = snapshot_coordinator
+            .deferred_described_file_reader(&execution, charge(), file)
             .expect("admit exact projected file description");
-        assert_eq!(task.resource().file_id(), expected_file_id);
-        let mut reader = AdmittedPinnedParquetFile::deferred(task);
         assert_eq!(resources.status().active_tasks, 1);
         assert_eq!(
             reader
@@ -1954,10 +1973,9 @@ mod tests {
         drop(reader);
         assert_eq!(resources.status().active_tasks, 0);
 
-        let cancelled_task = snapshot_coordinator
-            .admit_described_file_task(&execution, charge(), file)
+        let mut cancelled_reader = snapshot_coordinator
+            .deferred_described_file_reader(&execution, charge(), file)
             .expect("admit exact file before cancellation");
-        let mut cancelled_reader = AdmittedPinnedParquetFile::deferred(cancelled_task);
         resources
             .cancel_current_for_test(query)
             .expect("cancel before deferred file open");
