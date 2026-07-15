@@ -680,7 +680,8 @@ impl QueryRegistry {
 
     fn insert(&mut self, query_id: QueryId, control: Arc<QueryControl>) {
         debug_assert!(!self.tombstones.contains_key(&query_id));
-        debug_assert!(self.by_id.insert(query_id, control).is_none());
+        let previous = self.by_id.insert(query_id, control);
+        debug_assert!(previous.is_none());
     }
 
     fn len(&self) -> usize {

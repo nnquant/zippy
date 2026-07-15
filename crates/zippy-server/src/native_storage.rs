@@ -51,6 +51,7 @@ pub struct NativeStorageRuntimeConfig {
     catalog_file_verification: StartupCatalogFileVerifierConfig,
     table_actors: TableActorRegistryConfig,
     query_resources: crate::query_service::QueryServiceResourceConfig,
+    query_registry: crate::query_service::QueryServiceRegistryConfig,
     actor: CatalogActor,
     legacy_catalog_migration: LegacyCatalogMigrationStartup,
 }
@@ -68,6 +69,7 @@ impl NativeStorageRuntimeConfig {
             catalog_file_verification: StartupCatalogFileVerifierConfig::new(),
             table_actors: TableActorRegistryConfig::new(),
             query_resources: crate::query_service::QueryServiceResourceConfig::default(),
+            query_registry: crate::query_service::QueryServiceRegistryConfig::default(),
             actor: CatalogActor {
                 kind: CatalogActorKind::Server,
                 principal: DEFAULT_SERVER_ACTOR_PRINCIPAL.to_owned(),
@@ -139,6 +141,15 @@ impl NativeStorageRuntimeConfig {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_query_registry_config(
+        mut self,
+        query_registry: crate::query_service::QueryServiceRegistryConfig,
+    ) -> Self {
+        self.query_registry = query_registry;
+        self
+    }
+
     /// Replaces the audited server principal used for recovered Catalog commits.
     #[must_use]
     pub fn with_actor(mut self, actor: CatalogActor) -> Self {
@@ -168,6 +179,7 @@ impl NativeStorageRuntimeConfig {
         self.persist_controller.validate()?;
         self.table_actors.validate()?;
         self.query_resources.validate()?;
+        self.query_registry.validate(self.query_resources)?;
         Ok(())
     }
 }
@@ -338,9 +350,6 @@ impl NativeStorageStartup {
             ready.catalog_read_handle.clone(),
             ready.table_actors.clone(),
         );
-        let query_resources =
-            crate::query_service::QueryResourceCoordinator::new(ready.query_resources)
-                .expect("validated native query resource configuration");
         NativeStorageRuntime {
             report: ready.reconciliation,
             catalog_file_verification: ready.catalog_file_verification,
@@ -351,7 +360,7 @@ impl NativeStorageStartup {
             table_actors: ready.table_actors,
             table_actor_admission: ready.table_actor_admission,
             query_snapshot_coordinator,
-            query_resources,
+            query_resources: ready.query_resources,
             healthy: ready.healthy,
             terminal_failure: Arc::clone(&self.terminal_failure),
             shutdown: self.shutdown.take(),
@@ -537,6 +546,7 @@ impl NativeStorageRuntime {
             && self.healthy.load(Ordering::Acquire)
             && !self.shutdown_requested
             && self.final_shutdown.is_none()
+            && self.query_resources.status().sweeper_running
             && self
                 .supervisor
                 .as_ref()
@@ -678,7 +688,7 @@ struct SupervisorReady {
     table_actors: TableActorRegistryHandle,
     table_actor_admission: TableActorAdmissionControl,
     healthy: Arc<AtomicBool>,
-    query_resources: crate::query_service::QueryServiceResourceConfig,
+    query_resources: crate::query_service::QueryResourceCoordinator,
 }
 
 fn spawn_supervisor(config: NativeStorageRuntimeConfig) -> Result<NativeStorageStartup> {
@@ -963,6 +973,18 @@ async fn supervise_storage(
             fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
+    let query_resources = match crate::query_service::QueryResourceCoordinator::with_registry_config(
+        config.query_resources,
+        config.query_registry,
+    ) {
+        Ok(query_resources) => query_resources,
+        Err(error) => {
+            return (
+                false,
+                fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
+            );
+        }
+    };
     tracing::info!(
         component = "native_storage",
         event = "native_storage_ready",
@@ -1009,7 +1031,7 @@ async fn supervise_storage(
             table_actors: table_actor_handle,
             table_actor_admission,
             healthy: Arc::clone(&healthy),
-            query_resources: config.query_resources,
+            query_resources,
         }))
         .is_err()
     {

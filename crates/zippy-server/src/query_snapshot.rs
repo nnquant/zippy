@@ -528,7 +528,7 @@ mod tests {
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     };
-    use crate::query_service::{QueryResourceBudget, QueryTaskCharge};
+    use crate::query_service::{QueryResourceBudget, QueryServiceRegistryConfig, QueryTaskCharge};
 
     const NAMESPACE: u128 = 1;
     const NATIVE_TABLE: u128 = 10;
@@ -682,7 +682,11 @@ mod tests {
         catalog.close().expect("close seed Catalog");
         let runtime_config = NativeStorageRuntimeConfig::new(&ownership)
             .with_catalog_config(catalog_config)
-            .expect("reuse Catalog ownership");
+            .expect("reuse Catalog ownership")
+            .with_query_registry_config(QueryServiceRegistryConfig {
+                sweep_interval: Duration::from_secs(3600),
+                ..QueryServiceRegistryConfig::default()
+            });
         let runtime = NativeStorageRuntime::start(runtime_config).expect("start native storage");
         (temp, ownership, runtime)
     }

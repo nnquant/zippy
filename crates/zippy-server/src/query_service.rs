@@ -6,12 +6,14 @@
 
 use std::any::Any;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::watch;
 use zippy_types::query::{
     OpaqueQueryExecutionToken, QueryExecutionToken, QueryPlanInfo, QueryState,
 };
@@ -21,8 +23,10 @@ use zippy_types::{ErrorCode, QueryId, Result, ServerError, SessionId};
 static NEXT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(300);
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_REGISTERED_QUERIES: usize = 4096;
 const DEFAULT_MAX_QUERY_TOMBSTONES: usize = 65_536;
+const QUERY_SWEEPER_THREAD_NAME: &str = "zippy-query-sweeper";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueryServiceResourceConfig {
@@ -59,6 +63,7 @@ impl QueryServiceResourceConfig {
 /// Bounded lifecycle retention for the process-local query registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueryServiceRegistryConfig {
+    pub sweep_interval: Duration,
     pub terminal_retention: Duration,
     pub max_registered_queries: usize,
     pub max_query_tombstones: usize,
@@ -67,6 +72,7 @@ pub(crate) struct QueryServiceRegistryConfig {
 impl Default for QueryServiceRegistryConfig {
     fn default() -> Self {
         Self {
+            sweep_interval: DEFAULT_SWEEP_INTERVAL,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
             max_registered_queries: DEFAULT_MAX_REGISTERED_QUERIES,
             max_query_tombstones: DEFAULT_MAX_QUERY_TOMBSTONES,
@@ -75,8 +81,9 @@ impl Default for QueryServiceRegistryConfig {
 }
 
 impl QueryServiceRegistryConfig {
-    fn validate(self, resources: QueryServiceResourceConfig) -> Result<Self> {
-        if self.terminal_retention.is_zero()
+    pub(crate) fn validate(self, resources: QueryServiceResourceConfig) -> Result<Self> {
+        if self.sweep_interval.is_zero()
+            || self.terminal_retention.is_zero()
             || self.max_registered_queries == 0
             || self.max_query_tombstones == 0
         {
@@ -140,6 +147,8 @@ pub(crate) struct QueryServiceStatus {
     pub active_memory_bytes: u64,
     pub active_snapshot_owners: usize,
     pub query_tombstones: usize,
+    pub scheduled_deadlines: usize,
+    pub sweeper_running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,9 +165,50 @@ pub(crate) struct QueryRuntimeStatus {
     pub error: Option<ServerError>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryTerminalSignal {
+    pub query_id: QueryId,
+    pub generation: u64,
+    pub state: QueryState,
+    pub error: Option<ServerError>,
+}
+
+pub(crate) struct QueryCancellation {
+    query_id: QueryId,
+    cancelled: Arc<AtomicBool>,
+    receiver: watch::Receiver<Option<QueryTerminalSignal>>,
+}
+
+impl QueryCancellation {
+    pub(crate) fn terminal_signal(&self) -> Option<QueryTerminalSignal> {
+        self.receiver.borrow().clone()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> Result<QueryTerminalSignal> {
+        loop {
+            if let Some(signal) = self.terminal_signal() {
+                return Ok(signal);
+            }
+            if self.receiver.changed().await.is_err() {
+                return Err(ServerError::new(
+                    ErrorCode::Unavailable,
+                    "query terminal notification channel closed",
+                )
+                .with_query_id(self.query_id)
+                .with_retryable(false));
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct QueryResourceCoordinator {
     inner: Arc<CoordinatorInner>,
+    sweeper: Arc<QueryServiceSweeper>,
 }
 
 impl QueryResourceCoordinator {
@@ -172,17 +222,20 @@ impl QueryResourceCoordinator {
     ) -> Result<Self> {
         let config = config.validate()?;
         let registry_config = registry_config.validate(config)?;
-        Ok(Self {
-            inner: Arc::new(CoordinatorInner {
-                nonce: next_nonce(),
-                config,
-                terminal_retention_ns: duration_ns(registry_config.terminal_retention),
-                max_registered_queries: registry_config.max_registered_queries,
-                max_query_tombstones: registry_config.max_query_tombstones,
-                next_query_generation: AtomicU64::new(1),
-                state: Mutex::new(CoordinatorState::default()),
-            }),
-        })
+        let inner = Arc::new(CoordinatorInner {
+            nonce: next_nonce(),
+            config,
+            terminal_retention_ns: duration_ns(registry_config.terminal_retention),
+            max_registered_queries: registry_config.max_registered_queries,
+            max_query_tombstones: registry_config.max_query_tombstones,
+            next_query_generation: AtomicU64::new(1),
+            state: Mutex::new(CoordinatorState::default()),
+        });
+        let sweeper = Arc::new(QueryServiceSweeper::start(
+            &inner,
+            registry_config.sweep_interval,
+        )?);
+        Ok(Self { inner, sweeper })
     }
 
     pub(crate) fn register_planned(
@@ -204,6 +257,7 @@ impl QueryResourceCoordinator {
         }
 
         let generation = self.inner.next_query_generation();
+        let (terminal_sender, _) = watch::channel(None);
         let control = Arc::new(QueryControl {
             owner: Arc::downgrade(&self.inner),
             query_id,
@@ -211,7 +265,8 @@ impl QueryResourceCoordinator {
             budget,
             plan_expires_at_ns: info.expires_at_ns,
             execution_deadline_ns,
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            terminal_sender,
             state: Mutex::new(QueryControlState::default()),
         });
         let ownership;
@@ -262,14 +317,15 @@ impl QueryResourceCoordinator {
                 },
             );
         }
-        Ok(Box::new(QueryServicePlanToken {
+        let token: OpaqueQueryExecutionToken = Box::new(QueryServicePlanToken {
             coordinator_nonce: self.inner.nonce,
             info,
             owner_session_id,
             control,
             ownership: Some(ownership),
             armed: true,
-        }))
+        });
+        Ok(token)
     }
 
     pub(crate) fn begin_execution(
@@ -315,15 +371,112 @@ impl QueryResourceCoordinator {
     }
 
     pub(crate) fn begin_shutdown(&self) -> QueryServiceStatus {
-        self.inner.begin_shutdown()
+        self.inner.begin_shutdown();
+        self.sweeper.stop_and_join();
+        self.status()
     }
 
     pub(crate) fn status(&self) -> QueryServiceStatus {
-        self.inner.status()
+        let mut status = self.inner.status();
+        status.sweeper_running = self.sweeper.is_running();
+        status
     }
 
     pub(crate) fn query_status(&self, query_id: QueryId) -> Result<QueryRuntimeStatus> {
         self.inner.query_status(query_id)
+    }
+}
+
+struct QueryServiceSweeper {
+    signal: Arc<QuerySweeperSignal>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct QuerySweeperSignal {
+    stopping: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl QueryServiceSweeper {
+    fn start(inner: &Arc<CoordinatorInner>, interval: Duration) -> Result<Self> {
+        let signal = Arc::new(QuerySweeperSignal {
+            stopping: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let worker_signal = Arc::clone(&signal);
+        let weak_inner = Arc::downgrade(inner);
+        let worker = thread::Builder::new()
+            .name(QUERY_SWEEPER_THREAD_NAME.to_owned())
+            .spawn(move || run_query_sweeper(weak_inner, worker_signal, interval))
+            .map_err(|error| {
+                ServerError::new(
+                    ErrorCode::Unavailable,
+                    format!("failed to spawn query sweeper error=[{error}]"),
+                )
+                .with_retryable(false)
+            })?;
+        Ok(Self {
+            signal,
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+
+    fn is_running(&self) -> bool {
+        self.worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+    }
+
+    fn stop_and_join(&self) {
+        {
+            let mut stopping = self
+                .signal
+                .stopping
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *stopping = true;
+            self.signal.changed.notify_all();
+        }
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(worker) = worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for QueryServiceSweeper {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn run_query_sweeper(
+    inner: Weak<CoordinatorInner>,
+    signal: Arc<QuerySweeperSignal>,
+    interval: Duration,
+) {
+    loop {
+        let stopping = signal
+            .stopping
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (stopping, _) = signal
+            .changed
+            .wait_timeout_while(stopping, interval, |stopping| !*stopping)
+            .unwrap_or_else(|error| error.into_inner());
+        if *stopping {
+            return;
+        }
+        drop(stopping);
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        inner.sweep_expired(now_ns());
     }
 }
 
@@ -354,6 +507,13 @@ struct RegistryEntry {
 
 type TerminalOrderKey = Reverse<(u64, QueryId, u64)>;
 type TombstoneOrderKey = Reverse<(u64, QueryId, u64)>;
+type DeadlineOrderKey = (u64, QueryId, u64, QueryDeadlineKind);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QueryDeadlineKind {
+    PlanExpiry,
+    ExecutionDeadline,
+}
 
 #[derive(Clone, Copy)]
 struct QueryTombstone {
@@ -371,6 +531,7 @@ enum CapacityEviction {
 #[derive(Default)]
 struct QueryRegistry {
     by_id: HashMap<QueryId, RegistryEntry>,
+    deadline_order: BTreeSet<DeadlineOrderKey>,
     drained_terminal_order: BinaryHeap<TerminalOrderKey>,
     tombstones: HashMap<QueryId, QueryTombstone>,
     tombstone_order: BinaryHeap<TombstoneOrderKey>,
@@ -383,7 +544,25 @@ impl QueryRegistry {
 
     fn insert(&mut self, query_id: QueryId, entry: RegistryEntry) {
         debug_assert!(!self.tombstones.contains_key(&query_id));
-        debug_assert!(self.by_id.insert(query_id, entry).is_none());
+        let control = &entry.control;
+        let inserted_plan_deadline = self.deadline_order.insert((
+            control.plan_expires_at_ns,
+            query_id,
+            control.generation,
+            QueryDeadlineKind::PlanExpiry,
+        ));
+        debug_assert!(inserted_plan_deadline);
+        if let Some(deadline_ns) = control.execution_deadline_ns {
+            let inserted_execution_deadline = self.deadline_order.insert((
+                deadline_ns,
+                query_id,
+                control.generation,
+                QueryDeadlineKind::ExecutionDeadline,
+            ));
+            debug_assert!(inserted_execution_deadline);
+        }
+        let previous = self.by_id.insert(query_id, entry);
+        debug_assert!(previous.is_none());
     }
 
     fn len(&self) -> usize {
@@ -410,6 +589,46 @@ impl QueryRegistry {
             .get_mut(&query_id)
             .filter(|entry| entry.control.generation == generation)
             .and_then(|entry| entry.snapshot_root.take())
+    }
+
+    fn remove_plan_deadline(&mut self, control: &QueryControl) {
+        self.deadline_order.remove(&(
+            control.plan_expires_at_ns,
+            control.query_id,
+            control.generation,
+            QueryDeadlineKind::PlanExpiry,
+        ));
+    }
+
+    fn remove_deadlines(&mut self, control: &QueryControl) {
+        self.remove_plan_deadline(control);
+        if let Some(deadline_ns) = control.execution_deadline_ns {
+            self.deadline_order.remove(&(
+                deadline_ns,
+                control.query_id,
+                control.generation,
+                QueryDeadlineKind::ExecutionDeadline,
+            ));
+        }
+    }
+
+    fn pop_due_deadline(&mut self, now_ns: u64) -> Option<DeadlineOrderKey> {
+        let due = self.deadline_order.first().copied()?;
+        if due.0 > now_ns {
+            return None;
+        }
+        self.deadline_order.pop_first()
+    }
+
+    fn control_for_generation(
+        &self,
+        query_id: QueryId,
+        generation: u64,
+    ) -> Option<Arc<QueryControl>> {
+        self.by_id
+            .get(&query_id)
+            .filter(|entry| entry.control.generation == generation)
+            .map(|entry| Arc::clone(&entry.control))
     }
 
     fn record_drained_terminal(
@@ -585,6 +804,8 @@ impl CoordinatorState {
             active_memory_bytes: self.active_memory_bytes,
             active_snapshot_owners: self.active_snapshot_owners,
             query_tombstones: self.registry.tombstones.len(),
+            scheduled_deadlines: self.registry.deadline_order.len(),
+            sweeper_running: false,
         }
     }
 }
@@ -655,7 +876,7 @@ impl CoordinatorInner {
                 .is_some_and(|deadline| deadline <= now_ns)
         {
             let error = deadline(control.query_id, "query plan expired before execution");
-            Self::terminate_locked(
+            let signal = Self::terminate_locked(
                 &mut global,
                 control,
                 &mut query,
@@ -666,6 +887,7 @@ impl CoordinatorInner {
             let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
             drop(query);
             drop(global);
+            control.publish_terminal(signal);
             release_snapshot_root(snapshot_root);
             return Err(error);
         }
@@ -677,6 +899,7 @@ impl CoordinatorInner {
             .with_query_id(control.query_id));
         }
         query.state = QueryState::Running;
+        global.registry.remove_plan_deadline(control);
         Ok(())
     }
 
@@ -782,7 +1005,7 @@ impl CoordinatorInner {
                     .with_query_id(control.query_id),
             );
         }
-        Self::terminate_locked(
+        let signal = Self::terminate_locked(
             &mut global,
             control,
             &mut query,
@@ -793,6 +1016,7 @@ impl CoordinatorInner {
         let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         drop(query);
         drop(global);
+        control.publish_terminal(signal);
         release_snapshot_root(snapshot_root);
         Ok(())
     }
@@ -810,7 +1034,7 @@ impl CoordinatorInner {
             .map(|entry| Arc::clone(&entry.control))
             .ok_or_else(|| not_found(query_id))?;
         let mut query = control.state.lock().unwrap();
-        Self::terminate_locked(
+        let signal = Self::terminate_locked(
             &mut global,
             &control,
             &mut query,
@@ -821,6 +1045,7 @@ impl CoordinatorInner {
         let snapshot_root = Self::retire_terminal_if_drained(&mut global, &control, &mut query);
         drop(query);
         drop(global);
+        control.publish_terminal(signal);
         release_snapshot_root(snapshot_root);
         Ok(())
     }
@@ -833,7 +1058,7 @@ impl CoordinatorInner {
     ) {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
-        Self::terminate_locked(
+        let signal = Self::terminate_locked(
             &mut global,
             control,
             &mut query,
@@ -844,6 +1069,7 @@ impl CoordinatorInner {
         let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
         drop(query);
         drop(global);
+        control.publish_terminal(signal);
         release_snapshot_root(snapshot_root);
     }
 
@@ -854,16 +1080,23 @@ impl CoordinatorInner {
         terminal: QueryState,
         error: Option<ServerError>,
         finished_at_ns: u64,
-    ) -> bool {
+    ) -> Option<QueryTerminalSignal> {
         if query.state.is_terminal() {
-            return false;
+            return None;
         }
         debug_assert!(terminal.is_terminal());
         debug_assert!(query.state.can_transition_to(terminal));
         debug_assert_eq!(terminal == QueryState::Finished, error.is_none());
+        let signal = QueryTerminalSignal {
+            query_id: control.query_id,
+            generation: control.generation,
+            state: terminal,
+            error: error.clone(),
+        };
         query.state = terminal;
         query.error = error;
         query.finished_at_ns = Some(finished_at_ns);
+        global.registry.remove_deadlines(control);
         if query.logical_admitted {
             query.logical_admitted = false;
             debug_assert!(global.active_logical_queries > 0);
@@ -873,7 +1106,7 @@ impl CoordinatorInner {
             control.cancelled.store(true, Ordering::Release);
         }
         global.refresh_shutdown();
-        true
+        Some(signal)
     }
 
     fn retire_terminal_if_drained(
@@ -900,22 +1133,19 @@ impl CoordinatorInner {
 
     fn sweep_expired(&self, now_ns: u64) -> usize {
         let mut global = self.state.lock().unwrap();
-        let controls = global.registry.controls();
         let mut expired = 0;
         let mut snapshot_roots = Vec::new();
-        for control in controls {
+        let mut terminal_notifications = Vec::new();
+        while let Some((_, query_id, generation, kind)) = global.registry.pop_due_deadline(now_ns) {
+            let Some(control) = global.registry.control_for_generation(query_id, generation) else {
+                continue;
+            };
             let mut query = control.state.lock().unwrap();
-            let due = match query.state {
-                QueryState::Planned => {
-                    control.plan_expires_at_ns <= now_ns
-                        || control
-                            .execution_deadline_ns
-                            .is_some_and(|deadline| deadline <= now_ns)
+            let due = match kind {
+                QueryDeadlineKind::PlanExpiry => query.state == QueryState::Planned,
+                QueryDeadlineKind::ExecutionDeadline => {
+                    matches!(query.state, QueryState::Planned | QueryState::Running)
                 }
-                QueryState::Running => control
-                    .execution_deadline_ns
-                    .is_some_and(|deadline| deadline <= now_ns),
-                _ => false,
             };
             if due {
                 let error = deadline(control.query_id, "query exceeded its runtime deadline");
@@ -927,7 +1157,10 @@ impl CoordinatorInner {
                     Some(error),
                     now_ns,
                 );
-                expired += usize::from(terminated);
+                expired += usize::from(terminated.is_some());
+                if let Some(signal) = terminated {
+                    terminal_notifications.push((Arc::clone(&control), signal));
+                }
                 if let Some(root) =
                     Self::retire_terminal_if_drained(&mut global, &control, &mut query)
                 {
@@ -940,19 +1173,23 @@ impl CoordinatorInner {
             .remove_expired_terminal(now_ns, self.terminal_retention_ns);
         global.registry.remove_expired_tombstones(now_ns);
         drop(global);
+        for (control, signal) in terminal_notifications {
+            control.publish_terminal(Some(signal));
+        }
         for root in snapshot_roots {
             root.release();
         }
         expired
     }
 
-    fn begin_shutdown(&self) -> QueryServiceStatus {
+    fn begin_shutdown(&self) {
         let mut global = self.state.lock().unwrap();
         if global.lifecycle == QueryServiceLifecycle::Accepting {
             global.lifecycle = QueryServiceLifecycle::Draining;
         }
         let controls = global.registry.controls();
         let mut snapshot_roots = Vec::new();
+        let mut terminal_notifications = Vec::new();
         let finished_at_ns = now_ns();
         for control in controls {
             let mut query = control.state.lock().unwrap();
@@ -961,7 +1198,7 @@ impl CoordinatorInner {
                 "query cancelled during QueryService shutdown",
             )
             .with_query_id(control.query_id);
-            Self::terminate_locked(
+            let signal = Self::terminate_locked(
                 &mut global,
                 &control,
                 &mut query,
@@ -969,6 +1206,9 @@ impl CoordinatorInner {
                 Some(error),
                 finished_at_ns,
             );
+            if let Some(signal) = signal {
+                terminal_notifications.push((Arc::clone(&control), signal));
+            }
             if let Some(root) = Self::retire_terminal_if_drained(&mut global, &control, &mut query)
             {
                 snapshot_roots.push(root);
@@ -976,10 +1216,12 @@ impl CoordinatorInner {
         }
         global.refresh_shutdown();
         drop(global);
+        for (control, signal) in terminal_notifications {
+            control.publish_terminal(Some(signal));
+        }
         for root in snapshot_roots {
             root.release();
         }
-        self.status()
     }
 
     fn status(&self) -> QueryServiceStatus {
@@ -1013,24 +1255,44 @@ impl CoordinatorInner {
 
 impl Drop for CoordinatorInner {
     fn drop(&mut self) {
-        if let Ok(global) = self.state.get_mut() {
-            global.lifecycle = QueryServiceLifecycle::Stopped;
+        let mut terminal_notifications = Vec::new();
+        let mut snapshot_roots = Vec::new();
+        {
+            let global = self
+                .state
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner());
+            let finished_at_ns = now_ns();
+            global.lifecycle = QueryServiceLifecycle::Draining;
             for control in global.registry.controls() {
-                control.cancelled.store(true, Ordering::Release);
-                if let Ok(mut query) = control.state.lock() {
-                    if !query.state.is_terminal() {
-                        query.state = QueryState::Cancelled;
-                        query.logical_admitted = false;
-                        query.error = Some(
-                            ServerError::new(
-                                ErrorCode::Cancelled,
-                                "QueryService coordinator was dropped",
-                            )
-                            .with_query_id(control.query_id),
-                        );
-                    }
+                let mut query = control
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let error =
+                    ServerError::new(ErrorCode::Cancelled, "QueryService coordinator was dropped")
+                        .with_query_id(control.query_id);
+                if let Some(signal) = Self::terminate_locked(
+                    global,
+                    &control,
+                    &mut query,
+                    QueryState::Cancelled,
+                    Some(error),
+                    finished_at_ns,
+                ) {
+                    terminal_notifications.push((Arc::clone(&control), signal));
+                }
+                if let Some(root) = Self::retire_terminal_if_drained(global, &control, &mut query) {
+                    snapshot_roots.push(root);
                 }
             }
+            global.lifecycle = QueryServiceLifecycle::Stopped;
+        }
+        for (control, signal) in terminal_notifications {
+            control.publish_terminal(Some(signal));
+        }
+        for root in snapshot_roots {
+            root.release();
         }
     }
 }
@@ -1042,7 +1304,8 @@ struct QueryControl {
     budget: QueryResourceBudget,
     plan_expires_at_ns: u64,
     execution_deadline_ns: Option<u64>,
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    terminal_sender: watch::Sender<Option<QueryTerminalSignal>>,
     state: Mutex<QueryControlState>,
 }
 
@@ -1082,6 +1345,24 @@ impl QueryControl {
             );
         } else {
             self.cancelled.store(true, Ordering::Release);
+        }
+    }
+
+    fn cancellation(&self) -> QueryCancellation {
+        QueryCancellation {
+            query_id: self.query_id,
+            cancelled: Arc::clone(&self.cancelled),
+            receiver: self.terminal_sender.subscribe(),
+        }
+    }
+
+    fn publish_terminal(&self, signal: Option<QueryTerminalSignal>) {
+        if let Some(signal) = signal {
+            let previous = self.terminal_sender.send_replace(Some(signal));
+            debug_assert!(
+                previous.is_none(),
+                "terminal notification is published once"
+            );
         }
     }
 }
@@ -1334,6 +1615,10 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
     pub(crate) fn is_cancelled(&self) -> bool {
         self.control.cancelled.load(Ordering::Acquire)
     }
+
+    pub(crate) fn cancellation(&self) -> QueryCancellation {
+        self.control.cancellation()
+    }
 }
 
 impl<R: Send + 'static> Drop for QueryTaskPermit<R> {
@@ -1434,14 +1719,15 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use zippy_types::storage::{QueryReadSnapshotDescriptor, QueryReadSnapshotGuard};
     use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, SessionId};
 
     use super::{
         QueryResourceBudget, QueryResourceCoordinator, QueryServiceLifecycle,
-        QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryTaskCharge,
+        QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState, QueryTaskCharge,
     };
 
     struct TestSnapshot {
@@ -1519,10 +1805,22 @@ mod tests {
         terminal_retention: Duration,
     ) -> QueryServiceRegistryConfig {
         QueryServiceRegistryConfig {
+            sweep_interval: Duration::from_secs(3600),
             terminal_retention,
             max_registered_queries,
             max_query_tombstones,
         }
+    }
+
+    fn coordinator(resources: QueryServiceResourceConfig) -> QueryResourceCoordinator {
+        QueryResourceCoordinator::with_registry_config(
+            resources,
+            QueryServiceRegistryConfig {
+                sweep_interval: Duration::from_secs(3600),
+                ..QueryServiceRegistryConfig::default()
+            },
+        )
+        .unwrap()
     }
 
     fn info(query_id: QueryId, expires_at_ns: u64) -> zippy_types::query::QueryPlanInfo {
@@ -1563,7 +1861,7 @@ mod tests {
 
     #[test]
     fn registry_retains_revocable_snapshot_root_and_plan_drop_releases_once() {
-        let coordinator = QueryResourceCoordinator::new(config()).unwrap();
+        let coordinator = coordinator(config());
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
@@ -1597,7 +1895,7 @@ mod tests {
 
     #[test]
     fn rejected_registration_does_not_decrement_or_increment_admitted_ownership() {
-        let coordinator = QueryResourceCoordinator::new(config()).unwrap();
+        let coordinator = coordinator(config());
         let admitted_drops = Arc::new(AtomicUsize::new(0));
         let rejected_drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
@@ -1668,13 +1966,12 @@ mod tests {
 
     #[test]
     fn task_admission_enforces_per_query_and_global_cpu_memory_concurrency() {
-        let coordinator = QueryResourceCoordinator::new(QueryServiceResourceConfig {
+        let coordinator = coordinator(QueryServiceResourceConfig {
             max_active_queries: 2,
             max_active_tasks: 2,
             max_cpu_slots: 2,
             max_memory_bytes: 100,
-        })
-        .unwrap();
+        });
         let full_budget = QueryResourceBudget {
             max_active_tasks: 1,
             max_cpu_slots: 2,
@@ -1740,7 +2037,7 @@ mod tests {
 
     #[test]
     fn cancellation_releases_logical_slot_but_retains_physical_resources() {
-        let coordinator = QueryResourceCoordinator::new(config()).unwrap();
+        let coordinator = coordinator(config());
         let snapshot_drops = Arc::new(AtomicUsize::new(0));
         let resource_drops = Arc::new(AtomicUsize::new(0));
         let replacement_drops = Arc::new(AtomicUsize::new(0));
@@ -1805,7 +2102,7 @@ mod tests {
 
     #[test]
     fn ttl_revokes_unexecuted_snapshot_even_when_plan_token_is_retained() {
-        let coordinator = QueryResourceCoordinator::new(config()).unwrap();
+        let coordinator = coordinator(config());
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
@@ -1830,6 +2127,158 @@ mod tests {
         drop(token);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.sweep_expired(30), 0);
+    }
+
+    #[test]
+    fn deadline_index_processes_only_due_running_generation() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 2,
+            max_cpu_slots: 4,
+            max_memory_bytes: 200,
+        });
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let first = coordinator
+            .register_planned(
+                info(first_id, 100),
+                session_id(1),
+                Some(20),
+                budget(),
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned(
+                info(second_id, 100),
+                session_id(1),
+                Some(30),
+                budget(),
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+        assert_eq!(coordinator.status().scheduled_deadlines, 2);
+
+        assert_eq!(coordinator.sweep_expired(19), 0);
+        assert_eq!(coordinator.sweep_expired(20), 1);
+        assert_eq!(
+            coordinator.query_status(first_id).unwrap().state,
+            QueryState::TimedOut
+        );
+        assert_eq!(
+            coordinator.query_status(second_id).unwrap().state,
+            QueryState::Running
+        );
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
+
+        assert_eq!(coordinator.sweep_expired(30), 1);
+        assert_eq!(
+            coordinator.query_status(second_id).unwrap().state,
+            QueryState::TimedOut
+        );
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
+        drop((first, second));
+    }
+
+    #[test]
+    fn managed_sweeper_times_out_plan_and_joins_during_shutdown() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            QueryServiceRegistryConfig {
+                sweep_interval: Duration::from_millis(5),
+                terminal_retention: Duration::from_secs(30),
+                max_registered_queries: 1,
+                max_query_tombstones: 8,
+            },
+        )
+        .unwrap();
+        let now = super::now_ns();
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let token = coordinator
+            .register_planned(
+                info(id, now.saturating_add(20_000_000)),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::clone(&drops)),
+                now,
+            )
+            .unwrap();
+        assert!(coordinator.status().sweeper_running);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
+
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if coordinator.query_status(id).unwrap().state == QueryState::TimedOut {
+                break;
+            }
+            assert!(
+                Instant::now() < wait_deadline,
+                "managed sweeper did not expire plan"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
+
+        let stopped = coordinator.begin_shutdown();
+        assert_eq!(stopped.lifecycle, QueryServiceLifecycle::Stopped);
+        assert!(!stopped.sweeper_running);
+        drop(token);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_actively_wakes_waiting_physical_task() {
+        let coordinator = coordinator(config());
+        let now = super::now_ns();
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned(
+                info(id, now.saturating_add(60_000_000_000)),
+                session_id(1),
+                None,
+                budget(),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                now,
+            )
+            .unwrap();
+        let execution = coordinator
+            .begin_execution(token, now.saturating_add(1))
+            .unwrap();
+        let task = execution.admit_task(charge(1, 1), ()).unwrap();
+        let mut cancellation = task.cancellation();
+        assert!(!cancellation.is_cancelled());
+        let waiter = tokio::spawn(async move { cancellation.wait_terminal().await });
+        tokio::task::yield_now().await;
+
+        coordinator.cancel(id).unwrap();
+        let signal = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("terminal notification must wake without polling")
+            .expect("cancellation waiter task must not panic")
+            .expect("terminal channel must remain available");
+        assert_eq!(signal.query_id, id);
+        assert_eq!(signal.state, QueryState::Cancelled);
+        assert_eq!(signal.error.unwrap().code(), ErrorCode::Cancelled);
+        assert!(task.is_cancelled());
+        assert!(task.cancellation().is_cancelled());
+
+        coordinator.cancel(id).unwrap();
+        assert_eq!(
+            coordinator.query_status(id).unwrap().state,
+            QueryState::Cancelled
+        );
+        drop((execution, task));
+        assert_eq!(
+            coordinator.begin_shutdown().lifecycle,
+            QueryServiceLifecycle::Stopped
+        );
     }
 
     #[test]
@@ -1988,6 +2437,7 @@ mod tests {
 
         let state = coordinator.inner.state.lock().unwrap();
         assert_eq!(state.registry.by_id.len(), 2);
+        assert_eq!(state.registry.deadline_order.len(), 0);
         assert_eq!(state.registry.drained_terminal_order.len(), 2);
         assert_eq!(state.registry.tombstones.len(), 8);
         assert_eq!(state.registry.tombstone_order.len(), 8);
@@ -2094,6 +2544,7 @@ mod tests {
         let new_status = coordinator.query_status(id).unwrap();
         assert!(new_status.generation > old_generation);
         assert_eq!(new_status.state, zippy_types::query::QueryState::Planned);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         drop(old_token);
         let unaffected = coordinator.query_status(id).unwrap();
@@ -2102,10 +2553,12 @@ mod tests {
         assert_eq!(new_drops.load(Ordering::Relaxed), 0);
         assert_eq!(coordinator.status().active_logical_queries, 1);
         assert_eq!(coordinator.status().active_snapshot_owners, 1);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         drop(new_token);
         assert_eq!(new_drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_logical_queries, 0);
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
     }
 
     #[test]
@@ -2150,6 +2603,7 @@ mod tests {
             .unwrap();
         let new_generation = coordinator.query_status(id).unwrap().generation;
         assert!(new_generation > old_generation);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         drop(old_execution);
         let unaffected = coordinator.query_status(id).unwrap();
@@ -2157,6 +2611,7 @@ mod tests {
         assert_eq!(unaffected.state, zippy_types::query::QueryState::Planned);
         assert_eq!(new_drops.load(Ordering::Relaxed), 0);
         assert_eq!(coordinator.status().active_logical_queries, 1);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
         drop(new_token);
         assert_eq!(new_drops.load(Ordering::Relaxed), 1);
@@ -2164,7 +2619,7 @@ mod tests {
 
     #[test]
     fn shutdown_drains_only_after_tasks_and_snapshot_owners_exit() {
-        let coordinator = QueryResourceCoordinator::new(config()).unwrap();
+        let coordinator = coordinator(config());
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator
@@ -2204,7 +2659,7 @@ mod tests {
 
     #[test]
     fn shutdown_revokes_planned_snapshot_without_waiting_for_token_drop() {
-        let coordinator = QueryResourceCoordinator::new(config()).unwrap();
+        let coordinator = coordinator(config());
         let drops = Arc::new(AtomicUsize::new(0));
         let id = query_id(1);
         let token = coordinator

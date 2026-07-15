@@ -1989,9 +1989,18 @@ token 或 execution scope 仍被调用方持有，它们的 drop/cancel 也不�
 仍有 physical task 的 terminal query 不进入可淘汰堆，避免以缩小 registry 为名提前复用身份或丢失 pin
 撤销根。终态保留只保留控制状态，不保留已经可释放的 snapshot、task、CPU 或 memory 预算。
 
-这一小步尚未完成托管 sweeper、deadline 有序调度、可唤醒 cancellation token、session/owner 鉴权和完整
-QueryStatus/metrics；当前 `sweep_expired` 仍是显式调用并扫描 registry。这些能力必须在接入真实
-DataFusion physical task 前完成，不能把现有 registry 视为 Phase 5 query lifecycle 全部验收。
+QueryService 现在还维护严格有界的 deadline `BTreeSet`：planned TTL 和 execution deadline 各占一个
+带 generation 的有序 key，开始执行、任一 terminal 转换都会精确删除对应 key。到期处理只弹出当前
+时刻已经 due 的实例，不再周期性复制和扫描整个 registry；旧 generation 的 timer 即使残留也不能命中
+新实例。默认 100 ms 的具名 sweeper 使用可中断 `Condvar`，只持有 coordinator weak reference，
+QueryService shutdown 会发停止信号并 join，不能遗留 detached sleeping thread。terminal 转换在
+global/query 锁内只更新状态，随后在锁外通过 watch channel 发布一次终态通知；physical task permit 可
+取得不暴露 reader capability 的 cancellation handle，既保留低成本 atomic 检查，也能异步等待主动唤醒。
+
+这一小步尚未完成 session/owner 鉴权、完整 QueryStatus/metrics、planning 状态注册以及 DataFusion
+operator/result-stream 的实际取消传播。裸 `cancel(QueryId)` 仍只是 crate 内部协调入口，不能直接暴露为
+生产多租户 API。上述能力必须在接入真实 DataFusion physical task 前完成，不能把现有 registry 视为
+Phase 5 query lifecycle 全部验收。
 
 任务：
 
