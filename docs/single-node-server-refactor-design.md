@@ -2303,22 +2303,60 @@ retained charge 覆盖全部 decoded schema、manifest/table/file 容器和 allo
 `PartitionedFile`、DataFusion physical plan、metrics 和执行 operator 分配不在该 charge 中，后续必须分别由
 `PhysicalPlan` 与 `OperatorArena` permit 覆盖。
 
-下一步是引入 `NativeExecutionLease` 和 zippy-query-owned 全树 binding/validation API：完整物理计划中的每个
-planning marker 都必须被唯一替换并联合核验，漏绑、重复绑定或元数据错配一律 fail closed；随后接入延迟、有界的
-Parquet reader factory。lease 必须 consuming 地接管原始 `QueryRetainedPermit<ProjectedSnapshotManifest>`，不能只
-clone 其中可 clone 的 table/schema/file description 后提前退还 retained 账；只有物理计划取得自己独立且完整的
-`PhysicalPlan` charge 后才能原子转移或释放 manifest permit。故障测试必须覆盖 charge inspect 与 reserve 之间取消、
-投影中途取消，以及 query/revision/table/schema/file/legacy scan-order 的逐项错配。
+Stage 5.4f bounded persisted plan binding 已完成（2026-07-16）：`PreparedPersistedPlan` 在解析 SQL 前先按 limits
+申请不依赖解析结果的保守 preflight task；profile 生成后再以 profile 中的 exact build peak 覆盖异步 prepare 和 bind
+全过程。profile format version 参与指纹，preflight、profile、prepare、bind 的错误按稳定分类映射到
+`INVALID_ARGUMENT`、`DATA_CORRUPTION`、`UNSUPPORTED_PLAN`、`RESOURCE_EXHAUSTED` 或 `INTERNAL`，不解析错误
+字符串。
+
+zippy-query-owned 全树 binding 会唯一替换全部 planning marker，并在替换前后复核 synthetic location、typed
+extension、table/file ordinal、ID、snapshot/schema version、file range 和 Parquet options。缺失、重复、普通 Parquet
+scan 或任意 metadata 错配都会 fail closed。实际生成的 `ParquetExec` 显式关闭 page-index 和 bloom-filter read，bind
+校验也拒绝重新开启；row-group statistics pruning 保留。reader factory 替换基于原节点 clone，因此不会丢失已经
+核验的 options。
+
+非 Clone 的 `NativeExecutionLease` consuming 地接管原始
+`QueryRetainedPermit<ProjectedSnapshotManifest>`，并在 QueryService 的原子 rebuild 中把 manifest task/retained
+账转换为独立 `PhysicalPlan` retained 账。bound plan 和 file factory 只持有 weak execution authority，复制或长期
+保留 DataFusion plan 不能延长 query、snapshot pin 或文件读取能力。`finish`、`fail` 和 drop 都先关闭 reader
+admission；已发布终态优先于资源冲突返回，避免 admin cancel 已获胜后又向调用方伪造新的 `CONFLICT`。
+
+每个 persisted file reader 先申请 64 KiB task memory，实际打开后读取并校验精确 8-byte Parquet trailer，再按
+`64 KiB + serialized_footer_bytes * 64` 原子扩充同一个 query/session/process task reservation，成功后才把 reader
+交给 DataFusion。扩充拒绝不改变任何一级账本；reader、task permit 和 snapshot owner 共寿命。合法的 Zippy-managed
+Parquet 文件由该公式覆盖；若未来允许不可信本地文件，恶意 Thrift collection length 仍需要 bounded decoder 或独立
+进程/allocator 硬限制。
+
+本阶段故障矩阵：
+
+| 边界 | 必须结果 | 自动化证据 |
+| --- | --- | --- |
+| preflight/profile 拒绝 | 发布 `Failed`，task/retained/memory 归零 | `preflight_and_profile_failures_publish_failed_and_release_resources` |
+| query instance/revision/storage issuer 错配 | prepare 前 fail closed，不派生 reader | `foreign_instance_revision_and_storage_issuer_fail_before_preparation` |
+| bind metadata 错配 | 原 manifest 与 build task 同时回滚 | `bind_failure_rolls_back_build_and_manifest_reservations` |
+| finish/fail/drop | 保留第一个终态，执行 authority 不可复活 | `successful_finish_failure_and_drop_release_execution_authority` |
+| open 通过首检但尚未取得 execution mutex | close 后第二道门禁拒绝，不产生 task/pin | `reader_admission_second_gate_linearizes_finish_fail_and_drop` |
+| reader 已准入后 finish | 拒绝成功完成、关闭新 reader、旧 task/pin 随 reader drop 归零 | `real_reader_finish_closes_admission_and_drains_task_and_snapshot_pin` |
+| reader 已准入后 fail/drop | 保留 `Failed`/`Cancelled`，旧 task/pin 随 reader drop 归零 | `real_reader_fail_and_drop_keep_task_pin_until_reader_drop` |
+| admin cancel 先于 finish | finish 返回已发布的 `Cancelled`，不改写为 `Conflict` | `cancelled_lease_with_reader_finish_returns_first_terminal_error` |
+| 合法 footer task 扩充 | 三层 task memory 精确等于计算 charge | `admitted_parquet_cursor_retains_task_and_pin_until_final_drop` |
+| 真实 footer task 扩充超预算 | sticky `RESOURCE_EXHAUSTED`，无部分增长或重复 open | `real_footer_growth_rejection_is_sticky_and_releases_task_and_pin` |
+| footer grow 与 admin cancel 竞争 | 只允许 grow-first 或 cancel-first，三层账本一致 | `task_memory_growth_and_admin_cancel_are_linearized_across_all_ledgers` |
+| page-index/bloom 被篡改 | planning/bind 双重拒绝 | `binder_rejects_tampered_manifest_metadata_before_opening` |
+
+该阶段只完成计划、存储 reader 与生命周期的安全边界，尚未对外暴露 native result stream。decoded Arrow batch、
+sort/hash/join/aggregate operator arena、result delivery、DataFusion global memory pool、spill 和 temp quota 必须在执行
+入口开放前分别准入，不能把当前物理计划预算误当成完整查询内存上限。
 
 任务：
 
 1. 完成 DataFusion/Arrow version spike。（已完成）
-2. 新建 `zippy-query` 和 per-session `SessionContext` policy。
-3. 实现 `ZippyTableProvider`。
+2. 新建 `zippy-query` 和 per-session `SessionContext` policy。（persisted planning 已完成）
+3. 实现 `ZippyTableProvider`。（persisted-only 已完成）
 4. 实现 `ActiveSegmentExec` 和 snapshot lease guard。
 5. 先迁移 projection/filter/head/tail/slice。
 6. 迁移 sort/aggregate/join/window。
-7. 实现 query registry、cancel、deadline。
+7. 实现 query registry、cancel、deadline。（registry/lifecycle 已完成，result stream 尚未接入）
 8. 接入全局 memory pool、spill 和 temp quota。
 9. 实现 explain/profile/operator metrics。
 10. Python Table 改为发送完整 server plan，关闭 residual fallback。

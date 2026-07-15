@@ -59,15 +59,34 @@ Current scope:
   otherwise used by `ParquetAccessPlan`; row-group access plans must be composed into a future
   Zippy-owned extension instead of overwriting the identity.
 
-The server now projects these descriptions snapshot-wide from one exact pinned Catalog owner after
+The server projects these descriptions snapshot-wide from one exact pinned Catalog owner after
 QueryService task admission. It verifies query-level table ordering and uniqueness, descriptor and
 file identities, visibility, versions, and the decoder-produced schema charge before retaining a
-capability-free manifest. This does not make the planning-only provider executable.
+capability-free manifest.
 
-The next scope is a zippy-query-owned whole-plan binding and validation stage that replaces every
-planning marker with a `ParquetFileReaderFactory` resolving only the typed opaque file identity
-through a live execution lease. It must reject missing, duplicate, or mismatched bindings before
-multi-file bounded scheduling, result-stream, memory-pool, and spill integration. The execution plan
-must consume or retain the original admitted manifest owner rather than cloning table descriptions
-and releasing their retained-memory permit early. It must not retain a `TaskContext`,
-`SessionState`, `RuntimeEnv`, raw path, or a file handle detached from its QueryService permit.
+Persisted planning and binding are now admitted end to end. A conservative parse-independent
+preflight task is reserved before SQL profiling; the resulting immutable profile then supplies the
+exact build peak and retained-plan charge used by asynchronous preparation and whole-tree binding.
+Binding replaces every planning marker exactly once and rejects missing, duplicate, ordinary, or
+mismatched Parquet scans. The actual `ParquetExec`, not only the session defaults, has page-index and
+bloom-filter reads disabled and retains row-group pruning. Bind-time validation rejects either
+option being re-enabled.
+
+The server's non-cloneable `NativeExecutionLease` consumes the original admitted snapshot manifest
+and atomically rebuilds its retained reservation as a bound physical-plan reservation. Bound reader
+factories hold only a weak execution authority, so retaining or cloning a DataFusion plan cannot
+extend query or snapshot lifetime. Successful finish, explicit failure, and drop all close reader
+admission before publishing or preserving the terminal state and releasing plan ownership.
+
+Each persisted file starts with a 64 KiB task-memory reservation. Its deferred open reads and
+validates the exact 8-byte Parquet trailer, computes the serialized footer size, and atomically grows
+the same query/session/process task reservation to `64 KiB + footer_bytes * 64` before DataFusion
+parses metadata. A rejected growth leaves every ledger unchanged. Page indexes and bloom metadata
+remain disabled, which bounds this charge to the retained footer model while preserving row-group
+statistics pruning.
+
+This boundary does not yet expose a public native result stream. Decoded Arrow batches, execution
+operator arenas, result delivery, the global DataFusion memory pool, spill, and temporary-disk quota
+still require separate admission before native execution can replace the legacy query engine. The
+footer multiplier covers valid Zippy-managed Parquet files; treating arbitrary hostile local files
+as input would additionally require a bounded Thrift decoder or process/allocator isolation.
