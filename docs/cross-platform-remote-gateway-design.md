@@ -172,9 +172,9 @@ batch，channel 满后 scan cursor 让出共享 worker 并重新排队。单查�
 `[query].plan_ttl_ms` 是服务端为未执行 plan 设置的 TTL，默认 `30000` 毫秒，范围为
 `1..=86400000`；环境变量为 `ZIPPY_QUERY_PLAN_TTL_MS`。当前 authoritative Legacy/Gateway 和 staged
 native QueryService 使用同一配置。QueryService 会在 planning 完成时用服务端时钟重写
-`QueryPlanInfo.planned_at_ns`，并把 `expires_at_ns` 设为 request deadline 与 server plan TTL 的较早值；
-planner 传入的时间字段不能改变 snapshot pin。request deadline 继续覆盖 `Planned`/`Running`，plan TTL
-只覆盖尚未执行的 `Planned`。
+`QueryPlanInfo.planned_at_ns`，并把 `expires_at_ns` 设为 request deadline 与 server plan TTL 的较早值。
+native planner 只能提交不含时间字段的内部 `QueryPlanDraft`，不能影响 snapshot pin 生命周期。request
+deadline 继续覆盖 `Planned`/`Running`，plan TTL 只覆盖尚未执行的 `Planned`。
 
 默认不需要配置 gateway 的 `host` / `port`：当 master 是 TCP endpoint 时，
 GatewayServer endpoint 从 master endpoint 推导，端口为 `master.port + 1`。高级场景

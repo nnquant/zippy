@@ -130,6 +130,42 @@ pub(crate) struct QuerySubmissionMetadata {
     pub deadline_ns: Option<u64>,
 }
 
+/// Capability-free native plan metadata before QueryService assigns lifecycle timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryPlanDraft {
+    query_id: QueryId,
+    catalog_revision: u64,
+    snapshots: Vec<QueryTableVersion>,
+}
+
+impl QueryPlanDraft {
+    pub(crate) fn new(
+        query_id: QueryId,
+        catalog_revision: u64,
+        snapshots: Vec<QueryTableVersion>,
+    ) -> Self {
+        Self {
+            query_id,
+            catalog_revision,
+            snapshots,
+        }
+    }
+
+    pub(crate) fn snapshots(&self) -> &[QueryTableVersion] {
+        &self.snapshots
+    }
+
+    fn into_plan_info(self, planned_at_ns: u64, expires_at_ns: u64) -> QueryPlanInfo {
+        QueryPlanInfo {
+            query_id: self.query_id,
+            catalog_revision: self.catalog_revision,
+            snapshots: self.snapshots,
+            planned_at_ns,
+            expires_at_ns,
+        }
+    }
+}
+
 impl QueryResourceBudget {
     fn validate(self, global: QueryServiceResourceConfig) -> Result<Self> {
         if self.max_active_tasks == 0 || self.max_cpu_slots == 0 || self.max_memory_bytes == 0 {
@@ -428,16 +464,16 @@ impl QueryResourceCoordinator {
     pub(crate) fn complete_planning(
         &self,
         token: QueryPlanningToken,
-        info: QueryPlanInfo,
+        draft: QueryPlanDraft,
         snapshot: OpaqueQueryReadSnapshot,
     ) -> Result<OpaqueQueryExecutionToken> {
-        self.complete_planning_at(token, info, snapshot, now_ns())
+        self.complete_planning_at(token, draft, snapshot, now_ns())
     }
 
     fn complete_planning_at(
         &self,
         mut token: QueryPlanningToken,
-        mut info: QueryPlanInfo,
+        draft: QueryPlanDraft,
         snapshot: OpaqueQueryReadSnapshot,
         completed_at_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
@@ -448,21 +484,21 @@ impl QueryResourceCoordinator {
                     .with_query_id(query_id),
             );
         }
-        if info.query_id != query_id {
+        if draft.query_id != query_id {
             let error = invalid("completed plan belongs to another query").with_query_id(query_id);
             return self.reject_planning(&mut token, error);
         }
-        info.planned_at_ns = completed_at_ns;
         let server_plan_expiry_ns = completed_at_ns.saturating_add(self.inner.plan_ttl_ns);
-        info.expires_at_ns = token
+        let expires_at_ns = token
             .control
             .request_deadline_ns
             .map_or(server_plan_expiry_ns, |deadline_ns| {
                 deadline_ns.min(server_plan_expiry_ns)
             });
-        if let Err(error) = validate_plan_snapshot_binding(&info, snapshot.descriptor()) {
+        if let Err(error) = validate_plan_snapshot_binding(&draft, snapshot.descriptor()) {
             return self.reject_planning(&mut token, error);
         }
+        let info = draft.into_plan_info(completed_at_ns, expires_at_ns);
 
         match self
             .inner
@@ -616,11 +652,11 @@ impl QueryResourceCoordinator {
     pub(crate) fn complete_planning_at_for_test(
         &self,
         token: QueryPlanningToken,
-        info: QueryPlanInfo,
+        draft: QueryPlanDraft,
         snapshot: OpaqueQueryReadSnapshot,
         completed_at_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
-        self.complete_planning_at(token, info, snapshot, completed_at_ns)
+        self.complete_planning_at(token, draft, snapshot, completed_at_ns)
     }
 
     #[cfg(test)]
@@ -633,7 +669,9 @@ impl QueryResourceCoordinator {
         snapshot: OpaqueQueryReadSnapshot,
         now_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
-        validate_plan_snapshot_binding(&info, snapshot.descriptor())?;
+        let draft =
+            QueryPlanDraft::new(info.query_id, info.catalog_revision, info.snapshots.clone());
+        validate_plan_snapshot_binding(&draft, snapshot.descriptor())?;
         if execution_deadline_ns.is_some_and(|deadline| deadline <= now_ns) {
             return Err(deadline(
                 info.query_id,
@@ -649,7 +687,7 @@ impl QueryResourceCoordinator {
             budget,
             now_ns,
         )?;
-        self.complete_planning_at_for_test(planning, info, snapshot, now_ns)
+        self.complete_planning_at_for_test(planning, draft, snapshot, now_ns)
     }
 
     #[cfg(test)]
@@ -2828,25 +2866,25 @@ fn next_nonce() -> u64 {
 }
 
 fn validate_plan_snapshot_binding(
-    info: &QueryPlanInfo,
+    draft: &QueryPlanDraft,
     snapshot: &zippy_types::storage::QueryReadSnapshotDescriptor,
 ) -> Result<()> {
-    if snapshot.query_id != info.query_id {
+    if snapshot.query_id != draft.query_id {
         return Err(
-            invalid("query snapshot owner belongs to another query").with_query_id(info.query_id)
+            invalid("query snapshot owner belongs to another query").with_query_id(draft.query_id)
         );
     }
-    if snapshot.catalog_revision != info.catalog_revision {
+    if snapshot.catalog_revision != draft.catalog_revision {
         return Err(
             invalid("query plan catalog revision does not match snapshot owner")
-                .with_query_id(info.query_id),
+                .with_query_id(draft.query_id),
         );
     }
-    if snapshot.tables.len() != info.snapshots.len()
+    if snapshot.tables.len() != draft.snapshots.len()
         || snapshot
             .tables
             .iter()
-            .zip(&info.snapshots)
+            .zip(&draft.snapshots)
             .any(|(actual, planned)| {
                 actual.table_id != planned.table_id
                     || actual.persisted_snapshot_version != planned.snapshot_version
@@ -2855,7 +2893,7 @@ fn validate_plan_snapshot_binding(
     {
         return Err(
             invalid("query plan table versions do not match snapshot owner")
-                .with_query_id(info.query_id),
+                .with_query_id(draft.query_id),
         );
     }
     Ok(())
@@ -2912,8 +2950,8 @@ mod tests {
     use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, ServerError, SessionId};
 
     use super::{
-        QueryResourceBudget, QueryResourceCoordinator, QueryResultCharge, QueryServiceLifecycle,
-        QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState,
+        QueryPlanDraft, QueryResourceBudget, QueryResourceCoordinator, QueryResultCharge,
+        QueryServiceLifecycle, QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState,
         QuerySubmissionMetadata, QueryTaskCharge, DEFAULT_MAX_PLANNING_DURATION,
     };
 
@@ -3126,6 +3164,14 @@ mod tests {
         }
     }
 
+    fn draft(query_id: QueryId) -> QueryPlanDraft {
+        draft_at_revision(query_id, 1)
+    }
+
+    fn draft_at_revision(query_id: QueryId, catalog_revision: u64) -> QueryPlanDraft {
+        QueryPlanDraft::new(query_id, catalog_revision, Vec::new())
+    }
+
     fn metadata(query_id: QueryId, deadline_ns: Option<u64>) -> QuerySubmissionMetadata {
         QuerySubmissionMetadata {
             query_id,
@@ -3197,12 +3243,10 @@ mod tests {
         assert_eq!(coordinator.status().active_snapshot_owners, 0);
         assert_eq!(coordinator.status().scheduled_deadlines, 1);
 
-        let mut completed_info = info(id, 80);
-        completed_info.planned_at_ns = 999;
         let token = coordinator
             .complete_planning_at_for_test(
                 planning,
-                completed_info,
+                draft(id),
                 snapshot(id, Arc::clone(&drops)),
                 20,
             )
@@ -3272,7 +3316,7 @@ mod tests {
     }
 
     #[test]
-    fn server_plan_ttl_replaces_past_and_future_planner_timestamps() {
+    fn server_plan_ttl_is_the_only_plan_timestamp_authority() {
         let coordinator = coordinator_with_plan_ttl(
             QueryServiceResourceConfig {
                 max_active_queries: 2,
@@ -3282,17 +3326,15 @@ mod tests {
         );
         let owner = coordinator.owner(session_id(1));
 
-        for (value, supplied_expiry) in [(1, 1), (2, u64::MAX)] {
+        for value in [1, 2] {
             let id = query_id(value);
             let planning = coordinator
                 .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
                 .unwrap();
-            let mut supplied = info(id, supplied_expiry);
-            supplied.planned_at_ns = u64::MAX;
             let token = coordinator
                 .complete_planning_at_for_test(
                     planning,
-                    supplied,
+                    draft(id),
                     snapshot(id, Arc::new(AtomicUsize::new(0))),
                     20,
                 )
@@ -3381,7 +3423,7 @@ mod tests {
         let token = coordinator
             .complete_planning_at_for_test(
                 planning,
-                info(id, 100),
+                draft(id),
                 snapshot(id, Arc::clone(&drops)),
                 15,
             )
@@ -3428,7 +3470,7 @@ mod tests {
         let error = coordinator
             .complete_planning_at_for_test(
                 planning,
-                info(id, 100),
+                draft(id),
                 snapshot(id, Arc::clone(&drops)),
                 20,
             )
@@ -3461,7 +3503,7 @@ mod tests {
         let invalid_error = coordinator
             .complete_planning_at_for_test(
                 invalid,
-                info(invalid_id, 100),
+                draft_at_revision(invalid_id, 1),
                 snapshot_at_revision(invalid_id, 2, Arc::clone(&invalid_drops)),
                 20,
             )
@@ -3475,6 +3517,54 @@ mod tests {
         assert!(invalid_status.plan.is_none());
         assert_eq!(invalid_drops.load(Ordering::Relaxed), 1);
 
+        let wrong_query_id = query_id(3);
+        let wrong_query_drops = Arc::new(AtomicUsize::new(0));
+        let wrong_query = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(wrong_query_id, None), budget(), 10)
+            .unwrap();
+        let wrong_query_error = coordinator
+            .complete_planning_at_for_test(
+                wrong_query,
+                draft(query_id(4)),
+                snapshot(wrong_query_id, Arc::clone(&wrong_query_drops)),
+                20,
+            )
+            .err()
+            .expect("foreign query draft must fail");
+        assert_eq!(wrong_query_error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(wrong_query_drops.load(Ordering::Relaxed), 1);
+
+        let wrong_tables_id = query_id(5);
+        let wrong_tables_drops = Arc::new(AtomicUsize::new(0));
+        let wrong_tables = coordinator
+            .submit_at_for_test(
+                owner.as_ref(),
+                metadata(wrong_tables_id, None),
+                budget(),
+                10,
+            )
+            .unwrap();
+        let wrong_tables_draft = QueryPlanDraft::new(
+            wrong_tables_id,
+            1,
+            vec![zippy_types::query::QueryTableVersion {
+                table_id: zippy_types::TableId::from_u128(1).unwrap(),
+                snapshot_version: 1,
+                schema_version: 1,
+            }],
+        );
+        let wrong_tables_error = coordinator
+            .complete_planning_at_for_test(
+                wrong_tables,
+                wrong_tables_draft,
+                snapshot(wrong_tables_id, Arc::clone(&wrong_tables_drops)),
+                20,
+            )
+            .err()
+            .expect("mismatched table versions must fail");
+        assert_eq!(wrong_tables_error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(wrong_tables_drops.load(Ordering::Relaxed), 1);
+
         let expired_id = query_id(2);
         let expired_drops = Arc::new(AtomicUsize::new(0));
         let expired = coordinator
@@ -3484,7 +3574,7 @@ mod tests {
         let expired_error = coordinator
             .complete_planning_at_for_test(
                 expired,
-                info(expired_id, u64::MAX),
+                draft(expired_id),
                 snapshot(expired_id, Arc::clone(&expired_drops)),
                 20,
             )
@@ -3565,7 +3655,7 @@ mod tests {
             worker_barrier.wait();
             if let Ok(token) = worker_coordinator.complete_planning_at_for_test(
                 planning,
-                info(id, 100),
+                draft(id),
                 snapshot(id, worker_drops),
                 20,
             ) {
@@ -4051,7 +4141,7 @@ mod tests {
         let token = coordinator
             .complete_planning_at_for_test(
                 planning,
-                info(id, 100),
+                draft(id),
                 snapshot(id, Arc::new(AtomicUsize::new(0))),
                 10,
             )
@@ -4117,7 +4207,7 @@ mod tests {
         let token = coordinator
             .complete_planning_at_for_test(
                 planning,
-                info(id, 100),
+                draft(id),
                 snapshot(id, Arc::new(AtomicUsize::new(0))),
                 10,
             )
@@ -4178,7 +4268,7 @@ mod tests {
         let token = coordinator
             .complete_planning_at_for_test(
                 planning,
-                info(id, 100),
+                draft(id),
                 snapshot(id, Arc::new(AtomicUsize::new(0))),
                 10,
             )

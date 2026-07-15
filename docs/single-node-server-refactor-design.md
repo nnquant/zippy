@@ -2104,8 +2104,7 @@ server runtime 将同一值注入当前 authoritative Legacy/Gateway adapter 和
 避免迁移期同一配置出现两种行为。native `complete_planning` 使用服务端完成时刻重写
 `planned_at_ns`，并计算
 `expires_at_ns=min(request_deadline, completed_at_ns+plan_ttl)`；没有 request deadline 时只使用服务端
-TTL。planner 仍可构造共享的 `QueryPlanInfo`，但其中两个时间字段只是输入占位，不能缩短或延长 lease。
-request deadline 覆盖 Planned/Running；server plan TTL 只覆盖 Planned，开始执行后立即删除。
+TTL。request deadline 覆盖 Planned/Running；server plan TTL 只覆盖 Planned，开始执行后立即删除。
 
 这一小步仍是 native staging，不是 authority 切换。可信 session policy、完整外部 `QueryStatus`、
 DataFusion operator/result-stream 的实际取消传播仍未完成；当前 Python/Gateway `collect_stream` 也仍绕过
@@ -2179,6 +2178,18 @@ writer。升级任一依赖前必须先提升并验证 workspace Rust 基线。
 table actor 或 callback 热路径，也不宣称查询 authority 已切换。下一小步先让 native planner 产出不含
 服务端时间的 capability-free draft，再实现持有 QueryService task permit 的 pinned Parquet source；
 DataFusion 不能取得裸路径、裸文件或脱离资源账本的 reader。
+
+Stage 5.2 time-free native plan draft 已完成（2026-07-15）：`QueryPlanDraft` 是 `zippy-server` 内部、不可
+序列化的 capability-free 类型，只包含 query ID、Catalog revision 和 table snapshot/schema versions。
+`NativeQueryReadSnapshot::plan_draft()` 不再接收 `planned_at_ns/expires_at_ns`，planner 因而无法表达或伪造
+服务端时间。`QueryResourceCoordinator::complete_planning` 在校验 draft 与 opaque snapshot descriptor
+完全一致后，才以服务端完成时刻、server plan TTL 和 request deadline 唯一构造公开 `QueryPlanInfo`。
+公开 wire/status 类型保持不变；测试专用 planned-registration helper 虽继续接受最终 info 以复用资源账本
+用例，但会先丢弃其中时间字段并转换为 draft，生产 API 不存在该入口。
+
+draft 也不能保存 `PinnedDataFile`、reader、路径或其他 lease capability，因此未执行 plan 过期时，registry
+撤销 snapshot root 后不会有隐藏的文件 pin。下一小步是在 execution 开始后先取得 QueryService task
+permit，再从 snapshot 派生单文件 capability，并让 Parquet source/range readers 共同持有该 permit。
 
 任务：
 

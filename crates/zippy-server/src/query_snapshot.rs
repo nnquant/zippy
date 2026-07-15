@@ -15,7 +15,7 @@ use zippy_catalog::{
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
 use zippy_types::catalog::{CatalogRead, CatalogSnapshotSelector};
-use zippy_types::query::{QueryPlanInfo, QueryTableVersion};
+use zippy_types::query::QueryTableVersion;
 use zippy_types::storage::{
     OpaqueQueryReadSnapshot, QueryReadSnapshotDescriptor, QueryReadSnapshotGuard,
     TableReadSnapshotDescriptor,
@@ -26,7 +26,7 @@ use zippy_types::{
 };
 
 use crate::query_service::{
-    QueryExecutionScope, QueryPlanningToken, QueryTaskCharge, QueryTaskPermit,
+    QueryExecutionScope, QueryPlanDraft, QueryPlanningToken, QueryTaskCharge, QueryTaskPermit,
 };
 
 const MAX_SNAPSHOT_COORDINATION_ATTEMPTS: usize = 3;
@@ -494,13 +494,12 @@ pub(crate) struct NativeQueryReadSnapshot {
 }
 
 impl NativeQueryReadSnapshot {
-    /// Builds public plan metadata without exposing physical file locations.
-    pub(crate) fn plan_info(&self, planned_at_ns: u64, expires_at_ns: u64) -> QueryPlanInfo {
-        QueryPlanInfo {
-            query_id: self.descriptor.query_id,
-            catalog_revision: self.descriptor.catalog_revision,
-            snapshots: self
-                .descriptor
+    /// Builds capability-free plan metadata without exposing physical files or server time.
+    pub(crate) fn plan_draft(&self) -> QueryPlanDraft {
+        QueryPlanDraft::new(
+            self.descriptor.query_id,
+            self.descriptor.catalog_revision,
+            self.descriptor
                 .tables
                 .iter()
                 .map(|table| QueryTableVersion {
@@ -509,9 +508,7 @@ impl NativeQueryReadSnapshot {
                     schema_version: table.schema_version,
                 })
                 .collect(),
-            planned_at_ns,
-            expires_at_ns,
-        }
+        )
     }
 
     pub(crate) fn into_opaque(self) -> OpaqueQueryReadSnapshot {
@@ -867,10 +864,10 @@ mod tests {
             .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin mixed query snapshot");
-        let info = snapshot.plan_info(10, 100);
-        assert_eq!(info.snapshots.len(), 2);
-        assert_eq!(info.snapshots[0].table_id, table_id(NATIVE_TABLE));
-        assert_eq!(info.snapshots[1].table_id, table_id(LEGACY_TABLE));
+        let draft = snapshot.plan_draft();
+        assert_eq!(draft.snapshots().len(), 2);
+        assert_eq!(draft.snapshots()[0].table_id, table_id(NATIVE_TABLE));
+        assert_eq!(draft.snapshots()[1].table_id, table_id(LEGACY_TABLE));
 
         let status = runtime
             .runtime_snapshot_pin_status()
@@ -893,7 +890,7 @@ mod tests {
             .all(|record| descriptor_lease_ids.contains(&record.lease_id)));
 
         let token = resources
-            .complete_planning_at_for_test(planning, info, snapshot.into_opaque(), 10)
+            .complete_planning_at_for_test(planning, draft, snapshot.into_opaque(), 10)
             .expect("complete pinned plan");
         let execution = resources
             .begin_execution(token, 11)
@@ -1107,7 +1104,7 @@ mod tests {
         let token = resources
             .complete_planning_at_for_test(
                 planning,
-                snapshot.plan_info(10, 20),
+                snapshot.plan_draft(),
                 snapshot.into_opaque(),
                 10,
             )
