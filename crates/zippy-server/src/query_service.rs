@@ -14,6 +14,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
+use zippy_core::{
+    DEFAULT_MAX_CPU_CORES, DEFAULT_QUERY_MAX_ACTIVE_TASKS, DEFAULT_QUERY_MAX_CONCURRENT_QUERIES,
+    DEFAULT_QUERY_MAX_MEMORY_BYTES, MAX_QUERY_CONCURRENT_QUERIES,
+};
 use zippy_types::query::{
     OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryExecutionToken, QueryInstanceId,
     QueryOwnerCapability, QueryPlanInfo, QueryState, QueryTableVersion,
@@ -26,7 +30,7 @@ static NEXT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(300);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_PLANNING_DURATION: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_REGISTERED_QUERIES: usize = 4096;
+const DEFAULT_MAX_REGISTERED_QUERIES: usize = MAX_QUERY_CONCURRENT_QUERIES;
 const DEFAULT_MAX_QUERY_TOMBSTONES: usize = 65_536;
 const QUERY_SWEEPER_THREAD_NAME: &str = "zippy-query-sweeper";
 
@@ -41,10 +45,11 @@ pub(crate) struct QueryServiceResourceConfig {
 impl Default for QueryServiceResourceConfig {
     fn default() -> Self {
         Self {
-            max_active_queries: 64,
-            max_active_tasks: 256,
-            max_cpu_slots: 4,
-            max_memory_bytes: 1024 * 1024 * 1024,
+            max_active_queries: DEFAULT_QUERY_MAX_CONCURRENT_QUERIES,
+            max_active_tasks: DEFAULT_QUERY_MAX_ACTIVE_TASKS,
+            max_cpu_slots: u32::try_from(DEFAULT_MAX_CPU_CORES)
+                .expect("default runtime CPU budget must fit u32"),
+            max_memory_bytes: DEFAULT_QUERY_MAX_MEMORY_BYTES,
         }
     }
 }

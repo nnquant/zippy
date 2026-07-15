@@ -12,11 +12,30 @@ pub const DEFAULT_TABLE_PERSIST_DATA_DIR: &str = "data";
 pub const DEFAULT_TABLE_PERSIST_COMPACTION_INTERVAL_SEC: f64 = 300.0;
 pub const DEFAULT_TABLE_PERSIST_COMPACTION_MIN_FILES: usize = 8;
 pub const DEFAULT_MASTER_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
-pub const DEFAULT_MAX_PARALLELISM: usize = 4;
-pub const MAX_PARALLELISM: usize = 256;
+pub const DEFAULT_MAX_CPU_CORES: usize = 4;
+pub const MAX_CPU_CORES: usize = 256;
+/// Deprecated compatibility alias for APIs that have not migrated to CPU-budget terminology.
+pub const DEFAULT_MAX_PARALLELISM: usize = DEFAULT_MAX_CPU_CORES;
+/// Deprecated compatibility alias for APIs that have not migrated to CPU-budget terminology.
+pub const MAX_PARALLELISM: usize = MAX_CPU_CORES;
 pub const DEFAULT_MAX_QUERY_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 pub const DEFAULT_QUERY_MAX_BUFFERED_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_QUERY_BUFFER_BYTES: usize = u32::MAX as usize;
+/// Default number of logical native queries admitted concurrently.
+pub const DEFAULT_QUERY_MAX_CONCURRENT_QUERIES: usize = 64;
+/// Native query registry capacity available to concurrently admitted logical queries.
+pub const MAX_QUERY_CONCURRENT_QUERIES: usize = 4_096;
+const DEFAULT_QUERY_ACTIVE_TASKS_PER_CPU: usize = 4;
+/// Default number of native query tasks admitted across all logical queries.
+///
+/// Sixteen preserves the existing default of four tasks per default CPU core without claiming
+/// that all Zippy thread pools share one process-wide CPU semaphore.
+pub const DEFAULT_QUERY_MAX_ACTIVE_TASKS: usize =
+    DEFAULT_MAX_CPU_CORES * DEFAULT_QUERY_ACTIVE_TASKS_PER_CPU;
+/// Default native query task-memory admission budget.
+///
+/// This keeps the previous 512 MiB admission level while separating it from Gateway Arrow buffers.
+pub const DEFAULT_QUERY_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 pub const DEFAULT_CATALOG_SHADOW_QUEUE_CAPACITY: usize = 64;
 pub const DEFAULT_CATALOG_SHADOW_METADATA_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CATALOG_SHADOW_MAX_FILES_PER_COMPARISON: usize = 4_096;
@@ -135,9 +154,10 @@ pub struct ZippyServerConfig {
 }
 
 /// Process-wide execution resource limits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ZippyRuntimeConfig {
-    pub max_parallelism: usize,
+    /// Process-wide CPU budget consumed by components as an upper bound.
+    pub max_cpu_cores: usize,
     #[serde(default = "default_max_query_buffer_bytes")]
     pub max_query_buffer_bytes: usize,
 }
@@ -145,7 +165,7 @@ pub struct ZippyRuntimeConfig {
 impl Default for ZippyRuntimeConfig {
     fn default() -> Self {
         Self {
-            max_parallelism: DEFAULT_MAX_PARALLELISM,
+            max_cpu_cores: DEFAULT_MAX_CPU_CORES,
             max_query_buffer_bytes: DEFAULT_MAX_QUERY_BUFFER_BYTES,
         }
     }
@@ -155,11 +175,70 @@ fn default_max_query_buffer_bytes() -> usize {
     DEFAULT_MAX_QUERY_BUFFER_BYTES
 }
 
-/// Optional query-specific override of the process-wide parallelism limit.
+impl<'de> Deserialize<'de> for ZippyRuntimeConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RuntimeWireConfig {
+            #[serde(default, deserialize_with = "deserialize_optional_non_null_usize")]
+            max_cpu_cores: Option<usize>,
+            #[serde(default, deserialize_with = "deserialize_optional_non_null_usize")]
+            max_parallelism: Option<usize>,
+            #[serde(default = "default_max_query_buffer_bytes")]
+            max_query_buffer_bytes: usize,
+        }
+
+        let wire = RuntimeWireConfig::deserialize(deserializer)?;
+        let max_cpu_cores = resolve_runtime_cpu_aliases(
+            wire.max_cpu_cores,
+            wire.max_parallelism,
+            "serialized runtime",
+        )
+        .map_err(serde::de::Error::custom)?
+        .ok_or_else(|| serde::de::Error::missing_field("max_cpu_cores"))?;
+        Ok(Self {
+            max_cpu_cores,
+            max_query_buffer_bytes: wire.max_query_buffer_bytes,
+        })
+    }
+}
+
+fn deserialize_optional_non_null_usize<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    usize::deserialize(deserializer).map(Some)
+}
+
+/// Native query admission limits independent from Gateway Arrow buffer budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZippyQueryResourceConfig {
+    pub max_concurrent_queries: usize,
+    pub max_active_tasks: usize,
+    pub max_memory_bytes: u64,
+}
+
+impl Default for ZippyQueryResourceConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_queries: DEFAULT_QUERY_MAX_CONCURRENT_QUERIES,
+            max_active_tasks: DEFAULT_QUERY_MAX_ACTIVE_TASKS,
+            max_memory_bytes: DEFAULT_QUERY_MAX_MEMORY_BYTES,
+        }
+    }
+}
+
+/// Optional query-specific limits plus native query admission resources.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZippyQueryConfig {
     pub parallelism: Option<usize>,
     pub max_buffered_bytes: Option<usize>,
+    #[serde(default)]
+    pub resources: ZippyQueryResourceConfig,
 }
 
 /// Master control endpoint defaults.
@@ -306,6 +385,7 @@ struct PartialServerConfig {
 
 #[derive(Debug, Deserialize)]
 struct PartialRuntimeConfig {
+    max_cpu_cores: Option<usize>,
     max_parallelism: Option<usize>,
     max_query_buffer_bytes: Option<usize>,
 }
@@ -314,6 +394,19 @@ struct PartialRuntimeConfig {
 struct PartialQueryConfig {
     parallelism: Option<usize>,
     max_buffered_bytes: Option<usize>,
+    resources: Option<PartialQueryResourceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PartialQueryResourceConfig {
+    max_concurrent_queries: Option<usize>,
+    max_active_tasks: Option<usize>,
+    max_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct ConfigResolutionState {
+    query_max_active_tasks_explicit: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +504,7 @@ impl ZippyConfig {
     /// Load config from an optional TOML file path, then apply `ZIPPY_*` environment overrides.
     pub fn load_from_path(path: Option<impl AsRef<Path>>) -> Result<Self> {
         let mut config = Self::default();
+        let mut resolution = ConfigResolutionState::default();
         if let Some(path) = path {
             let path = path.as_ref();
             if path.exists() {
@@ -422,20 +516,95 @@ impl ZippyConfig {
                     ),
                 })?;
                 let config_base = absolute_parent(path)?;
-                config.apply_partial(parse_config_toml(&content, path)?, &config_base)?;
+                config.apply_partial(
+                    parse_config_toml(&content, path)?,
+                    &config_base,
+                    &mut resolution,
+                    "TOML [runtime]",
+                )?;
             }
         }
-        config.apply_env()?;
-        config.derive_endpoints()?;
-        config.validate()?;
+        config.apply_env(&mut resolution)?;
+        config.finalize_resolution(&resolution)?;
+        Ok(config)
+    }
+
+    /// Resolve a dynamic JSON config overlay without applying environment overrides.
+    ///
+    /// Relative managed paths are resolved against the explicit absolute `config_base`, making
+    /// the result independent from later working-directory changes.
+    pub fn from_json_overlay(
+        overlay: serde_json::Value,
+        config_base: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let config_base = config_base.as_ref();
+        if !config_base.is_absolute() {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "JSON config overlay base must be absolute path=[{}]",
+                    config_base.display()
+                ),
+            });
+        }
+        if !overlay.is_object() {
+            return Err(ZippyError::InvalidConfig {
+                reason: "JSON config overlay must be an object".to_string(),
+            });
+        }
+        let mut config = Self::default();
+        reject_non_nullable_json_nulls(&overlay, &config.to_json_value(), "")?;
+        let partial = serde_json::from_value::<PartialZippyConfig>(overlay).map_err(|error| {
+            ZippyError::InvalidConfig {
+                reason: format!("failed to parse JSON config overlay error=[{}]", error),
+            }
+        })?;
+        let mut resolution = ConfigResolutionState::default();
+        config.apply_partial(
+            partial,
+            config_base,
+            &mut resolution,
+            "JSON overlay [runtime]",
+        )?;
+        config.finalize_resolution(&resolution)?;
+        Ok(config)
+    }
+
+    pub(crate) fn from_wire_json(mut value: serde_json::Value) -> Result<Self> {
+        let resolution = ConfigResolutionState {
+            query_max_active_tasks_explicit: value
+                .pointer("/query/resources/max_active_tasks")
+                .is_some(),
+        };
+        canonicalize_runtime_cpu_wire_aliases(&mut value)?;
+        let mut config =
+            serde_json::from_value::<Self>(value).map_err(|error| ZippyError::InvalidConfig {
+                reason: format!("failed to decode zippy config error=[{}]", error),
+            })?;
+        config.finalize_resolution(&resolution)?;
         Ok(config)
     }
 
     pub fn to_json_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("zippy config must serialize")
+        let mut value = serde_json::to_value(self).expect("zippy config must serialize");
+        if let Some(runtime) = value
+            .get_mut("runtime")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            runtime.insert(
+                "max_parallelism".to_string(),
+                serde_json::json!(self.runtime.max_cpu_cores),
+            );
+        }
+        value
     }
 
-    fn apply_partial(&mut self, partial: PartialZippyConfig, config_base: &Path) -> Result<()> {
+    fn apply_partial(
+        &mut self,
+        partial: PartialZippyConfig,
+        config_base: &Path,
+        resolution: &mut ConfigResolutionState,
+        runtime_cpu_layer: &str,
+    ) -> Result<()> {
         if let Some(server) = partial.server {
             if let Some(data_dir) = server.data_dir {
                 let data_dir = non_empty(data_dir, "server.data_dir")?;
@@ -482,8 +651,12 @@ impl ZippyConfig {
             }
         }
         if let Some(runtime) = partial.runtime {
-            if let Some(max_parallelism) = runtime.max_parallelism {
-                self.runtime.max_parallelism = max_parallelism;
+            if let Some(max_cpu_cores) = resolve_runtime_cpu_aliases(
+                runtime.max_cpu_cores,
+                runtime.max_parallelism,
+                runtime_cpu_layer,
+            )? {
+                self.runtime.max_cpu_cores = max_cpu_cores;
             }
             if let Some(max_query_buffer_bytes) = runtime.max_query_buffer_bytes {
                 self.runtime.max_query_buffer_bytes = max_query_buffer_bytes;
@@ -588,11 +761,23 @@ impl ZippyConfig {
             if let Some(max_buffered_bytes) = query.max_buffered_bytes {
                 self.query.max_buffered_bytes = Some(max_buffered_bytes);
             }
+            if let Some(resources) = query.resources {
+                if let Some(max_concurrent_queries) = resources.max_concurrent_queries {
+                    self.query.resources.max_concurrent_queries = max_concurrent_queries;
+                }
+                if let Some(max_active_tasks) = resources.max_active_tasks {
+                    self.query.resources.max_active_tasks = max_active_tasks;
+                    resolution.query_max_active_tasks_explicit = true;
+                }
+                if let Some(max_memory_bytes) = resources.max_memory_bytes {
+                    self.query.resources.max_memory_bytes = max_memory_bytes;
+                }
+            }
         }
         Ok(())
     }
 
-    fn apply_env(&mut self) -> Result<()> {
+    fn apply_env(&mut self, resolution: &mut ConfigResolutionState) -> Result<()> {
         if let Some(data_dir) = std::env::var_os("ZIPPY_SERVER_DATA_DIR") {
             let data_dir = expand_home_path(PathBuf::from(data_dir));
             if data_dir.as_os_str().is_empty() {
@@ -656,8 +841,16 @@ impl ZippyConfig {
             self.catalog.shadow.dedup_capacity =
                 parse_usize_env("ZIPPY_CATALOG_SHADOW_DEDUP_CAPACITY", &value)?;
         }
-        if let Some(value) = env_string("ZIPPY_MAX_PARALLELISM") {
-            self.runtime.max_parallelism = parse_usize_env("ZIPPY_MAX_PARALLELISM", &value)?;
+        let max_cpu_cores = env_string("ZIPPY_MAX_CPU_CORES")
+            .map(|value| parse_usize_env("ZIPPY_MAX_CPU_CORES", &value))
+            .transpose()?;
+        let max_parallelism = env_string("ZIPPY_MAX_PARALLELISM")
+            .map(|value| parse_usize_env("ZIPPY_MAX_PARALLELISM", &value))
+            .transpose()?;
+        if let Some(value) =
+            resolve_runtime_cpu_aliases(max_cpu_cores, max_parallelism, "environment")?
+        {
+            self.runtime.max_cpu_cores = value;
         }
         if let Some(value) = env_string("ZIPPY_MAX_QUERY_BUFFER_BYTES") {
             self.runtime.max_query_buffer_bytes =
@@ -702,6 +895,19 @@ impl ZippyConfig {
         if let Some(value) = env_string("ZIPPY_QUERY_MAX_BUFFERED_BYTES") {
             self.query.max_buffered_bytes =
                 Some(parse_usize_env("ZIPPY_QUERY_MAX_BUFFERED_BYTES", &value)?);
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_MAX_CONCURRENT_QUERIES") {
+            self.query.resources.max_concurrent_queries =
+                parse_usize_env("ZIPPY_QUERY_MAX_CONCURRENT_QUERIES", &value)?;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_MAX_ACTIVE_TASKS") {
+            self.query.resources.max_active_tasks =
+                parse_usize_env("ZIPPY_QUERY_MAX_ACTIVE_TASKS", &value)?;
+            resolution.query_max_active_tasks_explicit = true;
+        }
+        if let Some(value) = env_string("ZIPPY_QUERY_MAX_MEMORY_BYTES") {
+            self.query.resources.max_memory_bytes =
+                parse_u64_env("ZIPPY_QUERY_MAX_MEMORY_BYTES", &value)?;
         }
         if let Some(value) = env_string("ZIPPY_TABLE_ROW_CAPACITY") {
             self.table.row_capacity =
@@ -826,6 +1032,30 @@ impl ZippyConfig {
         Ok(())
     }
 
+    fn resolve_query_resource_defaults(
+        &mut self,
+        resolution: &ConfigResolutionState,
+    ) -> Result<()> {
+        if !resolution.query_max_active_tasks_explicit {
+            self.query.resources.max_active_tasks = self
+                .query_parallelism()
+                .checked_mul(DEFAULT_QUERY_ACTIVE_TASKS_PER_CPU)
+                .ok_or_else(|| ZippyError::InvalidConfig {
+                    reason: format!(
+                        "derived query max_active_tasks exceeds usize query_parallelism=[{}]",
+                        self.query_parallelism()
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn finalize_resolution(&mut self, resolution: &ConfigResolutionState) -> Result<()> {
+        self.resolve_query_resource_defaults(resolution)?;
+        self.derive_endpoints()?;
+        self.validate()
+    }
+
     /// Resolves the managed server data root.
     ///
     /// `default` should be stable for one control endpoint. It is used only
@@ -921,23 +1151,55 @@ impl ZippyConfig {
                 });
             }
         }
-        if self.runtime.max_parallelism == 0 || self.runtime.max_parallelism > MAX_PARALLELISM {
+        if self.runtime.max_cpu_cores == 0 || self.runtime.max_cpu_cores > MAX_CPU_CORES {
             return Err(ZippyError::InvalidConfig {
                 reason: format!(
-                    "runtime max_parallelism must be between 1 and {} value=[{}]",
-                    MAX_PARALLELISM, self.runtime.max_parallelism
+                    "runtime max_cpu_cores must be between 1 and {} value=[{}]",
+                    MAX_CPU_CORES, self.runtime.max_cpu_cores
                 ),
             });
         }
         if let Some(parallelism) = self.query.parallelism {
-            if parallelism == 0 || parallelism > self.runtime.max_parallelism {
+            if parallelism == 0 || parallelism > self.runtime.max_cpu_cores {
                 return Err(ZippyError::InvalidConfig {
                     reason: format!(
-                        "query parallelism must be between 1 and runtime max_parallelism value=[{}] max_parallelism=[{}]",
-                        parallelism, self.runtime.max_parallelism
+                        "query parallelism must be between 1 and runtime max_cpu_cores value=[{}] max_cpu_cores=[{}]",
+                        parallelism, self.runtime.max_cpu_cores
                     ),
                 });
             }
+        }
+        if self.query.resources.max_concurrent_queries == 0
+            || self.query.resources.max_concurrent_queries > MAX_QUERY_CONCURRENT_QUERIES
+        {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    "query resources max_concurrent_queries must be between 1 and {} value=[{}]",
+                    MAX_QUERY_CONCURRENT_QUERIES, self.query.resources.max_concurrent_queries
+                ),
+            });
+        }
+        if self.query.resources.max_active_tasks == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query resources max_active_tasks must be greater than zero".to_string(),
+            });
+        }
+        if self.query.resources.max_memory_bytes == 0 {
+            return Err(ZippyError::InvalidConfig {
+                reason: "query resources max_memory_bytes must be greater than zero".to_string(),
+            });
+        }
+        let query_parallelism = self.query_parallelism();
+        if self.query.resources.max_active_tasks < query_parallelism {
+            return Err(ZippyError::InvalidConfig {
+                reason: format!(
+                    concat!(
+                        "query resources max_active_tasks must not be less than effective query ",
+                        "parallelism value=[{}] query_parallelism=[{}]"
+                    ),
+                    self.query.resources.max_active_tasks, query_parallelism
+                ),
+            });
         }
         if self.runtime.max_query_buffer_bytes == 0
             || self.runtime.max_query_buffer_bytes > MAX_QUERY_BUFFER_BYTES
@@ -1026,9 +1288,7 @@ impl ZippyConfig {
 
     /// Return the effective query limit after applying runtime inheritance.
     pub fn query_parallelism(&self) -> usize {
-        self.query
-            .parallelism
-            .unwrap_or(self.runtime.max_parallelism)
+        self.query.parallelism.unwrap_or(self.runtime.max_cpu_cores)
     }
 
     /// Return the effective per-query buffered Arrow byte limit.
@@ -1056,6 +1316,92 @@ fn parse_config_toml(content: &str, path: &Path) -> Result<PartialZippyConfig> {
 
 fn env_string(key: &str) -> Option<String> {
     std::env::var_os(key).map(|value| value.to_string_lossy().to_string())
+}
+
+fn resolve_runtime_cpu_aliases(
+    max_cpu_cores: Option<usize>,
+    max_parallelism: Option<usize>,
+    layer: &str,
+) -> Result<Option<usize>> {
+    match (max_cpu_cores, max_parallelism) {
+        (Some(canonical), Some(legacy)) if canonical != legacy => Err(ZippyError::InvalidConfig {
+            reason: format!(
+                concat!(
+                    "conflicting runtime CPU limits layer=[{}] ",
+                    "max_cpu_cores=[{}] max_parallelism=[{}]"
+                ),
+                layer, canonical, legacy
+            ),
+        }),
+        (Some(canonical), _) => Ok(Some(canonical)),
+        (None, Some(legacy)) => Ok(Some(legacy)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn canonicalize_runtime_cpu_wire_aliases(value: &mut serde_json::Value) -> Result<()> {
+    let Some(runtime) = value
+        .get_mut("runtime")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let max_cpu_cores = parse_wire_usize(runtime.get("max_cpu_cores"), "runtime.max_cpu_cores")?;
+    let max_parallelism =
+        parse_wire_usize(runtime.get("max_parallelism"), "runtime.max_parallelism")?;
+    let resolved =
+        resolve_runtime_cpu_aliases(max_cpu_cores, max_parallelism, "GetConfig wire response")?;
+    runtime.remove("max_parallelism");
+    if let Some(max_cpu_cores) = resolved {
+        runtime.insert(
+            "max_cpu_cores".to_string(),
+            serde_json::json!(max_cpu_cores),
+        );
+    }
+    Ok(())
+}
+
+fn parse_wire_usize(value: Option<&serde_json::Value>, name: &str) -> Result<Option<usize>> {
+    value
+        .cloned()
+        .map(|value| {
+            serde_json::from_value::<usize>(value).map_err(|error| ZippyError::InvalidConfig {
+                reason: format!(
+                    "wire config field must parse as usize name=[{}] error=[{}]",
+                    name, error
+                ),
+            })
+        })
+        .transpose()
+}
+
+fn reject_non_nullable_json_nulls(
+    overlay: &serde_json::Value,
+    defaults: &serde_json::Value,
+    path: &str,
+) -> Result<()> {
+    match (overlay, defaults) {
+        (serde_json::Value::Null, default) if !default.is_null() => {
+            Err(ZippyError::InvalidConfig {
+                reason: format!("JSON config overlay field must not be null path=[{}]", path),
+            })
+        }
+        (serde_json::Value::Object(overlay), serde_json::Value::Object(defaults)) => {
+            for (key, value) in overlay {
+                let Some(default) = defaults.get(key) else {
+                    continue;
+                };
+                let field_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                reject_non_nullable_json_nulls(value, default, &field_path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 fn parse_bool_env(key: &str, value: &str) -> Result<bool> {

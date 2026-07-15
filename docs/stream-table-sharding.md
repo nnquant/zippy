@@ -44,7 +44,7 @@ hash, not Python `hash()`.
 
 `shard_nums` is either an integer greater than 1 or `"auto"`. `"auto"` resolves
 before the pipeline starts to
-`min(os.cpu_count() or 1, runtime.max_parallelism, 16)`, and metadata stores the
+`min(os.cpu_count() or 1, runtime.max_cpu_cores, 16)`, and metadata stores the
 resolved integer rather than the string.
 
 Invalid combinations fail before streams are registered:
@@ -104,14 +104,14 @@ Configure the per-query read budget with:
 
 ```toml
 [runtime]
-max_parallelism = 4
+max_cpu_cores = 4
 
 [query]
 parallelism = 2
 ```
 
-Query parallelism inherits `runtime.max_parallelism` when its override is
-omitted. `ZIPPY_MAX_PARALLELISM` and `ZIPPY_QUERY_PARALLELISM` override the two
+Query parallelism inherits `runtime.max_cpu_cores` when its override is
+omitted. `ZIPPY_MAX_CPU_CORES` and `ZIPPY_QUERY_PARALLELISM` override the two
 values. Zippy divides the query budget across active shards, so shard fan-out
 and each shard's local persisted-file reads do not multiply into unbounded
 nested parallelism.

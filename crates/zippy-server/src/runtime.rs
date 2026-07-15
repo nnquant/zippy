@@ -1673,31 +1673,11 @@ fn start_native_storage_if_enabled(
     let persist_controller = PersistControllerConfig::new().with_max_parallel_writers(
         runtime_config
             .runtime
-            .max_parallelism
+            .max_cpu_cores
             .min(MAX_PERSIST_PARALLEL_WRITERS),
     );
     let runtime_snapshot_pins = runtime_config.catalog.runtime_snapshot_pins;
-    let query_parallelism = runtime_config.query_parallelism();
-    let query_resources = crate::query_service::QueryServiceResourceConfig {
-        max_active_queries: runtime_snapshot_pins.max_active_pins.clamp(1, 64),
-        max_active_tasks: query_parallelism.saturating_mul(4).max(1),
-        max_cpu_slots: u32::try_from(query_parallelism).map_err(|_| {
-            ServerError::new(
-                ErrorCode::InvalidArgument,
-                "configured query parallelism exceeds u32",
-            )
-            .with_retryable(false)
-        })?,
-        max_memory_bytes: u64::try_from(runtime_config.runtime.max_query_buffer_bytes).map_err(
-            |_| {
-                ServerError::new(
-                    ErrorCode::InvalidArgument,
-                    "configured query buffer byte budget exceeds u64",
-                )
-                .with_retryable(false)
-            },
-        )?,
-    };
+    let query_resources = native_query_resource_config(runtime_config)?;
     let catalog = SqliteCatalogConfig::new(data_directory).with_runtime_snapshot_pin_limits(
         runtime_snapshot_pins.max_active_pins,
         runtime_snapshot_pins.max_active_tables,
@@ -1728,6 +1708,23 @@ fn start_native_storage_if_enabled(
         }
         NativeStorageStartOutcome::Failed(error) => Err(with_stage("start native storage", error)),
     }
+}
+
+fn native_query_resource_config(
+    runtime_config: &ZippyConfig,
+) -> Result<crate::query_service::QueryServiceResourceConfig, ServerError> {
+    Ok(crate::query_service::QueryServiceResourceConfig {
+        max_active_queries: runtime_config.query.resources.max_concurrent_queries,
+        max_active_tasks: runtime_config.query.resources.max_active_tasks,
+        max_cpu_slots: u32::try_from(runtime_config.runtime.max_cpu_cores).map_err(|_| {
+            ServerError::new(
+                ErrorCode::InvalidArgument,
+                "configured runtime CPU core budget exceeds u32",
+            )
+            .with_retryable(false)
+        })?,
+        max_memory_bytes: runtime_config.query.resources.max_memory_bytes,
+    })
 }
 
 fn prepare_legacy_catalog_migration(
@@ -2312,6 +2309,28 @@ mod tests {
             "zippy-server-runtime-unit-test-logs-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn native_query_resources_are_independent_from_gateway_buffer_budget() {
+        let mut lower_buffer = ZippyConfig::default();
+        lower_buffer.runtime.max_cpu_cores = 6;
+        lower_buffer.runtime.max_query_buffer_bytes = 64 * 1024 * 1024;
+        lower_buffer.query.parallelism = Some(2);
+        lower_buffer.query.resources.max_concurrent_queries = 23;
+        lower_buffer.query.resources.max_active_tasks = 31;
+        lower_buffer.query.resources.max_memory_bytes = 384 * 1024 * 1024;
+        let mut higher_buffer = lower_buffer.clone();
+        higher_buffer.runtime.max_query_buffer_bytes = 1024 * 1024 * 1024;
+
+        let lower_resources = native_query_resource_config(&lower_buffer).unwrap();
+        let higher_resources = native_query_resource_config(&higher_buffer).unwrap();
+
+        assert_eq!(lower_resources, higher_resources);
+        assert_eq!(lower_resources.max_active_queries, 23);
+        assert_eq!(lower_resources.max_active_tasks, 31);
+        assert_eq!(lower_resources.max_cpu_slots, 6);
+        assert_eq!(lower_resources.max_memory_bytes, 384 * 1024 * 1024);
     }
 
     #[cfg(unix)]

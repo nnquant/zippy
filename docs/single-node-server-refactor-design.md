@@ -1502,6 +1502,10 @@ data_dir = "data/zippy"
 unix_endpoint = "data/zippy/run/zippy.sock"
 shutdown_timeout_ms = 10000
 
+[runtime]
+max_cpu_cores = 4
+max_query_buffer_bytes = 536870912
+
 [catalog]
 path = "data/zippy/catalog/catalog.db"
 synchronous = "full"
@@ -1515,11 +1519,14 @@ wal_segment_bytes = 268435456
 max_buffered_bytes = 268435456
 
 [query]
-max_cpu_cores = 4
-max_memory_bytes = 536870912
-per_query_memory_bytes = 134217728
+parallelism = 4
+max_buffered_bytes = 134217728
 max_spill_bytes = 4294967296
+
+[query.resources]
 max_concurrent_queries = 8
+max_active_tasks = 16
+max_memory_bytes = 536870912
 
 [subscription]
 max_clients = 128
@@ -1545,7 +1552,9 @@ legacy_gateway_protocol = true
 legacy_registry_import = true
 ```
 
-`ZIPPY_MAX_CPU_CORES` 继续作为全局硬上限；组件配置只能收紧，不能超过全局值。
+`ZIPPY_MAX_CPU_CORES` 是 canonical 全局 CPU 配置上限；组件配置只能收紧，不能超过全局值。
+在多个独立线程池统一接入同一个进程级 semaphore 前，不把该配置宣称为已实现的硬 CPU
+admission。
 
 ---
 
@@ -1955,7 +1964,7 @@ version、writer epoch 和 committed log watermark，再一次性构建 server-o
 每张 active table 会在 ready 前创建串行 actor；默认 per-table mailbox 64、全局 outstanding command
 4096，均为立即有界 admission。server 现在还会启动独占 Catalog commit coordinator 的
 `PersistController`：默认 64 个 accepted jobs、512 MiB 完整 retained input、4 路 Parquet writer，writer
-并发取 process-wide `runtime.max_parallelism` 并受 64 路硬上限约束。同表只允许一个 accepted persist，
+并发取 process-wide `runtime.max_cpu_cores` 并受 64 路安全上限约束。同表只允许一个 accepted persist，
 不同表可以并行；footer 在准入前完成 1 MiB 有界流式编码，schema、provenance、metadata、容器和 Arrow
 buffer 都计入输入预算。shutdown 顺序为关闭 table actor admission、排空已接受 actor command、排空
 PersistController 的 writer 与 Catalog commit、关闭 SQLite Catalog。actor 现在会逐请求复核 table、

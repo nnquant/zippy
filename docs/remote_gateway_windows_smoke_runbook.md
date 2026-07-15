@@ -39,7 +39,7 @@ host = "0.0.0.0"
 port = 17690
 
 [runtime]
-max_parallelism = 4
+max_cpu_cores = 4
 max_query_buffer_bytes = 536870912
 
 [query]
@@ -55,7 +55,8 @@ protocol_version = 1
 
 - `enabled = true`：master 会启动 native GatewayServer，并向远端 client 发布 Gateway
   capability；
-- `runtime.max_parallelism = 4`：限制进程级并行度和 Gateway worker 数；查询默认继承该值；
+- `runtime.max_cpu_cores = 4`：设置组件共同遵守的 CPU 上限和 Gateway worker 数；查询默认
+  继承该值；当前不同线程池尚未由同一个进程级硬 semaphore 统一 admission；
   如需单独收紧查询，可配置 `[query].parallelism` 或 `ZIPPY_QUERY_PARALLELISM`，但不得
   超过全局上限；
 - `runtime.max_query_buffer_bytes = 536870912`：所有 persisted streaming 查询合计最多 admission

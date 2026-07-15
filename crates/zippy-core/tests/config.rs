@@ -22,9 +22,13 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "ZIPPY_CATALOG_SHADOW_COMPARISON_TIMEOUT_MS",
     "ZIPPY_CATALOG_SHADOW_DEDUP_CAPACITY",
     "ZIPPY_LOG_LEVEL",
+    "ZIPPY_MAX_CPU_CORES",
     "ZIPPY_MAX_PARALLELISM",
     "ZIPPY_MAX_QUERY_BUFFER_BYTES",
+    "ZIPPY_QUERY_MAX_ACTIVE_TASKS",
     "ZIPPY_QUERY_MAX_BUFFERED_BYTES",
+    "ZIPPY_QUERY_MAX_CONCURRENT_QUERIES",
+    "ZIPPY_QUERY_MAX_MEMORY_BYTES",
     "ZIPPY_QUERY_PARALLELISM",
     "ZIPPY_TABLE_ROW_CAPACITY",
     "ZIPPY_TABLE_RETENTION_SEGMENTS",
@@ -66,12 +70,17 @@ import_legacy_endpoint_snapshot = false
 level = "debug"
 
 [runtime]
-max_parallelism = 10
+max_cpu_cores = 10
 max_query_buffer_bytes = 268435456
 
 [query]
 parallelism = 6
 max_buffered_bytes = 67108864
+
+[query.resources]
+max_concurrent_queries = 32
+max_active_tasks = 40
+max_memory_bytes = 402653184
 
 [table]
 row_capacity = 1024
@@ -112,9 +121,12 @@ shutdown_timeout_ms = 3000
             ("ZIPPY_SERVER_DATA_DIR", "/tmp/zippy-server-data-from-env"),
             ("ZIPPY_SERVER_IMPORT_LEGACY_SNAPSHOT", "true"),
             ("ZIPPY_LOG_LEVEL", "warn"),
-            ("ZIPPY_MAX_PARALLELISM", "9"),
+            ("ZIPPY_MAX_CPU_CORES", "9"),
             ("ZIPPY_MAX_QUERY_BUFFER_BYTES", "805306368"),
+            ("ZIPPY_QUERY_MAX_ACTIVE_TASKS", "36"),
             ("ZIPPY_QUERY_MAX_BUFFERED_BYTES", "100663296"),
+            ("ZIPPY_QUERY_MAX_CONCURRENT_QUERIES", "24"),
+            ("ZIPPY_QUERY_MAX_MEMORY_BYTES", "603979776"),
             ("ZIPPY_QUERY_PARALLELISM", "8"),
             ("ZIPPY_TABLE_ROW_CAPACITY", "2048"),
             ("ZIPPY_TABLE_RETENTION_SEGMENTS", "5"),
@@ -148,10 +160,13 @@ shutdown_timeout_ms = 3000
             assert_eq!(config.master.port, Some(27690));
             assert_eq!(config.master.shutdown_timeout_ms, 7000);
             assert_eq!(config.log.level, "warn");
-            assert_eq!(config.runtime.max_parallelism, 9);
+            assert_eq!(config.runtime.max_cpu_cores, 9);
             assert_eq!(config.runtime.max_query_buffer_bytes, 805306368);
             assert_eq!(config.query.parallelism, Some(8));
             assert_eq!(config.query.max_buffered_bytes, Some(100663296));
+            assert_eq!(config.query.resources.max_concurrent_queries, 24);
+            assert_eq!(config.query.resources.max_active_tasks, 36);
+            assert_eq!(config.query.resources.max_memory_bytes, 603979776);
             assert_eq!(config.query_parallelism(), 8);
             assert_eq!(config.query_max_buffered_bytes(), 100663296);
             assert_eq!(config.table.row_capacity, 2048);
@@ -194,12 +209,15 @@ fn zippy_config_defaults_query_parallelism_to_four() {
     })
     .unwrap();
 
-    assert_eq!(config.runtime.max_parallelism, 4);
+    assert_eq!(config.runtime.max_cpu_cores, 4);
     assert_eq!(config.runtime.max_query_buffer_bytes, 536870912);
     assert_eq!(config.query.parallelism, None);
     assert_eq!(config.query.max_buffered_bytes, None);
     assert_eq!(config.query_parallelism(), 4);
     assert_eq!(config.query_max_buffered_bytes(), 134217728);
+    assert_eq!(config.query.resources.max_concurrent_queries, 64);
+    assert_eq!(config.query.resources.max_active_tasks, 16);
+    assert_eq!(config.query.resources.max_memory_bytes, 536870912);
     assert_eq!(config.server.data_dir, None);
     assert!(!config.server.import_legacy_endpoint_snapshot);
     assert!(!config.server.native_storage_enabled);
@@ -216,6 +234,183 @@ fn zippy_config_defaults_query_parallelism_to_four() {
         config.server_data_dir("endpoint-data"),
         std::path::PathBuf::from("endpoint-data")
     );
+}
+
+#[test]
+fn zippy_config_json_overlay_ignores_environment_and_derives_active_tasks() {
+    let base = std::env::temp_dir().join("zippy-json-overlay-base");
+    let config = with_env(
+        &[
+            ("ZIPPY_MAX_CPU_CORES", "2"),
+            ("ZIPPY_QUERY_MAX_ACTIVE_TASKS", "999"),
+        ],
+        || {
+            ZippyConfig::from_json_overlay(
+                serde_json::json!({
+                    "runtime": {"max_cpu_cores": 32},
+                    "query": {"parallelism": 3},
+                }),
+                &base,
+            )
+        },
+    )
+    .unwrap();
+
+    assert_eq!(config.runtime.max_cpu_cores, 32);
+    assert_eq!(config.query_parallelism(), 3);
+    assert_eq!(config.query.resources.max_active_tasks, 12);
+}
+
+#[test]
+fn zippy_config_json_overlay_preserves_explicit_query_resources() {
+    let base = std::env::temp_dir().join("zippy-json-overlay-base");
+    let config = ZippyConfig::from_json_overlay(
+        serde_json::json!({
+            "runtime": {"max_cpu_cores": 8},
+            "query": {
+                "parallelism": 6,
+                "resources": {
+                    "max_concurrent_queries": 20,
+                    "max_active_tasks": 24,
+                    "max_memory_bytes": 268435456,
+                },
+            },
+        }),
+        &base,
+    )
+    .unwrap();
+
+    assert_eq!(config.query.resources.max_concurrent_queries, 20);
+    assert_eq!(config.query.resources.max_active_tasks, 24);
+    assert_eq!(config.query.resources.max_memory_bytes, 268435456);
+}
+
+#[test]
+fn zippy_config_json_overlay_resolves_relative_data_dir_from_explicit_base() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = ZippyConfig::from_json_overlay(
+        serde_json::json!({
+            "server": {"data_dir": "relative/database"},
+        }),
+        temp.path(),
+    )
+    .unwrap();
+
+    let expected = temp.path().join("relative/database");
+    assert_eq!(config.server.data_dir.as_deref(), Some(expected.as_path()));
+
+    let error = ZippyConfig::from_json_overlay(serde_json::json!({}), "relative/base").unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("JSON config overlay base must be absolute"));
+}
+
+#[test]
+fn zippy_config_json_overlay_accepts_legacy_cpu_alias_and_rejects_conflict() {
+    let base = std::env::temp_dir().join("zippy-json-overlay-base");
+    let config = ZippyConfig::from_json_overlay(
+        serde_json::json!({
+            "runtime": {"max_parallelism": 7},
+        }),
+        &base,
+    )
+    .unwrap();
+    assert_eq!(config.runtime.max_cpu_cores, 7);
+    assert_eq!(config.query.resources.max_active_tasks, 28);
+
+    let error = ZippyConfig::from_json_overlay(
+        serde_json::json!({
+            "runtime": {"max_cpu_cores": 7, "max_parallelism": 6},
+        }),
+        &base,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("conflicting runtime CPU limits layer=[JSON overlay [runtime]]"));
+}
+
+#[test]
+fn zippy_config_json_overlay_rejects_invalid_cpu_query_and_task_limits() {
+    let base = std::env::temp_dir().join("zippy-json-overlay-base");
+    let cases = [
+        (
+            serde_json::json!({"runtime": {"max_cpu_cores": 0}}),
+            "runtime max_cpu_cores must be between 1 and 256",
+        ),
+        (
+            serde_json::json!({
+                "runtime": {"max_cpu_cores": 4},
+                "query": {"parallelism": 5},
+            }),
+            "query parallelism must be between 1 and runtime max_cpu_cores",
+        ),
+        (
+            serde_json::json!({
+                "runtime": {"max_cpu_cores": 8},
+                "query": {
+                    "parallelism": 6,
+                    "resources": {"max_active_tasks": 5},
+                },
+            }),
+            "max_active_tasks must not be less than effective query parallelism",
+        ),
+    ];
+
+    for (overlay, expected) in cases {
+        let error = ZippyConfig::from_json_overlay(overlay, &base).unwrap_err();
+        assert!(error.to_string().contains(expected), "expected={expected}");
+    }
+}
+
+#[test]
+fn zippy_config_json_overlay_rejects_null_for_non_nullable_fields() {
+    let base = std::env::temp_dir().join("zippy-json-overlay-base");
+    let cases = [
+        (serde_json::json!({"runtime": null}), "runtime"),
+        (
+            serde_json::json!({"query": {"resources": null}}),
+            "query.resources",
+        ),
+        (
+            serde_json::json!({
+                "query": {"resources": {"max_memory_bytes": null}},
+            }),
+            "query.resources.max_memory_bytes",
+        ),
+        (
+            serde_json::json!({"runtime": {"max_parallelism": null}}),
+            "runtime.max_parallelism",
+        ),
+    ];
+
+    for (overlay, path) in cases {
+        let error = ZippyConfig::from_json_overlay(overlay, &base).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "JSON config overlay field must not be null path=[{path}]"
+            )),
+            "path={path} error={error}"
+        );
+    }
+}
+
+#[test]
+fn zippy_config_json_overlay_accepts_null_for_nullable_fields() {
+    let base = std::env::temp_dir().join("zippy-json-overlay-base");
+    let config = ZippyConfig::from_json_overlay(
+        serde_json::json!({
+            "server": {"data_dir": null},
+            "query": {"parallelism": null},
+            "gateway": {"endpoint": null},
+        }),
+        &base,
+    )
+    .unwrap();
+
+    assert_eq!(config.server.data_dir, None);
+    assert_eq!(config.query.parallelism, None);
+    assert_eq!(config.gateway.endpoint, None);
 }
 
 #[test]
@@ -478,9 +673,21 @@ fn zippy_config_serializes_native_storage_and_round_trips_equality() {
 
     let value = config.to_json_value();
     assert_eq!(value["server"]["native_storage_enabled"], true);
+    assert_eq!(value["runtime"]["max_cpu_cores"], 4);
+    assert_eq!(value["runtime"]["max_parallelism"], 4);
 
     let decoded = serde_json::from_value::<ZippyConfig>(value).unwrap();
     assert_eq!(decoded, config);
+}
+
+#[test]
+fn zippy_config_wire_json_redacts_master_token() {
+    let mut config = ZippyConfig::default();
+    config.master.token = Some("must-not-leak".to_string());
+
+    let value = config.to_json_value();
+
+    assert!(value["master"].get("token").is_none());
 }
 
 #[test]
@@ -522,7 +729,7 @@ data_dir = "../database"
     )
     .unwrap();
 
-    let config = ZippyConfig::load_from_path(Some(&config_path)).unwrap();
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
 
     assert_eq!(
         config.server_data_dir("unused"),
@@ -541,13 +748,184 @@ fn zippy_config_rejects_relative_server_data_dir_from_environment() {
 }
 
 #[test]
-fn zippy_runtime_config_deserializes_legacy_value_without_buffer_budget() {
-    let runtime = serde_json::from_value::<ZippyRuntimeConfig>(serde_json::json!({
-        "max_parallelism": 4
+fn zippy_runtime_config_deserializes_cpu_aliases_without_buffer_budget() {
+    for value in [
+        serde_json::json!({"max_cpu_cores": 4}),
+        serde_json::json!({"max_parallelism": 4}),
+        serde_json::json!({"max_cpu_cores": 4, "max_parallelism": 4}),
+    ] {
+        let runtime = serde_json::from_value::<ZippyRuntimeConfig>(value).unwrap();
+        assert_eq!(runtime.max_cpu_cores, 4);
+        assert_eq!(runtime.max_query_buffer_bytes, 512 * 1024 * 1024);
+    }
+}
+
+#[test]
+fn zippy_runtime_config_rejects_conflicting_cpu_aliases() {
+    let error = serde_json::from_value::<ZippyRuntimeConfig>(serde_json::json!({
+        "max_cpu_cores": 4,
+        "max_parallelism": 3,
     }))
+    .unwrap_err();
+
+    assert!(error.to_string().contains(
+        "conflicting runtime CPU limits layer=[serialized runtime] max_cpu_cores=[4] max_parallelism=[3]"
+    ));
+}
+
+#[test]
+fn zippy_runtime_config_rejects_null_cpu_aliases() {
+    for value in [
+        serde_json::json!({"max_cpu_cores": null, "max_parallelism": 4}),
+        serde_json::json!({"max_cpu_cores": 4, "max_parallelism": null}),
+    ] {
+        let error = serde_json::from_value::<ZippyRuntimeConfig>(value).unwrap_err();
+        assert!(error.to_string().contains("invalid type: null"));
+    }
+}
+
+#[test]
+fn zippy_config_accepts_equal_runtime_cpu_aliases_in_toml() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_cpu_cores = 6
+max_parallelism = 6
+"#,
+    )
     .unwrap();
 
-    assert_eq!(runtime.max_query_buffer_bytes, 512 * 1024 * 1024);
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.runtime.max_cpu_cores, 6);
+}
+
+#[test]
+fn zippy_config_rejects_conflicting_runtime_cpu_aliases_in_toml() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_cpu_cores = 6
+max_parallelism = 5
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error.to_string().contains(
+        "conflicting runtime CPU limits layer=[TOML [runtime]] max_cpu_cores=[6] max_parallelism=[5]"
+    ));
+}
+
+#[test]
+fn zippy_config_legacy_cpu_environment_alias_overrides_toml_canonical_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_cpu_cores = 6
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[("ZIPPY_MAX_PARALLELISM", "7")], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
+
+    assert_eq!(config.runtime.max_cpu_cores, 7);
+}
+
+#[test]
+fn zippy_config_rejects_conflicting_runtime_cpu_aliases_in_environment() {
+    let error = with_env(
+        &[("ZIPPY_MAX_CPU_CORES", "6"), ("ZIPPY_MAX_PARALLELISM", "5")],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains(
+        "conflicting runtime CPU limits layer=[environment] max_cpu_cores=[6] max_parallelism=[5]"
+    ));
+}
+
+#[test]
+fn zippy_config_accepts_equal_runtime_cpu_aliases_in_environment() {
+    let config = with_env(
+        &[("ZIPPY_MAX_CPU_CORES", "6"), ("ZIPPY_MAX_PARALLELISM", "6")],
+        || ZippyConfig::load_from_path(None::<&std::path::Path>),
+    )
+    .unwrap();
+
+    assert_eq!(config.runtime.max_cpu_cores, 6);
+}
+
+#[test]
+fn zippy_config_derives_tasks_for_high_legacy_runtime_cpu_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(&config_path, "[runtime]\nmax_parallelism = 32\n").unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.runtime.max_cpu_cores, 32);
+    assert_eq!(config.query_parallelism(), 32);
+    assert_eq!(config.query.resources.max_active_tasks, 128);
+}
+
+#[test]
+fn zippy_config_derives_tasks_from_tighter_query_parallelism() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_cpu_cores = 32
+
+[query]
+parallelism = 3
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
+
+    assert_eq!(config.query_parallelism(), 3);
+    assert_eq!(config.query.resources.max_active_tasks, 12);
+}
+
+#[test]
+fn zippy_config_environment_explicit_task_limit_overrides_toml_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_cpu_cores = 8
+
+[query.resources]
+max_active_tasks = 32
+"#,
+    )
+    .unwrap();
+
+    let config = with_env(&[("ZIPPY_QUERY_MAX_ACTIVE_TASKS", "48")], || {
+        ZippyConfig::load_from_path(Some(&config_path))
+    })
+    .unwrap();
+
+    assert_eq!(config.query.resources.max_active_tasks, 48);
 }
 
 #[test]
@@ -567,6 +945,7 @@ max_query_buffer_bytes = 67108864
     let config = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap();
 
     assert_eq!(config.query.parallelism, None);
+    assert_eq!(config.runtime.max_cpu_cores, 7);
     assert_eq!(config.query_parallelism(), 7);
     assert_eq!(config.query.max_buffered_bytes, None);
     assert_eq!(config.query_max_buffered_bytes(), 67108864);
@@ -589,18 +968,18 @@ parallelism = 5
 
     assert!(error
         .to_string()
-        .contains("query parallelism must be between 1 and runtime max_parallelism"));
+        .contains("query parallelism must be between 1 and runtime max_cpu_cores"));
 }
 
 #[test]
-fn zippy_config_rejects_invalid_runtime_max_parallelism() {
+fn zippy_config_rejects_invalid_runtime_max_cpu_cores() {
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp.path().join("config.toml");
     fs::write(
         &config_path,
         r#"
 [runtime]
-max_parallelism = 0
+max_cpu_cores = 0
 "#,
     )
     .unwrap();
@@ -609,7 +988,78 @@ max_parallelism = 0
 
     assert!(error
         .to_string()
-        .contains("runtime max_parallelism must be between 1 and 256"));
+        .contains("runtime max_cpu_cores must be between 1 and 256"));
+}
+
+#[test]
+fn zippy_config_rejects_zero_native_query_resource_limits() {
+    let cases = [
+        (
+            "max_concurrent_queries",
+            "query resources max_concurrent_queries must be between 1 and 4096 value=[0]",
+        ),
+        (
+            "max_active_tasks",
+            "query resources max_active_tasks must be greater than zero",
+        ),
+        (
+            "max_memory_bytes",
+            "query resources max_memory_bytes must be greater than zero",
+        ),
+    ];
+
+    for (field, message) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, format!("[query.resources]\n{field} = 0\n")).unwrap();
+
+        let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+        assert!(error.to_string().contains(message), "field={field}");
+    }
+}
+
+#[test]
+fn zippy_config_rejects_native_query_concurrency_above_registry_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "[query.resources]\nmax_concurrent_queries = 4097\n",
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("max_concurrent_queries must be between 1 and 4096 value=[4097]"));
+}
+
+#[test]
+fn zippy_config_rejects_native_task_budget_below_effective_query_parallelism() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[runtime]
+max_cpu_cores = 8
+
+[query]
+parallelism = 6
+
+[query.resources]
+max_active_tasks = 5
+"#,
+    )
+    .unwrap();
+
+    let error = with_env(&[], || ZippyConfig::load_from_path(Some(&config_path))).unwrap_err();
+
+    assert!(error.to_string().contains(
+        "max_active_tasks must not be less than effective query parallelism value=[5] query_parallelism=[6]"
+    ));
 }
 
 #[test]

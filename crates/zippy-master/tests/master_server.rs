@@ -4024,6 +4024,8 @@ fn master_server_control_plane_logging_case(temp_dir: &Path) {
 
     let config_response = send_request(&socket_path, "{\"GetConfig\":{}}\n");
     assert!(config_response.contains("ConfigFetched"));
+    assert!(config_response.contains("\"max_cpu_cores\":4"));
+    assert!(config_response.contains("\"max_parallelism\":4"));
 
     server.shutdown();
     join_handle.join().unwrap();

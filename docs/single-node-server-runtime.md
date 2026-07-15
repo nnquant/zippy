@@ -100,7 +100,7 @@ The server owns startup and shutdown order. When native storage is enabled, it f
 checks SQLite, runs pre-replay reconciliation, replays durable Catalog intents, and runs final
 reconciliation. The storage supervisor then starts a bounded `PersistController`, which exclusively
 owns native Parquet writer jobs and the durable Catalog commit coordinator. Writer concurrency uses
-`runtime.max_parallelism` (or `ZIPPY_MAX_PARALLELISM`) with a storage safety ceiling of 64; the
+`runtime.max_cpu_cores` (or `ZIPPY_MAX_CPU_CORES`) with a storage safety ceiling of 64; the
 controller defaults retain at most 64 accepted jobs and 512 MiB of complete request input. It then
 reads the current Catalog snapshots at one stable revision and verifies every visible managed
 Parquet path, size, checksum, footer, and row count before binding any listener. One serial
@@ -114,6 +114,14 @@ actor snapshot backward. It then binds the master listener, waits for its
 readiness barrier, starts Gateway when `[gateway].enabled = true`, performs a real Gateway-to-master
 control probe, and only then opens service admission. With Gateway disabled it intentionally runs
 in catalog-only mode; it does not publish a query service that cannot execute.
+
+The CPU value is a canonical process configuration ceiling consumed by each component, not yet one
+hard semaphore shared by every independent thread pool. The legacy `runtime.max_parallelism` and
+`ZIPPY_MAX_PARALLELISM` names remain aliases for one compatibility cycle. Native query admission is
+configured separately under `[query.resources]`: 64 concurrent logical queries and 512 MiB task
+memory by default. When omitted, active tasks resolve to four times the effective per-query
+parallelism (16 under default CPU settings). Its memory budget is independent from the Gateway-wide
+`runtime.max_query_buffer_bytes` Arrow buffer pool.
 
 ## Managed data root ownership
 

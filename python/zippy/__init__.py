@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+import copy
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
@@ -62,6 +63,7 @@ _LIVE_SNAPSHOT_RETRY_ATTEMPTS = 20
 _LIVE_SNAPSHOT_RETRY_SLEEP_SEC = 0.002
 _DEFAULT_MAX_PARALLELISM = 4
 _MAX_PARALLELISM = 256
+_MISSING_CONFIG_VALUE = object()
 _DEFAULT_MAX_QUERY_BUFFER_BYTES = 512 * 1024 * 1024
 _DEFAULT_QUERY_MAX_BUFFERED_BYTES = 128 * 1024 * 1024
 _MAX_QUERY_BUFFER_BYTES = (1 << 32) - 1
@@ -383,7 +385,7 @@ _MASTER_LOCAL_DATA_PATH: dict[int, bool] = {}
 _USE_MASTER_CONFIG = object()
 _BUILTIN_CONFIG: dict[str, object] = {
     "runtime": {
-        "max_parallelism": _DEFAULT_MAX_PARALLELISM,
+        "max_cpu_cores": _DEFAULT_MAX_PARALLELISM,
         "max_query_buffer_bytes": _DEFAULT_MAX_QUERY_BUFFER_BYTES,
     },
     "master": {
@@ -3216,6 +3218,7 @@ class RemoteMasterClient:
         self._master_endpoint = (
             _normalize_remote_endpoint(master_endpoint) if master_endpoint is not None else None
         )
+        self._master_config: dict[str, object] | None = None
         self._process_id: str | None = None
 
     @classmethod
@@ -3235,7 +3238,9 @@ class RemoteMasterClient:
                 "remote master does not advertise gateway.endpoint " f"endpoint=[{endpoint}]"
             )
         token = str(gateway["token"]) if gateway.get("token") else None
-        return cls(str(gateway["endpoint"]), token=token, master_endpoint=endpoint)
+        client = cls(str(gateway["endpoint"]), token=token, master_endpoint=endpoint)
+        client._master_config = copy.deepcopy(config)
+        return client
 
     def remote_gateway_endpoint(self) -> str:
         return self._endpoint
@@ -3282,6 +3287,8 @@ class RemoteMasterClient:
         return _pyarrow_schema_from_ipc(payload)
 
     def get_config(self) -> dict[str, object]:
+        if self._master_config is not None:
+            return copy.deepcopy(self._master_config)
         return {
             "gateway": {
                 "enabled": True,
@@ -3830,10 +3837,12 @@ class GatewayServer:
             int(max_blocking_requests) if max_blocking_requests is not None else None
         )
         self.write_timeout_ms = int(write_timeout_ms) if write_timeout_ms is not None else None
-        self.max_parallelism = _resolve_max_parallelism(master)
+        self.max_cpu_cores = _resolve_max_parallelism(master)
+        # Keep the Python attribute aligned with the current native FFI name during migration.
+        self.max_parallelism = self.max_cpu_cores
         self.query_parallelism = _resolve_query_parallelism(
             master,
-            max_parallelism=self.max_parallelism,
+            max_parallelism=self.max_cpu_cores,
         )
         self.max_query_buffer_bytes = _resolve_max_query_buffer_bytes(master)
         self.query_max_buffered_bytes = _resolve_query_max_buffered_bytes(
@@ -3849,7 +3858,7 @@ class GatewayServer:
             max_subscribers=self.max_subscribers,
             max_blocking_requests=self.max_blocking_requests,
             write_timeout_ms=self.write_timeout_ms,
-            max_parallelism=self.max_parallelism,
+            max_parallelism=self.max_cpu_cores,
             query_parallelism=self.query_parallelism,
             max_query_buffer_bytes=self.max_query_buffer_bytes,
             query_max_buffered_bytes=self.query_max_buffered_bytes,
@@ -10247,7 +10256,7 @@ class Pipeline:
             with ``shard_nums`` to keep the default single-materializer path.
         :type shard_key: str | list[str] | tuple[str, ...] | None
         :param shard_nums: Number of shards, or ``"auto"`` to use up to 16 CPU-backed shards
-            without exceeding ``runtime.max_parallelism``. When provided with ``shard_key``,
+            without exceeding ``runtime.max_cpu_cores``. When provided with ``shard_key``,
             stream_table creates a logical stream plus internal physical shard streams backed by
             a sharded native materializer.
         :type shard_nums: int | str | None
@@ -10637,20 +10646,53 @@ def _parse_parallelism(value: object, source: str) -> int:
     return parallelism
 
 
+def _resolve_parallelism_alias_pair(
+    canonical_value: object,
+    legacy_value: object,
+    *,
+    canonical_source: str,
+    legacy_source: str,
+) -> int | None:
+    canonical = (
+        None
+        if canonical_value is _MISSING_CONFIG_VALUE
+        else _parse_parallelism(canonical_value, canonical_source)
+    )
+    legacy = (
+        None
+        if legacy_value is _MISSING_CONFIG_VALUE
+        else _parse_parallelism(legacy_value, legacy_source)
+    )
+    if canonical is not None and legacy is not None and canonical != legacy:
+        raise ValueError(
+            "conflicting CPU core limits in the same configuration layer "
+            f"{canonical_source}=[{canonical}] {legacy_source}=[{legacy}]"
+        )
+    return canonical if canonical is not None else legacy
+
+
 def _resolve_max_parallelism(master: object | None) -> int:
-    env_value = os.environ.get("ZIPPY_MAX_PARALLELISM")
+    env_value = _resolve_parallelism_alias_pair(
+        os.environ.get("ZIPPY_MAX_CPU_CORES", _MISSING_CONFIG_VALUE),
+        os.environ.get("ZIPPY_MAX_PARALLELISM", _MISSING_CONFIG_VALUE),
+        canonical_source="ZIPPY_MAX_CPU_CORES",
+        legacy_source="ZIPPY_MAX_PARALLELISM",
+    )
     if env_value is not None:
-        return _parse_parallelism(env_value, "ZIPPY_MAX_PARALLELISM")
+        return env_value
     if master is None:
         return _DEFAULT_MAX_PARALLELISM
     master_config = _master_config(master)
     runtime_config = master_config.get("runtime", {})
     if not isinstance(runtime_config, dict):
         return _DEFAULT_MAX_PARALLELISM
-    return _parse_parallelism(
-        runtime_config.get("max_parallelism", _DEFAULT_MAX_PARALLELISM),
-        "runtime.max_parallelism",
+    configured = _resolve_parallelism_alias_pair(
+        runtime_config.get("max_cpu_cores", _MISSING_CONFIG_VALUE),
+        runtime_config.get("max_parallelism", _MISSING_CONFIG_VALUE),
+        canonical_source="runtime.max_cpu_cores",
+        legacy_source="runtime.max_parallelism",
     )
+    return _DEFAULT_MAX_PARALLELISM if configured is None else configured
 
 
 def _resolve_query_parallelism(
@@ -10675,8 +10717,8 @@ def _resolve_query_parallelism(
         )
     if parallelism > resolved_max:
         raise ValueError(
-            "query parallelism must not exceed runtime max_parallelism "
-            f"parallelism=[{parallelism}] max_parallelism=[{resolved_max}]"
+            "query parallelism must not exceed runtime max_cpu_cores "
+            f"parallelism=[{parallelism}] max_cpu_cores=[{resolved_max}]"
         )
     return parallelism
 

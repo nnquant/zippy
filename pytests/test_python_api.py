@@ -12425,6 +12425,86 @@ def test_remote_stream_subscriber_reconnects_until_gateway_starts() -> None:
         server.join()
 
 
+def test_remote_master_client_caches_full_config_for_gateway_limits(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    fetched: list[str] = []
+    fetched_config: dict[str, object] = {
+        "runtime": {
+            "max_cpu_cores": 8,
+            "max_parallelism": 8,
+        },
+        "query": {"parallelism": 6},
+        "gateway": {
+            "enabled": True,
+            "endpoint": "127.0.0.1:17691",
+            "token": "secret-token",
+            "protocol_version": 1,
+        },
+    }
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.endpoint = kwargs["endpoint"]
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    def fetch_config(endpoint: str) -> dict[str, object]:
+        fetched.append(endpoint)
+        return fetched_config
+
+    monkeypatch.setattr(zippy, "_remote_master_get_config", fetch_config)
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+
+    remote = zippy.RemoteMasterClient.from_master_endpoint("127.0.0.1:17690")
+    first = remote.get_config()
+    first_runtime = first["runtime"]
+    first_gateway = first["gateway"]
+    assert isinstance(first_runtime, dict)
+    assert isinstance(first_gateway, dict)
+    first_runtime["max_cpu_cores"] = 2
+    first_gateway["token"] = "mutated-token"
+    gateway = zippy.GatewayServer(master=remote)
+    second = remote.get_config()
+    second_gateway = second["gateway"]
+    assert isinstance(second_gateway, dict)
+
+    assert fetched == ["127.0.0.1:17690"]
+    assert remote.remote_gateway_endpoint() == "127.0.0.1:17691"
+    assert remote.remote_gateway_token() == "secret-token"
+    assert "secret-token" not in repr(remote)
+    assert second["runtime"] == {"max_cpu_cores": 8, "max_parallelism": 8}
+    assert second["query"] == {"parallelism": 6}
+    assert second_gateway["token"] == "secret-token"
+    assert gateway.max_cpu_cores == 8
+    assert gateway.query_parallelism == 6
+    assert captured["max_parallelism"] == 8
+    assert captured["query_parallelism"] == 6
+
+
+def test_direct_remote_master_client_keeps_gateway_only_config_fallback() -> None:
+    remote = zippy.RemoteMasterClient("tcp://127.0.0.1:17691", token="secret-token")
+
+    first = remote.get_config()
+    first_gateway = first["gateway"]
+    assert isinstance(first_gateway, dict)
+    first_gateway["endpoint"] = "mutated:1"
+    second = remote.get_config()
+
+    assert second == {
+        "gateway": {
+            "enabled": True,
+            "endpoint": "127.0.0.1:17691",
+            "token": "secret-token",
+            "protocol_version": 1,
+        }
+    }
+
+
 def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -12443,6 +12523,9 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
             return {}
 
     monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
 
     gateway = zippy.GatewayServer(
         endpoint="127.0.0.1:17691",
@@ -12458,6 +12541,7 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
     assert gateway.max_subscribers == 12
     assert gateway.max_blocking_requests == 13
     assert gateway.write_timeout_ms == 14
+    assert gateway.max_cpu_cores == 4
     assert captured["max_write_rows"] == 10
     assert captured["max_connections"] == 11
     assert captured["max_subscribers"] == 12
@@ -12469,13 +12553,13 @@ def test_gateway_server_forwards_resource_limits_to_native(monkeypatch) -> None:
     assert captured["query_max_buffered_bytes"] == 128 * 1024 * 1024
 
 
-def test_gateway_server_uses_query_parallelism_from_config_and_env(monkeypatch) -> None:
+def test_gateway_server_uses_canonical_cpu_limit_from_config_and_env(monkeypatch) -> None:
     captured: list[dict[str, object]] = []
 
     class FakeMaster:
         def get_config(self) -> dict[str, object]:
             return {
-                "runtime": {"max_parallelism": 8},
+                "runtime": {"max_cpu_cores": 8},
                 "query": {"parallelism": 7},
             }
 
@@ -12488,18 +12572,99 @@ def test_gateway_server_uses_query_parallelism_from_config_and_env(monkeypatch) 
             return {}
 
     monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+
+    configured = zippy.GatewayServer(master=FakeMaster())
+    monkeypatch.setenv("ZIPPY_MAX_CPU_CORES", "6")
+    monkeypatch.setenv("ZIPPY_QUERY_PARALLELISM", "3")
+    overridden = zippy.GatewayServer(master=FakeMaster())
+
+    assert configured.max_cpu_cores == 8
+    assert configured.max_parallelism == 8
+    assert configured.query_parallelism == 7
+    assert overridden.max_cpu_cores == 6
+    assert overridden.max_parallelism == 6
+    assert overridden.query_parallelism == 3
+    assert [item["max_parallelism"] for item in captured] == [8, 6]
+    assert [item["query_parallelism"] for item in captured] == [7, 3]
+
+
+def test_gateway_server_accepts_legacy_max_parallelism_aliases(monkeypatch) -> None:
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {"runtime": {"max_parallelism": 8}}
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            self.endpoint = kwargs["endpoint"]
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
     monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
 
     configured = zippy.GatewayServer(master=FakeMaster())
     monkeypatch.setenv("ZIPPY_MAX_PARALLELISM", "6")
-    monkeypatch.setenv("ZIPPY_QUERY_PARALLELISM", "3")
     overridden = zippy.GatewayServer(master=FakeMaster())
 
+    assert configured.max_cpu_cores == 8
     assert configured.max_parallelism == 8
-    assert configured.query_parallelism == 7
+    assert overridden.max_cpu_cores == 6
     assert overridden.max_parallelism == 6
-    assert overridden.query_parallelism == 3
-    assert [item["query_parallelism"] for item in captured] == [7, 3]
+
+
+def test_gateway_server_accepts_matching_runtime_cpu_aliases(monkeypatch) -> None:
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {"runtime": {"max_cpu_cores": 8, "max_parallelism": 8}}
+
+    class FakeNativeGatewayServer:
+        def __init__(self, **kwargs) -> None:
+            self.endpoint = kwargs["endpoint"]
+
+        def metrics(self) -> dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+    monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
+
+    gateway = zippy.GatewayServer(master=FakeMaster())
+
+    assert gateway.max_cpu_cores == 8
+    assert gateway.max_parallelism == 8
+
+
+def test_gateway_server_rejects_conflicting_runtime_cpu_aliases(monkeypatch) -> None:
+    class FakeMaster:
+        def get_config(self) -> dict[str, object]:
+            return {"runtime": {"max_cpu_cores": 8, "max_parallelism": 6}}
+
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
+    monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
+
+    with pytest.raises(
+        ValueError,
+        match=r"conflicting CPU core limits.*runtime\.max_cpu_cores.*runtime\.max_parallelism",
+    ):
+        zippy.GatewayServer(master=FakeMaster())
+
+
+def test_gateway_server_rejects_conflicting_cpu_limit_env_aliases(monkeypatch) -> None:
+    monkeypatch.setenv("ZIPPY_MAX_CPU_CORES", "8")
+    monkeypatch.setenv("ZIPPY_MAX_PARALLELISM", "6")
+
+    with pytest.raises(
+        ValueError,
+        match=r"conflicting CPU core limits.*ZIPPY_MAX_CPU_CORES.*ZIPPY_MAX_PARALLELISM",
+    ):
+        zippy.GatewayServer()
 
 
 def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> None:
@@ -12509,7 +12674,7 @@ def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> 
         def get_config(self) -> dict[str, object]:
             return {
                 "runtime": {
-                    "max_parallelism": 6,
+                    "max_cpu_cores": 6,
                     "max_query_buffer_bytes": 64 * 1024 * 1024,
                 },
                 "query": {"parallelism": None, "max_buffered_bytes": None},
@@ -12524,6 +12689,7 @@ def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> 
             return {}
 
     monkeypatch.setattr(zippy, "_NativeGatewayServer", FakeNativeGatewayServer)
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
     monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
     monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
     monkeypatch.delenv("ZIPPY_MAX_QUERY_BUFFER_BYTES", raising=False)
@@ -12531,6 +12697,7 @@ def test_gateway_server_query_parallelism_inherits_global_limit(monkeypatch) -> 
 
     gateway = zippy.GatewayServer(master=FakeMaster())
 
+    assert gateway.max_cpu_cores == 6
     assert gateway.max_parallelism == 6
     assert gateway.query_parallelism == 6
     assert gateway.max_query_buffer_bytes == 64 * 1024 * 1024
@@ -12606,14 +12773,15 @@ def test_gateway_server_rejects_query_parallelism_above_global_limit(monkeypatch
     class FakeMaster:
         def get_config(self) -> dict[str, object]:
             return {
-                "runtime": {"max_parallelism": 4},
+                "runtime": {"max_cpu_cores": 4},
                 "query": {"parallelism": 5},
             }
 
+    monkeypatch.delenv("ZIPPY_MAX_CPU_CORES", raising=False)
     monkeypatch.delenv("ZIPPY_MAX_PARALLELISM", raising=False)
     monkeypatch.delenv("ZIPPY_QUERY_PARALLELISM", raising=False)
 
-    with pytest.raises(ValueError, match="must not exceed runtime max_parallelism"):
+    with pytest.raises(ValueError, match="must not exceed runtime max_cpu_cores"):
         zippy.GatewayServer(master=FakeMaster())
 
 

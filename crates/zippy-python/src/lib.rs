@@ -186,24 +186,6 @@ fn serde_json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult
     Ok(python_json_loads(py, &text)?.into_py(py))
 }
 
-fn merge_json_object(base: &mut serde_json::Value, overlay: serde_json::Value) {
-    match (base, overlay) {
-        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
-            for (key, value) in overlay {
-                match base.get_mut(&key) {
-                    Some(base_value) => merge_json_object(base_value, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base, overlay) => {
-            *base = overlay;
-        }
-    }
-}
-
 fn serde_json_option_to_py(
     py: Python<'_>,
     value: Option<&serde_json::Value>,
@@ -5622,12 +5604,15 @@ impl MasterDaemon {
         let resolved_control_endpoint = resolved_control_endpoint.display_string();
         let server = if let Some(config) = config {
             let payload = python_json_dumps(py, &config)?;
-            let mut merged = serde_json::to_value(ZippyConfig::default())
-                .map_err(|error| py_value_error(error.to_string()))?;
             let overlay = serde_json::from_str::<serde_json::Value>(&payload)
                 .map_err(|error| py_value_error(error.to_string()))?;
-            merge_json_object(&mut merged, overlay);
-            let config = serde_json::from_value::<ZippyConfig>(merged)
+            let config_base = std::env::current_dir().map_err(|error| {
+                py_runtime_error(format!(
+                    "failed to resolve MasterServer config base error=[{}]",
+                    error
+                ))
+            })?;
+            let config = ZippyConfig::from_json_overlay(overlay, config_base)
                 .map_err(|error| py_value_error(error.to_string()))?;
             RustMasterServer::with_config(config)
         } else {
@@ -10001,6 +9986,100 @@ mod tests {
                 .unwrap();
 
             assert_eq!(code, "DATA_CORRUPTION");
+        });
+    }
+
+    fn master_daemon_from_config_value(
+        py: Python<'_>,
+        value: serde_json::Value,
+    ) -> PyResult<MasterDaemon> {
+        let text = serde_json::to_string(&value).unwrap();
+        let config = python_json_loads(py, &text)?;
+        MasterDaemon::new(py, None, None, Some(config))
+    }
+
+    #[test]
+    fn master_server_python_config_dict_uses_typed_overlay_resolution() {
+        prepare_python_for_tests();
+        Python::with_gil(|py| {
+            let canonical = master_daemon_from_config_value(
+                py,
+                serde_json::json!({"runtime": {"max_cpu_cores": 8}}),
+            )
+            .unwrap();
+            assert_eq!(canonical.server.runtime_config().runtime.max_cpu_cores, 8);
+            assert_eq!(
+                canonical
+                    .server
+                    .runtime_config()
+                    .query
+                    .resources
+                    .max_active_tasks,
+                32
+            );
+
+            let legacy = master_daemon_from_config_value(
+                py,
+                serde_json::json!({"runtime": {"max_parallelism": 7}}),
+            )
+            .unwrap();
+            assert_eq!(legacy.server.runtime_config().runtime.max_cpu_cores, 7);
+            assert_eq!(
+                legacy
+                    .server
+                    .runtime_config()
+                    .query
+                    .resources
+                    .max_active_tasks,
+                28
+            );
+
+            let explicit = master_daemon_from_config_value(
+                py,
+                serde_json::json!({
+                    "runtime": {"max_cpu_cores": 8},
+                    "query": {"resources": {"max_active_tasks": 40}},
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                explicit
+                    .server
+                    .runtime_config()
+                    .query
+                    .resources
+                    .max_active_tasks,
+                40
+            );
+
+            let relative = master_daemon_from_config_value(
+                py,
+                serde_json::json!({"server": {"data_dir": "relative/database"}}),
+            )
+            .unwrap();
+            assert_eq!(
+                relative.server.runtime_config().server.data_dir,
+                Some(std::env::current_dir().unwrap().join("relative/database"))
+            );
+
+            for invalid in [
+                serde_json::json!({
+                    "runtime": {"max_cpu_cores": 4},
+                    "query": {"parallelism": 5},
+                }),
+                serde_json::json!({
+                    "runtime": {"max_cpu_cores": 8},
+                    "query": {
+                        "parallelism": 6,
+                        "resources": {"max_active_tasks": 5},
+                    },
+                }),
+            ] {
+                let error = master_daemon_from_config_value(py, invalid)
+                    .err()
+                    .expect("invalid Python config dict must be rejected");
+                assert!(error.is_instance_of::<PyValueError>(py));
+            }
         });
     }
 

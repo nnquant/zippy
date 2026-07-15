@@ -13,7 +13,7 @@ use zippy_core::{
     canonical_schema_hash, schema_metadata, ControlEndpoint, ControlRequest, ControlResponse,
     HeartbeatRequest, MasterClient, RegisterEngineRequest, RegisterProcessRequest,
     RegisterSourceRequest, RegisterStreamRequest, SchemaRef, StreamInfo, UnregisterSourceRequest,
-    UpdateRecordStatusRequest, WatchResource,
+    UpdateRecordStatusRequest, WatchResource, ZippyConfig,
 };
 
 fn empty_schema() -> SchemaRef {
@@ -483,6 +483,31 @@ fn spawn_fake_server(socket_path: &Path, expected_connections: usize) -> thread:
     })
 }
 
+fn fetch_wire_config(config: serde_json::Value) -> zippy_core::Result<ZippyConfig> {
+    let socket_path = unique_socket_path();
+    let server_path = socket_path.clone();
+    let server = thread::spawn(move || {
+        let listener = UnixListener::bind(&server_path).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request = serde_json::from_str::<ControlRequest>(line.trim_end()).unwrap();
+        assert!(matches!(request, ControlRequest::GetConfig(_)));
+        let response = serde_json::to_string(&ControlResponse::ConfigFetched { config }).unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let _ = fs::remove_file(&server_path);
+    });
+    wait_for_socket(&socket_path);
+
+    let result = MasterClient::connect(&socket_path).unwrap().get_config();
+
+    server.join().unwrap();
+    result
+}
+
 #[test]
 fn master_client_gets_config() {
     let socket_path = unique_socket_path();
@@ -499,6 +524,47 @@ fn master_client_gets_config() {
     assert_eq!(config.table.persist.data_dir, "data");
 
     server.join().unwrap();
+}
+
+#[test]
+fn master_client_accepts_legacy_canonical_and_equal_dual_cpu_wire_configs() {
+    let mut legacy = ZippyConfig::default().to_json_value();
+    let legacy_runtime = legacy["runtime"].as_object_mut().unwrap();
+    legacy_runtime.remove("max_cpu_cores");
+    legacy_runtime.insert("max_parallelism".to_string(), serde_json::json!(32));
+    legacy["query"].as_object_mut().unwrap().remove("resources");
+    let legacy = fetch_wire_config(legacy).unwrap();
+    assert_eq!(legacy.runtime.max_cpu_cores, 32);
+    assert_eq!(legacy.query.resources.max_active_tasks, 128);
+
+    let mut canonical = ZippyConfig::default().to_json_value();
+    let canonical_runtime = canonical["runtime"].as_object_mut().unwrap();
+    canonical_runtime.remove("max_parallelism");
+    canonical_runtime.insert("max_cpu_cores".to_string(), serde_json::json!(8));
+    let canonical = fetch_wire_config(canonical).unwrap();
+    assert_eq!(canonical.runtime.max_cpu_cores, 8);
+    assert_eq!(canonical.query.resources.max_active_tasks, 16);
+
+    let mut dual_config = ZippyConfig::default();
+    dual_config.runtime.max_cpu_cores = 6;
+    dual_config.query.resources.max_active_tasks = 24;
+    let dual = fetch_wire_config(dual_config.to_json_value()).unwrap();
+    assert_eq!(dual.runtime.max_cpu_cores, 6);
+    assert_eq!(dual.query.resources.max_active_tasks, 24);
+}
+
+#[test]
+fn master_client_rejects_conflicting_dual_cpu_wire_config() {
+    let mut wire = ZippyConfig::default().to_json_value();
+    let runtime = wire["runtime"].as_object_mut().unwrap();
+    runtime.insert("max_cpu_cores".to_string(), serde_json::json!(8));
+    runtime.insert("max_parallelism".to_string(), serde_json::json!(7));
+
+    let error = fetch_wire_config(wire).unwrap_err();
+
+    assert!(error.to_string().contains(
+        "conflicting runtime CPU limits layer=[GetConfig wire response] max_cpu_cores=[8] max_parallelism=[7]"
+    ));
 }
 
 #[test]

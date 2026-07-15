@@ -29,30 +29,42 @@ uv run zippy stream ls --uri default
 
 ```toml
 [runtime]
-max_parallelism = 4
+max_cpu_cores = 4
 max_query_buffer_bytes = 536870912
 
-# 可选：查询预算默认继承 runtime.max_parallelism
+# 可选：单查询预算默认继承 runtime.max_cpu_cores
 [query]
 parallelism = 2
 max_buffered_bytes = 134217728
+
+[query.resources]
+max_concurrent_queries = 64
+max_active_tasks = 16
+max_memory_bytes = 536870912
 ```
 
 也可以用环境变量临时覆盖：
 
 ```bash
-ZIPPY_MAX_PARALLELISM=8 \
+ZIPPY_MAX_CPU_CORES=8 \
 ZIPPY_QUERY_PARALLELISM=4 \
 ZIPPY_MAX_QUERY_BUFFER_BYTES=536870912 \
 ZIPPY_QUERY_MAX_BUFFERED_BYTES=134217728 \
+ZIPPY_QUERY_MAX_CONCURRENT_QUERIES=64 \
+ZIPPY_QUERY_MAX_ACTIVE_TASKS=32 \
+ZIPPY_QUERY_MAX_MEMORY_BYTES=536870912 \
 uv run zippy master run default
 ```
 
-`ZIPPY_MAX_PARALLELISM` 覆盖 `[runtime].max_parallelism`；`ZIPPY_QUERY_PARALLELISM`
+`ZIPPY_MAX_CPU_CORES` 覆盖 `[runtime].max_cpu_cores`；`ZIPPY_QUERY_PARALLELISM`
 覆盖 `[query].parallelism`。两者有效范围都是 `1..=256`，查询覆盖值不得超过全局上限。
 未配置查询覆盖时，查询预算继承全局值。全局上限还约束 Gateway Tokio worker 和
 `shard_nums="auto"`；查询预算限制本地 persisted Parquet 文件读取、逻辑分片查询
 fan-out 和 native Gateway persisted 文件扫描。
+
+旧的 `[runtime].max_parallelism` 和 `ZIPPY_MAX_PARALLELISM` 保留一个兼容周期。同一 TOML
+或环境变量层同时提供新旧名称时，两者必须相等；环境变量层仍整体覆盖 TOML。该 CPU 值目前
+是组件配置上限，不代表所有独立线程池已经共享一个进程级硬 semaphore。
 
 persisted streaming 的进程级 Arrow 缓冲预算默认是 `512 MiB`，单查询默认是 `128 MiB`。
 单查询额度从全局额度中 admission，随后均分给活跃文件扫描槽位；默认并行度 4 时每槽约
@@ -62,6 +74,11 @@ batch，也不包括已经编码的网络 payload。
 `query.max_buffered_bytes` 是单次查询上限；同一 Gateway 进程内的并发查询共享
 `runtime.max_query_buffer_bytes`，不同进程各自拥有一份全局预算。仍需结合 Gateway 的
 `max_blocking_requests` 和实际磁盘能力控制总负载。
+
+`query.resources.max_memory_bytes` 是 native query task admission 的独立内存预算，不是
+Gateway Arrow buffer。`max_concurrent_queries` 默认 `64`、上限 `4096`；
+省略 `max_active_tasks` 时按最终有效 `query.parallelism * 4` 派生，默认 CPU 配置下为
+`16`，显式值不得低于有效查询并行度。
 
 多文件历史查询和逻辑分片查询通常能从更高并行度获益；单文件的 `head()`、`tail()`、
 `slice()` 主要依赖 row-group 和列裁剪，通常保留默认值即可。修改配置后需要重启 master；

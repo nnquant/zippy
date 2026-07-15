@@ -183,9 +183,9 @@ profile = "trading"
   symlink 一律拒绝，不能让配置把 maintenance RPC 重定向到 data root 外。
 - `heartbeat_interval_ms` 必须小于 `lease_ttl_ms / 3`；lease 使用 server 单调时钟判断本次 boot
   的活性，Catalog 中的 UTC expiry 只用于跨重启恢复。
-- 组件 CPU 额度必须是全局 CPU 上限的子集。当前代码仍使用
-  `[runtime].max_parallelism`/`ZIPPY_MAX_PARALLELISM`；重构总设计中的 `ZIPPY_MAX_CPU_CORES` 在统一
-  迁移完成后成为硬上限，不能同时保留两个含义不同的权威变量。
+- 组件 CPU 额度必须是全局 `[runtime].max_cpu_cores` / `ZIPPY_MAX_CPU_CORES` 上限的子集。
+  `max_parallelism` 旧名称仅保留一个兼容周期，同层新旧值不一致时配置失败。当前全局值是各
+  组件共同遵守的配置上限；多个独立线程池尚未统一接入一个进程级硬 CPU semaphore。
 - maintenance memory、IO、temp 和 open-file budget 是 admission 上限，不是事后观测阈值。
 
 ### 4.1 Legacy compaction 配置迁移

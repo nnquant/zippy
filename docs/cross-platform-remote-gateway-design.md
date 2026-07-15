@@ -107,12 +107,17 @@ host = "127.0.0.1"
 port = 17690
 
 [runtime]
-max_parallelism = 4
+max_cpu_cores = 4
 max_query_buffer_bytes = 536870912
 
 [query]
 parallelism = 2
 max_buffered_bytes = 134217728
+
+[query.resources]
+max_concurrent_queries = 64
+max_active_tasks = 16
+max_memory_bytes = 536870912
 
 [gateway]
 enabled = true
@@ -120,11 +125,13 @@ token = "..."
 protocol_version = 1
 ```
 
-`[runtime].max_parallelism` 是进程级并行度上限，默认值为 `4`，并约束 Gateway Tokio
-worker 数和 persisted file scan 共享 worker pool 大小。`[query].parallelism` 是可选的单次
-查询预算；省略时继承全局上限，配置时不得超过全局上限。对应环境变量是
-`ZIPPY_MAX_PARALLELISM` 和
-`ZIPPY_QUERY_PARALLELISM`，有效范围为 `1..=256`。
+`[runtime].max_cpu_cores` 是进程级 CPU 配置上限，默认值为 `4`，Gateway 用它设置 Tokio
+worker 数和 persisted file scan 共享 worker pool 大小。它目前是各组件共同遵守的配置上限，
+不是覆盖所有独立线程池的进程级硬 semaphore。`[query].parallelism` 是可选的单次查询预算；
+省略时继承全局上限，配置时不得超过全局上限。对应环境变量是 `ZIPPY_MAX_CPU_CORES` 和
+`ZIPPY_QUERY_PARALLELISM`，有效范围为 `1..=256`。旧的 `[runtime].max_parallelism` 和
+`ZIPPY_MAX_PARALLELISM` 保留一个兼容周期；同一层级同时配置新旧字段时值必须相等，环境变量
+层整体覆盖 TOML 层。
 多个并发 collect 请求各自拥有这个预算，进程总负载还受 Gateway
 `max_blocking_requests` 限制。
 
@@ -142,7 +149,7 @@ batch，channel 满后 scan cursor 让出共享 worker 并重新排队。单查�
 槽位，batch 的 Arrow memory size 超过槽位额度时查询明确失败，不会突破 retained-batch
 上限。每消费完一个文件才释放窗口槽位并补充新任务，因此 socket 写背压会直接限制后续文件
 预取。共享 pool 每次只让 cursor 推进一个 reader batch，运行 worker 数受
-`runtime.max_parallelism` 限制；排队 cursor 数受已 admission 的查询数和各查询文件窗口共同
+`runtime.max_cpu_cores` 限制；排队 cursor 数受已 admission 的查询数和各查询文件窗口共同
 约束，不随匹配文件总数增长。
 
 `collect_end.metrics` 中的 `file_scan_parallelism`、`max_in_flight_file_scans` 和
@@ -152,6 +159,14 @@ batch，channel 满后 scan cursor 让出共享 worker 并重新排队。单查�
 额度；`first_chunk_elapsed_ms` 用于观察 admission、首文件扫描、编码和首次写出的合计延迟。
 `head`、`tail`、`slice` 继续使用面向行范围的专用最小读取路径；默认无行范围的 pure persisted
 查询使用上述消费驱动流式路径。
+
+`[query.resources]` 单独控制 native query admission：`max_concurrent_queries` 默认 `64` 且
+不得超过 registry 容量 `4096`。省略 `max_active_tasks` 时按最终有效
+`query.parallelism * 4` 派生，因此默认 CPU 配置下为 `16`；显式值不得小于有效
+`query.parallelism`。`max_memory_bytes` 默认 `512 MiB`。这三个字段的环境变量分别是
+`ZIPPY_QUERY_MAX_CONCURRENT_QUERIES`、`ZIPPY_QUERY_MAX_ACTIVE_TASKS` 和
+`ZIPPY_QUERY_MAX_MEMORY_BYTES`。native memory 与 Gateway Arrow buffer 相互独立，修改
+`runtime.max_query_buffer_bytes` 不会改变 native query task memory admission。
 
 默认不需要配置 gateway 的 `host` / `port`：当 master 是 TCP endpoint 时，
 GatewayServer endpoint 从 master endpoint 推导，端口为 `master.port + 1`。高级场景

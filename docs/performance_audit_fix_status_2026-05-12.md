@@ -221,8 +221,8 @@
   执行 projection/filter，再把非空结果交给上层统一 concat。
 - tail persisted scan 保留从新到旧读取文件和最终正序输出语义，同时按 chunk 过滤。
 - `collect(stream=True)` 的 pure persisted 路径使用 bounded parallel file scan，并发由
-  `[runtime].max_parallelism` 约束；`[query].parallelism` 可进一步收紧，默认窗口最多 4 个文件。
-- Gateway 复用固定大小 persisted scan worker pool；worker 数由 `[runtime].max_parallelism`
+  `[runtime].max_cpu_cores` 约束；`[query].parallelism` 可进一步收紧，默认窗口最多 4 个文件。
+- Gateway 复用固定大小 persisted scan worker pool；worker 数由 `[runtime].max_cpu_cores`
   控制，不再为每个 streaming collect 创建一组临时线程。每个 cursor 一次只推进一个 reader
   batch 后重新排队，慢客户端不会长期占用 worker。
 - 默认 pure persisted producer 构造阶段只解析 schema、筛选 catalog 条目并校验路径，不打开或读取
@@ -243,6 +243,9 @@
 - head/tail/slice streaming 路径继续使用面向行范围的专用最小读取 helper，避免为了统一实现而扫描
   明知不需要的文件；默认无行范围路径使用消费驱动扫描器。
 - tail helper 修复了单文件跨多个 parquet reader batch 时的 batch 顺序反转问题。
+
+配置名更新：旧的 `[runtime].max_parallelism` 仅作为一个兼容周期的别名保留；新配置应使用
+`[runtime].max_cpu_cores`。
 
 边界：
 

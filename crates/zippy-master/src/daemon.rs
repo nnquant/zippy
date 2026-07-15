@@ -300,7 +300,7 @@ pub fn prepare_master_runtime(
         table_persist_enabled = runtime_config.table.persist.enabled,
         table_persist_method = runtime_config.table.persist.method.as_str(),
         table_persist_data_dir = runtime_config.table.persist.data_dir.as_str(),
-        max_parallelism = runtime_config.runtime.max_parallelism,
+        max_cpu_cores = runtime_config.runtime.max_cpu_cores,
         query_parallelism = runtime_config.query_parallelism(),
         log_file = snapshot
             .file_path
@@ -571,7 +571,7 @@ pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
             max_blocking_requests: None,
             write_timeout_ms: None,
         },
-        runtime_config.runtime.max_parallelism,
+        runtime_config.runtime.max_cpu_cores,
         runtime_config.query_parallelism(),
         runtime_config.runtime.max_query_buffer_bytes,
         runtime_config.query_max_buffered_bytes(),
@@ -586,7 +586,7 @@ pub fn start_legacy_gateway_with_persisted_read_snapshot_source_if_enabled(
         endpoint = gateway.endpoint(),
         host = host.as_str(),
         port = port.as_str(),
-        max_parallelism = runtime_config.runtime.max_parallelism,
+        max_cpu_cores = runtime_config.runtime.max_cpu_cores,
         query_parallelism = runtime_config.query_parallelism(),
         max_query_buffer_bytes = runtime_config.runtime.max_query_buffer_bytes,
         query_max_buffered_bytes = runtime_config.query_max_buffered_bytes(),

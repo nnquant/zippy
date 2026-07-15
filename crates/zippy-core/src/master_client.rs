@@ -330,11 +330,7 @@ impl MasterClient {
         let response = self.send_request(ControlRequest::GetConfig(GetConfigRequest {}))?;
 
         match response {
-            ControlResponse::ConfigFetched { config } => {
-                serde_json::from_value(config).map_err(|error| ZippyError::InvalidConfig {
-                    reason: format!("failed to decode zippy config error=[{}]", error),
-                })
-            }
+            ControlResponse::ConfigFetched { config } => ZippyConfig::from_wire_json(config),
             other => Err(unexpected_response("ConfigFetched", other)),
         }
     }
