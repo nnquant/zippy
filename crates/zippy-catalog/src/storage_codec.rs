@@ -1,19 +1,25 @@
 //! Versioned durable BLOB codecs and canonical Arrow schema validation.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::mem::{size_of, size_of_val};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use arrow::datatypes::{
-    DataType, Field, Fields, IntervalUnit, Schema, SchemaRef, TimeUnit, UnionFields, UnionMode,
-};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use zippy_types::schema_contract::{
+    MAX_CATALOG_SCHEMA_FIELDS as MAX_SCHEMA_TOTAL_FIELDS,
+    MAX_CATALOG_SCHEMA_IPC_BYTES as MAX_SCHEMA_IPC_BYTES,
+    MAX_CATALOG_SCHEMA_METADATA_BYTES as MAX_SCHEMA_METADATA_BYTES,
+    MAX_CATALOG_SCHEMA_METADATA_ENTRIES as MAX_SCHEMA_METADATA_ENTRIES,
+    MAX_CATALOG_SCHEMA_NESTING_DEPTH as MAX_SCHEMA_NESTING_DEPTH,
+};
+use zippy_types::schema_hash::canonical_catalog_schema_hash_v1;
 use zippy_types::table::{
     AppendTableDefinition, ColumnName, ColumnSet, FiniteMetadataFloat, FrameTableDefinition,
     KeyValueTableDefinition, MetadataMap, MetadataScalar, SchemaDescriptor, SchemaIpcPayload,
@@ -21,14 +27,9 @@ use zippy_types::table::{
 };
 use zippy_types::{ErrorCode, Result, ServerError};
 
-const MAX_SCHEMA_IPC_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCHEMA_FLATBUFFER_DEPTH: usize = 64;
 const MAX_SCHEMA_FLATBUFFER_TABLES: usize = 32_768;
 const MAX_SCHEMA_FLATBUFFER_APPARENT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SCHEMA_TOTAL_FIELDS: usize = 4_096;
-const MAX_SCHEMA_NESTING_DEPTH: usize = 32;
-const MAX_SCHEMA_METADATA_ENTRIES: usize = 4_096;
-const MAX_SCHEMA_METADATA_BYTES: usize = 1024 * 1024;
 const DECODED_SCHEMA_CHARGE_MULTIPLIER: u64 = 2;
 const DECODED_SCHEMA_FIXED_OVERHEAD_BYTES: u64 = 1024;
 const MAX_TYPED_JSON_BYTES: usize = 1024 * 1024;
@@ -39,8 +40,6 @@ const TYPED_JSON_PREFIX: &[u8; 4] = b"ZCJ\x01";
 const SHA256_BYTES: usize = 32;
 const TYPED_JSON_HEADER_BYTES: usize = TYPED_JSON_PREFIX.len() + SHA256_BYTES;
 const TYPED_JSON_HASH_DOMAIN: &[u8] = b"zippy.catalog.typed-json.v1\0";
-const SCHEMA_HASH_DOMAIN: &[u8] = b"zippy.catalog.canonical-arrow-schema.v1\0";
-const SCHEMA_HASH_PREFIX: &str = "sha256-v1:";
 
 const TABLE_DEFINITION_BLOB_KIND: &str = "table_definition";
 const TABLE_CONFIG_BLOB_KIND: &str = "table_config";
@@ -632,255 +631,13 @@ fn persisted_schema_corruption(
 /// Physical verifiers use this same function to bind the Arrow Schema observed in a data-file
 /// footer to the Schema later admitted by the Catalog.
 pub fn canonical_schema_hash(schema: &SchemaRef) -> Result<String> {
-    let mut encoder = CanonicalArrowSchemaEncoderV1::new();
-    encoder.schema(schema.as_ref());
-    Ok(format!(
-        "{SCHEMA_HASH_PREFIX}{:x}",
-        encoder.digest.finalize()
-    ))
+    Ok(canonical_catalog_schema_hash_v1(schema.as_ref()))
 }
 
 /// Decodes a schema-only Arrow IPC stream and returns its canonical logical hash.
 pub fn canonical_schema_hash_from_ipc(schema_ipc: &SchemaIpcPayload) -> Result<String> {
     let schema = decode_schema_ipc_stream(schema_ipc.as_bytes())?;
     canonical_schema_hash(&schema)
-}
-
-struct CanonicalArrowSchemaEncoderV1 {
-    digest: Sha256,
-}
-
-impl CanonicalArrowSchemaEncoderV1 {
-    fn new() -> Self {
-        let mut digest = Sha256::new();
-        digest.update(SCHEMA_HASH_DOMAIN);
-        Self { digest }
-    }
-
-    fn schema(&mut self, schema: &Schema) {
-        self.tag(1);
-        self.fields(schema.fields());
-        self.metadata(schema.metadata());
-    }
-
-    fn fields(&mut self, fields: &Fields) {
-        self.length(fields.len());
-        for field in fields {
-            self.field(field);
-        }
-    }
-
-    fn field(&mut self, field: &Field) {
-        self.string(field.name());
-        self.boolean(field.is_nullable());
-        self.data_type(field.data_type());
-        self.optional_i64(field.dict_id());
-        self.optional_boolean(field.dict_is_ordered());
-        self.metadata(field.metadata());
-    }
-
-    fn union_fields(&mut self, fields: &UnionFields) {
-        self.length(fields.len());
-        for (type_id, field) in fields.iter() {
-            self.signed_byte(type_id);
-            self.field(field);
-        }
-    }
-
-    fn data_type(&mut self, data_type: &DataType) {
-        match data_type {
-            DataType::Null => self.tag(0),
-            DataType::Boolean => self.tag(1),
-            DataType::Int8 => self.tag(2),
-            DataType::Int16 => self.tag(3),
-            DataType::Int32 => self.tag(4),
-            DataType::Int64 => self.tag(5),
-            DataType::UInt8 => self.tag(6),
-            DataType::UInt16 => self.tag(7),
-            DataType::UInt32 => self.tag(8),
-            DataType::UInt64 => self.tag(9),
-            DataType::Float16 => self.tag(10),
-            DataType::Float32 => self.tag(11),
-            DataType::Float64 => self.tag(12),
-            DataType::Timestamp(unit, timezone) => {
-                self.tag(13);
-                self.time_unit(*unit);
-                self.optional_string(timezone.as_deref());
-            }
-            DataType::Date32 => self.tag(14),
-            DataType::Date64 => self.tag(15),
-            DataType::Time32(unit) => {
-                self.tag(16);
-                self.time_unit(*unit);
-            }
-            DataType::Time64(unit) => {
-                self.tag(17);
-                self.time_unit(*unit);
-            }
-            DataType::Duration(unit) => {
-                self.tag(18);
-                self.time_unit(*unit);
-            }
-            DataType::Interval(unit) => {
-                self.tag(19);
-                self.interval_unit(*unit);
-            }
-            DataType::Binary => self.tag(20),
-            DataType::FixedSizeBinary(width) => {
-                self.tag(21);
-                self.signed_u32(*width);
-            }
-            DataType::LargeBinary => self.tag(22),
-            DataType::BinaryView => self.tag(23),
-            DataType::Utf8 => self.tag(24),
-            DataType::LargeUtf8 => self.tag(25),
-            DataType::Utf8View => self.tag(26),
-            DataType::List(field) => {
-                self.tag(27);
-                self.field(field);
-            }
-            DataType::ListView(field) => {
-                self.tag(28);
-                self.field(field);
-            }
-            DataType::FixedSizeList(field, width) => {
-                self.tag(29);
-                self.field(field);
-                self.signed_u32(*width);
-            }
-            DataType::LargeList(field) => {
-                self.tag(30);
-                self.field(field);
-            }
-            DataType::LargeListView(field) => {
-                self.tag(31);
-                self.field(field);
-            }
-            DataType::Struct(fields) => {
-                self.tag(32);
-                self.fields(fields);
-            }
-            DataType::Union(fields, mode) => {
-                self.tag(33);
-                self.union_fields(fields);
-                self.union_mode(*mode);
-            }
-            DataType::Dictionary(key, value) => {
-                self.tag(34);
-                self.data_type(key);
-                self.data_type(value);
-            }
-            DataType::Decimal128(precision, scale) => {
-                self.tag(35);
-                self.tag(*precision);
-                self.signed_byte(*scale);
-            }
-            DataType::Decimal256(precision, scale) => {
-                self.tag(36);
-                self.tag(*precision);
-                self.signed_byte(*scale);
-            }
-            DataType::Map(field, sorted) => {
-                self.tag(37);
-                self.field(field);
-                self.boolean(*sorted);
-            }
-            DataType::RunEndEncoded(run_ends, values) => {
-                self.tag(38);
-                self.field(run_ends);
-                self.field(values);
-            }
-        }
-    }
-
-    fn time_unit(&mut self, unit: TimeUnit) {
-        self.tag(match unit {
-            TimeUnit::Second => 0,
-            TimeUnit::Millisecond => 1,
-            TimeUnit::Microsecond => 2,
-            TimeUnit::Nanosecond => 3,
-        });
-    }
-
-    fn interval_unit(&mut self, unit: IntervalUnit) {
-        self.tag(match unit {
-            IntervalUnit::YearMonth => 0,
-            IntervalUnit::DayTime => 1,
-            IntervalUnit::MonthDayNano => 2,
-        });
-    }
-
-    fn union_mode(&mut self, mode: UnionMode) {
-        self.tag(match mode {
-            UnionMode::Sparse => 0,
-            UnionMode::Dense => 1,
-        });
-    }
-
-    fn metadata(&mut self, metadata: &HashMap<String, String>) {
-        let mut entries = metadata.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        self.length(entries.len());
-        for (key, value) in entries {
-            self.string(key);
-            self.string(value);
-        }
-    }
-
-    fn optional_string(&mut self, value: Option<&str>) {
-        match value {
-            None => self.tag(0),
-            Some(value) => {
-                self.tag(1);
-                self.string(value);
-            }
-        }
-    }
-
-    fn optional_i64(&mut self, value: Option<i64>) {
-        match value {
-            None => self.tag(0),
-            Some(value) => {
-                self.tag(1);
-                self.digest.update(value.to_be_bytes());
-            }
-        }
-    }
-
-    fn optional_boolean(&mut self, value: Option<bool>) {
-        match value {
-            None => self.tag(0),
-            Some(value) => {
-                self.tag(1);
-                self.boolean(value);
-            }
-        }
-    }
-
-    fn string(&mut self, value: &str) {
-        self.length(value.len());
-        self.digest.update(value.as_bytes());
-    }
-
-    fn length(&mut self, value: usize) {
-        self.digest.update((value as u64).to_be_bytes());
-    }
-
-    fn signed_u32(&mut self, value: i32) {
-        self.digest.update(value.to_be_bytes());
-    }
-
-    fn signed_byte(&mut self, value: i8) {
-        self.digest.update(value.to_be_bytes());
-    }
-
-    fn boolean(&mut self, value: bool) {
-        self.tag(u8::from(value));
-    }
-
-    fn tag(&mut self, value: u8) {
-        self.digest.update([value]);
-    }
 }
 
 /// Encodes a table definition through the frozen V1 storage DTO.

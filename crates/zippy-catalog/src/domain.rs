@@ -297,6 +297,15 @@ fn commit_prepared_command(
     prepared: PreparedCommand,
 ) -> Result<VersionedCatalogResponse> {
     let request_id = context.request_id;
+    let mutates_table_projection = matches!(
+        context.operation,
+        "create_table"
+            | "alter_table_schema"
+            | "acquire_producer"
+            | "commit_data_files"
+            | "commit_compaction"
+            | "drop_table"
+    );
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| {
@@ -382,6 +391,13 @@ fn commit_prepared_command(
         catalog_revision: next_revision,
         outcome,
     });
+    if mutates_table_projection {
+        crate::legacy_projection_domain::downgrade_ready_after_native_table_mutation(
+            &transaction,
+            committed_at_ns,
+        )
+        .map_err(|error| error.with_request_id(request_id))?;
+    }
     let response_blob = CatalogCodec::encode_response(&response).map_err(|error| {
         ServerError::new(
             ErrorCode::Internal,
@@ -411,6 +427,14 @@ fn commit_prepared_command(
             crate::map_sqlite_error("persist catalog idempotency response", error)
                 .with_request_id(request_id)
         })?;
+    crate::request_ledger::insert_owner(
+        &transaction,
+        request_id,
+        context.command_format_version,
+        context.operation,
+        &context.fingerprint,
+        committed_at_ns,
+    )?;
     transaction.commit().map_err(|error| {
         crate::map_sqlite_error("commit catalog command", error).with_request_id(request_id)
     })?;
@@ -606,44 +630,29 @@ fn try_replay_idempotent_response(
     operation: &str,
     fingerprint: &[u8; 32],
 ) -> Result<Option<VersionedCatalogResponse>> {
-    reject_legacy_import_request_id(connection, request_id)?;
-    load_idempotent_response(connection, request_id)?
-        .map(|stored| {
-            replay_idempotent_response(
-                stored,
-                request_id,
-                command_format_version,
-                operation,
-                fingerprint,
-            )
-        })
-        .transpose()
-}
-
-fn reject_legacy_import_request_id(connection: &Connection, request_id: RequestId) -> Result<()> {
-    for (table, namespace) in [
-        ("legacy_import_requests", "legacy import"),
-        ("legacy_file_view_mappings", "legacy reconcile"),
-    ] {
-        let sql = format!("SELECT 1 FROM {table} WHERE request_id = ?1");
-        let exists = connection
-            .query_row(&sql, [request_id.into_bytes().as_slice()], |_| Ok(()))
-            .optional()
-            .map_err(|error| {
-                crate::map_sqlite_error("check cross-version request-id conflict", error)
-                    .with_request_id(request_id)
-            })?
-            .is_some();
-        if exists {
-            return Err(ServerError::new(
-                ErrorCode::Conflict,
-                format!("catalog request id is already committed in the {namespace} namespace"),
-            )
-            .with_request_id(request_id)
-            .with_retryable(false));
-        }
+    let owner_exists = crate::request_ledger::exact_owner_exists(
+        connection,
+        request_id,
+        command_format_version,
+        operation,
+        fingerprint,
+    )?;
+    let stored = load_idempotent_response(connection, request_id)?;
+    match (owner_exists, stored) {
+        (true, Some(stored)) => Ok(Some(replay_idempotent_response(
+            stored,
+            request_id,
+            command_format_version,
+            operation,
+            fingerprint,
+        )?)),
+        (false, None) => Ok(None),
+        _ => Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "V1 idempotency fact and global request owner disagree",
+        )
+        .with_request_id(request_id)),
     }
-    Ok(())
 }
 
 fn replay_idempotent_response(
@@ -894,6 +903,13 @@ mod tests {
                      response_blob BLOB NOT NULL,\
                      committed_at_ns BLOB NOT NULL,\
                      expires_at_ns BLOB NOT NULL\
+                 );\
+                 CREATE TABLE catalog_request_ids (\
+                     request_id BLOB PRIMARY KEY,\
+                     format_version INTEGER NOT NULL,\
+                     operation TEXT NOT NULL,\
+                     fingerprint BLOB NOT NULL,\
+                     committed_at_ns BLOB NOT NULL\
                  );\
                  CREATE TABLE legacy_import_requests (\
                      request_id BLOB PRIMARY KEY,\

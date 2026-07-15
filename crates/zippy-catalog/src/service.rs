@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{oneshot, Semaphore};
 use zippy_types::catalog::{
     CatalogCommandReplayProbe, CatalogDataFileReferenceSnapshot, CatalogFileRead,
@@ -18,18 +18,20 @@ use zippy_types::catalog::{
     ClaimGarbageCollectionFilesRequest, ClaimedGarbageCollectionFiles,
     FinalizeGarbageCollectionFilesRequest, FinalizedGarbageCollectionFiles,
     LegacyCatalogImportEnvelopeV2, LegacyCatalogImportReplayProbeV2, LegacyCatalogImportResponseV2,
-    LegacyCatalogReconcileEnvelopeV3, LegacyCatalogReconcileResponseV3,
+    LegacyCatalogProjectionCheckpointV4, LegacyCatalogProjectionEnvelopeV4,
+    LegacyCatalogProjectionResponseV4, LegacyCatalogReconcileEnvelopeV3,
+    LegacyCatalogReconcileResponseV3, LegacyCatalogTableProjectionV4,
     LegacyFileViewSnapshotMapping, ListNamespacesRequest, ListNamespacesResponse,
     ListTablesRequest, ListTablesResponse, ManagedDataFileProbe, NamespaceRef,
     VersionedCatalogCommand, VersionedCatalogResponse,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
-use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError};
+use zippy_types::{BoxFuture, ErrorCode, RequestId, Result, ServerError, TableId};
 
 use crate::SqliteCatalogConfig;
 use crate::{
-    domain, file_domain, legacy_import_domain, legacy_reconcile_domain, manifest_domain,
-    snapshot_domain, table_domain,
+    domain, file_domain, legacy_import_domain, legacy_projection_domain, legacy_reconcile_domain,
+    manifest_domain, snapshot_domain, table_domain,
 };
 
 const SERVICE_ACTOR_THREAD_NAME: &str = "zippy-catalog-service";
@@ -827,6 +829,42 @@ impl SqliteCatalogReadHandle {
         }))
         .await
     }
+
+    /// Reads the durable singleton V4 legacy projection checkpoint.
+    pub async fn read_legacy_projection_checkpoint_v4(
+        &self,
+    ) -> Result<LegacyCatalogProjectionCheckpointV4> {
+        await_response(
+            self.endpoint
+                .control_request(ControlReadMessage::ReadLegacyProjectionCheckpointV4),
+        )
+        .await
+    }
+
+    /// Reads one V4 table projection, including seeded or dropped history when present.
+    pub async fn read_legacy_table_projection_v4(
+        &self,
+        table_id: TableId,
+    ) -> Result<Option<LegacyCatalogTableProjectionV4>> {
+        await_response(self.endpoint.control_request(|response| {
+            ControlReadMessage::ReadLegacyTableProjectionV4 { table_id, response }
+        }))
+        .await
+    }
+
+    /// Lists every V4 table projection in strict table-identity order.
+    ///
+    /// This full-state read is intended for trusted startup and continuity-loss reconciliation,
+    /// not for an unbounded external listing API.
+    pub async fn list_legacy_table_projections_v4(
+        &self,
+    ) -> Result<Vec<LegacyCatalogTableProjectionV4>> {
+        await_response(
+            self.endpoint
+                .control_request(ControlReadMessage::ListLegacyTableProjectionsV4),
+        )
+        .await
+    }
 }
 
 impl CatalogRead for SqliteCatalogReadHandle {
@@ -1080,6 +1118,54 @@ impl SqliteCatalogLegacyReconcileHandle {
                 ServiceMessage::LegacyReconcile(LegacyReconcileRequest {
                     command,
                     state: LegacyReconcileRequestState {
+                        request_id,
+                        response,
+                        _manifest_permit: manifest_permit,
+                        _publication_permit: publication_permit,
+                    },
+                })
+            }))
+            .await
+        })
+    }
+
+    /// Applies one trusted V4 legacy projection command through replay-first preparation.
+    ///
+    /// Verification runs on the preparation worker before the writer probes permanent replay.
+    /// Cooperative byte accounting and byte-budget admission precede the publication gate so an
+    /// unqueued command cannot block unrelated publication. Once admitted, every worker stage
+    /// retains the same bounded publication, command, and queued-byte permits.
+    pub fn apply_legacy_catalog_projection_v4(
+        &self,
+        command: LegacyCatalogProjectionEnvelopeV4,
+    ) -> BoxFuture<'_, Result<LegacyCatalogProjectionResponseV4>> {
+        Box::pin(async move {
+            let request_id = command.request_id;
+            let endpoint = self.endpoint.upgrade().ok_or_else(actor_stopped)?;
+            endpoint.check_admission()?;
+            let command_permit = self
+                .command_budget
+                .reserve()
+                .map_err(|error| error.with_request_id(request_id))?;
+            let queued_bytes =
+                legacy_projection_domain::legacy_projection_preflight_bytes(&command).await?;
+            let manifest_permit = self
+                .manifest_queue_budget
+                .reserve(queued_bytes)
+                .map_err(|error| error.with_request_id(request_id))?;
+            let publication_permit = Arc::clone(&self.publication_gate)
+                .acquire_owned()
+                .await
+                .map_err(|_| publication_gate_stopped().with_request_id(request_id))?;
+            let publication_permit = SqlitePublicationPermit {
+                owner_id: self.publication_owner_id,
+                _command_permit: command_permit,
+                _publication_permit: publication_permit,
+            };
+            await_response(endpoint.writer_request(|response| {
+                ServiceMessage::LegacyProjection(LegacyProjectionRequest {
+                    command,
+                    state: LegacyProjectionRequestState {
                         request_id,
                         response,
                         _manifest_permit: manifest_permit,
@@ -1487,6 +1573,51 @@ trait CatalogReadBackend: Send + Sync + 'static {
     ) -> Result<LegacyFileViewSnapshotMapping> {
         legacy_reconcile_domain::read_current_legacy_file_view_mapping(connection, table_id)
     }
+
+    fn read_legacy_projection_checkpoint_v4(
+        &self,
+        connection: &Connection,
+    ) -> Result<LegacyCatalogProjectionCheckpointV4> {
+        legacy_projection_domain::read_checkpoint(connection)
+    }
+
+    fn read_legacy_table_projection_v4(
+        &self,
+        connection: &mut Connection,
+        table_id: TableId,
+    ) -> Result<Option<LegacyCatalogTableProjectionV4>> {
+        deferred_control_read(
+            connection,
+            "read legacy V4 table projection snapshot",
+            |transaction| legacy_projection_domain::read_table_projection(transaction, table_id),
+        )
+    }
+
+    fn list_legacy_table_projections_v4(
+        &self,
+        connection: &mut Connection,
+    ) -> Result<Vec<LegacyCatalogTableProjectionV4>> {
+        deferred_control_read(
+            connection,
+            "list legacy V4 table projection snapshot",
+            legacy_projection_domain::list_table_projections,
+        )
+    }
+}
+
+fn deferred_control_read<T>(
+    connection: &mut Connection,
+    operation: &'static str,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| crate::map_sqlite_error(operation, error))?;
+    let result = read(&transaction)?;
+    transaction
+        .commit()
+        .map_err(|error| crate::map_sqlite_error(operation, error))?;
+    Ok(result)
 }
 
 struct DomainCatalogReadBackend;
@@ -1521,6 +1652,12 @@ enum ControlReadMessage {
         table_id: zippy_types::TableId,
         response: oneshot::Sender<Result<LegacyFileViewSnapshotMapping>>,
     },
+    ReadLegacyProjectionCheckpointV4(oneshot::Sender<Result<LegacyCatalogProjectionCheckpointV4>>),
+    ReadLegacyTableProjectionV4 {
+        table_id: TableId,
+        response: oneshot::Sender<Result<Option<LegacyCatalogTableProjectionV4>>>,
+    },
+    ListLegacyTableProjectionsV4(oneshot::Sender<Result<Vec<LegacyCatalogTableProjectionV4>>>),
     Shutdown,
 }
 
@@ -1901,6 +2038,24 @@ fn control_read_loop(
                     );
                 }
             }
+            ControlReadMessage::ReadLegacyProjectionCheckpointV4(response) => {
+                if !response.is_closed() {
+                    let _ =
+                        response.send(backend.read_legacy_projection_checkpoint_v4(&connection));
+                }
+            }
+            ControlReadMessage::ReadLegacyTableProjectionV4 { table_id, response } => {
+                if !response.is_closed() {
+                    let _ = response
+                        .send(backend.read_legacy_table_projection_v4(&mut connection, table_id));
+                }
+            }
+            ControlReadMessage::ListLegacyTableProjectionsV4(response) => {
+                if !response.is_closed() {
+                    let _ =
+                        response.send(backend.list_legacy_table_projections_v4(&mut connection));
+                }
+            }
             ControlReadMessage::Shutdown => break,
         }
     }
@@ -1948,6 +2103,7 @@ enum ServiceMessage {
     Command(CommandRequest),
     LegacyImport(LegacyImportRequest),
     LegacyReconcile(LegacyReconcileRequest),
+    LegacyProjection(LegacyProjectionRequest),
     ClaimGarbageCollection(GarbageCollectionClaimRequest),
     FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
     Shutdown(Sender<Result<()>>),
@@ -1957,6 +2113,7 @@ enum WriterRequest {
     Command(CommandRequest),
     LegacyImport(LegacyImportRequest),
     LegacyReconcile(LegacyReconcileRequest),
+    LegacyProjection(LegacyProjectionRequest),
     ClaimGarbageCollection(GarbageCollectionClaimRequest),
     FinalizeGarbageCollection(GarbageCollectionFinalizeRequest),
 }
@@ -1990,8 +2147,26 @@ struct LegacyReconcileRequestState {
     _publication_permit: SqlitePublicationPermit,
 }
 
+struct LegacyProjectionRequest {
+    command: LegacyCatalogProjectionEnvelopeV4,
+    state: LegacyProjectionRequestState,
+}
+
+struct LegacyProjectionRequestState {
+    request_id: RequestId,
+    response: oneshot::Sender<Result<LegacyCatalogProjectionResponseV4>>,
+    _manifest_permit: Option<ManifestQueuePermit>,
+    _publication_permit: SqlitePublicationPermit,
+}
+
 impl LegacyReconcileRequestState {
     fn send(self, result: Result<LegacyCatalogReconcileResponseV3>) {
+        let _ = self.response.send(result);
+    }
+}
+
+impl LegacyProjectionRequestState {
+    fn send(self, result: Result<LegacyCatalogProjectionResponseV4>) {
         let _ = self.response.send(result);
     }
 }
@@ -2006,6 +2181,7 @@ enum PreparationRequestState {
     Command(CommandRequestState),
     LegacyImport(LegacyImportRequestState),
     LegacyReconcile(LegacyReconcileRequestState),
+    LegacyProjection(LegacyProjectionRequestState),
 }
 
 impl PreparationRequestState {
@@ -2014,6 +2190,7 @@ impl PreparationRequestState {
             Self::Command(state) => state.request_id,
             Self::LegacyImport(state) => state.request_id,
             Self::LegacyReconcile(state) => state.request_id,
+            Self::LegacyProjection(state) => state.request_id,
         }
     }
 
@@ -2022,6 +2199,7 @@ impl PreparationRequestState {
             Self::Command(state) => state.send(Err(error)),
             Self::LegacyImport(state) => state.send(Err(error)),
             Self::LegacyReconcile(state) => state.send(Err(error)),
+            Self::LegacyProjection(state) => state.send(Err(error)),
         }
     }
 }
@@ -2112,6 +2290,8 @@ enum ManifestWorkerJob {
     Prepare(domain::ManifestCommandPreparation),
     PrepareLegacyImport(LegacyCatalogImportEnvelopeV2),
     PrepareLegacyReconcile(Box<LegacyCatalogReconcileEnvelopeV3>),
+    VerifyLegacyProjection(Box<LegacyCatalogProjectionEnvelopeV4>),
+    PrepareLegacyProjection(legacy_projection_domain::VerifiedLegacyCatalogProjectionV4),
 }
 
 impl ManifestWorkerJob {
@@ -2121,6 +2301,8 @@ impl ManifestWorkerJob {
             Self::Prepare(preparation) => preparation.request_id(),
             Self::PrepareLegacyImport(command) => command.request_id,
             Self::PrepareLegacyReconcile(command) => command.request_id,
+            Self::VerifyLegacyProjection(command) => command.request_id,
+            Self::PrepareLegacyProjection(command) => command.request_id(),
         }
     }
 }
@@ -2130,6 +2312,10 @@ enum ManifestWorkerCompletion {
     Prepared(domain::ManifestPreparationResult),
     LegacyImportPrepared(Result<legacy_import_domain::PreparedLegacyCatalogImportV2>),
     LegacyReconcilePrepared(Box<Result<legacy_reconcile_domain::PreparedLegacyCatalogReconcileV3>>),
+    LegacyProjectionVerified(Result<legacy_projection_domain::VerifiedLegacyCatalogProjectionV4>),
+    LegacyProjectionPrepared(
+        Box<Result<legacy_projection_domain::PreparedLegacyCatalogProjectionV4>>,
+    ),
 }
 
 enum ManifestWorkerSubmitError {
@@ -2228,6 +2414,30 @@ fn manifest_worker_loop(
                 }))
                 .unwrap_or_else(|_| Err(manifest_worker_panicked(request_id, "legacy_reconcile")));
                 ManifestWorkerCompletion::LegacyReconcilePrepared(Box::new(result))
+            }
+            ManifestWorkerJob::VerifyLegacyProjection(command) => {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    legacy_projection_domain::verify_legacy_catalog_projection_v4(*command)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(manifest_worker_panicked(
+                        request_id,
+                        "legacy_projection_verify",
+                    ))
+                });
+                ManifestWorkerCompletion::LegacyProjectionVerified(result)
+            }
+            ManifestWorkerJob::PrepareLegacyProjection(command) => {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    legacy_projection_domain::prepare_verified_legacy_catalog_projection_v4(command)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(manifest_worker_panicked(
+                        request_id,
+                        "legacy_projection_prepare",
+                    ))
+                });
+                ManifestWorkerCompletion::LegacyProjectionPrepared(Box::new(result))
             }
         };
         if completion_sender.send(completion).is_err() {
@@ -2428,6 +2638,13 @@ fn handle_service_message(
             pending_requests,
             WriterRequest::LegacyReconcile(request),
         ),
+        ServiceMessage::LegacyProjection(request) => admit_writer_request(
+            connection,
+            manifest_worker,
+            active_manifest,
+            pending_requests,
+            WriterRequest::LegacyProjection(request),
+        ),
         ServiceMessage::ClaimGarbageCollection(request) => admit_writer_request(
             connection,
             manifest_worker,
@@ -2489,6 +2706,15 @@ fn start_writer_request(
                 active_manifest,
                 ManifestWorkerJob::PrepareLegacyReconcile(Box::new(command)),
                 PreparationRequestState::LegacyReconcile(state),
+            );
+        }
+        WriterRequest::LegacyProjection(request) => {
+            let LegacyProjectionRequest { command, state } = request;
+            submit_manifest_job(
+                manifest_worker,
+                active_manifest,
+                ManifestWorkerJob::VerifyLegacyProjection(Box::new(command)),
+                PreparationRequestState::LegacyProjection(state),
             );
         }
         WriterRequest::ClaimGarbageCollection(request) => request.execute(connection),
@@ -2578,6 +2804,45 @@ fn handle_manifest_completion(
             };
             state.send((*result).and_then(|prepared| {
                 legacy_reconcile_domain::commit_legacy_catalog_reconcile_v3(connection, prepared)
+            }));
+        }
+        ManifestWorkerCompletion::LegacyProjectionVerified(result) => {
+            let PreparationRequestState::LegacyProjection(state) = state else {
+                state.send_error(ServerError::new(
+                    ErrorCode::Internal,
+                    "sqlite Catalog preparation state mismatched verified legacy projection",
+                ));
+                return;
+            };
+            match result.and_then(|verified| {
+                legacy_projection_domain::begin_verified_legacy_catalog_projection_v4(
+                    connection, verified,
+                )
+            }) {
+                Ok(legacy_projection_domain::LegacyCatalogProjectionStartV4::Replay(response)) => {
+                    state.send(Ok(response));
+                }
+                Ok(legacy_projection_domain::LegacyCatalogProjectionStartV4::Prepare(verified)) => {
+                    submit_manifest_job(
+                        manifest_worker,
+                        active_manifest,
+                        ManifestWorkerJob::PrepareLegacyProjection(verified),
+                        PreparationRequestState::LegacyProjection(state),
+                    );
+                }
+                Err(error) => state.send(Err(error)),
+            }
+        }
+        ManifestWorkerCompletion::LegacyProjectionPrepared(result) => {
+            let PreparationRequestState::LegacyProjection(state) = state else {
+                state.send_error(ServerError::new(
+                    ErrorCode::Internal,
+                    "sqlite Catalog preparation state mismatched prepared legacy projection",
+                ));
+                return;
+            };
+            state.send((*result).and_then(|prepared| {
+                legacy_projection_domain::execute_legacy_catalog_projection_v4(connection, prepared)
             }));
         }
     }
@@ -2728,18 +2993,27 @@ mod tests {
     use tempfile::TempDir;
     use zippy_core::OwnedDataDirectory;
     use zippy_types::catalog::{
-        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandReplayProbe,
-        CatalogCommandV1, CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
+        compute_legacy_catalog_projection_digest_v4,
+        compute_legacy_catalog_source_metadata_hash_v4, CatalogActor, CatalogActorKind,
+        CatalogCommandEnvelopeV1, CatalogCommandReplayProbe, CatalogCommandV1,
+        CatalogDataFileProbeMatch, CatalogFileRead, CatalogGarbageCollection,
         CatalogGarbageCollectionGuard, CatalogIdempotencyRead, CatalogPublicationControl,
         CatalogPublicationPermit, CatalogRead, CatalogSnapshotSelector, CatalogTableSnapshot,
         CatalogWrite, ClaimGarbageCollectionFilesRequest, CommandFingerprint,
         CommitCompactionCommand, CommitDataFilesCommand, CreateNamespaceCommand,
-        CreateTableCommand, LegacyCatalogImportCommandV2, LegacyCatalogImportEnvelopeV2,
-        LegacyCatalogImportFileV2, LegacyCatalogImportReplayProbeV2,
+        CreateTableCommand, LegacyCatalogAdoptExistingTableCommandV4,
+        LegacyCatalogAdvanceCheckpointCommandV4, LegacyCatalogBootstrapTableCommandV4,
+        LegacyCatalogCheckpointModeV4, LegacyCatalogDropTableCommandV4,
+        LegacyCatalogImportCommandV2, LegacyCatalogImportEnvelopeV2, LegacyCatalogImportFileV2,
+        LegacyCatalogImportReplayProbeV2, LegacyCatalogProjectionCommandV4,
+        LegacyCatalogProjectionCompletenessV4, LegacyCatalogProjectionDigestTableV4,
+        LegacyCatalogProjectionEnvelopeV4, LegacyCatalogProjectionOutcomeV4,
+        LegacyCatalogProjectionPhaseV4, LegacyCatalogProjectionTableStateV4,
         LegacyCatalogReconcileCommandV3, LegacyCatalogReconcileEnvelopeV3,
-        LegacyFileViewContinuity, ManagedDataFileProbe, VersionedCatalogCommand,
-        VersionedCatalogResponse, LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY,
-        LEGACY_REGISTRY_INDEX_METADATA_KEY, LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
+        LegacyCatalogSyncTableMetadataCommandV4, LegacyFileViewContinuity, ManagedDataFileProbe,
+        VersionedCatalogCommand, VersionedCatalogResponse,
+        LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY, LEGACY_REGISTRY_INDEX_METADATA_KEY,
+        LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, DataFileDescriptor, DataFileLocation,
@@ -2753,9 +3027,10 @@ mod tests {
     };
 
     use super::{
-        domain, snapshot_domain, verify_replay_probe_command, CatalogReadBackend,
-        DomainManifestPreparationBackend, ManifestPreparationBackend, ManifestQueueBudget,
-        ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig, REPLAY_PROBE_CAPACITY,
+        deferred_control_read, domain, snapshot_domain, verify_replay_probe_command,
+        CatalogReadBackend, DomainManifestPreparationBackend, ManifestPreparationBackend,
+        ManifestQueueBudget, ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig,
+        SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle, REPLAY_PROBE_CAPACITY,
     };
 
     const NAMESPACE_ID: u128 = 1;
@@ -2990,6 +3265,163 @@ mod tests {
         writer.finish().expect("finish schema-only IPC stream");
         drop(writer);
         SchemaIpcPayload::new(payload).expect("nonempty schema IPC payload")
+    }
+
+    fn canonical_hash(digit: char) -> String {
+        format!("sha256-v1:{}", digit.to_string().repeat(64))
+    }
+
+    fn projection_migration_config(name: &str, legacy_revision: u64) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "zippy.migration.legacy_stream_name".to_owned(),
+                name.to_owned(),
+            ),
+            (
+                "zippy.migration.legacy_persisted_files_revision_base".to_owned(),
+                legacy_revision.to_string(),
+            ),
+            (
+                "zippy.migration.native_snapshot_version_base".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "zippy.migration.source_snapshot_hash".to_owned(),
+                canonical_hash('a'),
+            ),
+            ("zippy.migration.version".to_owned(), "1".to_owned()),
+        ])
+    }
+
+    fn projection_envelope(
+        request: u128,
+        actor_kind: CatalogActorKind,
+        source_projection_hash: String,
+        source_catalog_revision: u64,
+        command: LegacyCatalogProjectionCommandV4,
+    ) -> LegacyCatalogProjectionEnvelopeV4 {
+        LegacyCatalogProjectionEnvelopeV4::new(
+            request_id(request),
+            CatalogActor {
+                kind: actor_kind,
+                principal: "catalog-service-legacy-v4-test".to_owned(),
+            },
+            0,
+            source_projection_hash,
+            source_catalog_revision,
+            command,
+        )
+        .expect("build V4 projection envelope")
+    }
+
+    async fn create_ready_ticks_projection(
+        catalog: &SqliteCatalog,
+        request_base: u128,
+        legacy_revision: u64,
+    ) -> (
+        SqliteCatalogLegacyReconcileHandle,
+        SqliteCatalogReadHandle,
+        String,
+        LegacyCatalogProjectionEnvelopeV4,
+    ) {
+        let namespace_id = NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id");
+        catalog
+            .command(command(
+                request_base,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id,
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create ready-projection namespace");
+        let projection = catalog
+            .legacy_reconcile_handle()
+            .expect("create ready-projection writer handle");
+        let read = catalog
+            .read_handle()
+            .expect("create ready-projection read handle");
+        let schema_ipc = schema_ipc();
+        let schema_hash = crate::canonical_schema_hash_from_ipc(&schema_ipc)
+            .expect("hash ready-projection Schema");
+        let definition = TableDefinition::Append(AppendTableDefinition {
+            event_time_column: None,
+        });
+        let bootstrap = projection_envelope(
+            request_base + 1,
+            CatalogActorKind::Migration,
+            canonical_hash('b'),
+            1,
+            LegacyCatalogProjectionCommandV4::BootstrapTable(
+                LegacyCatalogBootstrapTableCommandV4 {
+                    table_id: table_id(),
+                    namespace_id,
+                    name: CatalogName::new("ticks").expect("valid table name"),
+                    definition: definition.clone(),
+                    schema_ipc,
+                    canonical_schema_hash: schema_hash.clone(),
+                    config: projection_migration_config("ticks", legacy_revision),
+                    writer_epoch: 0,
+                    sources: Vec::new(),
+                    files: Vec::new(),
+                    legacy_files_revision: legacy_revision,
+                },
+            ),
+        );
+        projection
+            .apply_legacy_catalog_projection_v4(bootstrap.clone())
+            .await
+            .expect("bootstrap ready-projection table");
+        let digest =
+            compute_legacy_catalog_projection_digest_v4(&[LegacyCatalogProjectionDigestTableV4 {
+                table_id: table_id(),
+                namespace_id,
+                name: CatalogName::new("ticks").expect("valid table name"),
+                definition,
+                schema_version: 1,
+                schema_hash: schema_hash.clone(),
+                config: BTreeMap::new(),
+                legacy_files_revision: legacy_revision,
+                writer_epoch: 0,
+                state: LegacyCatalogProjectionTableStateV4::Active,
+                sources: Vec::new(),
+            }])
+            .expect("compute ready-projection digest");
+        let checkpoint = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read initial ready-projection checkpoint");
+        projection
+            .apply_legacy_catalog_projection_v4(projection_envelope(
+                request_base + 2,
+                CatalogActorKind::Server,
+                digest.clone(),
+                1,
+                LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(
+                    LegacyCatalogAdvanceCheckpointCommandV4 {
+                        expected_checkpoint_generation: checkpoint.checkpoint_generation,
+                        expected_source_catalog_revision: checkpoint.source_catalog_revision,
+                        expected_source_projection_hash: checkpoint.source_projection_hash,
+                        expected_phase: checkpoint.phase,
+                        shadow_epoch: 0,
+                        phase: LegacyCatalogProjectionPhaseV4::ReadCutoverReady,
+                        mode: LegacyCatalogCheckpointModeV4::FullReconcile,
+                        target_projection_digest: digest,
+                        observed_continuity_loss_epoch: 0,
+                    },
+                ),
+            ))
+            .await
+            .expect("mark single projection ready");
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read ready projection checkpoint")
+                .phase,
+            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
+        );
+        (projection, read, schema_hash, bootstrap)
     }
 
     async fn create_append_table(catalog: &SqliteCatalog) {
@@ -3336,6 +3768,23 @@ mod tests {
             .expect("import initial reconcile view");
         session.seal();
 
+        let projection_read = catalog
+            .read_handle()
+            .expect("create projection read handle for V2/V3 assertions");
+        let seeded_projection = projection_read
+            .read_legacy_table_projection_v4(table_id())
+            .await
+            .expect("read V2-seeded projection")
+            .expect("V2 import must seed a projection row");
+        assert_eq!(seeded_projection.projection_revision, 1);
+        assert_eq!(seeded_projection.native_snapshot_version, 2);
+        assert_eq!(seeded_projection.legacy_files_revision, 1);
+        assert_eq!(seeded_projection.writer_epoch, 1);
+        assert_eq!(
+            seeded_projection.completeness,
+            LegacyCatalogProjectionCompletenessV4::Seeded
+        );
+
         let handle = catalog
             .legacy_reconcile_handle()
             .expect("create online reconcile handle");
@@ -3382,6 +3831,19 @@ mod tests {
         assert_eq!(response.catalog_revision, 3);
         assert_eq!(response.native_snapshot_version, 3);
         assert_eq!(response.continuity, LegacyFileViewContinuity::Gap);
+        let reconciled_projection = projection_read
+            .read_legacy_table_projection_v4(table_id())
+            .await
+            .expect("read V3-synchronized projection")
+            .expect("V3 reconcile must retain the projection row");
+        assert_eq!(reconciled_projection.projection_revision, 2);
+        assert_eq!(reconciled_projection.native_snapshot_version, 3);
+        assert_eq!(reconciled_projection.legacy_files_revision, 3);
+        assert_eq!(reconciled_projection.writer_epoch, 2);
+        let checkpoint_after_first_reconcile = projection_read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read checkpoint after first V3 reconcile");
         assert_eq!(
             handle
                 .reconcile_legacy_table_v3(reconcile.clone())
@@ -3390,6 +3852,21 @@ mod tests {
             response
         );
         assert_eq!(catalog.revision().await.expect("read replay revision"), 3);
+        assert_eq!(
+            projection_read
+                .read_legacy_table_projection_v4(table_id())
+                .await
+                .expect("read projection after exact V3 replay")
+                .expect("projection remains present after exact V3 replay"),
+            reconciled_projection
+        );
+        assert_eq!(
+            projection_read
+                .read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read checkpoint after exact V3 replay"),
+            checkpoint_after_first_reconcile
+        );
 
         let base_mapping = catalog
             .resolve_legacy_file_view_mapping(table_id(), 1)
@@ -5476,5 +5953,875 @@ mod tests {
             committed
         );
         reopened.close().expect("close reopened Catalog actor");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_v4_byte_budget_precedes_publication_gate_and_releases_command_permit() {
+        let directory = TempDir::new().expect("create V4 admission directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open(
+            SqliteCatalogConfig::new(&data_directory)
+                .with_command_capacity(1)
+                .with_manifest_queue_capacity_bytes(1),
+        )
+        .expect("open bounded Catalog for V4 admission test");
+        let projection = catalog
+            .legacy_reconcile_handle()
+            .expect("create bounded V4 projection handle");
+        let exclusion = catalog
+            .acquire_publication_exclusion()
+            .await
+            .expect("hold publication exclusion");
+        let command = projection_envelope(
+            501,
+            CatalogActorKind::Server,
+            canonical_hash('a'),
+            0,
+            LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(
+                LegacyCatalogAdvanceCheckpointCommandV4 {
+                    expected_checkpoint_generation: 0,
+                    expected_source_catalog_revision: 0,
+                    expected_source_projection_hash: canonical_hash('a'),
+                    expected_phase: LegacyCatalogProjectionPhaseV4::FileShadow,
+                    shadow_epoch: 0,
+                    phase: LegacyCatalogProjectionPhaseV4::FullShadow,
+                    mode: LegacyCatalogCheckpointModeV4::FullReconcile,
+                    target_projection_digest: canonical_hash('b'),
+                    observed_continuity_loss_epoch: 0,
+                },
+            ),
+        );
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            projection.apply_legacy_catalog_projection_v4(command),
+        )
+        .await
+        .expect("byte-budget rejection must not wait for publication exclusion")
+        .expect_err("one-byte V4 manifest budget must reject the command");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(error.request_id(), Some(request_id(501)));
+
+        drop(exclusion);
+        let permit =
+            tokio::time::timeout(Duration::from_secs(1), catalog.acquire_publication_permit())
+                .await
+                .expect("failed V4 admission must release command capacity")
+                .expect("publication admission remains available after V4 rejection");
+        drop(permit);
+        catalog
+            .close()
+            .expect("close Catalog after V4 admission test");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_v4_service_routes_all_operations_replays_and_reads_complete_state() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+            .expect("open Catalog for V4 service flow");
+        let namespace_id = NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id");
+        catalog
+            .command(command(
+                401,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id,
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create V4 fixture namespace");
+
+        let projection = catalog
+            .legacy_reconcile_handle()
+            .expect("create V4 projection handle");
+        let read = catalog.read_handle().expect("create V4 read handle");
+        let definition = TableDefinition::Append(AppendTableDefinition {
+            event_time_column: None,
+        });
+        let ticks_schema_ipc = schema_ipc();
+        let schema_hash = crate::canonical_schema_hash_from_ipc(&ticks_schema_ipc)
+            .expect("hash V4 fixture Schema");
+        let bootstrap = projection_envelope(
+            402,
+            CatalogActorKind::Migration,
+            canonical_hash('b'),
+            1,
+            LegacyCatalogProjectionCommandV4::BootstrapTable(
+                LegacyCatalogBootstrapTableCommandV4 {
+                    table_id: table_id(),
+                    namespace_id,
+                    name: CatalogName::new("ticks").expect("valid table name"),
+                    definition: definition.clone(),
+                    schema_ipc: ticks_schema_ipc,
+                    canonical_schema_hash: schema_hash.clone(),
+                    config: projection_migration_config("ticks", 7),
+                    writer_epoch: 0,
+                    sources: Vec::new(),
+                    files: Vec::new(),
+                    legacy_files_revision: 7,
+                },
+            ),
+        );
+        let bootstrap_response = projection
+            .apply_legacy_catalog_projection_v4(bootstrap.clone())
+            .await
+            .expect("bootstrap V4 table through service");
+        assert!(matches!(
+            bootstrap_response.outcome,
+            LegacyCatalogProjectionOutcomeV4::BootstrapTable(_)
+        ));
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        let mut replay_without_preparable_schema = bootstrap.clone();
+        let LegacyCatalogProjectionCommandV4::BootstrapTable(command) =
+            &mut replay_without_preparable_schema.command
+        else {
+            panic!("expected bootstrap replay command");
+        };
+        command.schema_ipc = SchemaIpcPayload::new(vec![1]).expect("nonempty invalid Schema IPC");
+        assert_eq!(
+            projection
+                .apply_legacy_catalog_projection_v4(replay_without_preparable_schema)
+                .await
+                .expect("permanent replay must precede expensive Schema preparation"),
+            bootstrap_response
+        );
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        let bootstrapped = read
+            .read_legacy_table_projection_v4(table_id())
+            .await
+            .expect("read bootstrapped projection")
+            .expect("bootstrapped projection exists");
+        assert_eq!(bootstrapped.projection_revision, 1);
+        assert_eq!(bootstrapped.legacy_files_revision, 7);
+
+        let adopted_table_id = TableId::from_u128(3).expect("nonzero adopted table id");
+        let adopted_schema_ipc = schema_ipc();
+        catalog
+            .command(migration_command(
+                403,
+                Some(2),
+                CatalogCommandV1::CreateTable(CreateTableCommand {
+                    table_id: adopted_table_id,
+                    namespace_id,
+                    name: CatalogName::new("adopted").expect("valid adopted table name"),
+                    definition: definition.clone(),
+                    schema_ipc: adopted_schema_ipc,
+                    config: projection_migration_config("adopted", 13),
+                }),
+            ))
+            .await
+            .expect("create empty V1 table for adoption");
+        let adopt = projection_envelope(
+            404,
+            CatalogActorKind::Migration,
+            canonical_hash('c'),
+            2,
+            LegacyCatalogProjectionCommandV4::AdoptExistingTable(
+                LegacyCatalogAdoptExistingTableCommandV4 {
+                    table_id: adopted_table_id,
+                    namespace_id,
+                    name: CatalogName::new("adopted").expect("valid adopted table name"),
+                    definition: definition.clone(),
+                    expected_schema_version: 1,
+                    expected_schema_hash: schema_hash.clone(),
+                    config: projection_migration_config("adopted", 13),
+                    expected_snapshot_version: 1,
+                    expected_legacy_files_revision: 13,
+                    expected_writer_epoch: 0,
+                    sources: Vec::new(),
+                    files: Vec::new(),
+                },
+            ),
+        );
+        let adopt_response = projection
+            .apply_legacy_catalog_projection_v4(adopt)
+            .await
+            .expect("adopt V1 table through service");
+        assert!(matches!(
+            adopt_response.outcome,
+            LegacyCatalogProjectionOutcomeV4::AdoptExistingTable(_)
+        ));
+
+        let ticks_digest = LegacyCatalogProjectionDigestTableV4 {
+            table_id: table_id(),
+            namespace_id,
+            name: CatalogName::new("ticks").expect("valid table name"),
+            definition: definition.clone(),
+            schema_version: 1,
+            schema_hash: schema_hash.clone(),
+            config: BTreeMap::new(),
+            legacy_files_revision: 7,
+            writer_epoch: 0,
+            state: LegacyCatalogProjectionTableStateV4::Active,
+            sources: Vec::new(),
+        };
+        let adopted_digest = LegacyCatalogProjectionDigestTableV4 {
+            table_id: adopted_table_id,
+            namespace_id,
+            name: CatalogName::new("adopted").expect("valid adopted table name"),
+            definition,
+            schema_version: 1,
+            schema_hash: schema_hash.clone(),
+            config: BTreeMap::new(),
+            legacy_files_revision: 13,
+            writer_epoch: 0,
+            state: LegacyCatalogProjectionTableStateV4::Active,
+            sources: Vec::new(),
+        };
+        let ready_digest = compute_legacy_catalog_projection_digest_v4(&[
+            ticks_digest.clone(),
+            adopted_digest.clone(),
+        ])
+        .expect("compute ready projection digest");
+        let initial_checkpoint = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read initial V4 checkpoint");
+        let ready = projection_envelope(
+            405,
+            CatalogActorKind::Server,
+            ready_digest.clone(),
+            2,
+            LegacyCatalogProjectionCommandV4::AdvanceCheckpoint(
+                LegacyCatalogAdvanceCheckpointCommandV4 {
+                    expected_checkpoint_generation: initial_checkpoint.checkpoint_generation,
+                    expected_source_catalog_revision: initial_checkpoint.source_catalog_revision,
+                    expected_source_projection_hash: initial_checkpoint.source_projection_hash,
+                    expected_phase: initial_checkpoint.phase,
+                    shadow_epoch: 0,
+                    phase: LegacyCatalogProjectionPhaseV4::ReadCutoverReady,
+                    mode: LegacyCatalogCheckpointModeV4::FullReconcile,
+                    target_projection_digest: ready_digest,
+                    observed_continuity_loss_epoch: 0,
+                },
+            ),
+        );
+        let ready_response = projection
+            .apply_legacy_catalog_projection_v4(ready)
+            .await
+            .expect("advance V4 checkpoint through service");
+        assert!(matches!(
+            ready_response.outcome,
+            LegacyCatalogProjectionOutcomeV4::AdvanceCheckpoint(_)
+        ));
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read ready V4 checkpoint")
+                .phase,
+            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
+        );
+
+        let mut synced_ticks_digest = ticks_digest;
+        synced_ticks_digest.writer_epoch = 1;
+        let sync_digest = compute_legacy_catalog_projection_digest_v4(&[
+            synced_ticks_digest,
+            adopted_digest.clone(),
+        ])
+        .expect("compute synced projection digest");
+        let source_metadata_hash =
+            compute_legacy_catalog_source_metadata_hash_v4(&[]).expect("hash empty V4 source set");
+        let sync = projection_envelope(
+            406,
+            CatalogActorKind::Server,
+            sync_digest,
+            3,
+            LegacyCatalogProjectionCommandV4::SyncTableMetadata(
+                LegacyCatalogSyncTableMetadataCommandV4 {
+                    table_id: table_id(),
+                    expected_projection_revision: 1,
+                    expected_schema_version: 1,
+                    expected_schema_hash: schema_hash.clone(),
+                    expected_snapshot_version: 1,
+                    expected_legacy_files_revision: 7,
+                    expected_writer_epoch: 0,
+                    expected_source_metadata_hash: source_metadata_hash.clone(),
+                    writer_epoch: 1,
+                    sources: Vec::new(),
+                },
+            ),
+        );
+        let sync_response = projection
+            .apply_legacy_catalog_projection_v4(sync)
+            .await
+            .expect("sync V4 table metadata through service");
+        assert!(matches!(
+            sync_response.outcome,
+            LegacyCatalogProjectionOutcomeV4::SyncTableMetadata(_)
+        ));
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read demoted V4 checkpoint")
+                .phase,
+            LegacyCatalogProjectionPhaseV4::FullShadow
+        );
+
+        let remaining_digest = compute_legacy_catalog_projection_digest_v4(&[adopted_digest])
+            .expect("compute post-drop projection digest");
+        let drop = projection_envelope(
+            407,
+            CatalogActorKind::Server,
+            remaining_digest,
+            4,
+            LegacyCatalogProjectionCommandV4::DropTable(LegacyCatalogDropTableCommandV4 {
+                table_id: table_id(),
+                expected_projection_revision: 2,
+                expected_schema_version: 1,
+                expected_schema_hash: schema_hash,
+                expected_snapshot_version: 1,
+                expected_legacy_files_revision: 7,
+                expected_writer_epoch: 1,
+                expected_source_metadata_hash: Some(source_metadata_hash),
+            }),
+        );
+        let drop_response = projection
+            .apply_legacy_catalog_projection_v4(drop)
+            .await
+            .expect("drop V4 table through service");
+        assert!(matches!(
+            drop_response.outcome,
+            LegacyCatalogProjectionOutcomeV4::DropTable(_)
+        ));
+        let projections = read
+            .list_legacy_table_projections_v4()
+            .await
+            .expect("list complete V4 projection state");
+        assert_eq!(projections.len(), 2);
+        assert_eq!(projections[0].table_id, table_id());
+        assert_eq!(
+            projections[0].state,
+            LegacyCatalogProjectionTableStateV4::Dropped
+        );
+        assert_eq!(projections[1].table_id, adopted_table_id);
+
+        catalog
+            .close()
+            .expect("close Catalog after V4 service flow");
+        let read_error = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect_err("retained V4 read handle must close terminally");
+        assert_eq!(read_error.code(), ErrorCode::Unavailable);
+        let write_error = projection
+            .apply_legacy_catalog_projection_v4(bootstrap)
+            .await
+            .expect_err("retained V4 write handle must close terminally");
+        assert_eq!(write_error.code(), ErrorCode::Unavailable);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_v4_drop_none_atomically_absorbs_and_drops_empty_v1_table() {
+        let directory = TempDir::new().expect("create V1 empty-drop directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+            .expect("open Catalog for V1 empty-drop test");
+        let namespace_id = NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id");
+        catalog
+            .command(migration_command(
+                551,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id,
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create V1 empty-drop namespace");
+        let schema_ipc = schema_ipc();
+        let schema_hash =
+            crate::canonical_schema_hash_from_ipc(&schema_ipc).expect("hash V1 empty-drop Schema");
+        catalog
+            .command(migration_command(
+                552,
+                Some(1),
+                CatalogCommandV1::CreateTable(CreateTableCommand {
+                    table_id: table_id(),
+                    namespace_id,
+                    name: CatalogName::new("orphaned").expect("valid table name"),
+                    definition: TableDefinition::Append(AppendTableDefinition {
+                        event_time_column: None,
+                    }),
+                    schema_ipc,
+                    config: projection_migration_config("orphaned", 13),
+                }),
+            ))
+            .await
+            .expect("create empty V1 migration table");
+
+        let read = catalog
+            .read_handle()
+            .expect("create V1 empty-drop read handle");
+        assert_eq!(
+            read.read_legacy_table_projection_v4(table_id())
+                .await
+                .expect("read missing V1 projection"),
+            None
+        );
+        let missing_mapping = catalog
+            .resolve_current_legacy_file_view_mapping(table_id())
+            .await
+            .expect_err("empty V1 table starts without a legacy mapping");
+        assert_eq!(missing_mapping.code(), ErrorCode::NotFound);
+        let checkpoint = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read V1 empty-drop checkpoint");
+        let projection = catalog
+            .legacy_reconcile_handle()
+            .expect("create V1 empty-drop projection handle");
+        let drop_command = projection_envelope(
+            553,
+            CatalogActorKind::Server,
+            checkpoint.source_projection_hash.clone(),
+            checkpoint.source_catalog_revision,
+            LegacyCatalogProjectionCommandV4::DropTable(LegacyCatalogDropTableCommandV4 {
+                table_id: table_id(),
+                expected_projection_revision: 0,
+                expected_schema_version: 1,
+                expected_schema_hash: schema_hash,
+                expected_snapshot_version: 1,
+                expected_legacy_files_revision: 13,
+                expected_writer_epoch: 0,
+                expected_source_metadata_hash: None,
+            }),
+        );
+        let response = projection
+            .apply_legacy_catalog_projection_v4(drop_command.clone())
+            .await
+            .expect("absorb and drop empty V1 table");
+        let LegacyCatalogProjectionOutcomeV4::DropTable(result) = &response.outcome else {
+            panic!("expected V1 empty-drop outcome");
+        };
+        assert_eq!(result.projection_revision, 1);
+        assert_eq!(result.native_snapshot_version, 1);
+        assert_eq!(result.legacy_files_revision, 13);
+        assert_eq!(
+            result.completeness,
+            LegacyCatalogProjectionCompletenessV4::Seeded
+        );
+        assert_eq!(result.state, LegacyCatalogProjectionTableStateV4::Dropped);
+        assert_eq!(catalog.revision().await, Ok(3));
+
+        let dropped = read
+            .read_legacy_table_projection_v4(table_id())
+            .await
+            .expect("read absorbed V1 projection")
+            .expect("absorbed V1 projection exists");
+        assert_eq!(dropped.projection_revision, 1);
+        assert_eq!(dropped.source_metadata_hash, None);
+        assert_eq!(
+            dropped.completeness,
+            LegacyCatalogProjectionCompletenessV4::Seeded
+        );
+        assert_eq!(dropped.state, LegacyCatalogProjectionTableStateV4::Dropped);
+        let base = catalog
+            .resolve_legacy_file_view_mapping(table_id(), 13)
+            .await
+            .expect("resolve atomically bootstrapped base mapping");
+        assert_eq!(base.native_snapshot_version, 1);
+        assert_eq!(base.request_id, None);
+        assert_eq!(base.continuity, LegacyFileViewContinuity::Base);
+
+        assert_eq!(
+            projection
+                .apply_legacy_catalog_projection_v4(drop_command)
+                .await
+                .expect("replay empty V1 drop"),
+            response
+        );
+        assert_eq!(catalog.revision().await, Ok(3));
+        assert_eq!(
+            read.read_legacy_table_projection_v4(table_id())
+                .await
+                .expect("read V1 projection after replay")
+                .expect("V1 projection remains after replay"),
+            dropped
+        );
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read checkpoint after V1 drop replay"),
+            checkpoint
+        );
+        catalog
+            .close()
+            .expect("close Catalog after V1 empty-drop test");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_v3_first_commit_updates_projection_and_demotes_ready_once() {
+        let directory = TempDir::new().expect("create V3 hook directory");
+        let data_directory = data_directory(&directory);
+        let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
+            .expect("open Catalog for V3 hook test");
+        let (projection, read, schema_hash, _) =
+            create_ready_ticks_projection(&catalog, 601, 1).await;
+        let ready_checkpoint = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read checkpoint before V3 hook");
+        let reconcile = legacy_reconcile_command(604, &schema_hash, 0, 0, 1, 2, Vec::new());
+        let response = projection
+            .reconcile_legacy_table_v3(reconcile.clone())
+            .await
+            .expect("commit V3 reconcile through hook");
+        assert_eq!(response.native_snapshot_version, 2);
+        let synchronized = read
+            .read_legacy_table_projection_v4(table_id())
+            .await
+            .expect("read V3-synchronized complete projection")
+            .expect("V3-synchronized projection exists");
+        assert_eq!(synchronized.projection_revision, 2);
+        assert_eq!(synchronized.native_snapshot_version, 2);
+        assert_eq!(synchronized.legacy_files_revision, 2);
+        assert_eq!(
+            synchronized.completeness,
+            LegacyCatalogProjectionCompletenessV4::Complete
+        );
+        let demoted = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read checkpoint after V3 hook");
+        assert_eq!(demoted.phase, LegacyCatalogProjectionPhaseV4::FullShadow);
+        assert_eq!(
+            demoted.checkpoint_generation,
+            ready_checkpoint.checkpoint_generation + 1
+        );
+
+        assert_eq!(
+            projection
+                .reconcile_legacy_table_v3(reconcile)
+                .await
+                .expect("replay exact V3 reconcile"),
+            response
+        );
+        assert_eq!(
+            read.read_legacy_table_projection_v4(table_id())
+                .await
+                .expect("read projection after V3 replay")
+                .expect("projection remains after V3 replay"),
+            synchronized
+        );
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read checkpoint after V3 replay"),
+            demoted
+        );
+        assert_eq!(catalog.revision().await, Ok(4));
+        catalog.close().expect("close Catalog after V3 hook test");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_v1_table_commits_demote_ready_and_continue_under_native_authority() {
+        let directory = TempDir::new().expect("create V1 hook directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let database_path = config.path().to_path_buf();
+        let catalog = SqliteCatalog::open(config).expect("open Catalog for V1 hook test");
+        let (_, read, _, _) = create_ready_ticks_projection(&catalog, 701, 1).await;
+        let initial_ready = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read initial ready checkpoint");
+
+        let second_table_id = TableId::from_u128(3).expect("nonzero second table id");
+        let create_second_table = command(
+            704,
+            Some(3),
+            CatalogCommandV1::CreateTable(CreateTableCommand {
+                table_id: second_table_id,
+                namespace_id: NamespaceId::from_u128(NAMESPACE_ID).expect("nonzero namespace id"),
+                name: CatalogName::new("native_only").expect("valid native table name"),
+                definition: TableDefinition::Append(AppendTableDefinition {
+                    event_time_column: None,
+                }),
+                schema_ipc: schema_ipc(),
+                config: BTreeMap::new(),
+            }),
+        );
+        let create_response = catalog
+            .command(create_second_table.clone())
+            .await
+            .expect("commit native CreateTable while ready");
+        let create_demoted = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read checkpoint after native CreateTable");
+        assert_eq!(
+            create_demoted.phase,
+            LegacyCatalogProjectionPhaseV4::FileShadow
+        );
+        assert_eq!(
+            create_demoted.checkpoint_generation,
+            initial_ready.checkpoint_generation + 1
+        );
+        assert_eq!(catalog.revision().await, Ok(4));
+        assert_eq!(
+            catalog
+                .command(create_second_table)
+                .await
+                .expect("replay native CreateTable"),
+            create_response
+        );
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read checkpoint after CreateTable replay"),
+            create_demoted
+        );
+
+        let raw =
+            rusqlite::Connection::open(&database_path).expect("open raw checkpoint phase fixture");
+        raw.execute(
+            "UPDATE legacy_projection_checkpoint SET phase = 'read_cutover_ready' \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("restore ready phase for CommitDataFiles hook");
+        drop(raw);
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read restored ready checkpoint")
+                .phase,
+            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
+        );
+
+        let first_commit = commit_data_file(705, 10, 4, 1, 0);
+        let first_commit_response = catalog
+            .command(first_commit.clone())
+            .await
+            .expect("commit native file while ready");
+        let commit_demoted = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read checkpoint after native file commit");
+        assert_eq!(
+            commit_demoted.phase,
+            LegacyCatalogProjectionPhaseV4::FileShadow
+        );
+        assert_eq!(
+            commit_demoted.checkpoint_generation,
+            create_demoted.checkpoint_generation + 1
+        );
+        assert_eq!(catalog.revision().await, Ok(5));
+        assert_eq!(
+            catalog
+                .command(first_commit)
+                .await
+                .expect("replay native file commit"),
+            first_commit_response
+        );
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read checkpoint after native file replay"),
+            commit_demoted
+        );
+
+        let raw = rusqlite::Connection::open(&database_path)
+            .expect("open native-authority phase fixture");
+        raw.execute(
+            "UPDATE legacy_projection_checkpoint SET phase = 'native_authoritative' \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("set native-authoritative phase");
+        drop(raw);
+        catalog
+            .command(commit_data_file(706, 11, 5, 2, 1))
+            .await
+            .expect("native file commit remains available under native authority");
+        let authoritative = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read native-authoritative checkpoint");
+        assert_eq!(
+            authoritative.phase,
+            LegacyCatalogProjectionPhaseV4::NativeAuthoritative
+        );
+        assert_eq!(catalog.revision().await, Ok(6));
+        catalog.close().expect("close Catalog after V1 hook test");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_v2_import_demotes_ready_once_and_replay_is_side_effect_free() {
+        let directory = TempDir::new().expect("create V2 hook directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let database_path = config.path().to_path_buf();
+        let physical_file = directory.path().join("legacy-v2-hook.parquet");
+        let contents = b"legacy-v2-hook-fixture";
+        std::fs::write(&physical_file, contents).expect("write V2 hook fixture");
+        let import = external_legacy_import_command(&physical_file, contents);
+
+        let catalog = SqliteCatalog::open(config).expect("open Catalog for V2 hook test");
+        let session = catalog
+            .begin_legacy_import_session()
+            .expect("acquire V2 hook import session");
+        catalog
+            .command(migration_command(
+                1,
+                Some(0),
+                CatalogCommandV1::CreateNamespace(CreateNamespaceCommand {
+                    namespace_id: NamespaceId::from_u128(NAMESPACE_ID)
+                        .expect("nonzero namespace id"),
+                    name: CatalogName::new("market").expect("valid namespace name"),
+                }),
+            ))
+            .await
+            .expect("create V2 hook namespace");
+
+        let raw =
+            rusqlite::Connection::open(&database_path).expect("open V2 checkpoint phase fixture");
+        raw.execute(
+            "UPDATE legacy_projection_checkpoint SET phase = 'read_cutover_ready' \
+             WHERE singleton = 1",
+            [],
+        )
+        .expect("set ready phase before V2 import");
+        drop(raw);
+
+        let read = catalog.read_handle().expect("create V2 hook read handle");
+        let ready = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read ready checkpoint before V2 import");
+        assert_eq!(
+            ready.phase,
+            LegacyCatalogProjectionPhaseV4::ReadCutoverReady
+        );
+
+        let response = session
+            .import_legacy_table_v2(import.clone())
+            .await
+            .expect("commit V2 import while ready");
+        let demoted = read
+            .read_legacy_projection_checkpoint_v4()
+            .await
+            .expect("read checkpoint after V2 import");
+        assert_eq!(demoted.phase, LegacyCatalogProjectionPhaseV4::FileShadow);
+        assert_eq!(
+            demoted.checkpoint_generation,
+            ready.checkpoint_generation + 1
+        );
+        let seeded = read
+            .read_legacy_table_projection_v4(table_id())
+            .await
+            .expect("read projection after V2 import")
+            .expect("V2 import seeds a projection row");
+        assert_eq!(seeded.projection_revision, 1);
+        assert_eq!(seeded.native_snapshot_version, 2);
+        assert_eq!(seeded.legacy_files_revision, 1);
+        assert_eq!(seeded.writer_epoch, 1);
+        assert_eq!(
+            seeded.completeness,
+            LegacyCatalogProjectionCompletenessV4::Seeded
+        );
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        assert_eq!(
+            session
+                .import_legacy_table_v2(import)
+                .await
+                .expect("replay exact V2 import"),
+            response
+        );
+        assert_eq!(
+            read.read_legacy_projection_checkpoint_v4()
+                .await
+                .expect("read checkpoint after V2 replay"),
+            demoted
+        );
+        assert_eq!(
+            read.read_legacy_table_projection_v4(table_id())
+                .await
+                .expect("read projection after V2 replay")
+                .expect("projection remains after V2 replay"),
+            seeded
+        );
+        assert_eq!(catalog.revision().await, Ok(2));
+
+        session.seal();
+        catalog.close().expect("close Catalog after V2 hook test");
+    }
+
+    #[test]
+    fn deferred_control_read_keeps_multi_query_state_on_one_wal_snapshot() {
+        let directory = TempDir::new().expect("create temp directory");
+        let database_path = directory.path().join("deferred-read.db");
+        let setup = rusqlite::Connection::open(&database_path).expect("open SQLite fixture");
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; \
+                 CREATE TABLE projection(value INTEGER NOT NULL); \
+                 CREATE TABLE source(value INTEGER NOT NULL); \
+                 INSERT INTO projection VALUES (1); \
+                 INSERT INTO source VALUES (1);",
+            )
+            .expect("initialize deferred-read fixture");
+        drop(setup);
+
+        let mut reader = rusqlite::Connection::open(&database_path).expect("open reader");
+        let writer = rusqlite::Connection::open(&database_path).expect("open writer");
+        let (read_started_sender, read_started_receiver) = crossbeam_channel::bounded(1);
+        let (write_done_sender, write_done_receiver) = crossbeam_channel::bounded(1);
+        let writer_thread = std::thread::spawn(move || {
+            read_started_receiver
+                .recv()
+                .expect("reader must establish its snapshot");
+            writer
+                .execute_batch(
+                    "BEGIN IMMEDIATE; \
+                     UPDATE projection SET value = 2; \
+                     UPDATE source SET value = 2; \
+                     COMMIT;",
+                )
+                .expect("commit concurrent fixture update");
+            write_done_sender.send(()).expect("signal committed update");
+        });
+
+        let observed =
+            deferred_control_read(&mut reader, "test deferred control read", |transaction| {
+                let projection = transaction
+                    .query_row("SELECT value FROM projection", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|error| crate::map_sqlite_error("read projection fixture", error))?;
+                read_started_sender
+                    .send(())
+                    .expect("signal established read snapshot");
+                write_done_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("writer must commit while read transaction remains open");
+                let source = transaction
+                    .query_row("SELECT value FROM source", [], |row| row.get::<_, i64>(0))
+                    .map_err(|error| crate::map_sqlite_error("read source fixture", error))?;
+                Ok((projection, source))
+            })
+            .expect("complete deferred control read");
+        writer_thread.join().expect("join writer fixture thread");
+        assert_eq!(observed, (1, 1));
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM projection", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("read post-transaction projection"),
+            2
+        );
+        assert_eq!(
+            reader
+                .query_row("SELECT value FROM source", [], |row| row.get::<_, i64>(0))
+                .expect("read post-transaction source"),
+            2
+        );
     }
 }

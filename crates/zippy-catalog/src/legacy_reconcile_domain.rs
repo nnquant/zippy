@@ -169,7 +169,6 @@ pub(crate) fn commit_legacy_catalog_reconcile_v3(
             crate::map_sqlite_error("begin legacy Catalog V3 reconcile", error)
                 .with_request_id(request_id)
         })?;
-    reject_cross_version_request_id(&transaction, request_id)?;
     if let Some(response) = replay(&transaction, &prepared.envelope)? {
         transaction.commit().map_err(|error| {
             crate::map_sqlite_error("commit legacy Catalog V3 replay", error)
@@ -181,7 +180,11 @@ pub(crate) fn commit_legacy_catalog_reconcile_v3(
 
     let table = load_table(&transaction, prepared.envelope.command.table_id)?;
     validate_table_and_schema(&transaction, &prepared.envelope, &table)?;
-    ensure_base_mapping(&transaction, &prepared.envelope, &table)?;
+    ensure_base_mapping(
+        &transaction,
+        &table,
+        prepared.envelope.command.expected_legacy_files_revision,
+    )?;
     let current_mapping =
         load_mapping_by_snapshot(&transaction, table.table_id, table.current_snapshot_version)?
             .ok_or_else(|| corruption("active migrated table has no explicit legacy mapping"))?;
@@ -261,6 +264,31 @@ pub(crate) fn commit_legacy_catalog_reconcile_v3(
         committed_at_ns,
         continuity,
     )?;
+    crate::legacy_projection_domain::sync_projection_after_v3_reconcile(
+        &transaction,
+        table.table_id,
+        prepared.envelope.command.expected_schema_version,
+        &prepared.envelope.command.expected_schema_hash,
+        table.current_snapshot_version,
+        prepared.envelope.command.expected_legacy_files_revision,
+        prepared.envelope.command.expected_writer_epoch,
+        next_snapshot,
+        prepared.envelope.command.legacy_files_revision,
+        prepared.envelope.command.writer_epoch,
+        committed_at_ns,
+    )?;
+    crate::legacy_projection_domain::downgrade_ready_after_table_mutation(
+        &transaction,
+        committed_at_ns,
+    )?;
+    crate::request_ledger::insert_owner(
+        &transaction,
+        request_id,
+        i64::from(LEGACY_CATALOG_RECONCILE_FORMAT_VERSION_V3),
+        crate::request_ledger::V3_RECONCILE_OPERATION,
+        &prepared.envelope.canonical_fingerprint.into_bytes(),
+        committed_at_ns,
+    )?;
     transaction.commit().map_err(|error| {
         crate::map_sqlite_error("commit legacy Catalog V3 reconcile", error)
             .with_request_id(request_id)
@@ -276,34 +304,33 @@ pub(crate) fn commit_legacy_catalog_reconcile_v3(
     })
 }
 
-fn reject_cross_version_request_id(connection: &Connection, request_id: RequestId) -> Result<()> {
-    for (table, label) in [
-        ("idempotent_requests", "V1 command"),
-        ("legacy_import_requests", "V2 import"),
-    ] {
-        let sql = format!("SELECT 1 FROM {table} WHERE request_id = ?1");
-        let exists = connection
-            .query_row(&sql, [request_id.into_bytes().as_slice()], |_| Ok(()))
-            .optional()
-            .map_err(|error| crate::map_sqlite_error("check reconcile request id", error))?
-            .is_some();
-        if exists {
-            return Err(conflict(
-                request_id,
-                format!("Catalog request id is already committed as a {label}"),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn replay(
     connection: &Connection,
     envelope: &LegacyCatalogReconcileEnvelopeV3,
 ) -> Result<Option<LegacyCatalogReconcileResponseV3>> {
-    let Some(stored) = load_mapping_by_request_id(connection, envelope.request_id)? else {
-        return Ok(None);
+    let fingerprint = envelope.canonical_fingerprint.into_bytes();
+    let owner_exists = crate::request_ledger::exact_owner_exists(
+        connection,
+        envelope.request_id,
+        i64::from(LEGACY_CATALOG_RECONCILE_FORMAT_VERSION_V3),
+        crate::request_ledger::V3_RECONCILE_OPERATION,
+        &fingerprint,
+    )?;
+    let stored = load_mapping_by_request_id(connection, envelope.request_id)?;
+    let Some(stored) = stored else {
+        return if owner_exists {
+            Err(corruption(
+                "V3 reconcile mapping is missing for its global request owner",
+            ))
+        } else {
+            Ok(None)
+        };
     };
+    if !owner_exists {
+        return Err(corruption(
+            "V3 reconcile mapping has no global request owner",
+        ));
+    }
     let (format_version, fingerprint, previous) = connection
         .query_row(
             "SELECT format_version, fingerprint, previous_legacy_files_revision \
@@ -390,10 +417,7 @@ fn validate_replay_snapshot(
         .map_err(|error| crate::map_sqlite_error("read V3 reconcile replay snapshot", error))?
         .ok_or_else(|| corruption("V3 reconcile replay snapshot is missing"))?;
     let parent = crate::encoding::decode_optional_u64(&parent)?;
-    let expected_parent = mapping.native_snapshot_version.checked_sub(1);
-    if mapping.native_snapshot_version <= 2
-        || parent != expected_parent
-        || operation != "import"
+    if !valid_replay_snapshot_shape(mapping.native_snapshot_version, parent, &operation)
         || decode_u64(&commit_lsn)? != mapping.catalog_revision
         || decode_u64(&created_at_ns)? != mapping.committed_at_ns
     {
@@ -408,6 +432,16 @@ fn validate_replay_snapshot(
         ));
     }
     Ok(())
+}
+
+fn valid_replay_snapshot_shape(
+    native_snapshot_version: u64,
+    parent_snapshot_version: Option<u64>,
+    operation: &str,
+) -> bool {
+    native_snapshot_version >= 2
+        && parent_snapshot_version == native_snapshot_version.checked_sub(1)
+        && operation == "import"
 }
 
 fn reject_existing_target_revision(
@@ -498,7 +532,7 @@ fn validate_table_and_schema(
     Ok(())
 }
 
-fn validate_migration_config(table: &TableDescriptor) -> Result<(u64, u64, u64)> {
+pub(crate) fn validate_migration_config(table: &TableDescriptor) -> Result<(u64, u64, u64)> {
     let value = |key: &str| {
         table.config.get(key).ok_or_else(|| {
             corruption(format!(
@@ -567,10 +601,10 @@ fn parse_config_u64(value: &str, field: &str) -> Result<u64> {
         })
 }
 
-fn ensure_base_mapping(
+pub(crate) fn ensure_base_mapping(
     connection: &Connection,
-    envelope: &LegacyCatalogReconcileEnvelopeV3,
     table: &TableDescriptor,
+    expected_legacy_files_revision: u64,
 ) -> Result<()> {
     let (migration_version, legacy_base, native_base) = validate_migration_config(table)?;
     if load_mapping_by_snapshot(connection, table.table_id, table.current_snapshot_version)?
@@ -588,7 +622,7 @@ fn ensure_base_mapping(
         return Ok(());
     }
     if table.current_snapshot_version != native_base
-        || envelope.command.expected_legacy_files_revision != legacy_base
+        || expected_legacy_files_revision != legacy_base
     {
         return Err(corruption(
             "legacy mapping history is missing beyond the validated migration base",
@@ -667,6 +701,79 @@ fn ensure_base_mapping(
     {
         return Err(corruption(
             "legacy migration base file set does not match its migration version",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_exact_current_legacy_view(
+    connection: &Connection,
+    request_id: RequestId,
+    table_id: TableId,
+    snapshot_version: u64,
+    expected: &[PreparedLegacyFile],
+) -> Result<()> {
+    let current = load_current_legacy_files(connection, table_id, snapshot_version)?;
+    if current.len() != expected.len() {
+        return Err(conflict(
+            request_id,
+            "existing legacy file count does not match the adopted full view",
+        ));
+    }
+    let by_id = current
+        .iter()
+        .map(|file| (file.file_id, file))
+        .collect::<HashMap<_, _>>();
+    for prepared in expected {
+        let Some(current) = by_id.get(&prepared.file.file.file_id) else {
+            return Err(conflict(
+                request_id,
+                "existing legacy file identity is missing from the adopted full view",
+            ));
+        };
+        let expected_path = match &prepared.file.file.location {
+            DataFileLocation::ExternalLegacy(path) => path.as_str(),
+            DataFileLocation::Managed(_) => unreachable!("verified files are external legacy"),
+        };
+        if current.file_path != expected_path
+            || !immutable_file_matches(current, prepared)
+                .map_err(|error| error.with_request_id(request_id))?
+        {
+            return Err(conflict(
+                request_id,
+                "existing legacy file immutable metadata does not match adoption",
+            ));
+        }
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT file_id, discovery_order FROM legacy_reconcile_snapshot_files \
+              WHERE table_id = ?1 AND snapshot_version = ?2 ORDER BY discovery_order",
+        )
+        .map_err(|error| crate::map_sqlite_error("prepare adopted legacy order", error))?;
+    let rows = statement
+        .query_map(
+            params![
+                table_id.into_bytes().as_slice(),
+                encode_u64(snapshot_version).as_slice(),
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .map_err(|error| crate::map_sqlite_error("read adopted legacy order", error))?;
+    let mut actual = Vec::new();
+    for row in rows {
+        actual.push(
+            row.map_err(|error| crate::map_sqlite_error("decode adopted legacy order", error))?,
+        );
+    }
+    if actual.len() != expected.len()
+        || actual.iter().zip(expected).any(|((file_id, order), file)| {
+            file_id.as_slice() != file.file.file.file_id.into_bytes()
+                || decode_u64(order).ok() != Some(file.file.discovery_order)
+        })
+    {
+        return Err(corruption(
+            "existing legacy snapshot order does not match adoption",
         ));
     }
     Ok(())
@@ -1109,7 +1216,7 @@ fn remove_absent_files(
     Ok(())
 }
 
-fn insert_snapshot_order(
+pub(crate) fn insert_snapshot_order(
     connection: &Connection,
     table_id: TableId,
     snapshot_version: u64,
@@ -1423,4 +1530,30 @@ fn resource_exhausted(request_id: RequestId, message: impl Into<String>) -> Serv
 
 fn corruption(message: impl Into<String>) -> ServerError {
     ServerError::new(ErrorCode::DataCorruption, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_replay_snapshot_shape;
+
+    #[test]
+    fn replay_snapshot_shape_accepts_first_reconcile_snapshot() {
+        assert!(valid_replay_snapshot_shape(2, Some(1), "import"));
+    }
+
+    #[test]
+    fn replay_snapshot_shape_accepts_later_contiguous_snapshot() {
+        assert!(valid_replay_snapshot_shape(3, Some(2), "import"));
+    }
+
+    #[test]
+    fn replay_snapshot_shape_rejects_initial_snapshot() {
+        assert!(!valid_replay_snapshot_shape(1, Some(0), "import"));
+    }
+
+    #[test]
+    fn replay_snapshot_shape_rejects_wrong_parent_or_operation() {
+        assert!(!valid_replay_snapshot_shape(3, Some(1), "import"));
+        assert!(!valid_replay_snapshot_shape(3, Some(2), "append"));
+    }
 }

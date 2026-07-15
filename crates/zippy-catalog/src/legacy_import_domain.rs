@@ -478,6 +478,20 @@ pub(crate) fn commit_legacy_catalog_import_v2(
         snapshot,
     };
     ensure_import_mapping_and_order(&transaction, &prepared.envelope, &prepared.files, &response)?;
+    crate::legacy_projection_domain::seed_legacy_table_projection(
+        &transaction,
+        prepared.envelope.command.table_id,
+        INITIAL_SCHEMA_VERSION,
+        &prepared.envelope.command.canonical_schema_hash,
+        IMPORT_SNAPSHOT_VERSION,
+        prepared.envelope.command.legacy_files_revision,
+        prepared.envelope.command.writer_epoch,
+        committed_at_ns,
+    )?;
+    crate::legacy_projection_domain::downgrade_ready_after_table_mutation(
+        &transaction,
+        committed_at_ns,
+    )?;
     let response_blob =
         LegacyCatalogImportCodecV2::encode_response(&response).map_err(|error| {
             ServerError::new(
@@ -517,6 +531,14 @@ pub(crate) fn commit_legacy_catalog_import_v2(
             crate::map_sqlite_error("persist legacy Catalog V2 permanent replay response", error)
                 .with_request_id(request_id)
         })?;
+    crate::request_ledger::insert_owner(
+        &transaction,
+        request_id,
+        i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2),
+        crate::request_ledger::V2_IMPORT_OPERATION,
+        &fingerprint,
+        committed_at_ns,
+    )?;
     transaction.commit().map_err(|error| {
         crate::map_sqlite_error("commit legacy Catalog V2 import", error)
             .with_request_id(request_id)
@@ -658,12 +680,35 @@ fn replay(
     connection: &Connection,
     envelope: &LegacyCatalogImportEnvelopeV2,
 ) -> Result<Option<LegacyCatalogImportResponseV2>> {
-    reject_v1_request_id(connection, envelope.request_id)?;
-    let Some(stored) = load_legacy_import_replay_header(connection, envelope.request_id)? else {
-        return Ok(None);
+    let fingerprint = envelope.canonical_fingerprint.into_bytes();
+    let owner_exists = crate::request_ledger::exact_owner_exists(
+        connection,
+        envelope.request_id,
+        i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2),
+        crate::request_ledger::V2_IMPORT_OPERATION,
+        &fingerprint,
+    )?;
+    let stored = load_legacy_import_replay_header(connection, envelope.request_id)?;
+    let Some(stored) = stored else {
+        return if owner_exists {
+            Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "V2 replay fact is missing for its global request owner",
+            )
+            .with_request_id(envelope.request_id))
+        } else {
+            Ok(None)
+        };
     };
+    if !owner_exists {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "V2 replay fact has no global request owner",
+        )
+        .with_request_id(envelope.request_id));
+    }
     validate_replay_fingerprint_width(envelope.request_id, &stored.fingerprint)?;
-    if stored.fingerprint.as_slice() != envelope.canonical_fingerprint.into_bytes() {
+    if stored.fingerprint.as_slice() != fingerprint {
         return Err(ServerError::new(
             ErrorCode::Conflict,
             "legacy Catalog request id was reused with a different fingerprint",
@@ -700,12 +745,18 @@ pub(crate) fn probe_legacy_catalog_import_v2(
         })?;
     let observed_catalog_revision =
         crate::domain::revision(&transaction).map_err(|error| error.with_request_id(request_id))?;
-    reject_v1_request_id(&transaction, request_id)?;
-    let probe = match load_legacy_import_replay_header(&transaction, request_id)? {
-        None => LegacyCatalogImportReplayProbeV2::Missing {
+    let owner_exists = crate::request_ledger::namespace_owner_exists(
+        &transaction,
+        request_id,
+        i64::from(LEGACY_CATALOG_IMPORT_FORMAT_VERSION_V2),
+        crate::request_ledger::V2_IMPORT_OPERATION,
+    )?;
+    let stored = load_legacy_import_replay_header(&transaction, request_id)?;
+    let probe = match (owner_exists, stored) {
+        (false, None) => LegacyCatalogImportReplayProbeV2::Missing {
             observed_catalog_revision,
         },
-        Some(stored) => {
+        (true, Some(stored)) => {
             validate_replay_fingerprint_width(request_id, &stored.fingerprint)?;
             let response = load_and_validate_intrinsic_replay_response(
                 &transaction,
@@ -717,6 +768,13 @@ pub(crate) fn probe_legacy_catalog_import_v2(
                 observed_catalog_revision,
                 response,
             }
+        }
+        _ => {
+            return Err(ServerError::new(
+                ErrorCode::DataCorruption,
+                "V2 replay fact and global request owner disagree",
+            )
+            .with_request_id(request_id));
         }
     };
     transaction.commit().map_err(|error| {
@@ -942,52 +1000,7 @@ fn validate_replay_response_matches_command(
     Ok(())
 }
 
-fn reject_v1_request_id(connection: &Connection, request_id: RequestId) -> Result<()> {
-    let exists = connection
-        .query_row(
-            "SELECT 1 FROM idempotent_requests WHERE request_id = ?1",
-            [request_id.into_bytes().as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| {
-            crate::map_sqlite_error("check V1 request-id conflict", error)
-                .with_request_id(request_id)
-        })?
-        .is_some();
-    if exists {
-        return Err(ServerError::new(
-            ErrorCode::Conflict,
-            "catalog request id is already committed in the V1 command namespace",
-        )
-        .with_request_id(request_id)
-        .with_retryable(false));
-    }
-    let reconcile_exists = connection
-        .query_row(
-            "SELECT 1 FROM legacy_file_view_mappings \
-              WHERE request_id = ?1 AND format_version = 3",
-            [request_id.into_bytes().as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| {
-            crate::map_sqlite_error("check V3 request-id conflict", error)
-                .with_request_id(request_id)
-        })?
-        .is_some();
-    if reconcile_exists {
-        return Err(ServerError::new(
-            ErrorCode::Conflict,
-            "catalog request id is already committed in the V3 reconcile namespace",
-        )
-        .with_request_id(request_id)
-        .with_retryable(false));
-    }
-    Ok(())
-}
-
-fn ensure_file_identities_available(
+pub(crate) fn ensure_file_identities_available(
     connection: &Connection,
     request_id: RequestId,
     files: &[PreparedLegacyFile],
@@ -1044,7 +1057,7 @@ fn ensure_file_identities_available(
     Ok(())
 }
 
-fn insert_import_snapshot(
+pub(crate) fn insert_import_snapshot(
     connection: &Connection,
     table_id: zippy_types::TableId,
     commit_lsn: u64,
@@ -1071,7 +1084,7 @@ fn insert_import_snapshot(
     Ok(())
 }
 
-fn insert_legacy_files(
+pub(crate) fn insert_legacy_files(
     connection: &Connection,
     table_id: zippy_types::TableId,
     files: &[PreparedLegacyFile],
@@ -1117,7 +1130,7 @@ fn insert_legacy_files(
     Ok(())
 }
 
-fn update_imported_table(
+pub(crate) fn update_imported_table(
     connection: &Connection,
     table_id: zippy_types::TableId,
     writer_epoch: u64,

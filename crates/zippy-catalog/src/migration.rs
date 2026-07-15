@@ -19,6 +19,8 @@ const MIGRATION_V5_VERSION: u32 = 5;
 const MIGRATION_V5_NAME: &str = "legacy_import_requests";
 const MIGRATION_V6_VERSION: u32 = 6;
 const MIGRATION_V6_NAME: &str = "legacy_file_view_mappings";
+const MIGRATION_V7_VERSION: u32 = 7;
+const MIGRATION_V7_NAME: &str = "legacy_catalog_projection";
 
 // Physical SQLite schema versions are independent of CatalogCommand wire
 // versions. Physical v1 intentionally creates no domain tables: those must
@@ -737,6 +739,287 @@ define_v6_schema_additions! {
  )"#;
 }
 
+macro_rules! define_v7_schema_additions {
+    (@replace $replacement_name:ident = $replacement_sql:literal;
+     $($name:ident = $sql:literal;)+ @data $data:literal) => {
+        const $replacement_name: &str = $replacement_sql;
+        $(const $name: &str = $sql;)+
+        const MIGRATION_V7: &str = concat!(
+            "ALTER TABLE legacy_file_view_mappings ",
+            "RENAME TO legacy_file_view_mappings_v6;\n",
+            $replacement_sql,
+            ";\n",
+            "INSERT INTO legacy_file_view_mappings SELECT * ",
+            "FROM legacy_file_view_mappings_v6;\n",
+            "DROP TABLE legacy_file_view_mappings_v6;\n",
+            $($sql, ";\n",)+
+            $data
+        );
+    };
+}
+
+define_v7_schema_additions! {
+@replace LEGACY_FILE_VIEW_MAPPINGS_V7_SQL = r#"CREATE TABLE legacy_file_view_mappings (
+    table_id BLOB NOT NULL CHECK(
+        typeof(table_id) = 'blob'
+        AND length(table_id) = 16
+        AND table_id != zeroblob(16)
+    ),
+    legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(legacy_files_revision) = 'blob' AND length(legacy_files_revision) = 8
+    ),
+    native_snapshot_version BLOB NOT NULL CHECK(
+        typeof(native_snapshot_version) = 'blob' AND length(native_snapshot_version) = 8
+    ),
+    request_id BLOB CHECK(
+        request_id IS NULL
+        OR (
+            typeof(request_id) = 'blob'
+            AND length(request_id) = 16
+            AND request_id != zeroblob(16)
+        )
+    ),
+    format_version INTEGER NOT NULL CHECK(
+        typeof(format_version) = 'integer' AND format_version IN (0, 2, 3, 4)
+    ),
+    fingerprint BLOB CHECK(
+        fingerprint IS NULL
+        OR (typeof(fingerprint) = 'blob' AND length(fingerprint) = 32)
+    ),
+    previous_legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(previous_legacy_files_revision) = 'blob'
+        AND length(previous_legacy_files_revision) = 8
+    ),
+    source_catalog_revision BLOB NOT NULL CHECK(
+        typeof(source_catalog_revision) = 'blob' AND length(source_catalog_revision) = 8
+    ),
+    source_snapshot_hash TEXT NOT NULL CHECK(
+        typeof(source_snapshot_hash) = 'text' AND length(source_snapshot_hash) > 0
+    ),
+    catalog_revision BLOB NOT NULL CHECK(
+        typeof(catalog_revision) = 'blob' AND length(catalog_revision) = 8
+    ),
+    continuity TEXT NOT NULL CHECK(continuity IN ('base', 'contiguous', 'gap')),
+    committed_at_ns BLOB NOT NULL CHECK(
+        typeof(committed_at_ns) = 'blob' AND length(committed_at_ns) = 8
+    ),
+    PRIMARY KEY(table_id, legacy_files_revision),
+    UNIQUE(table_id, native_snapshot_version),
+    UNIQUE(request_id),
+    CHECK(
+        (request_id IS NULL AND format_version = 0 AND fingerprint IS NULL AND continuity = 'base')
+        OR
+        (request_id IS NOT NULL AND format_version IN (2, 3, 4) AND fingerprint IS NOT NULL)
+    ),
+    FOREIGN KEY(table_id) REFERENCES tables(table_id),
+    FOREIGN KEY(table_id, native_snapshot_version)
+        REFERENCES table_snapshots(table_id, snapshot_version)
+ )"#;
+
+CATALOG_REQUEST_IDS_SQL = r#"CREATE TABLE catalog_request_ids (
+    request_id BLOB PRIMARY KEY CHECK(
+        typeof(request_id) = 'blob'
+        AND length(request_id) = 16
+        AND request_id != zeroblob(16)
+    ),
+    format_version INTEGER NOT NULL CHECK(
+        typeof(format_version) = 'integer' AND format_version IN (1, 2, 3, 4)
+    ),
+    operation TEXT NOT NULL CHECK(
+        typeof(operation) = 'text'
+        AND (
+            (format_version = 1 AND operation IN (
+                'create_namespace', 'create_table', 'alter_table_schema',
+                'acquire_producer', 'commit_data_files', 'commit_compaction',
+                'commit_consumer_offset', 'acquire_snapshot_lease',
+                'release_snapshot_lease', 'create_maintenance_job',
+                'transition_maintenance_job', 'drop_table'
+            ))
+            OR (format_version = 2 AND operation = 'legacy_import_table')
+            OR (format_version = 3 AND operation = 'legacy_reconcile_files')
+            OR (format_version = 4 AND operation IN (
+                'legacy_bootstrap_table', 'legacy_adopt_existing_table',
+                'legacy_sync_table_metadata', 'legacy_drop_table',
+                'legacy_advance_checkpoint'
+            ))
+        )
+    ),
+    fingerprint BLOB NOT NULL CHECK(
+        typeof(fingerprint) = 'blob' AND length(fingerprint) = 32
+    ),
+    committed_at_ns BLOB NOT NULL CHECK(
+        typeof(committed_at_ns) = 'blob' AND length(committed_at_ns) = 8
+    )
+ )"#;
+
+LEGACY_PROJECTION_REQUESTS_SQL = r#"CREATE TABLE legacy_projection_requests (
+    request_id BLOB PRIMARY KEY CHECK(
+        typeof(request_id) = 'blob'
+        AND length(request_id) = 16
+        AND request_id != zeroblob(16)
+    ),
+    response_blob BLOB NOT NULL CHECK(
+        typeof(response_blob) = 'blob' AND length(response_blob) > 0
+    ),
+    FOREIGN KEY(request_id) REFERENCES catalog_request_ids(request_id)
+ )"#;
+
+LEGACY_TABLE_PROJECTIONS_SQL = r#"CREATE TABLE legacy_table_projections (
+    table_id BLOB PRIMARY KEY CHECK(
+        typeof(table_id) = 'blob'
+        AND length(table_id) = 16
+        AND table_id != zeroblob(16)
+    ),
+    projection_revision BLOB NOT NULL CHECK(
+        typeof(projection_revision) = 'blob' AND length(projection_revision) = 8
+    ),
+    schema_version BLOB NOT NULL CHECK(
+        typeof(schema_version) = 'blob' AND length(schema_version) = 8
+    ),
+    schema_hash TEXT NOT NULL CHECK(
+        typeof(schema_hash) = 'text' AND length(schema_hash) > 0
+    ),
+    native_snapshot_version BLOB NOT NULL CHECK(
+        typeof(native_snapshot_version) = 'blob' AND length(native_snapshot_version) = 8
+    ),
+    legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(legacy_files_revision) = 'blob' AND length(legacy_files_revision) = 8
+    ),
+    writer_epoch BLOB NOT NULL CHECK(
+        typeof(writer_epoch) = 'blob' AND length(writer_epoch) = 8
+    ),
+    completeness TEXT NOT NULL CHECK(completeness IN ('seeded', 'complete')),
+    state TEXT NOT NULL CHECK(state IN ('active', 'dropped')),
+    source_metadata_hash TEXT CHECK(
+        source_metadata_hash IS NULL
+        OR (typeof(source_metadata_hash) = 'text' AND length(source_metadata_hash) > 0)
+    ),
+    updated_at_ns BLOB NOT NULL CHECK(
+        typeof(updated_at_ns) = 'blob' AND length(updated_at_ns) = 8
+    ),
+    FOREIGN KEY(table_id) REFERENCES tables(table_id),
+    FOREIGN KEY(table_id, schema_version)
+        REFERENCES table_schemas(table_id, schema_version),
+    FOREIGN KEY(table_id, native_snapshot_version)
+        REFERENCES table_snapshots(table_id, snapshot_version),
+    FOREIGN KEY(table_id, legacy_files_revision)
+        REFERENCES legacy_file_view_mappings(table_id, legacy_files_revision),
+    CHECK(
+        (completeness = 'seeded' AND source_metadata_hash IS NULL)
+        OR (completeness = 'complete' AND source_metadata_hash IS NOT NULL)
+    )
+ )"#;
+
+LEGACY_PROJECTION_SOURCES_SQL = r#"CREATE TABLE legacy_projection_sources (
+    table_id BLOB NOT NULL CHECK(
+        typeof(table_id) = 'blob'
+        AND length(table_id) = 16
+        AND table_id != zeroblob(16)
+    ),
+    source_name TEXT NOT NULL CHECK(
+        typeof(source_name) = 'text' AND length(source_name) > 0
+    ),
+    source_type TEXT NOT NULL CHECK(
+        typeof(source_type) = 'text' AND length(source_type) > 0
+    ),
+    output_stream TEXT NOT NULL CHECK(
+        typeof(output_stream) = 'text' AND length(output_stream) > 0
+    ),
+    config_blob BLOB NOT NULL CHECK(
+        typeof(config_blob) = 'blob' AND length(config_blob) > 0
+    ),
+    writer_epoch BLOB NOT NULL CHECK(
+        typeof(writer_epoch) = 'blob' AND length(writer_epoch) = 8
+    ),
+    PRIMARY KEY(table_id, source_name),
+    FOREIGN KEY(table_id) REFERENCES legacy_table_projections(table_id)
+ )"#;
+
+LEGACY_PROJECTION_CHECKPOINT_SQL = r#"CREATE TABLE legacy_projection_checkpoint (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    checkpoint_generation BLOB NOT NULL CHECK(
+        typeof(checkpoint_generation) = 'blob' AND length(checkpoint_generation) = 8
+    ),
+    shadow_epoch BLOB NOT NULL CHECK(
+        typeof(shadow_epoch) = 'blob' AND length(shadow_epoch) = 8
+    ),
+    phase TEXT NOT NULL CHECK(
+        phase IN (
+            'foundation_only', 'file_shadow', 'full_shadow',
+            'read_cutover_ready', 'native_authoritative'
+        )
+    ),
+    source_catalog_revision BLOB NOT NULL CHECK(
+        typeof(source_catalog_revision) = 'blob' AND length(source_catalog_revision) = 8
+    ),
+    source_projection_hash TEXT NOT NULL CHECK(
+        typeof(source_projection_hash) = 'text' AND length(source_projection_hash) > 0
+    ),
+    projection_digest TEXT NOT NULL CHECK(
+        typeof(projection_digest) = 'text' AND length(projection_digest) > 0
+    ),
+    continuity_mode TEXT NOT NULL CHECK(
+        continuity_mode IN ('contiguous', 'full_reconcile')
+    ),
+    resolved_continuity_loss_epoch BLOB NOT NULL CHECK(
+        typeof(resolved_continuity_loss_epoch) = 'blob'
+        AND length(resolved_continuity_loss_epoch) = 8
+    ),
+    updated_at_ns BLOB NOT NULL CHECK(
+        typeof(updated_at_ns) = 'blob' AND length(updated_at_ns) = 8
+    )
+ )"#;
+
+@data r#"INSERT INTO catalog_request_ids(
+           request_id, format_version, operation, fingerprint, committed_at_ns
+       )
+       SELECT request_id, command_format_version, operation,
+              command_fingerprint, committed_at_ns
+         FROM idempotent_requests;
+       INSERT INTO catalog_request_ids(
+           request_id, format_version, operation, fingerprint, committed_at_ns
+       )
+       SELECT request_id, format_version, 'legacy_import_table',
+              fingerprint, committed_at_ns
+         FROM legacy_import_requests;
+       INSERT INTO catalog_request_ids(
+           request_id, format_version, operation, fingerprint, committed_at_ns
+       )
+       SELECT request_id, format_version, 'legacy_reconcile_files',
+              fingerprint, committed_at_ns
+         FROM legacy_file_view_mappings
+        WHERE format_version = 3;
+       INSERT INTO legacy_table_projections(
+           table_id, projection_revision, schema_version, schema_hash,
+           native_snapshot_version, legacy_files_revision, writer_epoch,
+           completeness, state, source_metadata_hash, updated_at_ns
+       )
+       SELECT tables.table_id, X'0000000000000001', tables.current_schema_version,
+              table_schemas.schema_hash, tables.current_snapshot_version,
+              mappings.legacy_files_revision, tables.writer_epoch, 'seeded',
+              tables.state,
+              NULL, mappings.committed_at_ns
+         FROM tables
+         JOIN table_schemas
+           ON table_schemas.table_id = tables.table_id
+          AND table_schemas.schema_version = tables.current_schema_version
+         JOIN legacy_file_view_mappings AS mappings
+           ON mappings.table_id = tables.table_id
+          AND mappings.native_snapshot_version = tables.current_snapshot_version;
+       INSERT INTO legacy_projection_checkpoint(
+           singleton, checkpoint_generation, shadow_epoch, phase, source_catalog_revision,
+           source_projection_hash, projection_digest, continuity_mode,
+           resolved_continuity_loss_epoch, updated_at_ns
+       ) VALUES (
+           1, X'0000000000000000', X'0000000000000000',
+           'foundation_only', X'0000000000000000',
+           'sha256-v1:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+           'sha256-v1:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+           'full_reconcile', X'0000000000000000', X'0000000000000000'
+       );
+"#
+}
+
 macro_rules! define_v3_schema_additions {
     ($($name:ident = $sql:literal;)+) => {
         $(const $name: &str = $sql;)+
@@ -1179,20 +1462,103 @@ const MIGRATION_V6_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 7] = [
     },
 ];
 
+const MIGRATION_V7_SCHEMA_ADDITIONS: [ExpectedSchemaObject; 13] = [
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_file_view_mappings_1",
+        table_name: "legacy_file_view_mappings",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_file_view_mappings_2",
+        table_name: "legacy_file_view_mappings",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_file_view_mappings_3",
+        table_name: "legacy_file_view_mappings",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_catalog_request_ids_1",
+        table_name: "catalog_request_ids",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_projection_requests_1",
+        table_name: "legacy_projection_requests",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_projection_sources_1",
+        table_name: "legacy_projection_sources",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "index",
+        name: "sqlite_autoindex_legacy_table_projections_1",
+        table_name: "legacy_table_projections",
+        sql: None,
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "catalog_request_ids",
+        table_name: "catalog_request_ids",
+        sql: Some(CATALOG_REQUEST_IDS_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_projection_checkpoint",
+        table_name: "legacy_projection_checkpoint",
+        sql: Some(LEGACY_PROJECTION_CHECKPOINT_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_projection_requests",
+        table_name: "legacy_projection_requests",
+        sql: Some(LEGACY_PROJECTION_REQUESTS_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_projection_sources",
+        table_name: "legacy_projection_sources",
+        sql: Some(LEGACY_PROJECTION_SOURCES_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_table_projections",
+        table_name: "legacy_table_projections",
+        sql: Some(LEGACY_TABLE_PROJECTIONS_SQL),
+    },
+    ExpectedSchemaObject {
+        object_type: "table",
+        name: "legacy_file_view_mappings",
+        table_name: "legacy_file_view_mappings",
+        sql: Some(LEGACY_FILE_VIEW_MAPPINGS_V7_SQL),
+    },
+];
+
 struct Migration {
     version: u32,
     name: &'static str,
     sql: &'static str,
     base_schema_version: Option<u32>,
+    schema_removals: &'static [(&'static str, &'static str)],
     schema_additions: &'static [ExpectedSchemaObject],
 }
 
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     Migration {
         version: MIGRATION_V1_VERSION,
         name: MIGRATION_V1_NAME,
         sql: MIGRATION_V1,
         base_schema_version: None,
+        schema_removals: &[],
         schema_additions: &MIGRATION_V1_SCHEMA,
     },
     Migration {
@@ -1200,6 +1566,7 @@ const MIGRATIONS: [Migration; 6] = [
         name: MIGRATION_V2_NAME,
         sql: MIGRATION_V2,
         base_schema_version: None,
+        schema_removals: &[],
         schema_additions: MIGRATION_V2_SCHEMA,
     },
     Migration {
@@ -1207,6 +1574,7 @@ const MIGRATIONS: [Migration; 6] = [
         name: MIGRATION_V3_NAME,
         sql: MIGRATION_V3,
         base_schema_version: Some(MIGRATION_V2_VERSION),
+        schema_removals: &[],
         schema_additions: &MIGRATION_V3_SCHEMA_ADDITIONS,
     },
     Migration {
@@ -1214,6 +1582,7 @@ const MIGRATIONS: [Migration; 6] = [
         name: MIGRATION_V4_NAME,
         sql: MIGRATION_V4,
         base_schema_version: Some(MIGRATION_V3_VERSION),
+        schema_removals: &[],
         schema_additions: &MIGRATION_V4_SCHEMA_ADDITIONS,
     },
     Migration {
@@ -1221,6 +1590,7 @@ const MIGRATIONS: [Migration; 6] = [
         name: MIGRATION_V5_NAME,
         sql: MIGRATION_V5,
         base_schema_version: Some(MIGRATION_V4_VERSION),
+        schema_removals: &[],
         schema_additions: &MIGRATION_V5_SCHEMA_ADDITIONS,
     },
     Migration {
@@ -1228,7 +1598,21 @@ const MIGRATIONS: [Migration; 6] = [
         name: MIGRATION_V6_NAME,
         sql: MIGRATION_V6,
         base_schema_version: Some(MIGRATION_V5_VERSION),
+        schema_removals: &[],
         schema_additions: &MIGRATION_V6_SCHEMA_ADDITIONS,
+    },
+    Migration {
+        version: MIGRATION_V7_VERSION,
+        name: MIGRATION_V7_NAME,
+        sql: MIGRATION_V7,
+        base_schema_version: Some(MIGRATION_V6_VERSION),
+        schema_removals: &[
+            ("index", "sqlite_autoindex_legacy_file_view_mappings_1"),
+            ("index", "sqlite_autoindex_legacy_file_view_mappings_2"),
+            ("index", "sqlite_autoindex_legacy_file_view_mappings_3"),
+            ("table", "legacy_file_view_mappings"),
+        ],
+        schema_additions: &MIGRATION_V7_SCHEMA_ADDITIONS,
     },
 ];
 
@@ -1390,9 +1774,15 @@ pub(crate) fn schema_version(connection: &Connection) -> Result<u32> {
 }
 
 fn apply_migration(connection: &Connection, migration: &Migration) -> Result<()> {
+    if migration.version == MIGRATION_V7_VERSION {
+        validate_v7_source_facts(connection)?;
+    }
     connection
         .execute_batch(migration.sql)
         .map_err(|error| crate::map_sqlite_error("apply catalog migration", error))?;
+    if migration.version == MIGRATION_V7_VERSION {
+        validate_v7_backfill(connection)?;
+    }
     if migration.version == MIGRATION_V1_VERSION {
         connection
             .execute(
@@ -1453,6 +1843,164 @@ fn apply_migration(connection: &Connection, migration: &Migration) -> Result<()>
         .pragma_update(None, "user_version", migration.version)
         .map_err(|error| crate::map_sqlite_error("record catalog schema version", error))?;
     let _ = validate_metadata_at_version_with_migration(connection, migration.version, migration)?;
+    Ok(())
+}
+
+fn validate_v7_source_facts(connection: &Connection) -> Result<()> {
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM idempotent_requests WHERE command_format_version != 1 LIMIT 1",
+        "legacy Catalog request ledger migration found an invalid V1 format",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM legacy_import_requests WHERE format_version != 2 LIMIT 1",
+        "legacy Catalog request ledger migration found an invalid V2 format",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM legacy_file_view_mappings \
+           WHERE request_id IS NOT NULL \
+             AND (format_version NOT IN (2, 3) OR fingerprint IS NULL) LIMIT 1",
+        "legacy Catalog request ledger migration found an invalid file-view request",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM legacy_file_view_mappings AS mappings \
+          LEFT JOIN legacy_import_requests AS requests \
+            ON requests.request_id = mappings.request_id \
+         WHERE mappings.format_version = 2 \
+           AND (requests.request_id IS NULL \
+             OR requests.format_version != 2 \
+             OR requests.fingerprint != mappings.fingerprint \
+             OR requests.committed_at_ns != mappings.committed_at_ns) LIMIT 1",
+        "legacy Catalog request ledger migration found an inconsistent V2 mapping",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM legacy_import_requests AS requests \
+          LEFT JOIN legacy_file_view_mappings AS mappings \
+            ON mappings.request_id = requests.request_id \
+           AND mappings.format_version = 2 \
+         WHERE mappings.request_id IS NULL LIMIT 1",
+        "legacy Catalog request ledger migration found a V2 request without its mapping",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT request_id FROM (\
+             SELECT request_id FROM idempotent_requests \
+             UNION ALL \
+             SELECT request_id FROM legacy_import_requests \
+             UNION ALL \
+             SELECT request_id FROM legacy_file_view_mappings WHERE format_version = 3\
+         ) GROUP BY request_id HAVING count(*) != 1 LIMIT 1",
+        "legacy Catalog request id is owned by multiple frozen command formats",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM tables \
+          JOIN legacy_file_view_mappings AS mappings \
+            ON mappings.table_id = tables.table_id \
+           AND mappings.native_snapshot_version = tables.current_snapshot_version \
+         WHERE tables.state NOT IN ('active', 'dropped') LIMIT 1",
+        "legacy Catalog projection cannot seed a table in a transitional state",
+    )?;
+    Ok(())
+}
+
+fn validate_v7_backfill(connection: &Connection) -> Result<()> {
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM catalog_request_ids AS owners \
+          LEFT JOIN (\
+              SELECT request_id, command_format_version AS format_version, operation, \
+                     command_fingerprint AS fingerprint, committed_at_ns \
+                FROM idempotent_requests \
+              UNION ALL \
+              SELECT request_id, format_version, 'legacy_import_table', \
+                     fingerprint, committed_at_ns \
+                FROM legacy_import_requests \
+              UNION ALL \
+              SELECT request_id, format_version, 'legacy_reconcile_files', \
+                     fingerprint, committed_at_ns \
+                FROM legacy_file_view_mappings WHERE format_version = 3\
+          ) AS source ON source.request_id = owners.request_id \
+         WHERE source.request_id IS NULL \
+            OR source.format_version != owners.format_version \
+            OR source.operation != owners.operation \
+            OR source.fingerprint != owners.fingerprint \
+            OR source.committed_at_ns != owners.committed_at_ns LIMIT 1",
+        "legacy Catalog request ledger backfill does not match its frozen source fact",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT request_id FROM (\
+             SELECT request_id FROM idempotent_requests \
+             UNION ALL \
+             SELECT request_id FROM legacy_import_requests \
+             UNION ALL \
+             SELECT request_id FROM legacy_file_view_mappings WHERE format_version = 3\
+         ) AS source \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM catalog_request_ids AS owners \
+              WHERE owners.request_id = source.request_id\
+         ) LIMIT 1",
+        "legacy Catalog request ledger backfill omitted a frozen source fact",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM legacy_table_projections AS projections \
+          LEFT JOIN tables ON tables.table_id = projections.table_id \
+          LEFT JOIN legacy_file_view_mappings AS mappings \
+            ON mappings.table_id = projections.table_id \
+           AND mappings.legacy_files_revision = projections.legacy_files_revision \
+         WHERE tables.table_id IS NULL \
+            OR mappings.table_id IS NULL \
+            OR projections.completeness != 'seeded' \
+            OR projections.source_metadata_hash IS NOT NULL \
+            OR projections.native_snapshot_version != tables.current_snapshot_version \
+            OR projections.schema_version != tables.current_schema_version \
+            OR projections.writer_epoch != tables.writer_epoch \
+            OR projections.state != tables.state LIMIT 1",
+        "legacy Catalog projection seed does not match its current table cursor",
+    )?;
+    ensure_no_rows(
+        connection,
+        "SELECT 1 FROM tables \
+          JOIN legacy_file_view_mappings AS mappings \
+            ON mappings.table_id = tables.table_id \
+           AND mappings.native_snapshot_version = tables.current_snapshot_version \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM legacy_table_projections AS projections \
+              WHERE projections.table_id = tables.table_id\
+         ) LIMIT 1",
+        "legacy Catalog projection seed omitted a mapped current table",
+    )?;
+    let checkpoints: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM legacy_projection_checkpoint WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| crate::map_sqlite_error("validate legacy projection checkpoint", error))?;
+    if checkpoints != 1 {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            "legacy Catalog projection checkpoint backfill is not a singleton",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_no_rows(connection: &Connection, sql: &str, message: &'static str) -> Result<()> {
+    let found: i64 = connection
+        .query_row(&format!("SELECT EXISTS({sql})"), [], |row| row.get(0))
+        .map_err(|error| {
+            crate::map_sqlite_error("validate legacy Catalog migration facts", error)
+        })?;
+    if found != 0 {
+        return Err(ServerError::new(ErrorCode::DataCorruption, message));
+    }
     Ok(())
 }
 
@@ -1681,6 +2229,18 @@ fn expected_schema_for_migration(migration: &Migration) -> Result<Vec<CanonicalS
         }
         None => Vec::new(),
     };
+    for (object_type, name) in migration.schema_removals {
+        let before = expected.len();
+        expected.retain(|object| object.object_type != *object_type || object.name != *name);
+        if expected.len().checked_add(1) != Some(before) {
+            return Err(ServerError::new(
+                ErrorCode::Internal,
+                format!(
+                    "catalog schema replacement target is not unique type=[{object_type}] name=[{name}]"
+                ),
+            ));
+        }
+    }
     expected.extend(
         migration
             .schema_additions
@@ -1911,6 +2471,7 @@ mod tests {
             name: MIGRATION_V5_NAME,
             sql: MIGRATION_V5,
             base_schema_version: Some(4),
+            schema_removals: &[],
             schema_additions: &[],
         };
         let error = {
@@ -1953,6 +2514,51 @@ mod tests {
     }
 
     #[test]
+    fn physical_v7_rejects_cross_format_request_ownership_as_data_corruption() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory Catalog");
+        for migration in MIGRATIONS.iter().take(6) {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin frozen migration");
+            apply_migration(&transaction, migration).expect("apply frozen migration");
+            transaction.commit().expect("commit frozen migration");
+        }
+        let request_id = [7_u8; 16];
+        let fingerprint = [11_u8; 32];
+        let timestamp = encode_u64(13);
+        connection
+            .execute(
+                "INSERT INTO idempotent_requests(\
+                    request_id, command_format_version, operation, command_fingerprint,\
+                    response_blob, committed_at_ns, expires_at_ns\
+                 ) VALUES (?1, 1, 'create_namespace', ?2, X'01', ?3, ?3)",
+                rusqlite::params![request_id, fingerprint, timestamp],
+            )
+            .expect("insert V1 owner");
+        connection
+            .execute(
+                "INSERT INTO legacy_import_requests(\
+                    request_id, format_version, fingerprint, response_blob, committed_at_ns\
+                 ) VALUES (?1, 2, ?2, X'02', ?3)",
+                rusqlite::params![request_id, fingerprint, timestamp],
+            )
+            .expect("insert conflicting V2 owner");
+
+        let error = {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin physical V7 migration");
+            apply_migration(&transaction, &MIGRATIONS[6])
+                .expect_err("cross-format RequestId reuse must fail closed")
+        };
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+        let user_version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read rolled-back physical version");
+        assert_eq!(user_version, 6);
+    }
+
+    #[test]
     fn fresh_migration_manifest_drift_rolls_back_before_commit() {
         let mut connection = Connection::open_in_memory().expect("open in-memory catalog");
         let drifted_manifest = Migration {
@@ -1960,6 +2566,7 @@ mod tests {
             name: MIGRATION_V1_NAME,
             sql: MIGRATION_V1,
             base_schema_version: None,
+            schema_removals: &[],
             schema_additions: &[],
         };
 
@@ -1974,6 +2581,7 @@ mod tests {
             name: "drifted_test_migration",
             sql: MIGRATION_V1,
             base_schema_version: None,
+            schema_removals: &[],
             schema_additions: &MIGRATION_V1_SCHEMA,
         };
 

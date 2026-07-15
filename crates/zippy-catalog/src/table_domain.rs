@@ -1,14 +1,15 @@
 //! Transactional table creation and lightweight table discovery.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use rusqlite::{params, Connection, OptionalExtension, Params, Row, TransactionBehavior};
 use zippy_types::catalog::{CreateTableCommand, ListTablesRequest, ListTablesResponse};
+use zippy_types::schema_contract::validate_catalog_table_schema;
 use zippy_types::table::{
-    CatalogName, ColumnName, MetadataMap, SchemaIpcPayload, TableDefinition, TableDescriptor,
-    TableKind, TableRef, TableState,
+    CatalogName, MetadataMap, SchemaIpcPayload, TableDefinition, TableDescriptor, TableKind,
+    TableRef, TableState,
 };
 use zippy_types::{ErrorCode, NamespaceId, OffsetWatermark, Result, ServerError, TableId};
 
@@ -28,7 +29,6 @@ const MAX_TABLE_RESOLUTION_REFERENCE_BYTES: usize = 1024 * 1024;
 const MAX_TABLE_READ_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TABLE_CONFIG_ENTRIES: usize = 4_096;
 const MAX_TABLE_CONFIG_TEXT_BYTES: usize = 1024 * 1024;
-const MAX_SCHEMA_FIELDS: usize = 4_096;
 
 macro_rules! table_select {
     ($suffix:literal) => {
@@ -422,69 +422,14 @@ pub(crate) fn validate_table_schema(
     schema: &SchemaRef,
     definition: &TableDefinition,
 ) -> Result<()> {
-    if schema.fields().len() > MAX_SCHEMA_FIELDS {
-        return Err(ServerError::new(
-            ErrorCode::ResourceExhausted,
-            format!(
-                "catalog schema field count exceeds maximum actual=[{}] maximum=[{}]",
-                schema.fields().len(),
-                MAX_SCHEMA_FIELDS
-            ),
-        ));
-    }
-    let mut names = BTreeSet::new();
-    for field in schema.fields() {
-        ColumnName::new(field.name()).map_err(|error| {
-            ServerError::new(
-                ErrorCode::SchemaMismatch,
-                format!("invalid catalog schema field name error=[{error}]"),
-            )
-        })?;
-        if !names.insert(field.name().as_str()) {
-            return Err(ServerError::new(
-                ErrorCode::SchemaMismatch,
-                format!("duplicate catalog schema field name=[{}]", field.name()),
-            ));
-        }
-    }
-
-    match definition {
-        TableDefinition::Append(definition) => {
-            if let Some(column) = &definition.event_time_column {
-                require_field(schema, column.as_str(), None)?;
-            }
-        }
-        TableDefinition::Frame(definition) => {
-            require_field(schema, definition.by.as_str(), None)?;
-        }
-        TableDefinition::KeyValue(definition) => {
-            for column in definition.keys().as_slice() {
-                require_field(schema, column.as_str(), Some(&DataType::Utf8))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn require_field(schema: &SchemaRef, name: &str, required_type: Option<&DataType>) -> Result<()> {
-    let field = schema.field_with_name(name).map_err(|_| {
-        ServerError::new(
-            ErrorCode::SchemaMismatch,
-            format!("table definition references missing schema field=[{name}]"),
-        )
-    })?;
-    if required_type.is_some_and(|required| field.data_type() != required) {
-        return Err(ServerError::new(
-            ErrorCode::SchemaMismatch,
-            format!(
-                "table definition field has unsupported type field=[{}] expected=[{:?}] actual=[{:?}]",
-                name,
-                required_type.expect("required type is present"),
-                field.data_type()
-            ),
-        ));
-    }
-    Ok(())
+    validate_catalog_table_schema(schema.as_ref(), definition).map_err(|error| {
+        let code = if error.is_resource_exhausted() {
+            ErrorCode::ResourceExhausted
+        } else {
+            ErrorCode::SchemaMismatch
+        };
+        ServerError::new(code, error.to_string())
+    })
 }
 
 fn ensure_namespace_exists(connection: &Connection, namespace_id: NamespaceId) -> Result<()> {

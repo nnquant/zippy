@@ -17,10 +17,12 @@ mod file_domain;
 mod gc_domain;
 mod lease_domain;
 mod legacy_import_domain;
+mod legacy_projection_domain;
 mod legacy_reconcile_domain;
 mod manifest_domain;
 mod migration;
 mod pinned_snapshot;
+mod request_ledger;
 mod runtime_pins;
 mod service;
 mod snapshot_domain;
@@ -53,7 +55,7 @@ use zippy_core::{ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::{ErrorCode, Result, ServerError};
 
 /// The latest SQLite schema version understood by this crate.
-pub const CATALOG_SCHEMA_VERSION: u32 = 6;
+pub const CATALOG_SCHEMA_VERSION: u32 = 7;
 
 /// SQLite header marker identifying a Zippy Catalog database.
 pub const CATALOG_APPLICATION_ID: u32 = 0x5A49_5059;
@@ -323,7 +325,24 @@ impl SqliteCatalogFoundation {
     /// Runs SQLite `PRAGMA quick_check` on the owning actor thread.
     pub fn quick_check(&self) -> Result<CatalogIntegrity> {
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
-        self.send(ActorMessage::QuickCheck(response_sender))?;
+        self.send(ActorMessage::QuickCheck {
+            timeout: None,
+            response: response_sender,
+        })?;
+        response_receiver.recv().map_err(|_| actor_stopped())?
+    }
+
+    /// Runs SQLite `PRAGMA quick_check` with one explicit elapsed-time budget.
+    ///
+    /// This overrides the configured integrity-check timeout for this invocation only. A zero
+    /// duration requests cancellation at the first SQLite progress callback, which is useful for
+    /// deterministic deadline handling and does not change subsequent checks.
+    pub fn quick_check_with_timeout(&self, timeout: Duration) -> Result<CatalogIntegrity> {
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        self.send(ActorMessage::QuickCheck {
+            timeout: Some(timeout),
+            response: response_sender,
+        })?;
         response_receiver.recv().map_err(|_| actor_stopped())?
     }
 
@@ -386,7 +405,10 @@ impl Drop for SqliteCatalogFoundation {
 
 enum ActorMessage {
     Inspect(SyncSender<Result<SqliteCatalogFoundationStatus>>),
-    QuickCheck(SyncSender<Result<CatalogIntegrity>>),
+    QuickCheck {
+        timeout: Option<Duration>,
+        response: SyncSender<Result<CatalogIntegrity>>,
+    },
     Shutdown(SyncSender<Result<()>>),
 }
 
@@ -493,8 +515,11 @@ fn actor_loop(
                 };
                 let _ = response.send(result);
             }
-            ActorMessage::QuickCheck(response) => {
-                let result = run_quick_check(&connection, config.integrity_check_timeout);
+            ActorMessage::QuickCheck { timeout, response } => {
+                let result = run_quick_check(
+                    &connection,
+                    timeout.unwrap_or(config.integrity_check_timeout),
+                );
                 last_integrity = result.clone();
                 let _ = response.send(result);
             }

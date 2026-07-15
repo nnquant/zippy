@@ -15,9 +15,10 @@ use zippy_core::{
 };
 use zippy_types::ErrorCode;
 
-const EXPECTED_TABLES: [&str; 17] = [
+const EXPECTED_TABLES: [&str; 22] = [
     "catalog_meta",
     "catalog_migrations",
+    "catalog_request_ids",
     "data_file_sources",
     "data_files",
     "durable_consumer_offsets",
@@ -25,7 +26,11 @@ const EXPECTED_TABLES: [&str; 17] = [
     "idempotent_requests",
     "legacy_file_view_mappings",
     "legacy_import_requests",
+    "legacy_projection_checkpoint",
+    "legacy_projection_requests",
+    "legacy_projection_sources",
     "legacy_reconcile_snapshot_files",
+    "legacy_table_projections",
     "maintenance_jobs",
     "namespaces",
     "producers",
@@ -34,6 +39,63 @@ const EXPECTED_TABLES: [&str; 17] = [
     "table_snapshots",
     "tables",
 ];
+
+const PHYSICAL_V6_LEGACY_FILE_VIEW_MAPPINGS_SQL: &str = r#"CREATE TABLE legacy_file_view_mappings (
+    table_id BLOB NOT NULL CHECK(
+        typeof(table_id) = 'blob'
+        AND length(table_id) = 16
+        AND table_id != zeroblob(16)
+    ),
+    legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(legacy_files_revision) = 'blob' AND length(legacy_files_revision) = 8
+    ),
+    native_snapshot_version BLOB NOT NULL CHECK(
+        typeof(native_snapshot_version) = 'blob' AND length(native_snapshot_version) = 8
+    ),
+    request_id BLOB CHECK(
+        request_id IS NULL
+        OR (
+            typeof(request_id) = 'blob'
+            AND length(request_id) = 16
+            AND request_id != zeroblob(16)
+        )
+    ),
+    format_version INTEGER NOT NULL CHECK(
+        typeof(format_version) = 'integer' AND format_version IN (0, 2, 3)
+    ),
+    fingerprint BLOB CHECK(
+        fingerprint IS NULL
+        OR (typeof(fingerprint) = 'blob' AND length(fingerprint) = 32)
+    ),
+    previous_legacy_files_revision BLOB NOT NULL CHECK(
+        typeof(previous_legacy_files_revision) = 'blob'
+        AND length(previous_legacy_files_revision) = 8
+    ),
+    source_catalog_revision BLOB NOT NULL CHECK(
+        typeof(source_catalog_revision) = 'blob' AND length(source_catalog_revision) = 8
+    ),
+    source_snapshot_hash TEXT NOT NULL CHECK(
+        typeof(source_snapshot_hash) = 'text' AND length(source_snapshot_hash) > 0
+    ),
+    catalog_revision BLOB NOT NULL CHECK(
+        typeof(catalog_revision) = 'blob' AND length(catalog_revision) = 8
+    ),
+    continuity TEXT NOT NULL CHECK(continuity IN ('base', 'contiguous', 'gap')),
+    committed_at_ns BLOB NOT NULL CHECK(
+        typeof(committed_at_ns) = 'blob' AND length(committed_at_ns) = 8
+    ),
+    PRIMARY KEY(table_id, legacy_files_revision),
+    UNIQUE(table_id, native_snapshot_version),
+    UNIQUE(request_id),
+    CHECK(
+        (request_id IS NULL AND format_version = 0 AND fingerprint IS NULL AND continuity = 'base')
+        OR
+        (request_id IS NOT NULL AND format_version IN (2, 3) AND fingerprint IS NOT NULL)
+    ),
+    FOREIGN KEY(table_id) REFERENCES tables(table_id),
+    FOREIGN KEY(table_id, native_snapshot_version)
+        REFERENCES table_snapshots(table_id, snapshot_version)
+ )"#;
 
 const EXPECTED_ACTIVE_TABLE_CURSOR_INDEXES: [&str; 2] =
     ["tables_by_namespace_state_id", "tables_by_state_id"];
@@ -311,6 +373,10 @@ fn initialize_catalog_at_physical_version(
     if physical_version == 0 {
         return;
     }
+    assert!(
+        (1..=6).contains(&physical_version),
+        "unsupported physical catalog fixture version [{physical_version}]"
+    );
     SqliteCatalogFoundation::open(SqliteCatalogConfig::new(data_directory))
         .expect("initialize current catalog fixture")
         .close()
@@ -320,10 +386,33 @@ fn initialize_catalog_at_physical_version(
         Connection::open(catalog_path(data_directory)).expect("open catalog fixture for downgrade");
     connection
         .execute_batch(
-            "DROP TABLE legacy_reconcile_snapshot_files;
-             DROP TABLE legacy_file_view_mappings;",
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE legacy_projection_sources;
+             DROP TABLE legacy_table_projections;
+             DROP TABLE legacy_projection_requests;
+             DROP TABLE legacy_projection_checkpoint;
+             DROP TABLE catalog_request_ids;",
         )
-        .expect("remove physical v6 legacy mapping tables");
+        .expect("remove physical v7 projection tables");
+    if physical_version <= 5 {
+        connection
+            .execute_batch(
+                "DROP TABLE legacy_reconcile_snapshot_files;
+                 DROP TABLE legacy_file_view_mappings;",
+            )
+            .expect("remove physical v6 legacy mapping tables");
+    } else {
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE legacy_file_view_mappings
+                     RENAME TO legacy_file_view_mappings_v7;
+                 {PHYSICAL_V6_LEGACY_FILE_VIEW_MAPPINGS_SQL};
+                 INSERT INTO legacy_file_view_mappings
+                      SELECT * FROM legacy_file_view_mappings_v7;
+                 DROP TABLE legacy_file_view_mappings_v7;"
+            ))
+            .expect("restore exact physical v6 legacy mapping table");
+    }
     if physical_version <= 4 {
         connection
             .execute_batch("DROP TABLE legacy_import_requests;")
@@ -396,7 +485,16 @@ fn initialize_catalog_at_physical_version(
                  PRAGMA user_version = 5;",
             )
             .expect("construct exact physical v5 fixture"),
-        unsupported => panic!("unsupported physical catalog fixture version [{unsupported}]"),
+        6 => connection
+            .execute_batch(
+                "DELETE FROM catalog_migrations WHERE schema_version > 6;
+                 UPDATE catalog_meta
+                    SET value = X'0000000000000006'
+                  WHERE key = 'schema_version';
+                 PRAGMA user_version = 6;",
+            )
+            .expect("construct exact physical v6 fixture"),
+        _ => unreachable!("physical catalog fixture version was validated above"),
     }
 }
 
@@ -497,7 +595,7 @@ fn migration_is_idempotent_and_creates_the_current_domain_schema() {
         .expect("query migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7]);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -506,7 +604,7 @@ fn migration_is_idempotent_and_creates_the_current_domain_schema() {
 fn concurrent_opens_migrate_supported_catalogs_exactly_once() {
     const ACTOR_COUNT: usize = 8;
 
-    for physical_version in [0, 1, 2, 3, 4, 5] {
+    for physical_version in [0, 1, 2, 3, 4, 5, 6] {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
         initialize_catalog_at_physical_version(&data_directory, physical_version);
@@ -552,7 +650,7 @@ fn concurrent_opens_migrate_supported_catalogs_exactly_once() {
             .expect("collect concurrent migration versions");
         assert_eq!(
             migration_versions,
-            vec![1, 2, 3, 4, 5, 6],
+            vec![1, 2, 3, 4, 5, 6, 7],
             "each migration must be recorded exactly once from physical version \
              [{physical_version}]"
         );
@@ -566,37 +664,7 @@ fn upgrades_an_existing_physical_v1_catalog_to_current_and_reopens() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
-    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
-        .expect("initialize current catalog")
-        .close()
-        .expect("close current catalog");
-
-    let raw = Connection::open(&path).expect("open catalog for v1 fixture downgrade");
-    raw.execute_batch(
-        "PRAGMA foreign_keys = OFF;
-         DROP TABLE legacy_reconcile_snapshot_files;
-         DROP TABLE legacy_file_view_mappings;
-         DROP TABLE legacy_import_requests;
-         DROP TABLE idempotent_requests;
-         DROP TABLE maintenance_jobs;
-         DROP TABLE snapshot_leases;
-         DROP TABLE durable_consumer_offsets;
-         DROP TABLE durable_consumers;
-         DROP TABLE producers;
-         DROP TABLE data_file_sources;
-         DROP TABLE data_files;
-         DROP TABLE table_snapshots;
-         DROP TABLE table_schemas;
-         DROP TABLE tables;
-         DROP TABLE namespaces;
-         DELETE FROM catalog_migrations WHERE schema_version > 1;
-         UPDATE catalog_meta
-            SET value = X'0000000000000001'
-          WHERE key = 'schema_version';
-         PRAGMA user_version = 1;",
-    )
-    .expect("construct exact physical v1 fixture");
-    drop(raw);
+    initialize_catalog_at_physical_version(&data_directory, 1);
 
     let upgraded = SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
         .expect("upgrade physical v1 catalog");
@@ -639,7 +707,7 @@ fn upgrades_an_existing_physical_v1_catalog_to_current_and_reopens() {
             row.get(0)
         })
         .expect("count upgraded migration audit");
-    assert_eq!(migration_count, 6);
+    assert_eq!(migration_count, 7);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -649,29 +717,7 @@ fn upgrades_an_existing_physical_v2_catalog_to_current_and_reopens() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
-    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
-        .expect("initialize current catalog")
-        .close()
-        .expect("close current catalog");
-
-    let raw = Connection::open(&path).expect("open catalog for v2 fixture downgrade");
-    raw.execute_batch(
-        "DROP TABLE legacy_reconcile_snapshot_files;
-         DROP TABLE legacy_file_view_mappings;
-         DROP TABLE legacy_import_requests;
-         DROP INDEX tables_by_state_id;
-         DROP INDEX tables_by_namespace_state_id;
-         DROP INDEX data_files_gc_retry_by_table;
-         DROP INDEX data_files_gc_claim_by_table;
-         DROP INDEX snapshot_leases_gc_by_table;
-         DELETE FROM catalog_migrations WHERE schema_version > 2;
-         UPDATE catalog_meta
-            SET value = X'0000000000000002'
-          WHERE key = 'schema_version';
-         PRAGMA user_version = 2;",
-    )
-    .expect("construct exact physical v2 fixture");
-    drop(raw);
+    initialize_catalog_at_physical_version(&data_directory, 2);
 
     let upgraded = SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
         .expect("upgrade physical v2 catalog");
@@ -698,7 +744,7 @@ fn upgrades_an_existing_physical_v2_catalog_to_current_and_reopens() {
         .expect("query upgraded migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect upgraded migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7]);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
 }
@@ -734,9 +780,277 @@ fn upgrades_an_existing_physical_v3_catalog_to_current_and_reopens() {
         .expect("query upgraded migration audit")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect upgraded migration versions");
-    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(migration_versions, vec![1, 2, 3, 4, 5, 6, 7]);
     assert_active_table_cursor_indexes(&raw);
     assert_safe_gc_indexes(&raw);
+}
+
+#[test]
+fn physical_v6_to_v7_migration_preserves_mapping_and_backfills_projection_state() {
+    let directory = TempDir::new().expect("create temp directory");
+    let data_directory = data_directory(&directory);
+    let path = catalog_path(&data_directory);
+    initialize_catalog_at_physical_version(&data_directory, 6);
+
+    let mut raw = Connection::open(&path).expect("open physical v6 catalog fixture");
+    raw.pragma_update(None, "foreign_keys", true)
+        .expect("enable physical v6 fixture foreign keys");
+    let zero = 0_u64.to_be_bytes();
+    let one = 1_u64.to_be_bytes();
+    let two = 2_u64.to_be_bytes();
+    let v1_request_id = stable_id_bytes(31);
+    let v2_request_id = stable_id_bytes(32);
+    let v3_request_id = stable_id_bytes(33);
+    let v1_fingerprint = [0x11_u8; 32];
+    let v2_fingerprint = [0x22_u8; 32];
+    let v3_fingerprint = [0x33_u8; 32];
+    let v1_committed_at_ns = 11_u64.to_be_bytes();
+    let v2_committed_at_ns = 22_u64.to_be_bytes();
+    let v3_committed_at_ns = 33_u64.to_be_bytes();
+    let transaction = raw
+        .transaction()
+        .expect("begin physical v6 fixture transaction");
+    insert_test_namespace_and_table(&transaction, &zero, &zero);
+    insert_test_schema(&transaction, &zero);
+    insert_test_snapshot(&transaction, &zero, &[0_u8; 9], "create");
+    insert_test_snapshot(&transaction, &one, &[0_u8; 9], "import");
+    transaction
+        .execute(
+            "INSERT INTO idempotent_requests(\
+                 request_id, command_format_version, operation, command_fingerprint, response_blob, \
+                 committed_at_ns, expires_at_ns\
+             ) VALUES (?1, 1, 'create_namespace', ?2, X'01', ?3, ?4)",
+            params![
+                v1_request_id.as_slice(),
+                v1_fingerprint.as_slice(),
+                v1_committed_at_ns.as_slice(),
+                u64::MAX.to_be_bytes().as_slice(),
+            ],
+        )
+        .expect("insert physical v6 V1 replay fact");
+    transaction
+        .execute(
+            "INSERT INTO legacy_import_requests(\
+                 request_id, format_version, fingerprint, response_blob, committed_at_ns\
+             ) VALUES (?1, 2, ?2, X'02', ?3)",
+            params![
+                v2_request_id.as_slice(),
+                v2_fingerprint.as_slice(),
+                v2_committed_at_ns.as_slice(),
+            ],
+        )
+        .expect("insert physical v6 V2 replay fact");
+    transaction
+        .execute(
+            "INSERT INTO legacy_file_view_mappings(\
+                 table_id, legacy_files_revision, native_snapshot_version, request_id,\
+                 format_version, fingerprint, previous_legacy_files_revision,\
+                 source_catalog_revision, source_snapshot_hash, catalog_revision, continuity,\
+                 committed_at_ns\
+             ) VALUES (?1, ?2, ?3, ?4, 2, ?5, ?6, ?7, ?8, ?9, 'contiguous', ?10)",
+            params![
+                stable_id_bytes(2).as_slice(),
+                two.as_slice(),
+                one.as_slice(),
+                v2_request_id.as_slice(),
+                v2_fingerprint.as_slice(),
+                one.as_slice(),
+                two.as_slice(),
+                "sha256-v1:physical-v6-import",
+                two.as_slice(),
+                v2_committed_at_ns.as_slice(),
+            ],
+        )
+        .expect("insert physical v6 V2 mapping fact");
+    transaction
+        .execute(
+            "INSERT INTO legacy_file_view_mappings(\
+                 table_id, legacy_files_revision, native_snapshot_version, request_id,\
+                 format_version, fingerprint, previous_legacy_files_revision,\
+                 source_catalog_revision, source_snapshot_hash, catalog_revision, continuity,\
+                 committed_at_ns\
+             ) VALUES (?1, ?2, ?3, ?4, 3, ?5, ?6, ?7, ?8, ?9, 'contiguous', ?10)",
+            params![
+                stable_id_bytes(2).as_slice(),
+                one.as_slice(),
+                zero.as_slice(),
+                v3_request_id.as_slice(),
+                v3_fingerprint.as_slice(),
+                zero.as_slice(),
+                one.as_slice(),
+                "sha256-v1:physical-v6",
+                one.as_slice(),
+                v3_committed_at_ns.as_slice(),
+            ],
+        )
+        .expect("insert physical v6 V3 mapping fact");
+    transaction
+        .commit()
+        .expect("commit physical v6 migration fixture");
+    drop(raw);
+
+    SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("upgrade physical v6 catalog")
+        .close()
+        .expect("close upgraded physical v7 catalog");
+
+    let raw = Connection::open(path).expect("inspect physical v7 migration result");
+    let mapping_count: u32 = raw
+        .query_row(
+            "SELECT count(*) FROM legacy_file_view_mappings \
+              WHERE table_id = ?1 AND legacy_files_revision = ?2 \
+                AND native_snapshot_version = ?3 AND request_id = ?4 \
+                AND format_version = 3 AND fingerprint = ?5 \
+                AND previous_legacy_files_revision = ?6 \
+                AND source_catalog_revision = ?7 \
+                AND source_snapshot_hash = 'sha256-v1:physical-v6' \
+                AND catalog_revision = ?8 AND continuity = 'contiguous' \
+                AND committed_at_ns = ?9",
+            params![
+                stable_id_bytes(2).as_slice(),
+                one.as_slice(),
+                zero.as_slice(),
+                v3_request_id.as_slice(),
+                v3_fingerprint.as_slice(),
+                zero.as_slice(),
+                one.as_slice(),
+                one.as_slice(),
+                v3_committed_at_ns.as_slice(),
+            ],
+            |row| row.get(0),
+        )
+        .expect("verify retained V3 mapping");
+    assert_eq!(mapping_count, 1);
+    let mapping_count: u32 = raw
+        .query_row(
+            "SELECT count(*) FROM legacy_file_view_mappings",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count retained physical v6 mappings");
+    assert_eq!(mapping_count, 2);
+
+    let request_owners = raw
+        .prepare(
+            "SELECT request_id, format_version, operation, fingerprint, committed_at_ns \
+               FROM catalog_request_ids ORDER BY format_version",
+        )
+        .expect("prepare migrated request-owner query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .expect("query migrated request owners")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect migrated request owners");
+    assert_eq!(
+        request_owners,
+        vec![
+            (
+                v1_request_id.to_vec(),
+                1,
+                "create_namespace".to_owned(),
+                v1_fingerprint.to_vec(),
+                v1_committed_at_ns.to_vec(),
+            ),
+            (
+                v2_request_id.to_vec(),
+                2,
+                "legacy_import_table".to_owned(),
+                v2_fingerprint.to_vec(),
+                v2_committed_at_ns.to_vec(),
+            ),
+            (
+                v3_request_id.to_vec(),
+                3,
+                "legacy_reconcile_files".to_owned(),
+                v3_fingerprint.to_vec(),
+                v3_committed_at_ns.to_vec(),
+            ),
+        ]
+    );
+
+    let projection = raw
+        .query_row(
+            "SELECT projection_revision, schema_version, schema_hash, native_snapshot_version,\
+                    legacy_files_revision, writer_epoch, completeness, state,\
+                    source_metadata_hash, updated_at_ns \
+               FROM legacy_table_projections WHERE table_id = ?1",
+            [stable_id_bytes(2).as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            },
+        )
+        .expect("read seeded legacy table projection");
+    assert_eq!(
+        projection,
+        (
+            one.to_vec(),
+            zero.to_vec(),
+            "sha256:test".to_owned(),
+            zero.to_vec(),
+            one.to_vec(),
+            zero.to_vec(),
+            "seeded".to_owned(),
+            "active".to_owned(),
+            None,
+            v3_committed_at_ns.to_vec(),
+        )
+    );
+
+    let checkpoint = raw
+        .query_row(
+            "SELECT checkpoint_generation, shadow_epoch, phase, source_catalog_revision,\
+                    source_projection_hash, projection_digest, continuity_mode,\
+                    resolved_continuity_loss_epoch, updated_at_ns \
+               FROM legacy_projection_checkpoint WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, Vec<u8>>(8)?,
+                ))
+            },
+        )
+        .expect("read initial projection checkpoint");
+    let empty_digest = "sha256-v1:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    assert_eq!(
+        checkpoint,
+        (
+            zero.to_vec(),
+            zero.to_vec(),
+            "foundation_only".to_owned(),
+            zero.to_vec(),
+            empty_digest.to_owned(),
+            empty_digest.to_owned(),
+            "full_reconcile".to_owned(),
+            zero.to_vec(),
+            zero.to_vec(),
+        )
+    );
 }
 
 #[test]
@@ -2014,7 +2328,7 @@ fn inspect_rejects_an_extra_migration_audit_record() {
     assert_live_tamper_rejected(
         "INSERT INTO catalog_migrations( \
              schema_version, migration_name, migration_checksum, applied_at_ns \
-         ) VALUES (7, 'unexpected', zeroblob(32), zeroblob(8))",
+         ) VALUES (8, 'unexpected', zeroblob(32), zeroblob(8))",
     );
 }
 
@@ -2221,11 +2535,8 @@ fn failed_explicit_integrity_check_blocks_inspect_until_a_successful_recheck() {
     let directory = TempDir::new().expect("create temp directory");
     let data_directory = data_directory(&directory);
     let path = catalog_path(&data_directory);
-    let catalog = SqliteCatalogFoundation::open(
-        SqliteCatalogConfig::new(&data_directory)
-            .with_integrity_check_timeout(Duration::from_millis(1)),
-    )
-    .expect("initialize catalog");
+    let catalog = SqliteCatalogFoundation::open(SqliteCatalogConfig::new(&data_directory))
+        .expect("initialize catalog");
     let raw = Connection::open(&path).expect("open raw catalog");
     raw.execute_batch(
         "WITH RECURSIVE counter(value) AS ( \
@@ -2238,7 +2549,7 @@ fn failed_explicit_integrity_check_blocks_inspect_until_a_successful_recheck() {
     drop(raw);
 
     let check_error = catalog
-        .quick_check()
+        .quick_check_with_timeout(Duration::ZERO)
         .expect_err("integrity check must exceed its VM execution threshold");
     assert_eq!(check_error.code(), ErrorCode::DeadlineExceeded);
     let inspect_error = catalog
