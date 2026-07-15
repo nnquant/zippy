@@ -28,7 +28,13 @@ use crate::{
     PersistedTableDescription, QuerySessionPolicy, ZippyTableProvider,
 };
 
-const PROFILE_FORMAT_VERSION: u32 = 6;
+const PROFILE_FORMAT_VERSION: u32 = 8;
+const PREFLIGHT_FIXED_TRANSIENT_BYTES: u64 = 2 * 1024 * 1024;
+const PREFLIGHT_BYTES_PER_SQL_BYTE: u64 = 1024;
+const PREFLIGHT_BYTES_PER_BINDING: u64 = 64 * 1024;
+const PREFLIGHT_BYTES_PER_RELATION: u64 = 16 * 1024;
+const PREFLIGHT_BYTES_PER_LOGICAL_NODE: u64 = 4 * 1024;
+const PREFLIGHT_BYTES_PER_EXPRESSION_NODE: u64 = 4 * 1024;
 const RETAINED_FIXED_BYTES: u64 = 1024 * 1024;
 const RETAINED_BYTES_PER_TEXT_BYTE: u64 = 32;
 const RETAINED_BYTES_PER_BINDING: u64 = 16 * 1024;
@@ -166,6 +172,49 @@ impl PersistedPlanLimits {
     pub const fn max_expression_nodes(self) -> usize {
         self.max_expression_nodes
     }
+
+    /// Returns the conservative task-memory peak for the first SQL preflight pass.
+    ///
+    /// This bound is computable without parsing SQL, so a server can admit it before
+    /// [`profile_persisted_plan`] constructs an AST. The exact physical-build reservation is
+    /// still derived from the resulting [`PersistedPlanProfile`] and admitted separately.
+    pub fn preflight_peak_bytes(self) -> Result<NonZeroU64> {
+        let components = [
+            (
+                self.max_sql_bytes,
+                PREFLIGHT_BYTES_PER_SQL_BYTE,
+                "SQL bytes",
+            ),
+            (self.max_bindings, PREFLIGHT_BYTES_PER_BINDING, "bindings"),
+            (
+                self.max_relation_occurrences,
+                PREFLIGHT_BYTES_PER_RELATION,
+                "relation occurrences",
+            ),
+            (
+                self.max_logical_nodes,
+                PREFLIGHT_BYTES_PER_LOGICAL_NODE,
+                "logical nodes",
+            ),
+            (
+                self.max_expression_nodes,
+                PREFLIGHT_BYTES_PER_EXPRESSION_NODE,
+                "expression nodes",
+            ),
+        ];
+        let total = components.into_iter().try_fold(
+            PREFLIGHT_FIXED_TRANSIENT_BYTES,
+            |total, (count, bytes_per_item, label)| {
+                u64::try_from(count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(bytes_per_item))
+                    .and_then(|component| total.checked_add(component))
+                    .ok_or_else(|| exhausted(format!("persisted SQL preflight {label} overflowed")))
+            },
+        )?;
+        NonZeroU64::new(total)
+            .ok_or_else(|| exhausted("persisted SQL preflight memory peak must be nonzero"))
+    }
 }
 
 /// A versioned admission envelope computed before DataFusion planning allocations begin.
@@ -187,6 +236,42 @@ pub struct PersistedPlanProfile {
     construction: PlanConstructionBounds,
     build_peak_bytes: NonZeroU64,
     retained_plan_bytes: NonZeroU64,
+}
+
+/// Stable server-facing classification of a persisted-plan failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedPlanErrorClass {
+    /// SQL, schema, or expression input is invalid for the persisted query subset.
+    InvalidInput,
+    /// The requested plan feature is valid but intentionally unsupported.
+    Unsupported,
+    /// Planning could not obtain or represent its bounded resources.
+    ResourceExhausted,
+    /// A planner, runtime, I/O, or integration invariant failed unexpectedly.
+    Internal,
+}
+
+/// Classifies a DataFusion persisted-plan error without exposing its unstable variants to Server.
+#[must_use]
+pub fn classify_persisted_plan_error(error: &DataFusionError) -> PersistedPlanErrorClass {
+    match error {
+        DataFusionError::Context(_, source) => classify_persisted_plan_error(source),
+        DataFusionError::ResourcesExhausted(_) => PersistedPlanErrorClass::ResourceExhausted,
+        DataFusionError::NotImplemented(_) => PersistedPlanErrorClass::Unsupported,
+        DataFusionError::SQL(_, _)
+        | DataFusionError::Plan(_)
+        | DataFusionError::Configuration(_)
+        | DataFusionError::SchemaError(_, _)
+        | DataFusionError::Execution(_) => PersistedPlanErrorClass::InvalidInput,
+        DataFusionError::ArrowError(_, _)
+        | DataFusionError::ParquetError(_)
+        | DataFusionError::ObjectStore(_)
+        | DataFusionError::IoError(_)
+        | DataFusionError::Internal(_)
+        | DataFusionError::ExecutionJoin(_)
+        | DataFusionError::External(_)
+        | DataFusionError::Substrait(_) => PersistedPlanErrorClass::Internal,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1413,9 +1498,9 @@ mod tests {
     use zippy_types::{ErrorCode, FileId, ServerError, TableId};
 
     use super::{
-        prepare_persisted_plan as prepare_validated_persisted_plan,
+        classify_persisted_plan_error, prepare_persisted_plan as prepare_validated_persisted_plan,
         profile_persisted_plan as profile_validated_persisted_plan, register_bindings,
-        validate_logical_plan, PersistedPlanLimits, PersistedTableBinding,
+        validate_logical_plan, PersistedPlanErrorClass, PersistedPlanLimits, PersistedTableBinding,
         BUILD_BYTES_PER_LOGICAL_NODE, BUILD_BYTES_PER_PHYSICAL_NODE,
         BUILD_EXPRESSION_NODES_PER_TEXT_BYTE, BUILD_EXPRESSION_NODE_EXPANSION_FACTOR,
         BUILD_LOGICAL_NODES_PER_EXPRESSION_NODE, RETAINED_BYTES_PER_PHYSICAL_NODE,
@@ -2209,6 +2294,17 @@ mod tests {
     #[test]
     fn zero_limits_and_budget_overflow_are_rejected_before_planning() {
         assert!(PersistedPlanLimits::try_new(0, 1, 1, 1, 1, 1).is_err());
+        let base = PersistedPlanLimits::try_new(4096, 1, 1, 8, 8, 8)
+            .expect("build bounded preflight limits");
+        let wider = PersistedPlanLimits::try_new(4096, 1, 1, 8, 8, 9)
+            .expect("build wider preflight limits");
+        assert!(wider.preflight_peak_bytes().unwrap() > base.preflight_peak_bytes().unwrap());
+        let overflowing = PersistedPlanLimits::try_new(usize::MAX, 1, 1, 1, 1, 1)
+            .expect("build overflowing preflight limits");
+        assert!(matches!(
+            overflowing.preflight_peak_bytes(),
+            Err(datafusion::common::DataFusionError::ResourcesExhausted(_))
+        ));
         let tables = vec![table(0, 1, 1)];
         let bindings = vec![binding("ticks", 0)];
         let tiny_sql_limit =
@@ -2220,6 +2316,31 @@ mod tests {
             error,
             datafusion::common::DataFusionError::ResourcesExhausted(_)
         ));
+    }
+
+    #[test]
+    fn datafusion_failures_map_to_stable_persisted_plan_classes() {
+        use datafusion::common::DataFusionError;
+
+        assert_eq!(
+            classify_persisted_plan_error(&DataFusionError::Context(
+                "bounded planning".to_owned(),
+                Box::new(DataFusionError::ResourcesExhausted("memory".to_owned(),)),
+            )),
+            PersistedPlanErrorClass::ResourceExhausted
+        );
+        assert_eq!(
+            classify_persisted_plan_error(&DataFusionError::NotImplemented("operator".to_owned(),)),
+            PersistedPlanErrorClass::Unsupported
+        );
+        assert_eq!(
+            classify_persisted_plan_error(&DataFusionError::Plan("input".to_owned())),
+            PersistedPlanErrorClass::InvalidInput
+        );
+        assert_eq!(
+            classify_persisted_plan_error(&DataFusionError::Internal("bug".to_owned())),
+            PersistedPlanErrorClass::Internal
+        );
     }
 
     #[test]

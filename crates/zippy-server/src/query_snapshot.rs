@@ -25,7 +25,7 @@ use zippy_query::{
     PersistedTableDescription,
 };
 use zippy_types::catalog::CatalogSnapshotSelector;
-use zippy_types::query::QueryTableVersion;
+use zippy_types::query::{QueryInstanceId, QueryTableVersion};
 use zippy_types::storage::{
     CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseDescriptor, OpaqueQueryReadSnapshot,
     QueryReadSnapshotDescriptor, QueryReadSnapshotGuard, TableReadSnapshotDescriptor,
@@ -460,6 +460,39 @@ impl NativeQuerySnapshotCoordinator {
             .with_retryable(false));
         }
         Ok(())
+    }
+
+    /// Validates the complete execution-to-snapshot binding before physical plan ownership moves.
+    pub(crate) fn validate_execution_binding(
+        &self,
+        execution: &QueryExecutionScope,
+        expected_instance: QueryInstanceId,
+        expected_revision: u64,
+    ) -> Result<()> {
+        if execution.instance_id() != expected_instance {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "native query execution belongs to another query instance",
+            )
+            .with_query_id(expected_instance.query_id())
+            .with_retryable(false));
+        }
+        execution.with_snapshot::<NativeQueryReadSnapshot, _>(|snapshot| {
+            self.validate_origin(snapshot)?;
+            if snapshot.descriptor.query_id != expected_instance.query_id() {
+                return Err(corruption(
+                    expected_instance.query_id(),
+                    "native query snapshot belongs to another query identity",
+                ));
+            }
+            if snapshot.descriptor.catalog_revision != expected_revision {
+                return Err(corruption(
+                    expected_instance.query_id(),
+                    "native query snapshot catalog revision differs from the execution manifest",
+                ));
+            }
+            Ok(())
+        })
     }
 
     /// Admits one table task before cloning its capability from the pinned snapshot.

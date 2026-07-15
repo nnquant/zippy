@@ -2031,6 +2031,95 @@ impl CoordinatorInner {
         })
     }
 
+    fn grow_task_memory(
+        &self,
+        control: &Arc<QueryControl>,
+        current_memory_bytes: NonZeroU64,
+        required_memory_bytes: NonZeroU64,
+    ) -> Result<()> {
+        if required_memory_bytes < current_memory_bytes {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    concat!(
+                        "query task memory charge cannot shrink ",
+                        "current_bytes=[{}] required_bytes=[{}]"
+                    ),
+                    current_memory_bytes, required_memory_bytes
+                ),
+            )
+            .with_query_id(control.query_id)
+            .with_retryable(false));
+        }
+
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Running {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not running")
+                    .with_query_id(control.query_id),
+            );
+        }
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(control.query_id));
+        }
+        if required_memory_bytes == current_memory_bytes {
+            return Ok(());
+        }
+
+        let additional_memory_bytes = required_memory_bytes
+            .get()
+            .checked_sub(current_memory_bytes.get())
+            .expect("validated query task memory growth is monotonic");
+        let query_task_memory_after = query
+            .active_task_memory_bytes
+            .checked_add(additional_memory_bytes);
+        let query_memory_after = query_task_memory_after
+            .and_then(|task_memory| task_memory.checked_add(query.active_snapshot_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_result_memory_bytes));
+        if query_memory_after.is_none_or(|value| value > control.budget.max_memory_bytes) {
+            return Err(exhausted(
+                control.query_id,
+                "per-query task memory growth is exhausted",
+            ));
+        }
+
+        let global_task_memory_after = global
+            .active_task_memory_bytes
+            .checked_add(additional_memory_bytes);
+        let global_memory_after = global_task_memory_after
+            .and_then(|task_memory| task_memory.checked_add(global.active_snapshot_memory_bytes))
+            .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes))
+            .and_then(|memory| memory.checked_add(global.active_result_memory_bytes));
+        if global_memory_after.is_none_or(|value| value > self.config.max_memory_bytes) {
+            return Err(exhausted(
+                control.query_id,
+                "global task memory growth is exhausted",
+            ));
+        }
+
+        query.active_task_memory_bytes =
+            query_task_memory_after.expect("validated per-query task memory growth");
+        global.active_task_memory_bytes =
+            global_task_memory_after.expect("validated global task memory growth");
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active task retains its session resource ledger");
+        session.active_task_memory_bytes = session
+            .active_task_memory_bytes
+            .checked_add(additional_memory_bytes)
+            .expect("session task memory accounting remains within global budget");
+        Ok(())
+    }
+
     fn release_task(&self, control: &Arc<QueryControl>, charge: QueryTaskCharge) {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
@@ -3257,7 +3346,7 @@ impl QueryExecutionScope {
     ///
     /// The callback boundary prevents a reference from escaping the ownership lock. A physical
     /// planner may clone only lease-bound task capabilities from the concrete guard.
-    fn with_snapshot<T, R>(&self, inspect: impl FnOnce(&T) -> Result<R>) -> Result<R>
+    pub(crate) fn with_snapshot<T, R>(&self, inspect: impl FnOnce(&T) -> Result<R>) -> Result<R>
     where
         T: Any + Send,
     {
@@ -3422,6 +3511,22 @@ struct QueryTaskReservation {
 }
 
 impl QueryTaskReservation {
+    fn try_grow_memory_to(&mut self, required_memory_bytes: NonZeroU64) -> Result<()> {
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| unavailable(self.control.query_id))?;
+        let charge = self
+            .charge
+            .expect("live task reservation retains its resource charge");
+        owner.grow_task_memory(&self.control, charge.memory_bytes, required_memory_bytes)?;
+        self.charge = Some(QueryTaskCharge {
+            memory_bytes: required_memory_bytes,
+            ..charge
+        });
+        Ok(())
+    }
+
     fn try_into_result(&mut self, charge: QueryResultCharge) -> Result<QueryResultReservation> {
         let owner = self
             .owner
@@ -3568,12 +3673,31 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
             .load(Ordering::Acquire)
     }
 
+    pub(crate) fn query_id(&self) -> QueryId {
+        self.reservation
+            .as_ref()
+            .expect("live task permit retains its resource reservation")
+            .control
+            .query_id
+    }
+
     pub(crate) fn cancellation(&self) -> QueryCancellation {
         self.reservation
             .as_ref()
             .expect("live task permit retains its resource reservation")
             .control
             .cancellation()
+    }
+
+    /// Grows this task's memory reservation to an exact monotonic target.
+    ///
+    /// Query, session, and global ledgers change atomically only after both configured memory
+    /// budgets accept the additional bytes. A rejection leaves the original charge unchanged.
+    pub(crate) fn grow_memory_to(&mut self, required_memory_bytes: NonZeroU64) -> Result<()> {
+        self.reservation
+            .as_mut()
+            .expect("live task permit retains its resource reservation")
+            .try_grow_memory_to(required_memory_bytes)
     }
 
     /// Replaces a task resource without releasing its snapshot owner or resource reservation.
@@ -3738,6 +3862,18 @@ pub(crate) struct QueryRetainedPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryRetainedPermit<R> {
+    pub(crate) fn instance_id(&self) -> QueryInstanceId {
+        let control = &self
+            .reservation
+            .as_ref()
+            .expect("live retained permit owns its memory reservation")
+            .control;
+        QueryInstanceId::new(
+            control.query_id,
+            NonZeroU64::new(control.generation).expect("QueryService query generation is nonzero"),
+        )
+    }
+
     pub(crate) fn resource(&self) -> &R {
         self.resource
             .as_ref()
@@ -3963,6 +4099,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use zippy_query::{parquet_metadata_memory_charge, PARQUET_TRAILER_SIZE_BYTES};
     use zippy_types::query::QueryOwnerCapability;
     use zippy_types::storage::{
         CatalogSnapshotMemoryLease, OpaqueQueryReadSnapshot, QueryReadSnapshotDescriptor,
@@ -5491,6 +5628,149 @@ mod tests {
         drop((first, second));
         assert_eq!(coordinator.status().active_tasks, 0);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn task_memory_growth_is_atomic_across_query_global_and_session_ledgers() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let full_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let first_session = session_id(1);
+        let second_session = session_id(2);
+        let first_id = query_id(1);
+        let second_id = query_id(2);
+        let first = coordinator
+            .register_planned_for_session(
+                info(first_id, 100),
+                first_session,
+                None,
+                full_budget,
+                snapshot(first_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .register_planned_for_session(
+                info(second_id, 100),
+                second_session,
+                None,
+                full_budget,
+                snapshot(second_id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let first = coordinator.begin_execution(first, 11).unwrap();
+        let second = coordinator.begin_execution(second, 11).unwrap();
+        let mut first_task = first.admit_task(charge(1, 20), ()).unwrap();
+        let second_task = second.admit_task(charge(1, 60), ()).unwrap();
+
+        first_task
+            .grow_memory_to(NonZeroU64::new(30).unwrap())
+            .expect("grow admitted task memory");
+        assert_eq!(coordinator.status().active_task_memory_bytes, 90);
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .status(first.instance_id())
+                .unwrap()
+                .active_task_memory_bytes,
+            30
+        );
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(first_session)
+                .active_task_memory_bytes,
+            30
+        );
+
+        let rejected = first_task
+            .grow_memory_to(NonZeroU64::new(50).unwrap())
+            .expect_err("global task memory growth must be bounded");
+        assert_eq!(rejected.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 90);
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .session_status(first_session)
+                .active_task_memory_bytes,
+            30
+        );
+
+        let shrink = first_task
+            .grow_memory_to(NonZeroU64::new(29).unwrap())
+            .expect_err("task memory charge cannot shrink");
+        assert_eq!(shrink.code(), ErrorCode::InvalidArgument);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 90);
+
+        drop((first_task, second_task));
+        assert_eq!(coordinator.status().active_task_memory_bytes, 0);
+        first.finish().unwrap();
+        second.finish().unwrap();
+    }
+
+    #[test]
+    fn oversized_parquet_footer_growth_rejects_and_releases_original_task_charge() {
+        const MEMORY_BUDGET_BYTES: u64 = 1024 * 1024;
+        const INITIAL_TASK_BYTES: u64 = 64 * 1024;
+
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: MEMORY_BUDGET_BYTES,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: MEMORY_BUDGET_BYTES,
+        };
+        let id = query_id(1);
+        let token = coordinator
+            .register_planned_for_session(
+                info(id, 100),
+                session_id(1),
+                None,
+                query_budget,
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                10,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 11).unwrap();
+        let mut task = execution
+            .admit_task(charge(1, INITIAL_TASK_BYTES), ())
+            .unwrap();
+
+        let serialized_footer_bytes = 20_000_u32;
+        let mut trailer = [0_u8; PARQUET_TRAILER_SIZE_BYTES];
+        trailer[..4].copy_from_slice(&serialized_footer_bytes.to_le_bytes());
+        trailer[4..].copy_from_slice(b"PAR1");
+        let required_memory = parquet_metadata_memory_charge(
+            u64::from(serialized_footer_bytes) + PARQUET_TRAILER_SIZE_BYTES as u64,
+            &trailer,
+        )
+        .expect("estimate oversized Parquet footer metadata");
+        assert!(required_memory.get() > MEMORY_BUDGET_BYTES);
+
+        let rejected = task
+            .grow_memory_to(required_memory)
+            .expect_err("oversized decoded Parquet metadata must fail closed");
+        assert_eq!(rejected.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(
+            coordinator.status().active_task_memory_bytes,
+            INITIAL_TASK_BYTES
+        );
+        drop(task);
+        assert_eq!(coordinator.status().active_task_memory_bytes, 0);
+        execution.finish().unwrap();
     }
 
     #[test]

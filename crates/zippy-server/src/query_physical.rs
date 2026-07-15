@@ -5,10 +5,11 @@ use std::num::NonZeroU64;
 
 use zippy_catalog::{PinnedDataFile, PinnedDataFileReader};
 use zippy_query::{
-    deferred_parquet_reader, AdmittedAsyncParquetReader, AdmittedParquetSource,
-    AdmittedRandomAccessFile, BoxedAsyncFileReader,
+    deferred_parquet_reader, parquet_metadata_memory_charge, AdmittedAsyncParquetReader,
+    AdmittedParquetSource, AdmittedRandomAccessFile, BoxedAsyncFileReader,
+    PARQUET_TRAILER_SIZE_BYTES,
 };
-use zippy_types::Result;
+use zippy_types::{ErrorCode, Result, ServerError};
 
 use crate::query_service::{QueryResultCharge, QueryResultPermit, QueryTaskPermit};
 
@@ -25,7 +26,9 @@ impl AdmittedPinnedParquetFile {
     pub(crate) fn open(
         task: QueryTaskPermit<PinnedDataFile>,
     ) -> Result<AdmittedParquetSource<Self>> {
-        let task = task.open_pinned_file()?;
+        let mut task = task.open_pinned_file()?;
+        let metadata_memory_bytes = inspect_parquet_metadata_memory(&task)?;
+        task.grow_memory_to(metadata_memory_bytes)?;
         Ok(AdmittedParquetSource::new(Self { task }))
     }
 
@@ -41,6 +44,59 @@ impl AdmittedPinnedParquetFile {
             })
         })
     }
+}
+
+fn inspect_parquet_metadata_memory(
+    task: &QueryTaskPermit<PinnedDataFileReader>,
+) -> Result<NonZeroU64> {
+    let query_id = task.query_id();
+    let reader = task.pinned_file_reader();
+    let table_id = reader.table_id();
+    let file_id = reader.file_id();
+    let file_size_bytes = reader.file_size_bytes();
+    let trailer_size =
+        u64::try_from(PARQUET_TRAILER_SIZE_BYTES).expect("Parquet trailer length always fits u64");
+    if file_size_bytes < trailer_size {
+        return Err(ServerError::new(
+            ErrorCode::DataCorruption,
+            format!(
+                "Parquet file is shorter than its trailer file_id=[{file_id}] file_size_bytes=[{file_size_bytes}]"
+            ),
+        )
+        .with_query_id(query_id)
+        .with_table_id(table_id)
+        .with_retryable(false));
+    }
+
+    let mut trailer = [0_u8; PARQUET_TRAILER_SIZE_BYTES];
+    reader
+        .read_exact_at(file_size_bytes - trailer_size, &mut trailer)
+        .map_err(|error| {
+            let code = if matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::InvalidData
+            ) {
+                ErrorCode::DataCorruption
+            } else {
+                ErrorCode::Unavailable
+            };
+            ServerError::new(
+                code,
+                format!("read Parquet trailer failed file_id=[{file_id}] error=[{error}]"),
+            )
+            .with_query_id(query_id)
+            .with_table_id(table_id)
+        })?;
+
+    parquet_metadata_memory_charge(file_size_bytes, &trailer).map_err(|error| {
+        ServerError::new(
+            ErrorCode::DataCorruption,
+            format!("invalid Parquet trailer file_id=[{file_id}] error=[{error}]"),
+        )
+        .with_query_id(query_id)
+        .with_table_id(table_id)
+        .with_retryable(false)
+    })
 }
 
 impl AdmittedRandomAccessFile for AdmittedPinnedParquetFile {

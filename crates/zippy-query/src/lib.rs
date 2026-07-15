@@ -10,7 +10,7 @@
 
 use std::future::Future;
 use std::io::{self, Read};
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::reader::{ChunkReader, Length};
+use parquet::file::FOOTER_SIZE;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use zippy_types::{ErrorCode, ServerError};
@@ -34,11 +35,54 @@ pub use persisted_plan::{
     ZippyTableProvider,
 };
 pub use prepared_plan::{
-    prepare_persisted_plan, profile_persisted_plan, PersistedPlanLimits, PersistedPlanProfile,
-    PersistedTableBinding, PreparedPersistedPlan,
+    classify_persisted_plan_error, prepare_persisted_plan, profile_persisted_plan,
+    PersistedPlanErrorClass, PersistedPlanLimits, PersistedPlanProfile, PersistedTableBinding,
+    PreparedPersistedPlan,
 };
 
 const MAX_POSITIONED_READ_BYTES: usize = 1024 * 1024;
+const PARQUET_METADATA_FIXED_MEMORY_BYTES: u64 = 64 * 1024;
+const PARQUET_METADATA_DECODE_EXPANSION_FACTOR: u64 = 64;
+
+/// Exact byte length of the standard Parquet footer trailer.
+pub const PARQUET_TRAILER_SIZE_BYTES: usize = FOOTER_SIZE;
+
+/// Computes a conservative task-memory charge for decoded Parquet file metadata.
+///
+/// The trailer is validated before its serialized footer length is used. The returned charge is
+/// a fixed decoder allowance plus a checked expansion of the serialized footer. Callers must
+/// retain this charge with the [`AsyncFileReader`] for the complete lifetime of any decoded
+/// [`ParquetMetaData`] derived from it.
+///
+/// # Errors
+///
+/// Returns a Parquet error when the trailer magic is invalid, the serialized footer does not fit
+/// inside the verified file length, or the conservative charge calculation overflows.
+pub fn parquet_metadata_memory_charge(
+    file_size_bytes: u64,
+    trailer: &[u8; PARQUET_TRAILER_SIZE_BYTES],
+) -> ParquetResult<NonZeroU64> {
+    let serialized_footer_bytes = u64::try_from(ParquetMetaDataReader::decode_footer(trailer)?)
+        .map_err(|_| ParquetError::General("Parquet footer length does not fit u64".to_owned()))?;
+    let trailer_bytes =
+        u64::try_from(PARQUET_TRAILER_SIZE_BYTES).expect("Parquet trailer length always fits u64");
+    let encoded_metadata_bytes = serialized_footer_bytes
+        .checked_add(trailer_bytes)
+        .ok_or_else(|| ParquetError::General("Parquet footer length overflowed".to_owned()))?;
+    if encoded_metadata_bytes > file_size_bytes {
+        return Err(ParquetError::EOF(format!(
+            "Parquet footer exceeds verified file length footer_bytes=[{serialized_footer_bytes}] file_size_bytes=[{file_size_bytes}]"
+        )));
+    }
+
+    let memory_bytes = serialized_footer_bytes
+        .checked_mul(PARQUET_METADATA_DECODE_EXPANSION_FACTOR)
+        .and_then(|expanded| expanded.checked_add(PARQUET_METADATA_FIXED_MEMORY_BYTES))
+        .ok_or_else(|| {
+            ParquetError::General("Parquet metadata memory charge overflowed".to_owned())
+        })?;
+    Ok(NonZeroU64::new(memory_bytes).expect("fixed Parquet metadata memory allowance is nonzero"))
+}
 
 /// A server-supplied Parquet reader whose concrete storage capability remains opaque here.
 pub type BoxedAsyncFileReader = Box<dyn AsyncFileReader + Send>;
@@ -378,7 +422,9 @@ impl QuerySessionPolicy {
     pub fn create_context(self) -> SessionContext {
         let config = SessionConfig::new()
             .with_target_partitions(self.target_partitions.get())
-            .with_repartition_file_scans(false);
+            .with_repartition_file_scans(false)
+            .with_parquet_page_index_pruning(false)
+            .with_parquet_bloom_filter_pruning(false);
         SessionContext::new_with_config(config)
     }
 }
@@ -400,9 +446,10 @@ mod tests {
     use parquet::file::reader::ChunkReader;
 
     use super::{
-        deferred_parquet_reader, AdmittedAsyncParquetReader, AdmittedParquetSource,
-        AdmittedRandomAccessFile, BoxedAsyncFileReader, QuerySessionPolicy,
-        MAX_POSITIONED_READ_BYTES,
+        deferred_parquet_reader, parquet_metadata_memory_charge, AdmittedAsyncParquetReader,
+        AdmittedParquetSource, AdmittedRandomAccessFile, BoxedAsyncFileReader, QuerySessionPolicy,
+        MAX_POSITIONED_READ_BYTES, PARQUET_METADATA_DECODE_EXPANSION_FACTOR,
+        PARQUET_METADATA_FIXED_MEMORY_BYTES, PARQUET_TRAILER_SIZE_BYTES,
     };
     use zippy_types::{ErrorCode, ServerError};
 
@@ -598,6 +645,40 @@ mod tests {
         bytes
     }
 
+    fn parquet_trailer(serialized_footer_bytes: u32) -> [u8; PARQUET_TRAILER_SIZE_BYTES] {
+        let mut trailer = [0_u8; PARQUET_TRAILER_SIZE_BYTES];
+        trailer[..4].copy_from_slice(&serialized_footer_bytes.to_le_bytes());
+        trailer[4..].copy_from_slice(b"PAR1");
+        trailer
+    }
+
+    #[test]
+    fn parquet_metadata_charge_validates_trailer_and_verified_file_bounds() {
+        let serialized_footer_bytes = 1_024_u32;
+        let trailer = parquet_trailer(serialized_footer_bytes);
+        let charge = parquet_metadata_memory_charge(
+            u64::from(serialized_footer_bytes) + PARQUET_TRAILER_SIZE_BYTES as u64,
+            &trailer,
+        )
+        .expect("charge valid Parquet metadata");
+        assert_eq!(
+            charge.get(),
+            PARQUET_METADATA_FIXED_MEMORY_BYTES
+                + u64::from(serialized_footer_bytes) * PARQUET_METADATA_DECODE_EXPANSION_FACTOR
+        );
+
+        let mut invalid_magic = trailer;
+        invalid_magic[4..].copy_from_slice(b"FAIL");
+        assert!(parquet_metadata_memory_charge(u64::MAX, &invalid_magic).is_err());
+
+        let truncated = parquet_metadata_memory_charge(
+            u64::from(serialized_footer_bytes) + PARQUET_TRAILER_SIZE_BYTES as u64 - 1,
+            &trailer,
+        )
+        .expect_err("serialized footer must fit inside the verified file");
+        assert!(truncated.to_string().contains("verified file length"));
+    }
+
     #[test]
     fn workspace_and_datafusion_record_batches_share_one_arrow_abi() {
         let values = Int64Array::from(vec![1_i64, 2, 3]);
@@ -635,6 +716,9 @@ mod tests {
                 .optimizer
                 .repartition_file_scans
         );
+        assert!(context.state().config().parquet_pruning());
+        assert!(!context.state().config().parquet_page_index_pruning());
+        assert!(!context.state().config().parquet_bloom_filter_pruning());
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,

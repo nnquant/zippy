@@ -734,6 +734,12 @@ fn validate_planning_scan(
             "persisted scan introduced partition columns or output ordering",
         ));
     }
+    let parquet_options = &parquet.table_parquet_options().global;
+    if parquet_options.enable_page_index || parquet_options.bloom_filter_on_read {
+        return Err(binding_error(
+            "persisted scan enabled unaccounted page-index or bloom-filter metadata",
+        ));
+    }
     if config.file_groups.len() != 1 {
         return Err(binding_error(format!(
             "persisted scan must contain exactly one file group actual=[{}]",
@@ -1078,7 +1084,12 @@ impl TableProvider for ZippyTableProvider {
                 builder =
                     builder.with_predicate(state.create_physical_expr(predicate, &table_schema)?);
             }
-            let plan: Arc<dyn ExecutionPlan> = builder.build_arc();
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(
+                builder
+                    .build()
+                    .with_enable_page_index(false)
+                    .with_bloom_filter_on_read(false),
+            );
             Ok(plan)
         })
     }
@@ -1261,9 +1272,13 @@ mod tests {
     }
 
     fn marked_plan(config: FileScanConfig) -> Arc<dyn ExecutionPlan> {
-        ParquetExec::builder(config)
-            .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
-            .build_arc()
+        Arc::new(
+            ParquetExec::builder(config)
+                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
+                .build()
+                .with_enable_page_index(false)
+                .with_bloom_filter_on_read(false),
+        )
     }
 
     fn file_meta(partitioned: &PartitionedFile) -> FileMeta {
@@ -1503,6 +1518,8 @@ mod tests {
         assert!(has_filter_ancestor_of_parquet(&plan));
         let parquet = find_plan::<ParquetExec>(&plan).expect("physical plan contains ParquetExec");
         assert!(parquet.predicate().is_some());
+        assert!(!parquet.table_parquet_options().global.enable_page_index);
+        assert!(!parquet.table_parquet_options().global.bloom_filter_on_read);
         assert_eq!(
             parquet.base_config().object_store_url.as_str(),
             PERSISTED_OBJECT_STORE_URL.to_owned() + "/"
@@ -1545,6 +1562,18 @@ mod tests {
         let bound_parquet = find_plan::<ParquetExec>(bound.execution_plan())
             .expect("bound physical plan contains ParquetExec");
         assert!(!has_factory(bound_parquet, &PLANNING_READER_FACTORY));
+        assert!(
+            !bound_parquet
+                .table_parquet_options()
+                .global
+                .enable_page_index
+        );
+        assert!(
+            !bound_parquet
+                .table_parquet_options()
+                .global
+                .bloom_filter_on_read
+        );
 
         let error = collect(planning_plan, context.task_ctx())
             .await
@@ -1687,6 +1716,32 @@ mod tests {
     fn binder_rejects_tampered_manifest_metadata_before_opening() {
         let table = table(0, 1, 7, &[10, 11]);
         let (opener, requests) = recording_opener(std::slice::from_ref(&table));
+
+        let page_index_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ParquetExec::builder(planning_config(&table))
+                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
+                .build()
+                .with_enable_page_index(true)
+                .with_bloom_filter_on_read(false),
+        );
+        assert!(bind_persisted_snapshot_plan(
+            page_index_plan,
+            std::slice::from_ref(&table),
+            &opener,
+        )
+        .is_err());
+
+        let bloom_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ParquetExec::builder(planning_config(&table))
+                .with_parquet_file_reader_factory(Arc::clone(&PLANNING_READER_FACTORY))
+                .build()
+                .with_enable_page_index(false)
+                .with_bloom_filter_on_read(true),
+        );
+        assert!(
+            bind_persisted_snapshot_plan(bloom_plan, std::slice::from_ref(&table), &opener,)
+                .is_err()
+        );
 
         let mut config = planning_config(&table);
         config.object_store_url = ObjectStoreUrl::local_filesystem();

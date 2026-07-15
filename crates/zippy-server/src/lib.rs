@@ -15,6 +15,9 @@ mod health;
 mod legacy_catalog_migration;
 mod legacy_query;
 mod native_storage;
+// Remove this allowance when the native query frontend owns execution leases directly.
+#[allow(dead_code)]
+mod query_execution;
 // Remove this allowance when the native planner constructs the coordinator directly.
 #[allow(dead_code)]
 mod query_service;
