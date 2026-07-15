@@ -4,7 +4,11 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use zippy_catalog::{
     PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
     SqliteCatalogReadHandle,
@@ -21,7 +25,9 @@ use zippy_types::{
     BoxFuture, ErrorCode, LeaseId, OffsetWatermark, QueryId, Result, ServerError, TableId,
 };
 
-use crate::query_service::{QueryExecutionScope, QueryTaskCharge, QueryTaskPermit};
+use crate::query_service::{
+    QueryExecutionScope, QueryPlanningToken, QueryTaskCharge, QueryTaskPermit,
+};
 
 const MAX_SNAPSHOT_COORDINATION_ATTEMPTS: usize = 3;
 static NEXT_SNAPSHOT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -39,6 +45,22 @@ struct NativeQuerySnapshotCoordinatorInner {
     accepting: AtomicBool,
     active_plans: AtomicUsize,
     next_lease_sequence: AtomicU64,
+    #[cfg(test)]
+    pin_stall: Mutex<Option<TestPinStall>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestPinStall {
+    stage: TestPinStage,
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestPinStage {
+    AfterCatalogPin,
 }
 
 impl NativeQuerySnapshotCoordinator {
@@ -54,33 +76,71 @@ impl NativeQuerySnapshotCoordinator {
                 accepting: AtomicBool::new(true),
                 active_plans: AtomicUsize::new(0),
                 next_lease_sequence: AtomicU64::new(1),
+                #[cfg(test)]
+                pin_stall: Mutex::new(None),
             }),
         }
     }
 
     /// Pins one immutable, persisted-only query boundary.
     ///
+    /// The borrowed planning token proves QueryService registered the exact query generation
+    /// before any Catalog or table-actor work begins and carries cancellation through pinning.
+    ///
     /// Table references are resolved in one Catalog transaction, deduplicated by immutable table
     /// identity, and then observed in stable table-ID order. A successful return owns every
     /// process-local Catalog pin required to keep its physical files outside Safe-GC.
     pub(crate) async fn pin_persisted(
         &self,
-        query_id: QueryId,
+        planning: &QueryPlanningToken,
         tables: &[TableRef],
     ) -> Result<NativeQueryReadSnapshot> {
+        let query_id = planning.instance_id().query_id();
+        self.ensure_planning_active(planning)?;
+        let mut cancellation = planning.cancellation();
         let _admission = self.admit_planning(query_id)?;
         let mut last_retryable_conflict = None;
         for attempt in 0..MAX_SNAPSHOT_COORDINATION_ATTEMPTS {
+            self.ensure_planning_active(planning)?;
             self.ensure_accepting(query_id)?;
-            match self.pin_persisted_once(query_id, tables).await {
-                Ok(snapshot) => return Ok(snapshot),
+            // Every awaited planning stage is owned by this one future. Dropping it abandons only
+            // oneshot responses; Catalog runtime pins inside it are synchronous RAII guards.
+            let outcome = tokio::select! {
+                biased;
+                terminal = cancellation.wait_terminal() => {
+                    return Err(terminal?.error.unwrap_or_else(|| {
+                        ServerError::new(ErrorCode::Cancelled, "query planning was cancelled")
+                            .with_query_id(query_id)
+                            .with_retryable(false)
+                    }));
+                }
+                outcome = self.pin_persisted_once(query_id, tables) => outcome,
+            };
+            self.ensure_planning_active(planning)?;
+            match outcome {
+                Ok(snapshot) => {
+                    return Ok(snapshot);
+                }
                 Err(error)
                     if error.code() == ErrorCode::Conflict
                         && error.retryable()
                         && attempt + 1 < MAX_SNAPSHOT_COORDINATION_ATTEMPTS =>
                 {
                     last_retryable_conflict = Some(error);
-                    tokio::task::yield_now().await;
+                    tokio::select! {
+                        biased;
+                        terminal = cancellation.wait_terminal() => {
+                            return Err(terminal?.error.unwrap_or_else(|| {
+                                ServerError::new(
+                                    ErrorCode::Cancelled,
+                                    "query planning was cancelled",
+                                )
+                                .with_query_id(query_id)
+                                .with_retryable(false)
+                            }));
+                        }
+                        () = tokio::task::yield_now() => {}
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -93,6 +153,39 @@ impl NativeQuerySnapshotCoordinator {
             .with_query_id(query_id)
             .with_retryable(false)
         }))
+    }
+
+    fn ensure_planning_active(&self, planning: &QueryPlanningToken) -> Result<()> {
+        if !planning.is_cancelled() {
+            return Ok(());
+        }
+        let query_id = planning.instance_id().query_id();
+        if let Some(error) = planning.terminal_error() {
+            return Err(error);
+        }
+        Err(ServerError::new(
+            ErrorCode::Cancelled,
+            "query planning cancellation is pending",
+        )
+        .with_query_id(query_id)
+        .with_retryable(false))
+    }
+
+    #[cfg(test)]
+    fn install_pin_stall(&self, stage: TestPinStage) -> TestPinStall {
+        let stall = TestPinStall {
+            stage,
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        let previous = self
+            .inner
+            .pin_stall
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(stall.clone());
+        assert!(previous.is_none(), "only one pin stall may be installed");
+        stall
     }
 
     pub(crate) fn close_admission(&self) {
@@ -239,6 +332,8 @@ impl NativeQuerySnapshotCoordinator {
             .catalog
             .read_pinned_query_snapshot_at(query_id, &pin_requests)
             .await?;
+        #[cfg(test)]
+        self.wait_for_pin_stall(TestPinStage::AfterCatalogPin).await;
         let tables = self.finalize_descriptors(query_id, &boundaries, &pin_requests, &pinned)?;
         let descriptor = QueryReadSnapshotDescriptor {
             query_id,
@@ -250,6 +345,31 @@ impl NativeQuerySnapshotCoordinator {
             pinned,
             coordinator_nonce: self.inner.nonce,
         })
+    }
+
+    #[cfg(test)]
+    async fn wait_for_pin_stall(&self, stage: TestPinStage) {
+        let stall = {
+            let mut slot = self
+                .inner
+                .pin_stall
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if slot.as_ref().is_some_and(|stall| stall.stage == stage) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(stall) = stall {
+            stall.started.add_permits(1);
+            let permit = stall
+                .release
+                .acquire()
+                .await
+                .expect("test pin stall semaphore remains open");
+            permit.forget();
+        }
     }
 
     fn finalize_descriptors(
@@ -523,12 +643,14 @@ mod tests {
     };
     use zippy_types::{NamespaceId, QueryId, RequestId, SessionId, TableId};
 
-    use super::NativeQuerySnapshotCoordinator;
+    use super::{NativeQuerySnapshotCoordinator, TestPinStage};
     use crate::legacy_catalog_migration::LEGACY_STREAM_NAME_CONFIG_KEY;
     use crate::native_storage::{
         NativeStorageRuntime, NativeStorageRuntimeConfig, NativeStorageShutdownOutcome,
     };
-    use crate::query_service::{QueryResourceBudget, QueryServiceRegistryConfig, QueryTaskCharge};
+    use crate::query_service::{
+        QueryResourceBudget, QueryServiceRegistryConfig, QuerySubmissionMetadata, QueryTaskCharge,
+    };
 
     const NAMESPACE: u128 = 1;
     const NATIVE_TABLE: u128 = 10;
@@ -727,8 +849,21 @@ mod tests {
         assert_eq!(runtime.table_runtime_count(), 1);
         let snapshot_coordinator = runtime.query_snapshot_coordinator();
         let query = query_id(101);
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register planning before snapshot pin");
         let snapshot = snapshot_coordinator
-            .pin_persisted(query, &mixed_refs())
+            .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin mixed query snapshot");
         let info = snapshot.plan_info(10, 100);
@@ -756,17 +891,9 @@ mod tests {
             .iter()
             .all(|record| descriptor_lease_ids.contains(&record.lease_id)));
 
-        let resources = runtime.query_resource_coordinator();
         let token = resources
-            .register_planned_for_session(
-                info,
-                session_id(),
-                None,
-                budget(),
-                snapshot.into_opaque(),
-                10,
-            )
-            .expect("register pinned plan");
+            .complete_planning_at_for_test(planning, info, snapshot.into_opaque(), 10)
+            .expect("complete pinned plan");
         let execution = resources
             .begin_execution(token, 11)
             .expect("begin pinned execution");
@@ -819,12 +946,28 @@ mod tests {
     async fn multi_table_pin_budget_failure_rolls_back_every_pin_and_audit_record() {
         let (_temp, _ownership, mut runtime) = start_runtime(1).await;
         let coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query_id(102),
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register planning before snapshot pin");
         let error = coordinator
-            .pin_persisted(query_id(102), &mixed_refs())
+            .pin_persisted(&planning, &mixed_refs())
             .await
             .err()
             .expect("second table must exhaust pin budget");
         assert_eq!(error.code(), zippy_types::ErrorCode::ResourceExhausted);
+        resources
+            .fail_planning(planning, error)
+            .expect("snapshot planning failure is terminal");
         let status = runtime
             .runtime_snapshot_pin_status()
             .expect("read pin status");
@@ -838,25 +981,136 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_planning_token_cannot_start_snapshot_pinning() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query_id(105),
+                    deadline_ns: Some(20),
+                },
+                budget(),
+                10,
+            )
+            .expect("register planning before deadline");
+        assert_eq!(resources.sweep_expired(20), 1);
+
+        let error = snapshot_coordinator
+            .pin_persisted(&planning, &mixed_refs())
+            .await
+            .err()
+            .expect("timed-out planning cannot pin snapshots");
+        assert_eq!(error.code(), zippy_types::ErrorCode::DeadlineExceeded);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("read pin status")
+                .active_query_pins,
+            0
+        );
+        drop(planning);
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_actively_interrupts_a_stalled_snapshot_pin_and_returns_bounded() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let stall = snapshot_coordinator.install_pin_stall(TestPinStage::AfterCatalogPin);
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query_id(106),
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register stalled planning query");
+        let pin_coordinator = snapshot_coordinator.clone();
+        let pin_task = tokio::spawn(async move {
+            let result = pin_coordinator
+                .pin_persisted(&planning, &mixed_refs())
+                .await
+                .map(|_| ());
+            drop(planning);
+            result
+        });
+        let started = tokio::time::timeout(Duration::from_secs(1), stall.started.acquire())
+            .await
+            .expect("stalled pin must enter its awaited stage")
+            .expect("test stall semaphore remains open");
+        started.forget();
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("stalled pin status")
+                .active_query_pins,
+            2
+        );
+
+        let shutdown = tokio::task::spawn_blocking(move || {
+            let outcome = runtime.shutdown(Duration::from_secs(1));
+            let remaining_query_pins = runtime.runtime_query_snapshot_pins();
+            (runtime, outcome, remaining_query_pins)
+        });
+        let pin_error = tokio::time::timeout(Duration::from_secs(1), pin_task)
+            .await
+            .expect("shutdown cancellation must wake stalled pin")
+            .expect("stalled pin task must join")
+            .expect_err("shutdown must cancel stalled pin");
+        assert_eq!(pin_error.code(), zippy_types::ErrorCode::Cancelled);
+        let (_runtime, outcome, remaining_query_pins) =
+            tokio::time::timeout(Duration::from_secs(2), shutdown)
+                .await
+                .expect("native shutdown must remain bounded")
+                .expect("native shutdown worker must join");
+        assert!(outcome.is_complete());
+        match remaining_query_pins {
+            Ok(records) => assert!(records.is_empty()),
+            Err(error) => assert_eq!(error.code(), zippy_types::ErrorCode::Unavailable),
+        }
+        assert_eq!(resources.status().active_snapshot_owners, 0);
+        assert!(snapshot_coordinator.planning_drained());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retained_plan_token_cannot_keep_catalog_pins_after_ttl() {
         let (_temp, _ownership, mut runtime) = start_runtime(8).await;
         let snapshot_coordinator = runtime.query_snapshot_coordinator();
         let query = query_id(103);
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register planning before snapshot pin");
         let snapshot = snapshot_coordinator
-            .pin_persisted(query, &mixed_refs())
+            .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin query snapshot");
-        let resources = runtime.query_resource_coordinator();
         let token = resources
-            .register_planned_for_session(
+            .complete_planning_at_for_test(
+                planning,
                 snapshot.plan_info(10, 20),
-                session_id(),
-                None,
-                budget(),
                 snapshot.into_opaque(),
                 10,
             )
-            .expect("register plan token");
+            .expect("complete plan token");
         assert_eq!(
             runtime
                 .runtime_snapshot_pin_status()
@@ -880,9 +1134,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_storage_shutdown_waits_until_the_final_query_pin_is_released() {
         let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query_id(104),
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register planning before snapshot pin");
         let snapshot = runtime
             .query_snapshot_coordinator()
-            .pin_persisted(query_id(104), &mixed_refs())
+            .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin query snapshot");
         assert!(matches!(
@@ -897,6 +1164,7 @@ mod tests {
             2
         );
         drop(snapshot);
+        drop(planning);
         assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
     }
 }

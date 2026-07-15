@@ -1061,14 +1061,21 @@ Substrait plan（后续可选）
 服务器完成：
 
 ```text
-parse
+submit + logical admission
+-> parse
 -> bind against catalog snapshot
 -> type check
 -> optimize
 -> create physical plan
--> admission
+-> complete planning + attach snapshot root
 -> execute
 ```
+
+`submit` 必须发生在 parse/bind 和 snapshot pin 之前。它同步分配不可复用的
+`QueryInstanceId(QueryId, generation)`，用服务端时钟记录 `submitted_at_ns`，把实例以
+`Planning` 放入有界 registry，并返回不可伪造、不可 `Clone` 的一次性 planning token。token 提供
+exact instance 与 cancellation；planner 只能消费它调用 `complete_planning` 或 `fail_planning`。
+token 未消费即 drop 表示 `Cancelled`，不能把 planner error 静默改写成 cancellation。
 
 Python 不再进行 remote/residual plan split。若服务端不支持某个操作，应在执行前返回
 `UNSUPPORTED_PLAN`，不能先拉取全表后在客户端悄悄执行。
@@ -1077,14 +1084,13 @@ Python 不再进行 remote/residual plan split。若服务端不支持某个操�
 
 ```rust
 pub struct QueryRecord {
-    pub query_id: QueryId,
-    pub session_id: SessionId,
+    pub instance_id: QueryInstanceId,
+    pub owner_session_id: SessionId,
     pub submitted_at_ns: u64,
+    pub plan: Option<QueryPlanStatus>,
     pub started_at_ns: Option<u64>,
     pub finished_at_ns: Option<u64>,
     pub state: QueryState,
-    pub catalog_revision: u64,
-    pub snapshots: Vec<(TableId, u64)>,
     pub priority: QueryPriority,
     pub deadline_ns: Option<u64>,
     pub memory_limit_bytes: usize,
@@ -1092,15 +1098,35 @@ pub struct QueryRecord {
     pub cancellation: CancellationToken,
     pub metrics: QueryMetrics,
 }
+
+pub struct QueryPlanStatus {
+    pub planned_at_ns: u64,
+    pub expires_at_ns: u64,
+    pub catalog_revision: u64,
+    pub snapshots: Vec<QueryTableVersion>,
+}
 ```
+
+`plan=None` 表示尚未 bind snapshot；`plan=Some` 且 `snapshots=[]` 表示合法的无表查询。禁止用零
+revision、空 snapshots 或登记时间填充尚未发生的 plan 指标。`complete_planning` 的线性化点必须在
+`global -> query` 锁序内一次完成 snapshot root、snapshot owner 计数、plan metadata、plan TTL 与
+`Planning -> Planned`；任一失败要么保留已经发生的 first-terminal，要么落成 `Failed`/`TimedOut`，
+不能遗留无 planning token 的孤儿 `Planning`。
+
+即使请求未提供 deadline，服务端也必须设置非零 `max_planning_duration`。当前 native 默认 30 秒，与
+legacy QueryEngine 的 plan TTL 对齐，避免迁移期出现两套明显不同的悬挂窗口。Planning 实际 deadline 为
+`min(request_deadline, submitted_at + max_planning_duration)`；进入 Planned 时必须原子删除该 deadline，
+再安装仍需覆盖 Planned/Running 的 request deadline 和只覆盖 Planned 的 plan TTL。
 
 状态机：
 
 ```text
-submitted -> queued -> planning -> running -> finished
-                                      |-> failed
-                                      |-> cancelled
-                                      |-> timed_out
+submitted -> queued -> planning -> planned -> running -> finished
+                         |          |          |-> failed
+                         |          |          |-> cancelled
+                         |          |          |-> timed_out
+                         |          |-> failed/cancelled/timed_out
+                         |-> failed/cancelled/timed_out
 ```
 
 取消必须传播到 Parquet scan、active segment scan、sort/join/aggregate 和结果 socket。
@@ -1989,10 +2015,13 @@ token 或 execution scope 仍被调用方持有，它们的 drop/cancel 也不�
 仍有 physical task 的 terminal query 不进入可淘汰堆，避免以缩小 registry 为名提前复用身份或丢失 pin
 撤销根。终态保留只保留控制状态，不保留已经可释放的 snapshot、task、CPU 或 memory 预算。
 
-QueryService 现在还维护严格有界的 deadline `BTreeSet`：planned TTL 和 execution deadline 各占一个
-带 generation 的有序 key，开始执行、任一 terminal 转换都会精确删除对应 key。到期处理只弹出当前
-时刻已经 due 的实例，不再周期性复制和扫描整个 registry；旧 generation 的 timer 即使残留也不能命中
-新实例。默认 100 ms 的具名 sweeper 使用可中断 `Condvar`，只持有 coordinator weak reference，
+QueryService 现在还维护严格有界的 deadline `BTreeSet`。`submit` 只登记一个 generation-bound
+`PlanningExpiry=min(request deadline, submitted_at+max_planning_duration)`；native 默认 planning 上限为
+30 秒，与 legacy plan TTL 对齐。`complete_planning` 在同一线性化点删除 PlanningExpiry，再登记覆盖
+`Planned`/`Running` 的 request deadline（若有）和只覆盖未执行 `Planned` 的 plan TTL。开始执行会删除
+plan TTL，任一 terminal 转换都会精确删除全部对应 key。到期处理只弹出当前时刻已经 due 的实例，不再
+周期性复制和扫描整个 registry；旧 generation 的 timer 即使残留也不能命中新实例。默认 100 ms 的具名
+sweeper 使用可中断 `Condvar`，只持有 coordinator weak reference，
 QueryService shutdown 会发停止信号并 join，不能遗留 detached sleeping thread。terminal 转换在
 global/query 锁内只更新状态，随后在锁外通过 watch channel 发布一次终态通知；physical task permit 可
 取得不暴露 reader capability 的 cancellation handle，既保留低成本 atomic 检查，也能异步等待主动唤醒。
@@ -2000,16 +2029,39 @@ global/query 锁内只更新状态，随后在锁外通过 watch channel 发布�
 查询控制契约不再使用裸 `QueryId`。`QueryInstanceId` 将 caller-assigned ID 与非零 generation 绑定，
 execution token、result stream、status 和 cancel 均携带这一 exact-instance fence；保留期后同 ID 新实例
 出现时，任何旧 owner/admin 请求都返回 `NOT_FOUND`，不会回退命中新 generation。generation 只解决 ABA，
-不等价于授权：native QueryService 的 planned registration 已要求 engine-bound owner capability，并把
-session 与 owner nonce 固化进 control；普通 owner 和 admin 使用不同 handle，同 session 的另一 capability
+不等价于授权：native QueryService 的 submission 已要求 engine-bound owner capability，并把 session 与
+owner nonce 固化进 control；普通 owner 和 admin 使用不同 handle，同 session 的另一 capability
 也不能读取或取消该实例。仅供单元测试的裸 QueryId helper 在生产构建中不存在。
 
-这一小步仍只覆盖 `Planned` 之后的 native staging 路径。完整 `QueryStatus`、planning 状态注册、session
-资源账本以及 DataFusion operator/result-stream 的实际取消传播尚未完成；不能用 `planned_at` 或登记时间
-冒充 `submitted_at`。下一步必须在 snapshot pin 之前同步 `submit`，立即分配 generation、登记
-`Planning`、返回 generation-bound planning handle，再异步完成 pin/plan。当前 Python/Gateway
-`collect_stream` 仍绕过 native QueryService，也没有可信的 per-connection owner session，因此不能据此
-宣称生产查询已经获得多租户隔离或统一资源治理。
+Stage 4.3 planning 前移小步已完成（2026-07-15）：生产 API 先调用 `submit(owner, metadata, budget)`，
+由 QueryService 服务端时钟记录 `submitted_at_ns`、分配 generation、以 `Planning` 登记并返回私有字段、
+不可 `Clone` 的 `QueryPlanningToken`。token 暴露 exact instance 和 cancellation，且必须被
+`complete_planning` 或 `fail_planning` 消费；未消费 drop 精确取消该 generation。显式 planner error 落
+`Failed`，不会被 token drop 覆盖成 `Cancelled`。超时、owner/admin cancel、shutdown 和 complete 竞争均
+遵循 first-terminal；late complete 不会挂载 snapshot。
+
+`NativeQuerySnapshotCoordinator::pin_persisted` 现在必须借用 planning token，因而生产类型签名不再允许
+先 pin、后登记。整个 resolve tables、table actor snapshot wait、Catalog pin/read future 与 terminal watch
+使用 cancellation-priority `tokio::select!` 竞争，而非只在 await 前后轮询；timeout、cancel 或 shutdown 会
+主动 drop 当前 planning future。Catalog resolve/read 的迟到 oneshot 响应只会被丢弃，TableActor snapshot
+命令仍完成并释放其有界 permit，Catalog query pins 则由 future 内同步 RAII guard 立即全量撤销。成功返回
+后仍复核 first-terminal，防止同一 poll 边界的 late cancel 挂载 snapshot。`complete_planning` 使用固定
+`global -> query` 锁序，在一个
+线性化点同时挂载 snapshot root、增加 owner 计数、安装 server-side `planned_at`/catalog/snapshots、加入
+plan TTL 并执行 `Planning -> Planned`。snapshot owner 容量、plan 过期或其他 completion 失败不会留下
+无人持有的 `Planning`。一次性 token 使安全 Rust 调用方无法重复 complete；foreign service token 被
+origin nonce 拒绝并由原服务 drop-cancel。
+
+native `QueryRuntimeStatus` 分开记录可信 `submitted_at_ns`、可选 `plan: QueryPlanStatus`、可选
+`started_at_ns` 和 `finished_at_ns`。`plan=None` 明确表示尚未 bind；`Some` 内的空 snapshots 才表示合法
+无表计划，避免用零 revision、空数组或调用方 supplied `planned_at` 伪造规划指标。测试专用
+`*_at`/planned-registration helper 只在 `cfg(test)` 存在，用于确定性 deadline 和保持旧 Planned+ 单测；
+生产调用方只能走 submit-first 流程。
+
+这一小步仍是 native staging，不是 authority 切换。session 资源账本、完整外部 `QueryStatus`、
+DataFusion operator/result-stream 的实际取消传播仍未完成；当前 Python/Gateway `collect_stream` 也仍绕过
+native QueryService，且没有可信的 per-connection owner session，因此不能据此宣称生产查询已经获得
+多租户隔离或统一资源治理。
 
 任务：
 

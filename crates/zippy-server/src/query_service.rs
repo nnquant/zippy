@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use zippy_types::query::{
     OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryExecutionToken, QueryInstanceId,
-    QueryOwnerCapability, QueryPlanInfo, QueryState,
+    QueryOwnerCapability, QueryPlanInfo, QueryState, QueryTableVersion,
 };
 use zippy_types::storage::OpaqueQueryReadSnapshot;
 use zippy_types::{ErrorCode, QueryId, Result, ServerError, SessionId};
@@ -25,6 +25,7 @@ static NEXT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_secs(300);
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_MAX_PLANNING_DURATION: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_REGISTERED_QUERIES: usize = 4096;
 const DEFAULT_MAX_QUERY_TOMBSTONES: usize = 65_536;
 const QUERY_SWEEPER_THREAD_NAME: &str = "zippy-query-sweeper";
@@ -66,6 +67,7 @@ impl QueryServiceResourceConfig {
 pub(crate) struct QueryServiceRegistryConfig {
     pub sweep_interval: Duration,
     pub terminal_retention: Duration,
+    pub max_planning_duration: Duration,
     pub max_registered_queries: usize,
     pub max_query_tombstones: usize,
 }
@@ -75,6 +77,7 @@ impl Default for QueryServiceRegistryConfig {
         Self {
             sweep_interval: DEFAULT_SWEEP_INTERVAL,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
+            max_planning_duration: DEFAULT_MAX_PLANNING_DURATION,
             max_registered_queries: DEFAULT_MAX_REGISTERED_QUERIES,
             max_query_tombstones: DEFAULT_MAX_QUERY_TOMBSTONES,
         }
@@ -85,11 +88,12 @@ impl QueryServiceRegistryConfig {
     pub(crate) fn validate(self, resources: QueryServiceResourceConfig) -> Result<Self> {
         if self.sweep_interval.is_zero()
             || self.terminal_retention.is_zero()
+            || self.max_planning_duration.is_zero()
             || self.max_registered_queries == 0
             || self.max_query_tombstones == 0
         {
             return Err(invalid(
-                "query service registry retention and capacities must be positive",
+                "query service registry durations and capacities must be positive",
             ));
         }
         if self.max_registered_queries < resources.max_active_queries {
@@ -106,6 +110,15 @@ pub(crate) struct QueryResourceBudget {
     pub max_active_tasks: usize,
     pub max_cpu_slots: u32,
     pub max_memory_bytes: u64,
+}
+
+/// Immutable request metadata retained before snapshot resolution starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuerySubmissionMetadata {
+    /// Caller-assigned identity; QueryService adds a process-local generation at admission.
+    pub query_id: QueryId,
+    /// Absolute Unix-nanosecond deadline for planning, execution, and result delivery.
+    pub deadline_ns: Option<u64>,
 }
 
 impl QueryResourceBudget {
@@ -153,11 +166,24 @@ pub(crate) struct QueryServiceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryPlanStatus {
+    pub planned_at_ns: u64,
+    pub expires_at_ns: u64,
+    pub catalog_revision: u64,
+    /// An empty vector is a legitimately planned table-free query.
+    pub snapshots: Vec<QueryTableVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueryRuntimeStatus {
     pub query_id: QueryId,
     pub generation: u64,
     pub owner_session_id: SessionId,
     pub state: QueryState,
+    pub submitted_at_ns: u64,
+    /// `None` means snapshot planning has not completed; a present empty snapshot list is valid.
+    pub plan: Option<QueryPlanStatus>,
+    pub started_at_ns: Option<u64>,
     pub logical_admitted: bool,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
@@ -239,6 +265,7 @@ impl QueryResourceCoordinator {
             terminal_retention_ns: duration_ns(registry_config.terminal_retention),
             max_registered_queries: registry_config.max_registered_queries,
             max_query_tombstones: registry_config.max_query_tombstones,
+            max_planning_duration_ns: duration_ns(registry_config.max_planning_duration),
             next_query_generation: AtomicU64::new(1),
             next_owner_nonce: AtomicU64::new(1),
             state: Mutex::new(CoordinatorState::default()),
@@ -264,24 +291,40 @@ impl QueryResourceCoordinator {
         }
     }
 
-    pub(crate) fn register_planned(
+    /// Admits a query before snapshot resolution or physical planning starts.
+    pub(crate) fn submit(
         &self,
         owner: &dyn QueryOwnerCapability,
-        info: QueryPlanInfo,
-        execution_deadline_ns: Option<u64>,
+        metadata: QuerySubmissionMetadata,
         budget: QueryResourceBudget,
-        snapshot: OpaqueQueryReadSnapshot,
-        now_ns: u64,
-    ) -> Result<OpaqueQueryExecutionToken> {
+    ) -> Result<QueryPlanningToken> {
+        self.submit_at(owner, metadata, budget, now_ns())
+    }
+
+    fn submit_at(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        metadata: QuerySubmissionMetadata,
+        budget: QueryResourceBudget,
+        submitted_at_ns: u64,
+    ) -> Result<QueryPlanningToken> {
         let owner = self.validate_owner(owner)?;
-        let query_id = info.query_id;
+        let query_id = metadata.query_id;
         let budget = budget.validate(self.inner.config)?;
-        validate_plan_snapshot_binding(&info, snapshot.descriptor())?;
-        if info.expires_at_ns <= now_ns
-            || execution_deadline_ns.is_some_and(|deadline| deadline <= now_ns)
+        if metadata
+            .deadline_ns
+            .is_some_and(|deadline| deadline <= submitted_at_ns)
         {
-            return Err(deadline(query_id, "query expired before plan registration"));
+            return Err(deadline(query_id, "query expired before submission"));
         }
+        let server_planning_deadline_ns = submitted_at_ns
+            .checked_add(self.inner.max_planning_duration_ns)
+            .ok_or_else(|| deadline(query_id, "query planning deadline exceeds Unix time range"))?;
+        let planning_deadline_ns = metadata
+            .deadline_ns
+            .map_or(server_planning_deadline_ns, |request_deadline_ns| {
+                request_deadline_ns.min(server_planning_deadline_ns)
+            });
 
         let generation = self.inner.next_query_generation();
         let (terminal_sender, _) = watch::channel(None);
@@ -292,19 +335,19 @@ impl QueryResourceCoordinator {
             owner_session_id: owner.session_id,
             owner_nonce: owner.owner_nonce,
             budget,
-            plan_expires_at_ns: info.expires_at_ns,
-            execution_deadline_ns,
+            submitted_at_ns,
+            request_deadline_ns: metadata.deadline_ns,
+            planning_deadline_ns,
             cancelled: Arc::new(AtomicBool::new(false)),
             terminal_sender,
             state: Mutex::new(QueryControlState::default()),
         });
-        let ownership;
         {
             let mut state = self.inner.state.lock().unwrap();
             state
                 .registry
-                .remove_expired_terminal(now_ns, self.inner.terminal_retention_ns);
-            state.registry.remove_expired_tombstones(now_ns);
+                .remove_expired_terminal(submitted_at_ns, self.inner.terminal_retention_ns);
+            state.registry.remove_expired_tombstones(submitted_at_ns);
             if state.lifecycle != QueryServiceLifecycle::Accepting {
                 return Err(unavailable(query_id));
             }
@@ -321,40 +364,114 @@ impl QueryResourceCoordinator {
                     "global logical query admission is exhausted",
                 ));
             }
-            if state.active_snapshot_owners >= self.inner.config.max_active_queries {
-                return Err(exhausted(
-                    query_id,
-                    "global query snapshot owner admission is exhausted",
-                ));
-            }
-            self.inner
-                .prepare_registry_for_registration(&mut state.registry, now_ns, query_id)?;
-            ownership = Arc::new(SharedSnapshotOwnership {
-                owner: Arc::downgrade(&self.inner),
-                snapshot: Mutex::new(Some(snapshot)),
-            });
-            state.active_snapshot_owners = state
-                .active_snapshot_owners
-                .checked_add(1)
-                .ok_or_else(|| exhausted(query_id, "snapshot owner accounting is exhausted"))?;
+            self.inner.prepare_registry_for_registration(
+                &mut state.registry,
+                submitted_at_ns,
+                query_id,
+            )?;
             state.active_logical_queries += 1;
-            state.registry.insert(
+            state.registry.insert_planning(
                 query_id,
                 RegistryEntry {
                     control: Arc::clone(&control),
-                    snapshot_root: Some(Arc::clone(&ownership)),
+                    snapshot_root: None,
                 },
             );
         }
-        let token: OpaqueQueryExecutionToken = Box::new(QueryServicePlanToken {
+        Ok(QueryPlanningToken {
             coordinator_nonce: self.inner.nonce,
-            info,
-            owner_session_id: owner.session_id,
             control,
-            ownership: Some(ownership),
             armed: true,
-        });
-        Ok(token)
+        })
+    }
+
+    /// Atomically binds the completed plan and snapshot root to an admitted planning instance.
+    pub(crate) fn complete_planning(
+        &self,
+        token: QueryPlanningToken,
+        info: QueryPlanInfo,
+        snapshot: OpaqueQueryReadSnapshot,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        self.complete_planning_at(token, info, snapshot, now_ns())
+    }
+
+    fn complete_planning_at(
+        &self,
+        mut token: QueryPlanningToken,
+        mut info: QueryPlanInfo,
+        snapshot: OpaqueQueryReadSnapshot,
+        completed_at_ns: u64,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        let query_id = token.control.query_id;
+        if token.coordinator_nonce != self.inner.nonce {
+            return Err(
+                invalid("planning token belongs to another QueryService instance")
+                    .with_query_id(query_id),
+            );
+        }
+        if info.query_id != query_id {
+            let error = invalid("completed plan belongs to another query").with_query_id(query_id);
+            return self.reject_planning(&mut token, error);
+        }
+        info.planned_at_ns = completed_at_ns;
+        if let Err(error) = validate_plan_snapshot_binding(&info, snapshot.descriptor()) {
+            return self.reject_planning(&mut token, error);
+        }
+
+        match self
+            .inner
+            .complete_planning(&token.control, info.clone(), snapshot, completed_at_ns)
+        {
+            Ok(ownership) => {
+                token.armed = false;
+                let execution: OpaqueQueryExecutionToken = Box::new(QueryServicePlanToken {
+                    coordinator_nonce: self.inner.nonce,
+                    info,
+                    owner_session_id: token.control.owner_session_id,
+                    control: Arc::clone(&token.control),
+                    ownership: Some(ownership),
+                    armed: true,
+                });
+                Ok(execution)
+            }
+            Err(error) => {
+                token.armed = false;
+                Err(error)
+            }
+        }
+    }
+
+    /// Completes planning unsuccessfully without allowing token drop to relabel it as cancellation.
+    pub(crate) fn fail_planning(
+        &self,
+        mut token: QueryPlanningToken,
+        error: ServerError,
+    ) -> Result<()> {
+        let query_id = token.control.query_id;
+        if token.coordinator_nonce != self.inner.nonce {
+            return Err(
+                invalid("planning token belongs to another QueryService instance")
+                    .with_query_id(query_id),
+            );
+        }
+        let result = self
+            .inner
+            .fail_planning(&token.control, error.with_query_id(query_id));
+        token.armed = false;
+        result
+    }
+
+    fn reject_planning(
+        &self,
+        token: &mut QueryPlanningToken,
+        error: ServerError,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        let result = self.inner.fail_planning(&token.control, error.clone());
+        token.armed = false;
+        match result {
+            Ok(()) => Err(error),
+            Err(terminal) => Err(terminal),
+        }
     }
 
     pub(crate) fn begin_execution(
@@ -428,6 +545,59 @@ impl QueryResourceCoordinator {
         let control = self.inner.control_instance(instance_id)?;
         control.authorize(owner, instance_id.query_id())?;
         self.inner.query_status(&control)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_at_for_test(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        metadata: QuerySubmissionMetadata,
+        budget: QueryResourceBudget,
+        submitted_at_ns: u64,
+    ) -> Result<QueryPlanningToken> {
+        self.submit_at(owner, metadata, budget, submitted_at_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_planning_at_for_test(
+        &self,
+        token: QueryPlanningToken,
+        info: QueryPlanInfo,
+        snapshot: OpaqueQueryReadSnapshot,
+        completed_at_ns: u64,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        self.complete_planning_at(token, info, snapshot, completed_at_ns)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_planned(
+        &self,
+        owner: &dyn QueryOwnerCapability,
+        info: QueryPlanInfo,
+        execution_deadline_ns: Option<u64>,
+        budget: QueryResourceBudget,
+        snapshot: OpaqueQueryReadSnapshot,
+        now_ns: u64,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        validate_plan_snapshot_binding(&info, snapshot.descriptor())?;
+        if info.expires_at_ns <= now_ns
+            || execution_deadline_ns.is_some_and(|deadline| deadline <= now_ns)
+        {
+            return Err(deadline(
+                info.query_id,
+                "query expired before test plan registration",
+            ));
+        }
+        let planning = self.submit_at_for_test(
+            owner,
+            QuerySubmissionMetadata {
+                query_id: info.query_id,
+                deadline_ns: execution_deadline_ns,
+            },
+            budget,
+            now_ns,
+        )?;
+        self.complete_planning_at_for_test(planning, info, snapshot, now_ns)
     }
 
     #[cfg(test)]
@@ -622,6 +792,7 @@ struct CoordinatorInner {
     terminal_retention_ns: u64,
     max_registered_queries: usize,
     max_query_tombstones: usize,
+    max_planning_duration_ns: u64,
     next_query_generation: AtomicU64,
     next_owner_nonce: AtomicU64,
     state: Mutex<CoordinatorState>,
@@ -648,8 +819,9 @@ type DeadlineOrderKey = (u64, QueryId, u64, QueryDeadlineKind);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum QueryDeadlineKind {
+    PlanningExpiry,
     PlanExpiry,
-    ExecutionDeadline,
+    RequestDeadline,
 }
 
 #[derive(Clone, Copy)]
@@ -679,27 +851,56 @@ impl QueryRegistry {
         self.by_id.get(query_id)
     }
 
-    fn insert(&mut self, query_id: QueryId, entry: RegistryEntry) {
+    fn insert_planning(&mut self, query_id: QueryId, entry: RegistryEntry) {
         debug_assert!(!self.tombstones.contains_key(&query_id));
         let control = &entry.control;
-        let inserted_plan_deadline = self.deadline_order.insert((
-            control.plan_expires_at_ns,
+        let inserted_planning_deadline = self.deadline_order.insert((
+            control.planning_deadline_ns,
             query_id,
+            control.generation,
+            QueryDeadlineKind::PlanningExpiry,
+        ));
+        debug_assert!(inserted_planning_deadline);
+        let previous = self.by_id.insert(query_id, entry);
+        debug_assert!(previous.is_none());
+    }
+
+    fn install_planned(
+        &mut self,
+        control: &QueryControl,
+        ownership: Arc<SharedSnapshotOwnership>,
+        expires_at_ns: u64,
+    ) {
+        let entry = self
+            .by_id
+            .get_mut(&control.query_id)
+            .filter(|entry| entry.control.generation == control.generation)
+            .expect("planning control remains registered at completion");
+        debug_assert!(entry.snapshot_root.is_none());
+        entry.snapshot_root = Some(ownership);
+        let removed_planning_deadline = self.deadline_order.remove(&(
+            control.planning_deadline_ns,
+            control.query_id,
+            control.generation,
+            QueryDeadlineKind::PlanningExpiry,
+        ));
+        debug_assert!(removed_planning_deadline);
+        if let Some(deadline_ns) = control.request_deadline_ns {
+            let inserted_request_deadline = self.deadline_order.insert((
+                deadline_ns,
+                control.query_id,
+                control.generation,
+                QueryDeadlineKind::RequestDeadline,
+            ));
+            debug_assert!(inserted_request_deadline);
+        }
+        let inserted_plan_deadline = self.deadline_order.insert((
+            expires_at_ns,
+            control.query_id,
             control.generation,
             QueryDeadlineKind::PlanExpiry,
         ));
         debug_assert!(inserted_plan_deadline);
-        if let Some(deadline_ns) = control.execution_deadline_ns {
-            let inserted_execution_deadline = self.deadline_order.insert((
-                deadline_ns,
-                query_id,
-                control.generation,
-                QueryDeadlineKind::ExecutionDeadline,
-            ));
-            debug_assert!(inserted_execution_deadline);
-        }
-        let previous = self.by_id.insert(query_id, entry);
-        debug_assert!(previous.is_none());
     }
 
     fn len(&self) -> usize {
@@ -728,23 +929,31 @@ impl QueryRegistry {
             .and_then(|entry| entry.snapshot_root.take())
     }
 
-    fn remove_plan_deadline(&mut self, control: &QueryControl) {
+    fn remove_plan_deadline(&mut self, control: &QueryControl, expires_at_ns: u64) {
         self.deadline_order.remove(&(
-            control.plan_expires_at_ns,
+            expires_at_ns,
             control.query_id,
             control.generation,
             QueryDeadlineKind::PlanExpiry,
         ));
     }
 
-    fn remove_deadlines(&mut self, control: &QueryControl) {
-        self.remove_plan_deadline(control);
-        if let Some(deadline_ns) = control.execution_deadline_ns {
+    fn remove_deadlines(&mut self, control: &QueryControl, plan: Option<&QueryPlanInfo>) {
+        self.deadline_order.remove(&(
+            control.planning_deadline_ns,
+            control.query_id,
+            control.generation,
+            QueryDeadlineKind::PlanningExpiry,
+        ));
+        if let Some(plan) = plan {
+            self.remove_plan_deadline(control, plan.expires_at_ns);
+        }
+        if let Some(deadline_ns) = control.request_deadline_ns {
             self.deadline_order.remove(&(
                 deadline_ns,
                 control.query_id,
                 control.generation,
-                QueryDeadlineKind::ExecutionDeadline,
+                QueryDeadlineKind::RequestDeadline,
             ));
         }
     }
@@ -1028,6 +1237,156 @@ impl CoordinatorInner {
         }
     }
 
+    fn complete_planning(
+        &self,
+        control: &Arc<QueryControl>,
+        info: QueryPlanInfo,
+        snapshot: OpaqueQueryReadSnapshot,
+        completed_at_ns: u64,
+    ) -> Result<Arc<SharedSnapshotOwnership>> {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Planning {
+            let error = ServerError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "query planning is already complete state=[{:?}]",
+                    query.state
+                ),
+            )
+            .with_query_id(control.query_id)
+            .with_retryable(false);
+            let signal = Self::terminate_locked(
+                &mut global,
+                control,
+                &mut query,
+                QueryState::Failed,
+                Some(error.clone()),
+                completed_at_ns,
+            );
+            let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+            drop(query);
+            drop(global);
+            control.publish_terminal(signal);
+            release_snapshot_root(snapshot_root);
+            return Err(error);
+        }
+
+        if control.planning_deadline_ns <= completed_at_ns || info.expires_at_ns <= completed_at_ns
+        {
+            let error = deadline(control.query_id, "query expired while planning");
+            let signal = Self::terminate_locked(
+                &mut global,
+                control,
+                &mut query,
+                QueryState::TimedOut,
+                Some(error.clone()),
+                completed_at_ns,
+            );
+            let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+            drop(query);
+            drop(global);
+            control.publish_terminal(signal);
+            release_snapshot_root(snapshot_root);
+            return Err(error);
+        }
+
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            let error = ServerError::new(
+                ErrorCode::Cancelled,
+                "query cancelled while QueryService admission is closed",
+            )
+            .with_query_id(control.query_id)
+            .with_retryable(false);
+            let signal = Self::terminate_locked(
+                &mut global,
+                control,
+                &mut query,
+                QueryState::Cancelled,
+                Some(error.clone()),
+                completed_at_ns,
+            );
+            let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+            drop(query);
+            drop(global);
+            control.publish_terminal(signal);
+            release_snapshot_root(snapshot_root);
+            return Err(error);
+        }
+
+        if global.active_snapshot_owners >= self.config.max_active_queries {
+            let error = exhausted(
+                control.query_id,
+                "global query snapshot owner admission is exhausted",
+            );
+            let signal = Self::terminate_locked(
+                &mut global,
+                control,
+                &mut query,
+                QueryState::Failed,
+                Some(error.clone()),
+                completed_at_ns,
+            );
+            let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+            drop(query);
+            drop(global);
+            control.publish_terminal(signal);
+            release_snapshot_root(snapshot_root);
+            return Err(error);
+        }
+
+        let ownership = Arc::new(SharedSnapshotOwnership {
+            owner: control.owner.clone(),
+            snapshot: Mutex::new(Some(snapshot)),
+        });
+        global.active_snapshot_owners += 1;
+        global
+            .registry
+            .install_planned(control, Arc::clone(&ownership), info.expires_at_ns);
+        query.plan = Some(info);
+        query.state = QueryState::Planned;
+        Ok(ownership)
+    }
+
+    fn fail_planning(&self, control: &Arc<QueryControl>, error: ServerError) -> Result<()> {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Planning {
+            return Err(ServerError::new(
+                ErrorCode::Conflict,
+                format!("query is not planning state=[{:?}]", query.state),
+            )
+            .with_query_id(control.query_id)
+            .with_retryable(false));
+        }
+        let signal = Self::terminate_locked(
+            &mut global,
+            control,
+            &mut query,
+            QueryState::Failed,
+            Some(error),
+            now_ns(),
+        );
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+        drop(query);
+        drop(global);
+        control.publish_terminal(signal);
+        release_snapshot_root(snapshot_root);
+        Ok(())
+    }
+
     fn begin_execution(&self, control: &Arc<QueryControl>, now_ns: u64) -> Result<()> {
         let mut global = self.state.lock().unwrap();
         let mut query = control.state.lock().unwrap();
@@ -1040,9 +1399,21 @@ impl CoordinatorInner {
         if global.lifecycle != QueryServiceLifecycle::Accepting {
             return Err(unavailable(control.query_id));
         }
-        if control.plan_expires_at_ns <= now_ns
+        let plan_expires_at_ns = query
+            .plan
+            .as_ref()
+            .map(|plan| plan.expires_at_ns)
+            .ok_or_else(|| {
+                ServerError::new(
+                    ErrorCode::Internal,
+                    "planned query is missing plan metadata",
+                )
+                .with_query_id(control.query_id)
+                .with_retryable(false)
+            })?;
+        if plan_expires_at_ns <= now_ns
             || control
-                .execution_deadline_ns
+                .request_deadline_ns
                 .is_some_and(|deadline| deadline <= now_ns)
         {
             let error = deadline(control.query_id, "query plan expired before execution");
@@ -1069,7 +1440,10 @@ impl CoordinatorInner {
             .with_query_id(control.query_id));
         }
         query.state = QueryState::Running;
-        global.registry.remove_plan_deadline(control);
+        query.started_at_ns = Some(now_ns);
+        global
+            .registry
+            .remove_plan_deadline(control, plan_expires_at_ns);
         Ok(())
     }
 
@@ -1237,7 +1611,9 @@ impl CoordinatorInner {
         query.state = terminal;
         query.error = error;
         query.finished_at_ns = Some(finished_at_ns);
-        global.registry.remove_deadlines(control);
+        global
+            .registry
+            .remove_deadlines(control, query.plan.as_ref());
         if query.logical_admitted {
             query.logical_admitted = false;
             debug_assert!(global.active_logical_queries > 0);
@@ -1283,13 +1659,21 @@ impl CoordinatorInner {
             };
             let mut query = control.state.lock().unwrap();
             let due = match kind {
+                QueryDeadlineKind::PlanningExpiry => query.state == QueryState::Planning,
                 QueryDeadlineKind::PlanExpiry => query.state == QueryState::Planned,
-                QueryDeadlineKind::ExecutionDeadline => {
+                QueryDeadlineKind::RequestDeadline => {
                     matches!(query.state, QueryState::Planned | QueryState::Running)
                 }
             };
             if due {
-                let error = deadline(control.query_id, "query exceeded its runtime deadline");
+                let message = match kind {
+                    QueryDeadlineKind::PlanningExpiry => {
+                        "query exceeded its effective planning deadline"
+                    }
+                    QueryDeadlineKind::PlanExpiry => "unexecuted query plan exceeded its TTL",
+                    QueryDeadlineKind::RequestDeadline => "query exceeded its request deadline",
+                };
+                let error = deadline(control.query_id, message);
                 let terminated = Self::terminate_locked(
                     &mut global,
                     &control,
@@ -1376,6 +1760,14 @@ impl CoordinatorInner {
             generation: control.generation,
             owner_session_id: control.owner_session_id,
             state: query.state,
+            submitted_at_ns: control.submitted_at_ns,
+            plan: query.plan.as_ref().map(|plan| QueryPlanStatus {
+                planned_at_ns: plan.planned_at_ns,
+                expires_at_ns: plan.expires_at_ns,
+                catalog_revision: plan.catalog_revision,
+                snapshots: plan.snapshots.clone(),
+            }),
+            started_at_ns: query.started_at_ns,
             logical_admitted: query.logical_admitted,
             active_tasks: query.active_tasks,
             active_cpu_slots: query.active_cpu_slots,
@@ -1438,8 +1830,9 @@ struct QueryControl {
     owner_session_id: SessionId,
     owner_nonce: u64,
     budget: QueryResourceBudget,
-    plan_expires_at_ns: u64,
-    execution_deadline_ns: Option<u64>,
+    submitted_at_ns: u64,
+    request_deadline_ns: Option<u64>,
+    planning_deadline_ns: u64,
     cancelled: Arc<AtomicBool>,
     terminal_sender: watch::Sender<Option<QueryTerminalSignal>>,
     state: Mutex<QueryControlState>,
@@ -1447,6 +1840,8 @@ struct QueryControl {
 
 struct QueryControlState {
     state: QueryState,
+    plan: Option<QueryPlanInfo>,
+    started_at_ns: Option<u64>,
     logical_admitted: bool,
     active_tasks: usize,
     active_cpu_slots: u32,
@@ -1459,7 +1854,9 @@ struct QueryControlState {
 impl Default for QueryControlState {
     fn default() -> Self {
         Self {
-            state: QueryState::Planned,
+            state: QueryState::Planning,
+            plan: None,
+            started_at_ns: None,
             logical_admitted: true,
             active_tasks: 0,
             active_cpu_slots: 0,
@@ -1554,6 +1951,51 @@ impl Drop for SharedSnapshotOwnership {
 fn release_snapshot_root(root: Option<Arc<SharedSnapshotOwnership>>) {
     if let Some(root) = root {
         root.release();
+    }
+}
+
+/// One-time, engine-issued ownership of an admitted query while it is planning.
+///
+/// Private fields make the token origin-authenticated, and the absence of `Clone` makes exactly
+/// one caller responsible for completing, failing, or cancelling this query incarnation.
+pub(crate) struct QueryPlanningToken {
+    coordinator_nonce: u64,
+    control: Arc<QueryControl>,
+    armed: bool,
+}
+
+impl QueryPlanningToken {
+    pub(crate) fn instance_id(&self) -> QueryInstanceId {
+        QueryInstanceId::new(
+            self.control.query_id,
+            NonZeroU64::new(self.control.generation)
+                .expect("QueryService query generation is nonzero"),
+        )
+    }
+
+    pub(crate) fn cancellation(&self) -> QueryCancellation {
+        self.control.cancellation()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.control.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn terminal_error(&self) -> Option<ServerError> {
+        self.control
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .error
+            .clone()
+    }
+}
+
+impl Drop for QueryPlanningToken {
+    fn drop(&mut self) {
+        if self.armed {
+            self.control.cancel("QueryService planning token dropped");
+        }
     }
 }
 
@@ -1880,17 +2322,18 @@ mod tests {
     use std::any::Any;
     use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use zippy_types::query::QueryOwnerCapability;
     use zippy_types::storage::{QueryReadSnapshotDescriptor, QueryReadSnapshotGuard};
-    use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, SessionId};
+    use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, ServerError, SessionId};
 
     use super::{
         QueryResourceBudget, QueryResourceCoordinator, QueryServiceLifecycle,
-        QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState, QueryTaskCharge,
+        QueryServiceRegistryConfig, QueryServiceResourceConfig, QueryState,
+        QuerySubmissionMetadata, QueryTaskCharge, DEFAULT_MAX_PLANNING_DURATION,
     };
 
     struct TestSnapshot {
@@ -1982,6 +2425,7 @@ mod tests {
         QueryServiceRegistryConfig {
             sweep_interval: Duration::from_secs(3600),
             terminal_retention,
+            max_planning_duration: DEFAULT_MAX_PLANNING_DURATION,
             max_registered_queries,
             max_query_tombstones,
         }
@@ -1998,6 +2442,21 @@ mod tests {
         .unwrap()
     }
 
+    fn coordinator_with_planning_duration(
+        resources: QueryServiceResourceConfig,
+        max_planning_duration: Duration,
+    ) -> QueryResourceCoordinator {
+        QueryResourceCoordinator::with_registry_config(
+            resources,
+            QueryServiceRegistryConfig {
+                sweep_interval: Duration::from_secs(3600),
+                max_planning_duration,
+                ..QueryServiceRegistryConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
     fn info(query_id: QueryId, expires_at_ns: u64) -> zippy_types::query::QueryPlanInfo {
         zippy_types::query::QueryPlanInfo {
             query_id,
@@ -2005,6 +2464,13 @@ mod tests {
             snapshots: Vec::new(),
             planned_at_ns: 10,
             expires_at_ns,
+        }
+    }
+
+    fn metadata(query_id: QueryId, deadline_ns: Option<u64>) -> QuerySubmissionMetadata {
+        QuerySubmissionMetadata {
+            query_id,
+            deadline_ns,
         }
     }
 
@@ -2032,6 +2498,417 @@ mod tests {
             cpu_slots: NonZeroU32::new(cpu_slots).unwrap(),
             memory_bytes: NonZeroU64::new(memory_bytes).unwrap(),
         }
+    }
+
+    #[test]
+    fn submission_and_completion_publish_only_honest_lifecycle_metadata() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, Some(90)), budget(), 10)
+            .expect("submit before snapshot planning");
+        let instance_id = planning.instance_id();
+
+        let planning_status = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(planning_status.state, QueryState::Planning);
+        assert_eq!(planning_status.submitted_at_ns, 10);
+        assert!(planning_status.plan.is_none());
+        assert!(planning_status.started_at_ns.is_none());
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+        assert_eq!(coordinator.status().scheduled_deadlines, 1);
+
+        let mut completed_info = info(id, 80);
+        completed_info.planned_at_ns = 999;
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                completed_info,
+                snapshot(id, Arc::clone(&drops)),
+                20,
+            )
+            .expect("atomically bind plan and snapshot");
+        assert_eq!(token.instance_id(), instance_id);
+        assert_eq!(token.info().planned_at_ns, 20);
+
+        let planned_status = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(planned_status.state, QueryState::Planned);
+        let plan = planned_status.plan.expect("completed plan metadata");
+        assert_eq!(plan.planned_at_ns, 20);
+        assert_eq!(plan.expires_at_ns, 80);
+        assert_eq!(plan.catalog_revision, 1);
+        assert!(plan.snapshots.is_empty());
+        assert!(planned_status.started_at_ns.is_none());
+        assert_eq!(coordinator.status().active_snapshot_owners, 1);
+        assert_eq!(coordinator.status().scheduled_deadlines, 2);
+
+        let execution = coordinator.begin_execution(token, 30).unwrap();
+        let running = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(running.state, QueryState::Running);
+        assert_eq!(running.started_at_ns, Some(30));
+        drop(execution);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn planning_deadline_starts_at_submission_and_wakes_exact_token() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, Some(20)), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let cancellation = planning.cancellation();
+
+        assert_eq!(coordinator.sweep_expired(19), 0);
+        assert_eq!(coordinator.sweep_expired(20), 1);
+        assert!(planning.is_cancelled());
+        let signal = cancellation
+            .terminal_signal()
+            .expect("planning timeout publishes terminal signal");
+        assert_eq!(signal.state, QueryState::TimedOut);
+        assert_eq!(signal.generation, instance_id.generation().get());
+        let status = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(status.state, QueryState::TimedOut);
+        assert!(status.plan.is_none());
+        assert_eq!(status.finished_at_ns, Some(20));
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
+
+        drop(planning);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), instance_id)
+                .unwrap()
+                .state,
+            QueryState::TimedOut
+        );
+    }
+
+    #[test]
+    fn effective_planning_deadline_uses_the_earlier_request_or_server_limit() {
+        let coordinator = coordinator_with_planning_duration(config(), Duration::from_nanos(10));
+        let owner = coordinator.owner(session_id(1));
+
+        let request_bounded = coordinator
+            .submit_at_for_test(
+                owner.as_ref(),
+                metadata(query_id(1), Some(15)),
+                budget(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(coordinator.sweep_expired(14), 0);
+        assert_eq!(coordinator.sweep_expired(15), 1);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), request_bounded.instance_id())
+                .unwrap()
+                .state,
+            QueryState::TimedOut
+        );
+
+        let server_bounded = coordinator
+            .submit_at_for_test(
+                owner.as_ref(),
+                metadata(query_id(2), Some(100)),
+                budget(),
+                20,
+            )
+            .unwrap();
+        assert_eq!(coordinator.sweep_expired(29), 0);
+        assert_eq!(coordinator.sweep_expired(30), 1);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), server_bounded.instance_id())
+                .unwrap()
+                .state,
+            QueryState::TimedOut
+        );
+
+        let default_bounded = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(query_id(3), None), budget(), 40)
+            .unwrap();
+        assert_eq!(coordinator.sweep_expired(49), 0);
+        assert_eq!(coordinator.sweep_expired(50), 1);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), default_bounded.instance_id())
+                .unwrap()
+                .state,
+            QueryState::TimedOut
+        );
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
+        drop((request_bounded, server_bounded, default_bounded));
+    }
+
+    #[test]
+    fn completing_planning_replaces_server_expiry_with_request_and_plan_deadlines() {
+        let coordinator = coordinator_with_planning_duration(config(), Duration::from_nanos(10));
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, Some(50)), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                info(id, 100),
+                snapshot(id, Arc::clone(&drops)),
+                15,
+            )
+            .unwrap();
+        assert_eq!(coordinator.status().scheduled_deadlines, 2);
+
+        assert_eq!(coordinator.sweep_expired(20), 0);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), instance_id)
+                .unwrap()
+                .state,
+            QueryState::Planned
+        );
+        assert_eq!(coordinator.sweep_expired(50), 1);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), instance_id)
+                .unwrap()
+                .state,
+            QueryState::TimedOut
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
+        drop(token);
+    }
+
+    #[test]
+    fn owner_cancel_wins_over_late_planning_completion_without_attaching_snapshot() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+
+        coordinator
+            .cancel_owned(owner.as_ref(), instance_id)
+            .expect("cancel exact planning instance");
+        let error = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                info(id, 100),
+                snapshot(id, Arc::clone(&drops)),
+                20,
+            )
+            .err()
+            .expect("cancelled planning cannot complete");
+        assert_eq!(error.code(), ErrorCode::Cancelled);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        let status = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(status.state, QueryState::Cancelled);
+        assert!(status.plan.is_none());
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+    }
+
+    #[test]
+    fn invalid_or_expired_completion_is_terminal_and_never_installs_partial_plan_state() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            ..config()
+        });
+        let owner = coordinator.owner(session_id(1));
+
+        let invalid_id = query_id(1);
+        let invalid_drops = Arc::new(AtomicUsize::new(0));
+        let invalid = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(invalid_id, None), budget(), 10)
+            .unwrap();
+        let invalid_instance = invalid.instance_id();
+        let invalid_error = coordinator
+            .complete_planning_at_for_test(
+                invalid,
+                info(invalid_id, 100),
+                snapshot_at_revision(invalid_id, 2, Arc::clone(&invalid_drops)),
+                20,
+            )
+            .err()
+            .expect("mismatched snapshot completion must fail");
+        assert_eq!(invalid_error.code(), ErrorCode::InvalidArgument);
+        let invalid_status = coordinator
+            .status_owned(owner.as_ref(), invalid_instance)
+            .unwrap();
+        assert_eq!(invalid_status.state, QueryState::Failed);
+        assert!(invalid_status.plan.is_none());
+        assert_eq!(invalid_drops.load(Ordering::Relaxed), 1);
+
+        let expired_id = query_id(2);
+        let expired_drops = Arc::new(AtomicUsize::new(0));
+        let expired = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(expired_id, None), budget(), 10)
+            .unwrap();
+        let expired_instance = expired.instance_id();
+        let expired_error = coordinator
+            .complete_planning_at_for_test(
+                expired,
+                info(expired_id, 20),
+                snapshot(expired_id, Arc::clone(&expired_drops)),
+                20,
+            )
+            .err()
+            .expect("expired plan completion must fail");
+        assert_eq!(expired_error.code(), ErrorCode::DeadlineExceeded);
+        let expired_status = coordinator
+            .status_owned(owner.as_ref(), expired_instance)
+            .unwrap();
+        assert_eq!(expired_status.state, QueryState::TimedOut);
+        assert!(expired_status.plan.is_none());
+        assert_eq!(expired_status.finished_at_ns, Some(20));
+        assert_eq!(expired_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+    }
+
+    #[test]
+    fn fail_and_drop_have_distinct_planning_terminal_semantics() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            ..config()
+        });
+        let owner = coordinator.owner(session_id(1));
+        let failed_id = query_id(1);
+        let failed = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(failed_id, None), budget(), 10)
+            .unwrap();
+        let failed_instance = failed.instance_id();
+        coordinator
+            .fail_planning(
+                failed,
+                ServerError::new(
+                    ErrorCode::InvalidArgument,
+                    "physical planner rejected input",
+                )
+                .with_retryable(false),
+            )
+            .unwrap();
+        let failed_status = coordinator
+            .status_owned(owner.as_ref(), failed_instance)
+            .unwrap();
+        assert_eq!(failed_status.state, QueryState::Failed);
+        assert_eq!(
+            failed_status.error.as_ref().map(ServerError::code),
+            Some(ErrorCode::InvalidArgument)
+        );
+
+        let dropped_id = query_id(2);
+        let dropped = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(dropped_id, None), budget(), 20)
+            .unwrap();
+        let dropped_instance = dropped.instance_id();
+        drop(dropped);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), dropped_instance)
+                .unwrap()
+                .state,
+            QueryState::Cancelled
+        );
+    }
+
+    #[test]
+    fn concurrent_cancel_and_complete_have_one_atomic_terminal_outcome() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let worker_coordinator = coordinator.clone();
+        let worker_drops = Arc::clone(&drops);
+        let worker = thread::spawn(move || {
+            worker_barrier.wait();
+            if let Ok(token) = worker_coordinator.complete_planning_at_for_test(
+                planning,
+                info(id, 100),
+                snapshot(id, worker_drops),
+                20,
+            ) {
+                drop(token);
+            }
+        });
+
+        barrier.wait();
+        coordinator.admin_handle().cancel(instance_id).unwrap();
+        worker.join().unwrap();
+        let status = coordinator.admin_handle().status(instance_id).unwrap();
+        assert_eq!(status.state, QueryState::Cancelled);
+        assert!(!status.logical_admitted);
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+        assert_eq!(coordinator.status().scheduled_deadlines, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retained_old_planning_token_cannot_target_reused_query_id() {
+        let mut registry = registry_config(4, 4, Duration::from_nanos(1));
+        registry.max_planning_duration = Duration::from_nanos(10);
+        let coordinator =
+            QueryResourceCoordinator::with_registry_config(config(), registry).unwrap();
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let old = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let old_instance = old.instance_id();
+        assert_eq!(coordinator.sweep_expired(20), 1);
+
+        let current = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 30)
+            .expect("expired terminal retention permits exact ID reuse");
+        let current_instance = current.instance_id();
+        assert_ne!(old_instance, current_instance);
+        assert_eq!(
+            coordinator
+                .admin_handle()
+                .cancel(old_instance)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+
+        drop(old);
+        let current_status = coordinator
+            .status_owned(owner.as_ref(), current_instance)
+            .unwrap();
+        assert_eq!(current_status.state, QueryState::Planning);
+        assert_eq!(current_status.instance_id(), current_instance);
+        assert_eq!(coordinator.sweep_expired(39), 0);
+        assert_eq!(coordinator.sweep_expired(40), 1);
+        assert_eq!(
+            coordinator
+                .status_owned(owner.as_ref(), current_instance)
+                .unwrap()
+                .state,
+            QueryState::TimedOut
+        );
+        drop(current);
     }
 
     #[test]
@@ -2405,13 +3282,14 @@ mod tests {
         assert_eq!(snapshot_drops.load(Ordering::Relaxed), 1);
         assert_eq!(resource_drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_tasks, 0);
+        let retry_id = query_id(3);
         let replacement = coordinator
             .register_planned_for_session(
-                info(replacement_id, 100),
+                info(retry_id, 100),
                 session_id(1),
                 None,
                 budget(),
-                snapshot(replacement_id, Arc::clone(&replacement_drops)),
+                snapshot(retry_id, Arc::clone(&replacement_drops)),
                 10,
             )
             .expect("released snapshot owner restores replacement admission");
@@ -2519,6 +3397,7 @@ mod tests {
             QueryServiceRegistryConfig {
                 sweep_interval: Duration::from_millis(5),
                 terminal_retention: Duration::from_secs(30),
+                max_planning_duration: DEFAULT_MAX_PLANNING_DURATION,
                 max_registered_queries: 1,
                 max_query_tombstones: 8,
             },
