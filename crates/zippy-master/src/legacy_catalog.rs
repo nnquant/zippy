@@ -1,6 +1,7 @@
 //! Read-only catalog compatibility over persistent legacy registry metadata.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,14 +11,21 @@ use arrow::ipc::writer::StreamWriter;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zippy_types::catalog::{
-    CatalogCommandV1, CatalogQuerySnapshot, CatalogRead, CatalogSnapshotSelector, CatalogWrite,
+    compute_legacy_catalog_projection_digest_v4, CatalogCommandV1, CatalogQuerySnapshot,
+    CatalogRead, CatalogSnapshotSelector, CatalogWrite, LegacyCatalogProjectionDigestTableV4,
+    LegacyCatalogProjectionTableStateV4, LegacyCatalogSourceV4, LegacyCatalogValueV4,
     ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest, ListTablesResponse,
     NamespaceRef, VersionedCatalogCommand, VersionedCatalogResponse,
+    MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4, MAX_LEGACY_CATALOG_PROJECTION_FILES_V4,
+    MAX_LEGACY_CATALOG_PROJECTION_SOURCES_V4, MAX_LEGACY_CATALOG_VALUE_DEPTH_V4,
+    MAX_LEGACY_CATALOG_VALUE_NODES_V4,
 };
+use zippy_types::schema_contract::{validate_catalog_table_schema, MAX_CATALOG_SCHEMA_IPC_BYTES};
+use zippy_types::schema_hash::canonical_catalog_schema_hash_v1;
 use zippy_types::table::{
-    AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FrameTableDefinition,
-    KeyValueTableDefinition, NamespaceDescriptor, TableDefinition, TableDescriptor, TableRef,
-    TableState,
+    AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FiniteMetadataFloat,
+    FrameTableDefinition, KeyValueTableDefinition, NamespaceDescriptor, TableDefinition,
+    TableDescriptor, TableRef, TableState,
 };
 use zippy_types::{
     BoxFuture, ErrorCode, NamespaceId, Result, ServerError, ServerErrorDetails, TableId,
@@ -72,6 +80,135 @@ impl LegacyCatalogMigrationSnapshot {
     #[must_use]
     pub fn tables(&self) -> &[LegacyCatalogMigrationTable] {
         &self.tables
+    }
+}
+
+/// One atomically captured complete V4 projection of the active public legacy Catalog.
+///
+/// This projection is deliberately independent from [`LegacyCatalogMigrationSnapshot`]. Its
+/// digest binds only logical table state and stable source fields; the source Catalog revision is
+/// returned as checkpoint evidence but is not part of that digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCatalogProjectionSnapshotV4 {
+    catalog_revision: u64,
+    global_projection_digest: String,
+    namespace: NamespaceDescriptor,
+    tables: Vec<LegacyCatalogActivePublicTableV4>,
+}
+
+impl LegacyCatalogProjectionSnapshotV4 {
+    /// Returns the legacy Catalog revision captured under the same registry lock as the snapshot.
+    #[must_use]
+    pub const fn catalog_revision(&self) -> u64 {
+        self.catalog_revision
+    }
+
+    /// Returns the canonical digest of all active public tables and their stable sources.
+    #[must_use]
+    pub fn global_projection_digest(&self) -> &str {
+        &self.global_projection_digest
+    }
+
+    /// Returns the stable default namespace represented by the legacy registry.
+    #[must_use]
+    pub const fn namespace(&self) -> &NamespaceDescriptor {
+        &self.namespace
+    }
+
+    /// Returns active public legacy tables in strict stable-table-id order.
+    #[must_use]
+    pub fn tables(&self) -> &[LegacyCatalogActivePublicTableV4] {
+        &self.tables
+    }
+}
+
+/// Complete detached V4 input for one active public legacy table.
+///
+/// The DTO contains the schema and file evidence needed to build a bootstrap or adoption command,
+/// together with the complete stable source set used by the V4 projection digest. Runtime source
+/// ownership, process state, status, metrics, and per-process revisions are absent by type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyCatalogActivePublicTableV4 {
+    descriptor: TableDescriptor,
+    legacy_schema: serde_json::Value,
+    legacy_schema_hash: String,
+    canonical_schema_hash: String,
+    schema_ipc: zippy_types::table::SchemaIpcPayload,
+    schema_has_custom_metadata: bool,
+    persisted_files_revision: u64,
+    migration_files: Vec<LegacyMigrationFile>,
+    sources: Vec<LegacyCatalogSourceV4>,
+}
+
+impl LegacyCatalogActivePublicTableV4 {
+    /// Returns the stable normalized active table descriptor.
+    #[must_use]
+    pub const fn descriptor(&self) -> &TableDescriptor {
+        &self.descriptor
+    }
+
+    /// Returns the original JSON Arrow schema metadata stored by the registry.
+    #[must_use]
+    pub const fn legacy_schema(&self) -> &serde_json::Value {
+        &self.legacy_schema
+    }
+
+    /// Returns the legacy control-plane schema hash.
+    #[must_use]
+    pub fn legacy_schema_hash(&self) -> &str {
+        &self.legacy_schema_hash
+    }
+
+    /// Returns the canonical hash recomputed from the parsed Arrow Schema.
+    #[must_use]
+    pub fn canonical_schema_hash(&self) -> &str {
+        &self.canonical_schema_hash
+    }
+
+    /// Returns the schema-only Arrow IPC stream required by a V4 bootstrap command.
+    #[must_use]
+    pub const fn schema_ipc(&self) -> &zippy_types::table::SchemaIpcPayload {
+        &self.schema_ipc
+    }
+
+    /// Returns whether custom metadata makes regenerated Arrow IPC byte ordering unstable.
+    #[must_use]
+    pub const fn schema_has_custom_metadata(&self) -> bool {
+        self.schema_has_custom_metadata
+    }
+
+    /// Returns the exact legacy persisted-file view revision represented by this table.
+    #[must_use]
+    pub const fn persisted_files_revision(&self) -> u64 {
+        self.persisted_files_revision
+    }
+
+    /// Returns validated persisted-file projections in Gateway-compatible scan order metadata.
+    #[must_use]
+    pub fn migration_files(&self) -> &[LegacyMigrationFile] {
+        &self.migration_files
+    }
+
+    /// Returns complete stable source records in strict source-name order.
+    #[must_use]
+    pub fn sources(&self) -> &[LegacyCatalogSourceV4] {
+        &self.sources
+    }
+
+    fn projection_digest_input(&self) -> LegacyCatalogProjectionDigestTableV4 {
+        LegacyCatalogProjectionDigestTableV4 {
+            table_id: self.descriptor.table_id,
+            namespace_id: self.descriptor.namespace_id,
+            name: self.descriptor.name.clone(),
+            definition: self.descriptor.definition.clone(),
+            schema_version: self.descriptor.current_schema_version,
+            schema_hash: self.canonical_schema_hash.clone(),
+            config: source_owned_table_config(&self.descriptor.config),
+            legacy_files_revision: self.persisted_files_revision,
+            writer_epoch: self.descriptor.writer_epoch,
+            state: LegacyCatalogProjectionTableStateV4::Active,
+            sources: self.sources.clone(),
+        }
     }
 }
 
@@ -368,6 +505,32 @@ struct LegacyMigrationStreamView {
     persisted_files: Vec<serde_json::Value>,
 }
 
+#[derive(Debug)]
+struct LegacyProjectionViewV4 {
+    catalog_revision: u64,
+    streams: Vec<LegacyProjectionStreamViewV4>,
+    sources: Vec<LegacyProjectionSourceViewV4>,
+}
+
+#[derive(Debug)]
+struct LegacyProjectionStreamViewV4 {
+    stream_name: String,
+    schema: serde_json::Value,
+    schema_hash: String,
+    persisted_files_revision: u64,
+    persisted_files: Vec<serde_json::Value>,
+    writer_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LegacyProjectionSourceViewV4 {
+    source_name: String,
+    source_type: String,
+    output_stream: String,
+    config: serde_json::Value,
+    writer_epoch: u64,
+}
+
 impl LegacyCatalogAdapter {
     pub(crate) fn new(registry: Arc<Mutex<Registry>>, running: Arc<AtomicBool>) -> Self {
         Self { registry, running }
@@ -442,6 +605,148 @@ impl LegacyCatalogAdapter {
     pub fn capture_migration_snapshot(&self) -> Result<LegacyCatalogMigrationSnapshot> {
         let view = self.capture_migration_view()?;
         build_migration_snapshot(view)
+    }
+
+    fn capture_projection_view_v4(&self) -> Result<LegacyProjectionViewV4> {
+        self.capture_projection_view_v4_with_metadata_budget(MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4)
+    }
+
+    fn capture_projection_view_v4_with_metadata_budget(
+        &self,
+        maximum_metadata_bytes: usize,
+    ) -> Result<LegacyProjectionViewV4> {
+        let registry = self.lock_registry()?;
+        let mut metadata_budget = ProjectionMetadataBudgetWriter::new(maximum_metadata_bytes);
+        let mut candidate_internal_markers = BTreeMap::<&str, Option<bool>>::new();
+        for source in registry.source_records() {
+            if source.source_name.is_empty()
+                || source.source_type.is_empty()
+                || source.output_stream.is_empty()
+            {
+                return Err(projection_corruption(
+                    "sources",
+                    "legacy projection contains an empty source identity",
+                ));
+            }
+            if registry.get_stream(&source.output_stream).is_none() {
+                return Err(projection_corruption(
+                    &format!("source/{}", source.source_name),
+                    &format!(
+                        "legacy source is bound to an unknown output stream output_stream=[{}]",
+                        source.output_stream
+                    ),
+                ));
+            }
+            if source_config_declares_table(&source.config) {
+                candidate_internal_markers
+                    .entry(source.output_stream.as_str())
+                    .or_default();
+            }
+        }
+        for source in registry.source_records() {
+            if let Some(marker) = candidate_internal_markers.get_mut(source.output_stream.as_str())
+            {
+                merge_internal_table_marker(&source.output_stream, marker, &source.config)?;
+            }
+        }
+        let mut public_streams = BTreeSet::new();
+        for (stream_name, internal_marker) in candidate_internal_markers {
+            let internal = internal_marker.unwrap_or_else(|| is_physical_shard_name(stream_name));
+            if !internal {
+                write_projection_metadata_budget_value_v4(
+                    &mut metadata_budget,
+                    stream_name,
+                    stream_name,
+                    "legacy table identity exceeds the global projection byte budget",
+                )?;
+                public_streams.insert((*stream_name).to_owned());
+            }
+        }
+        let mut source_counts = BTreeMap::<&str, usize>::new();
+        for source in registry
+            .source_records()
+            .filter(|source| public_streams.contains(&source.output_stream))
+        {
+            let count = source_counts
+                .entry(source.output_stream.as_str())
+                .or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                projection_corruption(
+                    &source.output_stream,
+                    "legacy source projection count overflowed",
+                )
+            })?;
+            validate_projection_source_count_v4(&source.output_stream, *count)?;
+            write_projection_source_metadata_budget_v4(
+                &mut metadata_budget,
+                &source.output_stream,
+                source.source_name.as_str(),
+                source.source_type.as_str(),
+                source.output_stream.as_str(),
+                &source.config,
+                source.writer_epoch,
+            )?;
+        }
+        for stream in registry
+            .stream_records()
+            .filter(|stream| public_streams.contains(&stream.stream_name))
+        {
+            validate_projection_file_count_v4(&stream.stream_name, stream.persisted_files.len())?;
+            write_projection_metadata_budget_parts_v4(
+                &mut metadata_budget,
+                &stream.stream_name,
+                &stream.schema,
+                std::iter::empty(),
+                &stream.persisted_files,
+            )?;
+            write_projection_metadata_budget_value_v4(
+                &mut metadata_budget,
+                &stream.stream_name,
+                &stream.schema_hash,
+                "legacy Schema hash exceeds the global projection byte budget",
+            )?;
+        }
+        // Do not clone any public schema, source config, or file metadata until the complete
+        // projection has passed the shared byte-budget preflight above.
+        let streams = registry
+            .stream_records()
+            .filter(|stream| public_streams.contains(&stream.stream_name))
+            .map(|stream| LegacyProjectionStreamViewV4 {
+                stream_name: stream.stream_name.clone(),
+                schema: stream.schema.clone(),
+                schema_hash: stream.schema_hash.clone(),
+                persisted_files_revision: stream.persisted_files_revision,
+                persisted_files: stream.persisted_files.clone(),
+                writer_epoch: stream.writer_epoch,
+            })
+            .collect();
+        let sources = registry
+            .source_records()
+            .filter(|source| public_streams.contains(&source.output_stream))
+            .map(|source| LegacyProjectionSourceViewV4 {
+                source_name: source.source_name.clone(),
+                source_type: source.source_type.clone(),
+                output_stream: source.output_stream.clone(),
+                config: source.config.clone(),
+                writer_epoch: source.writer_epoch,
+            })
+            .collect();
+        Ok(LegacyProjectionViewV4 {
+            catalog_revision: registry.catalog_revision(),
+            streams,
+            sources,
+        })
+    }
+
+    /// Captures the complete stable V4 projection under one legacy registry lock.
+    ///
+    /// Borrowed identity, public-table, count, and byte-budget preflight occurs before cloning.
+    /// Arrow IPC encoding, typed JSON conversion, and digest computation occur after releasing the
+    /// lock. Any malformed identity, duplicate identity, or bounded canonicalization failure aborts
+    /// the whole capture.
+    pub fn capture_projection_snapshot_v4(&self) -> Result<LegacyCatalogProjectionSnapshotV4> {
+        let view = self.capture_projection_view_v4()?;
+        build_projection_snapshot_v4(view)
     }
 
     fn read_revision(&self) -> Result<u64> {
@@ -986,6 +1291,512 @@ fn migration_snapshot_hash(
     ))
 }
 
+fn build_projection_snapshot_v4(
+    mut view: LegacyProjectionViewV4,
+) -> Result<LegacyCatalogProjectionSnapshotV4> {
+    view.streams
+        .sort_by(|left, right| left.stream_name.cmp(&right.stream_name));
+    if view
+        .streams
+        .iter()
+        .any(|stream| stream.stream_name.is_empty())
+        || view
+            .streams
+            .windows(2)
+            .any(|pair| pair[0].stream_name == pair[1].stream_name)
+    {
+        return Err(projection_corruption(
+            "streams",
+            "legacy projection contains an empty or duplicate stream identity",
+        ));
+    }
+    let stream_names = view
+        .streams
+        .iter()
+        .map(|stream| stream.stream_name.clone())
+        .collect::<BTreeSet<_>>();
+
+    view.sources
+        .sort_by(|left, right| left.source_name.cmp(&right.source_name));
+    if view.sources.iter().any(|source| {
+        source.source_name.is_empty()
+            || source.source_type.is_empty()
+            || source.output_stream.is_empty()
+    }) || view
+        .sources
+        .windows(2)
+        .any(|pair| pair[0].source_name == pair[1].source_name)
+    {
+        return Err(projection_corruption(
+            "sources",
+            "legacy projection contains an empty or duplicate source identity",
+        ));
+    }
+
+    let mut source_views_by_stream = BTreeMap::<String, Vec<LegacyProjectionSourceViewV4>>::new();
+    for source in view.sources {
+        if !stream_names.contains(&source.output_stream) {
+            return Err(projection_corruption(
+                &format!("source/{}", source.source_name),
+                &format!(
+                    "legacy source is bound to an unknown output stream output_stream=[{}]",
+                    source.output_stream
+                ),
+            ));
+        }
+        source_views_by_stream
+            .entry(source.output_stream.clone())
+            .or_default()
+            .push(source);
+    }
+
+    let namespace = default_namespace_descriptor();
+    let mut tables = Vec::new();
+    for stream in view.streams {
+        let stream_name = stream.stream_name.clone();
+        let source_views = source_views_by_stream
+            .remove(&stream_name)
+            .unwrap_or_default();
+        let catalog = LegacyStreamView {
+            stream_name: stream.stream_name,
+            persisted_files_revision: stream.persisted_files_revision,
+            writer_epoch: stream.writer_epoch,
+            source_configs: source_views
+                .iter()
+                .map(|source| source.config.clone())
+                .collect(),
+        };
+        if !has_explicit_table_kind(&catalog) || is_internal_table(&catalog)? {
+            continue;
+        }
+
+        let mut descriptor = map_table(&catalog)?;
+        descriptor.config = source_owned_table_config(&descriptor.config);
+        let persisted_files_revision = catalog.persisted_files_revision;
+        drop(catalog);
+        validate_projection_metadata_budget_v4(
+            &stream_name,
+            &stream.schema,
+            &source_views,
+            &stream.persisted_files,
+            MAX_LEGACY_CATALOG_CANONICAL_BYTES_V4,
+        )?;
+        validate_projection_file_count_v4(&stream_name, stream.persisted_files.len())?;
+        validate_projection_source_count_v4(&stream_name, source_views.len())?;
+        let mut value_nodes = 0_usize;
+        let sources = source_views
+            .iter()
+            .map(|source| {
+                Ok(LegacyCatalogSourceV4 {
+                    source_name: source.source_name.clone(),
+                    source_type: source.source_type.clone(),
+                    output_stream: source.output_stream.clone(),
+                    config: project_legacy_catalog_value_v4(
+                        &source.source_name,
+                        &source.config,
+                        1,
+                        &mut value_nodes,
+                    )?,
+                    writer_epoch: source.writer_epoch,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let schema = Arc::new(arrow_schema_from_stream_metadata(
+            &stream_name,
+            &stream.schema,
+        )?);
+        let schema_has_custom_metadata = !schema.metadata().is_empty()
+            || schema
+                .fields()
+                .iter()
+                .any(|field| !field.metadata().is_empty());
+        validate_legacy_control_schema_hash(
+            &stream_name,
+            &stream.schema_hash,
+            &schema,
+            schema_has_custom_metadata,
+        )?;
+        validate_catalog_table_schema(schema.as_ref(), &descriptor.definition).map_err(
+            |error| {
+                data_corruption(
+                    &stream_name,
+                    &format!("legacy table Schema violates Catalog contract error=[{error}]"),
+                )
+            },
+        )?;
+        let canonical_schema_hash = canonical_catalog_schema_hash_v1(schema.as_ref());
+        let schema_ipc = encode_schema_ipc(&stream_name, schema.as_ref())?;
+        validate_projection_schema_ipc_size_v4(&stream_name, schema_ipc.as_bytes().len())?;
+        let migration_files = project_legacy_migration_files(
+            &stream_name,
+            &stream.schema_hash,
+            &stream.persisted_files,
+        )?;
+        validate_unique_projection_file_paths_v4(&stream_name, &migration_files)?;
+        tables.push(LegacyCatalogActivePublicTableV4 {
+            descriptor,
+            legacy_schema: stream.schema,
+            legacy_schema_hash: stream.schema_hash,
+            canonical_schema_hash,
+            schema_ipc,
+            schema_has_custom_metadata,
+            persisted_files_revision,
+            migration_files,
+            sources,
+        });
+    }
+    tables.sort_by_key(|table| table.descriptor.table_id);
+    if let Some(duplicate) = tables
+        .windows(2)
+        .find(|pair| pair[0].descriptor.table_id == pair[1].descriptor.table_id)
+    {
+        return Err(data_corruption(
+            duplicate[0].descriptor.name.as_str(),
+            "deterministic legacy table id collision",
+        ));
+    }
+
+    let digest_inputs = tables
+        .iter()
+        .map(LegacyCatalogActivePublicTableV4::projection_digest_input)
+        .collect::<Vec<_>>();
+    let global_projection_digest = compute_legacy_catalog_projection_digest_v4(&digest_inputs)
+        .map_err(|error| {
+            projection_corruption(
+                "digest",
+                &format!("legacy V4 projection digest failed error=[{error}]"),
+            )
+        })?;
+    Ok(LegacyCatalogProjectionSnapshotV4 {
+        catalog_revision: view.catalog_revision,
+        global_projection_digest,
+        namespace,
+        tables,
+    })
+}
+
+fn project_legacy_catalog_value_v4(
+    source_name: &str,
+    value: &serde_json::Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<LegacyCatalogValueV4> {
+    *nodes = nodes.checked_add(1).ok_or_else(|| {
+        projection_corruption(
+            &format!("source/{source_name}"),
+            "legacy source config node count overflowed",
+        )
+    })?;
+    if *nodes > MAX_LEGACY_CATALOG_VALUE_NODES_V4 {
+        return Err(projection_corruption(
+            &format!("source/{source_name}"),
+            &format!(
+                "legacy source config exceeds node limit actual=[{}] maximum=[{}]",
+                *nodes, MAX_LEGACY_CATALOG_VALUE_NODES_V4
+            ),
+        ));
+    }
+    if depth > MAX_LEGACY_CATALOG_VALUE_DEPTH_V4 {
+        return Err(projection_corruption(
+            &format!("source/{source_name}"),
+            &format!(
+                "legacy source config exceeds depth limit actual=[{depth}] maximum=[{}]",
+                MAX_LEGACY_CATALOG_VALUE_DEPTH_V4
+            ),
+        ));
+    }
+    let next_depth = depth.saturating_add(1);
+    match value {
+        serde_json::Value::Null => Ok(LegacyCatalogValueV4::Null),
+        serde_json::Value::Bool(value) => Ok(LegacyCatalogValueV4::Boolean(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_u64() {
+                return Ok(LegacyCatalogValueV4::UInt64(value));
+            }
+            if let Some(value) = value.as_i64() {
+                return Ok(LegacyCatalogValueV4::Int64(value));
+            }
+            let value = value.as_f64().ok_or_else(|| {
+                projection_corruption(
+                    &format!("source/{source_name}"),
+                    "legacy source config contains an unsupported JSON number",
+                )
+            })?;
+            let value = FiniteMetadataFloat::new(value).map_err(|_| {
+                projection_corruption(
+                    &format!("source/{source_name}"),
+                    "legacy source config contains a non-finite JSON number",
+                )
+            })?;
+            Ok(LegacyCatalogValueV4::Float64(value))
+        }
+        serde_json::Value::String(value) => Ok(LegacyCatalogValueV4::String(value.clone())),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| project_legacy_catalog_value_v4(source_name, value, next_depth, nodes))
+            .collect::<Result<Vec<_>>>()
+            .map(LegacyCatalogValueV4::Array),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                project_legacy_catalog_value_v4(source_name, value, next_depth, nodes)
+                    .map(|value| (key.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+            .map(LegacyCatalogValueV4::Object),
+    }
+}
+
+fn validate_legacy_control_schema_hash(
+    stream_name: &str,
+    legacy_schema_hash: &str,
+    schema: &Arc<Schema>,
+    schema_has_custom_metadata: bool,
+) -> Result<()> {
+    if legacy_schema_hash.len() != 16
+        || legacy_schema_hash
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(data_corruption(
+            stream_name,
+            "legacy Schema hash must contain 16 canonical lowercase hexadecimal digits",
+        ));
+    }
+    if schema_has_custom_metadata {
+        return Ok(());
+    }
+    let recomputed = zippy_core::canonical_schema_hash(schema);
+    if legacy_schema_hash != recomputed {
+        return Err(data_corruption(
+            stream_name,
+            &format!(
+                "legacy Schema hash does not match parsed Arrow Schema expected=[{recomputed}] \
+                 actual=[{legacy_schema_hash}]"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_file_count_v4(stream_name: &str, actual: usize) -> Result<()> {
+    if actual > MAX_LEGACY_CATALOG_PROJECTION_FILES_V4 {
+        return Err(projection_corruption(
+            stream_name,
+            &format!(
+                "legacy file projection exceeds file limit actual=[{actual}] maximum=[{}]",
+                MAX_LEGACY_CATALOG_PROJECTION_FILES_V4
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_schema_ipc_size_v4(stream_name: &str, actual: usize) -> Result<()> {
+    if actual > MAX_CATALOG_SCHEMA_IPC_BYTES {
+        return Err(projection_corruption(
+            stream_name,
+            &format!(
+                "legacy Schema IPC exceeds byte limit actual=[{actual}] maximum=[{}]",
+                MAX_CATALOG_SCHEMA_IPC_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_source_count_v4(stream_name: &str, actual: usize) -> Result<()> {
+    if actual > MAX_LEGACY_CATALOG_PROJECTION_SOURCES_V4 {
+        return Err(projection_corruption(
+            stream_name,
+            &format!(
+                "legacy source projection exceeds source limit actual=[{actual}] maximum=[{}]",
+                MAX_LEGACY_CATALOG_PROJECTION_SOURCES_V4
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unique_projection_file_paths_v4(
+    stream_name: &str,
+    files: &[LegacyMigrationFile],
+) -> Result<()> {
+    let mut registry_indexes_by_path = BTreeMap::new();
+    for file in files {
+        if let Some(first_registry_index) =
+            registry_indexes_by_path.insert(file.file_path(), file.registry_index())
+        {
+            return Err(data_corruption(
+                stream_name,
+                &format!(
+                    "legacy file projection contains duplicate canonical path path=[{}] \
+                     first_registry_index=[{}] duplicate_registry_index=[{}]",
+                    file.file_path(),
+                    first_registry_index,
+                    file.registry_index()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_metadata_budget_v4(
+    stream_name: &str,
+    schema: &serde_json::Value,
+    sources: &[LegacyProjectionSourceViewV4],
+    persisted_files: &[serde_json::Value],
+    maximum: usize,
+) -> Result<()> {
+    validate_projection_metadata_budget_parts_v4(
+        stream_name,
+        schema,
+        sources.iter().map(|source| {
+            (
+                source.source_name.as_str(),
+                source.source_type.as_str(),
+                source.output_stream.as_str(),
+                &source.config,
+                source.writer_epoch,
+            )
+        }),
+        persisted_files,
+        maximum,
+    )
+}
+
+fn validate_projection_metadata_budget_parts_v4<'a>(
+    stream_name: &str,
+    schema: &serde_json::Value,
+    sources: impl IntoIterator<Item = (&'a str, &'a str, &'a str, &'a serde_json::Value, u64)>,
+    persisted_files: &[serde_json::Value],
+    maximum: usize,
+) -> Result<()> {
+    let mut writer = ProjectionMetadataBudgetWriter::new(maximum);
+    write_projection_metadata_budget_parts_v4(
+        &mut writer,
+        stream_name,
+        schema,
+        sources,
+        persisted_files,
+    )
+}
+
+fn write_projection_metadata_budget_parts_v4<'a>(
+    writer: &mut ProjectionMetadataBudgetWriter,
+    stream_name: &str,
+    schema: &serde_json::Value,
+    sources: impl IntoIterator<Item = (&'a str, &'a str, &'a str, &'a serde_json::Value, u64)>,
+    persisted_files: &[serde_json::Value],
+) -> Result<()> {
+    serde_json::to_writer(&mut *writer, schema).map_err(|error| {
+        projection_corruption(
+            stream_name,
+            &format!("legacy Schema metadata exceeds canonical byte budget error=[{error}]"),
+        )
+    })?;
+    for (source_name, source_type, output_stream, config, writer_epoch) in sources {
+        write_projection_source_metadata_budget_v4(
+            writer,
+            stream_name,
+            source_name,
+            source_type,
+            output_stream,
+            config,
+            writer_epoch,
+        )?;
+    }
+    serde_json::to_writer(&mut *writer, persisted_files).map_err(|error| {
+        projection_corruption(
+            stream_name,
+            &format!("legacy file metadata exceeds canonical byte budget error=[{error}]"),
+        )
+    })?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_projection_source_metadata_budget_v4(
+    writer: &mut ProjectionMetadataBudgetWriter,
+    stream_name: &str,
+    source_name: &str,
+    source_type: &str,
+    output_stream: &str,
+    config: &serde_json::Value,
+    writer_epoch: u64,
+) -> Result<()> {
+    serde_json::to_writer(
+        writer,
+        &(
+            source_name,
+            source_type,
+            output_stream,
+            config,
+            writer_epoch,
+        ),
+    )
+    .map_err(|error| {
+        projection_corruption(
+            stream_name,
+            &format!("legacy source metadata exceeds canonical byte budget error=[{error}]"),
+        )
+    })
+}
+
+fn write_projection_metadata_budget_value_v4(
+    writer: &mut ProjectionMetadataBudgetWriter,
+    stream_name: &str,
+    value: &(impl Serialize + ?Sized),
+    message: &'static str,
+) -> Result<()> {
+    serde_json::to_writer(writer, value)
+        .map_err(|error| projection_corruption(stream_name, &format!("{message} error=[{error}]")))
+}
+
+struct ProjectionMetadataBudgetWriter {
+    written: usize,
+    maximum: usize,
+}
+
+impl ProjectionMetadataBudgetWriter {
+    const fn new(maximum: usize) -> Self {
+        Self {
+            written: 0,
+            maximum,
+        }
+    }
+}
+
+impl Write for ProjectionMetadataBudgetWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next = self
+            .written
+            .checked_add(buffer.len())
+            .ok_or_else(|| io::Error::other("legacy projection metadata byte count overflowed"))?;
+        if next > self.maximum {
+            return Err(io::Error::other(format!(
+                "legacy projection metadata bytes exceed limit actual=[{next}] maximum=[{}]",
+                self.maximum
+            )));
+        }
+        self.written = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn source_owned_table_config(config: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    config
+        .iter()
+        .filter(|(key, _)| !key.starts_with("zippy.migration."))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn arrow_schema_from_stream_metadata(
     stream_name: &str,
     schema: &serde_json::Value,
@@ -1226,20 +2037,55 @@ fn map_key_value_definition(stream: &LegacyStreamView) -> Result<TableDefinition
 }
 
 fn has_explicit_table_kind(stream: &LegacyStreamView) -> bool {
-    stream.source_configs.iter().any(|config| {
-        config
-            .as_object()
-            .is_some_and(|object| object.contains_key(TABLE_KIND_FIELD))
-    })
+    stream
+        .source_configs
+        .iter()
+        .any(source_config_declares_table)
+}
+
+fn source_config_declares_table(config: &serde_json::Value) -> bool {
+    config
+        .as_object()
+        .is_some_and(|object| object.contains_key(TABLE_KIND_FIELD))
 }
 
 fn is_internal_table(stream: &LegacyStreamView) -> Result<bool> {
-    match unique_metadata(stream, INTERNAL_TABLE_FIELD)? {
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| data_corruption(&stream.stream_name, "invalid zippy_internal")),
-        None => Ok(is_physical_shard_name(&stream.stream_name)),
+    is_internal_table_from_configs(&stream.stream_name, stream.source_configs.iter())
+}
+
+fn is_internal_table_from_configs<'a>(
+    stream_name: &str,
+    source_configs: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Result<bool> {
+    let mut marker = None;
+    for config in source_configs {
+        merge_internal_table_marker(stream_name, &mut marker, config)?;
     }
+    Ok(marker.unwrap_or_else(|| is_physical_shard_name(stream_name)))
+}
+
+fn merge_internal_table_marker(
+    stream_name: &str,
+    marker: &mut Option<bool>,
+    config: &serde_json::Value,
+) -> Result<()> {
+    let Some(value) = config
+        .as_object()
+        .and_then(|object| object.get(INTERNAL_TABLE_FIELD))
+    else {
+        return Ok(());
+    };
+    let value = value
+        .as_bool()
+        .ok_or_else(|| data_corruption(stream_name, "invalid zippy_internal"))?;
+    if marker.is_some_and(|current| current != value) {
+        return Err(data_corruption(
+            stream_name,
+            &format!("conflicting {INTERNAL_TABLE_FIELD} metadata"),
+        ));
+    }
+    *marker = Some(value);
+    Ok(())
 }
 
 fn is_physical_shard_name(stream_name: &str) -> bool {
@@ -1338,6 +2184,16 @@ fn data_corruption(stream_name: &str, message: &str) -> ServerError {
         .expect("data corruption detail matches error code")
 }
 
+fn projection_corruption(object: &str, message: &str) -> ServerError {
+    ServerError::new(ErrorCode::DataCorruption, message)
+        .with_details(ServerErrorDetails::DataCorruption {
+            object: format!("legacy_catalog/projection/{object}"),
+            expected_checksum: None,
+            actual_checksum: None,
+        })
+        .expect("data corruption detail matches error code")
+}
+
 fn unsupported_plan(operator: &str) -> ServerError {
     ServerError::new(
         ErrorCode::UnsupportedPlan,
@@ -1351,7 +2207,7 @@ fn unsupported_plan(operator: &str) -> ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::future::Future;
     use std::num::NonZeroU32;
     use std::pin::pin;
@@ -1364,14 +2220,18 @@ mod tests {
     use zippy_core::{canonical_schema_hash, schema_metadata};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogRead,
-        CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, ListNamespacesRequest,
-        ListTablesRequest, NamespaceRef, VersionedCatalogCommand,
+        CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, LegacyCatalogValueV4,
+        ListNamespacesRequest, ListTablesRequest, NamespaceRef, VersionedCatalogCommand,
+        MAX_LEGACY_CATALOG_PROJECTION_FILES_V4, MAX_LEGACY_CATALOG_VALUE_DEPTH_V4,
+        MAX_LEGACY_CATALOG_VALUE_NODES_V4,
     };
+    use zippy_types::schema_contract::{MAX_CATALOG_SCHEMA_FIELDS, MAX_CATALOG_SCHEMA_IPC_BYTES};
     use zippy_types::table::{CatalogName, TableRef};
     use zippy_types::{ErrorCode, NamespaceId, RequestId, ServerErrorDetails, TableId};
 
     use super::{
-        legacy_namespace_id, map_tables, LegacyCatalogAdapter, LegacyCatalogMigrationSnapshot,
+        legacy_namespace_id, map_tables, source_owned_table_config, LegacyCatalogAdapter,
+        LegacyCatalogMigrationSnapshot, LegacyProjectionSourceViewV4, LegacyProjectionViewV4,
     };
     use crate::registry::Registry;
     use crate::server::MasterServer;
@@ -1418,6 +2278,23 @@ mod tests {
         config: serde_json::Value,
         custom_metadata: bool,
     ) {
+        add_migratable_stream_without_source(registry, stream_name, custom_metadata);
+        registry
+            .register_source(
+                &format!("{stream_name}_source"),
+                "test",
+                &format!("{stream_name}_process"),
+                stream_name,
+                config,
+            )
+            .unwrap();
+    }
+
+    fn add_migratable_stream_without_source(
+        registry: &mut Registry,
+        stream_name: &str,
+        custom_metadata: bool,
+    ) {
         let field = Field::new("value", DataType::Int64, false).with_metadata(if custom_metadata {
             HashMap::from([("unit".to_owned(), "ticks".to_owned())])
         } else {
@@ -1431,15 +2308,6 @@ mod tests {
                 &canonical_schema_hash(&schema),
                 64,
                 64,
-            )
-            .unwrap();
-        registry
-            .register_source(
-                &format!("{stream_name}_source"),
-                "test",
-                &format!("{stream_name}_process"),
-                stream_name,
-                config,
             )
             .unwrap();
     }
@@ -2186,6 +3054,812 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(table.migration_files()[0].canonical_value()).unwrap(),
             serde_json::to_vec(&table.persisted_files()[0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn projection_v4_publishes_only_source_declared_tables_and_types_json_numbers() {
+        let mut registry = Registry::default();
+        add_migratable_stream_without_source(&mut registry, "projection_events", false);
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+
+        let unpublished = adapter.capture_projection_snapshot_v4().unwrap();
+        assert!(unpublished.tables().is_empty());
+
+        registry
+            .lock()
+            .unwrap()
+            .register_source(
+                "projection_events_source",
+                "test",
+                "projection_process",
+                "projection_events",
+                json!({
+                    "zippy_table_kind": "append_table",
+                    "positive": u64::MAX,
+                    "negative": i64::MIN,
+                    "ratio": 1.5,
+                    "nested": {"enabled": true}
+                }),
+            )
+            .unwrap();
+
+        let published = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(published.tables().len(), 1);
+        assert!(published
+            .global_projection_digest()
+            .starts_with("sha256-v1:"));
+        let table = &published.tables()[0];
+        assert_eq!(table.legacy_schema_hash().len(), 16);
+        assert!(table.canonical_schema_hash().starts_with("sha256-v1:"));
+        assert_ne!(table.legacy_schema_hash(), table.canonical_schema_hash());
+        assert!(!table.schema_ipc().as_bytes().is_empty());
+        assert_eq!(table.sources().len(), 1);
+        let source = &table.sources()[0];
+        assert_eq!(source.source_name, "projection_events_source");
+        assert_eq!(source.source_type, "test");
+        assert_eq!(source.output_stream, "projection_events");
+        assert_eq!(source.writer_epoch, table.descriptor().writer_epoch);
+        let LegacyCatalogValueV4::Object(config) = &source.config else {
+            panic!("source config must remain an object");
+        };
+        assert_eq!(config["positive"], LegacyCatalogValueV4::UInt64(u64::MAX));
+        assert_eq!(config["negative"], LegacyCatalogValueV4::Int64(i64::MIN));
+        assert!(matches!(config["ratio"], LegacyCatalogValueV4::Float64(_)));
+    }
+
+    #[test]
+    fn projection_v4_digest_excludes_runtime_liveness_and_catalog_revision() {
+        let mut registry = Registry::default();
+        let process_id = registry.register_process("projection-test");
+        add_migratable_stream_without_source(&mut registry, "runtime_events", false);
+        registry
+            .register_source(
+                "runtime_events_source",
+                "test",
+                &process_id,
+                "runtime_events",
+                json!({"zippy_table_kind": "append_table", "endpoint": "source-a"}),
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+
+        let baseline = adapter.capture_projection_snapshot_v4().unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .set_source_status(
+                "runtime_events_source",
+                "running",
+                Some(json!({"rows": 17, "latency_us": 3})),
+            )
+            .unwrap();
+        let runtime_changed = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(
+            runtime_changed.global_projection_digest(),
+            baseline.global_projection_digest()
+        );
+        assert_eq!(
+            runtime_changed.catalog_revision(),
+            baseline.catalog_revision()
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .publish_persist_event(
+                "runtime_events",
+                &process_id,
+                json!({
+                    "persist_event_type": "flush_completed",
+                    "persist_event_id": "event-1"
+                }),
+            )
+            .unwrap();
+        let event_changed = adapter.capture_projection_snapshot_v4().unwrap();
+        assert!(event_changed.catalog_revision() > baseline.catalog_revision());
+        assert_eq!(
+            event_changed.global_projection_digest(),
+            baseline.global_projection_digest()
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .mark_records_lost_for_process(&process_id);
+        let ownership_lost = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(
+            ownership_lost.global_projection_digest(),
+            baseline.global_projection_digest()
+        );
+        assert_eq!(
+            ownership_lost.catalog_revision(),
+            event_changed.catalog_revision()
+        );
+    }
+
+    #[test]
+    fn projection_v4_digest_tracks_stable_source_writer_and_file_revision() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "stable_events",
+            json!({"zippy_table_kind": "append_table", "endpoint": "source-a"}),
+            false,
+        );
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+        let baseline = adapter.capture_projection_snapshot_v4().unwrap();
+        let baseline_writer_epoch = baseline.tables()[0].descriptor().writer_epoch;
+
+        {
+            let mut registry = registry.lock().unwrap();
+            registry.unregister_source("stable_events_source").unwrap();
+            registry
+                .register_source(
+                    "stable_events_source",
+                    "test",
+                    "stable_events_process",
+                    "stable_events",
+                    json!({"zippy_table_kind": "append_table", "endpoint": "source-b"}),
+                )
+                .unwrap();
+            registry
+                .set_source_writer_epoch("stable_events_source", baseline_writer_epoch)
+                .unwrap();
+        }
+        let source_changed = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_ne!(
+            source_changed.global_projection_digest(),
+            baseline.global_projection_digest()
+        );
+        assert_eq!(
+            source_changed.tables()[0].descriptor().writer_epoch,
+            baseline_writer_epoch
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .set_source_writer_epoch(
+                "stable_events_source",
+                baseline_writer_epoch.saturating_add(1),
+            )
+            .unwrap();
+        let writer_changed = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_ne!(
+            writer_changed.global_projection_digest(),
+            source_changed.global_projection_digest()
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .set_stream_segment_metadata(
+                "stable_events",
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                1,
+                Vec::new(),
+                baseline_writer_epoch.saturating_add(1),
+            )
+            .unwrap();
+        let files_changed = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(files_changed.tables()[0].persisted_files_revision(), 1);
+        assert_ne!(
+            files_changed.global_projection_digest(),
+            writer_changed.global_projection_digest()
+        );
+    }
+
+    #[test]
+    fn projection_v4_fails_closed_for_unbound_duplicate_and_malformed_sources() {
+        let mut unbound = Registry::default();
+        unbound
+            .register_source(
+                "unbound_source",
+                "test",
+                "process",
+                "missing_stream",
+                json!({}),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(unbound)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+
+        let duplicate = LegacyProjectionSourceViewV4 {
+            source_name: "duplicate".to_owned(),
+            source_type: "test".to_owned(),
+            output_stream: "events".to_owned(),
+            config: json!({}),
+            writer_epoch: 1,
+        };
+        let error = super::build_projection_snapshot_v4(LegacyProjectionViewV4 {
+            catalog_revision: 1,
+            streams: Vec::new(),
+            sources: vec![duplicate.clone(), duplicate],
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::DataCorruption);
+
+        let mut malformed = Registry::default();
+        add_migratable_stream_without_source(&mut malformed, "malformed_events", false);
+        malformed
+            .register_source(
+                "malformed_events_source",
+                "",
+                "process",
+                "malformed_events",
+                json!({"zippy_table_kind": "append_table"}),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(malformed)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_fails_closed_for_schema_and_config_resource_corruption() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut mismatched = Registry::default();
+        mismatched
+            .register_stream(
+                "mismatched_schema",
+                schema_metadata(&schema),
+                "0000000000000000",
+                64,
+                64,
+            )
+            .unwrap();
+        mismatched
+            .register_source(
+                "mismatched_schema_source",
+                "test",
+                "process",
+                "mismatched_schema",
+                json!({"zippy_table_kind": "append_table"}),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(mismatched)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+
+        let mut deep_value = serde_json::Value::Null;
+        for _ in 0..=MAX_LEGACY_CATALOG_VALUE_DEPTH_V4 {
+            deep_value = serde_json::Value::Array(vec![deep_value]);
+        }
+        let mut deep = Registry::default();
+        add_migratable_stream_without_source(&mut deep, "deep_config", false);
+        deep.register_source(
+            "deep_config_source",
+            "test",
+            "process",
+            "deep_config",
+            json!({"zippy_table_kind": "append_table", "deep": deep_value}),
+        )
+        .unwrap();
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::new(Mutex::new(deep)), Arc::new(AtomicBool::new(true)));
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+
+        let mut oversized = Registry::default();
+        add_migratable_stream_without_source(&mut oversized, "oversized_config", false);
+        oversized
+            .register_source(
+                "oversized_config_source",
+                "test",
+                "process",
+                "oversized_config",
+                json!({
+                    "zippy_table_kind": "append_table",
+                    "values": vec![serde_json::Value::Null; MAX_LEGACY_CATALOG_VALUE_NODES_V4]
+                }),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(oversized)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_custom_metadata_uses_native_hash_and_validates_legacy_hash_format() {
+        let field = Field::new("value", DataType::Int64, false).with_metadata(HashMap::from([
+            ("currency".to_owned(), "CNY".to_owned()),
+            ("scale".to_owned(), "10000".to_owned()),
+        ]));
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![field],
+            HashMap::from([
+                ("source".to_owned(), "exchange".to_owned()),
+                ("timezone".to_owned(), "Asia/Shanghai".to_owned()),
+            ]),
+        ));
+        let mut registry = Registry::default();
+        registry
+            .register_stream(
+                "metadata_projection",
+                schema_metadata(&schema),
+                "0123456789abcdef",
+                64,
+                64,
+            )
+            .unwrap();
+        registry
+            .register_source(
+                "metadata_projection_source",
+                "test",
+                "process",
+                "metadata_projection",
+                json!({"zippy_table_kind": "append_table"}),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(registry)),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let first = adapter.capture_projection_snapshot_v4().unwrap();
+        let second = adapter.capture_projection_snapshot_v4().unwrap();
+        let table = &first.tables()[0];
+        assert!(table.schema_has_custom_metadata());
+        assert_eq!(table.legacy_schema_hash(), "0123456789abcdef");
+        assert!(table.canonical_schema_hash().starts_with("sha256-v1:"));
+        assert_eq!(
+            first.global_projection_digest(),
+            second.global_projection_digest()
+        );
+
+        let mut equivalent = Registry::default();
+        equivalent
+            .register_stream(
+                "metadata_projection",
+                schema_metadata(&schema),
+                "fedcba9876543210",
+                64,
+                64,
+            )
+            .unwrap();
+        equivalent
+            .register_source(
+                "metadata_projection_source",
+                "test",
+                "another_process",
+                "metadata_projection",
+                json!({"zippy_table_kind": "append_table"}),
+            )
+            .unwrap();
+        let equivalent = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(equivalent)),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .capture_projection_snapshot_v4()
+        .unwrap();
+        assert_eq!(
+            equivalent.global_projection_digest(),
+            first.global_projection_digest()
+        );
+
+        let mut malformed = Registry::default();
+        malformed
+            .register_stream(
+                "malformed_metadata_hash",
+                schema_metadata(&schema),
+                "ABCDEF0123456789",
+                64,
+                64,
+            )
+            .unwrap();
+        malformed
+            .register_source(
+                "malformed_metadata_hash_source",
+                "test",
+                "process",
+                "malformed_metadata_hash",
+                json!({"zippy_table_kind": "append_table"}),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(malformed)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_file_count_boundary_and_duplicate_path_fail_closed() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "file_boundary",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        let at_limit = (0..MAX_LEGACY_CATALOG_PROJECTION_FILES_V4)
+            .map(|index| json!({"file_path": format!("/legacy/file-{index:04}.parquet")}))
+            .collect::<Vec<_>>();
+        registry
+            .set_stream_segment_metadata(
+                "file_boundary",
+                1,
+                Vec::new(),
+                at_limit.clone(),
+                Vec::new(),
+                1,
+                1,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let registry = Arc::new(Mutex::new(registry));
+        let adapter =
+            LegacyCatalogAdapter::new(Arc::clone(&registry), Arc::new(AtomicBool::new(true)));
+
+        let snapshot = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(
+            snapshot.tables()[0].migration_files().len(),
+            MAX_LEGACY_CATALOG_PROJECTION_FILES_V4
+        );
+
+        let mut over_limit = at_limit;
+        over_limit.push(json!({"file_path": "/legacy/file-over-limit.parquet"}));
+        registry
+            .lock()
+            .unwrap()
+            .set_stream_segment_metadata(
+                "file_boundary",
+                2,
+                Vec::new(),
+                over_limit,
+                Vec::new(),
+                2,
+                2,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+
+        registry
+            .lock()
+            .unwrap()
+            .set_stream_segment_metadata(
+                "file_boundary",
+                3,
+                Vec::new(),
+                vec![
+                    json!({"file_path": "/legacy/duplicate.parquet"}),
+                    json!({"file_path": "/legacy/duplicate.parquet"}),
+                ],
+                Vec::new(),
+                3,
+                3,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            adapter.capture_projection_snapshot_v4().unwrap_err().code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_metadata_budget_is_enforced_without_allocating_canonical_bytes() {
+        let source = LegacyProjectionSourceViewV4 {
+            source_name: "budget_source".to_owned(),
+            source_type: "test".to_owned(),
+            output_stream: "budget_stream".to_owned(),
+            config: json!({"payload": "x".repeat(128)}),
+            writer_epoch: 1,
+        };
+
+        assert_eq!(
+            super::validate_projection_metadata_budget_v4(
+                "budget_stream",
+                &json!({"fields": []}),
+                &[source],
+                &[],
+                64,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::DataCorruption
+        );
+        assert_eq!(
+            super::validate_projection_schema_ipc_size_v4(
+                "budget_stream",
+                MAX_CATALOG_SCHEMA_IPC_BYTES + 1,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_metadata_budget_accumulates_across_public_tables() {
+        type EmptySource<'a> = (&'a str, &'a str, &'a str, &'a serde_json::Value, u64);
+
+        let schema = json!({"fields": []});
+        let files = Vec::<serde_json::Value>::new();
+        let per_table_bytes =
+            serde_json::to_vec(&schema).unwrap().len() + serde_json::to_vec(&files).unwrap().len();
+        let maximum = per_table_bytes * 2 - 1;
+        super::validate_projection_metadata_budget_parts_v4(
+            "first",
+            &schema,
+            std::iter::empty::<EmptySource<'_>>(),
+            &files,
+            maximum,
+        )
+        .expect("either table fits the budget in isolation");
+
+        let mut shared = super::ProjectionMetadataBudgetWriter::new(maximum);
+        super::write_projection_metadata_budget_parts_v4(
+            &mut shared,
+            "first",
+            &schema,
+            std::iter::empty::<EmptySource<'_>>(),
+            &files,
+        )
+        .expect("first table fits the shared budget");
+        assert_eq!(
+            super::write_projection_metadata_budget_parts_v4(
+                &mut shared,
+                "second",
+                &schema,
+                std::iter::empty::<EmptySource<'_>>(),
+                &files,
+            )
+            .unwrap_err()
+            .code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_capture_uses_one_budget_for_the_complete_public_snapshot() {
+        fn adapter_for(stream_names: &[&str]) -> LegacyCatalogAdapter {
+            let mut registry = Registry::default();
+            for stream_name in stream_names {
+                add_migratable_stream(
+                    &mut registry,
+                    stream_name,
+                    json!({
+                        "zippy_table_kind": "append_table",
+                        "payload": "x".repeat(64),
+                    }),
+                    false,
+                );
+            }
+            LegacyCatalogAdapter::new(
+                Arc::new(Mutex::new(registry)),
+                Arc::new(AtomicBool::new(true)),
+            )
+        }
+
+        fn minimum_passing_budget(adapter: &LegacyCatalogAdapter) -> usize {
+            let mut upper = 1_usize;
+            while adapter
+                .capture_projection_view_v4_with_metadata_budget(upper)
+                .is_err()
+            {
+                upper = upper.checked_mul(2).expect("test budget must not overflow");
+            }
+            let mut lower = 0_usize;
+            while lower + 1 < upper {
+                let midpoint = lower + (upper - lower) / 2;
+                if adapter
+                    .capture_projection_view_v4_with_metadata_budget(midpoint)
+                    .is_ok()
+                {
+                    upper = midpoint;
+                } else {
+                    lower = midpoint;
+                }
+            }
+            upper
+        }
+
+        let first = adapter_for(&["first_events"]);
+        let second = adapter_for(&["second_events"]);
+        let combined = adapter_for(&["first_events", "second_events"]);
+        let isolated_limit = minimum_passing_budget(&first).max(minimum_passing_budget(&second));
+
+        first
+            .capture_projection_view_v4_with_metadata_budget(isolated_limit)
+            .expect("first table fits the isolated limit");
+        second
+            .capture_projection_view_v4_with_metadata_budget(isolated_limit)
+            .expect("second table fits the isolated limit");
+        assert_eq!(
+            combined
+                .capture_projection_view_v4_with_metadata_budget(isolated_limit)
+                .unwrap_err()
+                .code(),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_ignores_oversized_config_on_non_public_stream() {
+        let mut registry = Registry::default();
+        add_migratable_stream(
+            &mut registry,
+            "public_events",
+            json!({"zippy_table_kind": "append_table"}),
+            false,
+        );
+        add_migratable_stream_without_source(&mut registry, "plain_events", false);
+        registry
+            .register_source(
+                "plain_events_source",
+                "test",
+                "process",
+                "plain_events",
+                json!({
+                    "payload": vec![
+                        serde_json::Value::Null;
+                        MAX_LEGACY_CATALOG_VALUE_NODES_V4 + 1
+                    ]
+                }),
+            )
+            .unwrap();
+        let adapter = LegacyCatalogAdapter::new(
+            Arc::new(Mutex::new(registry)),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let snapshot = adapter.capture_projection_snapshot_v4().unwrap();
+        assert_eq!(snapshot.tables().len(), 1);
+        assert_eq!(
+            snapshot.tables()[0].descriptor().name.as_str(),
+            "public_events"
+        );
+    }
+
+    #[test]
+    fn projection_v4_enforces_shared_table_schema_contract() {
+        fn capture_error(schema: Arc<Schema>, config: serde_json::Value) -> ErrorCode {
+            let mut registry = Registry::default();
+            registry
+                .register_stream(
+                    "invalid_schema",
+                    schema_metadata(&schema),
+                    &canonical_schema_hash(&schema),
+                    64,
+                    64,
+                )
+                .unwrap();
+            registry
+                .register_source(
+                    "invalid_schema_source",
+                    "test",
+                    "process",
+                    "invalid_schema",
+                    config,
+                )
+                .unwrap();
+            LegacyCatalogAdapter::new(
+                Arc::new(Mutex::new(registry)),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .capture_projection_snapshot_v4()
+            .unwrap_err()
+            .code()
+        }
+
+        let duplicate = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+        assert_eq!(
+            capture_error(duplicate, json!({"zippy_table_kind": "append_table"})),
+            ErrorCode::DataCorruption
+        );
+
+        let missing_frame_by = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        assert_eq!(
+            capture_error(
+                missing_frame_by,
+                json!({
+                    "zippy_table_kind": "frame_table",
+                    "zippy_frame_by": "dt"
+                }),
+            ),
+            ErrorCode::DataCorruption
+        );
+
+        let non_utf8_key = Arc::new(Schema::new(vec![Field::new(
+            "instrument_id",
+            DataType::Int64,
+            false,
+        )]));
+        assert_eq!(
+            capture_error(
+                non_utf8_key,
+                json!({
+                    "zippy_table_kind": "key_value_table",
+                    "zippy_key_value_keys": ["instrument_id"]
+                }),
+            ),
+            ErrorCode::DataCorruption
+        );
+
+        let over_field_limit = Arc::new(Schema::new(
+            (0..=MAX_CATALOG_SCHEMA_FIELDS)
+                .map(|index| Field::new(format!("field_{index}"), DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            capture_error(
+                over_field_limit,
+                json!({"zippy_table_kind": "append_table"}),
+            ),
+            ErrorCode::DataCorruption
+        );
+    }
+
+    #[test]
+    fn projection_v4_table_config_excludes_all_migration_bookkeeping() {
+        let config = BTreeMap::from([
+            ("retention".to_owned(), "30d".to_owned()),
+            (
+                "zippy.migration.legacy_stream_name".to_owned(),
+                "events".to_owned(),
+            ),
+            ("zippy.migration.version".to_owned(), "3".to_owned()),
+        ]);
+
+        assert_eq!(
+            source_owned_table_config(&config),
+            BTreeMap::from([("retention".to_owned(), "30d".to_owned())])
         );
     }
 

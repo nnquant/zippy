@@ -2009,6 +2009,11 @@ impl Registry {
         self.sources.values().cloned().collect()
     }
 
+    /// Iterates source records without cloning runtime-only status and metrics fields.
+    pub(crate) fn source_records(&self) -> impl Iterator<Item = &SourceRecord> {
+        self.sources.values()
+    }
+
     pub fn list_engines(&self) -> Vec<EngineRecord> {
         self.engines.values().cloned().collect()
     }
