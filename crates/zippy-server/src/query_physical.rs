@@ -4,8 +4,11 @@ use std::io;
 use std::num::NonZeroU64;
 
 use zippy_catalog::{PinnedDataFile, PinnedDataFileReader};
-use zippy_query::{AdmittedParquetSource, AdmittedRandomAccessFile};
-use zippy_types::Result;
+use zippy_query::{
+    deferred_parquet_reader, AdmittedAsyncParquetReader, AdmittedParquetSource,
+    AdmittedRandomAccessFile, BoxedAsyncFileReader,
+};
+use zippy_types::{ErrorCode, Result, ServerError};
 
 use crate::query_service::{QueryResultCharge, QueryResultPermit, QueryTaskPermit};
 
@@ -22,9 +25,39 @@ impl AdmittedPinnedParquetFile {
     pub(crate) fn open(
         task: QueryTaskPermit<PinnedDataFile>,
     ) -> Result<AdmittedParquetSource<Self>> {
-        let task = task.try_map_resource(|file| file.open_reader())?;
+        let cancellation = task.cancellation();
+        let task = task.try_map_resource(move |file| {
+            if cancellation.is_cancelled() {
+                return Err(cancelled_open());
+            }
+            file.open_reader()
+        })?;
+        if task.is_cancelled() {
+            return Err(cancelled_open());
+        }
         Ok(AdmittedParquetSource::new(Self { task }))
     }
+
+    /// Returns a lazy async reader that opens this admitted file on first physical read.
+    ///
+    /// The task permit moves into the blocking opener closure. Dropping an in-flight open future
+    /// or the outer reader therefore cannot release task, memory, or snapshot ownership before
+    /// synchronous descriptor and checksum work actually exits.
+    pub(crate) fn deferred(task: QueryTaskPermit<PinnedDataFile>) -> BoxedAsyncFileReader {
+        deferred_parquet_reader(move || {
+            Self::open(task).map(|source| {
+                Box::new(AdmittedAsyncParquetReader::new(source)) as BoxedAsyncFileReader
+            })
+        })
+    }
+}
+
+fn cancelled_open() -> ServerError {
+    ServerError::new(
+        ErrorCode::Cancelled,
+        "native query file task was cancelled before Parquet open completed",
+    )
+    .with_retryable(false)
 }
 
 impl AdmittedRandomAccessFile for AdmittedPinnedParquetFile {

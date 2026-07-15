@@ -508,6 +508,72 @@ impl NativeQuerySnapshotCoordinator {
         )
     }
 
+    /// Admits one exactly described physical file from the live pinned query snapshot.
+    ///
+    /// The description is path-free and untrusted at this boundary. Every stable identity,
+    /// ordinal, version, and scalar file property is revalidated after task admission but before
+    /// the pinned capability can escape the snapshot guard.
+    pub(crate) fn admit_described_file_task(
+        &self,
+        execution: &QueryExecutionScope,
+        charge: QueryTaskCharge,
+        description: PersistedFileDescription,
+    ) -> Result<QueryTaskPermit<PinnedDataFile>> {
+        let query_id = execution.query_id();
+        execution.admit_snapshot_task::<NativeQueryReadSnapshot, PinnedDataFile>(
+            charge,
+            |snapshot| {
+                self.validate_origin(snapshot)?;
+                if snapshot.descriptor.query_id != query_id {
+                    return Err(corruption(
+                        query_id,
+                        "persisted file request belongs to another native query snapshot",
+                    ));
+                }
+                let table = snapshot
+                    .pinned
+                    .table(description.table_index())
+                    .ok_or_else(|| {
+                        corruption(
+                            query_id,
+                            "persisted file request table ordinal is out of bounds",
+                        )
+                    })?;
+                let selector = table.selector();
+                if table.table_index() != description.table_index()
+                    || selector.table_id != description.table_id()
+                    || selector.snapshot_version != description.snapshot_version().get()
+                {
+                    return Err(corruption(
+                        query_id,
+                        "persisted file request does not match its pinned table snapshot",
+                    )
+                    .with_table_id(selector.table_id));
+                }
+                let file = table.file(description.file_index()).ok_or_else(|| {
+                    corruption(
+                        query_id,
+                        "persisted file request file ordinal is out of bounds",
+                    )
+                    .with_table_id(selector.table_id)
+                })?;
+                if file.table_id() != description.table_id()
+                    || file.file_id() != description.file_id()
+                    || file.schema_version() != description.schema_version().get()
+                    || file.file_size_bytes() != description.file_size_bytes().get()
+                    || file.row_count() != description.row_count()
+                {
+                    return Err(corruption(
+                        query_id,
+                        "persisted file request does not match its pinned physical file",
+                    )
+                    .with_table_id(selector.table_id));
+                }
+                Ok(file)
+            },
+        )
+    }
+
     /// Projects the exact pinned snapshot into capability-free persisted query metadata.
     ///
     /// Admission covers the complete retained manifest plus one bounded schema-decode transient.
@@ -1205,7 +1271,7 @@ mod tests {
     use parquet::file::reader::ChunkReader;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
     use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
-    use zippy_query::AdmittedAsyncParquetReader;
+    use zippy_query::{AdmittedAsyncParquetReader, PersistedFileDescription, PersistedFileKey};
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
         CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
@@ -1777,8 +1843,142 @@ mod tests {
         assert_eq!(file.file_size_bytes().get(), expected_size);
         assert_eq!(file.row_count(), expected_rows);
 
+        let different_table_id = table_id(999);
+        let different_file_id = FileId::from_u128(999).expect("nonzero forged file ID");
+        let next_snapshot_version = NonZeroU64::new(file.snapshot_version().get() + 1)
+            .expect("next snapshot version is nonzero");
+        let next_schema_version = NonZeroU64::new(file.schema_version().get() + 1)
+            .expect("next schema version is nonzero");
+        let next_file_size =
+            NonZeroU64::new(file.file_size_bytes().get() + 1).expect("next file size is nonzero");
+        let next_row_count =
+            NonZeroU64::new(file.row_count().get() + 1).expect("next row count is nonzero");
+        let forged = [
+            PersistedFileDescription::try_new(
+                PersistedFileKey::new(1, 0, file.table_id(), file.file_id()),
+                file.snapshot_version(),
+                file.schema_version(),
+                file.file_size_bytes(),
+                file.row_count(),
+            )
+            .expect("forge table ordinal"),
+            PersistedFileDescription::try_new(
+                PersistedFileKey::new(0, 1, file.table_id(), file.file_id()),
+                file.snapshot_version(),
+                file.schema_version(),
+                file.file_size_bytes(),
+                file.row_count(),
+            )
+            .expect("forge file ordinal"),
+            PersistedFileDescription::try_new(
+                PersistedFileKey::new(0, 0, different_table_id, file.file_id()),
+                file.snapshot_version(),
+                file.schema_version(),
+                file.file_size_bytes(),
+                file.row_count(),
+            )
+            .expect("forge table identity"),
+            PersistedFileDescription::try_new(
+                PersistedFileKey::new(0, 0, file.table_id(), different_file_id),
+                file.snapshot_version(),
+                file.schema_version(),
+                file.file_size_bytes(),
+                file.row_count(),
+            )
+            .expect("forge file identity"),
+            PersistedFileDescription::try_new(
+                file.key(),
+                next_snapshot_version,
+                file.schema_version(),
+                file.file_size_bytes(),
+                file.row_count(),
+            )
+            .expect("forge snapshot version"),
+            PersistedFileDescription::try_new(
+                file.key(),
+                file.snapshot_version(),
+                next_schema_version,
+                file.file_size_bytes(),
+                file.row_count(),
+            )
+            .expect("forge schema version"),
+            PersistedFileDescription::try_new(
+                file.key(),
+                file.snapshot_version(),
+                file.schema_version(),
+                next_file_size,
+                file.row_count(),
+            )
+            .expect("forge file size"),
+            PersistedFileDescription::try_new(
+                file.key(),
+                file.snapshot_version(),
+                file.schema_version(),
+                file.file_size_bytes(),
+                next_row_count,
+            )
+            .expect("forge row count"),
+        ];
+        for description in forged {
+            let error = snapshot_coordinator
+                .admit_described_file_task(&execution, charge(), description)
+                .err()
+                .expect("forged persisted file description must be rejected");
+            assert_eq!(error.code(), zippy_types::ErrorCode::DataCorruption);
+            assert_eq!(resources.status().active_tasks, 0);
+        }
+
+        let task = snapshot_coordinator
+            .admit_described_file_task(&execution, charge(), file)
+            .expect("admit exact projected file description");
+        assert_eq!(task.resource().file_id(), expected_file_id);
+        let mut reader = AdmittedPinnedParquetFile::deferred(task);
+        assert_eq!(resources.status().active_tasks, 1);
+        assert_eq!(
+            reader
+                .get_bytes(0..4)
+                .await
+                .expect("read through deferred admitted file")
+                .as_ref(),
+            b"PAR1"
+        );
+        assert_eq!(
+            reader
+                .get_metadata()
+                .await
+                .expect("read deferred admitted metadata")
+                .file_metadata()
+                .num_rows(),
+            1
+        );
+        drop(reader);
+        assert_eq!(resources.status().active_tasks, 0);
+
+        let cancelled_task = snapshot_coordinator
+            .admit_described_file_task(&execution, charge(), file)
+            .expect("admit exact file before cancellation");
+        let mut cancelled_reader = AdmittedPinnedParquetFile::deferred(cancelled_task);
+        resources
+            .cancel_current_for_test(query)
+            .expect("cancel before deferred file open");
+        let error = cancelled_reader
+            .get_metadata()
+            .await
+            .expect_err("cancelled deferred file must not open");
+        assert!(error.to_string().contains("cancelled before Parquet open"));
+        assert_eq!(resources.status().active_tasks, 0);
+        drop(cancelled_reader);
+
         drop(projected);
-        execution.finish().unwrap();
+        drop(execution);
+        assert_eq!(resources.status().active_memory_bytes, 0);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("cancelled deferred reader releases the snapshot pin")
+                .active_query_pins,
+            0
+        );
         assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
     }
 
