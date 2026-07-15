@@ -122,18 +122,38 @@ configured separately under `[query.resources]`: 64 concurrent logical queries a
 memory by default. When omitted, active tasks resolve to four times the effective per-query
 parallelism (16 under default CPU settings). Its memory budget is independent from the Gateway-wide
 `runtime.max_query_buffer_bytes` Arrow buffer pool. Inside the staged native QueryService, physical
-task, capability-free retained execution metadata, and result-delivery reservations now share this
-one memory ceiling and are aggregated by session, query, and process. Session entries disappear when
-their logical, task, retained, and result usage all reach zero. In-flight result permits reuse the
-configured active-task count as a hard query/process count ceiling. Task-to-result and
+planning snapshot peaks, physical tasks, capability-free retained execution metadata, and
+result-delivery reservations now share this one memory ceiling and are aggregated by session, query,
+and process. Session entries disappear when their logical, snapshot, task, retained, and result usage
+all reach zero. In-flight result permits reuse the configured active-task count as a hard
+query/process count ceiling. Task-to-result and
 task-to-retained handoffs reclassify charges atomically; retained memory may only shrink from the
 task peak that covered its construction. A query cannot enter `Finished` until retained execution
 metadata and result delivery reservations are gone. This is usage accounting only; per-session
 quotas wait for a trusted connection/session authority. The native result permit is not yet attached
 to the public `RecordBatchStream`, so this does not make the native query frontend production-ready.
-The Catalog snapshot allocated during `Planning` is still bounded by Catalog read limits rather than
-pre-reserved from this memory ledger; production authority requires a separate planning-snapshot
-reservation that follows the Catalog worker and pinned owner before those allocations begin.
+Before any Catalog resolution or snapshot copy starts, native planning reserves one conservative
+peak from this ledger. It is the checked sum of Catalog table-resolution ownership, exact pinned
+snapshot ownership, and a bounded server coordination envelope. The initial exact-snapshot guardrail
+permits 2 MiB of raw SQLite response, 4,096 visible files, and 16,384 source-lineage rows. The charged
+value is deliberately much larger than 2 MiB: Catalog includes bounded request/response decode
+expansion, duplicate descriptors, containers, one schema-decode transient, pinned sidecars, and
+allocator margin. A private concrete lease is issued by the authority paired with this Catalog; the
+read handle retains only its verifier, so a copied descriptor, caller-defined trait implementation,
+or foreign issuer cannot authorize physical work. The descriptor combines a process-unique
+authority ID, reservation sequence, reserved bytes, and the complete query incarnation. All public
+physical pin APIs require the concrete lease. It follows the table-resolution queue and worker,
+returns with the resolved response, then follows the exact-snapshot queue, worker, pinned owner,
+plan, and execution ownership. Cancelling either awaited read therefore does not return memory while
+synchronous SQLite work is still running.
+
+QueryService records the full descriptor and places its accounting permit inside that same lease.
+Production `complete_planning` accepts only the privately constructed `NativeQueryReadSnapshot`,
+reads the descriptor from its pinned owner, and compares the full reservation under the same
+global-then-query lock that installs the snapshot root. An unrelated small permit cannot admit a
+larger snapshot, and there is no check/install TOCTOU window. The reservation currently remains at
+its conservative peak until the final snapshot owner drops; a later shrink-only reclassification may
+improve concurrency without weakening pre-admission.
 Physical executors now have one consuming `QueryExecutionScope::fail(error)` boundary: it records a
 `Running -> Failed` transition, preserves the original structured error, wakes cancellation waiters,
 and leaves task/retained/result reservations to drain through RAII. Concurrent cancellation,

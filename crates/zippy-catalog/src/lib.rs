@@ -46,6 +46,7 @@ pub use storage_codec::{
     canonical_schema_hash, canonical_schema_hash_from_ipc, decode_persisted_schema,
     decode_persisted_table_schema, DecodedPersistedTableSchema,
 };
+pub use table_domain::conservative_table_resolution_owned_peak_bytes;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};

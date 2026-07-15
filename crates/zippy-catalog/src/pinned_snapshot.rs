@@ -10,7 +10,10 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use zippy_core::OwnedDataDirectory;
 use zippy_types::catalog::{CatalogQuerySnapshot, CatalogSnapshotSelector};
-use zippy_types::storage::{CatalogSnapshotPinDescriptor, CatalogSnapshotPinGuard};
+use zippy_types::storage::{
+    CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseDescriptor, CatalogSnapshotPinDescriptor,
+    CatalogSnapshotPinGuard,
+};
 use zippy_types::table::{
     DataFileDescriptor, DataFileLocation, DataFileProvenance, DataFileState, MetadataMap,
     SchemaDescriptor, TableDescriptor, TableSnapshot,
@@ -42,6 +45,8 @@ struct PinnedSnapshotOwner {
     retained_schema_charge_bytes: Vec<NonZeroU64>,
     _pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
     _data_directory: Arc<OwnedDataDirectory>,
+    // Keep this field last so owned snapshot data and sidecars drop before admission is released.
+    _memory_lease: CatalogSnapshotMemoryLease,
 }
 
 impl SqliteCatalogPinnedQuerySnapshot {
@@ -49,6 +54,7 @@ impl SqliteCatalogPinnedQuerySnapshot {
         snapshot: CatalogQuerySnapshot,
         pins: Vec<crate::SqliteCatalogRuntimeSnapshotPin>,
         data_directory: Arc<OwnedDataDirectory>,
+        memory_lease: CatalogSnapshotMemoryLease,
     ) -> Result<Self> {
         debug_assert!(!pins.is_empty());
         debug_assert_eq!(snapshot.tables().len(), pins.len());
@@ -107,6 +113,7 @@ impl SqliteCatalogPinnedQuerySnapshot {
                 retained_schema_charge_bytes,
                 _pins: pins,
                 _data_directory: data_directory,
+                _memory_lease: memory_lease,
             }),
         })
     }
@@ -121,6 +128,15 @@ impl SqliteCatalogPinnedQuerySnapshot {
     #[must_use]
     pub fn descriptor(&self) -> &CatalogSnapshotPinDescriptor {
         &self.owner.descriptor
+    }
+
+    /// Returns the authenticated memory reservation retained by this pinned owner.
+    ///
+    /// The descriptor is audit data, not an independent capability. This snapshot can only be
+    /// constructed after its private Catalog verifier accepts the structurally retained lease.
+    #[must_use]
+    pub fn memory_lease_descriptor(&self) -> CatalogSnapshotMemoryLeaseDescriptor {
+        self.owner._memory_lease.descriptor()
     }
 
     /// Returns the number of exact table manifests retained by this owner.

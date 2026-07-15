@@ -1,10 +1,15 @@
 //! Three-phase coordination of exact catalog versions with live storage state.
 
 use std::any::Any;
+use std::fmt;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::CatalogSnapshotSelector;
+use crate::query::QueryInstanceId;
 use crate::table::{SourceSegmentIdentity, TableDescriptor};
 use crate::{BoxFuture, LeaseId, OffsetWatermark, QueryId, Result, TableId};
 
@@ -162,6 +167,261 @@ pub trait CatalogSnapshotPinGuard: Any + Send {
 /// A type-erased, non-serializable Catalog snapshot pin capability.
 pub type OpaqueCatalogSnapshotPin = Box<dyn CatalogSnapshotPinGuard>;
 
+static NEXT_CATALOG_SNAPSHOT_MEMORY_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-unique identity for one Catalog snapshot memory reservation.
+///
+/// The authority component distinguishes Catalog instances and the sequence component is allocated
+/// monotonically by that authority. It is an accounting identity, not a standalone capability:
+/// Catalog also verifies the private authority retained by the concrete lease before accepting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CatalogSnapshotMemoryReservationId {
+    authority_id: NonZeroU64,
+    sequence: NonZeroU64,
+}
+
+impl CatalogSnapshotMemoryReservationId {
+    /// Returns the process-unique Catalog authority component.
+    #[must_use]
+    pub const fn authority_id(self) -> NonZeroU64 {
+        self.authority_id
+    }
+
+    /// Returns the nonzero sequence allocated within the Catalog authority.
+    #[must_use]
+    pub const fn sequence(self) -> NonZeroU64 {
+        self.sequence
+    }
+}
+
+/// Copyable audit descriptor for one exclusive Catalog snapshot memory reservation.
+///
+/// This value may be stored in a query admission ledger and compared with a pinned snapshot. It
+/// does not authorize a Catalog operation without the concrete, non-cloneable lease that owns the
+/// private issuing authority and accounting payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CatalogSnapshotMemoryLeaseDescriptor {
+    reservation_id: CatalogSnapshotMemoryReservationId,
+    reserved_bytes: NonZeroU64,
+    query_instance_id: Option<QueryInstanceId>,
+}
+
+impl CatalogSnapshotMemoryLeaseDescriptor {
+    /// Returns the issuer-assigned reservation identity.
+    #[must_use]
+    pub const fn reservation_id(self) -> CatalogSnapshotMemoryReservationId {
+        self.reservation_id
+    }
+
+    /// Returns the admission-accounting bytes retained by this reservation.
+    #[must_use]
+    pub const fn reserved_bytes(self) -> NonZeroU64 {
+        self.reserved_bytes
+    }
+
+    /// Returns the exact query incarnation charged for this reservation, when attributed.
+    #[must_use]
+    pub const fn query_instance_id(self) -> Option<QueryInstanceId> {
+        self.query_instance_id
+    }
+}
+
+#[derive(Debug)]
+struct CatalogSnapshotMemoryLeaseAuthority {
+    authority_id: NonZeroU64,
+    next_reservation_id: AtomicU64,
+}
+
+impl CatalogSnapshotMemoryLeaseAuthority {
+    fn new(authority_id: NonZeroU64) -> Self {
+        Self {
+            authority_id,
+            next_reservation_id: AtomicU64::new(1),
+        }
+    }
+
+    fn allocate_reservation_id(&self) -> crate::Result<CatalogSnapshotMemoryReservationId> {
+        let value = self
+            .next_reservation_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                crate::ServerError::new(
+                    crate::ErrorCode::ResourceExhausted,
+                    "catalog snapshot memory reservation identity space is exhausted",
+                )
+                .with_retryable(false)
+            })?;
+        let value = NonZeroU64::new(value).expect("reservation identity starts at one");
+        Ok(CatalogSnapshotMemoryReservationId {
+            authority_id: self.authority_id,
+            sequence: value,
+        })
+    }
+}
+
+fn allocate_catalog_snapshot_memory_authority_id() -> crate::Result<NonZeroU64> {
+    let value = NEXT_CATALOG_SNAPSHOT_MEMORY_AUTHORITY_ID
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| {
+            crate::ServerError::new(
+                crate::ErrorCode::ResourceExhausted,
+                "catalog snapshot memory authority identity space is exhausted",
+            )
+            .with_retryable(false)
+        })?;
+    Ok(NonZeroU64::new(value).expect("authority identity starts at one"))
+}
+
+/// Process-local capability that issues memory reservations for one Catalog instance.
+///
+/// The issuer is intentionally returned only by the Catalog's explicit native-runtime startup API.
+/// Clones share one authority and monotonically allocated reservation identity space.
+#[derive(Clone)]
+pub struct CatalogSnapshotMemoryLeaseIssuer {
+    authority: Arc<CatalogSnapshotMemoryLeaseAuthority>,
+}
+
+impl fmt::Debug for CatalogSnapshotMemoryLeaseIssuer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogSnapshotMemoryLeaseIssuer")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogSnapshotMemoryLeaseIssuer {
+    /// Creates a fresh issuer/verifier authority pair.
+    ///
+    /// A Catalog instance retains only the verifier. Its native query runtime receives the paired
+    /// issuer and uses [`Self::issue_with_owner`] after memory admission succeeds.
+    ///
+    /// :returns: Fresh process-local issuer and its matching origin verifier.
+    /// :raises ServerError: If the process-wide authority identity space is exhausted.
+    pub fn new_authority() -> crate::Result<(Self, CatalogSnapshotMemoryLeaseVerifier)> {
+        let authority = Arc::new(CatalogSnapshotMemoryLeaseAuthority::new(
+            allocate_catalog_snapshot_memory_authority_id()?,
+        ));
+        Ok((
+            Self {
+                authority: Arc::clone(&authority),
+            },
+            CatalogSnapshotMemoryLeaseVerifier { authority },
+        ))
+    }
+
+    /// Issues one exclusive reservation and constructs its accounting owner from the exact ID.
+    ///
+    /// The owner factory observes the final descriptor before producing the payload. This permits
+    /// the caller to bind the same reservation identity into its memory ledger atomically; the
+    /// resulting payload remains structurally owned by the lease until Catalog releases it.
+    ///
+    /// :param reserved_bytes: Conservative owned-memory peak admitted by the caller.
+    /// :param query_instance_id: Exact charged query incarnation, or `None` for maintenance work.
+    /// :param owner_factory: Factory that consumes the final descriptor and returns the accounting
+    ///     owner retained by the lease.
+    /// :returns: Non-cloneable lease accepted only by the paired verifier.
+    /// :raises ServerError: If reservation identities are exhausted or the owner factory rejects
+    ///     admission.
+    pub fn issue_with_owner<F>(
+        &self,
+        reserved_bytes: NonZeroU64,
+        query_instance_id: Option<QueryInstanceId>,
+        owner_factory: F,
+    ) -> crate::Result<CatalogSnapshotMemoryLease>
+    where
+        F: FnOnce(
+            CatalogSnapshotMemoryLeaseDescriptor,
+        ) -> crate::Result<Box<dyn Any + Send + Sync>>,
+    {
+        let descriptor = CatalogSnapshotMemoryLeaseDescriptor {
+            reservation_id: self.authority.allocate_reservation_id()?,
+            reserved_bytes,
+            query_instance_id,
+        };
+        let owner = owner_factory(descriptor)?;
+        Ok(CatalogSnapshotMemoryLease {
+            authority: Arc::clone(&self.authority),
+            descriptor,
+            _owner: owner,
+        })
+    }
+}
+
+/// Catalog-internal verifier paired with one snapshot memory lease issuer.
+///
+/// A verifier can validate origin but cannot issue a lease or recover its private owner payload.
+#[derive(Clone)]
+pub struct CatalogSnapshotMemoryLeaseVerifier {
+    authority: Arc<CatalogSnapshotMemoryLeaseAuthority>,
+}
+
+impl fmt::Debug for CatalogSnapshotMemoryLeaseVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogSnapshotMemoryLeaseVerifier")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CatalogSnapshotMemoryLeaseVerifier {
+    /// Returns whether the lease was issued by this verifier's paired authority.
+    #[must_use]
+    pub fn accepts(&self, lease: &CatalogSnapshotMemoryLease) -> bool {
+        Arc::ptr_eq(&self.authority, &lease.authority)
+    }
+}
+
+/// An exclusive memory reservation for one owned Catalog snapshot.
+///
+/// The reservation has private fields, is non-cloneable and non-serializable, and cannot be
+/// implemented by callers. Catalog carries it across worker boundaries and retains it beside the
+/// final pinned snapshot owner. Dropping the lease drops its accounting payload only after all
+/// preceding owned snapshot data has been released.
+///
+/// ```compile_fail
+/// fn duplicate(lease: zippy_types::storage::CatalogSnapshotMemoryLease) {
+///     let _second_owner = lease.clone();
+/// }
+/// ```
+pub struct CatalogSnapshotMemoryLease {
+    authority: Arc<CatalogSnapshotMemoryLeaseAuthority>,
+    descriptor: CatalogSnapshotMemoryLeaseDescriptor,
+    _owner: Box<dyn Any + Send + Sync>,
+}
+
+impl CatalogSnapshotMemoryLease {
+    /// Returns the copyable accounting descriptor bound at issuance.
+    #[must_use]
+    pub const fn descriptor(&self) -> CatalogSnapshotMemoryLeaseDescriptor {
+        self.descriptor
+    }
+
+    /// Returns the admission-accounting bytes retained by this reservation.
+    #[must_use]
+    pub const fn reserved_bytes(&self) -> NonZeroU64 {
+        self.descriptor.reserved_bytes()
+    }
+
+    /// Returns the exact query incarnation charged for this reservation, when attributed.
+    #[must_use]
+    pub const fn query_instance_id(&self) -> Option<QueryInstanceId> {
+        self.descriptor.query_instance_id()
+    }
+}
+
+impl fmt::Debug for CatalogSnapshotMemoryLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CatalogSnapshotMemoryLease")
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Cloneable data for an immutable persisted and live table boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableReadSnapshotDescriptor {
@@ -266,14 +526,18 @@ pub trait StorageEngine: Send + Sync {
 #[cfg(test)]
 mod tests {
     use std::any::Any;
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use super::{
-        CatalogSnapshotPinDescriptor, CatalogSnapshotPinGuard, LiveSnapshotPinGuard,
-        LiveSnapshotPinsDescriptor, LiveTableSnapshotPinDescriptor, OpaqueCatalogSnapshotPin,
-        OpaqueLiveSnapshotPins, OpaqueQueryReadSnapshot, QueryReadSnapshotDescriptor,
-        QueryReadSnapshotGuard, StorageEngine,
+        CatalogSnapshotMemoryLeaseIssuer, CatalogSnapshotPinDescriptor, CatalogSnapshotPinGuard,
+        LiveSnapshotPinGuard, LiveSnapshotPinsDescriptor, LiveTableSnapshotPinDescriptor,
+        OpaqueCatalogSnapshotPin, OpaqueLiveSnapshotPins, OpaqueQueryReadSnapshot,
+        QueryReadSnapshotDescriptor, QueryReadSnapshotGuard, StorageEngine,
     };
     use crate::catalog::CatalogSnapshotSelector;
+    use crate::query::QueryInstanceId;
     use crate::{BoxFuture, LeaseId, OffsetWatermark, QueryId, Result, TableId};
 
     struct TestLiveGuard {
@@ -407,6 +671,7 @@ mod tests {
 
     fn assert_storage_object_safe(_: Option<&dyn StorageEngine>) {}
     fn assert_catalog_guard_object_safe(_: Option<OpaqueCatalogSnapshotPin>) {}
+    fn assert_catalog_memory_lease_thread_safe<T: Send + Sync>(_: T) {}
     fn assert_live_guard_object_safe(_: Option<OpaqueLiveSnapshotPins>) {}
     fn assert_query_guard_object_safe(_: Option<OpaqueQueryReadSnapshot>) {}
     fn assert_live_trait_object_safe(_: Option<&dyn LiveSnapshotPinGuard>) {}
@@ -420,6 +685,114 @@ mod tests {
         assert_query_guard_object_safe(None);
         assert_live_trait_object_safe(None);
         assert_query_trait_object_safe(None);
+        let (issuer, verifier) = CatalogSnapshotMemoryLeaseIssuer::new_authority()
+            .expect("create test memory lease authority");
+        let lease = issuer
+            .issue_with_owner(
+                NonZeroU64::new(7).expect("nonzero test memory reservation"),
+                None,
+                |_| Ok(Box::new(())),
+            )
+            .expect("issue test memory reservation");
+        assert!(verifier.accepts(&lease));
+        assert_eq!(lease.reserved_bytes().get(), 7);
+        assert_eq!(lease.query_instance_id(), None);
+        assert_catalog_memory_lease_thread_safe(lease);
+        assert_catalog_memory_lease_thread_safe(issuer);
+        assert_catalog_memory_lease_thread_safe(verifier);
+    }
+
+    #[test]
+    fn catalog_memory_lease_binds_descriptor_owner_and_private_authority() {
+        struct DropCounter(Arc<AtomicUsize>);
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let (issuer, verifier) = CatalogSnapshotMemoryLeaseIssuer::new_authority()
+            .expect("create test memory lease authority");
+        let (foreign_issuer, foreign_verifier) = CatalogSnapshotMemoryLeaseIssuer::new_authority()
+            .expect("create foreign test memory lease authority");
+        let query_instance_id = QueryInstanceId::new(
+            QueryId::from_u128(17).expect("nonzero test query ID"),
+            NonZeroU64::new(3).expect("nonzero test query generation"),
+        );
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner_drops = Arc::clone(&drops);
+        let observed_descriptor = Arc::new(std::sync::Mutex::new(None));
+        let owner_descriptor = Arc::clone(&observed_descriptor);
+        let lease = issuer
+            .issue_with_owner(
+                NonZeroU64::new(11).expect("nonzero test memory reservation"),
+                Some(query_instance_id),
+                move |descriptor| {
+                    *owner_descriptor.lock().expect("lock owner descriptor") = Some(descriptor);
+                    Ok(Box::new(DropCounter(owner_drops)))
+                },
+            )
+            .expect("issue test memory reservation");
+        let descriptor = lease.descriptor();
+        assert_eq!(
+            *observed_descriptor
+                .lock()
+                .expect("lock observed descriptor"),
+            Some(descriptor)
+        );
+        assert_eq!(descriptor.reserved_bytes().get(), 11);
+        assert_eq!(descriptor.query_instance_id(), Some(query_instance_id));
+        assert!(verifier.accepts(&lease));
+        assert!(!foreign_verifier.accepts(&lease));
+
+        let foreign_lease = foreign_issuer
+            .issue_with_owner(
+                NonZeroU64::new(11).expect("nonzero foreign reservation"),
+                Some(query_instance_id),
+                |_| Ok(Box::new(())),
+            )
+            .expect("issue foreign reservation");
+        assert!(!verifier.accepts(&foreign_lease));
+        assert_ne!(
+            descriptor.reservation_id(),
+            foreign_lease.descriptor().reservation_id()
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(lease);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn catalog_memory_reservation_ids_are_unique_within_one_authority() {
+        let (issuer, _verifier) = CatalogSnapshotMemoryLeaseIssuer::new_authority()
+            .expect("create test memory lease authority");
+        let first = issuer
+            .issue_with_owner(NonZeroU64::new(1).unwrap(), None, |_| Ok(Box::new(())))
+            .expect("issue first reservation");
+        let second = issuer
+            .issue_with_owner(NonZeroU64::new(1).unwrap(), None, |_| Ok(Box::new(())))
+            .expect("issue second reservation");
+        assert_ne!(
+            first.descriptor().reservation_id(),
+            second.descriptor().reservation_id()
+        );
+    }
+
+    #[test]
+    fn failed_owner_admission_does_not_create_a_memory_lease() {
+        let (issuer, _verifier) = CatalogSnapshotMemoryLeaseIssuer::new_authority()
+            .expect("create test memory lease authority");
+        let error = issuer
+            .issue_with_owner(NonZeroU64::new(1).unwrap(), None, |_| {
+                Err(crate::ServerError::new(
+                    crate::ErrorCode::ResourceExhausted,
+                    "injected owner admission failure",
+                )
+                .with_retryable(false))
+            })
+            .expect_err("failed owner admission must not produce a lease");
+        assert_eq!(error.code(), crate::ErrorCode::ResourceExhausted);
     }
 
     #[test]

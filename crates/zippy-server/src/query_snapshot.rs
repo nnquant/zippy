@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
@@ -10,15 +11,16 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use zippy_catalog::{
-    PinnedDataFile, PinnedTableManifest, SqliteCatalogPinnedQuerySnapshot,
-    SqliteCatalogQuerySnapshotPinRequest, SqliteCatalogReadHandle,
+    conservative_table_resolution_owned_peak_bytes, PinnedDataFile, PinnedTableManifest,
+    SqliteCatalogPinnedQuerySnapshot, SqliteCatalogQuerySnapshotPinRequest,
+    SqliteCatalogReadHandle, SqliteCatalogSnapshotReadLimits,
 };
 use zippy_ingest::{TableActorRegistryHandle, TableActorSnapshot};
-use zippy_types::catalog::{CatalogRead, CatalogSnapshotSelector};
+use zippy_types::catalog::CatalogSnapshotSelector;
 use zippy_types::query::QueryTableVersion;
 use zippy_types::storage::{
-    OpaqueQueryReadSnapshot, QueryReadSnapshotDescriptor, QueryReadSnapshotGuard,
-    TableReadSnapshotDescriptor,
+    CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseDescriptor, OpaqueQueryReadSnapshot,
+    QueryReadSnapshotDescriptor, QueryReadSnapshotGuard, TableReadSnapshotDescriptor,
 };
 use zippy_types::table::{TableDescriptor, TableRef};
 use zippy_types::{
@@ -30,7 +32,56 @@ use crate::query_service::{
 };
 
 const MAX_SNAPSHOT_COORDINATION_ATTEMPTS: usize = 3;
+const QUERY_SNAPSHOT_COORDINATION_FIXED_BYTES: u64 = 1024 * 1024;
+const QUERY_SNAPSHOT_COORDINATION_BYTES_PER_REFERENCE: u64 = 4 * 1024;
+const QUERY_SNAPSHOT_READ_LIMITS: SqliteCatalogSnapshotReadLimits =
+    SqliteCatalogSnapshotReadLimits {
+        max_visible_files: 4_096,
+        max_source_lineage_rows: 16_384,
+        max_raw_response_bytes: 2 * 1024 * 1024,
+    };
 static NEXT_SNAPSHOT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn conservative_query_snapshot_planning_peak_bytes(reference_count: usize) -> Result<NonZeroU64> {
+    let resolution_peak = conservative_table_resolution_owned_peak_bytes(reference_count)?.get();
+    let snapshot_peak = QUERY_SNAPSHOT_READ_LIMITS
+        .conservative_owned_peak_bytes(reference_count)?
+        .get();
+    let reference_count = u64::try_from(reference_count).map_err(|_| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "query snapshot reference count exceeds u64",
+        )
+        .with_retryable(false)
+    })?;
+    let coordination_peak = reference_count
+        .checked_mul(QUERY_SNAPSHOT_COORDINATION_BYTES_PER_REFERENCE)
+        .and_then(|bytes| bytes.checked_add(QUERY_SNAPSHOT_COORDINATION_FIXED_BYTES))
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "query snapshot coordination memory estimate overflow",
+            )
+            .with_retryable(false)
+        })?;
+    let total = resolution_peak
+        .checked_add(snapshot_peak)
+        .and_then(|bytes| bytes.checked_add(coordination_peak))
+        .ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::ResourceExhausted,
+                "query snapshot planning memory estimate overflow",
+            )
+            .with_retryable(false)
+        })?;
+    NonZeroU64::new(total).ok_or_else(|| {
+        ServerError::new(
+            ErrorCode::ResourceExhausted,
+            "query snapshot planning memory estimate must be nonzero",
+        )
+        .with_retryable(false)
+    })
+}
 
 /// Coordinates serialized table observations with exact, GC-protected Catalog manifests.
 #[derive(Clone)]
@@ -99,12 +150,16 @@ impl NativeQuerySnapshotCoordinator {
         self.ensure_planning_active(planning)?;
         let mut cancellation = planning.cancellation();
         let _admission = self.admit_planning(query_id)?;
+        let snapshot_memory_bytes = conservative_query_snapshot_planning_peak_bytes(tables.len())
+            .map_err(|error| error.with_query_id(query_id))?;
         let mut last_retryable_conflict = None;
         for attempt in 0..MAX_SNAPSHOT_COORDINATION_ATTEMPTS {
             self.ensure_planning_active(planning)?;
             self.ensure_accepting(query_id)?;
+            let snapshot_memory_lease = planning.reserve_snapshot_memory(snapshot_memory_bytes)?;
             // Every awaited planning stage is owned by this one future. Dropping it abandons only
-            // oneshot responses; Catalog runtime pins inside it are synchronous RAII guards.
+            // oneshot responses; the Catalog worker retains both memory admission and runtime pins
+            // until its synchronous work exits.
             let outcome = tokio::select! {
                 biased;
                 terminal = cancellation.wait_terminal() => {
@@ -114,7 +169,12 @@ impl NativeQuerySnapshotCoordinator {
                             .with_retryable(false)
                     }));
                 }
-                outcome = self.pin_persisted_once(query_id, tables) => outcome,
+                outcome = self.pin_persisted_once(
+                    query_id,
+                    tables,
+                    QUERY_SNAPSHOT_READ_LIMITS,
+                    snapshot_memory_lease,
+                ) => outcome,
             };
             self.ensure_planning_active(planning)?;
             match outcome {
@@ -304,8 +364,16 @@ impl NativeQuerySnapshotCoordinator {
         &self,
         query_id: QueryId,
         tables: &[TableRef],
+        limits: SqliteCatalogSnapshotReadLimits,
+        mut snapshot_memory_lease: CatalogSnapshotMemoryLease,
     ) -> Result<NativeQueryReadSnapshot> {
-        let resolved = self.inner.catalog.resolve_tables(tables).await?;
+        let resolved_with_lease = self
+            .inner
+            .catalog
+            .resolve_tables_with_memory_lease(query_id, tables, snapshot_memory_lease)
+            .await?;
+        let resolved = resolved_with_lease.0;
+        snapshot_memory_lease = resolved_with_lease.1;
         let resolved = canonicalize_tables(resolved)?;
         let mut pending = Vec::with_capacity(resolved.len());
         for table in resolved.values() {
@@ -363,7 +431,7 @@ impl NativeQuerySnapshotCoordinator {
         let pinned = self
             .inner
             .catalog
-            .read_pinned_query_snapshot_at(query_id, &pin_requests)
+            .read_pinned_query_snapshot_at(query_id, &pin_requests, limits, snapshot_memory_lease)
             .await?;
         #[cfg(test)]
         self.wait_for_pin_stall(TestPinStage::AfterCatalogPin).await;
@@ -547,6 +615,10 @@ impl NativeQueryReadSnapshot {
     pub(crate) fn into_opaque(self) -> OpaqueQueryReadSnapshot {
         Box::new(self)
     }
+
+    pub(crate) fn memory_lease_descriptor(&self) -> CatalogSnapshotMemoryLeaseDescriptor {
+        self.pinned.memory_lease_descriptor()
+    }
 }
 
 impl QueryReadSnapshotGuard for NativeQueryReadSnapshot {
@@ -669,12 +741,12 @@ mod tests {
     use parquet::arrow::async_reader::AsyncFileReader;
     use parquet::file::reader::ChunkReader;
     use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
-    use zippy_core::OwnedDataDirectory;
+    use zippy_core::{OwnedDataDirectory, DEFAULT_QUERY_MAX_MEMORY_BYTES};
     use zippy_query::AdmittedAsyncParquetReader;
     use zippy_storage::{ParquetCandidateSpec, PersistCandidateInput, PersistRequest};
     use zippy_types::catalog::{
-        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1,
-        CatalogSnapshotSelector, CatalogWrite, CreateNamespaceCommand, CreateTableCommand,
+        CatalogActor, CatalogActorKind, CatalogCommandEnvelopeV1, CatalogCommandV1, CatalogWrite,
+        CreateNamespaceCommand, CreateTableCommand,
     };
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, MetadataMap, NativeDataFileProvenance,
@@ -724,22 +796,18 @@ mod tests {
     async fn closing_snapshot_admission_waits_for_an_inflight_planning_guard() {
         let (_temp, _ownership, mut runtime) = start_runtime(8).await;
         let coordinator = runtime.query_snapshot_coordinator();
-        let raw_catalog = runtime.catalog_read_handle();
         let admission = coordinator
             .admit_planning(query_id(99))
             .expect("admit one snapshot plan");
         runtime.begin_shutdown();
         assert!(!coordinator.planning_drained());
         assert!(coordinator.admit_planning(query_id(100)).is_err());
-        let raw_pin_error = raw_catalog
-            .read_pinned_snapshot_at(&[CatalogSnapshotSelector {
-                table_id: table_id(NATIVE_TABLE),
-                snapshot_version: 1,
-                schema_version: 1,
-            }])
-            .await
-            .expect_err("raw Catalog pin admission must close before the drain decision");
-        assert_eq!(raw_pin_error.code(), zippy_types::ErrorCode::Unavailable);
+        assert!(
+            !runtime
+                .runtime_snapshot_pin_status()
+                .expect("read closed Catalog pin admission")
+                .admission_open
+        );
         assert_eq!(
             runtime.shutdown(Duration::from_millis(10)),
             NativeStorageShutdownOutcome::TimedOut
@@ -928,11 +996,21 @@ mod tests {
     }
 
     fn budget() -> QueryResourceBudget {
+        let max_memory_bytes = snapshot_peak_bytes(mixed_refs().len())
+            .checked_add(1024 * 1024)
+            .expect("snapshot test budget remains within u64");
+        assert!(max_memory_bytes <= DEFAULT_QUERY_MAX_MEMORY_BYTES);
         QueryResourceBudget {
             max_active_tasks: 2,
             max_cpu_slots: 2,
-            max_memory_bytes: 1024,
+            max_memory_bytes,
         }
+    }
+
+    fn snapshot_peak_bytes(selector_count: usize) -> u64 {
+        super::conservative_query_snapshot_planning_peak_bytes(selector_count)
+            .expect("query snapshot limits have a valid conservative peak")
+            .get()
     }
 
     fn charge() -> QueryTaskCharge {
@@ -965,6 +1043,15 @@ mod tests {
             .pin_persisted(&planning, &mixed_refs())
             .await
             .expect("pin mixed query snapshot");
+        let snapshot_memory_bytes = snapshot_peak_bytes(mixed_refs().len());
+        let resource_status = resources.status();
+        assert_eq!(resource_status.active_snapshot_memory_permits, 1);
+        assert_eq!(
+            resource_status.active_snapshot_memory_bytes,
+            snapshot_memory_bytes
+        );
+        assert_eq!(resource_status.active_tasks, 0);
+        assert_eq!(resource_status.active_cpu_slots, 0);
         let draft = snapshot.plan_draft();
         assert_eq!(draft.snapshots().len(), 2);
         assert_eq!(draft.snapshots()[0].table_id, table_id(NATIVE_TABLE));
@@ -991,7 +1078,7 @@ mod tests {
             .all(|record| descriptor_lease_ids.contains(&record.lease_id)));
 
         let token = resources
-            .complete_planning_at_for_test(planning, draft, snapshot.into_opaque(), 10)
+            .complete_native_planning_at_for_test(planning, draft, snapshot, 10)
             .expect("complete pinned plan");
         let execution = resources
             .begin_execution(token, 11)
@@ -1063,6 +1150,181 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrelated_small_reservation_cannot_replace_snapshot_owned_memory() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let query = query_id(111);
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register planning before snapshot pin");
+        let snapshot = snapshot_coordinator
+            .pin_persisted(&planning, &mixed_refs())
+            .await
+            .expect("pin query snapshot");
+        let snapshot_memory_bytes = snapshot_peak_bytes(mixed_refs().len());
+        let unrelated = planning
+            .reserve_snapshot_memory(NonZeroU64::new(1).expect("nonzero test reservation"))
+            .expect("reserve unrelated planning memory");
+        assert_eq!(resources.status().active_snapshot_memory_permits, 2);
+
+        let token = resources
+            .complete_native_planning_at_for_test(planning, snapshot.plan_draft(), snapshot, 10)
+            .expect("complete only from the snapshot-owned reservation");
+        drop(unrelated);
+        assert_eq!(resources.status().active_snapshot_memory_permits, 1);
+        assert_eq!(
+            resources.status().active_snapshot_memory_bytes,
+            snapshot_memory_bytes
+        );
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("read retained snapshot pins")
+                .active_query_pins,
+            2
+        );
+
+        drop(token);
+        assert_eq!(resources.status().active_snapshot_memory_permits, 0);
+        assert_eq!(resources.status().active_snapshot_memory_bytes, 0);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("read released snapshot pins")
+                .active_query_pins,
+            0
+        );
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreign_catalog_reservation_is_rejected_for_the_same_query_incarnation() {
+        let (_first_temp, _first_ownership, mut first_runtime) = start_runtime(8).await;
+        let (_second_temp, _second_ownership, mut second_runtime) = start_runtime(8).await;
+        let first_resources = first_runtime.query_resource_coordinator();
+        let second_resources = second_runtime.query_resource_coordinator();
+        let query = query_id(112);
+        let first_owner = first_resources.owner(session_id());
+        let second_owner = second_resources.owner(session_id());
+        let first_planning = first_resources
+            .submit_at_for_test(
+                first_owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register first runtime query");
+        let second_planning = second_resources
+            .submit_at_for_test(
+                second_owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                budget(),
+                10,
+            )
+            .expect("register matching second runtime query");
+        assert_eq!(first_planning.instance_id(), second_planning.instance_id());
+        let foreign_snapshot = second_runtime
+            .query_snapshot_coordinator()
+            .pin_persisted(&second_planning, &mixed_refs())
+            .await
+            .expect("pin snapshot under the second Catalog authority");
+
+        let error = match first_resources.complete_native_planning_at_for_test(
+            first_planning,
+            foreign_snapshot.plan_draft(),
+            foreign_snapshot,
+            10,
+        ) {
+            Ok(_) => panic!("foreign reservation must not match the first query ledger"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), zippy_types::ErrorCode::Internal);
+        assert_eq!(first_resources.status().active_snapshot_memory_permits, 0);
+        assert_eq!(second_resources.status().active_snapshot_memory_permits, 0);
+        assert_eq!(
+            second_runtime
+                .runtime_snapshot_pin_status()
+                .expect("read released foreign pins")
+                .active_query_pins,
+            0
+        );
+
+        drop(second_planning);
+        assert!(first_runtime.shutdown(Duration::from_secs(5)).is_complete());
+        assert!(second_runtime
+            .shutdown(Duration::from_secs(5))
+            .is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_memory_admission_precedes_catalog_resolution_and_pin_work() {
+        let (_temp, _ownership, mut runtime) = start_runtime(8).await;
+        let snapshot_coordinator = runtime.query_snapshot_coordinator();
+        let resources = runtime.query_resource_coordinator();
+        let owner = resources.owner(session_id());
+        let query = query_id(110);
+        let required = snapshot_peak_bytes(1);
+        let planning = resources
+            .submit_at_for_test(
+                owner.as_ref(),
+                QuerySubmissionMetadata {
+                    query_id: query,
+                    deadline_ns: None,
+                },
+                QueryResourceBudget {
+                    max_active_tasks: 1,
+                    max_cpu_slots: 1,
+                    max_memory_bytes: required - 1,
+                },
+                10,
+            )
+            .expect("register an intentionally under-budget query");
+
+        let error = snapshot_coordinator
+            .pin_persisted(
+                &planning,
+                &[TableRef::Id {
+                    table_id: table_id(999),
+                }],
+            )
+            .await
+            .err()
+            .expect("snapshot memory must fail before resolving the missing table");
+        assert_eq!(error.code(), zippy_types::ErrorCode::ResourceExhausted);
+        let resource_status = resources.status();
+        assert_eq!(resource_status.active_snapshot_memory_permits, 0);
+        assert_eq!(resource_status.active_snapshot_memory_bytes, 0);
+        assert_eq!(resource_status.active_tasks, 0);
+        assert_eq!(
+            runtime
+                .runtime_snapshot_pin_status()
+                .expect("read pin status after rejected snapshot admission")
+                .active_query_pins,
+            0
+        );
+        resources
+            .fail_planning(planning, error)
+            .expect("record the admission failure as terminal");
+        assert!(runtime.shutdown(Duration::from_secs(5)).is_complete());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admitted_parquet_cursor_retains_task_and_pin_until_final_drop() {
         let (_temp, _ownership, mut runtime) = start_runtime(8).await;
         runtime
@@ -1098,7 +1360,7 @@ mod tests {
             .expect("pin persisted Parquet snapshot");
         let draft = snapshot.plan_draft();
         let token = resources
-            .complete_planning_at_for_test(planning, draft, snapshot.into_opaque(), 10)
+            .complete_native_planning_at_for_test(planning, draft, snapshot, 10)
             .expect("complete native Parquet plan");
         let execution = resources
             .begin_execution(token, 11)
@@ -1373,12 +1635,7 @@ mod tests {
             .await
             .expect("pin query snapshot");
         let token = resources
-            .complete_planning_at_for_test(
-                planning,
-                snapshot.plan_draft(),
-                snapshot.into_opaque(),
-                10,
-            )
+            .complete_native_planning_at_for_test(planning, snapshot.plan_draft(), snapshot, 10)
             .expect("complete plan token");
         assert_eq!(
             runtime

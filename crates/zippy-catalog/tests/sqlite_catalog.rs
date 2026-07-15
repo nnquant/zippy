@@ -9,7 +9,7 @@ use arrow::ipc::writer::StreamWriter;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig};
+use zippy_catalog::{SqliteCatalog, SqliteCatalogConfig, SqliteCatalogSnapshotReadLimits};
 use zippy_core::{DataDirectoryError, ManagedDataDirectory, OwnedDataDirectory};
 use zippy_types::catalog::{
     AcquireSnapshotLeaseCommand, CatalogActor, CatalogActorKind, CatalogCodec,
@@ -18,6 +18,7 @@ use zippy_types::catalog::{
     ListNamespacesRequest, ListTablesRequest, NamespaceRef, ReleaseSnapshotLeaseCommand,
     VersionedCatalogCommand, VersionedCatalogResponse,
 };
+use zippy_types::storage::{CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseIssuer};
 use zippy_types::table::{
     AppendTableDefinition, CatalogName, ColumnName, ColumnSet, FrameTableDefinition,
     KeyValueTableDefinition, SchemaCompatibility, SchemaIpcPayload, SnapshotOperation,
@@ -28,6 +29,18 @@ use zippy_types::{ErrorCode, FileId, LeaseId, NamespaceId, RequestId, TableId};
 type RawInitialSnapshotRow = (Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 const MAX_SQLITE_CATALOG_NAME_BYTES: usize = 1024;
+
+fn snapshot_memory_lease(
+    issuer: &CatalogSnapshotMemoryLeaseIssuer,
+    selector_count: usize,
+) -> CatalogSnapshotMemoryLease {
+    let reserved_bytes = SqliteCatalogSnapshotReadLimits::default()
+        .conservative_owned_peak_bytes(selector_count)
+        .expect("estimate integration snapshot memory");
+    issuer
+        .issue_with_owner(reserved_bytes, None, |_| Ok(Box::new(())))
+        .expect("issue integration snapshot memory lease")
+}
 
 fn data_directory(directory: &TempDir) -> Arc<OwnedDataDirectory> {
     Arc::new(
@@ -888,10 +901,17 @@ fn insert_raw_second_snapshot(raw: &Connection, table: TableId) -> CatalogSnapsh
 
 async fn catalog_with_raw_second_snapshot(
     directory: &TempDir,
-) -> (SqliteCatalog, Connection, CatalogSnapshotSelector) {
+) -> (
+    SqliteCatalog,
+    CatalogSnapshotMemoryLeaseIssuer,
+    Connection,
+    CatalogSnapshotSelector,
+) {
     let data_directory = data_directory(directory);
-    let catalog = SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory))
-        .expect("open sqlite catalog");
+    let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+        SqliteCatalogConfig::new(&data_directory),
+    )
+    .expect("open sqlite catalog");
     catalog
         .command(create_namespace(1, 1, "market", Some(0)))
         .await
@@ -911,13 +931,14 @@ async fn catalog_with_raw_second_snapshot(
 
     let raw = Connection::open(catalog_path(&data_directory)).expect("open raw catalog");
     let selector = insert_raw_second_snapshot(&raw, table_id(1));
-    (catalog, raw, selector)
+    (catalog, memory_lease_issuer, raw, selector)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discovery_order() {
     let directory = TempDir::new().expect("create temp directory");
-    let (catalog, raw, selector) = catalog_with_raw_second_snapshot(&directory).await;
+    let (catalog, memory_lease_issuer, raw, selector) =
+        catalog_with_raw_second_snapshot(&directory).await;
     let table = selector.table_id;
     insert_native_data_file(&raw, table, file_id(2));
     insert_legacy_data_file(&raw, table, file_id(1), None);
@@ -941,7 +962,10 @@ async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discover
     let pinned = catalog
         .read_handle()
         .expect("create Catalog read handle")
-        .read_pinned_snapshot_at(std::slice::from_ref(&selector))
+        .read_pinned_snapshot_at(
+            std::slice::from_ref(&selector),
+            snapshot_memory_lease(&memory_lease_issuer, 1),
+        )
         .await
         .expect("read pinned mixed-provenance manifest");
     let manifest = pinned.table(0).expect("pinned table manifest");
@@ -987,7 +1011,8 @@ async fn raw_snapshot_keeps_file_id_order_while_pinned_scan_uses_legacy_discover
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_rejects_invalid_legacy_discovery_order_and_incomplete_import_manifest() {
     let directory = TempDir::new().expect("create temp directory");
-    let (catalog, raw, selector) = catalog_with_raw_second_snapshot(&directory).await;
+    let (catalog, _memory_lease_issuer, raw, selector) =
+        catalog_with_raw_second_snapshot(&directory).await;
     insert_legacy_data_file(&raw, selector.table_id, file_id(1), Some(0));
     insert_legacy_data_file(&raw, selector.table_id, file_id(2), Some(0));
 
@@ -1102,7 +1127,8 @@ async fn snapshot_rejects_invalid_legacy_discovery_order_and_incomplete_import_m
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_discovery_order_is_scoped_to_each_table() {
     let directory = TempDir::new().expect("create temp directory");
-    let (catalog, raw, first_selector) = catalog_with_raw_second_snapshot(&directory).await;
+    let (catalog, _memory_lease_issuer, raw, first_selector) =
+        catalog_with_raw_second_snapshot(&directory).await;
     catalog
         .command(create_table(
             3,

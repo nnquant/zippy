@@ -1,6 +1,8 @@
 //! Transactional table creation and lightweight table discovery.
 
 use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
+use std::num::NonZeroU64;
 use std::str::FromStr;
 
 use arrow::datatypes::SchemaRef;
@@ -29,6 +31,9 @@ const MAX_TABLE_RESOLUTION_REFERENCE_BYTES: usize = 1024 * 1024;
 const MAX_TABLE_READ_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TABLE_CONFIG_ENTRIES: usize = 4_096;
 const MAX_TABLE_CONFIG_TEXT_BYTES: usize = 1024 * 1024;
+const TABLE_RESOLUTION_REQUEST_DECODE_EXPANSION: usize = 4;
+const TABLE_RESOLUTION_RESPONSE_DECODE_EXPANSION: usize = 32;
+const TABLE_RESOLUTION_FIXED_ALLOCATOR_MARGIN_BYTES: usize = 1024 * 1024;
 
 macro_rules! table_select {
     ($suffix:literal) => {
@@ -314,6 +319,78 @@ pub(crate) fn validate_table_resolution_request(table_refs: &[TableRef]) -> Resu
         ));
     }
     Ok(())
+}
+
+/// Returns a conservative logical peak for resolving one bounded table-reference request.
+///
+/// The estimate covers the hard one-mebibyte request payload, the hard four-mebibyte raw response,
+/// decoded request and response expansion, duplicate output descriptors, lookup containers, and a
+/// fixed allocator margin. It is an admission-accounting budget rather than measured RSS; SQLite
+/// page cache, thread stacks, allocator arenas, and unrelated process memory are outside it.
+///
+/// :param reference_count: Number of table references that will be resolved.
+/// :returns: Nonzero conservative logical peak in bytes.
+/// :raises ServerError: If the count exceeds the Catalog hard limit or arithmetic overflows.
+pub fn conservative_table_resolution_owned_peak_bytes(
+    reference_count: usize,
+) -> Result<NonZeroU64> {
+    if reference_count > MAX_TABLE_RESOLUTION_COUNT {
+        return Err(ServerError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                "catalog table resolution exceeds maximum requested=[{reference_count}] \
+                 maximum=[{MAX_TABLE_RESOLUTION_COUNT}]"
+            ),
+        ));
+    }
+
+    let request_bytes = checked_resolution_peak_mul(
+        MAX_TABLE_RESOLUTION_REFERENCE_BYTES,
+        TABLE_RESOLUTION_REQUEST_DECODE_EXPANSION,
+        "request decode expansion",
+    )?;
+    let response_bytes = checked_resolution_peak_mul(
+        MAX_TABLE_READ_RESPONSE_BYTES,
+        TABLE_RESOLUTION_RESPONSE_DECODE_EXPANSION,
+        "response decode expansion",
+    )?;
+    let reference_slot_bytes = size_of::<TableRef>()
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(size_of::<TableDescriptor>() * 2))
+        .and_then(|bytes| bytes.checked_add(size_of::<usize>() * 4))
+        .ok_or_else(|| resolution_peak_overflow("reference slot size"))?;
+    let container_bytes = checked_resolution_peak_mul(
+        reference_count,
+        reference_slot_bytes,
+        "reference and descriptor containers",
+    )?;
+    let peak = checked_resolution_peak_add(request_bytes, response_bytes, "decoded response")?;
+    let peak = checked_resolution_peak_add(peak, container_bytes, "request containers")?;
+    let peak = checked_resolution_peak_add(
+        peak,
+        TABLE_RESOLUTION_FIXED_ALLOCATOR_MARGIN_BYTES,
+        "allocator margin",
+    )?;
+    let peak =
+        u64::try_from(peak).map_err(|_| resolution_peak_overflow("peak bytes exceed u64"))?;
+    NonZeroU64::new(peak).ok_or_else(|| resolution_peak_overflow("peak bytes must be nonzero"))
+}
+
+fn checked_resolution_peak_mul(left: usize, right: usize, component: &str) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| resolution_peak_overflow(component))
+}
+
+fn checked_resolution_peak_add(left: usize, right: usize, component: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| resolution_peak_overflow(component))
+}
+
+fn resolution_peak_overflow(component: &str) -> ServerError {
+    ServerError::new(
+        ErrorCode::ResourceExhausted,
+        format!("catalog table resolution peak byte overflow component=[{component}]"),
+    )
 }
 
 /// Resolves active table descriptors in input order from one read transaction.
@@ -730,4 +807,44 @@ fn table_response_budget_exhausted(actual_bytes: usize) -> ServerError {
 
 fn corruption(message: String) -> ServerError {
     ServerError::new(ErrorCode::DataCorruption, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        checked_resolution_peak_add, checked_resolution_peak_mul,
+        conservative_table_resolution_owned_peak_bytes, MAX_TABLE_RESOLUTION_COUNT,
+    };
+    use zippy_types::ErrorCode;
+
+    #[test]
+    fn table_resolution_peak_estimator_is_bounded_nonzero_and_strictly_monotonic() {
+        let empty = conservative_table_resolution_owned_peak_bytes(0)
+            .expect("estimate empty resolution")
+            .get();
+        let one = conservative_table_resolution_owned_peak_bytes(1)
+            .expect("estimate one reference")
+            .get();
+        let maximum = conservative_table_resolution_owned_peak_bytes(MAX_TABLE_RESOLUTION_COUNT)
+            .expect("estimate hard maximum")
+            .get();
+        assert!(empty > 0);
+        assert!(one > empty);
+        assert!(maximum > one);
+
+        let oversized =
+            conservative_table_resolution_owned_peak_bytes(MAX_TABLE_RESOLUTION_COUNT + 1)
+                .expect_err("reject an oversized resolution before admission");
+        assert_eq!(oversized.code(), ErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn table_resolution_peak_estimator_checks_arithmetic() {
+        let multiplication = checked_resolution_peak_mul(usize::MAX, 2, "test")
+            .expect_err("multiplication overflow must fail closed");
+        assert_eq!(multiplication.code(), ErrorCode::ResourceExhausted);
+        let addition = checked_resolution_peak_add(usize::MAX, 1, "test")
+            .expect_err("addition overflow must fail closed");
+        assert_eq!(addition.code(), ErrorCode::ResourceExhausted);
+    }
 }

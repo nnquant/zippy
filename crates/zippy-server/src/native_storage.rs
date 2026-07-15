@@ -773,12 +773,13 @@ async fn supervise_storage(
     startup: &mpsc::SyncSender<Result<SupervisorReady>>,
     terminal_failure: &Arc<Mutex<Option<ServerError>>>,
 ) -> (bool, Result<()>) {
-    let catalog = match SqliteCatalog::open(config.catalog.clone()) {
-        Ok(catalog) => Arc::new(catalog),
-        Err(error) => {
-            return (false, Err(error));
-        }
-    };
+    let (catalog, snapshot_memory_lease_issuer) =
+        match SqliteCatalog::open_with_snapshot_memory_lease_issuer(config.catalog.clone()) {
+            Ok((catalog, issuer)) => (Arc::new(catalog), issuer),
+            Err(error) => {
+                return (false, Err(error));
+            }
+        };
 
     if shutdown_requested(&shutdown) {
         return (
@@ -972,9 +973,10 @@ async fn supervise_storage(
             fail_storage(error, Some(table_actors), Some(persist_controller), catalog).await,
         );
     }
-    let query_resources = match crate::query_service::QueryResourceCoordinator::with_registry_config(
+    let query_resources = match crate::query_service::QueryResourceCoordinator::with_registry_config_and_snapshot_memory_lease_issuer(
         config.query_resources,
         config.query_registry,
+        snapshot_memory_lease_issuer,
     ) {
         Ok(query_resources) => query_resources,
         Err(error) => {

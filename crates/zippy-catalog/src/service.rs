@@ -2,6 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -25,6 +26,10 @@ use zippy_types::catalog::{
     LegacyFileViewSnapshotMapping, ListNamespacesRequest, ListNamespacesResponse,
     ListTablesRequest, ListTablesResponse, ManagedDataFileProbe, NamespaceRef,
     VersionedCatalogCommand, VersionedCatalogResponse,
+};
+use zippy_types::storage::{
+    CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseIssuer,
+    CatalogSnapshotMemoryLeaseVerifier,
 };
 use zippy_types::table::{NamespaceDescriptor, TableDescriptor, TableRef};
 use zippy_types::{BoxFuture, ErrorCode, QueryId, RequestId, Result, ServerError, TableId};
@@ -72,6 +77,7 @@ pub struct SqliteCatalog {
     publication_gate: Arc<Semaphore>,
     publication_gate_capacity: u32,
     runtime_snapshot_pins: Arc<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
+    snapshot_memory_lease_verifier: CatalogSnapshotMemoryLeaseVerifier,
     ownership: Arc<zippy_core::OwnedDataDirectory>,
     legacy_import_state: AtomicU8,
 }
@@ -107,6 +113,7 @@ impl fmt::Debug for SqliteCatalogLegacyImportSession<'_> {
 pub struct SqliteCatalogReadHandle {
     endpoint: Arc<CatalogReadEndpoint>,
     runtime_snapshot_pins: Weak<crate::runtime_pins::RuntimeSnapshotPinRegistry>,
+    snapshot_memory_lease_verifier: CatalogSnapshotMemoryLeaseVerifier,
     ownership: Weak<zippy_core::OwnedDataDirectory>,
 }
 
@@ -156,7 +163,24 @@ impl SqliteCatalog {
     /// preflight, durable SQLite configuration, migrations, and integrity check
     /// have completed on the actor thread.
     pub fn open(config: SqliteCatalogConfig) -> Result<Self> {
-        Self::open_with_backends(
+        Self::open_with_backends_and_snapshot_memory_lease_issuer(
+            config,
+            Arc::new(DomainManifestPreparationBackend),
+            Arc::new(DomainCatalogReadBackend),
+        )
+        .map(|(catalog, _issuer)| catalog)
+    }
+
+    /// Opens the Catalog and returns its exclusive native-query memory-lease issuer.
+    ///
+    /// The paired verifier remains private to this Catalog instance and is copied into each read
+    /// handle. Callers must retain the issuer in the native snapshot coordinator; a lease issued by
+    /// any other Catalog or independently created authority is rejected before worker admission or
+    /// runtime pin acquisition. [`Self::open`] deliberately discards this capability.
+    pub fn open_with_snapshot_memory_lease_issuer(
+        config: SqliteCatalogConfig,
+    ) -> Result<(Self, CatalogSnapshotMemoryLeaseIssuer)> {
+        Self::open_with_backends_and_snapshot_memory_lease_issuer(
             config,
             Arc::new(DomainManifestPreparationBackend),
             Arc::new(DomainCatalogReadBackend),
@@ -171,12 +195,28 @@ impl SqliteCatalog {
         Self::open_with_backends(config, manifest_backend, Arc::new(DomainCatalogReadBackend))
     }
 
+    #[cfg(test)]
     fn open_with_backends(
         config: SqliteCatalogConfig,
         manifest_backend: Arc<dyn ManifestPreparationBackend>,
         read_backend: Arc<dyn CatalogReadBackend>,
     ) -> Result<Self> {
+        Self::open_with_backends_and_snapshot_memory_lease_issuer(
+            config,
+            manifest_backend,
+            read_backend,
+        )
+        .map(|(catalog, _issuer)| catalog)
+    }
+
+    fn open_with_backends_and_snapshot_memory_lease_issuer(
+        config: SqliteCatalogConfig,
+        manifest_backend: Arc<dyn ManifestPreparationBackend>,
+        read_backend: Arc<dyn CatalogReadBackend>,
+    ) -> Result<(Self, CatalogSnapshotMemoryLeaseIssuer)> {
         crate::validate_config(&config)?;
+        let (snapshot_memory_lease_issuer, snapshot_memory_lease_verifier) =
+            CatalogSnapshotMemoryLeaseIssuer::new_authority()?;
         let ownership = Arc::clone(config.ownership());
         let runtime_ownership = config
             .ownership
@@ -231,13 +271,14 @@ impl SqliteCatalog {
                     publication_gate,
                     publication_gate_capacity,
                     runtime_snapshot_pins,
+                    snapshot_memory_lease_verifier,
                     ownership,
                     legacy_import_state: AtomicU8::new(LEGACY_IMPORT_AVAILABLE),
                 };
                 match CatalogReadPool::start(&config, read_backend) {
                     Ok(read_pool) => {
                         catalog.read_pool = Some(read_pool);
-                        Ok(catalog)
+                        Ok((catalog, snapshot_memory_lease_issuer))
                     }
                     Err(error) => {
                         if let Err(cleanup_error) = catalog.shutdown() {
@@ -281,6 +322,7 @@ impl SqliteCatalog {
         Ok(SqliteCatalogReadHandle {
             endpoint: Arc::clone(&read_pool.endpoint),
             runtime_snapshot_pins: Arc::downgrade(&self.runtime_snapshot_pins),
+            snapshot_memory_lease_verifier: self.snapshot_memory_lease_verifier.clone(),
             ownership: Arc::downgrade(&self.ownership),
         })
     }
@@ -709,10 +751,15 @@ impl CatalogRead for SqliteCatalog {
             table_domain::validate_table_resolution_request(tables)?;
             await_response(self.read_pool().and_then(|pool| {
                 pool.control_request(|sender| {
-                    ControlReadMessage::ResolveTables(tables.to_vec(), sender)
+                    ControlReadMessage::ResolveTables(ResolveTablesRequest {
+                        tables: tables.to_vec(),
+                        memory_lease: None,
+                        response: sender,
+                    })
                 })
             }))
             .await
+            .map(|response| response.tables)
         })
     }
 
@@ -728,11 +775,13 @@ impl CatalogRead for SqliteCatalog {
                     SnapshotReadMessage::Read(SnapshotReadRequest {
                         selectors,
                         limits: snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                        memory_lease: None,
                         response,
                     })
                 })
             }))
             .await
+            .map(|response| response.snapshot)
         })
     }
 }
@@ -774,6 +823,52 @@ impl SqliteCatalogReadHandle {
             .map(|registry| registry.query_pin_records())
     }
 
+    /// Resolves table references while retaining one query-attributed memory reservation.
+    ///
+    /// Validation and reservation checks happen before the request is cloned or admitted to the
+    /// control-read queue. Once admitted, the reservation follows the queued request, synchronous
+    /// SQLite worker, and response. Cancellation cannot release it while worker work remains live.
+    ///
+    /// :param query_id: Caller-assigned query identity that must match the lease attribution.
+    /// :param tables: Ordered table references to resolve atomically.
+    /// :param memory_lease: Exclusive reservation covering Catalog's conservative resolution peak.
+    /// :returns: Resolved descriptors in input order and the same exclusive reservation.
+    /// :raises ServerError: If validation, admission, resolution, or attribution fails.
+    pub async fn resolve_tables_with_memory_lease(
+        &self,
+        query_id: QueryId,
+        tables: &[TableRef],
+        memory_lease: CatalogSnapshotMemoryLease,
+    ) -> Result<(Vec<TableDescriptor>, CatalogSnapshotMemoryLease)> {
+        table_domain::validate_table_resolution_request(tables)?;
+        let required = table_domain::conservative_table_resolution_owned_peak_bytes(tables.len())?;
+        validate_catalog_memory_lease(
+            &memory_lease,
+            &self.snapshot_memory_lease_verifier,
+            required,
+            Some(query_id),
+            "table resolution",
+        )?;
+        let tables = tables.to_vec();
+        let response = await_response(self.endpoint.control_request(|response| {
+            ControlReadMessage::ResolveTables(ResolveTablesRequest {
+                tables,
+                memory_lease: Some(memory_lease),
+                response,
+            })
+        }))
+        .await?;
+        let memory_lease = response.memory_lease.ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Internal,
+                "catalog control worker lost an owned memory reservation",
+            )
+            .with_query_id(query_id)
+            .with_retryable(false)
+        })?;
+        Ok((response.tables, memory_lease))
+    }
+
     /// Atomically admits query-attributed pins before reading exact Catalog metadata.
     ///
     /// Requests must be nonempty, in strict table-ID order, and use unique lease identities. If
@@ -783,6 +878,8 @@ impl SqliteCatalogReadHandle {
         &self,
         query_id: QueryId,
         requests: &[crate::SqliteCatalogQuerySnapshotPinRequest],
+        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+        memory_lease: CatalogSnapshotMemoryLease,
     ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
         if requests.is_empty() {
             return Err(ServerError::new(
@@ -792,6 +889,15 @@ impl SqliteCatalogReadHandle {
             .with_query_id(query_id)
             .with_retryable(false));
         }
+        let limits = limits.validate()?;
+        let required = limits.conservative_owned_peak_bytes(requests.len())?;
+        validate_catalog_memory_lease(
+            &memory_lease,
+            &self.snapshot_memory_lease_verifier,
+            required,
+            Some(query_id),
+            "query snapshot",
+        )?;
         let selectors = requests
             .iter()
             .map(|request| request.selector.clone())
@@ -829,8 +935,23 @@ impl SqliteCatalogReadHandle {
                 acquired_at_ns,
             )?);
         }
-        let snapshot = self.read_snapshot_at(&selectors).await?;
-        crate::SqliteCatalogPinnedQuerySnapshot::try_new(snapshot, pins, ownership)
+        let response = self
+            .read_snapshot_at_with_limits_and_memory_lease(&selectors, limits, Some(memory_lease))
+            .await?;
+        let memory_lease = response.memory_lease.ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Internal,
+                "catalog snapshot worker lost an owned memory reservation",
+            )
+            .with_query_id(query_id)
+            .with_retryable(false)
+        })?;
+        crate::SqliteCatalogPinnedQuerySnapshot::try_new(
+            response.snapshot,
+            pins,
+            ownership,
+            memory_lease,
+        )
     }
 
     /// Reads exact metadata only after pinning every selected table against physical GC.
@@ -842,10 +963,12 @@ impl SqliteCatalogReadHandle {
     pub async fn read_pinned_snapshot_at(
         &self,
         selectors: &[CatalogSnapshotSelector],
+        memory_lease: CatalogSnapshotMemoryLease,
     ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
         self.read_pinned_snapshot_at_with_limits(
             selectors,
             snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+            memory_lease,
         )
         .await
     }
@@ -855,6 +978,7 @@ impl SqliteCatalogReadHandle {
         &self,
         selectors: &[CatalogSnapshotSelector],
         limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+        memory_lease: CatalogSnapshotMemoryLease,
     ) -> Result<crate::SqliteCatalogPinnedQuerySnapshot> {
         if selectors.is_empty() {
             return Err(ServerError::new(
@@ -865,6 +989,14 @@ impl SqliteCatalogReadHandle {
         }
         snapshot_domain::validate_snapshot_selectors(selectors)?;
         let limits = limits.validate()?;
+        let required = limits.conservative_owned_peak_bytes(selectors.len())?;
+        validate_catalog_memory_lease(
+            &memory_lease,
+            &self.snapshot_memory_lease_verifier,
+            required,
+            None,
+            "snapshot",
+        )?;
         let ownership = self.ownership.upgrade().ok_or_else(|| {
             ServerError::new(
                 ErrorCode::Unavailable,
@@ -877,8 +1009,22 @@ impl SqliteCatalogReadHandle {
         for selector in selectors {
             pins.push(runtime_snapshot_pins.pin(selector.table_id, selector.snapshot_version)?);
         }
-        let snapshot = self.read_snapshot_at_with_limits(selectors, limits).await?;
-        crate::SqliteCatalogPinnedQuerySnapshot::try_new(snapshot, pins, ownership)
+        let response = self
+            .read_snapshot_at_with_limits_and_memory_lease(selectors, limits, Some(memory_lease))
+            .await?;
+        let memory_lease = response.memory_lease.ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Internal,
+                "catalog snapshot worker lost an owned memory reservation",
+            )
+            .with_retryable(false)
+        })?;
+        crate::SqliteCatalogPinnedQuerySnapshot::try_new(
+            response.snapshot,
+            pins,
+            ownership,
+            memory_lease,
+        )
     }
 
     fn runtime_snapshot_pin_registry(
@@ -903,6 +1049,17 @@ impl SqliteCatalogReadHandle {
         selectors: &[CatalogSnapshotSelector],
         limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
     ) -> Result<CatalogQuerySnapshot> {
+        self.read_snapshot_at_with_limits_and_memory_lease(selectors, limits, None)
+            .await
+            .map(|response| response.snapshot)
+    }
+
+    async fn read_snapshot_at_with_limits_and_memory_lease(
+        &self,
+        selectors: &[CatalogSnapshotSelector],
+        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+        memory_lease: Option<CatalogSnapshotMemoryLease>,
+    ) -> Result<SnapshotReadResponse> {
         snapshot_domain::validate_snapshot_selectors(selectors)?;
         let limits = limits.validate()?;
         let selectors = selectors.to_vec();
@@ -910,6 +1067,7 @@ impl SqliteCatalogReadHandle {
             SnapshotReadMessage::Read(SnapshotReadRequest {
                 selectors,
                 limits,
+                memory_lease,
                 response,
             })
         }))
@@ -1040,9 +1198,14 @@ impl CatalogRead for SqliteCatalogReadHandle {
         Box::pin(async move {
             table_domain::validate_table_resolution_request(tables)?;
             await_response(self.endpoint.control_request(|sender| {
-                ControlReadMessage::ResolveTables(tables.to_vec(), sender)
+                ControlReadMessage::ResolveTables(ResolveTablesRequest {
+                    tables: tables.to_vec(),
+                    memory_lease: None,
+                    response: sender,
+                })
             }))
             .await
+            .map(|response| response.tables)
         })
     }
 
@@ -1752,7 +1915,7 @@ enum ControlReadMessage {
         ListTablesRequest,
         oneshot::Sender<Result<ListTablesResponse>>,
     ),
-    ResolveTables(Vec<TableRef>, oneshot::Sender<Result<Vec<TableDescriptor>>>),
+    ResolveTables(ResolveTablesRequest),
     InspectFiles(
         Vec<ManagedDataFileProbe>,
         oneshot::Sender<Result<CatalogDataFileReferenceSnapshot>>,
@@ -1783,6 +1946,17 @@ struct CommandReplayProbeRequest {
     probe_permit: ReplayProbePermit,
 }
 
+struct ResolveTablesRequest {
+    tables: Vec<TableRef>,
+    memory_lease: Option<CatalogSnapshotMemoryLease>,
+    response: oneshot::Sender<Result<ResolveTablesResponse>>,
+}
+
+struct ResolveTablesResponse {
+    tables: Vec<TableDescriptor>,
+    memory_lease: Option<CatalogSnapshotMemoryLease>,
+}
+
 struct LegacyImportReplayProbeRequest {
     request_id: RequestId,
     response: oneshot::Sender<Result<LegacyCatalogImportReplayProbeV2>>,
@@ -1797,7 +1971,13 @@ enum SnapshotReadMessage {
 struct SnapshotReadRequest {
     selectors: Vec<CatalogSnapshotSelector>,
     limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
-    response: oneshot::Sender<Result<CatalogQuerySnapshot>>,
+    memory_lease: Option<CatalogSnapshotMemoryLease>,
+    response: oneshot::Sender<Result<SnapshotReadResponse>>,
+}
+
+struct SnapshotReadResponse {
+    snapshot: CatalogQuerySnapshot,
+    memory_lease: Option<CatalogSnapshotMemoryLease>,
 }
 
 struct CatalogReadEndpoint {
@@ -2095,9 +2275,27 @@ fn control_read_loop(
                     let _ = response.send(backend.list_tables(&mut connection, request));
                 }
             }
-            ControlReadMessage::ResolveTables(tables, response) => {
-                if !response.is_closed() {
-                    let _ = response.send(backend.resolve_tables(&mut connection, &tables));
+            ControlReadMessage::ResolveTables(request) => {
+                let ResolveTablesRequest {
+                    tables,
+                    memory_lease,
+                    response,
+                } = request;
+                if response.is_closed() {
+                    drop(memory_lease);
+                    continue;
+                }
+                match backend.resolve_tables(&mut connection, &tables) {
+                    Ok(tables) => {
+                        let _ = response.send(Ok(ResolveTablesResponse {
+                            tables,
+                            memory_lease,
+                        }));
+                    }
+                    Err(error) => {
+                        drop(memory_lease);
+                        let _ = response.send(Err(error));
+                    }
                 }
             }
             ControlReadMessage::InspectFiles(probes, response) => {
@@ -2191,11 +2389,22 @@ fn snapshot_read_loop(
                 let SnapshotReadRequest {
                     selectors,
                     limits,
+                    memory_lease,
                     response,
                 } = request;
                 if !response.is_closed() {
-                    let _ =
-                        response.send(backend.read_snapshot(&mut connection, &selectors, limits));
+                    match backend.read_snapshot(&mut connection, &selectors, limits) {
+                        Ok(snapshot) => {
+                            let _ = response.send(Ok(SnapshotReadResponse {
+                                snapshot,
+                                memory_lease,
+                            }));
+                        }
+                        Err(error) => {
+                            drop(memory_lease);
+                            let _ = response.send(Err(error));
+                        }
+                    }
                 }
             }
             SnapshotReadMessage::Shutdown => break,
@@ -3010,6 +3219,65 @@ fn fail_active_manifest_worker(
     }
 }
 
+fn validate_catalog_memory_lease(
+    memory_lease: &CatalogSnapshotMemoryLease,
+    verifier: &CatalogSnapshotMemoryLeaseVerifier,
+    required_bytes: NonZeroU64,
+    expected_query_id: Option<QueryId>,
+    operation: &'static str,
+) -> Result<()> {
+    if !verifier.accepts(memory_lease) {
+        let error = ServerError::new(
+            ErrorCode::InvalidArgument,
+            format!("catalog memory lease has a foreign authority operation=[{operation}]"),
+        )
+        .with_retryable(false);
+        return Err(match expected_query_id {
+            Some(query_id) => error.with_query_id(query_id),
+            None => error,
+        });
+    }
+    let actual_instance = memory_lease.query_instance_id();
+    match (expected_query_id, actual_instance) {
+        (Some(expected), Some(actual)) if actual.query_id() == expected => {}
+        (Some(expected), _) => {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "catalog memory lease query attribution does not match operation=[{operation}]"
+                ),
+            )
+            .with_query_id(expected)
+            .with_retryable(false));
+        }
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!("catalog memory lease must be unattributed operation=[{operation}]"),
+            )
+            .with_retryable(false));
+        }
+    }
+    let reserved_bytes = memory_lease.reserved_bytes();
+    if reserved_bytes < required_bytes {
+        return Err(ServerError::new(
+            ErrorCode::ResourceExhausted,
+            format!(
+                concat!(
+                    "catalog memory lease is smaller than conservative peak ",
+                    "operation=[{}] reserved_bytes=[{}] required_bytes=[{}]"
+                ),
+                operation,
+                reserved_bytes.get(),
+                required_bytes.get()
+            ),
+        )
+        .with_retryable(false));
+    }
+    Ok(())
+}
+
 async fn await_response<T>(response: Result<oneshot::Receiver<Result<T>>>) -> Result<T> {
     response?.await.map_err(|_| actor_stopped())?
 }
@@ -3150,19 +3418,21 @@ mod tests {
         LEGACY_EFFECTIVE_SCAN_ORDER_METADATA_KEY, LEGACY_REGISTRY_INDEX_METADATA_KEY,
         LEGACY_VERIFIED_SCHEMA_HASH_METADATA_KEY,
     };
+    use zippy_types::query::QueryInstanceId;
+    use zippy_types::storage::{CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseIssuer};
     use zippy_types::table::{
         AppendTableDefinition, CatalogName, DataFileDescriptor, DataFileLocation,
         DataFileProvenance, DataFileState, DataFiles, ExternalDataPath, ManagedDataPath,
         MetadataMap, MetadataScalar, NativeDataFileProvenance, PendingDataFile,
         SchemaCompatibility, SchemaDescriptor, SchemaIpcPayload, SourceSegmentIdentity,
-        SourceSegmentLineage, SourceSegmentLineages, TableDefinition,
+        SourceSegmentLineage, SourceSegmentLineages, TableDefinition, TableRef,
     };
     use zippy_types::{
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetRange, OffsetWatermark, RequestId, TableId,
     };
 
     use super::{
-        deferred_control_read, domain, snapshot_domain, verify_replay_probe_command,
+        deferred_control_read, domain, snapshot_domain, table_domain, verify_replay_probe_command,
         CatalogReadBackend, DomainManifestPreparationBackend, ManifestPreparationBackend,
         ManifestQueueBudget, ReplayProbeBudget, SqliteCatalog, SqliteCatalogConfig,
         SqliteCatalogLegacyReconcileHandle, SqliteCatalogReadHandle, REPLAY_PROBE_CAPACITY,
@@ -3187,6 +3457,15 @@ mod tests {
 
     struct PanickingControlReadBackend;
 
+    struct PanickingResolutionReadBackend;
+
+    struct PanickingSnapshotReadBackend;
+
+    struct CountingResolutionAndSnapshotBackend {
+        resolution_calls: Arc<AtomicUsize>,
+        snapshot_calls: Arc<AtomicUsize>,
+    }
+
     struct CountingReplayReadBackend {
         probe_calls: Arc<AtomicUsize>,
     }
@@ -3202,6 +3481,87 @@ mod tests {
         release: crossbeam_channel::Receiver<()>,
         block_once: AtomicBool,
         calls: Arc<AtomicUsize>,
+    }
+
+    struct BlockingResolutionBackend {
+        started: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+        block_once: AtomicBool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct DropCountingSnapshotMemoryLease {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropCountingSnapshotMemoryLease {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn snapshot_memory_lease(
+        issuer: &CatalogSnapshotMemoryLeaseIssuer,
+        drops: &Arc<AtomicUsize>,
+        reserved_bytes: NonZeroU64,
+        query_instance_id: Option<QueryInstanceId>,
+    ) -> CatalogSnapshotMemoryLease {
+        let drops = Arc::clone(drops);
+        issuer
+            .issue_with_owner(reserved_bytes, query_instance_id, move |_| {
+                Ok(Box::new(DropCountingSnapshotMemoryLease { drops }))
+            })
+            .expect("issue test Catalog snapshot memory lease")
+    }
+
+    fn unattributed_snapshot_memory_lease(
+        issuer: &CatalogSnapshotMemoryLeaseIssuer,
+        selector_count: usize,
+    ) -> CatalogSnapshotMemoryLease {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let required = snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+            .conservative_owned_peak_bytes(selector_count)
+            .expect("estimate default test snapshot memory");
+        snapshot_memory_lease(issuer, &drops, required, None)
+    }
+
+    fn attributed_snapshot_memory_lease(
+        issuer: &CatalogSnapshotMemoryLeaseIssuer,
+        drops: &Arc<AtomicUsize>,
+        query_id: zippy_types::QueryId,
+        limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+        selector_count: usize,
+    ) -> CatalogSnapshotMemoryLease {
+        let required = limits
+            .conservative_owned_peak_bytes(selector_count)
+            .expect("estimate attributed test snapshot memory");
+        snapshot_memory_lease(
+            issuer,
+            drops,
+            required,
+            Some(QueryInstanceId::new(
+                query_id,
+                NonZeroU64::new(1).expect("nonzero test query generation"),
+            )),
+        )
+    }
+
+    fn attributed_resolution_memory_lease(
+        issuer: &CatalogSnapshotMemoryLeaseIssuer,
+        drops: &Arc<AtomicUsize>,
+        query_id: zippy_types::QueryId,
+        reference_count: usize,
+    ) -> CatalogSnapshotMemoryLease {
+        snapshot_memory_lease(
+            issuer,
+            drops,
+            table_domain::conservative_table_resolution_owned_peak_bytes(reference_count)
+                .expect("estimate attributed test resolution memory"),
+            Some(QueryInstanceId::new(
+                query_id,
+                NonZeroU64::new(1).expect("nonzero test query generation"),
+            )),
+        )
     }
 
     impl ManifestPreparationBackend for BlockingManifestBackend {
@@ -3312,9 +3672,70 @@ mod tests {
         }
     }
 
+    impl CatalogReadBackend for BlockingResolutionBackend {
+        fn resolve_tables(
+            &self,
+            connection: &mut rusqlite::Connection,
+            tables: &[zippy_types::table::TableRef],
+        ) -> zippy_types::Result<Vec<zippy_types::table::TableDescriptor>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.block_once.swap(false, Ordering::AcqRel) {
+                self.started
+                    .send(())
+                    .expect("test resolution start observer must remain connected");
+                self.release
+                    .recv()
+                    .expect("test resolution release must be signalled");
+            }
+            table_domain::resolve_tables(connection, tables)
+        }
+    }
+
+    impl CatalogReadBackend for CountingResolutionAndSnapshotBackend {
+        fn resolve_tables(
+            &self,
+            connection: &mut rusqlite::Connection,
+            tables: &[zippy_types::table::TableRef],
+        ) -> zippy_types::Result<Vec<zippy_types::table::TableDescriptor>> {
+            self.resolution_calls.fetch_add(1, Ordering::AcqRel);
+            table_domain::resolve_tables(connection, tables)
+        }
+
+        fn read_snapshot(
+            &self,
+            connection: &mut rusqlite::Connection,
+            selectors: &[CatalogSnapshotSelector],
+            limits: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+        ) -> zippy_types::Result<zippy_types::catalog::CatalogQuerySnapshot> {
+            self.snapshot_calls.fetch_add(1, Ordering::AcqRel);
+            snapshot_domain::read_snapshot_at_with_limits(connection, selectors, limits)
+        }
+    }
+
     impl CatalogReadBackend for PanickingControlReadBackend {
         fn revision(&self, _: &rusqlite::Connection) -> zippy_types::Result<u64> {
             panic!("injected control read worker panic");
+        }
+    }
+
+    impl CatalogReadBackend for PanickingResolutionReadBackend {
+        fn resolve_tables(
+            &self,
+            _: &mut rusqlite::Connection,
+            _: &[zippy_types::table::TableRef],
+        ) -> zippy_types::Result<Vec<zippy_types::table::TableDescriptor>> {
+            panic!("injected table resolution worker panic");
+        }
+    }
+
+    impl CatalogReadBackend for PanickingSnapshotReadBackend {
+        fn read_snapshot(
+            &self,
+            _: &mut rusqlite::Connection,
+            _: &[CatalogSnapshotSelector],
+            _: snapshot_domain::SqliteCatalogSnapshotReadLimits,
+        ) -> zippy_types::Result<zippy_types::catalog::CatalogQuerySnapshot> {
+            panic!("injected snapshot read worker panic");
         }
     }
 
@@ -4853,6 +5274,28 @@ mod tests {
         )
     }
 
+    fn blocking_resolution_backend() -> (
+        Arc<dyn CatalogReadBackend>,
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (started_sender, started_receiver) = crossbeam_channel::bounded(1);
+        let (release_sender, release_receiver) = crossbeam_channel::bounded(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(BlockingResolutionBackend {
+                started: started_sender,
+                release: release_receiver,
+                block_once: AtomicBool::new(true),
+                calls: Arc::clone(&calls),
+            }),
+            started_receiver,
+            release_sender,
+            calls,
+        )
+    }
+
     #[test]
     fn manifest_queue_budget_releases_completed_reservations() {
         let budget = Arc::new(ManifestQueueBudget::new(8));
@@ -4951,8 +5394,10 @@ mod tests {
         let data_directory = data_directory(&directory);
         let contents: Vec<u8> = (0..128).collect();
         write_managed_file_fixture(&data_directory, 10, &contents);
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         create_append_table(&catalog).await;
         catalog
             .command(commit_data_file(3, 10, 2, 1, 0))
@@ -4965,11 +5410,14 @@ mod tests {
 
         let handle = catalog.read_handle().expect("create read handle");
         let pinned = handle
-            .read_pinned_snapshot_at(&[CatalogSnapshotSelector {
-                table_id: table_id(),
-                snapshot_version: 2,
-                schema_version: 1,
-            }])
+            .read_pinned_snapshot_at(
+                &[CatalogSnapshotSelector {
+                    table_id: table_id(),
+                    snapshot_version: 2,
+                    schema_version: 1,
+                }],
+                unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
+            )
             .await
             .expect("read and pin historical snapshot");
         assert_eq!(pinned.catalog_revision(), 4);
@@ -5070,18 +5518,34 @@ mod tests {
     async fn attributed_multi_table_read_failure_rolls_back_all_runtime_pins() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         create_append_table(&catalog).await;
         let handle = catalog.read_handle().expect("create read handle");
         let query_id = zippy_types::QueryId::from_u128(41).expect("nonzero query id");
         let empty_attributed = handle
-            .read_pinned_query_snapshot_at(query_id, &[])
+            .read_pinned_query_snapshot_at(
+                query_id,
+                &[],
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                attributed_snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &Arc::new(AtomicUsize::new(0)),
+                    query_id,
+                    snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                    1,
+                ),
+            )
             .await
             .expect_err("empty attributed pin must not retain uncounted ownership");
         assert_eq!(empty_attributed.code(), ErrorCode::InvalidArgument);
         let empty_generic = handle
-            .read_pinned_snapshot_at(&[])
+            .read_pinned_snapshot_at(
+                &[],
+                unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
+            )
             .await
             .expect_err("empty generic pin must not retain uncounted ownership");
         assert_eq!(empty_generic.code(), ErrorCode::InvalidArgument);
@@ -5104,7 +5568,18 @@ mod tests {
             },
         ];
         let error = handle
-            .read_pinned_query_snapshot_at(query_id, &requests)
+            .read_pinned_query_snapshot_at(
+                query_id,
+                &requests,
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                attributed_snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &Arc::new(AtomicUsize::new(0)),
+                    query_id,
+                    snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                    requests.len(),
+                ),
+            )
             .await
             .expect_err("missing second table must fail the exact read");
         assert_eq!(error.code(), ErrorCode::NotFound);
@@ -5121,11 +5596,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn attributed_snapshot_memory_lease_follows_success_and_read_error_ownership() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(44).expect("nonzero query id");
+        let request = crate::SqliteCatalogQuerySnapshotPinRequest {
+            selector: CatalogSnapshotSelector {
+                table_id: table_id(),
+                snapshot_version: 1,
+                schema_version: 1,
+            },
+            lease_id: zippy_types::LeaseId::from_u128(45).expect("nonzero lease id"),
+        };
+
+        let success_drops = Arc::new(AtomicUsize::new(0));
+        let pinned = handle
+            .read_pinned_query_snapshot_at(
+                query_id,
+                std::slice::from_ref(&request),
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                attributed_snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &success_drops,
+                    query_id,
+                    snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                    1,
+                ),
+            )
+            .await
+            .expect("build attributed pinned snapshot");
+        let memory_descriptor = pinned.memory_lease_descriptor();
+        assert_eq!(
+            memory_descriptor
+                .query_instance_id()
+                .expect("query-attributed pinned reservation")
+                .query_id(),
+            query_id
+        );
+        assert_eq!(
+            memory_descriptor.reserved_bytes(),
+            snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+                .conservative_owned_peak_bytes(1)
+                .expect("estimate pinned reservation")
+        );
+        assert_eq!(success_drops.load(Ordering::Acquire), 0);
+        let manifest = pinned.table(0).expect("retain one pinned table owner");
+        drop(pinned);
+        assert_eq!(success_drops.load(Ordering::Acquire), 0);
+        drop(manifest);
+        assert_eq!(success_drops.load(Ordering::Acquire), 1);
+
+        let error_drops = Arc::new(AtomicUsize::new(0));
+        let error_request = crate::SqliteCatalogQuerySnapshotPinRequest {
+            lease_id: zippy_types::LeaseId::from_u128(46).expect("nonzero lease id"),
+            ..request
+        };
+        let error_limits = snapshot_domain::SqliteCatalogSnapshotReadLimits {
+            max_raw_response_bytes: 1,
+            ..snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+        };
+        let error = handle
+            .read_pinned_query_snapshot_at(
+                query_id,
+                std::slice::from_ref(&error_request),
+                error_limits,
+                attributed_snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &error_drops,
+                    query_id,
+                    error_limits,
+                    1,
+                ),
+            )
+            .await
+            .expect_err("snapshot read error must release its memory reservation");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(error_drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            handle
+                .runtime_snapshot_pin_status()
+                .expect("read pin status after memory-budget failure")
+                .active_pins,
+            0
+        );
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pinned_schema_charges_follow_deterministic_table_ordinals() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         create_append_table(&catalog).await;
         let second_table_id = TableId::from_u128(3).expect("nonzero second table id");
         catalog
@@ -5175,7 +5745,10 @@ mod tests {
         let pinned = catalog
             .read_handle()
             .expect("create read handle")
-            .read_pinned_snapshot_at(&selectors)
+            .read_pinned_snapshot_at(
+                &selectors,
+                unattributed_snapshot_memory_lease(&memory_lease_issuer, 2),
+            )
             .await
             .expect("pin exact two-table snapshot");
         let manifests = pinned.tables().collect::<Vec<_>>();
@@ -5199,8 +5772,10 @@ mod tests {
     async fn pinned_schema_sidecar_failure_rolls_back_runtime_pins() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         create_append_table(&catalog).await;
         let selector = CatalogSnapshotSelector {
             table_id: table_id(),
@@ -5229,15 +5804,23 @@ mod tests {
             .pin_runtime_snapshot(table_id(), 1)
             .expect("pin runtime snapshot before sidecar validation");
         assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 1);
+        let memory_lease_drops = Arc::new(AtomicUsize::new(0));
 
         let error = crate::SqliteCatalogPinnedQuerySnapshot::try_new(
             corrupt_snapshot,
             vec![pin],
             Arc::clone(&data_directory),
+            snapshot_memory_lease(
+                &memory_lease_issuer,
+                &memory_lease_drops,
+                NonZeroU64::new(1).expect("nonzero direct test reservation"),
+                None,
+            ),
         )
         .expect_err("corrupt persisted schema must reject pinned owner construction");
         assert_eq!(error.code(), ErrorCode::DataCorruption);
         assert_eq!(catalog.runtime_snapshot_pin_status().active_pins, 0);
+        assert_eq!(memory_lease_drops.load(Ordering::Acquire), 1);
         catalog.close().expect("close catalog");
     }
 
@@ -5248,8 +5831,10 @@ mod tests {
         let data_directory = data_directory(&directory);
         let physical_file = directory.path().join("legacy-events.parquet");
         let contents = (0_u8..=127).collect::<Vec<_>>();
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         let snapshot = import_external_legacy_file(&catalog, &physical_file, &contents).await;
         let pin = catalog
             .pin_runtime_snapshot(table_id(), 2)
@@ -5258,6 +5843,7 @@ mod tests {
             snapshot,
             vec![pin],
             Arc::clone(&data_directory),
+            unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
         )
         .expect("build pinned external legacy snapshot");
         let file = pinned
@@ -5285,8 +5871,10 @@ mod tests {
         let data_directory = data_directory(&directory);
         let physical_file = directory.path().join("legacy-events.parquet");
         let contents = [0x5a_u8; 128];
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         let snapshot = import_external_legacy_file(&catalog, &physical_file, &contents).await;
         let pin = catalog
             .pin_runtime_snapshot(table_id(), 2)
@@ -5295,6 +5883,7 @@ mod tests {
             snapshot,
             vec![pin],
             Arc::clone(&data_directory),
+            unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
         )
         .expect("build pinned external legacy snapshot");
         let file = pinned
@@ -5327,8 +5916,10 @@ mod tests {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
         let physical_file = write_managed_file_fixture(&data_directory, 10, &[0x5a; 127]);
-        let catalog =
-            SqliteCatalog::open(SqliteCatalogConfig::new(&data_directory)).expect("open catalog");
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
         create_append_table(&catalog).await;
         catalog
             .command(commit_data_file(3, 10, 2, 1, 0))
@@ -5337,11 +5928,14 @@ mod tests {
         let pinned = catalog
             .read_handle()
             .expect("create read handle")
-            .read_pinned_snapshot_at(&[CatalogSnapshotSelector {
-                table_id: table_id(),
-                snapshot_version: 2,
-                schema_version: 1,
-            }])
+            .read_pinned_snapshot_at(
+                &[CatalogSnapshotSelector {
+                    table_id: table_id(),
+                    snapshot_version: 2,
+                    schema_version: 1,
+                }],
+                unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
+            )
             .await
             .expect("read pinned snapshot");
         let table = pinned.table(0).expect("pinned table manifest");
@@ -5388,7 +5982,9 @@ mod tests {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
         let config = SqliteCatalogConfig::new(&data_directory);
-        let catalog = SqliteCatalog::open(config.clone()).expect("open catalog");
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_snapshot_memory_lease_issuer(config.clone())
+                .expect("open catalog");
         create_append_table(&catalog).await;
         let handle = catalog.read_handle().expect("create read handle");
         let selectors = [CatalogSnapshotSelector {
@@ -5397,7 +5993,10 @@ mod tests {
             schema_version: 1,
         }];
         let pinned = handle
-            .read_pinned_snapshot_at(&selectors)
+            .read_pinned_snapshot_at(
+                &selectors,
+                unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
+            )
             .await
             .expect("pin initial snapshot");
 
@@ -5413,7 +6012,10 @@ mod tests {
         };
         assert_eq!(conflict.code(), ErrorCode::Conflict);
         let stale_handle = handle
-            .read_pinned_snapshot_at(&selectors)
+            .read_pinned_snapshot_at(
+                &selectors,
+                unattributed_snapshot_memory_lease(&memory_lease_issuer, 1),
+            )
             .await
             .expect_err("closed epoch rejects new pin admission");
         assert_eq!(stale_handle.code(), ErrorCode::Unavailable);
@@ -5704,6 +6306,425 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn leased_table_resolution_returns_ownership_and_releases_it_on_read_error() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (catalog, memory_lease_issuer) = SqliteCatalog::open_with_snapshot_memory_lease_issuer(
+            SqliteCatalogConfig::new(&data_directory),
+        )
+        .expect("open catalog");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(81).expect("nonzero query id");
+        let references = [TableRef::from(table_id())];
+
+        let success_drops = Arc::new(AtomicUsize::new(0));
+        let (tables, memory_lease) = handle
+            .resolve_tables_with_memory_lease(
+                query_id,
+                &references,
+                attributed_resolution_memory_lease(
+                    &memory_lease_issuer,
+                    &success_drops,
+                    query_id,
+                    references.len(),
+                ),
+            )
+            .await
+            .expect("resolve one table with retained admission");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].table_id, table_id());
+        assert_eq!(
+            memory_lease
+                .query_instance_id()
+                .expect("query-attributed resolution lease")
+                .query_id(),
+            query_id
+        );
+        assert_eq!(success_drops.load(Ordering::Acquire), 0);
+        drop(tables);
+        assert_eq!(success_drops.load(Ordering::Acquire), 0);
+        drop(memory_lease);
+        assert_eq!(success_drops.load(Ordering::Acquire), 1);
+
+        let error_drops = Arc::new(AtomicUsize::new(0));
+        let missing = [TableRef::from(
+            TableId::from_u128(999).expect("nonzero missing table id"),
+        )];
+        let error = handle
+            .resolve_tables_with_memory_lease(
+                query_id,
+                &missing,
+                attributed_resolution_memory_lease(
+                    &memory_lease_issuer,
+                    &error_drops,
+                    query_id,
+                    missing.len(),
+                ),
+            )
+            .await
+            .expect_err("resolution error must release worker-owned admission");
+        assert_eq!(error.code(), ErrorCode::NotFound);
+        assert_eq!(error_drops.load(Ordering::Acquire), 1);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn memory_lease_validation_precedes_resolution_worker_and_runtime_pins() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let resolution_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                SqliteCatalogConfig::new(&data_directory),
+                Arc::new(DomainManifestPreparationBackend),
+                Arc::new(CountingResolutionAndSnapshotBackend {
+                    resolution_calls: Arc::clone(&resolution_calls),
+                    snapshot_calls: Arc::clone(&snapshot_calls),
+                }),
+            )
+            .expect("open catalog with counting read backend");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(82).expect("nonzero query id");
+        let references = [TableRef::from(table_id())];
+
+        let (foreign_issuer, _foreign_verifier) = CatalogSnapshotMemoryLeaseIssuer::new_authority()
+            .expect("create foreign memory lease authority");
+        let foreign_resolution_drops = Arc::new(AtomicUsize::new(0));
+        let foreign_resolution = snapshot_memory_lease(
+            &foreign_issuer,
+            &foreign_resolution_drops,
+            table_domain::conservative_table_resolution_owned_peak_bytes(references.len())
+                .expect("estimate foreign resolution reservation"),
+            Some(QueryInstanceId::new(
+                query_id,
+                NonZeroU64::new(1).expect("nonzero query generation"),
+            )),
+        );
+        let error = handle
+            .resolve_tables_with_memory_lease(query_id, &references, foreign_resolution)
+            .await
+            .expect_err("foreign issuer must fail before resolution admission");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.message().contains("foreign authority"));
+        assert_eq!(foreign_resolution_drops.load(Ordering::Acquire), 1);
+        assert_eq!(resolution_calls.load(Ordering::Acquire), 0);
+
+        let insufficient_resolution_drops = Arc::new(AtomicUsize::new(0));
+        let insufficient_resolution = snapshot_memory_lease(
+            &memory_lease_issuer,
+            &insufficient_resolution_drops,
+            NonZeroU64::new(1).expect("nonzero insufficient reservation"),
+            Some(QueryInstanceId::new(
+                query_id,
+                NonZeroU64::new(1).expect("nonzero query generation"),
+            )),
+        );
+        let error = handle
+            .resolve_tables_with_memory_lease(query_id, &references, insufficient_resolution)
+            .await
+            .expect_err("insufficient resolution lease must fail before enqueue");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(insufficient_resolution_drops.load(Ordering::Acquire), 1);
+        assert_eq!(resolution_calls.load(Ordering::Acquire), 0);
+
+        let wrong_query_drops = Arc::new(AtomicUsize::new(0));
+        let wrong_query_id = zippy_types::QueryId::from_u128(83).expect("nonzero wrong query id");
+        let error = handle
+            .resolve_tables_with_memory_lease(
+                query_id,
+                &references,
+                attributed_resolution_memory_lease(
+                    &memory_lease_issuer,
+                    &wrong_query_drops,
+                    wrong_query_id,
+                    references.len(),
+                ),
+            )
+            .await
+            .expect_err("cross-query resolution lease must fail before enqueue");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(wrong_query_drops.load(Ordering::Acquire), 1);
+        assert_eq!(resolution_calls.load(Ordering::Acquire), 0);
+
+        let selector = CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        };
+        let foreign_snapshot_drops = Arc::new(AtomicUsize::new(0));
+        let foreign_snapshot = snapshot_memory_lease(
+            &foreign_issuer,
+            &foreign_snapshot_drops,
+            snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+                .conservative_owned_peak_bytes(1)
+                .expect("estimate foreign snapshot reservation"),
+            None,
+        );
+        let error = handle
+            .read_pinned_snapshot_at(std::slice::from_ref(&selector), foreign_snapshot)
+            .await
+            .expect_err("foreign issuer must fail before runtime pin admission");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.message().contains("foreign authority"));
+        assert_eq!(foreign_snapshot_drops.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            handle
+                .runtime_snapshot_pin_status()
+                .expect("read pin status after foreign lease")
+                .active_pins,
+            0
+        );
+
+        let foreign_query_drops = Arc::new(AtomicUsize::new(0));
+        let foreign_query_request = crate::SqliteCatalogQuerySnapshotPinRequest {
+            selector: selector.clone(),
+            lease_id: zippy_types::LeaseId::from_u128(84).expect("nonzero lease id"),
+        };
+        let foreign_query_lease = snapshot_memory_lease(
+            &foreign_issuer,
+            &foreign_query_drops,
+            snapshot_domain::SqliteCatalogSnapshotReadLimits::default()
+                .conservative_owned_peak_bytes(1)
+                .expect("estimate foreign query snapshot reservation"),
+            Some(QueryInstanceId::new(
+                query_id,
+                NonZeroU64::new(1).expect("nonzero query generation"),
+            )),
+        );
+        let error = handle
+            .read_pinned_query_snapshot_at(
+                query_id,
+                std::slice::from_ref(&foreign_query_request),
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                foreign_query_lease,
+            )
+            .await
+            .expect_err("foreign issuer must fail before query pin admission");
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(error.message().contains("foreign authority"));
+        assert_eq!(foreign_query_drops.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            handle
+                .runtime_snapshot_pin_status()
+                .expect("read query pin status after foreign lease")
+                .active_query_pins,
+            0
+        );
+
+        let insufficient_snapshot_drops = Arc::new(AtomicUsize::new(0));
+        let error = handle
+            .read_pinned_snapshot_at(
+                std::slice::from_ref(&selector),
+                snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &insufficient_snapshot_drops,
+                    NonZeroU64::new(1).expect("nonzero insufficient reservation"),
+                    None,
+                ),
+            )
+            .await
+            .expect_err("insufficient snapshot lease must fail before pin admission");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(insufficient_snapshot_drops.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            handle
+                .runtime_snapshot_pin_status()
+                .expect("read pin status after rejected lease")
+                .active_pins,
+            0
+        );
+
+        let query_pin_drops = Arc::new(AtomicUsize::new(0));
+        let request = crate::SqliteCatalogQuerySnapshotPinRequest {
+            selector,
+            lease_id: zippy_types::LeaseId::from_u128(84).expect("nonzero lease id"),
+        };
+        let error = handle
+            .read_pinned_query_snapshot_at(
+                query_id,
+                std::slice::from_ref(&request),
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &query_pin_drops,
+                    NonZeroU64::new(1).expect("nonzero insufficient reservation"),
+                    Some(QueryInstanceId::new(
+                        query_id,
+                        NonZeroU64::new(1).expect("nonzero query generation"),
+                    )),
+                ),
+            )
+            .await
+            .expect_err("insufficient query snapshot lease must fail before pin admission");
+        assert_eq!(error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(query_pin_drops.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            handle
+                .runtime_snapshot_pin_status()
+                .expect("read query pin status after rejected lease")
+                .active_query_pins,
+            0
+        );
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_resolution_retains_lease_until_control_worker_dequeues_it() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (read_backend, started, release, calls) = blocking_resolution_backend();
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                SqliteCatalogConfig::new(&data_directory).with_control_read_capacity(1),
+                Arc::new(DomainManifestPreparationBackend),
+                read_backend,
+            )
+            .expect("open catalog with one queued control slot");
+        create_append_table(&catalog).await;
+        let references = [TableRef::from(table_id())];
+        let mut active = catalog.resolve_tables(&references);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(active.as_mut().poll(&mut context), Poll::Pending));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first resolution must occupy its worker");
+
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(85).expect("nonzero query id");
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let mut queued = Box::pin(handle.resolve_tables_with_memory_lease(
+            query_id,
+            &references,
+            attributed_resolution_memory_lease(
+                &memory_lease_issuer,
+                &lease_drops,
+                query_id,
+                references.len(),
+            ),
+        ));
+        assert!(matches!(queued.as_mut().poll(&mut context), Poll::Pending));
+        let full = catalog
+            .revision()
+            .await
+            .expect_err("active and queued resolutions must saturate the control lane");
+        assert_eq!(full.code(), ErrorCode::ResourceExhausted);
+        drop(queued);
+        assert_eq!(lease_drops.load(Ordering::Acquire), 0);
+
+        release.send(()).expect("release active resolution");
+        active.await.expect("finish active resolution");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lease_drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled queued resolution must eventually release its lease");
+        assert_eq!(lease_drops.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_inflight_resolution_retains_lease_until_sqlite_work_exits() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (read_backend, started, release, calls) = blocking_resolution_backend();
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                SqliteCatalogConfig::new(&data_directory),
+                Arc::new(DomainManifestPreparationBackend),
+                read_backend,
+            )
+            .expect("open catalog with blocking resolution backend");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(86).expect("nonzero query id");
+        let references = [TableRef::from(table_id())];
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let mut resolution = Box::pin(handle.resolve_tables_with_memory_lease(
+            query_id,
+            &references,
+            attributed_resolution_memory_lease(
+                &memory_lease_issuer,
+                &lease_drops,
+                query_id,
+                references.len(),
+            ),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            resolution.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("leased resolution must enter SQLite work");
+
+        drop(resolution);
+        assert_eq!(lease_drops.load(Ordering::Acquire), 0);
+        release.send(()).expect("release in-flight resolution");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lease_drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled in-flight resolution must release after SQLite exits");
+        assert_eq!(lease_drops.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        catalog.close().expect("close catalog");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicked_resolution_worker_drops_its_inflight_memory_lease() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                SqliteCatalogConfig::new(&data_directory),
+                Arc::new(DomainManifestPreparationBackend),
+                Arc::new(PanickingResolutionReadBackend),
+            )
+            .expect("open catalog with panicking resolution backend");
+        let handle = catalog.read_handle().expect("create read handle");
+        let query_id = zippy_types::QueryId::from_u128(87).expect("nonzero query id");
+        let references = [TableRef::from(table_id())];
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+
+        let error = match handle
+            .resolve_tables_with_memory_lease(
+                query_id,
+                &references,
+                attributed_resolution_memory_lease(
+                    &memory_lease_issuer,
+                    &lease_drops,
+                    query_id,
+                    references.len(),
+                ),
+            )
+            .await
+        {
+            Ok(_) => panic!("panicked worker unexpectedly returned a leased resolution"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(lease_drops.load(Ordering::Acquire), 1);
+
+        let close_error = catalog
+            .close()
+            .expect_err("joining the panicked control worker must fail");
+        assert_eq!(close_error.code(), ErrorCode::Internal);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn cooperative_manifest_preflight_yields_and_releases_cancelled_command_budget() {
         let directory = TempDir::new().expect("create temp directory");
         let data_directory = data_directory(&directory);
@@ -5796,12 +6817,13 @@ mod tests {
         let data_directory = data_directory(&directory);
         let config = SqliteCatalogConfig::new(&data_directory).with_snapshot_read_capacity(1);
         let (read_backend, started, release, calls) = blocking_snapshot_backend();
-        let catalog = SqliteCatalog::open_with_backends(
-            config,
-            Arc::new(DomainManifestPreparationBackend),
-            read_backend,
-        )
-        .expect("open catalog with one queued snapshot slot");
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                config,
+                Arc::new(DomainManifestPreparationBackend),
+                read_backend,
+            )
+            .expect("open catalog with one queued snapshot slot");
         create_append_table(&catalog).await;
 
         let selectors = [CatalogSnapshotSelector {
@@ -5816,7 +6838,18 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("first snapshot must occupy its worker");
 
-        let mut cancelled = catalog.read_snapshot_at(&selectors);
+        let handle = catalog.read_handle().expect("create read handle");
+        let queued_lease_drops = Arc::new(AtomicUsize::new(0));
+        let mut cancelled = Box::pin(handle.read_snapshot_at_with_limits_and_memory_lease(
+            &selectors,
+            snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+            Some(snapshot_memory_lease(
+                &memory_lease_issuer,
+                &queued_lease_drops,
+                NonZeroU64::new(1).expect("nonzero queued test reservation"),
+                None,
+            )),
+        ));
         assert!(matches!(
             cancelled.as_mut().poll(&mut context),
             Poll::Pending
@@ -5828,9 +6861,18 @@ mod tests {
         assert_eq!(full.code(), ErrorCode::ResourceExhausted);
         assert_eq!(full.message(), "sqlite catalog snapshot read queue is full");
         drop(cancelled);
+        assert_eq!(queued_lease_drops.load(Ordering::Acquire), 0);
 
         release.send(()).expect("release active snapshot");
         active.await.expect("finish active snapshot");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queued_lease_drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled queued request must release its memory lease");
+        assert_eq!(queued_lease_drops.load(Ordering::Acquire), 1);
         let final_snapshot = loop {
             match catalog.read_snapshot_at(&selectors).await {
                 Err(error) if error.code() == ErrorCode::ResourceExhausted => {
@@ -5842,6 +6884,108 @@ mod tests {
         final_snapshot.expect("snapshot lane must recover after skipping cancellation");
         assert_eq!(calls.load(Ordering::Acquire), 2);
         catalog.close().expect("close catalog after cancellation");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_inflight_snapshot_retains_memory_lease_until_sqlite_read_exits() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let config = SqliteCatalogConfig::new(&data_directory);
+        let (read_backend, started, release, calls) = blocking_snapshot_backend();
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                config,
+                Arc::new(DomainManifestPreparationBackend),
+                read_backend,
+            )
+            .expect("open catalog with blocking snapshot backend");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let selectors = [CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        }];
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+        let mut snapshot = Box::pin(handle.read_snapshot_at_with_limits_and_memory_lease(
+            &selectors,
+            snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+            Some(snapshot_memory_lease(
+                &memory_lease_issuer,
+                &lease_drops,
+                NonZeroU64::new(1).expect("nonzero in-flight test reservation"),
+                None,
+            )),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            snapshot.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("leased snapshot must enter its SQLite read");
+
+        drop(snapshot);
+        assert_eq!(lease_drops.load(Ordering::Acquire), 0);
+        release.send(()).expect("release in-flight snapshot read");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lease_drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed response must drop the returned memory lease");
+        assert_eq!(lease_drops.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        catalog
+            .close()
+            .expect("close catalog after in-flight cancellation");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicked_snapshot_worker_drops_its_inflight_memory_lease() {
+        let directory = TempDir::new().expect("create temp directory");
+        let data_directory = data_directory(&directory);
+        let (catalog, memory_lease_issuer) =
+            SqliteCatalog::open_with_backends_and_snapshot_memory_lease_issuer(
+                SqliteCatalogConfig::new(&data_directory),
+                Arc::new(DomainManifestPreparationBackend),
+                Arc::new(PanickingSnapshotReadBackend),
+            )
+            .expect("open catalog with panicking snapshot read backend");
+        create_append_table(&catalog).await;
+        let handle = catalog.read_handle().expect("create read handle");
+        let selectors = [CatalogSnapshotSelector {
+            table_id: table_id(),
+            snapshot_version: 1,
+            schema_version: 1,
+        }];
+        let lease_drops = Arc::new(AtomicUsize::new(0));
+
+        let error = match handle
+            .read_snapshot_at_with_limits_and_memory_lease(
+                &selectors,
+                snapshot_domain::SqliteCatalogSnapshotReadLimits::default(),
+                Some(snapshot_memory_lease(
+                    &memory_lease_issuer,
+                    &lease_drops,
+                    NonZeroU64::new(1).expect("nonzero panic test reservation"),
+                    None,
+                )),
+            )
+            .await
+        {
+            Ok(_) => panic!("panicked worker unexpectedly returned a leased snapshot"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(lease_drops.load(Ordering::Acquire), 1);
+
+        let close_error = catalog
+            .close()
+            .expect_err("joining the panicked snapshot worker must fail");
+        assert_eq!(close_error.code(), ErrorCode::Internal);
     }
 
     #[tokio::test(flavor = "current_thread")]

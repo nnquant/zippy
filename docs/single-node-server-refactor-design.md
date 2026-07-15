@@ -2247,11 +2247,39 @@ reservation。retained permit 会阻止 `Finished`、terminal eviction、session
 析构始终先于账本额度释放；原 snapshot root 仍可在 physical task 归零后释放，因为 retained 类型不得携带
 reader、pin、路径或其他存储 capability。
 
-这一步只覆盖 execution 开始后的新增分配。`SqliteCatalogPinnedQuerySnapshot` 在 planning 阶段构建，当前由
-Catalog snapshot hard limits 约束，但尚未在读取前从 QueryService 预留内存。下一步必须增加独立的 planning
-snapshot peak reservation，并让 opaque RAII lease 随 Catalog queue request、SQLite worker、snapshot response、
-pinned owner 和 execution ownership 传递；不能在 snapshot 已分配后追认额度，也不能复用要求在 `finish` 前
-归零的 execution-retained permit。
+Stage 5.4d planning snapshot peak admission 已完成（2026-07-15）：`QueryPlanningToken` 只能在
+`Planning + Accepting` 状态预留 snapshot memory；该 permit 不占 task count 或 CPU slot，但和 task、retained、
+result 共用 query/session/process 三级内存硬上限。总预留由三个 checked 部分相加：Catalog table-resolution peak、
+exact pinned-snapshot peak，以及 1 MiB 固定加每个输入引用 4 KiB 的 Server coordination envelope。resolution
+estimator 覆盖最多 1 MiB 请求、4 MiB 原始响应、解码/重复 descriptor 和 lookup container；exact estimator 覆盖
+SQLite raw value 的 32 倍解码膨胀、table/file/lineage 容器、最多 128 MiB 的单 schema 解码瞬时空间、pinned
+scan index/schema charge sidecar 和 allocator margin。Server 初始 exact guardrail 为 2 MiB raw response、4096 个
+visible files 和 16384 条 source-lineage row；2 MiB 不是最终记账值，status 展示的是三部分完整保守峰值。
+
+非 Clone、非序列化且字段私有的 concrete RAII lease 由 Catalog 启动时配对的 issuer/verifier 签发和验源；普通
+`SqliteCatalog::open` 不泄露 issuer，native runtime 使用显式启动 API取得 issuer，而 read handle 只持 verifier。
+reservation identity 由进程级 authority ID 和 authority 内递增序号组成，descriptor 还包含 `reserved_bytes` 与完整
+`QueryInstanceId`。因此依赖方不能通过实现公开 trait、复制 descriptor 或创建另一套 issuer 伪造当前 Catalog 的
+能力。Catalog 在任何排队、pin 或分配前联合核对 origin、额度和 attribution。所有公开 pinned-snapshot API 都必须
+显式接收 lease；query API 拒绝无 attribution 或错误 query ID，通用 maintenance API 拒绝 query-attributed lease。
+
+issuer 的 owner factory 把 QueryService 的私有 accounting permit 结构性装入 concrete lease；QueryService 同时按
+`reservation_id -> 完整 descriptor` 记账。lease 先进入 table-resolution control queue/SQLite worker，随 resolved
+response 原样返回，再进入 exact-snapshot queue/worker；caller 在任一排队或同步读取期间取消，只会关闭 response，
+不会提前退还预算。成功后 lease 随 response 进入 `PinnedSnapshotOwner`，并继续跟随 plan token、execution scope 和
+最后一个派生 task；读取错误、worker panic、response send failure、pinned-owner 构造失败和最终 owner drop 都只
+释放一次。每次 snapshot conflict retry 都重新准入，不会复用已经释放的 reservation。
+
+QueryService 的生产 `complete_planning` 只接受私有构造的 `NativeQueryReadSnapshot`，不再接受调用方提供的任意
+opaque guard 或独立 permit。它从 pinned owner 读取实际 descriptor，并在同一个 `global -> query` 临界区按 authority、
+reservation ID、bytes 和 query generation 全等核验账本后立即安装同一 snapshot root；一个无关的 1-byte permit
+既不能代替真实快照额度，也不能在检查与安装之间制造 TOCTOU。terminal retention、session 清理和 shutdown 会等待
+外部 worker-owned permit，而 `finish()` 不要求它预先归零：当 physical task 归零后先从 registry 取出 snapshot
+root，在锁外析构 root，再由内嵌 permit 按 exact reservation 退账，避免形成生命周期环。
+
+当前为 fail-closed，成功构建后仍保留保守峰值而不缩减为实际 owned bytes，因此会压缩同一查询可用的执行内存。
+后续可增加只减不增的 actual-size reclassification，但不得先分配再追认额度。下一步是在 execution 开始后从同一
+snapshot 投影并记账 exact table description，再接入 `NativeExecutionLease` 和延迟文件准入 factory。
 
 任务：
 

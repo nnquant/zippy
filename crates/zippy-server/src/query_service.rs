@@ -22,7 +22,10 @@ use zippy_types::query::{
     OpaqueQueryExecutionToken, OpaqueQueryOwnerCapability, QueryExecutionToken, QueryInstanceId,
     QueryOwnerCapability, QueryPlanInfo, QueryState, QueryTableVersion,
 };
-use zippy_types::storage::OpaqueQueryReadSnapshot;
+use zippy_types::storage::{
+    CatalogSnapshotMemoryLease, CatalogSnapshotMemoryLeaseDescriptor,
+    CatalogSnapshotMemoryLeaseIssuer, CatalogSnapshotMemoryReservationId, OpaqueQueryReadSnapshot,
+};
 use zippy_types::{ErrorCode, QueryId, Result, ServerError, SessionId};
 
 static NEXT_COORDINATOR_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -166,6 +169,30 @@ impl QueryPlanDraft {
     }
 }
 
+/// One native read snapshot bound to its structurally owned planning-memory reservation.
+pub(crate) struct AdmittedQueryReadSnapshot {
+    instance_id: QueryInstanceId,
+    memory_reservation: CatalogSnapshotMemoryLeaseDescriptor,
+    snapshot: OpaqueQueryReadSnapshot,
+}
+
+impl AdmittedQueryReadSnapshot {
+    fn into_parts(
+        self,
+    ) -> (
+        CatalogSnapshotMemoryLeaseDescriptor,
+        OpaqueQueryReadSnapshot,
+    ) {
+        (self.memory_reservation, self.snapshot)
+    }
+}
+
+enum SnapshotMemoryBinding {
+    Exact(CatalogSnapshotMemoryLeaseDescriptor),
+    #[cfg(test)]
+    Unchecked,
+}
+
 impl QueryResourceBudget {
     fn validate(self, global: QueryServiceResourceConfig) -> Result<Self> {
         if self.max_active_tasks == 0 || self.max_cpu_slots == 0 || self.max_memory_bytes == 0 {
@@ -222,6 +249,8 @@ pub(crate) struct QueryServiceStatus {
     pub registered_queries: usize,
     pub tracked_sessions: usize,
     pub active_logical_queries: usize,
+    pub active_snapshot_memory_permits: usize,
+    pub active_snapshot_memory_bytes: u64,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_task_memory_bytes: u64,
@@ -256,6 +285,8 @@ pub(crate) struct QueryRuntimeStatus {
     pub plan: Option<QueryPlanStatus>,
     pub started_at_ns: Option<u64>,
     pub logical_admitted: bool,
+    pub active_snapshot_memory_permits: usize,
+    pub active_snapshot_memory_bytes: u64,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_task_memory_bytes: u64,
@@ -273,6 +304,8 @@ pub(crate) struct QueryRuntimeStatus {
 pub(crate) struct QuerySessionResourceStatus {
     pub session_id: SessionId,
     pub active_logical_queries: usize,
+    pub active_snapshot_memory_permits: usize,
+    pub active_snapshot_memory_bytes: u64,
     pub active_tasks: usize,
     pub active_cpu_slots: u32,
     pub active_task_memory_bytes: u64,
@@ -339,13 +372,29 @@ pub(crate) struct QueryResourceCoordinator {
 }
 
 impl QueryResourceCoordinator {
+    #[cfg(test)]
     pub(crate) fn new(config: QueryServiceResourceConfig) -> Result<Self> {
         Self::with_registry_config(config, QueryServiceRegistryConfig::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn with_registry_config(
         config: QueryServiceResourceConfig,
         registry_config: QueryServiceRegistryConfig,
+    ) -> Result<Self> {
+        let (snapshot_memory_lease_issuer, _verifier) =
+            CatalogSnapshotMemoryLeaseIssuer::new_authority()?;
+        Self::with_registry_config_and_snapshot_memory_lease_issuer(
+            config,
+            registry_config,
+            snapshot_memory_lease_issuer,
+        )
+    }
+
+    pub(crate) fn with_registry_config_and_snapshot_memory_lease_issuer(
+        config: QueryServiceResourceConfig,
+        registry_config: QueryServiceRegistryConfig,
+        snapshot_memory_lease_issuer: CatalogSnapshotMemoryLeaseIssuer,
     ) -> Result<Self> {
         let config = config.validate()?;
         let registry_config = registry_config.validate(config)?;
@@ -359,6 +408,7 @@ impl QueryResourceCoordinator {
             plan_ttl_ns: duration_ns(registry_config.plan_ttl),
             next_query_generation: AtomicU64::new(1),
             next_owner_nonce: AtomicU64::new(1),
+            snapshot_memory_lease_issuer,
             state: Mutex::new(CoordinatorState::default()),
         });
         let sweeper = Arc::new(QueryServiceSweeper::start(
@@ -486,9 +536,33 @@ impl QueryResourceCoordinator {
         &self,
         token: QueryPlanningToken,
         draft: QueryPlanDraft,
-        snapshot: OpaqueQueryReadSnapshot,
+        snapshot: crate::query_snapshot::NativeQueryReadSnapshot,
     ) -> Result<OpaqueQueryExecutionToken> {
-        self.complete_planning_at(token, draft, snapshot, now_ns())
+        self.complete_native_planning_at(token, draft, snapshot, now_ns())
+    }
+
+    fn complete_native_planning_at(
+        &self,
+        token: QueryPlanningToken,
+        draft: QueryPlanDraft,
+        snapshot: crate::query_snapshot::NativeQueryReadSnapshot,
+        completed_at_ns: u64,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        let snapshot = token.admit_snapshot(snapshot)?;
+        if snapshot.instance_id != token.instance_id() {
+            return Err(
+                invalid("admitted snapshot belongs to another query instance")
+                    .with_query_id(token.control.query_id),
+            );
+        }
+        let (memory_reservation, snapshot) = snapshot.into_parts();
+        self.complete_planning_at(
+            token,
+            draft,
+            snapshot,
+            SnapshotMemoryBinding::Exact(memory_reservation),
+            completed_at_ns,
+        )
     }
 
     fn complete_planning_at(
@@ -496,6 +570,7 @@ impl QueryResourceCoordinator {
         mut token: QueryPlanningToken,
         draft: QueryPlanDraft,
         snapshot: OpaqueQueryReadSnapshot,
+        memory_binding: SnapshotMemoryBinding,
         completed_at_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
         let query_id = token.control.query_id;
@@ -521,10 +596,13 @@ impl QueryResourceCoordinator {
         }
         let info = draft.into_plan_info(completed_at_ns, expires_at_ns);
 
-        match self
-            .inner
-            .complete_planning(&token.control, info.clone(), snapshot, completed_at_ns)
-        {
+        match self.inner.complete_planning(
+            &token.control,
+            info.clone(),
+            snapshot,
+            memory_binding,
+            completed_at_ns,
+        ) {
             Ok(ownership) => {
                 token.armed = false;
                 let execution: OpaqueQueryExecutionToken = Box::new(QueryServicePlanToken {
@@ -677,7 +755,24 @@ impl QueryResourceCoordinator {
         snapshot: OpaqueQueryReadSnapshot,
         completed_at_ns: u64,
     ) -> Result<OpaqueQueryExecutionToken> {
-        self.complete_planning_at(token, draft, snapshot, completed_at_ns)
+        self.complete_planning_at(
+            token,
+            draft,
+            snapshot,
+            SnapshotMemoryBinding::Unchecked,
+            completed_at_ns,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_native_planning_at_for_test(
+        &self,
+        token: QueryPlanningToken,
+        draft: QueryPlanDraft,
+        snapshot: crate::query_snapshot::NativeQueryReadSnapshot,
+        completed_at_ns: u64,
+    ) -> Result<OpaqueQueryExecutionToken> {
+        self.complete_native_planning_at(token, draft, snapshot, completed_at_ns)
     }
 
     #[cfg(test)]
@@ -911,6 +1006,7 @@ struct CoordinatorInner {
     plan_ttl_ns: u64,
     next_query_generation: AtomicU64,
     next_owner_nonce: AtomicU64,
+    snapshot_memory_lease_issuer: CatalogSnapshotMemoryLeaseIssuer,
     state: Mutex<CoordinatorState>,
 }
 
@@ -919,6 +1015,8 @@ struct CoordinatorState {
     registry: QueryRegistry,
     sessions: HashMap<SessionId, SessionResourceUsage>,
     active_logical_queries: usize,
+    active_snapshot_memory_permits: usize,
+    active_snapshot_memory_bytes: u64,
     active_tasks: usize,
     active_cpu_slots: u32,
     active_task_memory_bytes: u64,
@@ -932,6 +1030,8 @@ struct CoordinatorState {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SessionResourceUsage {
     active_logical_queries: usize,
+    active_snapshot_memory_permits: usize,
+    active_snapshot_memory_bytes: u64,
     active_tasks: usize,
     active_cpu_slots: u32,
     active_task_memory_bytes: u64,
@@ -944,6 +1044,8 @@ struct SessionResourceUsage {
 impl SessionResourceUsage {
     fn is_idle(self) -> bool {
         self.active_logical_queries == 0
+            && self.active_snapshot_memory_permits == 0
+            && self.active_snapshot_memory_bytes == 0
             && self.active_tasks == 0
             && self.active_cpu_slots == 0
             && self.active_task_memory_bytes == 0
@@ -957,6 +1059,8 @@ impl SessionResourceUsage {
         QuerySessionResourceStatus {
             session_id,
             active_logical_queries: self.active_logical_queries,
+            active_snapshot_memory_permits: self.active_snapshot_memory_permits,
+            active_snapshot_memory_bytes: self.active_snapshot_memory_bytes,
             active_tasks: self.active_tasks,
             active_cpu_slots: self.active_cpu_slots,
             active_task_memory_bytes: self.active_task_memory_bytes,
@@ -965,8 +1069,9 @@ impl SessionResourceUsage {
             active_result_permits: self.active_result_permits,
             active_result_memory_bytes: self.active_result_memory_bytes,
             active_memory_bytes: self
-                .active_task_memory_bytes
-                .checked_add(self.active_retained_memory_bytes)
+                .active_snapshot_memory_bytes
+                .checked_add(self.active_task_memory_bytes)
+                .and_then(|memory| memory.checked_add(self.active_retained_memory_bytes))
                 .and_then(|memory| memory.checked_add(self.active_result_memory_bytes))
                 .expect("session query memory accounting remains within global budget"),
         }
@@ -1281,6 +1386,8 @@ impl Default for CoordinatorState {
             registry: QueryRegistry::default(),
             sessions: HashMap::new(),
             active_logical_queries: 0,
+            active_snapshot_memory_permits: 0,
+            active_snapshot_memory_bytes: 0,
             active_tasks: 0,
             active_cpu_slots: 0,
             active_task_memory_bytes: 0,
@@ -1305,6 +1412,7 @@ impl CoordinatorState {
     fn refresh_shutdown(&mut self) {
         if self.lifecycle == QueryServiceLifecycle::Draining
             && self.active_logical_queries == 0
+            && self.active_snapshot_memory_permits == 0
             && self.active_tasks == 0
             && self.active_retained_permits == 0
             && self.active_result_permits == 0
@@ -1334,8 +1442,9 @@ impl CoordinatorState {
 
     fn status(&self) -> QueryServiceStatus {
         let active_memory_bytes = self
-            .active_task_memory_bytes
-            .checked_add(self.active_retained_memory_bytes)
+            .active_snapshot_memory_bytes
+            .checked_add(self.active_task_memory_bytes)
+            .and_then(|memory| memory.checked_add(self.active_retained_memory_bytes))
             .and_then(|memory| memory.checked_add(self.active_result_memory_bytes))
             .expect("global query memory accounting remains within configured budget");
         QueryServiceStatus {
@@ -1343,6 +1452,8 @@ impl CoordinatorState {
             registered_queries: self.registry.len(),
             tracked_sessions: self.sessions.len(),
             active_logical_queries: self.active_logical_queries,
+            active_snapshot_memory_permits: self.active_snapshot_memory_permits,
+            active_snapshot_memory_bytes: self.active_snapshot_memory_bytes,
             active_tasks: self.active_tasks,
             active_cpu_slots: self.active_cpu_slots,
             active_task_memory_bytes: self.active_task_memory_bytes,
@@ -1445,6 +1556,7 @@ impl CoordinatorInner {
         control: &Arc<QueryControl>,
         info: QueryPlanInfo,
         snapshot: OpaqueQueryReadSnapshot,
+        memory_binding: SnapshotMemoryBinding,
         completed_at_ns: u64,
     ) -> Result<Arc<SharedSnapshotOwnership>> {
         let mut global = self.state.lock().unwrap();
@@ -1520,6 +1632,47 @@ impl CoordinatorInner {
             control.publish_terminal(signal);
             release_snapshot_root(snapshot_root);
             return Err(error);
+        }
+
+        match memory_binding {
+            SnapshotMemoryBinding::Exact(descriptor) => {
+                let expected_instance = QueryInstanceId::new(
+                    control.query_id,
+                    NonZeroU64::new(control.generation)
+                        .expect("QueryService query generation is nonzero"),
+                );
+                let admitted_reservation = query
+                    .snapshot_memory_reservations
+                    .get(&descriptor.reservation_id())
+                    .copied();
+                if descriptor.query_instance_id() != Some(expected_instance)
+                    || admitted_reservation != Some(descriptor)
+                {
+                    let error = ServerError::new(
+                        ErrorCode::Internal,
+                        "query snapshot does not own its exact planning memory reservation",
+                    )
+                    .with_query_id(control.query_id)
+                    .with_retryable(false);
+                    let signal = Self::terminate_locked(
+                        &mut global,
+                        control,
+                        &mut query,
+                        QueryState::Failed,
+                        Some(error.clone()),
+                        completed_at_ns,
+                    );
+                    let snapshot_root =
+                        Self::retire_terminal_if_drained(&mut global, control, &mut query);
+                    drop(query);
+                    drop(global);
+                    control.publish_terminal(signal);
+                    release_snapshot_root(snapshot_root);
+                    return Err(error);
+                }
+            }
+            #[cfg(test)]
+            SnapshotMemoryBinding::Unchecked => {}
         }
 
         if global.active_snapshot_owners >= self.config.max_active_queries {
@@ -1649,6 +1802,150 @@ impl CoordinatorInner {
         Ok(())
     }
 
+    fn reserve_snapshot_memory(
+        self: &Arc<Self>,
+        control: &Arc<QueryControl>,
+        memory_bytes: NonZeroU64,
+    ) -> Result<CatalogSnapshotMemoryLease> {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        if query.state.is_terminal() {
+            return Err(query.error.clone().unwrap_or_else(|| {
+                ServerError::new(ErrorCode::Conflict, "query is already terminal")
+                    .with_query_id(control.query_id)
+            }));
+        }
+        if query.state != QueryState::Planning {
+            return Err(
+                ServerError::new(ErrorCode::Conflict, "query is not planning")
+                    .with_query_id(control.query_id),
+            );
+        }
+        if global.lifecycle != QueryServiceLifecycle::Accepting {
+            return Err(unavailable(control.query_id));
+        }
+
+        let memory_bytes_value = memory_bytes.get();
+        let query_permits_after = query.active_snapshot_memory_permits.checked_add(1);
+        let query_snapshot_memory_after = query
+            .active_snapshot_memory_bytes
+            .checked_add(memory_bytes_value);
+        let query_memory_after = query_snapshot_memory_after
+            .and_then(|snapshot_memory| snapshot_memory.checked_add(query.active_task_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_result_memory_bytes));
+        if query_permits_after.is_none()
+            || query_memory_after.is_none_or(|value| value > control.budget.max_memory_bytes)
+        {
+            return Err(exhausted(
+                control.query_id,
+                "per-query snapshot memory resources are exhausted",
+            ));
+        }
+
+        let global_permits_after = global.active_snapshot_memory_permits.checked_add(1);
+        let global_snapshot_memory_after = global
+            .active_snapshot_memory_bytes
+            .checked_add(memory_bytes_value);
+        let global_memory_after = global_snapshot_memory_after
+            .and_then(|snapshot_memory| {
+                snapshot_memory.checked_add(global.active_task_memory_bytes)
+            })
+            .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes))
+            .and_then(|memory| memory.checked_add(global.active_result_memory_bytes));
+        if global_permits_after.is_none()
+            || global_memory_after.is_none_or(|value| value > self.config.max_memory_bytes)
+        {
+            return Err(exhausted(
+                control.query_id,
+                "global snapshot memory resources are exhausted",
+            ));
+        }
+
+        let permit_owner = Arc::downgrade(self);
+        let permit_control = Arc::clone(control);
+        let instance_id = QueryInstanceId::new(
+            control.query_id,
+            NonZeroU64::new(control.generation).expect("QueryService query generation is nonzero"),
+        );
+        let memory_lease = self.snapshot_memory_lease_issuer.issue_with_owner(
+            memory_bytes,
+            Some(instance_id),
+            move |descriptor| {
+                Ok(Box::new(QuerySnapshotMemoryPermit {
+                    owner: permit_owner,
+                    control: permit_control,
+                    descriptor,
+                    memory_bytes: Some(memory_bytes),
+                }))
+            },
+        )?;
+        let descriptor = memory_lease.descriptor();
+
+        query.active_snapshot_memory_permits =
+            query_permits_after.expect("validated snapshot memory permit count");
+        query.active_snapshot_memory_bytes =
+            query_snapshot_memory_after.expect("validated per-query snapshot memory addition");
+        global.active_snapshot_memory_permits =
+            global_permits_after.expect("validated global snapshot memory permit count");
+        global.active_snapshot_memory_bytes =
+            global_snapshot_memory_after.expect("validated global snapshot memory addition");
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("admitted query retains its session resource ledger");
+        session.active_snapshot_memory_permits = session
+            .active_snapshot_memory_permits
+            .checked_add(1)
+            .expect("session snapshot memory permit accounting remains within global capacity");
+        session.active_snapshot_memory_bytes = session
+            .active_snapshot_memory_bytes
+            .checked_add(memory_bytes_value)
+            .expect("session snapshot memory accounting remains within global budget");
+        let previous = query
+            .snapshot_memory_reservations
+            .insert(descriptor.reservation_id(), descriptor);
+        debug_assert!(previous.is_none(), "snapshot reservation IDs are unique");
+        Ok(memory_lease)
+    }
+
+    fn release_snapshot_memory(
+        &self,
+        control: &Arc<QueryControl>,
+        descriptor: CatalogSnapshotMemoryLeaseDescriptor,
+        memory_bytes: NonZeroU64,
+    ) {
+        let mut global = self.state.lock().unwrap();
+        let mut query = control.state.lock().unwrap();
+        let memory_bytes = memory_bytes.get();
+        let admitted_descriptor = query
+            .snapshot_memory_reservations
+            .remove(&descriptor.reservation_id())
+            .expect("snapshot permit owns a registered reservation identity");
+        debug_assert_eq!(admitted_descriptor, descriptor);
+        debug_assert_eq!(descriptor.reserved_bytes().get(), memory_bytes);
+        debug_assert!(
+            query.active_snapshot_memory_permits > 0 && global.active_snapshot_memory_permits > 0
+        );
+        query.active_snapshot_memory_permits -= 1;
+        query.active_snapshot_memory_bytes -= memory_bytes;
+        global.active_snapshot_memory_permits -= 1;
+        global.active_snapshot_memory_bytes -= memory_bytes;
+        let session = global
+            .sessions
+            .get_mut(&control.owner_session_id)
+            .expect("active snapshot memory keeps its session resource ledger");
+        debug_assert!(session.active_snapshot_memory_permits > 0);
+        session.active_snapshot_memory_permits -= 1;
+        session.active_snapshot_memory_bytes -= memory_bytes;
+        let snapshot_root = Self::retire_terminal_if_drained(&mut global, control, &mut query);
+        global.remove_idle_session(control.owner_session_id);
+        global.refresh_shutdown();
+        drop(query);
+        drop(global);
+        release_snapshot_root(snapshot_root);
+    }
+
     fn reserve_task(
         self: &Arc<Self>,
         control: &Arc<QueryControl>,
@@ -1677,7 +1974,8 @@ impl CoordinatorInner {
         let query_cpu_after = query.active_cpu_slots.checked_add(cpu_slots);
         let query_task_memory_after = query.active_task_memory_bytes.checked_add(memory_bytes);
         let query_memory_after = query_task_memory_after
-            .and_then(|task_memory| task_memory.checked_add(query.active_retained_memory_bytes))
+            .and_then(|task_memory| task_memory.checked_add(query.active_snapshot_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes))
             .and_then(|memory| memory.checked_add(query.active_result_memory_bytes));
         if query.active_tasks >= control.budget.max_active_tasks
             || query_cpu_after.is_none_or(|value| value > control.budget.max_cpu_slots)
@@ -1691,7 +1989,8 @@ impl CoordinatorInner {
         let global_cpu_after = global.active_cpu_slots.checked_add(cpu_slots);
         let global_task_memory_after = global.active_task_memory_bytes.checked_add(memory_bytes);
         let global_memory_after = global_task_memory_after
-            .and_then(|task_memory| task_memory.checked_add(global.active_retained_memory_bytes))
+            .and_then(|task_memory| task_memory.checked_add(global.active_snapshot_memory_bytes))
+            .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes))
             .and_then(|memory| memory.checked_add(global.active_result_memory_bytes));
         if global.active_tasks >= self.config.max_active_tasks
             || global_cpu_after.is_none_or(|value| value > self.config.max_cpu_slots)
@@ -1785,7 +2084,8 @@ impl CoordinatorInner {
         let memory_bytes = charge.memory_bytes.get();
         let query_result_memory_after = query.active_result_memory_bytes.checked_add(memory_bytes);
         let query_memory_after = query_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(query.active_task_memory_bytes))
+            .and_then(|result_memory| result_memory.checked_add(query.active_snapshot_memory_bytes))
+            .and_then(|memory| memory.checked_add(query.active_task_memory_bytes))
             .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes));
         let query_permits_after = query.active_result_permits.checked_add(1);
         if query.active_result_permits >= control.budget.max_active_tasks
@@ -1800,7 +2100,10 @@ impl CoordinatorInner {
         let global_result_memory_after =
             global.active_result_memory_bytes.checked_add(memory_bytes);
         let global_memory_after = global_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(global.active_task_memory_bytes))
+            .and_then(|result_memory| {
+                result_memory.checked_add(global.active_snapshot_memory_bytes)
+            })
+            .and_then(|memory| memory.checked_add(global.active_task_memory_bytes))
             .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes));
         let global_permits_after = global.active_result_permits.checked_add(1);
         if global.active_result_permits >= self.config.max_active_tasks
@@ -1872,7 +2175,8 @@ impl CoordinatorInner {
             .active_result_memory_bytes
             .checked_add(result_memory_bytes);
         let query_memory_after = query_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(query_task_memory_after))
+            .and_then(|result_memory| result_memory.checked_add(query.active_snapshot_memory_bytes))
+            .and_then(|memory| memory.checked_add(query_task_memory_after))
             .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes));
         let query_permits_after = query.active_result_permits.checked_add(1);
         if query.active_result_permits >= control.budget.max_active_tasks
@@ -1893,7 +2197,10 @@ impl CoordinatorInner {
             .active_result_memory_bytes
             .checked_add(result_memory_bytes);
         let global_memory_after = global_result_memory_after
-            .and_then(|result_memory| result_memory.checked_add(global_task_memory_after))
+            .and_then(|result_memory| {
+                result_memory.checked_add(global.active_snapshot_memory_bytes)
+            })
+            .and_then(|memory| memory.checked_add(global_task_memory_after))
             .and_then(|memory| memory.checked_add(global.active_retained_memory_bytes));
         let global_permits_after = global.active_result_permits.checked_add(1);
         if global.active_result_permits >= self.config.max_active_tasks
@@ -2262,6 +2569,7 @@ impl CoordinatorInner {
             None
         };
         if query.active_tasks == 0
+            && query.active_snapshot_memory_permits == 0
             && query.active_retained_permits == 0
             && query.active_result_permits == 0
             && !query.retention_scheduled
@@ -2403,6 +2711,8 @@ impl CoordinatorInner {
             }),
             started_at_ns: query.started_at_ns,
             logical_admitted: query.logical_admitted,
+            active_snapshot_memory_permits: query.active_snapshot_memory_permits,
+            active_snapshot_memory_bytes: query.active_snapshot_memory_bytes,
             active_tasks: query.active_tasks,
             active_cpu_slots: query.active_cpu_slots,
             active_task_memory_bytes: query.active_task_memory_bytes,
@@ -2411,8 +2721,9 @@ impl CoordinatorInner {
             active_result_permits: query.active_result_permits,
             active_result_memory_bytes: query.active_result_memory_bytes,
             active_memory_bytes: query
-                .active_task_memory_bytes
-                .checked_add(query.active_retained_memory_bytes)
+                .active_snapshot_memory_bytes
+                .checked_add(query.active_task_memory_bytes)
+                .and_then(|memory| memory.checked_add(query.active_retained_memory_bytes))
                 .and_then(|memory| memory.checked_add(query.active_result_memory_bytes))
                 .expect("query memory accounting remains within configured budget"),
             cancellation_requested: control.cancelled.load(Ordering::Acquire),
@@ -2486,6 +2797,10 @@ struct QueryControlState {
     plan: Option<QueryPlanInfo>,
     started_at_ns: Option<u64>,
     logical_admitted: bool,
+    snapshot_memory_reservations:
+        HashMap<CatalogSnapshotMemoryReservationId, CatalogSnapshotMemoryLeaseDescriptor>,
+    active_snapshot_memory_permits: usize,
+    active_snapshot_memory_bytes: u64,
     active_tasks: usize,
     active_cpu_slots: u32,
     active_task_memory_bytes: u64,
@@ -2505,6 +2820,9 @@ impl Default for QueryControlState {
             plan: None,
             started_at_ns: None,
             logical_admitted: true,
+            snapshot_memory_reservations: HashMap::new(),
+            active_snapshot_memory_permits: 0,
+            active_snapshot_memory_bytes: 0,
             active_tasks: 0,
             active_cpu_slots: 0,
             active_task_memory_bytes: 0,
@@ -2652,12 +2970,70 @@ impl QueryPlanningToken {
             .error
             .clone()
     }
+
+    /// Reserves memory for an in-flight Catalog snapshot planning attempt.
+    pub(crate) fn reserve_snapshot_memory(
+        &self,
+        memory_bytes: NonZeroU64,
+    ) -> Result<CatalogSnapshotMemoryLease> {
+        let owner = self.control.owner.upgrade().ok_or_else(|| {
+            ServerError::new(
+                ErrorCode::Unavailable,
+                "QueryService coordinator is unavailable",
+            )
+            .with_query_id(self.control.query_id)
+        })?;
+        owner.reserve_snapshot_memory(&self.control, memory_bytes)
+    }
+
+    /// Binds a private native snapshot to the exact reservation retained by its pinned owner.
+    pub(crate) fn admit_snapshot(
+        &self,
+        snapshot: crate::query_snapshot::NativeQueryReadSnapshot,
+    ) -> Result<AdmittedQueryReadSnapshot> {
+        let memory_reservation = snapshot.memory_lease_descriptor();
+        if memory_reservation.query_instance_id() != Some(self.instance_id()) {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                "query snapshot memory reservation belongs to another query instance",
+            )
+            .with_query_id(self.control.query_id)
+            .with_retryable(false));
+        }
+        Ok(AdmittedQueryReadSnapshot {
+            instance_id: self.instance_id(),
+            memory_reservation,
+            snapshot: snapshot.into_opaque(),
+        })
+    }
 }
 
 impl Drop for QueryPlanningToken {
     fn drop(&mut self) {
         if self.armed {
             self.control.cancel("QueryService planning token dropped");
+        }
+    }
+}
+
+/// Exclusive accounting permit for memory retained by snapshot planning.
+///
+/// The permit is intentionally non-cloneable. Dropping it releases the query, session, and global
+/// ledgers, including after the owning query has become terminal.
+pub(crate) struct QuerySnapshotMemoryPermit {
+    owner: Weak<CoordinatorInner>,
+    control: Arc<QueryControl>,
+    descriptor: CatalogSnapshotMemoryLeaseDescriptor,
+    memory_bytes: Option<NonZeroU64>,
+}
+
+impl Drop for QuerySnapshotMemoryPermit {
+    fn drop(&mut self) {
+        let Some(memory_bytes) = self.memory_bytes.take() else {
+            return;
+        };
+        if let Some(owner) = self.owner.upgrade() {
+            owner.release_snapshot_memory(&self.control, self.descriptor, memory_bytes);
         }
     }
 }
@@ -3302,7 +3678,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use zippy_types::query::QueryOwnerCapability;
-    use zippy_types::storage::{QueryReadSnapshotDescriptor, QueryReadSnapshotGuard};
+    use zippy_types::storage::{
+        CatalogSnapshotMemoryLease, OpaqueQueryReadSnapshot, QueryReadSnapshotDescriptor,
+        QueryReadSnapshotGuard,
+    };
     use zippy_types::{BoxFuture, ErrorCode, QueryId, Result, ServerError, SessionId};
 
     use super::{
@@ -3319,6 +3698,12 @@ mod tests {
 
     struct PanicSnapshot {
         descriptor: QueryReadSnapshotDescriptor,
+        drops: Arc<AtomicUsize>,
+    }
+
+    struct MemoryLeasedTestSnapshot {
+        descriptor: QueryReadSnapshotDescriptor,
+        _memory_permit: CatalogSnapshotMemoryLease,
         drops: Arc<AtomicUsize>,
     }
 
@@ -3348,6 +3733,37 @@ mod tests {
     }
 
     impl Drop for TestSnapshot {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl QueryReadSnapshotGuard for MemoryLeasedTestSnapshot {
+        fn descriptor(&self) -> &QueryReadSnapshotDescriptor {
+            &self.descriptor
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn renew(&mut self, _expires_at_ns: u64) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn release(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async move {
+                drop(self);
+                Ok(())
+            })
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+            self
+        }
+    }
+
+    impl Drop for MemoryLeasedTestSnapshot {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
@@ -3600,6 +4016,10 @@ mod tests {
             kind,
             memory_bytes: NonZeroU64::new(memory_bytes).unwrap(),
         }
+    }
+
+    fn snapshot_memory(memory_bytes: u64) -> NonZeroU64 {
+        NonZeroU64::new(memory_bytes).unwrap()
     }
 
     #[test]
@@ -4347,6 +4767,346 @@ mod tests {
         drop(token);
         assert_eq!(admitted_drops.load(Ordering::Relaxed), 1);
         assert_eq!(coordinator.status().active_snapshot_owners, 0);
+    }
+
+    #[test]
+    fn snapshot_memory_shares_query_budget_and_status_totals_without_using_task_capacity() {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+        assert_send_sync_static::<super::QuerySnapshotMemoryPermit>();
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 1,
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 2,
+            max_cpu_slots: 2,
+            max_memory_bytes: 100,
+        };
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), query_budget, 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let snapshot_memory_permit = planning
+            .reserve_snapshot_memory(snapshot_memory(10))
+            .unwrap();
+        let rejected = planning
+            .reserve_snapshot_memory(snapshot_memory(91))
+            .expect_err("snapshot planning memory must obey the per-query memory budget");
+        assert_eq!(rejected.code(), ErrorCode::ResourceExhausted);
+
+        let service = coordinator.status();
+        assert_eq!(service.active_snapshot_memory_permits, 1);
+        assert_eq!(service.active_snapshot_memory_bytes, 10);
+        assert_eq!(service.active_tasks, 0);
+        assert_eq!(service.active_cpu_slots, 0);
+        assert_eq!(service.active_memory_bytes, 10);
+        let session = coordinator.session_status_owned(owner.as_ref()).unwrap();
+        assert_eq!(session.active_snapshot_memory_permits, 1);
+        assert_eq!(session.active_snapshot_memory_bytes, 10);
+        assert_eq!(session.active_memory_bytes, 10);
+        let query = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(query.active_snapshot_memory_permits, 1);
+        assert_eq!(query.active_snapshot_memory_bytes, 10);
+        assert_eq!(query.active_memory_bytes, 10);
+
+        let token = coordinator
+            .complete_planning_at_for_test(
+                planning,
+                draft(id),
+                snapshot(id, Arc::new(AtomicUsize::new(0))),
+                11,
+            )
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 12).unwrap();
+        let retained = execution
+            .admit_task(charge(1, 30), ())
+            .unwrap()
+            .into_retained(|()| Ok(((), retained_charge(QueryRetainedKind::PhysicalPlan, 20))))
+            .unwrap();
+        let result = execution.admit_result(result_charge(20), ()).unwrap();
+        let task = execution.admit_task(charge(1, 50), ()).unwrap();
+        let rejected = execution
+            .admit_task(charge(1, 1), ())
+            .err()
+            .expect("snapshot, task, retained, and result memory must share one hard budget");
+        assert_eq!(rejected.code(), ErrorCode::ResourceExhausted);
+
+        let service = coordinator.status();
+        assert_eq!(service.active_snapshot_memory_bytes, 10);
+        assert_eq!(service.active_task_memory_bytes, 50);
+        assert_eq!(service.active_retained_memory_bytes, 20);
+        assert_eq!(service.active_result_memory_bytes, 20);
+        assert_eq!(service.active_memory_bytes, 100);
+        let session = coordinator.session_status_owned(owner.as_ref()).unwrap();
+        assert_eq!(session.active_snapshot_memory_bytes, 10);
+        assert_eq!(session.active_task_memory_bytes, 50);
+        assert_eq!(session.active_retained_memory_bytes, 20);
+        assert_eq!(session.active_result_memory_bytes, 20);
+        assert_eq!(session.active_memory_bytes, 100);
+        let query = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(query.active_snapshot_memory_bytes, 10);
+        assert_eq!(query.active_task_memory_bytes, 50);
+        assert_eq!(query.active_retained_memory_bytes, 20);
+        assert_eq!(query.active_result_memory_bytes, 20);
+        assert_eq!(query.active_memory_bytes, 100);
+
+        drop((task, result, retained));
+        execution
+            .finish()
+            .expect("execution may finish while Catalog still owns planning memory");
+        let terminal = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(terminal.state, QueryState::Finished);
+        assert_eq!(terminal.active_snapshot_memory_permits, 1);
+        assert_eq!(terminal.active_snapshot_memory_bytes, 10);
+        assert_eq!(coordinator.status().active_snapshot_owners, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 1);
+
+        drop(snapshot_memory_permit);
+        let status = coordinator.status();
+        assert_eq!(status.active_snapshot_memory_permits, 0);
+        assert_eq!(status.active_snapshot_memory_bytes, 0);
+        assert_eq!(status.active_memory_bytes, 0);
+        assert_eq!(status.tracked_sessions, 0);
+    }
+
+    #[test]
+    fn finish_releases_snapshot_root_owned_memory_permit_without_deadlock() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let memory_permit = planning
+            .reserve_snapshot_memory(snapshot_memory(20))
+            .unwrap();
+        let admitted_snapshot: OpaqueQueryReadSnapshot = Box::new(MemoryLeasedTestSnapshot {
+            descriptor: QueryReadSnapshotDescriptor {
+                query_id: id,
+                catalog_revision: 1,
+                tables: Vec::new(),
+            },
+            _memory_permit: memory_permit,
+            drops: Arc::clone(&drops),
+        });
+        let token = coordinator
+            .complete_planning_at_for_test(planning, draft(id), admitted_snapshot, 11)
+            .unwrap();
+        let execution = coordinator.begin_execution(token, 12).unwrap();
+        assert_eq!(coordinator.status().active_snapshot_owners, 1);
+        assert_eq!(coordinator.status().active_snapshot_memory_permits, 1);
+        assert_eq!(coordinator.status().active_snapshot_memory_bytes, 20);
+
+        execution
+            .finish()
+            .expect("snapshot root release must drop its memory permit after unlocking");
+        let terminal = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(terminal.state, QueryState::Finished);
+        assert_eq!(terminal.active_snapshot_memory_permits, 0);
+        assert_eq!(terminal.active_snapshot_memory_bytes, 0);
+        let service = coordinator.status();
+        assert_eq!(service.active_snapshot_owners, 0);
+        assert_eq!(service.active_snapshot_memory_permits, 0);
+        assert_eq!(service.active_snapshot_memory_bytes, 0);
+        assert_eq!(service.active_memory_bytes, 0);
+        assert_eq!(service.tracked_sessions, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn snapshot_memory_enforces_global_budget_across_queries_and_sessions() {
+        let coordinator = coordinator(QueryServiceResourceConfig {
+            max_active_queries: 2,
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        });
+        let query_budget = QueryResourceBudget {
+            max_active_tasks: 1,
+            max_cpu_slots: 1,
+            max_memory_bytes: 100,
+        };
+        let first_owner = coordinator.owner(session_id(1));
+        let second_owner = coordinator.owner(session_id(2));
+        let first = coordinator
+            .submit_at_for_test(
+                first_owner.as_ref(),
+                metadata(query_id(1), None),
+                query_budget,
+                10,
+            )
+            .unwrap();
+        let second = coordinator
+            .submit_at_for_test(
+                second_owner.as_ref(),
+                metadata(query_id(2), None),
+                query_budget,
+                10,
+            )
+            .unwrap();
+        let first_permit = first.reserve_snapshot_memory(snapshot_memory(70)).unwrap();
+        let rejected = second
+            .reserve_snapshot_memory(snapshot_memory(31))
+            .expect_err("snapshot memory from another query must remain globally reserved");
+        assert_eq!(rejected.code(), ErrorCode::ResourceExhausted);
+        let second_permit = second.reserve_snapshot_memory(snapshot_memory(30)).unwrap();
+
+        let service = coordinator.status();
+        assert_eq!(service.active_snapshot_memory_permits, 2);
+        assert_eq!(service.active_snapshot_memory_bytes, 100);
+        assert_eq!(service.active_tasks, 0);
+        assert_eq!(service.active_cpu_slots, 0);
+        assert_eq!(service.active_memory_bytes, 100);
+        assert_eq!(
+            coordinator
+                .session_status_owned(first_owner.as_ref())
+                .unwrap()
+                .active_snapshot_memory_bytes,
+            70
+        );
+        assert_eq!(
+            coordinator
+                .session_status_owned(second_owner.as_ref())
+                .unwrap()
+                .active_snapshot_memory_bytes,
+            30
+        );
+
+        drop((first, second));
+        assert_eq!(coordinator.status().active_logical_queries, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 2);
+        drop((first_permit, second_permit));
+        assert_eq!(coordinator.status().active_memory_bytes, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn cancelled_planning_keeps_snapshot_memory_charged_until_permit_drop() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let instance_id = planning.instance_id();
+        let permit = planning
+            .reserve_snapshot_memory(snapshot_memory(30))
+            .unwrap();
+
+        coordinator.cancel_current_for_test(id).unwrap();
+        let query = coordinator
+            .status_owned(owner.as_ref(), instance_id)
+            .unwrap();
+        assert_eq!(query.state, QueryState::Cancelled);
+        assert_eq!(query.active_snapshot_memory_permits, 1);
+        assert_eq!(query.active_snapshot_memory_bytes, 30);
+        assert_eq!(coordinator.status().active_logical_queries, 0);
+        assert_eq!(coordinator.status().active_snapshot_memory_bytes, 30);
+        let cancelled = planning
+            .reserve_snapshot_memory(snapshot_memory(1))
+            .expect_err("terminal planning may not reserve additional snapshot memory");
+        assert_eq!(cancelled.code(), ErrorCode::Cancelled);
+
+        drop(planning);
+        assert_eq!(coordinator.status().active_snapshot_memory_bytes, 30);
+        assert_eq!(coordinator.status().tracked_sessions, 1);
+        drop(permit);
+        assert_eq!(coordinator.status().active_snapshot_memory_permits, 0);
+        assert_eq!(coordinator.status().active_snapshot_memory_bytes, 0);
+        assert_eq!(coordinator.status().tracked_sessions, 0);
+    }
+
+    #[test]
+    fn snapshot_memory_blocks_terminal_capacity_eviction_until_permit_drop() {
+        let coordinator = QueryResourceCoordinator::with_registry_config(
+            config(),
+            registry_config(1, 8, Duration::from_secs(30)),
+        )
+        .unwrap();
+        let first_owner = coordinator.owner(session_id(1));
+        let second_owner = coordinator.owner(session_id(2));
+        let first_id = query_id(1);
+        let first = coordinator
+            .submit_at_for_test(first_owner.as_ref(), metadata(first_id, None), budget(), 10)
+            .unwrap();
+        let permit = first.reserve_snapshot_memory(snapshot_memory(10)).unwrap();
+        coordinator.cancel_current_for_test(first_id).unwrap();
+        drop(first);
+
+        let blocked = coordinator
+            .submit_at_for_test(
+                second_owner.as_ref(),
+                metadata(query_id(2), None),
+                budget(),
+                20,
+            )
+            .err()
+            .expect("terminal query with snapshot memory must not be capacity-evicted");
+        assert_eq!(blocked.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(coordinator.status().query_tombstones, 0);
+
+        drop(permit);
+        let replacement = coordinator
+            .submit_at_for_test(
+                second_owner.as_ref(),
+                metadata(query_id(2), None),
+                budget(),
+                21,
+            )
+            .expect("terminal query becomes evictable after snapshot memory drains");
+        assert_eq!(coordinator.status().registered_queries, 1);
+        assert_eq!(coordinator.status().query_tombstones, 1);
+        drop(replacement);
+    }
+
+    #[test]
+    fn shutdown_waits_for_snapshot_memory_permits() {
+        let coordinator = coordinator(config());
+        let owner = coordinator.owner(session_id(1));
+        let id = query_id(1);
+        let planning = coordinator
+            .submit_at_for_test(owner.as_ref(), metadata(id, None), budget(), 10)
+            .unwrap();
+        let permit = planning
+            .reserve_snapshot_memory(snapshot_memory(20))
+            .unwrap();
+
+        let draining = coordinator.begin_shutdown();
+        assert_eq!(draining.lifecycle, QueryServiceLifecycle::Draining);
+        assert_eq!(draining.active_logical_queries, 0);
+        assert_eq!(draining.active_snapshot_memory_permits, 1);
+        assert_eq!(draining.active_snapshot_memory_bytes, 20);
+        assert_eq!(draining.active_tasks, 0);
+        assert_eq!(draining.active_cpu_slots, 0);
+        drop(planning);
+        assert_eq!(
+            coordinator.status().lifecycle,
+            QueryServiceLifecycle::Draining
+        );
+
+        drop(permit);
+        let stopped = coordinator.status();
+        assert_eq!(stopped.lifecycle, QueryServiceLifecycle::Stopped);
+        assert_eq!(stopped.active_snapshot_memory_permits, 0);
+        assert_eq!(stopped.active_snapshot_memory_bytes, 0);
+        assert_eq!(stopped.active_memory_bytes, 0);
+        assert_eq!(stopped.tracked_sessions, 0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Exact, revision-consistent Catalog snapshot reads.
 
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::num::NonZeroU64;
 
 use rusqlite::types::FromSql;
@@ -26,6 +27,10 @@ const MAX_VISIBLE_FILES: usize = 65_536;
 const MAX_SOURCE_LINEAGE_ROWS: usize = 262_144;
 const LINEAGE_QUERY_CHUNK_SIZE: usize = 512;
 const MAX_SNAPSHOT_RAW_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_RAW_DECODE_EXPANSION: usize = 32;
+const SNAPSHOT_SCHEMA_DECODE_TRANSIENT_BYTES: usize =
+    zippy_types::schema_contract::MAX_CATALOG_SCHEMA_IPC_BYTES * 8;
+const SNAPSHOT_FIXED_ALLOCATOR_MARGIN_BYTES: usize = 1024 * 1024;
 const TABLE_ROW_LENGTHS_SQL: &str =
     "SELECT length(table_id), length(namespace_id), length(CAST(name AS BLOB)), \
             length(CAST(table_kind AS BLOB)), length(definition_blob), \
@@ -135,6 +140,108 @@ impl SqliteCatalogSnapshotReadLimits {
         }
         Ok(self)
     }
+
+    /// Returns a conservative logical peak for owning one decoded and pinned snapshot.
+    ///
+    /// The estimate covers raw SQLite value expansion, selector and table containers, pending and
+    /// finalized file descriptors, lineage maps, one bounded schema-decode transient, pinned scan
+    /// indices, schema charges, and a fixed allocator margin. Catalog owns this formula because it
+    /// owns those private layouts. The result is an admission-accounting budget, not measured RSS:
+    /// allocator arenas, SQLite page cache, thread stacks, and unrelated process memory are outside
+    /// this value.
+    ///
+    /// :param selector_count: Number of exact table selectors in the snapshot request.
+    /// :returns: Nonzero conservative logical peak in bytes.
+    /// :raises ServerError: If limits or selector count are invalid, or arithmetic overflows.
+    pub fn conservative_owned_peak_bytes(self, selector_count: usize) -> Result<NonZeroU64> {
+        let limits = self.validate()?;
+        if selector_count == 0 || selector_count > MAX_SNAPSHOT_SELECTORS {
+            return Err(ServerError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "catalog snapshot selector count must be between 1 and hard maximum \
+                     actual=[{selector_count}] maximum=[{MAX_SNAPSHOT_SELECTORS}]"
+                ),
+            )
+            .with_retryable(false));
+        }
+
+        let raw_decode = checked_peak_mul(
+            limits.max_raw_response_bytes,
+            SNAPSHOT_RAW_DECODE_EXPANSION,
+            "raw SQLite decode expansion",
+        )?;
+        let table_slot_bytes = size_of::<CatalogSnapshotSelector>()
+            .checked_add(size_of::<PendingTableSnapshot>())
+            .and_then(|bytes| bytes.checked_add(size_of::<CatalogTableSnapshot>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<TableDescriptor>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<SchemaDescriptor>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<TableSnapshot>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<Box<[usize]>>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<NonZeroU64>()))
+            .ok_or_else(|| resource_exhausted("catalog snapshot table slot byte overflow"))?;
+        let table_containers = checked_peak_mul(
+            selector_count,
+            table_slot_bytes,
+            "selector and table containers",
+        )?;
+
+        // Pending and finalized descriptors may overlap while the response is assembled. The
+        // extra hash-table slots cover visible-file deduplication and lineage lookup buckets.
+        let file_slot_bytes = size_of::<PendingVisibleFile>()
+            .checked_add(size_of::<DataFileDescriptor>())
+            .and_then(|bytes| bytes.checked_add(size_of::<FileId>() * 4))
+            .and_then(|bytes| bytes.checked_add(size_of::<usize>()))
+            .ok_or_else(|| resource_exhausted("catalog snapshot file slot byte overflow"))?;
+        let file_containers = checked_peak_mul(
+            limits.max_visible_files,
+            file_slot_bytes,
+            "file descriptors and pinned scan sidecars",
+        )?;
+        let lineage_slot_bytes = size_of::<SourceSegmentLineage>()
+            .checked_add(size_of::<FileId>() * 2)
+            .and_then(|bytes| bytes.checked_add(size_of::<usize>() * 2))
+            .ok_or_else(|| resource_exhausted("catalog snapshot lineage slot byte overflow"))?;
+        let lineage_containers = checked_peak_mul(
+            limits.max_source_lineage_rows,
+            lineage_slot_bytes,
+            "lineage rows and lookup containers",
+        )?;
+
+        let peak = checked_peak_add(raw_decode, table_containers, "table containers")?;
+        let peak = checked_peak_add(peak, file_containers, "file containers")?;
+        let peak = checked_peak_add(peak, lineage_containers, "lineage containers")?;
+        let peak = checked_peak_add(
+            peak,
+            SNAPSHOT_SCHEMA_DECODE_TRANSIENT_BYTES,
+            "schema decode transient",
+        )?;
+        let peak = checked_peak_add(
+            peak,
+            SNAPSHOT_FIXED_ALLOCATOR_MARGIN_BYTES,
+            "allocator margin",
+        )?;
+        let peak = u64::try_from(peak)
+            .map_err(|_| resource_exhausted("catalog snapshot peak bytes exceed u64"))?;
+        NonZeroU64::new(peak)
+            .ok_or_else(|| resource_exhausted("catalog snapshot peak bytes must be nonzero"))
+    }
+}
+
+fn checked_peak_mul(left: usize, right: usize, component: &str) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(|| {
+        resource_exhausted(format!(
+            "catalog snapshot peak byte multiplication overflow component=[{component}]"
+        ))
+    })
+}
+
+fn checked_peak_add(left: usize, right: usize, component: &str) -> Result<usize> {
+    left.checked_add(right).ok_or_else(|| {
+        resource_exhausted(format!(
+            "catalog snapshot peak byte addition overflow component=[{component}]"
+        ))
+    })
 }
 
 struct SnapshotReadBudget {
@@ -1458,7 +1565,11 @@ mod tests {
         ErrorCode, FileId, LogOffset, NamespaceId, OffsetWatermark, RequestId, TableId,
     };
 
-    use super::{read_snapshot_at, GET_VISIBLE_FILES_SQL};
+    use super::{
+        checked_peak_add, checked_peak_mul, read_snapshot_at, SqliteCatalogSnapshotReadLimits,
+        GET_VISIBLE_FILES_SQL, MAX_SNAPSHOT_RAW_RESPONSE_BYTES, MAX_SNAPSHOT_SELECTORS,
+        MAX_SOURCE_LINEAGE_ROWS, MAX_VISIBLE_FILES,
+    };
     use crate::encoding::{encode_offset_watermark, encode_optional_u64, encode_u64};
     use crate::storage_codec::{
         encode_data_file_metadata_blob, encode_data_file_partition_blob,
@@ -1661,6 +1772,88 @@ mod tests {
             MetadataScalar::UInt64(file),
         )]))
         .expect("encode file metadata")
+    }
+
+    #[test]
+    fn snapshot_peak_estimator_accepts_exact_boundaries_and_rejects_invalid_counts() {
+        let minimum = SqliteCatalogSnapshotReadLimits {
+            max_visible_files: 1,
+            max_source_lineage_rows: 1,
+            max_raw_response_bytes: 1,
+        };
+        assert!(
+            minimum
+                .conservative_owned_peak_bytes(1)
+                .expect("estimate minimum valid request")
+                .get()
+                > 0
+        );
+
+        let maximum = SqliteCatalogSnapshotReadLimits {
+            max_visible_files: MAX_VISIBLE_FILES,
+            max_source_lineage_rows: MAX_SOURCE_LINEAGE_ROWS,
+            max_raw_response_bytes: MAX_SNAPSHOT_RAW_RESPONSE_BYTES,
+        };
+        maximum
+            .conservative_owned_peak_bytes(MAX_SNAPSHOT_SELECTORS)
+            .expect("estimate exact hard-limit request without overflow");
+
+        for selector_count in [0, MAX_SNAPSHOT_SELECTORS + 1] {
+            let error = minimum
+                .conservative_owned_peak_bytes(selector_count)
+                .expect_err("invalid selector count must fail");
+            assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn snapshot_peak_estimator_is_strictly_monotonic_for_every_input_bound() {
+        let base = SqliteCatalogSnapshotReadLimits {
+            max_visible_files: 1,
+            max_source_lineage_rows: 1,
+            max_raw_response_bytes: 1,
+        };
+        let baseline = base
+            .conservative_owned_peak_bytes(1)
+            .expect("estimate baseline")
+            .get();
+        let increased = [
+            base.conservative_owned_peak_bytes(2)
+                .expect("increase selector count")
+                .get(),
+            SqliteCatalogSnapshotReadLimits {
+                max_visible_files: 2,
+                ..base
+            }
+            .conservative_owned_peak_bytes(1)
+            .expect("increase file limit")
+            .get(),
+            SqliteCatalogSnapshotReadLimits {
+                max_source_lineage_rows: 2,
+                ..base
+            }
+            .conservative_owned_peak_bytes(1)
+            .expect("increase lineage limit")
+            .get(),
+            SqliteCatalogSnapshotReadLimits {
+                max_raw_response_bytes: 2,
+                ..base
+            }
+            .conservative_owned_peak_bytes(1)
+            .expect("increase raw byte limit")
+            .get(),
+        ];
+        assert!(increased.into_iter().all(|estimate| estimate > baseline));
+    }
+
+    #[test]
+    fn snapshot_peak_estimator_reports_checked_arithmetic_overflow() {
+        let multiplication = checked_peak_mul(usize::MAX, 2, "test")
+            .expect_err("multiplication overflow must fail closed");
+        assert_eq!(multiplication.code(), ErrorCode::ResourceExhausted);
+        let addition = checked_peak_add(usize::MAX, 1, "test")
+            .expect_err("addition overflow must fail closed");
+        assert_eq!(addition.code(), ErrorCode::ResourceExhausted);
     }
 
     #[test]
