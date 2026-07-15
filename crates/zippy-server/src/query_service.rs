@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
+use zippy_catalog::{PinnedDataFile, PinnedDataFileReader};
 use zippy_core::{
     DEFAULT_MAX_CPU_CORES, DEFAULT_QUERY_MAX_ACTIVE_TASKS, DEFAULT_QUERY_MAX_CONCURRENT_QUERIES,
     DEFAULT_QUERY_MAX_MEMORY_BYTES, DEFAULT_QUERY_PLAN_TTL_MS, MAX_QUERY_CONCURRENT_QUERIES,
@@ -3544,6 +3545,7 @@ pub(crate) struct QueryTaskPermit<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> QueryTaskPermit<R> {
+    #[cfg(test)]
     pub(crate) fn resource(&self) -> &R {
         self.resource
             .as_ref()
@@ -3579,6 +3581,7 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
     /// This is used after admission to perform fallible physical setup such as opening a pinned
     /// file. If the conversion fails or panics, the original task charge and snapshot ownership
     /// are released by normal unwinding rather than escaping as an unaccounted resource.
+    #[cfg(test)]
     pub(crate) fn try_map_resource<T: Send + 'static>(
         mut self,
         convert: impl FnOnce(R) -> Result<T>,
@@ -3686,6 +3689,46 @@ impl<R: Send + 'static> QueryTaskPermit<R> {
             reservation: Some(reservation),
         })
     }
+}
+
+impl QueryTaskPermit<PinnedDataFile> {
+    /// Opens a pinned file without exposing either the raw capability or a detached reader.
+    pub(crate) fn open_pinned_file(mut self) -> Result<QueryTaskPermit<PinnedDataFileReader>> {
+        if self.is_cancelled() {
+            return Err(cancelled_pinned_file_open());
+        }
+        let file = self
+            .resource
+            .take()
+            .expect("live pinned-file task permit retains its physical capability");
+        let reader = file.open_reader()?;
+        if self.is_cancelled() {
+            drop(reader);
+            return Err(cancelled_pinned_file_open());
+        }
+        Ok(QueryTaskPermit {
+            resource: Some(reader),
+            ownership: self.ownership.take(),
+            reservation: self.reservation.take(),
+        })
+    }
+}
+
+impl QueryTaskPermit<PinnedDataFileReader> {
+    /// Borrows an already-open reader that cannot clone or expose its storage capability.
+    pub(crate) fn pinned_file_reader(&self) -> &PinnedDataFileReader {
+        self.resource
+            .as_ref()
+            .expect("live pinned-reader task permit retains its physical reader")
+    }
+}
+
+fn cancelled_pinned_file_open() -> ServerError {
+    ServerError::new(
+        ErrorCode::Cancelled,
+        "native query file task was cancelled before Parquet open completed",
+    )
+    .with_retryable(false)
 }
 
 pub(crate) struct QueryRetainedPermit<R: Send + 'static> {
